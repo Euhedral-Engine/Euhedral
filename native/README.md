@@ -86,3 +86,55 @@ Container Toolkit), along with target-matching CUDA user-space runtime/NVRTC lib
 the CUDA headers used by NVRTC to compile the installed `.cu` sources. Set
 `EUHEDRAL_CUDA_INCLUDE_DIR` to their include directory. Driver stubs and development import
 libraries are for linking only, not runtime deployment.
+
+## Opt-in Q3 temporal fragment pipeline
+
+`q3/pipeline_kernels.cu` is a separate C++17 NVRTC translation unit, not a production
+Q3 dispatch mode. Its `euhedral_q3_pipeline_<rows>_<cm>x<cn>` entry points take the
+same Q3 matrix arguments as the fragment-node kernels, followed by a nullable
+`unsigned long long* observations`. Launch 256 threads per CTA, with a 2D grid
+rounded up to the kernel's fixed `(cn, cm, 1)` cluster dimensions. Supported row
+tiles are 32 and 64; compositions `(cm,cn)` are `(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`,
+`(1,4)` and `(2,2)`. Compilation needs the CUDA include directory and its `cccl`
+subdirectory on the include path. The normal C++14 Q3 source and dispatch are unchanged.
+
+Each A or B branch owns two execution-storage slots and separate ready, parent-ready
+and borrower-release barriers per slot. Generation identity is branch/slot-local;
+there is no CTA-wide current-generation stamp. Generations are consecutive from
+zero, with `slot = generation % kSlots` and phase derived from the slot's reuse
+count. The generation protocol does not encode a K extent. This first storage,
+producer and MMA policy still uses K64; changing that extent also requires changing
+those policy-specific layouts and loops, not merely selecting a different kernel name.
+
+The first mapping uses four branch-producer warps and the existing four MMA warps.
+Only the strategy assigns physical warp IDs. A single producer warp collectively
+begins, accepts and publishes each branch generation; each registered descendant
+warp acquires and releases it once in order. A parent owner aliases its local
+execution slot. Remote producers copy each branch fragment once into their own slot,
+release the parent borrow immediately after that copy, then publish locally to
+sibling MMA descendants. Parent reuse counts both local MMA borrowers and remote
+copy borrowers; child-slot reuse counts its local MMA borrowers. No extra full-tile
+intermediate is introduced. Warp FP32 accumulators retain the existing K/high/low
+numerical order and flow through CTA result storage to BF16 output.
+
+Steady-state handoffs use scoped release arrivals and acquire waits on CUDA
+`mbarrier` objects. Producer warps wait only for their branch slot's previous
+borrowers; remote acceptance waits only on that parent branch's publication; MMA
+warps wait only on their A and B branches. Warp joins connect all-lane reads/writes
+to a leader's notification. There are no whole-CTA or whole-cluster barriers inside
+the K loop. Relative to the single-slot fragment strategy, each generation removes
+six explicit CTA barriers (one parent-production, one begin, two publish, two release)
+and two cluster barriers (publication and retirement).
+
+Two whole-cluster joins remain per launch: bootstrap makes initialized barriers and
+DSM CTA lifetimes available, and the terminal join prevents any CTA exiting while a
+peer still accesses its shared memory. The terminal join also publishes CTA result
+writes before output writeback. Neither join scales with the number of generations.
+
+A non-null observation buffer requires `grid.x * grid.y * ceil(width/64) * 44`
+64-bit words. Per CTA/generation, four branches each record six words (production
+start, acceptance complete, pre-publication timestamp, logical remote-fragment count,
+generation, slot); four consumers each record five words (acquired, MMA complete,
+pre-release timestamp, first A address, first B address). Timestamps use the device
+global timer. These records are diagnostics, never synchronization state; publication
+and release stamps precede the actual notifications. Timed launches pass null.
