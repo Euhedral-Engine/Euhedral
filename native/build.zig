@@ -87,12 +87,12 @@ pub fn build(b: *std.Build) void {
     b.installFile("src/rms_norm_bf16.cu", "share/euhedral_cuda/rms_norm_bf16.cu");
     b.installFile("src/q3_linear_bf16.cu", "share/euhedral_cuda/q3_linear_bf16.cu");
     const q3_sources = [_][]const u8{
-        "kernels.cu", "cluster_kernels.cu", "hierarchical_kernels.cu", "numeric.cuh", "layout.cuh",
+        "kernels.cu", "cluster_kernels.cu", "hierarchical_kernels.cu", "fragment_kernels.cu", "numeric.cuh", "layout.cuh",
         "primitives/packed_load.cuh", "primitives/activation.cuh",
         "primitives/decode.cuh", "primitives/staging.cuh", "primitives/mma.cuh",
         "primitives/accumulation.cuh", "primitives/writeback.cuh",
         "strategies/scalar.cuh", "strategies/decode.cuh", "strategies/prefill.cuh", "strategies/cluster_reuse.cuh",
-        "strategies/hierarchical.cuh",
+        "strategies/hierarchical.cuh", "strategies/fragments.cuh",
     };
     for (q3_sources) |source| {
         b.installFile(b.fmt("src/q3/{s}", .{source}), b.fmt("share/euhedral_cuda/q3/{s}", .{source}));
