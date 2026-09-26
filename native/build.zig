@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
         "primitives/accumulation.cuh", "primitives/writeback.cuh",
         "strategies/scalar.cuh", "strategies/decode.cuh", "strategies/prefill.cuh", "strategies/cluster_reuse.cuh",
         "strategies/hierarchical.cuh", "strategies/fragments.cuh",
+        "pipeline_kernels.cu", "strategies/pipelined_fragments.cuh",
     };
     for (q3_sources) |source| {
         b.installFile(b.fmt("src/q3/{s}", .{source}), b.fmt("share/euhedral_cuda/q3/{s}", .{source}));
