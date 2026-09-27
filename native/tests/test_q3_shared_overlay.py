@@ -56,7 +56,7 @@ class Q3SharedOverlayTest(unittest.TestCase):
         self.assertIn('values[Tile::kRows * A_STRIDE]', source)
         self.assertIn('tile[(i / K_TILE) * STRIDE + i % K_TILE]',
                       (ROOT / 'native/src/q3/primitives/activation.cuh').read_text())
-        self.assertIn('col * STRIDE + lane * 2 + p',
+        self.assertIn('stage_split_pair(hi, lo, col * STRIDE + lane * 2, codes, scale);',
                       (ROOT / 'native/src/q3/primitives/staging.cuh').read_text())
         self.assertIn('consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>', source)
         self.assertIn('constexpr int A_STRIDE = 80;', kernels)

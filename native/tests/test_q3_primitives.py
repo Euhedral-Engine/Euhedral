@@ -60,6 +60,32 @@ extern "C" __global__ void probe_split_weights(
         }
     }
 }
+// Pair staging vs the per-weight split: one warp covers all 64 6-bit
+// code pairs in two passes. Output order: [pass][lane][p] of (hi, lo) bits.
+extern "C" __global__ void probe_split_pairs(
+        const unsigned short* scales, unsigned short* actual, unsigned short* expected, unsigned int count) {
+    __shared__ __align__(4) __nv_bfloat16 h[64], l[64], rh[64], rl[64];
+    if (threadIdx.x >= 32) return;  // one warp covers all 64 code pairs
+    unsigned int lane = threadIdx.x;
+    for (unsigned int s = 0; s < count; s++) {
+        float scale = q3::fp16_to_float(scales[s]);
+        for (unsigned int pass = 0; pass < 2; pass++) {
+            unsigned int codes = lane + pass * 32;
+            q3::stage_split_pair(h, l, lane * 2, codes, scale);
+            for (int p = 0; p < 2; p++)
+                q3::stage_split_weight(rh, rl, lane * 2 + p, q3::apply_scale(q3::decode_code(codes, p), scale));
+            __syncwarp();
+            unsigned long long o = ((unsigned long long)s * 2 + pass) * 128 + lane * 4;
+            for (int p = 0; p < 2; p++) {
+                actual[o + p * 2] = __bfloat16_as_ushort(h[lane * 2 + p]);
+                actual[o + p * 2 + 1] = __bfloat16_as_ushort(l[lane * 2 + p]);
+                expected[o + p * 2] = __bfloat16_as_ushort(rh[lane * 2 + p]);
+                expected[o + p * 2 + 1] = __bfloat16_as_ushort(rl[lane * 2 + p]);
+            }
+            __syncwarp();
+        }
+    }
+}
 // Activation staging: tile contents including zero-fill past rows / K.
 extern "C" __global__ void probe_activation_tile(
         const unsigned short* input, float* out, unsigned int rows, unsigned int in_features,
@@ -365,6 +391,22 @@ class Q3PrimitiveTest(unittest.TestCase):
                     self.assertEqual(exact[i], f32(code * fp16(bits)))
                     self.assertEqual(f32(hi[i] + lo[i]), exact[i])
                     self.assertEqual(hi[i] + lo[i], exact[i], "hi + lo must be exact without rounding")
+
+    def test_pair_staging_matches_per_weight_split_bitwise(self):
+        # Every 6-bit code pair, including zero, subnormal, max, infinite, and NaN scales.
+        scales = [0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3555, 0xB555, 0x3C00,
+                  0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x7E11, 0xFE11, 0x7C01]
+        scales += [self.rng.randrange(0x10000) for _ in range(64)]
+        gpu = self.gpu
+        count, size = len(scales), len(scales) * 256 * 2
+        with contextlib.ExitStack() as stack:
+            source = self.owned(stack, gpu.upload(struct.pack(f"<{count}H", *scales)))
+            actual = self.owned(stack, gpu.zeros(size, fill=0xA5))
+            expected = self.owned(stack, gpu.zeros(size, fill=0x5A))
+            gpu.launch("probe_split_pairs", 1, [C.c_uint64(source), C.c_uint64(actual),
+                                                C.c_uint64(expected), C.c_uint(count)])
+            got, want = gpu.download(actual, size), gpu.download(expected, size)
+        self.assertEqual(got, want)
 
     def test_activation_staging_zero_fills_outside_rows_and_k(self):
         gpu = self.gpu

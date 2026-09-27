@@ -76,9 +76,7 @@ static __device__ __forceinline__ void stage_prefetched_weights(
         unsigned int high = __shfl_sync(0xffffffffu, next.words[j], (bit >> 5) + 1);
         unsigned int codes = (unsigned int)((((unsigned long long)high << 32) | low) >> (bit & 31u)) & 63u;
         float scale = fp16_to_float(__shfl_sync(0xffffffffu, (unsigned int)next.scales[j], 0));
-        #pragma unroll
-        for (int p = 0; p < 2; ++p)
-            stage_split_weight(hi, lo, col * STRIDE + lane * 2 + p, apply_scale(decode_code(codes, p), scale));
+        stage_split_pair(hi, lo, col * STRIDE + lane * 2, codes, scale);
     }
 }
 

@@ -13,6 +13,30 @@ static __device__ __forceinline__ void stage_split_weight(
     lo[i] = __float2bfloat16(weight - __bfloat162float(hi[i]));
 }
 
+// hi/lo split of decode(raw) * scale, packed as (hi << 16) | lo. Bitwise
+// identical to stage_split_weight (exact for finite scales).
+// SCOPE: thread-local; pure.
+static __device__ __forceinline__ unsigned int split_entry(unsigned int raw, float scale) {
+    float weight = apply_scale((int)raw - ((raw & 4u) ? 8 : 0), scale);
+    __nv_bfloat16 hi = __float2bfloat16(weight);
+    __nv_bfloat16 lo = __float2bfloat16(weight - __bfloat162float(hi));
+    return ((unsigned int)__bfloat16_as_ushort(hi) << 16) | __bfloat16_as_ushort(lo);
+}
+
+// Stage a lane's two weights (K = i, i + 1) from its 6-bit code pair.
+// Both splits complete in registers before any shared store, so no store
+// waits on the other element's conversion chain.
+// SCOPE: thread-local; elements i and i + 1 are owned by the calling thread.
+static __device__ __forceinline__ void stage_split_pair(
+        __nv_bfloat16* hi, __nv_bfloat16* lo, unsigned int i, unsigned int codes, float scale) {
+    unsigned int e0 = split_entry(codes & 7u, scale);
+    unsigned int e1 = split_entry((codes >> 3) & 7u, scale);
+    hi[i] = __ushort_as_bfloat16((unsigned short)(e0 >> 16));
+    lo[i] = __ushort_as_bfloat16((unsigned short)e0);
+    hi[i + 1] = __ushort_as_bfloat16((unsigned short)(e1 >> 16));
+    lo[i + 1] = __ushort_as_bfloat16((unsigned short)e1);
+}
+
 // Decode and stage one K group for COLS output columns into borrowed hi/lo tiles
 // (column-major: column c occupies [c * STRIDE, c * STRIDE + kGroup)). Each warp
 // stages columns warp, warp + WARPS, ...; columns >= out_features stage zeros.
@@ -31,9 +55,7 @@ static __device__ __forceinline__ void stage_weight_tile(
             codes = load_packed_pair(w, g, lane);
             scale = load_group_scale(w, g, lane);
         }
-        #pragma unroll
-        for (int p = 0; p < 2; p++)
-            stage_split_weight(hi, lo, col * STRIDE + lane * 2 + p, apply_scale(decode_code(codes, p), scale));
+        stage_split_pair(hi, lo, col * STRIDE + lane * 2, codes, scale);
     }
 }
 
