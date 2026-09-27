@@ -17,7 +17,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction function;
-static CUfunction decode1, decode2, decode4, prefill, prefill64;
+static CUfunction decode1, decode2, decode4, prefill, prefill64, prefill64_wmma;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction optional_kernel(const char* name) {
     CUfunction loaded = NULL;
@@ -31,6 +31,7 @@ static void initialize(void) {
     decode4 = optional_kernel("euhedral_q3_decode_4");
     prefill = optional_kernel("euhedral_q3_prefill");
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
+    prefill64_wmma = optional_kernel("euhedral_q3_prefill_64_wmma");
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -67,11 +68,15 @@ static int linear_q3(const void* input, const void* weights, void* output,
     if (pthread_once(&once, initialize) != 0) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 #endif
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return init_status;
-    // A matched older NVRTC source may lack this optional tile. Retain the original
-    // 32-row prefill route for normal dispatch; explicit 64-row requests still fail.
-    if (mode == 2 && wide_prefill && prefill64 == NULL) {
-        wide_prefill = 0;
-        grid = (((uint64_t)rows + 31) / 32) * (((uint64_t)out_features + 31) / 32);
+    // A matched older NVRTC source may lack the optional tile64 kernels. AUTO then
+    // retains the 32-row route; explicit 64-row requests fail below.
+    enum euhedral_q3_prefill_kernel prefill_kernel = EUHEDRAL_Q3_PREFILL_NONE;
+    if (mode == 2 || mode == 3) {
+        prefill_kernel = euhedral_q3_select_prefill(mode, rows, in_features, out_features,
+                prefill64 != NULL, prefill64_wmma != NULL);
+        wide_prefill = prefill_kernel == EUHEDRAL_Q3_PREFILL64 || prefill_kernel == EUHEDRAL_Q3_PREFILL64_WMMA;
+        grid = (((uint64_t)rows + (wide_prefill ? 63 : 31)) / (wide_prefill ? 64 : 32))
+                * (((uint64_t)out_features + 31) / 32);
         if (grid > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     }
     CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
@@ -79,8 +84,11 @@ static int linear_q3(const void* input, const void* weights, void* output,
     unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
     unsigned long long scale_arg = scale_offset;
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
-    CUfunction selected = wide_prefill ? prefill64 : mode == 2 ? prefill : mode == 1
-            ? (row_tile == 1 ? decode1 : row_tile == 2 ? decode2 : decode4) : function;
+    CUfunction selected = mode == 1 ? (row_tile == 1 ? decode1 : row_tile == 2 ? decode2 : decode4)
+            : mode == 0 ? function
+            : prefill_kernel == EUHEDRAL_Q3_PREFILL64_WMMA ? prefill64_wmma
+            : prefill_kernel == EUHEDRAL_Q3_PREFILL64 ? prefill64
+            : prefill_kernel == EUHEDRAL_Q3_PREFILL32 ? prefill : NULL;
     if (selected == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     CUresult status = cuLaunchKernel(selected, (unsigned int)grid, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);
     if (status != CUDA_SUCCESS) return (int)status;

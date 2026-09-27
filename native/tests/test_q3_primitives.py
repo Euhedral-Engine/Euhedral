@@ -584,8 +584,8 @@ class Q3PrimitiveTest(unittest.TestCase):
                             output, accumulators = run(f'probe_{leaf}_{suffix}', grid, tile_rows * tile_cols)
                             self.assertEqual(accumulators, reference[1])
                             self.assertEqual(output, reference[0])
-                    kernel = {'32': 'euhedral_q3_prefill', '64': 'euhedral_q3_prefill_64'}.get(suffix)
-                    if kernel:
+                    kernels = {'32': ['euhedral_q3_prefill'], '64': ['euhedral_q3_prefill_64', 'euhedral_q3_prefill_64_wmma']}
+                    for kernel in kernels.get(suffix, []):
                         with self.subTest(rows=rows, width=width, outputs=outputs, kernel=kernel):
                             y = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
                             gpu.launch(kernel, grid, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),

@@ -6,7 +6,8 @@
 // explicit leaves' FP32 accumulators are tested bitwise against it (see
 // mma_leaf.cuh).
 // The 32-row tile is fastest with the explicit ldmatrix/mma.sync leaf; the
-// 64-row tile additionally benefits from fragment ping-pong.
+// 64-row tile additionally benefits from fragment ping-pong, except the down
+// projection at 64 rows, which AUTO routes to euhedral_q3_prefill_64_wmma.
 #ifndef Q3_PREFILL_LEAF
 #define Q3_PREFILL_LEAF MmaSyncLeaf
 #endif
@@ -62,5 +63,21 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64(
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE];
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];
     q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE, q3::Q3_PREFILL64_LEAF<Tile>>(input, weights, output, rows, in_features, out_features, scale_offset,
+            staging, b_hi, b_lo);
+}
+
+// 64-row tile with the WMMA reference leaf. Optional symbol: AUTO routes shapes
+// where the explicit leaf measured slower here (q3_prefill_policy.h).
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_wmma(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features,
+        unsigned long long scale_offset) {
+    using Tile = q3::Prefill64;
+    constexpr int A_STRIDE = 80;
+    constexpr int B_STRIDE = Tile::kRows == 32 ? 80 : 64;
+    __shared__ q3::PrefillShared<Tile, A_STRIDE> staging;
+    __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE];
+    __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];
+    q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE, q3::WmmaLeaf<Tile>>(input, weights, output, rows, in_features, out_features, scale_offset,
             staging, b_hi, b_lo);
 }
