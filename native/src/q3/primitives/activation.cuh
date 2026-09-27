@@ -3,17 +3,18 @@
 
 namespace q3 {
 // Stage a ROWS x K_TILE activation tile from global BF16 into a borrowed shared
-// tile (row-major, leading dimension K_TILE), zero-filling rows >= `rows` and
-// columns >= `in_features`.
+// tile (row-major, physical stride STRIDE), zero-filling rows >= `rows` and
+// columns >= `in_features`. The logical K tile is always K_TILE wide.
 // SCOPE: CTA-cooperative over THREADS threads; no barrier. The strategy must
 // barrier before any consumer reads `tile`, and again before it is re-staged.
-template<int ROWS, int K_TILE, int THREADS>
+template<int ROWS, int K_TILE, int THREADS, int STRIDE = K_TILE>
 static __device__ __forceinline__ void stage_activation_tile(
         __nv_bfloat16* tile, const unsigned short* input, unsigned int rows, unsigned int in_features,
         unsigned int row_start, unsigned int k_base, unsigned int thread) {
+    static_assert(STRIDE >= K_TILE && STRIDE % 16 == 0, "WMMA A stride must cover the K tile");
     for (unsigned int i = thread; i < ROWS * K_TILE; i += THREADS) {
         unsigned int r = row_start + i / K_TILE, k = k_base + i % K_TILE;
-        tile[i] = __float2bfloat16(r < rows && k < in_features
+        tile[(i / K_TILE) * STRIDE + i % K_TILE] = __float2bfloat16(r < rows && k < in_features
                 ? bf16_to_float(input[(unsigned long long)r * in_features + k]) : 0.0f);
     }
 }
