@@ -9,7 +9,7 @@ PRODUCT = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
 HEADERS = (
     'numeric.cuh', 'layout.cuh', 'primitives/packed_load.cuh',
     'primitives/activation.cuh', 'primitives/decode.cuh',
-    'primitives/staging.cuh', 'primitives/mma.cuh',
+    'primitives/staging.cuh', 'primitives/mma.cuh', 'primitives/mma_leaf.cuh',
     'primitives/accumulation.cuh', 'primitives/writeback.cuh',
     'strategies/scalar.cuh', 'strategies/decode.cuh',
     'strategies/prefill.cuh',

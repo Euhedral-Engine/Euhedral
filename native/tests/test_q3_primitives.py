@@ -168,6 +168,60 @@ PROBE_TILED(probe_tiled_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>)
 PROBE_TILED(probe_tiled_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>)
 PROBE_TILED(probe_unpadded_32, q3::Prefill32)
 PROBE_TILED(probe_unpadded_64, q3::Prefill64)
+// Leaf probes: the same padded CTA AUTO staging with an explicit MMA leaf.
+// DumpLeaf also copies each CTA's FP32 result tile, before BF16 conversion, to
+// probe_accumulators[blockIdx.x] so leaves can be compared bit for bit.
+__device__ float probe_accumulators[64 * 2048];
+template<class Inner>
+struct DumpLeaf {
+    template<class Tile> struct Of {
+        using Leaf = typename Inner::template Of<Tile>::Leaf;
+        using Acc = typename Leaf::Acc;
+        static __device__ __forceinline__ void fill(Acc& acc) { Leaf::fill(acc); }
+        template<int K_TILE, int LDA, int LDB>
+        static __device__ __forceinline__ void consume(Acc& acc, const __nv_bfloat16* a,
+                const __nv_bfloat16* b_hi, const __nv_bfloat16* b_lo, unsigned int warp) {
+            Leaf::template consume<K_TILE, LDA, LDB>(acc, a, b_hi, b_lo, warp);
+        }
+        static __device__ __forceinline__ void store(float* result, Acc& acc, unsigned int warp) {
+            Leaf::store(result, acc, warp);
+            __syncwarp();
+            float* dump = probe_accumulators + (unsigned long long)blockIdx.x * Tile::kRows * Tile::kCols;
+            for (int m = 0; m < Tile::kFrags; m++)
+                for (unsigned int i = threadIdx.x & 31u; i < 256u; i += 32u) {
+                    unsigned int at = (Tile::row(warp, m) + i / 16u) * Tile::kCols + Tile::col(warp) + i % 16u;
+                    dump[at] = result[at];
+                }
+        }
+    };
+};
+template<template<class> class L> struct LeafOf { template<class Tile> struct Of { using Leaf = L<Tile>; }; };
+template<class Tile> using WmmaDump = DumpLeaf<LeafOf<q3::WmmaLeaf>>::Of<Tile>;
+template<class Tile> using MmaDump = DumpLeaf<LeafOf<q3::MmaSyncLeaf>>::Of<Tile>;
+template<class Tile> using PingPongDump = DumpLeaf<LeafOf<q3::MmaPingPongLeaf>>::Of<Tile>;
+#define PROBE_LEAF(NAME, TILE, LEAF, AS, BS) \
+extern "C" __global__ __launch_bounds__(128) void NAME( \
+        const unsigned short* input, const unsigned char* weights, unsigned short* output, \
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) { \
+    using Tile = TILE; \
+    __shared__ q3::PrefillShared<Tile, AS> staging; \
+    __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * BS]; \
+    __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * BS]; \
+    q3::tiled_prefill<Tile, AS, BS, LEAF<Tile>>(input, weights, output, rows, in_features, out_features, \
+            scale_offset, staging, b_hi, b_lo); \
+}
+PROBE_LEAF(probe_wmma_32, q3::Prefill32, WmmaDump, 80, 80)
+PROBE_LEAF(probe_mma_32, q3::Prefill32, MmaDump, 80, 80)
+PROBE_LEAF(probe_pingpong_32, q3::Prefill32, PingPongDump, 80, 80)
+PROBE_LEAF(probe_wmma_64, q3::Prefill64, WmmaDump, 80, 64)
+PROBE_LEAF(probe_mma_64, q3::Prefill64, MmaDump, 80, 64)
+PROBE_LEAF(probe_pingpong_64, q3::Prefill64, PingPongDump, 80, 64)
+PROBE_LEAF(probe_wmma_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>, WmmaDump, 64, 64)
+PROBE_LEAF(probe_mma_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>, MmaDump, 64, 64)
+PROBE_LEAF(probe_pingpong_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>, PingPongDump, 64, 64)
+PROBE_LEAF(probe_wmma_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>, WmmaDump, 64, 64)
+PROBE_LEAF(probe_mma_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>, MmaDump, 64, 64)
+PROBE_LEAF(probe_pingpong_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>, PingPongDump, 64, 64)
 // Independent sequential-staging control: the merged K schedule, with the
 // same tile geometry, strides, union transitions, and WMMA accumulation order.
 template<class Tile, int AS, int BS>
@@ -486,6 +540,57 @@ class Q3PrimitiveTest(unittest.TestCase):
                         actual = got[f'euhedral_q3_decode_{tile}']
                         self.assertNotIn(b'\xa5\xa5', [actual[i:i + 2] for i in range(0, len(actual), 2)])
                         self.assertEqual(actual, got[f'probe_group_decode_{tile}'])
+
+    def test_explicit_mma_leaves_match_wmma_bitwise(self):
+        # Every explicit leaf on every geometry against the WMMA leaf, comparing the
+        # FP32 accumulators before BF16 conversion, plus the production kernels'
+        # BF16 output against the WMMA reference.
+        gpu = self.gpu
+        get_global = _bind(CUDA, "cuModuleGetGlobal_v2", [C.POINTER(C.c_uint64), C.POINTER(C.c_size_t), P, C.c_char_p])
+        dump, dump_size = C.c_uint64(), C.c_size_t()
+        _check(get_global(C.byref(dump), C.byref(dump_size), gpu.module, b"probe_accumulators"), "probe_accumulators")
+        special = [0x3f80, 0xbf00, 0x7fc1, 0xffc3, 0x7f80, 0xff80, 0x0001, 0x8000]
+        scales = [0x3555, 0xb555, 0x0001, 0x8000, 0x7bff, 0x7c00, 0x7e11, 0xfe11]
+        cases = [(1, 1, 1), (33, 65, 35), (65, 100, 9), (97, 192, 37), (64, 320, 64), (17, 1000, 70)]
+        geometries = [('32', 32, 32), ('64', 64, 32), ('64x16', 64, 16), ('16x64', 16, 64)]
+        for rows, width, outputs in cases:
+            groups = ((width + 127) // 128) * 2
+            offset = (outputs * groups * 24 + 255) & ~255
+            payload = bytearray(self.rng.randrange(256) for _ in range(offset + outputs * groups * 2))
+            nonfinite = width in (1, 65)
+            for i in range(outputs * groups):
+                bits = scales[i % len(scales)] if nonfinite else self.rng.randrange(0x2c00, 0x3400) | (i & 1) << 15
+                struct.pack_into('<H', payload, offset + i * 2, bits)
+            values = ([special[i % len(special)] for i in range(rows * width)] if nonfinite else
+                      [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)])
+            with contextlib.ExitStack() as stack:
+                x = self.owned(stack, gpu.upload(struct.pack(f'<{len(values)}H', *values)))
+                w = self.owned(stack, gpu.upload(bytes(payload)))
+
+                def run(name, grid, tile_elements):
+                    y = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                    gpu.memset(dump, 0xa5, dump_size.value)
+                    gpu.launch(name, grid, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
+                                            C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)])
+                    return gpu.download(y, rows * outputs * 2), gpu.download(dump, grid * tile_elements * 4)
+
+                for suffix, tile_rows, tile_cols in geometries:
+                    grid = ((rows + tile_rows - 1) // tile_rows) * ((outputs + tile_cols - 1) // tile_cols)
+                    self.assertLessEqual(grid * tile_rows * tile_cols * 4, dump_size.value)
+                    reference = run(f'probe_wmma_{suffix}', grid, tile_rows * tile_cols)
+                    self.assertNotIn(b'\xa5\xa5\xa5\xa5', [reference[1][i:i + 4] for i in range(0, len(reference[1]), 4)])
+                    for leaf in ('mma', 'pingpong'):
+                        with self.subTest(rows=rows, width=width, outputs=outputs, geometry=suffix, leaf=leaf):
+                            output, accumulators = run(f'probe_{leaf}_{suffix}', grid, tile_rows * tile_cols)
+                            self.assertEqual(accumulators, reference[1])
+                            self.assertEqual(output, reference[0])
+                    kernel = {'32': 'euhedral_q3_prefill', '64': 'euhedral_q3_prefill_64'}.get(suffix)
+                    if kernel:
+                        with self.subTest(rows=rows, width=width, outputs=outputs, kernel=kernel):
+                            y = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                            gpu.launch(kernel, grid, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
+                                                      C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)])
+                            self.assertEqual(gpu.download(y, rows * outputs * 2), reference[0])
 
     def test_activation_staging_zero_fills_outside_rows_and_k(self):
         gpu = self.gpu

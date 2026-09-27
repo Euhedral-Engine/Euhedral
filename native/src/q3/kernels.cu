@@ -2,6 +2,18 @@
 #include "strategies/decode.cuh"
 #include "strategies/prefill.cuh"
 
+// MMA leaves per CTA AUTO tile. WmmaLeaf remains the portable reference; the
+// explicit leaves' FP32 accumulators are tested bitwise against it (see
+// mma_leaf.cuh).
+// The 32-row tile is fastest with the explicit ldmatrix/mma.sync leaf; the
+// 64-row tile additionally benefits from fragment ping-pong.
+#ifndef Q3_PREFILL_LEAF
+#define Q3_PREFILL_LEAF MmaSyncLeaf
+#endif
+#ifndef Q3_PREFILL64_LEAF
+#define Q3_PREFILL64_LEAF MmaPingPongLeaf
+#endif
+
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_linear_bf16(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features,
@@ -32,7 +44,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill(
     __shared__ q3::PrefillShared<Tile, A_STRIDE> staging;
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE];
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];
-    q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE>(input, weights, output, rows, in_features, out_features, scale_offset,
+    q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE, q3::Q3_PREFILL_LEAF<Tile>>(input, weights, output, rows, in_features, out_features, scale_offset,
             staging, b_hi, b_lo);
 }
 
@@ -49,6 +61,6 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64(
     __shared__ q3::PrefillShared<Tile, A_STRIDE> staging;
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE];
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];
-    q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE>(input, weights, output, rows, in_features, out_features, scale_offset,
+    q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE, q3::Q3_PREFILL64_LEAF<Tile>>(input, weights, output, rows, in_features, out_features, scale_offset,
             staging, b_hi, b_lo);
 }

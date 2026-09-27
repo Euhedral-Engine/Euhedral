@@ -89,7 +89,7 @@ pub fn build(b: *std.Build) void {
     const q3_sources = [_][]const u8{
         "kernels.cu", "cluster_kernels.cu", "hierarchical_kernels.cu", "fragment_kernels.cu", "numeric.cuh", "layout.cuh",
         "primitives/packed_load.cuh", "primitives/activation.cuh",
-        "primitives/decode.cuh", "primitives/staging.cuh", "primitives/prefetch.cuh", "primitives/mma.cuh",
+        "primitives/decode.cuh", "primitives/staging.cuh", "primitives/prefetch.cuh", "primitives/mma.cuh", "primitives/mma_leaf.cuh",
         "primitives/accumulation.cuh", "primitives/writeback.cuh",
         "strategies/scalar.cuh", "strategies/decode.cuh", "strategies/prefill.cuh", "strategies/cluster_reuse.cuh",
         "strategies/hierarchical.cuh", "strategies/fragments.cuh",

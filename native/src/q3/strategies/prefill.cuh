@@ -3,6 +3,7 @@
 #include "../primitives/staging.cuh"
 #include "../primitives/prefetch.cuh"
 #include "../primitives/mma.cuh"
+#include "../primitives/mma_leaf.cuh"
 #include "../primitives/writeback.cuh"
 
 namespace q3 {
@@ -24,15 +25,15 @@ union alignas(32) PrefillShared {
     __device__ PrefillShared(ActivateResult) : result() {}
 };
 
-// Tiled WMMA prefill. The CTA owns Tile::kRows x Tile::kCols outputs and consumes
+// Tiled MMA prefill (leaf selected per kernel). The CTA owns Tile::kRows x Tile::kCols outputs and consumes
 // K one G64 group at a time:
 //   decode prefetched A and B into shared -> barrier
 //   each compute warp prefetches the next compact group while consuming this
-//   decoded tile with WMMA in the original K order -> retirement barrier
+//   decoded tile with the MMA leaf in the original K order -> retirement barrier
 // then stores accumulators to shared, barriers, and writes BF16 output. The two
 // per-step barriers are the single-buffer reuse edges: staged tiles are visible
 // only after the first, and may be overwritten only after the second.
-template<class Tile, int A_STRIDE = kGroup, int B_STRIDE = kGroup>
+template<class Tile, int A_STRIDE = kGroup, int B_STRIDE = kGroup, class Leaf = WmmaLeaf<Tile>>
 static __device__ __forceinline__ void tiled_prefill(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features,
@@ -50,8 +51,8 @@ static __device__ __forceinline__ void tiled_prefill(
     const unsigned int row_start = (blockIdx.x / output_tiles) * Tile::kRows;
     const unsigned int out_start = (blockIdx.x % output_tiles) * Tile::kCols;
     const Layout w(weights, in_features, scale_offset);
-    Accumulators<Tile::kFrags> acc;
-    acc.fill();
+    typename Leaf::Acc acc;
+    Leaf::fill(acc);
     // Reconstruct the union with A selected; never name the inactive member.
     if (threadIdx.x == 0) new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateA{});
     __syncthreads();
@@ -71,7 +72,7 @@ static __device__ __forceinline__ void tiled_prefill(
             if (base + kGroup < in_features)
                 prefetch_compact_tile(next, input, w, rows, in_features, out_features,
                         row_start, out_start, base + kGroup, threadIdx.x, warp, lane);
-            consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
+            Leaf::template consume<kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
             __syncthreads();
         }
     } else {
@@ -81,7 +82,7 @@ static __device__ __forceinline__ void tiled_prefill(
             stage_weight_tile<Tile::kCols, Tile::kWarps, B_STRIDE>(
                     b_hi, b_lo, w, out_start, out_features, base, warp, lane);
             __syncthreads();
-            consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
+            Leaf::template consume<kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
             __syncthreads();
         }
     }
@@ -89,7 +90,7 @@ static __device__ __forceinline__ void tiled_prefill(
     if (threadIdx.x == 0) new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateResult{});
     __syncthreads();
     float* result = staging.result.values;
-    store_accumulators<Tile>(result, acc, warp);
+    Leaf::store(result, acc, warp);
     __syncthreads();
     write_output_tile<Tile::kRows, Tile::kCols, kThreads>(
             output, result, rows, out_features, row_start, out_start, threadIdx.x);
