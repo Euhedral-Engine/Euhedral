@@ -94,6 +94,56 @@ PROBE_TILED(probe_tiled_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>)
 PROBE_TILED(probe_tiled_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>)
 PROBE_TILED(probe_unpadded_32, q3::Prefill32)
 PROBE_TILED(probe_unpadded_64, q3::Prefill64)
+// Independent sequential-staging control: the merged K schedule, with the
+// same tile geometry, strides, union transitions, and WMMA accumulation order.
+template<class Tile, int AS, int BS>
+__device__ void probe_sequential_prefill(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features,
+        unsigned long long scale_offset, q3::PrefillShared<Tile, AS>& staging,
+        __nv_bfloat16* b_hi, __nv_bfloat16* b_lo) {
+    constexpr int threads = Tile::kWarps * 32;
+    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    unsigned int output_tiles = (out_features + Tile::kCols - 1u) / Tile::kCols;
+    unsigned int row_start = (blockIdx.x / output_tiles) * Tile::kRows;
+    unsigned int out_start = (blockIdx.x % output_tiles) * Tile::kCols;
+    q3::Layout w(weights, in_features, scale_offset);
+    q3::Accumulators<Tile::kFrags> acc;
+    acc.fill();
+    using Shared = q3::PrefillShared<Tile, AS>;
+    if (threadIdx.x == 0) new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateA{});
+    __syncthreads();
+    __nv_bfloat16* a = staging.a.values;
+    for (unsigned int base = 0; base < in_features; base += q3::kGroup) {
+        q3::stage_activation_tile<Tile::kRows, q3::kGroup, threads, AS>(
+                a, input, rows, in_features, row_start, base, threadIdx.x);
+        q3::stage_weight_tile<Tile::kCols, Tile::kWarps, BS>(
+                b_hi, b_lo, w, out_start, out_features, base, warp, lane);
+        __syncthreads();
+        q3::consume_mma_tile<Tile, q3::kGroup, AS, BS>(acc, a, b_hi, b_lo, warp);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateResult{});
+    __syncthreads();
+    float* result = staging.result.values;
+    q3::store_accumulators<Tile>(result, acc, warp);
+    __syncthreads();
+    q3::write_output_tile<Tile::kRows, Tile::kCols, threads>(
+            output, result, rows, out_features, row_start, out_start, threadIdx.x);
+}
+#define PROBE_SEQUENTIAL(NAME, TILE, AS, BS) \
+extern "C" __global__ __launch_bounds__(128) void NAME( \
+        const unsigned short* input, const unsigned char* weights, unsigned short* output, \
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) { \
+    using Tile = TILE; \
+    __shared__ q3::PrefillShared<Tile, AS> staging; \
+    __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * BS]; \
+    __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * BS]; \
+    probe_sequential_prefill<Tile, AS, BS>(input, weights, output, rows, in_features, out_features, \
+            scale_offset, staging, b_hi, b_lo); \
+}
+PROBE_SEQUENTIAL(probe_sequential_32, q3::Prefill32, 80, 80)
+PROBE_SEQUENTIAL(probe_sequential_64, q3::Prefill64, 80, 64)
 """
 
 
@@ -380,6 +430,62 @@ class Q3PrimitiveTest(unittest.TestCase):
                     self.assertEqual(results["probe_unpadded_64"], results["euhedral_q3_prefill"])
                     self.assertEqual(results["probe_tiled_64x16"], results["euhedral_q3_prefill"])
                     self.assertEqual(results["probe_tiled_16x64"], results["euhedral_q3_prefill"])
+
+    def test_prefetched_k_matches_sequential_staging_bitwise_at_boundaries(self):
+        gpu = self.gpu
+        special = [0x3f80, 0xbf00, 0x7fc1, 0xffc3, 0x7f80, 0xff80, 0x0001, 0x8000]
+        scales = [0x3555, 0xb555, 0x0001, 0x7c00, 0x7e11, 0xfe11]
+        for rows, width, outputs in [(1, 1, 9), (33, 65, 35), (65, 100, 9),
+                                     (97, 192, 37), (31, 128, 32)]:
+            groups = ((width + 127) // 128) * 2
+            offset = (outputs * groups * 24 + 255) & ~255
+            payload = bytearray(self.rng.randrange(256) for _ in range(offset + outputs * groups * 2))
+            for i in range(outputs * groups):
+                struct.pack_into('<H', payload, offset + i * 2, scales[i % len(scales)])
+            values = ([special[i % len(special)] for i in range(rows * width)]
+                      if width in (1, 65) else
+                      [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)])
+            with contextlib.ExitStack() as stack:
+                x = self.owned(stack, gpu.upload(struct.pack(f'<{len(values)}H', *values)))
+                w = self.owned(stack, gpu.upload(payload))
+                for tile, suffix in [(32, '32'), (64, '64')]:
+                    expected = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                    actual = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                    grid = ((rows + tile - 1) // tile) * ((outputs + 31) // 32)
+                    args = lambda y: [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
+                                      C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)]
+                    gpu.launch('probe_sequential_' + suffix, grid, args(expected))
+                    kernel = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '')
+                    gpu.launch(kernel, grid, args(actual))
+                    with self.subTest(rows=rows, width=width, outputs=outputs, tile=tile):
+                        self.assertEqual(gpu.download(actual, rows * outputs * 2),
+                                         gpu.download(expected, rows * outputs * 2))
+
+    def test_prefetch_handles_two_byte_aligned_input_base(self):
+        gpu = self.gpu
+        rows, width, outputs = 33, 128, 35
+        groups = ((width + 127) // 128) * 2
+        offset = (outputs * groups * 24 + 255) & ~255
+        payload = bytearray(self.rng.randrange(256) for _ in range(offset + outputs * groups * 2))
+        for i in range(outputs * groups):
+            struct.pack_into('<H', payload, offset + i * 2, 0x3555)
+        values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
+        with contextlib.ExitStack() as stack:
+            # A valid BF16 pointer need not be aligned for an ld.global.u32.
+            source = self.owned(stack, gpu.upload(b'\x00\x00' + struct.pack(f'<{len(values)}H', *values)))
+            w = self.owned(stack, gpu.upload(payload))
+            for tile, suffix in [(32, '32'), (64, '64')]:
+                expected = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                actual = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                grid = ((rows + tile - 1) // tile) * ((outputs + 31) // 32)
+                args = lambda y: [C.c_uint64(source + 2), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
+                                  C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)]
+                gpu.launch('probe_sequential_' + suffix, grid, args(expected))
+                kernel = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '')
+                gpu.launch(kernel, grid, args(actual))
+                with self.subTest(tile=tile):
+                    self.assertEqual(gpu.download(actual, rows * outputs * 2),
+                                     gpu.download(expected, rows * outputs * 2))
 
 
 if __name__ == "__main__":

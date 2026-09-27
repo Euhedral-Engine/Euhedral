@@ -13,8 +13,11 @@ PRODUCT = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
 @unittest.skipIf(NVRTC is None, 'pinned NVRTC unavailable')
 class Q3SharedOverlayTest(unittest.TestCase):
     def test_packaged_kernel_source_matches(self):
-        self.assertEqual((ROOT / 'native/src/q3/kernels.cu').read_bytes(),
-                         (PRODUCT / 'q3/kernels.cu').read_bytes())
+        for asset in ('q3/kernels.cu', 'q3/strategies/prefill.cuh',
+                      'q3/primitives/prefetch.cuh'):
+            with self.subTest(asset=asset):
+                self.assertEqual((ROOT / 'native/src' / asset).read_bytes(),
+                                 (PRODUCT / asset).read_bytes())
 
     def test_prefill_activates_each_shared_region_before_using_it(self):
         source = (ROOT / 'native/src/q3/strategies/prefill.cuh').read_text()
@@ -29,8 +32,8 @@ class Q3SharedOverlayTest(unittest.TestCase):
         activation_barrier = source.index('__syncthreads();', activation)
         a_pointer = source.index('staging.a.values', activation)
         k_loop = source.index('for (unsigned int base = 0;', a_pointer)
-        final_k_barrier = source.index('__syncthreads();\n    }', k_loop)
-        result = source.index('new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateResult{});', final_k_barrier)
+        result = source.index('new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateResult{});', k_loop)
+        final_k_barrier = source.rindex('__syncthreads();', k_loop, result)
         result_barrier = source.index('__syncthreads();', result)
         result_pointer = source.index('staging.result.values', result)
         store = source.index('store_accumulators<Tile>', result_pointer)
@@ -59,6 +62,32 @@ class Q3SharedOverlayTest(unittest.TestCase):
         self.assertIn('constexpr int A_STRIDE = 80;', kernels)
         self.assertIn('constexpr int B_STRIDE = Tile::kRows == 32 ? 80 : 64;', kernels)
         self.assertIn('Tile::kCols * B_STRIDE', kernels)
+
+    def test_prefill_compact_next_group_before_current_mma(self):
+        source = (ROOT / 'native/src/q3/strategies/prefill.cuh').read_text()
+        self.assertIn('CompactPrefetch<Tile> next;', source)
+        self.assertIn('(reinterpret_cast<unsigned long long>(input) & 3ull) == 0ull', source)
+        self.assertIn('(in_features & 1u) == 0u', source)
+        self.assertIn('stage_activation_tile<Tile::kRows, kGroup, kThreads, A_STRIDE>', source)
+        self.assertIn('stage_weight_tile<Tile::kCols, Tile::kWarps, B_STRIDE>', source)
+        self.assertIn('prefetch_compact_tile(next, input, w,', source)
+        self.assertIn('stage_prefetched_activation', source)
+        self.assertIn('stage_prefetched_weights', source)
+        loop = source.index('for (unsigned int base = 0;')
+        stage = source.index('stage_prefetched_activation', loop)
+        visible = source.index('__syncthreads();', stage)
+        next_load = source.index('prefetch_compact_tile(next, input, w,', visible)
+        consume = source.index('consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>', next_load)
+        retire = source.index('__syncthreads();', consume)
+        self.assertLess(stage, visible)
+        self.assertLess(visible, next_load)
+        self.assertLess(next_load, consume)
+        self.assertLess(consume, retire)
+        self.assertNotIn('stage_activation_tile<', source[loop:retire])
+        self.assertNotIn('stage_weight_tile<', source[loop:retire])
+        compact = (ROOT / 'native/src/q3/primitives/prefetch.cuh').read_text()
+        self.assertIn('unsigned int activation[', compact)
+        self.assertIn('unsigned int words[', compact)
 
     def test_prefill_result_reuses_activation_shared_storage(self):
         with contextlib.ExitStack() as cleanup:

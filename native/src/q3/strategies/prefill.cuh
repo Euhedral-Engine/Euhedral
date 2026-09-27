@@ -1,6 +1,7 @@
 #pragma once
 #include "../primitives/activation.cuh"
 #include "../primitives/staging.cuh"
+#include "../primitives/prefetch.cuh"
 #include "../primitives/mma.cuh"
 #include "../primitives/writeback.cuh"
 
@@ -25,8 +26,9 @@ union alignas(32) PrefillShared {
 
 // Tiled WMMA prefill. The CTA owns Tile::kRows x Tile::kCols outputs and consumes
 // K one G64 group at a time:
-//   stage A (activations) + stage B (decoded hi/lo weights)  -> barrier
-//   every warp consumes the staged tile into FP32 accumulators -> barrier
+//   decode prefetched A and B into shared -> barrier
+//   each compute warp prefetches the next compact group while consuming this
+//   decoded tile with WMMA in the original K order -> retirement barrier
 // then stores accumulators to shared, barriers, and writes BF16 output. The two
 // per-step barriers are the single-buffer reuse edges: staged tiles are visible
 // only after the first, and may be overwritten only after the second.
@@ -54,13 +56,34 @@ static __device__ __forceinline__ void tiled_prefill(
     if (threadIdx.x == 0) new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateA{});
     __syncthreads();
     __nv_bfloat16* a = staging.a.values;
-    for (unsigned int base = 0; base < in_features; base += kGroup) {
-        stage_activation_tile<Tile::kRows, kGroup, kThreads, A_STRIDE>(
-                a, input, rows, in_features, row_start, base, threadIdx.x);
-        stage_weight_tile<Tile::kCols, Tile::kWarps, B_STRIDE>(b_hi, b_lo, w, out_start, out_features, base, warp, lane);
-        __syncthreads();
-        consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
-        __syncthreads();
+    // BF16 pointers may be only two-byte aligned; keep the original single-
+    // stage path for those inputs and for odd row strides. The fast path uses
+    // one compact register stage plus the existing decoded shared stage.
+    if ((reinterpret_cast<unsigned long long>(input) & 3ull) == 0ull && (in_features & 1u) == 0u) {
+        CompactPrefetch<Tile> next;
+        if (in_features != 0)
+            prefetch_compact_tile(next, input, w, rows, in_features, out_features,
+                    row_start, out_start, 0, threadIdx.x, warp, lane);
+        for (unsigned int base = 0; base < in_features; base += kGroup) {
+            stage_prefetched_activation<Tile, A_STRIDE>(a, next, threadIdx.x);
+            stage_prefetched_weights<Tile, B_STRIDE>(b_hi, b_lo, next, warp, lane);
+            __syncthreads();
+            if (base + kGroup < in_features)
+                prefetch_compact_tile(next, input, w, rows, in_features, out_features,
+                        row_start, out_start, base + kGroup, threadIdx.x, warp, lane);
+            consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
+            __syncthreads();
+        }
+    } else {
+        for (unsigned int base = 0; base < in_features; base += kGroup) {
+            stage_activation_tile<Tile::kRows, kGroup, kThreads, A_STRIDE>(
+                    a, input, rows, in_features, row_start, base, threadIdx.x);
+            stage_weight_tile<Tile::kCols, Tile::kWarps, B_STRIDE>(
+                    b_hi, b_lo, w, out_start, out_features, base, warp, lane);
+            __syncthreads();
+            consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);
+            __syncthreads();
+        }
     }
     // Every thread has completed its final A read before replacing that member.
     if (threadIdx.x == 0) new (static_cast<void*>(&staging)) Shared(typename Shared::ActivateResult{});
