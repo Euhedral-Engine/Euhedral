@@ -86,6 +86,54 @@ extern "C" __global__ void probe_split_pairs(
         }
     }
 }
+// Independent per-group decode control: the original G64 load schedule with
+// the same lane ownership, stripe order, and FP32 accumulation order.
+template<int R>
+__device__ void probe_group_decode(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features,
+        unsigned long long scale_offset) {
+    constexpr int kWarpCols = 2, kStripes = 4;
+    const unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned int output_tiles = (out_features + 7u) / 8u;
+    const unsigned int first_out = (blockIdx.x % output_tiles) * 8 + warp * kWarpCols;
+    const unsigned int first_row = (blockIdx.x / output_tiles) * R;
+    const q3::Layout w(weights, in_features, scale_offset);
+    float sums[R][kWarpCols][kStripes] = {};
+    for (unsigned int k = 0; k < in_features; k += 2 * q3::kGroup) {
+        float x[R][kStripes];
+        q3::load_activation_stripes<R, kStripes>(x, input, rows, in_features, first_row, k, lane);
+        for (int n = 0; n < kWarpCols; n++) {
+            if (first_out + n < out_features) {
+                for (int half = 0; half < 2; half++) {
+                    unsigned long long g = w.group(first_out + n, k / q3::kGroup + half);
+                    unsigned int pairs = q3::load_packed_pair(w, g, lane);
+                    float scale = q3::load_group_scale(w, g, lane);
+                    for (int p = 0; p < 2; p++) {
+                        int code = q3::decode_code(q3::stripe_pair(pairs, lane, p), lane & 1);
+                        for (int r = 0; r < R; r++)
+                            sums[r][n][half * 2 + p] += q3::scaled_product(x[r][half * 2 + p], code, scale);
+                    }
+                }
+            }
+        }
+    }
+    for (int r = 0; r < R; r++)
+        for (int n = 0; n < kWarpCols; n++) {
+            float sum = q3::reduce_stripes(sums[r][n]);
+            if (lane == 0 && first_row + r < rows && first_out + n < out_features)
+                q3::write_bf16(output, first_row + r, first_out + n, out_features, sum);
+        }
+}
+#define PROBE_GROUP_DECODE(R) \
+extern "C" __global__ __launch_bounds__(128) void probe_group_decode_##R( \
+        const unsigned short* input, const unsigned char* weights, unsigned short* output, \
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) { \
+    probe_group_decode<R>(input, weights, output, rows, in_features, out_features, scale_offset); \
+}
+PROBE_GROUP_DECODE(1)
+PROBE_GROUP_DECODE(2)
+PROBE_GROUP_DECODE(4)
 // Activation staging: tile contents including zero-fill past rows / K.
 extern "C" __global__ void probe_activation_tile(
         const unsigned short* input, float* out, unsigned int rows, unsigned int in_features,
@@ -407,6 +455,37 @@ class Q3PrimitiveTest(unittest.TestCase):
                                                 C.c_uint64(expected), C.c_uint(count)])
             got, want = gpu.download(actual, size), gpu.download(expected, size)
         self.assertEqual(got, want)
+
+    def test_k128_decode_matches_per_group_decode_bitwise(self):
+        gpu = self.gpu
+        special = [0x3f80, 0xbf00, 0x7fc1, 0xffc3, 0x7f80, 0xff80, 0x0001, 0x8000]
+        scales = [0x3555, 0xb555, 0x0001, 0x8000, 0x7bff, 0x7c00, 0x7e11, 0xfe11]
+        for rows, width, outputs in [(1, 1, 1), (2, 65, 9), (4, 128, 8), (3, 200, 13),
+                                     (4, 320, 37), (1, 5120, 16), (2, 1000, 7)]:
+            groups = ((width + 127) // 128) * 2
+            offset = (outputs * groups * 24 + 255) & ~255
+            payload = bytearray(self.rng.randrange(256) for _ in range(offset + outputs * groups * 2))
+            for i in range(outputs * groups):
+                bits = (scales[i % len(scales)] if width < 320 else
+                        self.rng.randrange(0x2c00, 0x3400) | (0x8000 if i & 1 else 0))
+                struct.pack_into('<H', payload, offset + i * 2, bits)
+            values = ([special[i % len(special)] for i in range(rows * width)] if width < 320 else
+                      [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)])
+            with contextlib.ExitStack() as stack:
+                x = self.owned(stack, gpu.upload(struct.pack(f'<{len(values)}H', *values)))
+                w = self.owned(stack, gpu.upload(bytes(payload)))
+                for tile in (1, 2, 4):
+                    grid = ((rows + tile - 1) // tile) * ((outputs + 7) // 8)
+                    got = {}
+                    for kernel in (f'euhedral_q3_decode_{tile}', f'probe_group_decode_{tile}'):
+                        y = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
+                        gpu.launch(kernel, grid, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
+                                                  C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)])
+                        got[kernel] = gpu.download(y, rows * outputs * 2)
+                    with self.subTest(rows=rows, width=width, outputs=outputs, tile=tile):
+                        actual = got[f'euhedral_q3_decode_{tile}']
+                        self.assertNotIn(b'\xa5\xa5', [actual[i:i + 2] for i in range(0, len(actual), 2)])
+                        self.assertEqual(actual, got[f'probe_group_decode_{tile}'])
 
     def test_activation_staging_zero_fills_outside_rows_and_k(self):
         gpu = self.gpu
