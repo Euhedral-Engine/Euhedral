@@ -84,12 +84,11 @@ extern "C" __global__ __launch_bounds__(128) void NAME( \
         const unsigned short* input, const unsigned char* weights, unsigned short* output, \
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) { \
     using Tile = TILE; \
-    __shared__ __align__(32) __nv_bfloat16 a[Tile::kRows * q3::kGroup]; \
+    __shared__ q3::PrefillShared<Tile> staging; \
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * q3::kGroup]; \
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * q3::kGroup]; \
-    __shared__ __align__(32) float result[Tile::kRows * Tile::kCols]; \
     q3::tiled_prefill<Tile>(input, weights, output, rows, in_features, out_features, scale_offset, \
-            a, b_hi, b_lo, result); \
+            staging, b_hi, b_lo); \
 }
 PROBE_TILED(probe_tiled_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>)
 PROBE_TILED(probe_tiled_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>)
