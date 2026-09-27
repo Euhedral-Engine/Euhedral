@@ -17,6 +17,29 @@ __device__ __forceinline__ float qwen_gdn_reduce_sum(float value, float* scratch
     return result;
 }
 
+/// Sums one value per thread of a 128-thread CTA with the same addition tree as `qwen_gdn_reduce_sum`.
+/// Stride 64 runs through shared memory; warp 0 folds stride 32 in registers, finishes strides 16..1
+/// with shuffles, and lane 0 publishes the result through `scratch[0]`.
+__device__ __forceinline__ float qwen_gdn_reduce_sum_128(float value, float* scratch) {
+    scratch[threadIdx.x] = value;
+    __syncthreads();
+    if (threadIdx.x < 64) scratch[threadIdx.x] += scratch[threadIdx.x + 64];
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float sum = scratch[threadIdx.x] + scratch[threadIdx.x + 32];
+        sum += __shfl_down_sync(0xffffffffu, sum, 16);
+        sum += __shfl_down_sync(0xffffffffu, sum, 8);
+        sum += __shfl_down_sync(0xffffffffu, sum, 4);
+        sum += __shfl_down_sync(0xffffffffu, sum, 2);
+        sum += __shfl_down_sync(0xffffffffu, sum, 1);
+        if (threadIdx.x == 0) scratch[0] = sum;
+    }
+    __syncthreads();
+    const float result = scratch[0];
+    __syncthreads();
+    return result;
+}
+
 __device__ __forceinline__ float qwen_gdn_sigmoid(float value) {
     return 1.0f / (1.0f + expf(-value));
 }
@@ -100,14 +123,14 @@ extern "C" __global__ void euhedral_gdn_recurrence_bf16(
         const uint32_t valueBase = queryKeyWidth + valueHead * valueHeadDim + valueColumn;
         const float query = __bfloat162float(convolved[rowOffset + queryBase + lane]);
         const float key = __bfloat162float(convolved[rowOffset + keyBase + lane]);
-        const float normalizedKey = key * rsqrtf(qwen_gdn_reduce_sum(key * key, scratch) + 1.0e-6f);
-        const float normalizedQuery = query * rsqrtf(qwen_gdn_reduce_sum(query * query, scratch) + 1.0e-6f);
-        const float stateKeyDot = qwen_gdn_reduce_sum(stateValue * normalizedKey, scratch);
+        const float normalizedKey = key * rsqrtf(qwen_gdn_reduce_sum_128(key * key, scratch) + 1.0e-6f);
+        const float normalizedQuery = query * rsqrtf(qwen_gdn_reduce_sum_128(query * query, scratch) + 1.0e-6f);
+        const float stateKeyDot = qwen_gdn_reduce_sum_128(stateValue * normalizedKey, scratch);
         const float alpha = expf(g[static_cast<uint64_t>(row) * valueHeads + valueHead]);
         const float delta = beta[static_cast<uint64_t>(row) * valueHeads + valueHead]
                 * (__bfloat162float(convolved[rowOffset + valueBase]) - alpha * stateKeyDot);
         stateValue = alpha * stateValue + delta * normalizedKey;
-        const float outputSum = qwen_gdn_reduce_sum(stateValue * normalizedQuery, scratch);
+        const float outputSum = qwen_gdn_reduce_sum_128(stateValue * normalizedQuery, scratch);
         if (lane == 0) output[static_cast<uint64_t>(row) * valueHeads * valueHeadDim + valueRow]
                 = __float2bfloat16_rn(outputSum * outputScale);
     }
