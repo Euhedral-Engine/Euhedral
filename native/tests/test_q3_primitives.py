@@ -84,12 +84,11 @@ extern "C" __global__ __launch_bounds__(128) void NAME( \
         const unsigned short* input, const unsigned char* weights, unsigned short* output, \
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) { \
     using Tile = TILE; \
-    __shared__ __align__(32) __nv_bfloat16 a[Tile::kRows * q3::kGroup]; \
+    __shared__ q3::PrefillShared<Tile> staging; \
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * q3::kGroup]; \
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * q3::kGroup]; \
-    __shared__ __align__(32) float result[Tile::kRows * Tile::kCols]; \
     q3::tiled_prefill<Tile>(input, weights, output, rows, in_features, out_features, scale_offset, \
-            a, b_hi, b_lo, result); \
+            staging, b_hi, b_lo); \
 }
 PROBE_TILED(probe_tiled_64x16, q3::WarpTile<4 COMMA 1 COMMA 1>)
 PROBE_TILED(probe_tiled_16x64, q3::WarpTile<1 COMMA 4 COMMA 1>)
@@ -360,6 +359,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                 w = self.owned(stack, gpu.upload(bytes(payload)))
                 results = {}
                 for kernel, tile_rows, tile_cols in [("euhedral_q3_prefill", 32, 32),
+                                                      ("euhedral_q3_prefill_64", 64, 32),
                                                       ("probe_tiled_64x16", 64, 16),
                                                       ("probe_tiled_16x64", 16, 64)]:
                     with contextlib.ExitStack() as launch_stack:
@@ -371,6 +371,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                 with self.subTest(rows=rows, width=width, outputs=outputs):
                     self.assertNotIn(b"\xa5\xa5", [results["euhedral_q3_prefill"][i:i + 2]
                                                    for i in range(0, rows * outputs * 2, 2)])
+                    self.assertEqual(results["euhedral_q3_prefill_64"], results["euhedral_q3_prefill"])
                     self.assertEqual(results["probe_tiled_64x16"], results["euhedral_q3_prefill"])
                     self.assertEqual(results["probe_tiled_16x64"], results["euhedral_q3_prefill"])
 
