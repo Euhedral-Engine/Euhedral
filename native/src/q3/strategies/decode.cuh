@@ -15,8 +15,10 @@ namespace q3 {
 // aligned within a buffer whose group words are already read as 32-bit values.
 static __device__ __forceinline__ unsigned int load_k128_word(
         const Layout& w, unsigned long long g, unsigned int lane) {
-    if (lane < 12) return ((const unsigned int*)w.group_bytes(g))[lane];
-    return lane == 12 ? *(const unsigned int*)(w.scales + g) : 0u;
+    const unsigned int* code = (const unsigned int*)w.group_bytes(g);
+    const unsigned int* scale = (const unsigned int*)(w.scales + g);
+    const unsigned int* selected = lane < 12 ? code + lane : scale;
+    return lane < 13 ? *selected : 0u;
 }
 
 // Hand one group of a K128 word set to load ownership (lane owns K = 2*lane,
