@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
@@ -116,6 +117,67 @@ class CudaGpuOperationsIntegrationTest {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    @Test
+    void mixerQ3AutoMatchesExplicitTile64AcrossDispatchBoundary() throws Throwable {
+        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
+        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
+                Arena arena = Arena.ofConfined()) {
+            var symbols = java.lang.foreign.SymbolLookup.libraryLookup(library, arena);
+            var descriptor = java.lang.foreign.FunctionDescriptor.of(
+                    java.lang.foreign.ValueLayout.JAVA_INT,
+                    java.lang.foreign.ValueLayout.ADDRESS,
+                    java.lang.foreign.ValueLayout.ADDRESS,
+                    java.lang.foreign.ValueLayout.ADDRESS,
+                    java.lang.foreign.ValueLayout.JAVA_INT,
+                    java.lang.foreign.ValueLayout.JAVA_INT,
+                    java.lang.foreign.ValueLayout.JAVA_INT,
+                    java.lang.foreign.ValueLayout.JAVA_LONG);
+            var explicit = java.lang.foreign.Linker.nativeLinker()
+                    .downcallHandle(
+                            symbols.find("euhedral_cuda_linear_q3_prefill_64_bf16")
+                                    .orElseThrow(),
+                            descriptor);
+            int width = 6144, outputs = 5120;
+            byte[] packed = q3Weights(outputs, width);
+            long w = upload(gpu, arena, packed);
+            try {
+                for (int rows : new int[] {96, 97, 127, 128, 256, 511, 512, 513}) {
+                    short[] input = new short[rows * width];
+                    for (int i = 0; i < input.length; i++) input[i] = floatToBf16((i % 23 - 11) * 0.125f);
+                    long x = upload(gpu, arena, input);
+                    short[] sentinel = new short[rows * outputs];
+                    Arrays.fill(sentinel, (short) 0x7fff);
+                    long autoOutput = upload(gpu, arena, sentinel);
+                    long explicitOutput = upload(gpu, arena, sentinel);
+                    try {
+                        gpu.linearQ3Bf16(x, w, autoOutput, rows, width, outputs, packed.length);
+                        int status = (int) explicit.invokeExact(
+                                MemorySegment.ofAddress(x),
+                                MemorySegment.ofAddress(w),
+                                MemorySegment.ofAddress(explicitOutput),
+                                rows,
+                                width,
+                                outputs,
+                                (long) packed.length);
+                        assertEquals(0, status, "explicit tile64 at rows=" + rows);
+                        short[] actual = download(gpu, arena, autoOutput, rows * outputs);
+                        assertArrayEquals(download(gpu, arena, explicitOutput, rows * outputs), actual, "rows=" + rows);
+                        for (short value : actual) {
+                            if (value == (short) 0x7fff)
+                                throw new AssertionError("unwritten mixer output at rows=" + rows);
+                        }
+                    } finally {
+                        gpu.free(explicitOutput);
+                        gpu.free(autoOutput);
+                        gpu.free(x);
+                    }
+                }
+            } finally {
+                gpu.free(w);
             }
         }
     }

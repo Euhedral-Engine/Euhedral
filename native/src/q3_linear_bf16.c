@@ -1,4 +1,5 @@
 #include "cuda_kernel_loader.h"
+#include "q3_prefill_policy.h"
 #include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdint.h>
@@ -54,11 +55,9 @@ static int linear_q3(const void* input, const void* weights, void* output,
     uint64_t grid = (uint64_t)rows * out_features;
     uint32_t row_tile = rows == 1 ? 1 : rows == 2 ? 2 : 4;
     if (mode == 1) grid = (((uint64_t)rows + row_tile - 1) / row_tile) * (((uint64_t)out_features + 7) / 8);
-    // The larger tile reuses one decoded Q3 weight tile across 64 token rows.
-    // Leave the existing 32-row prefill route intact for other matrices and short prompts.
-    int wide_prefill = mode == 3 || (mode == 2 && rows >= 64
-            && ((in_features == 5120 && out_features == 34816)
-                    || (in_features == 17408 && out_features == 5120)));
+    // Match the prefill grid to the selected CTA tile. The optional tile64
+    // symbol is checked below before normal dispatch can use this grid.
+    int wide_prefill = euhedral_q3_wide_prefill(mode, rows, in_features, out_features);
     if (mode == 2 || mode == 3) grid = (((uint64_t)rows + (wide_prefill ? 63 : 31)) / (wide_prefill ? 64 : 32))
             * (((uint64_t)out_features + 31) / 32);
     if (grid > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
