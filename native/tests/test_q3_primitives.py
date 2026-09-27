@@ -360,6 +360,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                 w = self.owned(stack, gpu.upload(bytes(payload)))
                 results = {}
                 for kernel, tile_rows, tile_cols in [("euhedral_q3_prefill", 32, 32),
+                                                      ("euhedral_q3_prefill_64", 64, 32),
                                                       ("probe_tiled_64x16", 64, 16),
                                                       ("probe_tiled_16x64", 16, 64)]:
                     with contextlib.ExitStack() as launch_stack:
@@ -371,6 +372,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                 with self.subTest(rows=rows, width=width, outputs=outputs):
                     self.assertNotIn(b"\xa5\xa5", [results["euhedral_q3_prefill"][i:i + 2]
                                                    for i in range(0, rows * outputs * 2, 2)])
+                    self.assertEqual(results["euhedral_q3_prefill_64"], results["euhedral_q3_prefill"])
                     self.assertEqual(results["probe_tiled_64x16"], results["euhedral_q3_prefill"])
                     self.assertEqual(results["probe_tiled_16x64"], results["euhedral_q3_prefill"])
 
