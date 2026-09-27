@@ -47,13 +47,26 @@ class Q3SharedOverlayTest(unittest.TestCase):
         self.assertNotIn('staging.a', kernels)
         self.assertNotIn('staging.result', kernels)
 
+    def test_prefill_layout_selects_padded_a_and_tile_specific_b(self):
+        source = (ROOT / 'native/src/q3/strategies/prefill.cuh').read_text()
+        kernels = (ROOT / 'native/src/q3/kernels.cu').read_text()
+        self.assertIn('values[Tile::kRows * A_STRIDE]', source)
+        self.assertIn('tile[(i / K_TILE) * STRIDE + i % K_TILE]',
+                      (ROOT / 'native/src/q3/primitives/activation.cuh').read_text())
+        self.assertIn('col * STRIDE + lane * 2 + p',
+                      (ROOT / 'native/src/q3/primitives/staging.cuh').read_text())
+        self.assertIn('consume_mma_tile<Tile, kGroup, A_STRIDE, B_STRIDE>', source)
+        self.assertIn('constexpr int A_STRIDE = 80;', kernels)
+        self.assertIn('constexpr int B_STRIDE = Tile::kRows == 32 ? 80 : 64;', kernels)
+        self.assertIn('Tile::kCols * B_STRIDE', kernels)
+
     def test_prefill_result_reuses_activation_shared_storage(self):
         with contextlib.ExitStack() as cleanup:
             gpu = Gpu(b'#include "q3/kernels.cu"\n', include_dir=PRODUCT)
             cleanup.callback(gpu.close)
             attribute = _bind(CUDA, 'cuFuncGetAttribute', [C.POINTER(I), I, P])
-            for kernel, expected_bytes in [('euhedral_q3_prefill', 12288),
-                                           ('euhedral_q3_prefill_64', 16384)]:
+            for kernel, expected_bytes in [('euhedral_q3_prefill', 15360),
+                                           ('euhedral_q3_prefill_64', 18432)]:
                 with self.subTest(kernel=kernel):
                     function = P()
                     _check(gpu.function(C.byref(function), gpu.module, kernel.encode()), kernel)
