@@ -1,23 +1,18 @@
 #pragma once
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 namespace q3 {
 static __device__ __forceinline__ float bf16_to_float(unsigned short value) {
     return __uint_as_float((unsigned int)value << 16);
 }
 static __device__ __forceinline__ float fp16_to_float(unsigned short value) {
-    unsigned int sign = ((unsigned int)value & 0x8000u) << 16;
-    unsigned int exponent = ((unsigned int)value >> 10) & 31u;
-    unsigned int mantissa = (unsigned int)value & 1023u;
-    if (exponent == 0u) {
-        if (mantissa == 0u) return __uint_as_float(sign);
-        int shift = 0;
-        while ((mantissa & 1024u) == 0u) { mantissa <<= 1; --shift; }
-        mantissa &= 1023u;
-        return __uint_as_float(sign | ((unsigned int)(113 + shift) << 23) | (mantissa << 13));
-    }
-    if (exponent == 31u) return __uint_as_float(sign | 0x7f800000u | (mantissa << 13));
-    return __uint_as_float(sign | ((exponent + 112u) << 23) | (mantissa << 13));
+    float converted = __half2float(__ushort_as_half(value));
+    // The intrinsic canonicalizes NaNs; retain the original sign and payload.
+    if ((value & 0x7c00u) == 0x7c00u && (value & 0x03ffu) != 0u)
+        return __uint_as_float(((unsigned int)(value & 0x8000u) << 16) | 0x7f800000u
+                | ((unsigned int)(value & 0x03ffu) << 13));
+    return converted;
 }
 static __device__ __forceinline__ unsigned short float_to_bf16(float value) {
     unsigned int bits = __float_as_uint(value);
