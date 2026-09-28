@@ -118,7 +118,7 @@ class Q45KernelTest(unittest.TestCase):
             return decode_ref, prefill_ref
 
     def test_every_route_matches_the_original_kernels_bitwise(self):
-        cases = [(1, 128, 1), (2, 128, 9), (3, 256, 17), (4, 384, 33), (5, 128, 40),
+        cases = [(1, 128, 8), (1, 256, 16), (1, 5120, 16), (1, 128, 1), (2, 128, 9), (3, 256, 17), (4, 384, 33), (5, 128, 40),
                  (9, 256, 8), (31, 128, 32), (33, 256, 35), (64, 128, 64), (65, 384, 70),
                  (97, 256, 37), (130, 512, 66)]
         for bits in (4, 5):
@@ -131,19 +131,19 @@ class Q45KernelTest(unittest.TestCase):
         special = [0x3F80, 0xBF00, 0x7FC1, 0xFFC3, 0x7F80, 0xFF80, 0x0001, 0x8000]
         scales = [0x3555, 0xB555, 0x0001, 0x8000, 0x7BFF, 0x7C00, 0x7E11, 0xFE11]
         for bits in (4, 5):
-            for rows, width, outputs in [(1, 128, 9), (4, 256, 33), (65, 128, 35)]:
+            for rows, width, outputs in [(1, 128, 16), (1, 128, 9), (4, 256, 33), (65, 128, 35)]:
                 payload = make_weights(self.rng, bits, width, outputs, lambda i: scales[i % len(scales)])
                 values = [special[i % len(special)] for i in range(rows * width)]
                 self.compare_all_routes(bits, rows, width, outputs, payload, values)
 
     def test_two_byte_aligned_input_takes_sequential_staging(self):
         for bits in (4, 5):
-            rows, width, outputs = 67, 256, 35
-            payload = make_weights(self.rng, bits, width, outputs)
-            values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
-            aligned = self.compare_all_routes(bits, rows, width, outputs, payload, values)
-            shifted = self.compare_all_routes(bits, rows, width, outputs, payload, values, input_offset=2)
-            self.assertEqual(aligned, shifted)
+            for rows, width, outputs in [(1, 256, 16), (67, 256, 35)]:
+                payload = make_weights(self.rng, bits, width, outputs)
+                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
+                aligned = self.compare_all_routes(bits, rows, width, outputs, payload, values)
+                shifted = self.compare_all_routes(bits, rows, width, outputs, payload, values, input_offset=2)
+                self.assertEqual(aligned, shifted)
 
     def test_routes_agree_with_independent_cpu_dequantization(self):
         for bits in (4, 5):
