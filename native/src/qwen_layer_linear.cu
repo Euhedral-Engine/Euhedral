@@ -56,21 +56,25 @@ extern "C" __global__ void euhedral_linear_quantized_bf16(
         uint32_t inFeatures,
         uint32_t outFeatures,
         uint32_t bits) {
-    const uint64_t outputIndex = static_cast<uint64_t>(blockIdx.x);
-    if (outputIndex >= static_cast<uint64_t>(rows) * outFeatures) return;
-    const uint32_t row = static_cast<uint32_t>(outputIndex / outFeatures);
-    const uint32_t outputColumn = static_cast<uint32_t>(outputIndex % outFeatures);
+    // Block-stride over outputs: rows * outFeatures may exceed the grid limit, so
+    // the host caps the grid and each block computes every gridDim.x-th output.
+    // The loop bound is block-uniform, so the reduction barriers stay uniform.
+    const uint64_t count = static_cast<uint64_t>(rows) * outFeatures;
     const uint32_t groups = inFeatures / 64;
-    const __nv_bfloat16* activation = input + static_cast<uint64_t>(row) * inFeatures;
-    float partial = 0.0f;
-    for (uint32_t k = threadIdx.x; k < inFeatures; k += blockDim.x) {
-        const int q = qwen_quantized_value(weights, outputColumn, k, groups, outFeatures, bits);
-        const float scale = qwen_quantized_scale(weights, outputColumn, k / 64, groups, outFeatures, bits);
-        partial = fmaf(__bfloat162float(activation[k]), static_cast<float>(q) * scale, partial);
-    }
     __shared__ float scratch[128];
-    const float sum = qwen_reduce_sum(partial, scratch);
-    if (threadIdx.x == 0) output[outputIndex] = __float2bfloat16_rn(sum);
+    for (uint64_t outputIndex = blockIdx.x; outputIndex < count; outputIndex += gridDim.x) {
+        const uint32_t row = static_cast<uint32_t>(outputIndex / outFeatures);
+        const uint32_t outputColumn = static_cast<uint32_t>(outputIndex % outFeatures);
+        const __nv_bfloat16* activation = input + static_cast<uint64_t>(row) * inFeatures;
+        float partial = 0.0f;
+        for (uint32_t k = threadIdx.x; k < inFeatures; k += blockDim.x) {
+            const int q = qwen_quantized_value(weights, outputColumn, k, groups, outFeatures, bits);
+            const float scale = qwen_quantized_scale(weights, outputColumn, k / 64, groups, outFeatures, bits);
+            partial = fmaf(__bfloat162float(activation[k]), static_cast<float>(q) * scale, partial);
+        }
+        const float sum = qwen_reduce_sum(partial, scratch);
+        if (threadIdx.x == 0) output[outputIndex] = __float2bfloat16_rn(sum);
+    }
 }
 
 extern "C" __global__ void euhedral_linear_bf16_to_float(

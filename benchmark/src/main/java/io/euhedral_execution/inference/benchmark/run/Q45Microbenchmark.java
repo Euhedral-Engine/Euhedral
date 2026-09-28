@@ -23,8 +23,8 @@ public final class Q45Microbenchmark {
 
     public static void run(BenchmarkOptions options, String selectedMatrix, Integer selectedRows) throws Exception {
         String mode = System.getenv("EUHEDRAL_Q45_DISPATCH");
-        if (!"SCALAR".equals(mode) && !"DECODE".equals(mode) && !"PREFILL".equals(mode))
-            throw new IllegalArgumentException("q45 requires EUHEDRAL_Q45_DISPATCH=SCALAR|DECODE|PREFILL");
+        if (!"SCALAR".equals(mode) && !"DECODE".equals(mode) && !"PREFILL".equals(mode) && !"PREFILL64".equals(mode))
+            throw new IllegalArgumentException("q45 requires EUHEDRAL_Q45_DISPATCH=SCALAR|DECODE|PREFILL|PREFILL64");
         if (options.output().toString().endsWith(".json") || Files.exists(options.output()))
             throw new IllegalArgumentException("q45 requires a new JSONL output path");
         if (selectedRows != null && selectedRows <= 0) throw new IllegalArgumentException("rows must be positive");

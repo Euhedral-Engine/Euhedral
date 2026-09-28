@@ -28,10 +28,11 @@ static CUmodule gdn_module;
 static CUmodule elementwise_module;
 static CUmodule attention_module;
 static CUfunction linear_quantized;
-static CUfunction q4_decode;
-static CUfunction q5_decode;
-static CUfunction q4_prefill;
-static CUfunction q5_prefill;
+// Q4/Q5 kernels indexed by [bits == 5]: cooperative decode for 1, 2 and 4
+// token rows per CTA, and 32- and 64-row prefill tiles.
+static CUfunction q45_decode[2][3];
+static CUfunction q45_prefill[2];
+static CUfunction q45_prefill64[2];
 static int q45_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction linear_bf16_to_float;
 static CUfunction gdn_control;
@@ -45,6 +46,10 @@ static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
+// AUTO routes Q4/Q5 prefill batches of at least this many rows to the 64-row
+// tile, which reuses each decoded weight tile across twice as many rows.
+#define Q45_PREFILL64_MIN_ROWS 64u
+
 static int get_function(CUmodule module, CUfunction* function, const char* name) {
     return (int)cuModuleGetFunction(function, module, name);
 }
@@ -57,11 +62,19 @@ static void initialize(void) {
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
 
     q45_status = euhedral_cuda_load_kernel(
-            &q45_anchor, "q45_linear_bf16.cu", "euhedral_q4_decode", &q45_module, &q4_decode);
+            &q45_anchor, "q45_linear_bf16.cu", "euhedral_q4_decode_1", &q45_module, &q45_decode[0][0]);
     if (q45_status == EUHEDRAL_CUDA_SUCCESS) {
-        status = get_function(q45_module, &q5_decode, "euhedral_q5_decode");
-        if (status == CUDA_SUCCESS) status = get_function(q45_module, &q4_prefill, "euhedral_q4_prefill");
-        if (status == CUDA_SUCCESS) status = get_function(q45_module, &q5_prefill, "euhedral_q5_prefill");
+        static const char* const decode_names[2][3] = {
+                {"euhedral_q4_decode_1", "euhedral_q4_decode_2", "euhedral_q4_decode_4"},
+                {"euhedral_q5_decode_1", "euhedral_q5_decode_2", "euhedral_q5_decode_4"}};
+        static const char* const prefill_names[2] = {"euhedral_q4_prefill", "euhedral_q5_prefill"};
+        static const char* const prefill64_names[2] = {"euhedral_q4_prefill_64", "euhedral_q5_prefill_64"};
+        for (int format = 0; format < 2 && status == CUDA_SUCCESS; format++) {
+            for (int tile = 0; tile < 3 && status == CUDA_SUCCESS; tile++)
+                status = get_function(q45_module, &q45_decode[format][tile], decode_names[format][tile]);
+            if (status == CUDA_SUCCESS) status = get_function(q45_module, &q45_prefill[format], prefill_names[format]);
+            if (status == CUDA_SUCCESS) status = get_function(q45_module, &q45_prefill64[format], prefill64_names[format]);
+        }
         if (status != CUDA_SUCCESS) q45_status = (int)status;
     }
 
@@ -170,12 +183,19 @@ int euhedral_cuda_linear_quantized_bf16(
     CUdeviceptr output = (CUdeviceptr)(uintptr_t)device_output;
     uint32_t rows_arg = rows, in_arg = in_features, out_arg = out_features, bits_arg = bits;
     void* parameters[] = {&input, &weights, &output, &rows_arg, &in_arg, &out_arg, &bits_arg};
+    // The scalar kernel strides over outputs, so its grid is capped at the CUDA
+    // grid-x limit rather than rejecting counts above it.
+    const uint32_t scalar_grid = count > 2147483647u ? 2147483647u : (uint32_t)count;
     const char* mode = getenv("EUHEDRAL_Q45_DISPATCH");
     if (mode != NULL && strcmp(mode, "SCALAR") == 0)
-        return launch_and_synchronize(linear_quantized, (uint32_t)count, 128, parameters);
-    int use_decode;
-    if (mode != NULL && strcmp(mode, "DECODE") == 0) use_decode = 1;
-    else if (mode != NULL && strcmp(mode, "PREFILL") == 0) use_decode = 0;
+        return launch_and_synchronize(linear_quantized, scalar_grid, 128, parameters);
+    // DECODE, PREFILL and PREFILL64 force one optimized route; AUTO (the default)
+    // selects decode through the per-format row threshold, then the 64-row
+    // prefill tile from Q45_PREFILL64_MIN_ROWS rows and the 32-row tile below it.
+    enum { ROUTE_DECODE, ROUTE_PREFILL, ROUTE_PREFILL64 } route;
+    if (mode != NULL && strcmp(mode, "DECODE") == 0) route = ROUTE_DECODE;
+    else if (mode != NULL && strcmp(mode, "PREFILL") == 0) route = ROUTE_PREFILL;
+    else if (mode != NULL && strcmp(mode, "PREFILL64") == 0) route = ROUTE_PREFILL64;
     else if (mode == NULL || strcmp(mode, "AUTO") == 0) {
         const char* threshold_string = getenv(bits == 4 ? "EUHEDRAL_Q4_DECODE_MAX_ROWS" : "EUHEDRAL_Q5_DECODE_MAX_ROWS");
         uint32_t threshold = bits == 4 ? 9 : 4;
@@ -186,13 +206,33 @@ int euhedral_cuda_linear_quantized_bf16(
                 return EUHEDRAL_CUDA_INVALID_ARGUMENT;
             threshold = (uint32_t)parsed;
         }
-        use_decode = rows <= threshold;
+        route = rows <= threshold ? ROUTE_DECODE
+                : rows >= Q45_PREFILL64_MIN_ROWS ? ROUTE_PREFILL64 : ROUTE_PREFILL;
     } else return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    // The optimized kernels read code, fifth-bit and scale-pair words as 32-bit
+    // values, which needs a 4-byte-aligned weight base. Other bases (a valid
+    // payload may start at an allocation + 2) keep the byte-oriented scalar
+    // reference, which has no alignment requirement beyond its FP16 scales.
+    if (((uintptr_t)device_weights & 3u) != 0u)
+        return launch_and_synchronize(linear_quantized, scalar_grid, 128, parameters);
     if (q45_status != EUHEDRAL_CUDA_SUCCESS) return q45_status;
-    CUfunction function = bits == 4 ? (use_decode ? q4_decode : q4_prefill)
-                                    : (use_decode ? q5_decode : q5_prefill);
-    uint64_t grid64 = use_decode ? (uint64_t)rows * (((uint64_t)out_features + 7u) / 8u)
-                                 : (((uint64_t)rows + 31u) / 32u) * (((uint64_t)out_features + 31u) / 32u);
+    const int format = bits == 5;
+    CUfunction function;
+    uint64_t grid64;
+    const uint64_t decode_tiles = ((uint64_t)out_features + 7u) / 8u;
+    const uint64_t prefill_tiles = ((uint64_t)out_features + 31u) / 32u;
+    if (route == ROUTE_DECODE) {
+        // Rows per CTA: 1 and 2 exactly, otherwise 4 (the last CTA may be partial).
+        const uint32_t row_tile = rows == 1 ? 1 : rows == 2 ? 2 : 4;
+        function = q45_decode[format][row_tile == 1 ? 0 : row_tile == 2 ? 1 : 2];
+        grid64 = (((uint64_t)rows + row_tile - 1u) / row_tile) * decode_tiles;
+    } else if (route == ROUTE_PREFILL64) {
+        function = q45_prefill64[format];
+        grid64 = (((uint64_t)rows + 63u) / 64u) * prefill_tiles;
+    } else {
+        function = q45_prefill[format];
+        grid64 = (((uint64_t)rows + 31u) / 32u) * prefill_tiles;
+    }
     if (grid64 > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     uint32_t grid = (uint32_t)grid64;
     void* optimized_parameters[] = {&input, &weights, &output, &rows_arg, &in_arg, &out_arg};

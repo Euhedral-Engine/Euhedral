@@ -174,7 +174,7 @@ mode when comparing against the async baseline.
 The `q45 CONFIG.json [MATRIX ROWS]` command uses real packed weights from the first GDN and
 attention layers. Matrix names are `gdn-q4`, `gdn-q5`, `attention-q4`, and `attention-q5`.
 Without a selector it sweeps 1, 2, 4, 8, 9, 12, 16, 32, 256, and 512 rows. Set
-`EUHEDRAL_Q45_DISPATCH` to `SCALAR`, `DECODE`, or `PREFILL` in a separate JVM for each
+`EUHEDRAL_Q45_DISPATCH` to `SCALAR`, `DECODE`, `PREFILL`, or `PREFILL64` in a separate JVM for each
 forced path. Each path writes its own JSONL results and per-case raw BF16 output files;
 compare the latter against the forced scalar run before accepting timings. Output files must
 not exist before a run. The screen clears 128 MiB of device memory outside each timed
@@ -188,11 +188,13 @@ EUHEDRAL_Q45_DISPATCH=SCALAR \
   q45 screen-scalar.json gdn-q4 32
 ```
 
-Use separate configuration/output paths for `DECODE` and `PREFILL`; archive and compare
-all three sets of raw BF16 files, not just their timings.
+Use separate configuration/output paths for `DECODE`, `PREFILL`, and `PREFILL64`; archive and
+compare all four sets of raw BF16 files, not just their timings.
 
 Normal inference uses `AUTO` (also the default when the variable is unset): Q4 selects decode
-through 9 rows and Q5 through 4 rows, then uses tiled prefill. The optional environment
+through 9 rows and Q5 through 4 rows, then uses the 32-row prefill tile below 64 rows and the
+64-row tile from 64 rows. Decode groups 1, 2, or 4 token rows per CTA; `PREFILL` forces the
+32-row tile and `PREFILL64` the 64-row tile. The optional environment
 variables `EUHEDRAL_Q4_DECODE_MAX_ROWS` and `EUHEDRAL_Q5_DECODE_MAX_ROWS` override those
 thresholds independently. Archive the exact environment alongside any benchmark results;
 these native experiment controls are not fields in the engine snapshot. `SCALAR` retains the
