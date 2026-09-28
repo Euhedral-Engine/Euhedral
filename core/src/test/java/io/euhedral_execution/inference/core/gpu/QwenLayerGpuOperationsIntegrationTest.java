@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -182,6 +183,48 @@ class QwenLayerGpuOperationsIntegrationTest {
                     } finally {
                         gpu.free(outputAddress);
                         gpu.free(weightAddress);
+                        gpu.free(inputAddress);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void q4AndQ5LinearAcceptTwoByteAlignedWeightPayload() throws Exception {
+        // A valid packed payload need not start on a 4-byte boundary; every row
+        // count that selects a different optimized route must still be correct.
+        try (CudaGpuMemory gpu = new CudaGpuMemory(cudaLibrary());
+                Arena arena = Arena.ofConfined()) {
+            for (int bits : new int[] {4, 5}) {
+                for (int rows : new int[] {1, 2, 4, 9, 33, 64}) {
+                    int width = 256;
+                    int outputs = 37;
+                    short[] input = new short[rows * width];
+                    for (int i = 0; i < input.length; i++) input[i] = floatToBf16((i % 23 - 11) * 0.0625f);
+                    byte[] weights = quantizedWeights(outputs, width, bits);
+                    MemorySegment host = arena.allocate(weights.length);
+                    MemorySegment.copy(weights, 0, host, ValueLayout.JAVA_BYTE, 0, weights.length);
+                    long inputAddress = upload(gpu, arena, input);
+                    long allocation = gpu.allocate(weights.length + 4L);
+                    long weightAddress = allocation + 2;
+                    long outputAddress = gpu.allocate((long) rows * outputs * Short.BYTES);
+                    try {
+                        gpu.copyHostToDevice(weightAddress, host, weights.length);
+                        if (bits == 4) {
+                            gpu.linearQ4Bf16(
+                                    inputAddress, weightAddress, outputAddress, rows, width, outputs, weights.length);
+                        } else {
+                            gpu.linearQ5Bf16(
+                                    inputAddress, weightAddress, outputAddress, rows, width, outputs, weights.length);
+                        }
+                        assertBf16Equals(
+                                quantizedLinearReference(input, weights, rows, width, outputs, bits),
+                                download(gpu, arena, outputAddress, rows * outputs),
+                                0.025f);
+                    } finally {
+                        gpu.free(outputAddress);
+                        gpu.free(allocation);
                         gpu.free(inputAddress);
                     }
                 }
