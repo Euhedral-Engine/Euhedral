@@ -1,6 +1,15 @@
 name: CUDA native products
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "native/**"
+      - "native.gradle.kts"
+      - "build.gradle.kts"
+      - "api/build.gradle.kts"
+      - "mise.toml"
+      - ".github/workflows/native-package.yaml"
   pull_request:
     paths:
       - "native/**"
@@ -21,6 +30,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,6 +44,15 @@ jobs:
           install: true
           cache: true
       - uses: gradle/actions/setup-gradle@v4
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            native/.zig-cache
+            native/.zig-global-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('mise.toml', 'native/build.zig', 'native/native-products.json') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

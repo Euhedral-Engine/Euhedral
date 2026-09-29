@@ -24,6 +24,13 @@ class MiseTasksTest(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/native-package.yaml").read_text()
         self.assertIn('      - "mise.toml"', workflow)
         self.assertNotIn('      - ".mise.toml"', workflow)
+        self.assertIn("  push:\n    branches: [main]", workflow)
+        self.assertIn("uses: jdx/mise-action@v2", workflow)
+        self.assertIn("uses: gradle/actions/setup-gradle@v4", workflow)
+        self.assertIn("uses: actions/cache@v4", workflow)
+        self.assertIn("native/.zig-cache", workflow)
+        self.assertIn("native/.zig-global-cache", workflow)
+        self.assertIn("hashFiles('mise.toml', 'native/build.zig', 'native/native-products.json')", workflow)
 
 
 if __name__ == "__main__":
