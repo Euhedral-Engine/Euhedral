@@ -44,19 +44,6 @@ public final class QwenExecutionPlan {
         ATTENTION_CAUSAL
     }
 
-    public enum PrefillRegions {
-        NONE,
-        RESIDUAL_NORM,
-        GDN_CONTROL,
-        RESIDUAL_NORM_CONTROL,
-        GATE_UP_SWIGLU,
-        COMBINED,
-        STREAMED_FFN,
-        ATTENTION_KV,
-        COMBINED_KV,
-        STREAMED_KV
-    }
-
     public enum Buffer {
         HIDDEN_STATE,
         MIXER_HIDDEN,
@@ -200,7 +187,34 @@ public final class QwenExecutionPlan {
             List<Instruction> instructions,
             List<Integer> projectionWidths,
             List<BufferSpec> bufferSpecs,
-            boolean firstLayer) {}
+            boolean firstLayer,
+            boolean fullModel) {
+        PlanData(
+                List<Instruction> instructions,
+                List<Integer> projectionWidths,
+                List<BufferSpec> bufferSpecs,
+                boolean firstLayer) {
+            this(instructions, projectionWidths, bufferSpecs, firstLayer, false);
+        }
+    }
+
+    /// Prefill specializations derived from the full-model reference topology.
+    /// `SMALL` covers quanta below the 64-row producer tile; `STREAMED` exists only at the
+    /// qualified streamed-FFN geometry.
+    private enum PrefillView {
+        SMALL,
+        REGIONS,
+        STREAMED
+    }
+
+    /// Row threshold for the attention producer and gate/up regions (one 64-row prefill tile).
+    private static final int REGION_MIN_ROWS = 64;
+    /// Exact geometry at which the streamed FFN region is qualified; elsewhere gate/up + down is used.
+    private static final int STREAMED_FFN_ROWS = 256;
+    private static final int STREAMED_FFN_HIDDEN = 5120;
+    private static final int STREAMED_FFN_INTERMEDIATE = 17408;
+    /// Two bounded BF16 feature slots of 4096 features each.
+    private static final int STREAMED_FFN_STAGING_WIDTH = 2 * 4096;
 
     private final QwenWeights weights;
     private final List<Instruction> instructions;
@@ -208,47 +222,45 @@ public final class QwenExecutionPlan {
     private final List<Integer> projectionWidths;
     private final List<BufferSpec> bufferSpecs;
     private final boolean firstLayer;
-    private final boolean reusePrefillStorage;
-    private final QwenExecutionPlan executionOwner;
-    private final QwenExecutionPlan prefillPlan;
-    private final QwenExecutionPlan smallPrefillPlan;
-    private final QwenExecutionPlan streamedFallback;
+    private final boolean reuseStorage;
+    private final QwenExecutionPlan owner;
+    private final QwenExecutionPlan smallPrefill;
+    private final QwenExecutionPlan regionPrefill;
+    private final QwenExecutionPlan streamedPrefill;
 
-    /// Uses the actual loaded layer zero when present; an embedding-only weight view stays embedding-only.
+    /// Builds the production plan. For a complete model, prefill quanta automatically select the
+    /// retained region architecture by row count and geometry; decode keeps the reference topology.
+    /// Staged plans for partial weights (embedding-only, layer zero) remain reference-only.
     public QwenExecutionPlan(QwenWeights weights) {
-        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights));
+        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), null, false);
     }
 
-    /// Selects an experimental prefill architecture; decode keeps the reference instructions.
-    public QwenExecutionPlan(QwenWeights weights, PrefillRegions regions) {
-        this(
-                Objects.requireNonNull(weights, "weights"),
-                planFromLoadedWeights(weights),
-                Objects.requireNonNull(regions, "regions"));
+    /// Unfused reference topology for every execution kind. This is a correctness oracle for tests
+    /// and is never selected by the runtime.
+    public static QwenExecutionPlan reference(QwenWeights weights) {
+        Objects.requireNonNull(weights, "weights");
+        PlanData data = planFromLoadedWeights(weights);
+        return new QwenExecutionPlan(
+                weights,
+                new PlanData(data.instructions(), data.projectionWidths(), data.bufferSpecs(), data.firstLayer()),
+                null,
+                false);
     }
 
-    /// Canonical plan family used by public/manual sources; concrete runtime sources keep their selected view.
+    /// Owning plan whose views belong to one family; runners admit any view of their owner.
     QwenExecutionPlan executionOwner() {
-        return this.executionOwner;
+        return this.owner;
     }
 
-    public QwenExecutionPlan forExecution(QwenExecutionContext.ExecutionKind kind) {
-        Objects.requireNonNull(kind, "kind");
-        return kind == QwenExecutionContext.ExecutionKind.PREFILL
-                ? this.executionOwner.prefillPlan
-                : this.executionOwner;
-    }
-
+    /// Selects the qualified topology for a quantum. Any view requalifies through its owner.
     public QwenExecutionPlan forExecution(QwenExecutionContext.ExecutionKind kind, int rows) {
         Objects.requireNonNull(kind, "kind");
         if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
-        return this.executionOwner.selectExecution(kind, rows);
-    }
-
-    private QwenExecutionPlan selectExecution(QwenExecutionContext.ExecutionKind kind, int rows) {
-        if (kind == QwenExecutionContext.ExecutionKind.DECODE) return this;
-        if (this.streamedFallback != null && rows != 256) return this.streamedFallback.selectExecution(kind, rows);
-        return rows < 64 ? this.smallPrefillPlan : this.prefillPlan;
+        QwenExecutionPlan family = this.owner;
+        if (kind == QwenExecutionContext.ExecutionKind.DECODE || family.regionPrefill == null) return family;
+        if (rows < REGION_MIN_ROWS) return family.smallPrefill;
+        if (rows == STREAMED_FFN_ROWS && family.streamedPrefill != null) return family.streamedPrefill;
+        return family.regionPrefill;
     }
 
     /// Builds an embedding-only plan for callers that intentionally validate only token lookup.
@@ -295,23 +307,17 @@ public final class QwenExecutionPlan {
     }
 
     private QwenExecutionPlan(QwenWeights weights, PlanData data) {
-        this(weights, data, PrefillRegions.NONE);
+        this(weights, data, null, false);
     }
 
-    private QwenExecutionPlan(QwenWeights weights, PlanData data, PrefillRegions regions) {
-        this(weights, data, regions, null);
-    }
-
-    private QwenExecutionPlan(QwenWeights weights, PlanData data, PrefillRegions regions, QwenExecutionPlan owner) {
-        this.executionOwner = owner == null ? this : owner;
+    private QwenExecutionPlan(QwenWeights weights, PlanData data, QwenExecutionPlan owner, boolean reuseStorage) {
+        this.owner = owner == null ? this : owner;
         this.weights = weights;
         this.instructions = List.copyOf(data.instructions());
         this.projectionWidths = List.copyOf(data.projectionWidths());
         this.bufferSpecs = List.copyOf(data.bufferSpecs());
         this.firstLayer = data.firstLayer();
-        this.reusePrefillStorage = this.instructions.stream().anyMatch(i -> i.kind() == Kind.ATTENTION_PRODUCERS)
-                && this.instructions.stream()
-                        .anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU || i.kind() == Kind.FFN_STREAMED);
+        this.reuseStorage = reuseStorage;
         List<List<Integer>> edges = new ArrayList<>();
         for (int index = 0; index < this.instructions.size(); index++) {
             edges.add(new ArrayList<>());
@@ -325,54 +331,47 @@ public final class QwenExecutionPlan {
             }
         }
         this.successors = edges.stream().map(List::copyOf).toList();
-        this.prefillPlan = regions == PrefillRegions.NONE
-                ? this
-                : new QwenExecutionPlan(
-                        weights, prefillRegions(data, regions), PrefillRegions.NONE, this.executionOwner);
-        this.smallPrefillPlan = (regions == PrefillRegions.GATE_UP_SWIGLU || regions == PrefillRegions.ATTENTION_KV)
-                ? this
-                : (regions == PrefillRegions.COMBINED
-                                || regions == PrefillRegions.STREAMED_FFN
-                                || regions == PrefillRegions.COMBINED_KV
-                                || regions == PrefillRegions.STREAMED_KV)
-                        ? new QwenExecutionPlan(
-                                weights,
-                                prefillRegions(data, PrefillRegions.RESIDUAL_NORM_CONTROL),
-                                PrefillRegions.NONE,
-                                this.executionOwner)
-                        : this.prefillPlan;
-        this.streamedFallback = regions == PrefillRegions.STREAMED_FFN || regions == PrefillRegions.STREAMED_KV
-                ? new QwenExecutionPlan(
-                        weights,
-                        data,
-                        regions == PrefillRegions.STREAMED_KV ? PrefillRegions.COMBINED_KV : PrefillRegions.COMBINED,
-                        this.executionOwner)
-                : null;
+        if (owner != null || !data.fullModel()) {
+            this.smallPrefill = null;
+            this.regionPrefill = null;
+            this.streamedPrefill = null;
+            return;
+        }
+        QwenConfig config = weights.config();
+        this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
+        this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
+        this.streamedPrefill =
+                config.hiddenSize() == STREAMED_FFN_HIDDEN && config.intermediateSize() == STREAMED_FFN_INTERMEDIATE
+                        ? prefillPlan(weights, data, PrefillView.STREAMED, this)
+                        : null;
     }
 
-    private static PlanData prefillRegions(PlanData data, PrefillRegions regions) {
-        boolean streamed = regions == PrefillRegions.STREAMED_FFN || regions == PrefillRegions.STREAMED_KV;
-        boolean attention = regions == PrefillRegions.ATTENTION_KV
-                || regions == PrefillRegions.COMBINED_KV
-                || regions == PrefillRegions.STREAMED_KV;
-        boolean combined = regions == PrefillRegions.COMBINED || regions == PrefillRegions.COMBINED_KV;
-        boolean residualNorm = streamed
-                || regions == PrefillRegions.RESIDUAL_NORM
-                || regions == PrefillRegions.RESIDUAL_NORM_CONTROL
-                || combined;
-        boolean control = streamed
-                || regions == PrefillRegions.GDN_CONTROL
-                || regions == PrefillRegions.RESIDUAL_NORM_CONTROL
-                || combined;
-        boolean gateUp = streamed || regions == PrefillRegions.GATE_UP_SWIGLU || combined;
-        List<Instruction> source = control ? earlyControlOrder(data.instructions()) : data.instructions();
+    private static QwenExecutionPlan prefillPlan(
+            QwenWeights weights, PlanData data, PrefillView view, QwenExecutionPlan owner) {
+        PlanData selected = prefillView(data, view);
+        // The named lifetime pairs are qualified only when the view contains both the
+        // attention producer and a fused FFN, not for a shape that falls back to ordinary FFN.
+        boolean hasAttentionProducer =
+                selected.instructions().stream().anyMatch(i -> i.kind() == Kind.ATTENTION_PRODUCERS);
+        boolean hasFusedFfn = selected.instructions().stream()
+                .anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU || i.kind() == Kind.FFN_STREAMED);
+        return new QwenExecutionPlan(weights, selected, owner, hasAttentionProducer && hasFusedFfn);
+    }
+
+    /// Rewrites the reference layer DAG into the retained prefill regions:
+    /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows,
+    /// F attention producers with direct cache writes plus B gate/up+SwiGLU (or C streamed FFN).
+    private static PlanData prefillView(PlanData data, PrefillView view) {
+        boolean producers = view != PrefillView.SMALL;
+        boolean streamed = view == PrefillView.STREAMED;
+        List<Instruction> source = earlyControlOrder(data.instructions());
         List<Instruction> result = new ArrayList<>();
         int[] remapped = new int[source.size()];
         java.util.Arrays.fill(remapped, -1);
         for (int index = 0; index < source.size(); index++) {
             Instruction first = source.get(index);
             Instruction next = index + 1 < source.size() ? source.get(index + 1) : null;
-            if (attention
+            if (producers
                     && first.kind() == Kind.Q4_LINEAR
                     && index + 3 < source.size()
                     && source.get(index + 2).kind() == Kind.ATTENTION_QK_NORM_ROPE) {
@@ -403,8 +402,7 @@ public final class QwenExecutionPlan {
                 index += 3;
                 continue;
             }
-            if (residualNorm
-                    && first.kind() == Kind.RESIDUAL_ADD
+            if (first.kind() == Kind.RESIDUAL_ADD
                     && next != null
                     && next.kind() == Kind.RMS_NORM_UNIT_OFFSET
                     && !next.outputBuffers().contains(Buffer.FINAL_NORMALIZED)
@@ -433,8 +431,8 @@ public final class QwenExecutionPlan {
                     && next != null
                     && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
                     && next.kind() == Kind.SWIGLU
-                    && first.inputWidth() == 5120
-                    && first.outputWidth() == 34816
+                    && first.inputWidth() == STREAMED_FFN_HIDDEN
+                    && first.outputWidth() == 2 * STREAMED_FFN_INTERMEDIATE
                     && index + 2 < source.size()) {
                 Instruction down = source.get(index + 2);
                 if (down.kind() != Kind.Q3_LINEAR
@@ -459,7 +457,7 @@ public final class QwenExecutionPlan {
                 index += 2;
                 continue;
             }
-            if (gateUp
+            if (producers
                     && first.kind() == Kind.Q3_LINEAR
                     && next != null
                     && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
@@ -483,8 +481,7 @@ public final class QwenExecutionPlan {
                 index++;
                 continue;
             }
-            if (control
-                    && first.kind() == Kind.BF16_LINEAR
+            if (first.kind() == Kind.BF16_LINEAR
                     && first.outputBuffers().equals(List.of(Buffer.A_PROJECTED))
                     && index + 2 < source.size()) {
                 Instruction b = source.get(index + 1);
@@ -524,7 +521,7 @@ public final class QwenExecutionPlan {
                     first.kind(),
                     dependencies,
                     first.weights(),
-                    attention && first.kind() == Kind.ATTENTION_CAUSAL
+                    producers && first.kind() == Kind.ATTENTION_CAUSAL
                             ? List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED)
                             : first.inputBuffers(),
                     first.outputBuffers(),
@@ -536,15 +533,14 @@ public final class QwenExecutionPlan {
         boolean needsGateUp = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.GATE_UP));
         boolean needsSwiGlu = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.SWIGLU));
         List<BufferSpec> buffers = new ArrayList<>(data.bufferSpecs().stream()
-                .filter(spec -> !attention || spec.buffer() != Buffer.ATTENTION_QK_NORMALIZED)
+                .filter(spec -> !producers || spec.buffer() != Buffer.ATTENTION_QK_NORMALIZED)
                 .filter(spec -> needsSwiGlu || spec.buffer() != Buffer.SWIGLU)
                 .filter(spec -> needsGateUp || spec.buffer() != Buffer.GATE_UP)
-                .filter(spec ->
-                        !control || (spec.buffer() != Buffer.A_PROJECTED && spec.buffer() != Buffer.B_PROJECTED))
+                .filter(spec -> spec.buffer() != Buffer.A_PROJECTED && spec.buffer() != Buffer.B_PROJECTED)
                 .toList());
         if (result.stream().anyMatch(i -> i.kind() == Kind.FFN_STREAMED)) {
-            buffers.add(spec(Buffer.FFN_STAGING, 8192, ElementType.BF16));
-            buffers.add(spec(Buffer.FFN_ACCUMULATORS, 5120, ElementType.FP32));
+            buffers.add(spec(Buffer.FFN_STAGING, STREAMED_FFN_STAGING_WIDTH, ElementType.BF16));
+            buffers.add(spec(Buffer.FFN_ACCUMULATORS, STREAMED_FFN_HIDDEN, ElementType.FP32));
         }
         return new PlanData(result, data.projectionWidths(), buffers, data.firstLayer());
     }
@@ -594,20 +590,16 @@ public final class QwenExecutionPlan {
         return this.bufferSpecs;
     }
 
+    /// Prefill views owned by this plan, for runner admission of requalified quanta.
     List<QwenExecutionPlan> executionVariants() {
-        var variants = new java.util.LinkedHashSet<QwenExecutionPlan>();
-        variants.add(this.prefillPlan);
-        variants.add(this.smallPrefillPlan);
-        if (this.streamedFallback != null) {
-            variants.add(this.streamedFallback.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 64));
-            variants.add(this.streamedFallback.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 1));
-        }
-        variants.remove(this);
-        return List.copyOf(variants);
+        if (this.owner != this || this.regionPrefill == null) return List.of();
+        return this.streamedPrefill == null
+                ? List.of(this.smallPrefill, this.regionPrefill)
+                : List.of(this.smallPrefill, this.regionPrefill, this.streamedPrefill);
     }
 
     boolean reusePrefillStorage() {
-        return this.reusePrefillStorage;
+        return this.reuseStorage;
     }
 
     public boolean hasFirstLayer() {
@@ -904,6 +896,7 @@ public final class QwenExecutionPlan {
         int queryHeads = config.numAttentionHeads();
         int keyValueHeads = config.numKeyValueHeads();
         int attentionHeadDim = config.attentionHeadDim();
+        int rotaryDim = (int) Math.round(attentionHeadDim * config.partialRotaryFactor());
         int keyHeads = config.linearNumKeyHeads();
         int valueHeads = config.linearNumValueHeads();
         int keyHeadDim = config.linearKeyHeadDim();
@@ -913,28 +906,30 @@ public final class QwenExecutionPlan {
                 || layerTypes.length != config.numHiddenLayers()
                 || layers.length != config.numHiddenLayers()
                 || hidden <= 0
-                || hidden % 64 != 0
+                || hidden % 128 != 0
                 || intermediate <= 0
                 || queryHeads <= 0
                 || keyValueHeads <= 0
                 || queryHeads % keyValueHeads != 0
-                || attentionHeadDim <= 0
+                || attentionHeadDim != 256
                 || !config.attentionOutputGate()
                 || !Double.isFinite(config.ropeTheta())
                 || config.ropeTheta() <= 0
                 || !Double.isFinite(config.partialRotaryFactor())
                 || config.partialRotaryFactor() <= 0
                 || config.partialRotaryFactor() > 1
-                || ((int) (attentionHeadDim * config.partialRotaryFactor())) <= 0
-                || ((int) (attentionHeadDim * config.partialRotaryFactor())) % 2 != 0
+                || rotaryDim <= 0
+                || rotaryDim % 2 != 0
                 || keyHeads <= 0
                 || valueHeads <= 0
                 || valueHeads % keyHeads != 0
                 || keyHeadDim != 128
                 || valueHeadDim != 128
                 || kernelWidth < 2
+                || kernelWidth > 32
                 || !Double.isFinite(config.rmsNormEpsilon())
-                || config.rmsNormEpsilon() <= 0) {
+                || !Float.isFinite((float) config.rmsNormEpsilon())
+                || (float) config.rmsNormEpsilon() <= 0) {
             throw new IllegalArgumentException("unsupported Qwen text model geometry");
         }
 
@@ -1262,6 +1257,7 @@ public final class QwenExecutionPlan {
                         gdnValueWidth,
                         attentionQkWidth,
                         attentionQueryWidth),
+                true,
                 true);
     }
 

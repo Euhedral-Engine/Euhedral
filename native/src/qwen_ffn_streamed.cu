@@ -1,4 +1,7 @@
 #include "q3/strategies/k32_prefill.cuh"
+// Region C: bounded two-slot gate/up+SwiGLU producer and a down consumer that carries its FP32
+// accumulators across feature regions. Launched only at the qualified M256 geometry. Template
+// flags mirror qwen_ffn.cu and are kept for identical generated code.
 namespace streamed_ffn {
 using namespace k32_probe;
 template<bool EARLY_A, bool EARLY_B, bool DUMP, bool COMPACT_B = false>

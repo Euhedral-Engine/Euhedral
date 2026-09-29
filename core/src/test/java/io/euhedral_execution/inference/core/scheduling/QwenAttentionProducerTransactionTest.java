@@ -29,8 +29,7 @@ class QwenAttentionProducerTransactionTest {
 
     private static void runCase(boolean launchFailure, boolean completionFailure, boolean cancel) throws Exception {
         var weights = EngineExecutionFixture.weights();
-        var plan = new QwenExecutionPlan(weights, QwenExecutionPlan.PrefillRegions.ATTENTION_KV)
-                .forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 64);
+        var plan = new QwenExecutionPlan(weights).forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 64);
         var sequence = new QwenSequenceState(807);
         var gpu = new HoldingGpu(weights.config().vocabSize(), sequence, launchFailure);
         var context = new QwenExecutionContext(

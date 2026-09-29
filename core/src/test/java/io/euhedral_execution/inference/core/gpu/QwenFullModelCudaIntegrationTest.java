@@ -438,71 +438,88 @@ class QwenFullModelCudaIntegrationTest {
 
     @Test
     @Timeout(value = 600, unit = TimeUnit.SECONDS)
-    void macroPrefillRegionsMatchReferenceHiddenLogitsAndPersistentStateBitwise() throws Exception {
+    void productionPrefillRouteMatchesReferenceHiddenLogitsAndPersistentStateBitwise() throws Exception {
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
                 QwenModel model = QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu)) {
+            var production = new QwenExecutionPlan(model.weights());
+            var reference = QwenExecutionPlan.reference(model.weights());
             for (int rows : new int[] {64, 256, 512, 1024}) {
-                short[] expectedHidden = null, expectedLogits = null, expectedDecode = null;
-                String expectedState = null, expectedDecodeState = null;
+                var selected = production.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
+                boolean streamed =
+                        selected.instructions().stream().anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.FFN_STREAMED);
+                assertEquals(rows == 256, streamed, "streamed FFN qualification M=" + rows);
+                assertTrue(selected.instructions().stream()
+                        .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_PRODUCERS));
                 int[] tokens = new int[rows];
                 for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
-                for (var regions : QwenExecutionPlan.PrefillRegions.values()) {
-                    var owner = new QwenExecutionPlan(model.weights(), regions);
-                    var sequence = new QwenSequenceState(900 + regions.ordinal());
-                    try {
-                        RunResult prefill = execute(
-                                gpu,
-                                owner.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows),
-                                sequence,
-                                QwenExecutionContext.ExecutionKind.PREFILL,
-                                0,
-                                tokens,
-                                List.of(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
-                                QwenLogitsRequirement.LAST_TOKEN);
-                        try {
-                            short[] hidden = prefill.buffers().get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
-                            String state = macroStateFingerprint(gpu, model.weights(), sequence);
-                            if (expectedHidden == null) {
-                                expectedHidden = hidden;
-                                expectedLogits = prefill.logits();
-                                expectedState = state;
-                            } else {
-                                assertArrayEquals(expectedHidden, hidden, regions + " hidden M=" + rows);
-                                assertArrayEquals(expectedLogits, prefill.logits(), regions + " logits M=" + rows);
-                                assertEquals(expectedState, state, regions + " state M=" + rows);
-                            }
-                        } finally {
-                            prefill.closeLogits();
-                        }
-                        RunResult decode = execute(
-                                gpu,
-                                owner,
-                                sequence,
-                                QwenExecutionContext.ExecutionKind.DECODE,
-                                rows,
-                                new int[] {INITIAL_TOKEN},
-                                List.of(),
-                                QwenLogitsRequirement.LAST_TOKEN);
-                        try {
-                            String state = macroStateFingerprint(gpu, model.weights(), sequence);
-                            if (expectedDecode == null) {
-                                expectedDecode = decode.logits();
-                                expectedDecodeState = state;
-                            } else {
-                                assertArrayEquals(expectedDecode, decode.logits(), regions + " decode M=" + rows);
-                                assertEquals(expectedDecodeState, state, regions + " decode state M=" + rows);
-                            }
-                        } finally {
-                            decode.closeLogits();
-                        }
-                        System.out.println("MACRO_BITWISE PASS rows=" + rows + " regions=" + regions
-                                + " workspace_bytes=" + prefill.workspaceBytes());
-                    } finally {
-                        sequence.complete();
-                    }
-                }
+                RouteResult expected = runRoute(gpu, model, reference, rows, tokens, 900 + rows);
+                RouteResult actual = runRoute(gpu, model, production, rows, tokens, 901 + rows);
+                assertArrayEquals(expected.hidden(), actual.hidden(), "hidden M=" + rows);
+                assertArrayEquals(expected.logits(), actual.logits(), "logits M=" + rows);
+                assertEquals(expected.state(), actual.state(), "state M=" + rows);
+                assertArrayEquals(expected.decodeLogits(), actual.decodeLogits(), "decode M=" + rows);
+                assertEquals(expected.decodeState(), actual.decodeState(), "decode state M=" + rows);
+                System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows + " streamed=" + streamed
+                        + " workspace_bytes=" + actual.workspaceBytes()
+                        + " reference_workspace_bytes=" + expected.workspaceBytes());
             }
+        }
+    }
+
+    private record RouteResult(
+            short[] hidden,
+            short[] logits,
+            String state,
+            short[] decodeLogits,
+            String decodeState,
+            long workspaceBytes) {}
+
+    private static RouteResult runRoute(
+            CudaGpuMemory gpu, QwenModel model, QwenExecutionPlan plan, int rows, int[] tokens, long sequenceId)
+            throws Exception {
+        var sequence = new QwenSequenceState(sequenceId);
+        try {
+            RunResult prefill = execute(
+                    gpu,
+                    plan.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows),
+                    sequence,
+                    QwenExecutionContext.ExecutionKind.PREFILL,
+                    0,
+                    tokens,
+                    List.of(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                    QwenLogitsRequirement.LAST_TOKEN);
+            short[] hidden, logits;
+            String state;
+            try {
+                hidden = prefill.buffers().get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
+                logits = prefill.logits();
+                state = macroStateFingerprint(gpu, model.weights(), sequence);
+            } finally {
+                prefill.closeLogits();
+            }
+            RunResult decode = execute(
+                    gpu,
+                    plan,
+                    sequence,
+                    QwenExecutionContext.ExecutionKind.DECODE,
+                    rows,
+                    new int[] {INITIAL_TOKEN},
+                    List.of(),
+                    QwenLogitsRequirement.LAST_TOKEN);
+            try {
+                return new RouteResult(
+                        hidden,
+                        logits,
+                        state,
+                        decode.logits(),
+                        macroStateFingerprint(gpu, model.weights(), sequence),
+                        prefill.workspaceBytes());
+            } finally {
+                decode.closeLogits();
+            }
+        } finally {
+            sequence.complete();
         }
     }
 

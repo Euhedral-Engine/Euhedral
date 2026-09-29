@@ -72,6 +72,40 @@ workspace owns only transient activation buffers. Sequence state is closed on co
 or failure, after no frame can still access it. The explicit norm/projection constructor remains a
 low-level operator slice for existing tests and does not construct a synthetic transformer layer.
 
+## Prefill and decode routes
+
+For a complete model, `QwenExecutionPlan.forExecution(kind, rows)` selects the topology per quantum.
+There is no runtime or serving switch; the plan owns its fixed views and any view requalifies through
+its owner.
+
+```text
+prefill:
+  M == 256 and FFN 5120 x 17408 -> streamed C + A + D + F
+  otherwise, M >= 64            -> combined A + B + D + F
+  M < 64                        -> A + D, ordinary FFN and attention
+
+decode:
+  reference instruction topology
+```
+
+- A: rounded residual add + following RMSNorm (the final model layer keeps its plain residual).
+- B: Q3 gate/up with a SwiGLU epilogue; ordinary Q3 down.
+- C: gate/up+SwiGLU into two bounded feature slots consumed by a down pass that carries FP32
+  accumulators across feature regions. It owns internal CUDA streams even in SYNC outer mode.
+- D: joint BF16 A/B projection + GDN control, submitted before the heavy Q4/Q5 projections.
+- F: Q4/Q5 attention producers with in-place query normalization and direct K/V cache writes,
+  committed once at successful completion.
+
+The complete model admits only native-supported projection/attention geometry (128-aligned hidden
+width, 256-wide attention heads, a GDN convolution kernel of 2..32, and RMS epsilon representable
+as a positive finite float). B's 128-aligned input and 32-aligned output follow from those admitted
+weights. Workspace lifetime sharing applies only when both F and B/C occur in the selected view.
+Region views share storage through fixed, named lifetime pairs
+(`QwenExecutionWorkspace.configureRegionStorage`); a shared view cannot be detached. Lower-level
+Q3/Q4/Q5 kernel dispatch is chosen natively by shape. `QwenExecutionPlan.reference(weights)` is
+the unfused oracle used by tests; staged plans (`prefix`, `embeddingOnly`, operator slices) are
+also reference-only.
+
 ## Completion boundary
 
 All GPU operations remain synchronous. An operation's output becomes ready only after CUDA
