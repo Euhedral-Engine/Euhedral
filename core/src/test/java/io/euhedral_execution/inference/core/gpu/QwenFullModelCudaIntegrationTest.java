@@ -448,7 +448,7 @@ class QwenFullModelCudaIntegrationTest {
                 var selected = production.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
                 boolean streamed =
                         selected.instructions().stream().anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.FFN_STREAMED);
-                assertEquals(rows == 256, streamed, "streamed FFN qualification M=" + rows);
+                assertEquals(rows == 64 || rows == 1024, streamed, "streamed FFN qualification M=" + rows);
                 assertTrue(selected.instructions().stream()
                         .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_PRODUCERS));
                 int[] tokens = new int[rows];

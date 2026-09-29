@@ -73,7 +73,7 @@ class QwenPrefillRouteTest {
     void streamedFfnIsSelectedOnlyAtItsExactQualifiedGeometry() {
         var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
         var plan = new QwenExecutionPlan(weights);
-        var streamed = plan.forExecution(ExecutionKind.PREFILL, 256);
+        var streamed = plan.forExecution(ExecutionKind.PREFILL, 64);
         int layers = weights.config().numHiddenLayers();
         assertEquals(layers, count(streamed, Kind.FFN_STREAMED));
         assertFalse(has(streamed, Kind.Q3_GATE_UP_SWIGLU));
@@ -84,10 +84,24 @@ class QwenPrefillRouteTest {
         assertEquals(5120, streamed.bufferWidth(Buffer.FFN_ACCUMULATORS));
         assertTrue(streamed.reusePrefillStorage());
         assertTopology(streamed);
-        for (int rows : new int[] {64, 255, 257, 512, 1024}) {
+        assertSame(streamed, plan.forExecution(ExecutionKind.PREFILL, 1024));
+        for (int rows : new int[] {65, 255, 256, 257, 512, 1023, 1025}) {
             var fallback = plan.forExecution(ExecutionKind.PREFILL, rows);
             assertNotSame(streamed, fallback, "rows=" + rows);
             assertCombined(layers, fallback);
+        }
+    }
+
+    @Test
+    void materializedFfnDownHasItsOwnSemanticInstruction() {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408));
+        for (int rows : new int[] {256, 512}) {
+            var selected = plan.forExecution(ExecutionKind.PREFILL, rows);
+            assertTrue(selected.instructions().stream()
+                    .anyMatch(i -> i.kind().name().equals("Q3_FFN_DOWN")));
+            assertFalse(selected.instructions().stream()
+                    .anyMatch(
+                            i -> i.kind() == Kind.Q3_LINEAR && i.outputBuffers().contains(Buffer.FFN_DELTA)));
         }
     }
 
@@ -202,9 +216,9 @@ class QwenPrefillRouteTest {
     @Test
     void streamedWorkspaceHostsBoundedSlotsAndCarryInRetiredProjectionStorage() {
         var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408))
-                .forExecution(ExecutionKind.PREFILL, 256);
+                .forExecution(ExecutionKind.PREFILL, 64);
         var gpu = new QwenExecutionFixtures.RecordingGpu();
-        try (var workspace = new QwenExecutionWorkspace(gpu, 256, plan, QwenLogitsRequirement.NONE)) {
+        try (var workspace = new QwenExecutionWorkspace(gpu, 64, plan, QwenLogitsRequirement.NONE)) {
             workspace.allocateBuffers();
             assertShared(workspace, Buffer.VALUE_Z_PROJECTED, Buffer.FFN_STAGING);
             assertShared(workspace, Buffer.QK_PROJECTED, Buffer.FFN_ACCUMULATORS);

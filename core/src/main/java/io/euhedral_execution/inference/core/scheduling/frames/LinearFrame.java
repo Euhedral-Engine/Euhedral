@@ -32,6 +32,15 @@ public final class LinearFrame extends QwenInstructionFrame {
                 ? context.workspace().address(instruction.outputBuffers().getFirst())
                 : context.workspace().projectionAddress(instruction.outputBufferIndex());
         switch (instruction.kind()) {
+            case Q3_FFN_DOWN ->
+                gpu().q3FfnDownBf16(
+                                input,
+                                instruction.weightAddress(),
+                                output,
+                                rows,
+                                instruction.inputWidth(),
+                                instruction.outputWidth(),
+                                instruction.weightByteSize());
             case Q3_LINEAR ->
                 gpu().linearQ3Bf16(
                                 input,

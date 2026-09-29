@@ -15,6 +15,7 @@ STUBS = r'''
 typedef void* cudaStream_t;
 typedef void* cudaEvent_t;
 typedef void* CUstream;
+typedef void* CUfunction;
 #define EUHEDRAL_CUDA_SUCCESS 0
 #define EUHEDRAL_CUDA_INVALID_ARGUMENT -1
 #define EUHEDRAL_CUDA_FORMAT_MISMATCH -2
@@ -22,6 +23,8 @@ typedef void* CUstream;
 #define cudaStreamNonBlocking 1
 #define cudaEventDisableTiming 2
 static void *ffn_stream_gate=(void*)10, *ffn_stream_down=(void*)11;
+static void *stream_gate64=(void*)10, *stream_gate128=(void*)10;
+static void *stream_down64=(void*)11, *stream_down128=(void*)11;
 static int fail_at, call_count, asynchronous, pending, fail_drains, next_event;
 static int trace_kind[256], trace_handle[256], pending_before[256];
 static unsigned char buffers[8 << 20] __attribute__((aligned(16)));
@@ -72,7 +75,7 @@ int probe(int injected_call, int async_mode) {
     uint64_t gg=34816ull*80, dg=5120ull*272;
     uint64_t gb=((gg*24+255)&~255ull)+gg*2, db=((dg*24+255)&~255ull)+dg*2;
     return euhedral_cuda_q3_ffn_streamed_bf16(buffers,buffers,buffers,buffers,buffers,
-            (float*)buffers,256,5120,17408,gb,db);
+            (float*)buffers,64,5120,17408,gb,db);
 }
 int calls(void) {return call_count;}
 int kind(int i) {return trace_kind[i];}
@@ -94,7 +97,7 @@ class StreamedFfnLifecycleTest(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix='ffn-lifecycle-')
         cls.addClassCleanup(cls.directory.cleanup)
         path = pathlib.Path(cls.directory.name)
-        (path / 'probe.c').write_text(STUBS + source[start:end] + WRAPPER)
+        (path / 'probe.c').write_text(STUBS + '\n#include "' + str(ROOT / "src/qwen_ffn_policy.h") + '"\n' + source[start:end] + WRAPPER)
         subprocess.run([cc, '-std=c11', '-shared', '-fPIC', '-O0', str(path / 'probe.c'),
                         '-o', str(path / 'probe.so')], check=True, capture_output=True)
         cls.lib = ctypes.CDLL(str(path / 'probe.so'))
