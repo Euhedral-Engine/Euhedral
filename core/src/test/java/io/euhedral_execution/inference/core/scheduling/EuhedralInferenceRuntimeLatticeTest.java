@@ -337,7 +337,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                     assertFalse(runners.get(index).isAttached(), "completed runner still has its lattice downstream");
                     assertFalse(sequenceRuntime.hasAttachedRunner(), "runtime retained a detached runner");
                 }
-                assertTrue(lattice.isDrained(), "Euhedral workers retained runnable frames after disconnection");
+                awaitDrained(lattice);
                 for (QwenSequenceState sequence : sequences) assertEquals(1, sequence.currentTokenPosition());
             } finally {
                 gpu.projectionGate.release();
@@ -488,6 +488,12 @@ class EuhedralInferenceRuntimeLatticeTest {
                 expectedRegistrations,
                 registrationProbe.getThreadCount(),
                 "worker source partitions did not register before source attachment");
+    }
+
+    private static void awaitDrained(ControlPlaneLattice lattice) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!lattice.isDrained() && System.nanoTime() < deadline) Thread.sleep(1);
+        assertTrue(lattice.isDrained(), "Euhedral workers retained runnable frames after disconnection");
     }
 
     private static void verifySequenceStateSurvivesRunnerTeardown(ControlPlaneLattice lattice) throws Exception {
