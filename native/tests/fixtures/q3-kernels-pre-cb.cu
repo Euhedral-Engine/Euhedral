@@ -1,7 +1,6 @@
 #include "strategies/scalar.cuh"
 #include "strategies/decode.cuh"
 #include "strategies/prefill.cuh"
-#include "strategies/k32_prefill.cuh"
 
 // MMA leaves per CTA AUTO tile. WmmaLeaf remains the portable reference; the
 // explicit leaves' FP32 accumulators are tested bitwise against it (see
@@ -81,15 +80,4 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_wmma(
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];
     q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE, q3::WmmaLeaf<Tile>>(input, weights, output, rows, in_features, out_features, scale_offset,
             staging, b_hi, b_lo);
-}
-
-// Exact operator/row shapes measured for the K32 compact-B-only schedule.
-// Host AUTO selects this optional symbol only when its policy and load both pass.
-extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_k32_cb(
-        const unsigned short* input, const unsigned char* weights, unsigned short* output,
-        unsigned int rows, unsigned int in_features, unsigned int out_features,
-        unsigned long long scale_offset) {
-    __shared__ k32_probe::Shared storage;
-    k32_probe::run<false, false, false, true>(input, weights, output, rows, in_features,
-            out_features, scale_offset, nullptr, storage);
 }

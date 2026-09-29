@@ -687,6 +687,32 @@ class Q3PrimitiveTest(unittest.TestCase):
                         self.assertEqual(gpu.download(actual, rows * outputs * 2),
                                          gpu.download(expected, rows * outputs * 2))
 
+    def test_compact_b_kernel_matches_tile64_across_k_generation_counts(self):
+        gpu = self.gpu
+        rows, outputs = 64, 32
+        for width in (32, 64, 96, 128):
+            groups = ((width + 127) // 128) * 2
+            scale_offset = (outputs * groups * 24 + 255) & ~255
+            payload = bytearray(self.rng.randrange(256)
+                                for _ in range(scale_offset + outputs * groups * 2))
+            for index in range(outputs * groups):
+                struct.pack_into('<H', payload, scale_offset + index * 2, 0x3555)
+            values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
+            with contextlib.ExitStack() as stack:
+                source = self.owned(stack, gpu.upload(struct.pack(f'<{len(values)}H', *values)))
+                weights = self.owned(stack, gpu.upload(payload))
+                expected = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0))
+                actual = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0))
+                grid = (rows + 63) // 64
+                args = lambda destination: [C.c_uint64(source), C.c_uint64(weights),
+                        C.c_uint64(destination), C.c_uint(rows), C.c_uint(width),
+                        C.c_uint(outputs), C.c_ulonglong(scale_offset)]
+                gpu.launch('probe_sequential_64', grid, args(expected))
+                gpu.launch('euhedral_q3_prefill_64_k32_cb', grid, args(actual))
+                with self.subTest(width=width, generations=width // 32):
+                    self.assertEqual(gpu.download(actual, rows * outputs * 2),
+                                     gpu.download(expected, rows * outputs * 2))
+
     def test_prefetch_handles_two_byte_aligned_input_base(self):
         gpu = self.gpu
         rows, width, outputs = 33, 128, 35

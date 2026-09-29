@@ -14,7 +14,7 @@ PRODUCT = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
 class Q3SharedOverlayTest(unittest.TestCase):
     def test_packaged_kernel_source_matches(self):
         for asset in ('q3/kernels.cu', 'q3/strategies/prefill.cuh',
-                      'q3/primitives/prefetch.cuh'):
+                      'q3/strategies/k32_prefill.cuh', 'q3/primitives/prefetch.cuh'):
             with self.subTest(asset=asset):
                 self.assertEqual((ROOT / 'native/src' / asset).read_bytes(),
                                  (PRODUCT / asset).read_bytes())
@@ -95,7 +95,8 @@ class Q3SharedOverlayTest(unittest.TestCase):
             cleanup.callback(gpu.close)
             attribute = _bind(CUDA, 'cuFuncGetAttribute', [C.POINTER(I), I, P])
             for kernel, expected_bytes in [('euhedral_q3_prefill', 15360),
-                                           ('euhedral_q3_prefill_64', 18432)]:
+                                           ('euhedral_q3_prefill_64', 18432),
+                                           ('euhedral_q3_prefill_64_k32_cb', 16512)]:
                 with self.subTest(kernel=kernel):
                     function = P()
                     _check(gpu.function(C.byref(function), gpu.module, kernel.encode()), kernel)
