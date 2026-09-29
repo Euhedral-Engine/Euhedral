@@ -1,5 +1,6 @@
 """Fault-inject the actual compound host function; no CUDA device is touched."""
 import ctypes
+import os
 import pathlib
 import shutil
 import subprocess
@@ -97,9 +98,19 @@ class StreamedFfnLifecycleTest(unittest.TestCase):
         subprocess.run([cc, '-std=c11', '-shared', '-fPIC', '-O0', str(path / 'probe.c'),
                         '-o', str(path / 'probe.so')], check=True, capture_output=True)
         cls.lib = ctypes.CDLL(str(path / 'probe.so'))
+        cls.addClassCleanup(cls._unload_library)
         cls.lib.probe.argtypes = [ctypes.c_int, ctypes.c_int]
         for symbol in ['kind', 'handle', 'borrowed']:
             getattr(cls.lib, symbol).argtypes = [ctypes.c_int]
+
+    @classmethod
+    def _unload_library(cls):
+        library = getattr(cls, 'lib', None)
+        if library is None:
+            return
+        if os.name == 'nt':
+            import _ctypes
+            _ctypes.FreeLibrary(library._handle)
 
     def trace(self):
         return [(self.lib.kind(i), self.lib.handle(i), self.lib.borrowed(i))
