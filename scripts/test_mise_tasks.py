@@ -25,6 +25,9 @@ class MiseTasksTest(unittest.TestCase):
         self.assertIn('      - "mise.toml"', workflow)
         self.assertNotIn('      - ".mise.toml"', workflow)
         self.assertIn("  push:\n    branches: [main]", workflow)
+        self.assertEqual(2, workflow.count('      - "api/**"'))
+        self.assertEqual(2, workflow.count('      - "core/**"'))
+        self.assertEqual(2, workflow.count('      - "benchmark/**"'))
         for action in (
             "actions/checkout@v7.0.1",
             "jdx/mise-action@v5.0.0",
