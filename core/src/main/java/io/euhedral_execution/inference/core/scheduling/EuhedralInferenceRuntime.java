@@ -63,9 +63,16 @@ public final class EuhedralInferenceRuntime {
             throws InterruptedException, ExecutionException {
         List<QwenExecutionContext> acceptedContexts = List.copyOf(Objects.requireNonNull(contexts, "contexts"));
         if (acceptedContexts.isEmpty()) return List.of();
+        QwenExecutionPlan prefillPlan = this.plan.forExecution(
+                QwenExecutionContext.ExecutionKind.PREFILL,
+                acceptedContexts.getFirst().inputTokenCount());
+        QwenExecutionPlan executionPlan = acceptedContexts.getFirst().plan() == prefillPlan ? prefillPlan : this.plan;
         // Each call owns its source and completion futures; the fabric schedules independent inputs.
-        var runner = new QwenExecutionRunner(
-                this.plan, this.gpu, Objects.requireNonNull(terminalConsumer, "terminalConsumer"));
+        Objects.requireNonNull(terminalConsumer, "terminalConsumer");
+        boolean homogeneous = acceptedContexts.stream().allMatch(context -> context.plan() == executionPlan);
+        var runner = homogeneous
+                ? QwenExecutionRunner.concrete(executionPlan, this.gpu, terminalConsumer)
+                : new QwenExecutionRunner(this.plan, this.gpu, terminalConsumer);
         admit();
         Throwable executionFailure = null;
         try {

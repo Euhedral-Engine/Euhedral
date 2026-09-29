@@ -68,7 +68,8 @@ public final class QwenExecutionContext {
             long startPosition,
             int[] tokenIds,
             QwenLogitsRequirement logitsRequirement) {
-        this.plan = Objects.requireNonNull(plan, "plan");
+        this.plan = Objects.requireNonNull(plan, "plan")
+                .forExecution(kind, Objects.requireNonNull(tokenIds, "tokenIds").length);
         this.logitsRequirement = Objects.requireNonNull(logitsRequirement, "logitsRequirement");
         this.sequence = Objects.requireNonNull(sequence, "sequence");
         this.kind = Objects.requireNonNull(kind, "kind");
@@ -78,8 +79,9 @@ public final class QwenExecutionContext {
         }
         this.startPosition = startPosition;
         this.tokenIds = tokenIds.clone();
-        this.remainingDependencies = new AtomicIntegerArray(plan.instructions().size());
-        for (QwenExecutionPlan.Instruction instruction : plan.instructions()) {
+        this.remainingDependencies =
+                new AtomicIntegerArray(this.plan.instructions().size());
+        for (QwenExecutionPlan.Instruction instruction : this.plan.instructions()) {
             remainingDependencies.set(
                     instruction.id(), instruction.dependencies().size());
         }

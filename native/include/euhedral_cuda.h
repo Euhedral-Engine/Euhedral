@@ -155,6 +155,26 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_gated_rms_norm_bf16(
         uint32_t head_dim,
         float epsilon);
 
+// Owns internal streams even with synchronous outer submission. On ANY error, the caller
+// must prove device completion or quarantine all borrowed buffers before releasing them.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_ffn_streamed_bf16(
+        const void* input, const void* gate_weights, const void* down_weights, void* output,
+        void* slots, float* accumulators, uint32_t rows, uint32_t hidden, uint32_t intermediate,
+        uint64_t gate_bytes, uint64_t down_bytes);
+
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_gate_up_swiglu_bf16(
+        const void* input, const void* weights, void* output, uint32_t rows,
+        uint32_t width, uint32_t outputs, uint64_t weight_bytes);
+
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_rms_norm_bf16(
+        const void* residual, const void* delta, const void* weight,
+        void* hidden, void* normalized, uint32_t rows, uint32_t width, float epsilon);
+
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_project_control_fp32(
+        const void* input, const void* a_weight, const void* b_weight,
+        const float* a_log, const float* dt_bias, float* g, float* beta,
+        uint32_t rows, uint32_t width, uint32_t heads);
+
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_add_bf16(
         const void* device_residual,
         const void* device_delta,
@@ -169,6 +189,12 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_swiglu_bf16(
         uint32_t intermediate_size);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_zero_device_memory(void* device_address, uint64_t byte_size);
+
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_producers_bf16(
+        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
+        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
+        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
+        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         const void* device_query_key,

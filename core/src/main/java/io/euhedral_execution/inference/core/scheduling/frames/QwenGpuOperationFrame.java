@@ -30,10 +30,55 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
     @Override
     protected void perform(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         switch (instruction.kind()) {
+            case FFN_STREAMED ->
+                gpu().q3FfnStreamedBf16(
+                                input(context, instruction, 0),
+                                instruction.weightAddress(0),
+                                instruction.weightAddress(1),
+                                output(context, instruction, 0),
+                                output(context, instruction, 1),
+                                output(context, instruction, 2),
+                                context.inputTokenCount(),
+                                instruction.inputWidth(),
+                                context.plan().weights().config().intermediateSize(),
+                                instruction.weightByteSize(0),
+                                instruction.weightByteSize(1));
+            case Q3_GATE_UP_SWIGLU ->
+                gpu().q3GateUpSwiGluBf16(
+                                input(context, instruction, 0),
+                                instruction.weightAddress(),
+                                output(context, instruction, 0),
+                                context.inputTokenCount(),
+                                instruction.inputWidth(),
+                                instruction.outputWidth(),
+                                instruction.weightByteSize());
+            case RESIDUAL_RMS_NORM ->
+                gpu().residualRmsNormBf16(
+                                input(context, instruction, 0),
+                                input(context, instruction, 1),
+                                instruction.weightAddress(),
+                                output(context, instruction, 0),
+                                output(context, instruction, 1),
+                                context.inputTokenCount(),
+                                instruction.outputWidth(),
+                                (float) context.plan().weights().config().rmsNormEpsilon());
+            case GDN_PROJECT_CONTROL ->
+                gpu().gdnProjectControlFp32(
+                                input(context, instruction, 0),
+                                instruction.weightAddress(0),
+                                instruction.weightAddress(1),
+                                instruction.weightAddress(2),
+                                instruction.weightAddress(3),
+                                output(context, instruction, 0),
+                                output(context, instruction, 1),
+                                context.inputTokenCount(),
+                                instruction.inputWidth(),
+                                instruction.outputWidth());
             case GDN_CONTROL -> runControl(context, instruction);
             case GDN_CONVOLUTION -> runConvolution(context, instruction);
             case GDN_RECURRENCE -> runRecurrence(context, instruction);
             case GDN_GATED_RMS_NORM -> runGatedRmsNorm(context, instruction);
+            case ATTENTION_PRODUCERS -> runAttentionProducers(context, instruction);
             case ATTENTION_QK_NORM_ROPE -> runAttentionQkNormRope(context, instruction);
             case ATTENTION_KV_APPEND -> runAttentionKvAppend(context, instruction);
             case ATTENTION_CAUSAL -> runAttentionCausal(context, instruction);
@@ -120,6 +165,35 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                         context.startPosition(),
                         (float) config.rmsNormEpsilon(),
                         config.ropeTheta());
+    }
+
+    private void runAttentionProducers(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
+        QwenConfig config = context.plan().weights().config();
+        AttentionKvState state = attentionState(context, instruction);
+        state.prepareAppend(context.startPosition(), context.inputTokenCount());
+        gpu().attentionProducersBf16(
+                        input(context, instruction, 0),
+                        instruction.weightAddress(0),
+                        instruction.weightAddress(1),
+                        instruction.weightAddress(2),
+                        instruction.weightAddress(3),
+                        output(context, instruction, 0),
+                        output(context, instruction, 1),
+                        state.keyCacheAddress(),
+                        state.valueCacheAddress(),
+                        context.inputTokenCount(),
+                        instruction.inputWidth(),
+                        config.numAttentionHeads(),
+                        config.numKeyValueHeads(),
+                        config.attentionHeadDim(),
+                        (int) Math.round(config.attentionHeadDim() * config.partialRotaryFactor()),
+                        context.startPosition(),
+                        (float) config.rmsNormEpsilon(),
+                        config.ropeTheta(),
+                        instruction.weightByteSize(0),
+                        instruction.weightByteSize(1));
+        this.pendingAppendState = state;
+        this.pendingAppendTokens = context.inputTokenCount();
     }
 
     private void runAttentionKvAppend(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {

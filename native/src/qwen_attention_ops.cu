@@ -16,7 +16,8 @@ __device__ __forceinline__ float attention_reduce_sum(float value, float* scratc
     return result;
 }
 
-extern "C" __global__ void euhedral_attention_qk_norm_rope_bf16(
+template<bool CACHE>
+static __device__ __forceinline__ void qk_norm_rope(
         const __nv_bfloat16* queryKey,
         const __nv_bfloat16* queryNorm,
         const __nv_bfloat16* keyNorm,
@@ -28,7 +29,7 @@ extern "C" __global__ void euhedral_attention_qk_norm_rope_bf16(
         uint32_t rotaryDim,
         uint64_t startPosition,
         float epsilon,
-        double ropeTheta) {
+        double ropeTheta, __nv_bfloat16* keyCache) {
     const uint32_t rowHead = blockIdx.x;
     const uint32_t row = rowHead / (queryHeads + keyValueHeads);
     const uint32_t head = rowHead % (queryHeads + keyValueHeads);
@@ -59,7 +60,29 @@ extern "C" __global__ void euhedral_attention_qk_norm_rope_bf16(
                 * (1.0f + __bfloat162float(norm[pair]));
         result = lane < half ? value * cosine - paired * sine : value * cosine + paired * sine;
     }
-    output[outputOffset + lane] = __float2bfloat16_rn(result);
+    // The in-place query path cannot overwrite another warp's RoPE pair read.
+    if (CACHE) __syncthreads();
+    if (CACHE && !isQuery)
+        keyCache[(startPosition + row) * keyValueHeads * headDim
+                + static_cast<uint64_t>(head - queryHeads) * headDim + lane] = __float2bfloat16_rn(result);
+    else output[outputOffset + lane] = __float2bfloat16_rn(result);
+}
+
+extern "C" __global__ void euhedral_attention_qk_norm_rope_bf16(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* queryNorm, const __nv_bfloat16* keyNorm,
+        __nv_bfloat16* output, uint32_t rows, uint32_t queryHeads, uint32_t keyValueHeads,
+        uint32_t headDim, uint32_t rotaryDim, uint64_t startPosition, float epsilon, double ropeTheta) {
+    qk_norm_rope<false>(queryKey, queryNorm, keyNorm, output, rows, queryHeads, keyValueHeads,
+            headDim, rotaryDim, startPosition, epsilon, ropeTheta, nullptr);
+}
+
+extern "C" __global__ void euhedral_attention_qk_norm_cache_bf16(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* queryNorm, const __nv_bfloat16* keyNorm,
+        __nv_bfloat16* output, uint32_t rows, uint32_t queryHeads, uint32_t keyValueHeads,
+        uint32_t headDim, uint32_t rotaryDim, uint64_t startPosition, float epsilon, double ropeTheta,
+        __nv_bfloat16* keyCache) {
+    qk_norm_rope<true>(queryKey, queryNorm, keyNorm, output, rows, queryHeads, keyValueHeads,
+            headDim, rotaryDim, startPosition, epsilon, ropeTheta, keyCache);
 }
 
 extern "C" __global__ void euhedral_attention_kv_append_bf16(

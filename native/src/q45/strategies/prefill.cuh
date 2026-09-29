@@ -39,11 +39,20 @@ union alignas(32) PrefillShared {
 // then stores accumulators to shared, barriers, and writes BF16 output. The two
 // per-step barriers are the single-buffer reuse edges. A 2-byte-aligned input
 // base takes the sequential staging path, which stages identical tiles.
-template<int BITS, class Tile, int A_STRIDE, int B_STRIDE, class Leaf>
+struct MatrixWriteback {
+    template<int ROWS, int COLS, int THREADS>
+    __device__ __forceinline__ void write(unsigned short* output, const float* result,
+            unsigned int rows, unsigned int width, unsigned int row, unsigned int col, unsigned int thread) const {
+        write_output_tile<ROWS, COLS, THREADS>(output, result, rows, width, row, col, thread);
+    }
+};
+
+template<int BITS, class Tile, int A_STRIDE, int B_STRIDE, class Leaf, class Writeback = MatrixWriteback>
 static __device__ __forceinline__ void tiled_prefill(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features,
-        PrefillShared<Tile, A_STRIDE>& staging, __nv_bfloat16* b_hi, __nv_bfloat16* b_lo) {
+        PrefillShared<Tile, A_STRIDE>& staging, __nv_bfloat16* b_hi, __nv_bfloat16* b_lo,
+        Writeback writeback = Writeback{}) {
     using Shared = PrefillShared<Tile, A_STRIDE>;
     static_assert(__is_trivial(typename Shared::Activation), "A wrapper must be trivial");
     static_assert(__is_trivial(typename Shared::Result), "result wrapper must be trivial");
@@ -91,7 +100,7 @@ static __device__ __forceinline__ void tiled_prefill(
     float* result = staging.result.values;
     Leaf::store(result, acc, warp);
     __syncthreads();
-    write_output_tile<Tile::kRows, Tile::kCols, kThreads>(
+    writeback.template write<Tile::kRows, Tile::kCols, kThreads>(
             output, result, rows, out_features, row_start, out_start, threadIdx.x);
 }
 

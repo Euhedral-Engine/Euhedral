@@ -86,8 +86,10 @@ final class QwenExecutionFixtures {
     }
 
     static QwenWeights statefulCompactWeights(int vocabularySize) {
-        int hidden = 128;
-        int intermediate = 128;
+        return statefulCompactWeights(vocabularySize, 128, 128);
+    }
+
+    static QwenWeights statefulCompactWeights(int vocabularySize, int hidden, int intermediate) {
         QwenLayerType[] types = {QwenLayerType.GATED_DELTA_NET, QwenLayerType.FULL_ATTENTION};
         QwenConfig config = new QwenConfig(
                 vocabularySize,

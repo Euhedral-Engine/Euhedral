@@ -20,3 +20,4 @@ EXPORTS
     cudaStreamCreateWithFlags
     cudaStreamDestroy
     cudaStreamSynchronize
+    cudaStreamWaitEvent

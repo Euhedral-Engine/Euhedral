@@ -60,6 +60,43 @@ extern "C" __global__ void euhedral_gdn_control_fp32(
     betaOutput[index] = qwen_gdn_sigmoid(bProjection[index]);
 }
 
+// One CTA owns both FP32 projections for one (row, head). Activation loads are shared,
+// while each projection retains the original 128-lane FMA stripes and addition tree.
+extern "C" __global__ __launch_bounds__(128) void euhedral_gdn_project_control_fp32(
+        const __nv_bfloat16* input, const __nv_bfloat16* aWeight, const __nv_bfloat16* bWeight,
+        const float* aLog, const float* dtBias, float* gOutput, float* betaOutput,
+        uint32_t rows, uint32_t width, uint32_t heads) {
+    const uint64_t index = blockIdx.x;
+    if (index >= static_cast<uint64_t>(rows) * heads) return;
+    const uint32_t row = static_cast<uint32_t>(index / heads);
+    const uint32_t head = static_cast<uint32_t>(index % heads);
+    const uint64_t activationBase = static_cast<uint64_t>(row) * width;
+    const uint64_t weightBase = static_cast<uint64_t>(head) * width;
+    float a = 0.0f, b = 0.0f;
+    for (uint32_t k = threadIdx.x; k < width; k += blockDim.x) {
+        const float x = __bfloat162float(input[activationBase + k]);
+        a = fmaf(x, __bfloat162float(aWeight[weightBase + k]), a);
+        b = fmaf(x, __bfloat162float(bWeight[weightBase + k]), b);
+    }
+    __shared__ float partialA[128], partialB[128];
+    partialA[threadIdx.x] = a;
+    partialB[threadIdx.x] = b;
+    __syncthreads();
+    for (uint32_t stride = 64; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partialA[threadIdx.x] += partialA[threadIdx.x + stride];
+            partialB[threadIdx.x] += partialB[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float shifted = partialA[0] + dtBias[head];
+        const float softplus = fmaxf(shifted, 0.0f) + log1pf(expf(-fabsf(shifted)));
+        gOutput[index] = -expf(aLog[head]) * softplus;
+        betaOutput[index] = qwen_gdn_sigmoid(partialB[0]);
+    }
+}
+
 extern "C" __global__ void euhedral_gdn_convolution_bf16(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* valueZ,
         const __nv_bfloat16* convolutionWeights, __nv_bfloat16* convolutionState,
