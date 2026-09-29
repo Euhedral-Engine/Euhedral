@@ -25,9 +25,16 @@ class MiseTasksTest(unittest.TestCase):
         self.assertIn('      - "mise.toml"', workflow)
         self.assertNotIn('      - ".mise.toml"', workflow)
         self.assertIn("  push:\n    branches: [main]", workflow)
-        self.assertIn("uses: jdx/mise-action@v2", workflow)
-        self.assertIn("uses: gradle/actions/setup-gradle@v4", workflow)
-        self.assertIn("uses: actions/cache@v4", workflow)
+        for action in (
+            "actions/checkout@v7.0.1",
+            "jdx/mise-action@v5.0.0",
+            "gradle/actions/setup-gradle@v6.4.0",
+            "actions/cache@v6.1.0",
+            "actions/setup-python@v7.0.0",
+            "actions/upload-artifact@v7.0.1",
+        ):
+            self.assertIn(f"uses: {action}", workflow)
+        self.assertIn("cache-provider: basic", workflow)
         self.assertIn("native/.zig-cache", workflow)
         self.assertIn("native/.zig-global-cache", workflow)
         self.assertIn("hashFiles('mise.toml', 'native/build.zig', 'native/native-products.json')", workflow)

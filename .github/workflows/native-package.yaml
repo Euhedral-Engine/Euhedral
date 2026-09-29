@@ -36,16 +36,18 @@ jobs:
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5.0.0
         with:
           install: true
           cache: true
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6.4.0
+        with:
+          cache-provider: basic
       - name: Cache Zig
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             native/.zig-cache
@@ -53,12 +55,12 @@ jobs:
           key: ${{ runner.os }}-zig-${{ hashFiles('mise.toml', 'native/build.zig', 'native/native-products.json') }}
           restore-keys: |
             ${{ runner.os }}-zig-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
       - name: Build both CUDA products and package Spring Boot
         run: mise exec -- gradle nativeVerify :api:bootJar build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         if: failure()
         with:
           name: failed-tests-${{ matrix.os }}
@@ -68,7 +70,7 @@ jobs:
             benchmark/build/test-results/test/*.xml
       - name: Check ELF/PE targets, imports, and installed CUDA sources
         run: python -m unittest discover -s native/tests -v
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: cuda-native-${{ matrix.os }}
           if-no-files-found: error
