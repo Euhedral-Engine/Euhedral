@@ -44,8 +44,7 @@ class QwenStreamedFfnLifecycleTest {
 
     private static void runCase(Scenario scenario, boolean asynchronous, boolean nativeSucceeded) throws Exception {
         var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
-        var plan = new QwenExecutionPlan(weights, QwenExecutionPlan.PrefillRegions.STREAMED_FFN)
-                .forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 256);
+        var plan = new QwenExecutionPlan(weights).forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 256);
         var sequence = new QwenSequenceState(901);
         var gpu = new HoldingGpu(scenario, asynchronous);
         gpu.nativeSucceeded = nativeSucceeded;

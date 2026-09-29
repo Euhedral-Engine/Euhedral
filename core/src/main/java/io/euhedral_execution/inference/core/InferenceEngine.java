@@ -106,10 +106,7 @@ public final class InferenceEngine implements AutoCloseable {
             QwenArtifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath(), tuning);
             model = bootstrap.loadModel(config.artifactPath(), artifact, gpu);
-            QwenExecutionPlan plan = new QwenExecutionPlan(
-                    model.weights(),
-                    QwenExecutionPlan.PrefillRegions.valueOf(
-                            System.getProperty("euhedral.qwen.prefillRegions", "NONE")));
+            QwenExecutionPlan plan = new QwenExecutionPlan(model.weights());
             lattice = bootstrap.createLattice(config, gpu);
             bootstrap.startLattice(lattice);
             EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);

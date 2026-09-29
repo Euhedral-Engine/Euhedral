@@ -90,6 +90,33 @@ final class QwenExecutionFixtures {
     }
 
     static QwenWeights statefulCompactWeights(int vocabularySize, int hidden, int intermediate) {
+        return statefulCompactWeights(vocabularySize, hidden, intermediate, 256, 1.0, 2, 1.0e-6);
+    }
+
+    static QwenWeights statefulCompactWeightsWithHeadDim(int attentionHeadDim) {
+        return statefulCompactWeights(VOCABULARY, 128, 128, attentionHeadDim, 1.0, 2, 1.0e-6);
+    }
+
+    static QwenWeights statefulCompactWeightsWithRotaryFactor(double factor) {
+        return statefulCompactWeights(VOCABULARY, 128, 128, 256, factor, 2, 1.0e-6);
+    }
+
+    static QwenWeights statefulCompactWeightsWithKernelWidth(int kernelWidth) {
+        return statefulCompactWeights(VOCABULARY, 128, 128, 256, 1.0, kernelWidth, 1.0e-6);
+    }
+
+    static QwenWeights statefulCompactWeightsWithEpsilon(double epsilon) {
+        return statefulCompactWeights(VOCABULARY, 128, 128, 256, 1.0, 2, epsilon);
+    }
+
+    private static QwenWeights statefulCompactWeights(
+            int vocabularySize,
+            int hidden,
+            int intermediate,
+            int attentionHeadDim,
+            double rotaryFactor,
+            int kernelWidth,
+            double epsilon) {
         QwenLayerType[] types = {QwenLayerType.GATED_DELTA_NET, QwenLayerType.FULL_ATTENTION};
         QwenConfig config = new QwenConfig(
                 vocabularySize,
@@ -97,16 +124,16 @@ final class QwenExecutionFixtures {
                 types.length,
                 1,
                 1,
-                128,
+                attentionHeadDim,
                 intermediate,
                 1,
                 1,
                 128,
                 128,
-                2,
-                1.0e-6,
+                kernelWidth,
+                epsilon,
                 1_000_000.0,
-                1.0,
+                rotaryFactor,
                 128,
                 "silu",
                 types,
@@ -118,8 +145,8 @@ final class QwenExecutionFixtures {
                 true,
                 0);
         QwenLayerWeights[] layers = new QwenLayerWeights[types.length];
-        layers[0] = layer(0, hidden, intermediate, gdnWeights(hidden));
-        layers[1] = layer(1, hidden, intermediate, attentionWeights(hidden));
+        layers[0] = layer(0, hidden, intermediate, gdnWeights(hidden, kernelWidth));
+        layers[1] = layer(1, hidden, intermediate, attentionWeights(hidden, attentionHeadDim));
         return new QwenWeights(
                 config,
                 quantized("text/token_embedding", vocabularySize, hidden, WeightFormat.Q3_G64_FP16),
@@ -140,11 +167,11 @@ final class QwenExecutionFixtures {
                         quantized("layer-" + index + "/down", hidden, intermediate, WeightFormat.Q3_G64_FP16)));
     }
 
-    private static QwenCompactGatedDeltaNetWeights gdnWeights(int hidden) {
+    private static QwenCompactGatedDeltaNetWeights gdnWeights(int hidden, int kernelWidth) {
         return new QwenCompactGatedDeltaNetWeights(
                 direct("gdn/a_log", WeightFormat.FP32, 1),
                 direct("gdn/dt_bias", WeightFormat.FP32, 1),
-                direct("gdn/convolution", WeightFormat.BF16, 2, 384),
+                direct("gdn/convolution", WeightFormat.BF16, kernelWidth, 384),
                 direct("gdn/a_projection", WeightFormat.BF16, 1, hidden),
                 direct("gdn/b_projection", WeightFormat.BF16, 1, hidden),
                 quantized("gdn/query_key", 256, hidden, WeightFormat.Q4_G64_FP16),
@@ -153,13 +180,13 @@ final class QwenExecutionFixtures {
                 quantized("gdn/output", hidden, 128, WeightFormat.Q3_G64_FP16));
     }
 
-    private static QwenCompactAttentionWeights attentionWeights(int hidden) {
+    private static QwenCompactAttentionWeights attentionWeights(int hidden, int headDim) {
         return new QwenCompactAttentionWeights(
-                quantized("attention/query_key", 256, hidden, WeightFormat.Q4_G64_FP16),
-                quantized("attention/gate_value", 256, hidden, WeightFormat.Q5_G64_FP16),
-                direct("attention/query_norm", WeightFormat.BF16, 128),
-                direct("attention/key_norm", WeightFormat.BF16, 128),
-                quantized("attention/output", hidden, 128, WeightFormat.Q3_G64_FP16));
+                quantized("attention/query_key", 2 * headDim, hidden, WeightFormat.Q4_G64_FP16),
+                quantized("attention/gate_value", 2 * headDim, hidden, WeightFormat.Q5_G64_FP16),
+                direct("attention/query_norm", WeightFormat.BF16, headDim),
+                direct("attention/key_norm", WeightFormat.BF16, headDim),
+                quantized("attention/output", hidden, headDim, WeightFormat.Q3_G64_FP16));
     }
 
     private static TensorHandle direct(String name, WeightFormat format, int... dimensions) {
@@ -263,6 +290,63 @@ final class QwenExecutionFixtures {
             operations.add("linear:" + weightsAddress);
             if (linearFailure != null) throw linearFailure;
         }
+
+        // Production prefill regions are no-ops for scheduling fakes; subclasses record as needed.
+        @Override
+        public void residualRmsNormBf16(
+                long residual,
+                long delta,
+                long weight,
+                long hidden,
+                long normalized,
+                int rows,
+                int width,
+                float epsilon) {}
+
+        @Override
+        public void gdnProjectControlFp32(
+                long input, long a, long b, long log, long bias, long g, long beta, int rows, int width, int heads) {}
+
+        @Override
+        public void q3GateUpSwiGluBf16(
+                long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {}
+
+        @Override
+        public void q3FfnStreamedBf16(
+                long input,
+                long gateWeights,
+                long downWeights,
+                long output,
+                long slots,
+                long accumulators,
+                int rows,
+                int hidden,
+                int intermediate,
+                long gateBytes,
+                long downBytes) {}
+
+        @Override
+        public void attentionProducersBf16(
+                long input,
+                long q4,
+                long q5,
+                long queryNorm,
+                long keyNorm,
+                long queryKey,
+                long gate,
+                long keys,
+                long values,
+                int rows,
+                int hidden,
+                int queryHeads,
+                int keyHeads,
+                int headDim,
+                int rotaryDim,
+                long start,
+                float epsilon,
+                double theta,
+                long q4Bytes,
+                long q5Bytes) {}
 
         @Override
         public void synchronize() {

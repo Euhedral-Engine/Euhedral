@@ -1,9 +1,11 @@
 #include "q3/strategies/k32_prefill.cuh"
 #include "qwen_ffn_streamed.cu"
 
-// Experimental region: pair the independent N16 branches as gate/up columns.
-// Frozen CB helpers and K32/A/B/MMA schedule are reused without any leaf tuning.
-// The duplicated schedule is isolated here so the qualified CB source stays byte-identical.
+// Region B: pair the independent N16 branches as gate/up columns and apply SwiGLU in the
+// epilogue. Frozen CB helpers and the K32/A/compact-B/MMA schedule are reused unchanged; the
+// schedule is duplicated here so the qualified CB source stays byte-identical. The template
+// flags mirror the CB leaf signature; only <false,false,false,true> is instantiated, and folding
+// them changes generated SASS, so they stay until the kernel is requalified.
 namespace qwen_ffn {
 using namespace k32_probe;
 template<bool EARLY_A, bool EARLY_B, bool DUMP, bool COMPACT_B = false>

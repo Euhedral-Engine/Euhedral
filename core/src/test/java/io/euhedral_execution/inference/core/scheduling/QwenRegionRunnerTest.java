@@ -11,7 +11,7 @@ class QwenRegionRunnerTest {
     @Test
     void oneAttachedSourceAcceptsItsPrefillAndDecodeTopologiesAndRejectsAnotherOwner() throws Exception {
         var weights = EngineExecutionFixture.weights();
-        var owner = new QwenExecutionPlan(weights, QwenExecutionPlan.PrefillRegions.RESIDUAL_NORM);
+        var owner = new QwenExecutionPlan(weights);
         var gpu = new RegionGpu(weights.config().vocabSize());
         var runner = new QwenExecutionRunner(owner, gpu);
         var sequences = new ArrayList<QwenSequenceState>();
@@ -36,7 +36,7 @@ class QwenRegionRunnerTest {
                 assertEquals(
                         QwenExecutionContext.Status.SUCCESS,
                         completion.get(2, TimeUnit.SECONDS).status());
-            var foreign = new QwenExecutionPlan(weights, QwenExecutionPlan.PrefillRegions.RESIDUAL_NORM);
+            var foreign = new QwenExecutionPlan(weights);
             assertThrows(
                     IllegalArgumentException.class,
                     () -> runner.submit(new QwenExecutionContext(
@@ -56,22 +56,21 @@ class QwenRegionRunnerTest {
 
     @Test
     void runnerBuiltFromDerivedViewAdmitsRequalifiedFallbackAndDecode() throws Exception {
-        for (var regions : new QwenExecutionPlan.PrefillRegions[] {
-            QwenExecutionPlan.PrefillRegions.ATTENTION_KV, QwenExecutionPlan.PrefillRegions.STREAMED_KV
-        }) {
-            var weights = EngineExecutionFixture.weights();
-            var owner = new QwenExecutionPlan(weights, regions);
-            var view = owner.forExecution(QwenExecutionContext.ExecutionKind.PREFILL);
-            var gpu = new RegionGpu(weights.config().vocabSize());
-            var runner = new QwenExecutionRunner(view, gpu);
-            new DefaultExecutor().input(runner);
-            try {
-                for (var kind : QwenExecutionContext.ExecutionKind.values()) {
-                    var sequence = new QwenSequenceState(700 + kind.ordinal());
+        var weights = EngineExecutionFixture.weights();
+        var owner = new QwenExecutionPlan(weights);
+        var view = owner.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 256);
+        var gpu = new RegionGpu(weights.config().vocabSize());
+        var runner = new QwenExecutionRunner(view, gpu);
+        new DefaultExecutor().input(runner);
+        try {
+            for (var kind : QwenExecutionContext.ExecutionKind.values()) {
+                for (int rows : new int[] {1, 64}) {
+                    if (kind == QwenExecutionContext.ExecutionKind.DECODE && rows != 1) continue;
+                    var sequence = new QwenSequenceState(700 + kind.ordinal() * 100 + rows);
                     try {
                         var context = new QwenExecutionContext(
-                                view, sequence, kind, 0, new int[1], QwenLogitsRequirement.NONE);
-                        assertSame(owner.forExecution(kind, 1), context.plan());
+                                view, sequence, kind, 0, new int[rows], QwenLogitsRequirement.NONE);
+                        assertSame(owner.forExecution(kind, rows), context.plan());
                         var completion = runner.submit(context);
                         runner.request(1000);
                         assertEquals(
@@ -81,17 +80,17 @@ class QwenRegionRunnerTest {
                         sequence.complete();
                     }
                 }
-            } finally {
-                runner.completeGracefully();
-                runner.awaitTermination();
             }
+        } finally {
+            runner.completeGracefully();
+            runner.awaitTermination();
         }
     }
 
     @Test
     void gracefulCloseWaitsForDerivedGpuCompletionAndItsSuccessors() throws Exception {
         var weights = EngineExecutionFixture.weights();
-        var owner = new QwenExecutionPlan(weights, QwenExecutionPlan.PrefillRegions.RESIDUAL_NORM);
+        var owner = new QwenExecutionPlan(weights);
         var gpu = new HoldingRegionGpu(weights.config().vocabSize());
         var sequence = new QwenSequenceState(601);
         var runner = new QwenExecutionRunner(owner, gpu);
@@ -125,7 +124,7 @@ class QwenRegionRunnerTest {
     @Test
     void cancellingTheCallersFutureDoesNotRetireDerivedGpuWork() throws Exception {
         var weights = EngineExecutionFixture.weights();
-        var owner = new QwenExecutionPlan(weights, QwenExecutionPlan.PrefillRegions.RESIDUAL_NORM);
+        var owner = new QwenExecutionPlan(weights);
         var gpu = new HoldingRegionGpu(weights.config().vocabSize());
         var sequence = new QwenSequenceState(602);
         var runner = new QwenExecutionRunner(owner, gpu);
@@ -186,23 +185,8 @@ class QwenRegionRunnerTest {
     }
 
     private static class RegionGpu extends EngineExecutionFixture.SamplingGpu {
-        @Override
-        public void gdnProjectControlFp32(
-                long input, long a, long b, long log, long bias, long g, long beta, int rows, int width, int heads) {}
-
         RegionGpu(int vocabularySize) {
             super(vocabularySize);
         }
-
-        @Override
-        public void residualRmsNormBf16(
-                long residual,
-                long delta,
-                long weights,
-                long hidden,
-                long normalized,
-                int rows,
-                int width,
-                float epsilon) {}
     }
 }
