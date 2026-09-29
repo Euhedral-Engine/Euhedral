@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
     b.installFile("src/qwen_layer_linear.cu", "share/euhedral_cuda/qwen_layer_linear.cu");
     b.installFile("src/q45_linear_bf16.cu", "share/euhedral_cuda/q45_linear_bf16.cu");
     const q45_sources = [_][]const u8{
-        "kernels.cu", "numeric.cuh", "layout.cuh",
+        "kernels.cu", "numeric.cuh", "layout.cuh", "attention_cache.cuh",
         "primitives/decode.cuh", "primitives/packed_load.cuh", "primitives/staging.cuh",
         "primitives/prefetch.cuh", "primitives/writeback.cuh",
         "strategies/decode.cuh", "strategies/prefill.cuh",
@@ -110,6 +110,8 @@ pub fn build(b: *std.Build) void {
         b.installFile(b.fmt("src/q45/{s}", .{source}), b.fmt("share/euhedral_cuda/q45/{s}", .{source}));
     }
     b.installFile("src/qwen_gdn_ops.cu", "share/euhedral_cuda/qwen_gdn_ops.cu");
+    b.installFile("src/qwen_ffn.cu", "share/euhedral_cuda/qwen_ffn.cu");
+    b.installFile("src/qwen_ffn_streamed.cu", "share/euhedral_cuda/qwen_ffn_streamed.cu");
     b.installFile("src/qwen_elementwise.cu", "share/euhedral_cuda/qwen_elementwise.cu");
     b.installFile("src/qwen_attention_ops.cu", "share/euhedral_cuda/qwen_attention_ops.cu");
 }

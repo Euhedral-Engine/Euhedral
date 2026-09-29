@@ -436,6 +436,107 @@ class QwenFullModelCudaIntegrationTest {
         }
     }
 
+    @Test
+    @Timeout(value = 600, unit = TimeUnit.SECONDS)
+    void macroPrefillRegionsMatchReferenceHiddenLogitsAndPersistentStateBitwise() throws Exception {
+        Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
+        try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
+                QwenModel model = QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu)) {
+            for (int rows : new int[] {64, 256, 512, 1024}) {
+                short[] expectedHidden = null, expectedLogits = null, expectedDecode = null;
+                String expectedState = null, expectedDecodeState = null;
+                int[] tokens = new int[rows];
+                for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
+                for (var regions : QwenExecutionPlan.PrefillRegions.values()) {
+                    var owner = new QwenExecutionPlan(model.weights(), regions);
+                    var sequence = new QwenSequenceState(900 + regions.ordinal());
+                    try {
+                        RunResult prefill = execute(
+                                gpu,
+                                owner.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows),
+                                sequence,
+                                QwenExecutionContext.ExecutionKind.PREFILL,
+                                0,
+                                tokens,
+                                List.of(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                                QwenLogitsRequirement.LAST_TOKEN);
+                        try {
+                            short[] hidden = prefill.buffers().get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
+                            String state = macroStateFingerprint(gpu, model.weights(), sequence);
+                            if (expectedHidden == null) {
+                                expectedHidden = hidden;
+                                expectedLogits = prefill.logits();
+                                expectedState = state;
+                            } else {
+                                assertArrayEquals(expectedHidden, hidden, regions + " hidden M=" + rows);
+                                assertArrayEquals(expectedLogits, prefill.logits(), regions + " logits M=" + rows);
+                                assertEquals(expectedState, state, regions + " state M=" + rows);
+                            }
+                        } finally {
+                            prefill.closeLogits();
+                        }
+                        RunResult decode = execute(
+                                gpu,
+                                owner,
+                                sequence,
+                                QwenExecutionContext.ExecutionKind.DECODE,
+                                rows,
+                                new int[] {INITIAL_TOKEN},
+                                List.of(),
+                                QwenLogitsRequirement.LAST_TOKEN);
+                        try {
+                            String state = macroStateFingerprint(gpu, model.weights(), sequence);
+                            if (expectedDecode == null) {
+                                expectedDecode = decode.logits();
+                                expectedDecodeState = state;
+                            } else {
+                                assertArrayEquals(expectedDecode, decode.logits(), regions + " decode M=" + rows);
+                                assertEquals(expectedDecodeState, state, regions + " decode state M=" + rows);
+                            }
+                        } finally {
+                            decode.closeLogits();
+                        }
+                        System.out.println("MACRO_BITWISE PASS rows=" + rows + " regions=" + regions
+                                + " workspace_bytes=" + prefill.workspaceBytes());
+                    } finally {
+                        sequence.complete();
+                    }
+                }
+            }
+        }
+    }
+
+    private static String macroStateFingerprint(CudaGpuMemory gpu, QwenWeights weights, QwenSequenceState sequence)
+            throws Exception {
+        var hash = java.security.MessageDigest.getInstance("SHA-256");
+        var config = weights.config();
+        for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
+            if (config.layerTypes()[layer] == QwenLayerType.GATED_DELTA_NET) {
+                var gdn = ((GdnSequenceStates) sequence.recurrentState()).forLayer(layer);
+                long channels = 2L * config.linearNumKeyHeads() * config.linearKeyHeadDim()
+                        + (long) config.linearNumValueHeads() * config.linearValueHeadDim();
+                hash.update(readDeviceBytes(
+                        gpu,
+                        gdn.convolutionStateAddress(),
+                        channels * (config.linearConvKernelDim() - 1) * Short.BYTES));
+                hash.update(readDeviceBytes(
+                        gpu,
+                        gdn.recurrentStateAddress(),
+                        (long) config.linearNumValueHeads()
+                                * config.linearKeyHeadDim()
+                                * config.linearValueHeadDim()
+                                * Float.BYTES));
+            } else {
+                var kv = ((AttentionSequenceStates) sequence.kvCacheState()).forLayer(layer);
+                assertEquals(sequence.currentTokenPosition(), kv.length());
+                long bytes = (long) kv.length() * config.numKeyValueHeads() * config.attentionHeadDim() * Short.BYTES;
+                hash.update(readDeviceBytes(gpu, kv.keyCacheAddress(), bytes));
+                hash.update(readDeviceBytes(gpu, kv.valueCacheAddress(), bytes));
+            }
+        }
+        return java.util.HexFormat.of().formatHex(hash.digest());
+    }
+
     private static RunResult execute(
             CudaGpuMemory gpu,
             QwenExecutionPlan plan,
@@ -462,8 +563,25 @@ class QwenFullModelCudaIntegrationTest {
         EnumMap<QwenExecutionPlan.Buffer, short[]> buffers = new EnumMap<>(QwenExecutionPlan.Buffer.class);
         AtomicReference<short[]> logits = new AtomicReference<>();
         AtomicReference<QwenExecutionContext> completedContext = new AtomicReference<>();
+        var workspaceBytes = new java.util.concurrent.atomic.AtomicLong();
         QwenExecutionRunner runner = new QwenExecutionRunner(plan, gpu, context -> {
             completedContext.set(context);
+            var allocations = new java.util.HashMap<Long, Long>();
+            for (var spec : context.plan().bufferSpecs()) {
+                if (!context.workspace().hasBuffer(spec.buffer())) continue;
+                if (spec.buffer() == QwenExecutionPlan.Buffer.LOGITS) {
+                    context.logitsOutput()
+                            .ifPresent(logitsOutput -> allocations.put(
+                                    logitsOutput.deviceAddress(),
+                                    context.workspace().bufferByteSize(spec.buffer())));
+                } else
+                    allocations.merge(
+                            context.workspace().address(spec.buffer()),
+                            context.workspace().bufferByteSize(spec.buffer()),
+                            Math::max);
+            }
+            workspaceBytes.set(
+                    allocations.values().stream().mapToLong(Long::longValue).sum());
             try (Arena arena = Arena.ofShared()) {
                 for (QwenExecutionPlan.Buffer buffer : capturedBuffers) {
                     if (!context.workspace().hasBuffer(buffer)) continue;
@@ -489,7 +607,7 @@ class QwenFullModelCudaIntegrationTest {
                     runner.submit(new QwenExecutionContext(plan, sequence, kind, startPosition, tokenIds, requirement));
             runner.request(plan.instructions().size());
             QwenExecutionContext.Outcome result = outcome.get(600, TimeUnit.SECONDS);
-            RunResult run = new RunResult(completedContext.get(), buffers, logits.get());
+            RunResult run = new RunResult(completedContext.get(), buffers, logits.get(), workspaceBytes.get());
             if (result.status() != QwenExecutionContext.Status.SUCCESS) {
                 throw new AssertionError("Euhedral graph failed: " + result.failure());
             }
@@ -651,7 +769,10 @@ class QwenFullModelCudaIntegrationTest {
     }
 
     private record RunResult(
-            QwenExecutionContext context, EnumMap<QwenExecutionPlan.Buffer, short[]> buffers, short[] logits) {
+            QwenExecutionContext context,
+            EnumMap<QwenExecutionPlan.Buffer, short[]> buffers,
+            short[] logits,
+            long workspaceBytes) {
         private void closeLogits() {
             context.logitsOutput().ifPresent(deviceLogits -> deviceLogits.close());
         }

@@ -76,6 +76,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle gdnRecurrenceBf16;
     private final MethodHandle gdnGatedRmsNormBf16;
     private final MethodHandle residualAddBf16;
+    private final MethodHandle residualRmsNormBf16;
+    private final MethodHandle q3GateUpSwiGluBf16;
+    private final MethodHandle q3FfnStreamedBf16;
+    private final MethodHandle attentionProducersBf16;
+    private final MethodHandle gdnProjectControlFp32;
     private final MethodHandle swiGluBf16;
     private final MethodHandle zeroDeviceMemory;
     private final MethodHandle attentionQkNormRopeBf16;
@@ -216,6 +221,82 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.gdnRecurrenceBf16 = bind(linker, symbols, "euhedral_cuda_gdn_recurrence_bf16", GDN_RECURRENCE_BF16);
             this.gdnGatedRmsNormBf16 =
                     bind(linker, symbols, "euhedral_cuda_gdn_gated_rms_norm_bf16", GDN_GATED_RMS_NORM_BF16);
+            this.attentionProducersBf16 = symbols.find("euhedral_cuda_attention_producers_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_FLOAT,
+                                    ValueLayout.JAVA_DOUBLE,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.q3FfnStreamedBf16 = symbols.find("euhedral_cuda_q3_ffn_streamed_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.q3GateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_gate_up_swiglu_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
+                    .orElse(null);
+            this.residualRmsNormBf16 = symbols.find("euhedral_cuda_residual_rms_norm_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_FLOAT)))
+                    .orElse(null);
+            this.gdnProjectControlFp32 = symbols.find("euhedral_cuda_gdn_project_control_fp32")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT)))
+                    .orElse(null);
             this.residualAddBf16 = bind(linker, symbols, "euhedral_cuda_residual_add_bf16", RESIDUAL_ADD_BF16);
             this.swiGluBf16 = bind(linker, symbols, "euhedral_cuda_swiglu_bf16", SWIGLU_BF16);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
@@ -978,6 +1059,175 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 valueHeads,
                 headDim,
                 epsilon);
+    }
+
+    @Override
+    public void attentionProducersBf16(
+            long input,
+            long q4,
+            long q5,
+            long queryNorm,
+            long keyNorm,
+            long queryKey,
+            long gate,
+            long keys,
+            long values,
+            int rows,
+            int hidden,
+            int queryHeads,
+            int keyHeads,
+            int headDim,
+            int rotaryDim,
+            long start,
+            float epsilon,
+            double theta,
+            long q4Bytes,
+            long q5Bytes) {
+        ensureOpen();
+        requireAddresses(input, q4, q5, queryNorm, keyNorm, queryKey, gate, keys, values);
+        if (rows < 64
+                || hidden <= 0
+                || queryHeads <= 0
+                || keyHeads <= 0
+                || headDim != 256
+                || rotaryDim <= 0
+                || start < 0
+                || q4Bytes <= 0
+                || q5Bytes <= 0) throw new IllegalArgumentException("invalid attention producer geometry");
+        if (attentionProducersBf16 == null)
+            throw new UnsupportedOperationException("native attention producers unavailable");
+        invokeLayer(
+                "attention producer region",
+                attentionProducersBf16,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(q4),
+                MemorySegment.ofAddress(q5),
+                MemorySegment.ofAddress(queryNorm),
+                MemorySegment.ofAddress(keyNorm),
+                MemorySegment.ofAddress(queryKey),
+                MemorySegment.ofAddress(gate),
+                MemorySegment.ofAddress(keys),
+                MemorySegment.ofAddress(values),
+                rows,
+                hidden,
+                queryHeads,
+                keyHeads,
+                headDim,
+                rotaryDim,
+                start,
+                epsilon,
+                theta,
+                q4Bytes,
+                q5Bytes);
+    }
+
+    @Override
+    public void q3FfnStreamedBf16(
+            long input,
+            long gateWeights,
+            long downWeights,
+            long output,
+            long slots,
+            long accumulators,
+            int rows,
+            int hidden,
+            int intermediate,
+            long gateBytes,
+            long downBytes) {
+        ensureOpen();
+        requireAddresses(input, gateWeights, downWeights, output, slots, accumulators);
+        if (rows != 256 || hidden != 5120 || intermediate != 17408 || gateBytes <= 0 || downBytes <= 0)
+            throw new IllegalArgumentException("streamed FFN geometry is not qualified");
+        if (q3FfnStreamedBf16 == null) throw new UnsupportedOperationException("native streamed FFN unavailable");
+        invokeLayer(
+                "streamed FFN region",
+                q3FfnStreamedBf16,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(gateWeights),
+                MemorySegment.ofAddress(downWeights),
+                MemorySegment.ofAddress(output),
+                MemorySegment.ofAddress(slots),
+                MemorySegment.ofAddress(accumulators),
+                rows,
+                hidden,
+                intermediate,
+                gateBytes,
+                downBytes);
+    }
+
+    @Override
+    public void q3GateUpSwiGluBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        if (rows <= 0 || width <= 0 || width % 128 != 0 || outputs <= 0 || outputs % 32 != 0 || weightBytes <= 0)
+            throw new IllegalArgumentException("invalid Q3 gate/up region dimensions");
+        if (q3GateUpSwiGluBf16 == null) throw new UnsupportedOperationException("native Q3 gate/up region unavailable");
+        invokeLayer(
+                "Q3 gate/up SwiGLU region",
+                q3GateUpSwiGluBf16,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(weights),
+                MemorySegment.ofAddress(output),
+                rows,
+                width,
+                outputs,
+                weightBytes);
+    }
+
+    @Override
+    public void residualRmsNormBf16(
+            long residual, long delta, long weight, long hidden, long normalized, int rows, int width, float epsilon) {
+        ensureOpen();
+        requireAddresses(residual, delta, weight, hidden, normalized);
+        if (rows <= 0 || width <= 0 || !Float.isFinite(epsilon) || epsilon < 0)
+            throw new IllegalArgumentException("invalid residual RMSNorm region dimensions");
+        if (residualRmsNormBf16 == null)
+            throw new UnsupportedOperationException("native residual RMSNorm region unavailable");
+        invokeLayer(
+                "residual RMSNorm region",
+                residualRmsNormBf16,
+                MemorySegment.ofAddress(residual),
+                MemorySegment.ofAddress(delta),
+                MemorySegment.ofAddress(weight),
+                MemorySegment.ofAddress(hidden),
+                MemorySegment.ofAddress(normalized),
+                rows,
+                width,
+                epsilon);
+    }
+
+    @Override
+    public void gdnProjectControlFp32(
+            long input,
+            long aWeight,
+            long bWeight,
+            long aLog,
+            long dtBias,
+            long g,
+            long beta,
+            int rows,
+            int width,
+            int heads) {
+        ensureOpen();
+        requireAddresses(input, aWeight, bWeight, aLog, dtBias, g, beta);
+        if (rows <= 0 || width <= 0 || heads <= 0)
+            throw new IllegalArgumentException("invalid GDN control region dimensions");
+        if (gdnProjectControlFp32 == null)
+            throw new UnsupportedOperationException("native GDN control region unavailable");
+        invokeLayer(
+                "GDN projection/control region",
+                gdnProjectControlFp32,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(aWeight),
+                MemorySegment.ofAddress(bWeight),
+                MemorySegment.ofAddress(aLog),
+                MemorySegment.ofAddress(dtBias),
+                MemorySegment.ofAddress(g),
+                MemorySegment.ofAddress(beta),
+                rows,
+                width,
+                heads);
     }
 
     @Override

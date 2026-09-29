@@ -22,6 +22,11 @@ static int q45_anchor;
 static int gdn_anchor;
 static int elementwise_anchor;
 static int attention_anchor;
+static int ffn_anchor;
+static CUmodule ffn_module;
+static CUfunction gate_up_swiglu;
+static CUfunction ffn_stream_gate;
+static CUfunction ffn_stream_down;
 static CUmodule quantized_module;
 static CUmodule q45_module;
 static CUmodule gdn_module;
@@ -40,10 +45,14 @@ static CUfunction gdn_convolution;
 static CUfunction gdn_recurrence;
 static CUfunction gdn_gated_rms_norm;
 static CUfunction residual_add;
+static CUfunction residual_rms_norm;
+static CUfunction gdn_project_control;
 static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
+static CUfunction attention_norm_cache;
+static CUfunction attention_value_cache;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 // AUTO routes Q4/Q5 prefill batches of at least this many rows to the 64-row
@@ -64,6 +73,7 @@ static void initialize(void) {
     q45_status = euhedral_cuda_load_kernel(
             &q45_anchor, "q45_linear_bf16.cu", "euhedral_q4_decode_1", &q45_module, &q45_decode[0][0]);
     if (q45_status == EUHEDRAL_CUDA_SUCCESS) {
+        get_function(q45_module, &attention_value_cache, "euhedral_attention_value_cache_bf16");
         static const char* const decode_names[2][3] = {
                 {"euhedral_q4_decode_1", "euhedral_q4_decode_2", "euhedral_q4_decode_4"},
                 {"euhedral_q5_decode_1", "euhedral_q5_decode_2", "euhedral_q5_decode_4"}};
@@ -81,6 +91,7 @@ static void initialize(void) {
     init_status = euhedral_cuda_load_kernel(
             &gdn_anchor, "qwen_gdn_ops.cu", "euhedral_gdn_control_fp32", &gdn_module, &gdn_control);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
+    get_function(gdn_module, &gdn_project_control, "euhedral_gdn_project_control_fp32");
     status = get_function(gdn_module, &gdn_convolution, "euhedral_gdn_convolution_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(gdn_module, &gdn_recurrence, "euhedral_gdn_recurrence_bf16");
@@ -91,6 +102,7 @@ static void initialize(void) {
     init_status = euhedral_cuda_load_kernel(
             &elementwise_anchor, "qwen_elementwise.cu", "euhedral_residual_add_bf16", &elementwise_module, &residual_add);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
+    get_function(elementwise_module, &residual_rms_norm, "euhedral_residual_rms_norm_bf16");
     status = get_function(elementwise_module, &swiglu, "euhedral_swiglu_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
 
@@ -101,10 +113,19 @@ static void initialize(void) {
             &attention_module,
             &attention_qk_norm_rope);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
+    get_function(attention_module, &attention_norm_cache, "euhedral_attention_qk_norm_cache_bf16");
     status = get_function(attention_module, &attention_kv_append, "euhedral_attention_kv_append_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(attention_module, &attention_causal, "euhedral_attention_causal_bf16");
     init_status = status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+    if (init_status == EUHEDRAL_CUDA_SUCCESS) {
+        euhedral_cuda_load_kernel(&ffn_anchor, "qwen_ffn.cu", "euhedral_q3_gate_up_swiglu_bf16",
+                &ffn_module, &gate_up_swiglu);
+        if (ffn_module) {
+            get_function(ffn_module, &ffn_stream_gate, "stream_gate_up");
+            get_function(ffn_module, &ffn_stream_down, "stream_down");
+        }
+    }
 }
 
 #ifdef _WIN32
@@ -354,6 +375,126 @@ int euhedral_cuda_gdn_gated_rms_norm_bf16(
     return launch_and_synchronize(gdn_gated_rms_norm, (uint32_t)count, 128, parameters);
 }
 
+// One compound FFN instruction owns both slots and the FP32 continuation matrix.
+// CUDA event edges name slot readiness/release; no consumer spins on global progress flags.
+int euhedral_cuda_q3_ffn_streamed_bf16(
+        const void* input, const void* gate_weights, const void* down_weights, void* output,
+        void* slots, float* accumulators, uint32_t rows, uint32_t hidden, uint32_t intermediate,
+        uint64_t gate_bytes, uint64_t down_bytes) {
+    if (!input || !gate_weights || !down_weights || !output || !slots || !accumulators
+            || rows != 256 || hidden != 5120 || intermediate != 17408
+            || ((uintptr_t)input & 15u) != 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint32_t gate_outputs = intermediate * 2u;
+    uint64_t gate_groups = (uint64_t)gate_outputs * (hidden / 64u);
+    uint64_t down_groups = (uint64_t)hidden * (intermediate / 64u);
+    uint64_t gate_scale = (gate_groups * 24u + 255u) & ~UINT64_C(255);
+    uint64_t down_scale = (down_groups * 24u + 255u) & ~UINT64_C(255);
+    if (gate_bytes != gate_scale + gate_groups * 2u || down_bytes != down_scale + down_groups * 2u)
+        return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (!ffn_stream_gate || !ffn_stream_down) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    cudaStream_t producer = (cudaStream_t)euhedral_cuda_submission_stream();
+    cudaStream_t consumer = NULL;
+    cudaEvent_t ready[2] = {NULL, NULL}, release[2] = {NULL, NULL};
+#define FFN_TRY(call) do { status = (int)(call); if (status != 0) goto cleanup; } while (0)
+    FFN_TRY(cudaStreamCreateWithFlags(&consumer, cudaStreamNonBlocking));
+    for (int slot = 0; slot < 2; slot++) {
+        FFN_TRY(cudaEventCreateWithFlags(&ready[slot], cudaEventDisableTiming));
+        FFN_TRY(cudaEventCreateWithFlags(&release[slot], cudaEventDisableTiming));
+    }
+    uint32_t part = 0, last_slot = 0;
+    for (uint32_t begin = 0; begin < intermediate; begin += 4096u, part++) {
+        uint32_t count = intermediate - begin;
+        if (count > 4096u) count = 4096u;
+        uint32_t slot = part & 1u;
+        last_slot = slot;
+        void* staging = (unsigned char*)slots + (uint64_t)slot * rows * 4096u * 2u;
+        if (part >= 2u) FFN_TRY(cudaStreamWaitEvent(producer, release[slot], 0));
+        void* gate_args[] = {&input, &gate_weights, &staging, &rows, &hidden, &gate_outputs, &gate_scale, &begin, &count};
+        FFN_TRY(cuLaunchKernel(ffn_stream_gate, (rows / 64u) * (count / 16u), 1, 1, 128, 1, 1, 0,
+                (CUstream)producer, gate_args, NULL));
+        FFN_TRY(cudaEventRecord(ready[slot], producer));
+        FFN_TRY(cudaStreamWaitEvent(consumer, ready[slot], 0));
+        void* down_args[] = {&staging, &down_weights, &output, &rows, &intermediate, &hidden, &down_scale,
+                &accumulators, &begin, &count};
+        FFN_TRY(cuLaunchKernel(ffn_stream_down, (rows / 64u) * (hidden / 32u), 1, 1, 128, 1, 1, 0,
+                (CUstream)consumer, down_args, NULL));
+        FFN_TRY(cudaEventRecord(release[slot], consumer));
+    }
+    FFN_TRY(cudaStreamWaitEvent(producer, release[last_slot], 0));
+    if (producer == NULL) FFN_TRY(cudaStreamSynchronize(producer));
+cleanup:
+    if (status != 0) {
+        // Best-effort branch drain. Any error still requires the caller to prove device
+        // completion or quarantine borrowed storage, even with a NULL submission stream.
+        if (consumer != NULL) cudaStreamSynchronize(consumer);
+        cudaStreamSynchronize(producer);
+    }
+    for (int slot = 0; slot < 2; slot++) {
+        if (ready[slot]) { int error = (int)cudaEventDestroy(ready[slot]); if (status == 0) status = error; }
+        if (release[slot]) { int error = (int)cudaEventDestroy(release[slot]); if (status == 0) status = error; }
+    }
+    if (consumer) { int error = (int)cudaStreamDestroy(consumer); if (status == 0) status = error; }
+#undef FFN_TRY
+    return status;
+}
+
+int euhedral_cuda_q3_gate_up_swiglu_bf16(
+        const void* input, const void* weights, void* output, uint32_t rows,
+        uint32_t width, uint32_t outputs, uint64_t weight_bytes) {
+    if (!input || !weights || !output || rows == 0 || width == 0 || outputs == 0
+            || width % 128 != 0 || outputs % 32 != 0 || ((uintptr_t)input & 15u) != 0)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint64_t groups = (uint64_t)outputs * (width / 64u);
+    if (groups > (UINT64_MAX - 255) / 26u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    uint64_t scale_offset = (groups * 24u + 255u) & ~UINT64_C(255);
+    if (weight_bytes != scale_offset + groups * 2u) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    uint64_t grid = (((uint64_t)rows + 63u) / 64u) * (outputs / 32u);
+    if (grid > INT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (!gate_up_swiglu) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    void* parameters[] = {&input, &weights, &output, &rows, &width, &outputs, &scale_offset};
+    return launch_and_synchronize(gate_up_swiglu, (uint32_t)grid, 128, parameters);
+}
+
+int euhedral_cuda_residual_rms_norm_bf16(
+        const void* residual, const void* delta, const void* weight,
+        void* hidden, void* normalized, uint32_t rows, uint32_t width, float epsilon) {
+    if (!residual || !delta || !weight || !hidden || !normalized || rows == 0 || width == 0
+            || !isfinite(epsilon) || epsilon < 0.0f) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    if (rows > INT32_MAX || (uint64_t)rows * width > UINT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (!residual_rms_norm) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    void* parameters[] = {&residual, &delta, &weight, &hidden, &normalized, &rows, &width, &epsilon};
+    return launch_and_synchronize(residual_rms_norm, rows, 128, parameters);
+}
+
+int euhedral_cuda_gdn_project_control_fp32(
+        const void* input, const void* a_weight, const void* b_weight,
+        const float* a_log, const float* dt_bias, float* g, float* beta,
+        uint32_t rows, uint32_t width, uint32_t heads) {
+    if (!input || !a_weight || !b_weight || !a_log || !dt_bias || !g || !beta
+            || rows == 0 || width == 0 || heads == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    const uint64_t count = (uint64_t)rows * heads;
+    if (count > INT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (!gdn_project_control) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    void* parameters[] = {&input, &a_weight, &b_weight, &a_log, &dt_bias, &g, &beta, &rows, &width, &heads};
+    return launch_and_synchronize(gdn_project_control, (uint32_t)count, 128, parameters);
+}
+
 int euhedral_cuda_residual_add_bf16(
         const void* device_residual, const void* device_delta, void* device_output, uint32_t rows, uint32_t width) {
     if (device_residual == NULL || device_delta == NULL || device_output == NULL || rows == 0 || width == 0)
@@ -402,6 +543,55 @@ int euhedral_cuda_zero_device_memory(void* device_address, uint64_t byte_size) {
     if (result != cudaSuccess) return (int)result;
     result = cudaDeviceSynchronize();
     return result == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)result;
+}
+
+int euhedral_cuda_attention_producers_bf16(
+        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
+        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
+        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
+        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes) {
+    if (!input || !q4 || !q5 || !query_norm || !key_norm || !query_key || !gate || !keys || !values
+            || rows < 64 || hidden == 0 || hidden % 64 != 0 || !query_heads || !key_heads
+            || query_heads % key_heads != 0 || head_dim != 256 || !rotary_dim || rotary_dim > head_dim
+            || (rotary_dim & 1u) || !isfinite(epsilon) || epsilon <= 0 || !isfinite(theta) || theta <= 0
+            || start > UINT64_MAX - rows) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint64_t heads = (uint64_t)query_heads + key_heads;
+    uint64_t projected = heads * head_dim;
+    uint64_t grid = ((uint64_t)rows + 63u) / 64u * (projected / 32u);
+    uint64_t norm_grid = (uint64_t)rows * heads;
+    if (projected > UINT32_MAX || grid > UINT32_MAX || norm_grid > UINT32_MAX
+            || start + rows > UINT64_MAX / ((uint64_t)key_heads * head_dim * 2u))
+        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    uint32_t width = (uint32_t)projected, query_width = query_heads * head_dim;
+    uint64_t expected4, expected5;
+    int status = quantized_byte_size(hidden, width, 4, &expected4);
+    if (status != 0) return status;
+    status = quantized_byte_size(hidden, width, 5, &expected5);
+    if (status != 0) return status;
+    if (q4_bytes != expected4 || q5_bytes != expected5) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    status = euhedral_cuda_bind_thread_context();
+    if (status != 0) return status;
+    status = ensure_initialized();
+    if (status != 0) return status;
+    if (q45_status != 0 || !q45_prefill64[0] || !attention_norm_cache || !attention_value_cache)
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    CUstream stream = euhedral_cuda_submission_stream();
+    void* q4_args[] = {&input, &q4, &query_key, &rows, &hidden, &width};
+    void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
+            &head_dim, &rotary_dim, &start, &epsilon, &theta, &keys};
+    void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width, &values, &query_width, &start};
+    status = (int)cuLaunchKernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    if (status == 0) status = (int)cuLaunchKernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
+            head_dim, 1, 1, 0, stream, norm_args, NULL);
+    if (status == 0) status = (int)cuLaunchKernel(attention_value_cache, (uint32_t)grid, 1, 1,
+            128, 1, 1, 0, stream, q5_args, NULL);
+    // One owner and one completion edge cover both physical cache producers.
+    // Failed partial submission must drain before borrowed cache/workspace can retire.
+    if (status != 0 || stream == NULL) {
+        int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);
+        if (status == 0) status = drained;
+    }
+    return status;
 }
 
 int euhedral_cuda_attention_qk_norm_rope_bf16(

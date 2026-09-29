@@ -33,10 +33,28 @@ public final class QwenExecutionPlan {
         GDN_RECURRENCE,
         GDN_GATED_RMS_NORM,
         RESIDUAL_ADD,
+        RESIDUAL_RMS_NORM,
+        GDN_PROJECT_CONTROL,
+        Q3_GATE_UP_SWIGLU,
+        FFN_STREAMED,
         SWIGLU,
         ATTENTION_QK_NORM_ROPE,
         ATTENTION_KV_APPEND,
+        ATTENTION_PRODUCERS,
         ATTENTION_CAUSAL
+    }
+
+    public enum PrefillRegions {
+        NONE,
+        RESIDUAL_NORM,
+        GDN_CONTROL,
+        RESIDUAL_NORM_CONTROL,
+        GATE_UP_SWIGLU,
+        COMBINED,
+        STREAMED_FFN,
+        ATTENTION_KV,
+        COMBINED_KV,
+        STREAMED_KV
     }
 
     public enum Buffer {
@@ -60,6 +78,8 @@ public final class QwenExecutionPlan {
         GATE_UP,
         SWIGLU,
         FFN_DELTA,
+        FFN_STAGING,
+        FFN_ACCUMULATORS,
         FINAL_NORMALIZED,
         LOGITS,
         SLICE_PROJECTION
@@ -188,10 +208,47 @@ public final class QwenExecutionPlan {
     private final List<Integer> projectionWidths;
     private final List<BufferSpec> bufferSpecs;
     private final boolean firstLayer;
+    private final boolean reusePrefillStorage;
+    private final QwenExecutionPlan executionOwner;
+    private final QwenExecutionPlan prefillPlan;
+    private final QwenExecutionPlan smallPrefillPlan;
+    private final QwenExecutionPlan streamedFallback;
 
     /// Uses the actual loaded layer zero when present; an embedding-only weight view stays embedding-only.
     public QwenExecutionPlan(QwenWeights weights) {
         this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights));
+    }
+
+    /// Selects an experimental prefill architecture; decode keeps the reference instructions.
+    public QwenExecutionPlan(QwenWeights weights, PrefillRegions regions) {
+        this(
+                Objects.requireNonNull(weights, "weights"),
+                planFromLoadedWeights(weights),
+                Objects.requireNonNull(regions, "regions"));
+    }
+
+    /// Canonical plan family used by public/manual sources; concrete runtime sources keep their selected view.
+    QwenExecutionPlan executionOwner() {
+        return this.executionOwner;
+    }
+
+    public QwenExecutionPlan forExecution(QwenExecutionContext.ExecutionKind kind) {
+        Objects.requireNonNull(kind, "kind");
+        return kind == QwenExecutionContext.ExecutionKind.PREFILL
+                ? this.executionOwner.prefillPlan
+                : this.executionOwner;
+    }
+
+    public QwenExecutionPlan forExecution(QwenExecutionContext.ExecutionKind kind, int rows) {
+        Objects.requireNonNull(kind, "kind");
+        if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
+        return this.executionOwner.selectExecution(kind, rows);
+    }
+
+    private QwenExecutionPlan selectExecution(QwenExecutionContext.ExecutionKind kind, int rows) {
+        if (kind == QwenExecutionContext.ExecutionKind.DECODE) return this;
+        if (this.streamedFallback != null && rows != 256) return this.streamedFallback.selectExecution(kind, rows);
+        return rows < 64 ? this.smallPrefillPlan : this.prefillPlan;
     }
 
     /// Builds an embedding-only plan for callers that intentionally validate only token lookup.
@@ -238,11 +295,23 @@ public final class QwenExecutionPlan {
     }
 
     private QwenExecutionPlan(QwenWeights weights, PlanData data) {
+        this(weights, data, PrefillRegions.NONE);
+    }
+
+    private QwenExecutionPlan(QwenWeights weights, PlanData data, PrefillRegions regions) {
+        this(weights, data, regions, null);
+    }
+
+    private QwenExecutionPlan(QwenWeights weights, PlanData data, PrefillRegions regions, QwenExecutionPlan owner) {
+        this.executionOwner = owner == null ? this : owner;
         this.weights = weights;
         this.instructions = List.copyOf(data.instructions());
         this.projectionWidths = List.copyOf(data.projectionWidths());
         this.bufferSpecs = List.copyOf(data.bufferSpecs());
         this.firstLayer = data.firstLayer();
+        this.reusePrefillStorage = this.instructions.stream().anyMatch(i -> i.kind() == Kind.ATTENTION_PRODUCERS)
+                && this.instructions.stream()
+                        .anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU || i.kind() == Kind.FFN_STREAMED);
         List<List<Integer>> edges = new ArrayList<>();
         for (int index = 0; index < this.instructions.size(); index++) {
             edges.add(new ArrayList<>());
@@ -256,6 +325,257 @@ public final class QwenExecutionPlan {
             }
         }
         this.successors = edges.stream().map(List::copyOf).toList();
+        this.prefillPlan = regions == PrefillRegions.NONE
+                ? this
+                : new QwenExecutionPlan(
+                        weights, prefillRegions(data, regions), PrefillRegions.NONE, this.executionOwner);
+        this.smallPrefillPlan = (regions == PrefillRegions.GATE_UP_SWIGLU || regions == PrefillRegions.ATTENTION_KV)
+                ? this
+                : (regions == PrefillRegions.COMBINED
+                                || regions == PrefillRegions.STREAMED_FFN
+                                || regions == PrefillRegions.COMBINED_KV
+                                || regions == PrefillRegions.STREAMED_KV)
+                        ? new QwenExecutionPlan(
+                                weights,
+                                prefillRegions(data, PrefillRegions.RESIDUAL_NORM_CONTROL),
+                                PrefillRegions.NONE,
+                                this.executionOwner)
+                        : this.prefillPlan;
+        this.streamedFallback = regions == PrefillRegions.STREAMED_FFN || regions == PrefillRegions.STREAMED_KV
+                ? new QwenExecutionPlan(
+                        weights,
+                        data,
+                        regions == PrefillRegions.STREAMED_KV ? PrefillRegions.COMBINED_KV : PrefillRegions.COMBINED,
+                        this.executionOwner)
+                : null;
+    }
+
+    private static PlanData prefillRegions(PlanData data, PrefillRegions regions) {
+        boolean streamed = regions == PrefillRegions.STREAMED_FFN || regions == PrefillRegions.STREAMED_KV;
+        boolean attention = regions == PrefillRegions.ATTENTION_KV
+                || regions == PrefillRegions.COMBINED_KV
+                || regions == PrefillRegions.STREAMED_KV;
+        boolean combined = regions == PrefillRegions.COMBINED || regions == PrefillRegions.COMBINED_KV;
+        boolean residualNorm = streamed
+                || regions == PrefillRegions.RESIDUAL_NORM
+                || regions == PrefillRegions.RESIDUAL_NORM_CONTROL
+                || combined;
+        boolean control = streamed
+                || regions == PrefillRegions.GDN_CONTROL
+                || regions == PrefillRegions.RESIDUAL_NORM_CONTROL
+                || combined;
+        boolean gateUp = streamed || regions == PrefillRegions.GATE_UP_SWIGLU || combined;
+        List<Instruction> source = control ? earlyControlOrder(data.instructions()) : data.instructions();
+        List<Instruction> result = new ArrayList<>();
+        int[] remapped = new int[source.size()];
+        java.util.Arrays.fill(remapped, -1);
+        for (int index = 0; index < source.size(); index++) {
+            Instruction first = source.get(index);
+            Instruction next = index + 1 < source.size() ? source.get(index + 1) : null;
+            if (attention
+                    && first.kind() == Kind.Q4_LINEAR
+                    && index + 3 < source.size()
+                    && source.get(index + 2).kind() == Kind.ATTENTION_QK_NORM_ROPE) {
+                Instruction norm = source.get(index + 2), append = source.get(index + 3);
+                if (next.kind() != Kind.Q5_LINEAR
+                        || append.kind() != Kind.ATTENTION_KV_APPEND
+                        || !next.dependencies().equals(first.dependencies())
+                        || !norm.dependencies().equals(List.of(first.id()))
+                        || !append.dependencies().equals(List.of(norm.id(), next.id())))
+                    throw new IllegalStateException("unexpected attention producer topology");
+                for (int offset = 0; offset < 4; offset++)
+                    remapped[source.get(index + offset).id()] = result.size();
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.ATTENTION_PRODUCERS,
+                        remapDependencies(first.dependencies(), remapped),
+                        List.of(
+                                first.weight(),
+                                next.weight(),
+                                norm.weights().get(0),
+                                norm.weights().get(1)),
+                        first.inputBuffers(),
+                        List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED),
+                        first.inputWidth(),
+                        first.outputWidth(),
+                        -1,
+                        first.layerIndex()));
+                index += 3;
+                continue;
+            }
+            if (residualNorm
+                    && first.kind() == Kind.RESIDUAL_ADD
+                    && next != null
+                    && next.kind() == Kind.RMS_NORM_UNIT_OFFSET
+                    && !next.outputBuffers().contains(Buffer.FINAL_NORMALIZED)
+                    && next.dependencies().equals(List.of(first.id()))
+                    && next.inputBuffers().equals(first.outputBuffers())) {
+                remapped[first.id()] = result.size();
+                remapped[next.id()] = result.size();
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.RESIDUAL_RMS_NORM,
+                        remapDependencies(first.dependencies(), remapped),
+                        next.weights(),
+                        first.inputBuffers(),
+                        List.of(
+                                first.outputBuffers().getFirst(),
+                                next.outputBuffers().getFirst()),
+                        first.inputWidth(),
+                        first.outputWidth(),
+                        -1,
+                        first.layerIndex()));
+                index++;
+                continue;
+            }
+            if (streamed
+                    && first.kind() == Kind.Q3_LINEAR
+                    && next != null
+                    && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
+                    && next.kind() == Kind.SWIGLU
+                    && first.inputWidth() == 5120
+                    && first.outputWidth() == 34816
+                    && index + 2 < source.size()) {
+                Instruction down = source.get(index + 2);
+                if (down.kind() != Kind.Q3_LINEAR
+                        || !down.dependencies().equals(List.of(next.id()))
+                        || !next.dependencies().equals(List.of(first.id()))
+                        || !down.outputBuffers().equals(List.of(Buffer.FFN_DELTA)))
+                    throw new IllegalStateException("unexpected streamed FFN topology");
+                remapped[first.id()] = result.size();
+                remapped[next.id()] = result.size();
+                remapped[down.id()] = result.size();
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.FFN_STREAMED,
+                        remapDependencies(first.dependencies(), remapped),
+                        List.of(first.weight(), down.weight()),
+                        first.inputBuffers(),
+                        List.of(Buffer.FFN_DELTA, Buffer.FFN_STAGING, Buffer.FFN_ACCUMULATORS),
+                        first.inputWidth(),
+                        down.outputWidth(),
+                        -1,
+                        first.layerIndex()));
+                index += 2;
+                continue;
+            }
+            if (gateUp
+                    && first.kind() == Kind.Q3_LINEAR
+                    && next != null
+                    && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
+                    && next.kind() == Kind.SWIGLU
+                    && next.dependencies().equals(List.of(first.id()))
+                    && first.inputWidth() % 128 == 0
+                    && first.outputWidth() % 32 == 0) {
+                remapped[first.id()] = result.size();
+                remapped[next.id()] = result.size();
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.Q3_GATE_UP_SWIGLU,
+                        remapDependencies(first.dependencies(), remapped),
+                        first.weights(),
+                        first.inputBuffers(),
+                        next.outputBuffers(),
+                        first.inputWidth(),
+                        first.outputWidth(),
+                        -1,
+                        first.layerIndex()));
+                index++;
+                continue;
+            }
+            if (control
+                    && first.kind() == Kind.BF16_LINEAR
+                    && first.outputBuffers().equals(List.of(Buffer.A_PROJECTED))
+                    && index + 2 < source.size()) {
+                Instruction b = source.get(index + 1);
+                Instruction last = source.get(index + 2);
+                if (b.kind() != Kind.BF16_LINEAR
+                        || !b.outputBuffers().equals(List.of(Buffer.B_PROJECTED))
+                        || last.kind() != Kind.GDN_CONTROL
+                        || !first.dependencies().equals(b.dependencies())
+                        || !first.inputBuffers().equals(b.inputBuffers())
+                        || !last.dependencies().equals(List.of(first.id(), b.id()))) {
+                    throw new IllegalStateException("GDN projection/control region has unexpected topology");
+                }
+                remapped[first.id()] = result.size();
+                remapped[b.id()] = result.size();
+                remapped[last.id()] = result.size();
+                List<TensorHandle> regionWeights = new ArrayList<>(first.weights());
+                regionWeights.addAll(b.weights());
+                regionWeights.addAll(last.weights());
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.GDN_PROJECT_CONTROL,
+                        remapDependencies(first.dependencies(), remapped),
+                        regionWeights,
+                        first.inputBuffers(),
+                        last.outputBuffers(),
+                        first.inputWidth(),
+                        first.outputWidth(),
+                        -1,
+                        first.layerIndex()));
+                index += 2;
+                continue;
+            }
+            List<Integer> dependencies = remapDependencies(first.dependencies(), remapped);
+            remapped[first.id()] = result.size();
+            result.add(new Instruction(
+                    result.size(),
+                    first.kind(),
+                    dependencies,
+                    first.weights(),
+                    attention && first.kind() == Kind.ATTENTION_CAUSAL
+                            ? List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED)
+                            : first.inputBuffers(),
+                    first.outputBuffers(),
+                    first.inputWidth(),
+                    first.outputWidth(),
+                    first.outputBufferIndex(),
+                    first.layerIndex()));
+        }
+        boolean needsGateUp = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.GATE_UP));
+        boolean needsSwiGlu = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.SWIGLU));
+        List<BufferSpec> buffers = new ArrayList<>(data.bufferSpecs().stream()
+                .filter(spec -> !attention || spec.buffer() != Buffer.ATTENTION_QK_NORMALIZED)
+                .filter(spec -> needsSwiGlu || spec.buffer() != Buffer.SWIGLU)
+                .filter(spec -> needsGateUp || spec.buffer() != Buffer.GATE_UP)
+                .filter(spec ->
+                        !control || (spec.buffer() != Buffer.A_PROJECTED && spec.buffer() != Buffer.B_PROJECTED))
+                .toList());
+        if (result.stream().anyMatch(i -> i.kind() == Kind.FFN_STREAMED)) {
+            buffers.add(spec(Buffer.FFN_STAGING, 8192, ElementType.BF16));
+            buffers.add(spec(Buffer.FFN_ACCUMULATORS, 5120, ElementType.FP32));
+        }
+        return new PlanData(result, data.projectionWidths(), buffers, data.firstLayer());
+    }
+
+    private static List<Instruction> earlyControlOrder(List<Instruction> instructions) {
+        List<Instruction> result = new ArrayList<>(instructions.size());
+        for (int index = 0; index < instructions.size(); index++) {
+            if (index + 4 < instructions.size()
+                    && instructions.get(index).kind() == Kind.Q4_LINEAR
+                    && instructions.get(index + 1).kind() == Kind.Q5_LINEAR
+                    && instructions.get(index + 2).kind() == Kind.BF16_LINEAR
+                    && instructions.get(index + 3).kind() == Kind.BF16_LINEAR
+                    && instructions.get(index + 4).kind() == Kind.GDN_CONTROL) {
+                result.addAll(instructions.subList(index + 2, index + 5));
+                result.add(instructions.get(index));
+                result.add(instructions.get(index + 1));
+                index += 4;
+            } else result.add(instructions.get(index));
+        }
+        return result;
+    }
+
+    private static List<Integer> remapDependencies(List<Integer> dependencies, int[] remapped) {
+        return dependencies.stream()
+                .map(id -> {
+                    int mapped = remapped[id];
+                    if (mapped < 0) throw new IllegalStateException("region depends on unpublished work");
+                    return mapped;
+                })
+                .distinct()
+                .toList();
     }
 
     public List<Instruction> instructions() {
@@ -272,6 +592,22 @@ public final class QwenExecutionPlan {
 
     public List<BufferSpec> bufferSpecs() {
         return this.bufferSpecs;
+    }
+
+    List<QwenExecutionPlan> executionVariants() {
+        var variants = new java.util.LinkedHashSet<QwenExecutionPlan>();
+        variants.add(this.prefillPlan);
+        variants.add(this.smallPrefillPlan);
+        if (this.streamedFallback != null) {
+            variants.add(this.streamedFallback.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 64));
+            variants.add(this.streamedFallback.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 1));
+        }
+        variants.remove(this);
+        return List.copyOf(variants);
+    }
+
+    boolean reusePrefillStorage() {
+        return this.reusePrefillStorage;
     }
 
     public boolean hasFirstLayer() {

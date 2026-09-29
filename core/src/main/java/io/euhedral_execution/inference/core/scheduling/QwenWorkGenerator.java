@@ -61,9 +61,14 @@ public final class QwenWorkGenerator {
                     || instruction.kind() == QwenExecutionPlan.Kind.GDN_CONVOLUTION
                     || instruction.kind() == QwenExecutionPlan.Kind.GDN_RECURRENCE
                     || instruction.kind() == QwenExecutionPlan.Kind.GDN_GATED_RMS_NORM
+                    || instruction.kind() == QwenExecutionPlan.Kind.FFN_STREAMED
+                    || instruction.kind() == QwenExecutionPlan.Kind.Q3_GATE_UP_SWIGLU
+                    || instruction.kind() == QwenExecutionPlan.Kind.RESIDUAL_RMS_NORM
+                    || instruction.kind() == QwenExecutionPlan.Kind.GDN_PROJECT_CONTROL
                     || instruction.kind() == QwenExecutionPlan.Kind.RESIDUAL_ADD
                     || instruction.kind() == QwenExecutionPlan.Kind.SWIGLU
                     || instruction.kind() == QwenExecutionPlan.Kind.ATTENTION_QK_NORM_ROPE
+                    || instruction.kind() == QwenExecutionPlan.Kind.ATTENTION_PRODUCERS
                     || instruction.kind() == QwenExecutionPlan.Kind.ATTENTION_KV_APPEND
                     || instruction.kind() == QwenExecutionPlan.Kind.ATTENTION_CAUSAL) {
                 operationManagers.put(instruction.id(), operationManager(instruction));
@@ -224,9 +229,14 @@ public final class QwenWorkGenerator {
                     GDN_CONVOLUTION,
                     GDN_RECURRENCE,
                     GDN_GATED_RMS_NORM,
+                    FFN_STREAMED,
+                    Q3_GATE_UP_SWIGLU,
+                    RESIDUAL_RMS_NORM,
+                    GDN_PROJECT_CONTROL,
                     RESIDUAL_ADD,
                     SWIGLU,
                     ATTENTION_QK_NORM_ROPE,
+                    ATTENTION_PRODUCERS,
                     ATTENTION_KV_APPEND,
                     ATTENTION_CAUSAL ->
                 Objects.requireNonNull(this.operationFrames.get(instruction.id()))

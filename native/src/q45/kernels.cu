@@ -1,5 +1,6 @@
 #include "strategies/decode.cuh"
 #include "strategies/prefill.cuh"
+#include "attention_cache.cuh"
 
 // Q4/Q5 kernels, structured like the Q3 module: format layout and code
 // unpacking are Q4/Q5-specific; the cooperative decode, compact K prefetch,

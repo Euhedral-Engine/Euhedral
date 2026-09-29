@@ -23,6 +23,7 @@ public final class QwenExecutionRunner implements LatticeSource {
     private final ExecutionGpu gpu;
     private final PartitionedMpscQueue<QwenExecutionContext> ready;
     private final QwenWorkGenerator generator;
+    private final java.util.Map<QwenExecutionPlan, QwenExecutionRunner> variantRunners;
     private final AtomicInteger active = new AtomicInteger();
     private final AtomicBoolean attached = new AtomicBoolean();
 
@@ -36,16 +37,36 @@ public final class QwenExecutionRunner implements LatticeSource {
 
     public QwenExecutionRunner(
             QwenExecutionPlan plan, ExecutionGpu gpu, Consumer<? super QwenExecutionContext> terminalConsumer) {
+        this(Objects.requireNonNull(plan, "plan").executionOwner(), gpu, terminalConsumer, true);
+    }
+
+    static QwenExecutionRunner concrete(
+            QwenExecutionPlan plan, ExecutionGpu gpu, Consumer<? super QwenExecutionContext> terminalConsumer) {
+        return new QwenExecutionRunner(plan, gpu, terminalConsumer, false);
+    }
+
+    private QwenExecutionRunner(
+            QwenExecutionPlan plan,
+            ExecutionGpu gpu,
+            Consumer<? super QwenExecutionContext> terminalConsumer,
+            boolean includeVariants) {
         this.plan = Objects.requireNonNull(plan, "plan");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.ready = new PartitionedMpscQueue<>(plan.instructions().size(), 64);
         this.generator = new QwenWorkGenerator(plan, gpu, this, terminalConsumer);
+        var variants = new java.util.LinkedHashMap<QwenExecutionPlan, QwenExecutionRunner>();
+        if (includeVariants)
+            for (var variant : plan.executionVariants())
+                variants.put(variant, new QwenExecutionRunner(variant, gpu, terminalConsumer, false));
+        this.variantRunners = java.util.Collections.unmodifiableMap(variants);
     }
 
     public CompletableFuture<QwenExecutionContext.Outcome> submit(QwenExecutionContext context) {
         Objects.requireNonNull(context, "context");
         if (context.plan() != plan) {
-            throw new IllegalArgumentException("quantum belongs to another execution plan");
+            QwenExecutionRunner variant = this.variantRunners.get(context.plan());
+            if (variant == null) throw new IllegalArgumentException("quantum belongs to another execution plan");
+            return submitVariant(variant, context);
         }
         gpu.ensureHealthy();
         while (true) {
@@ -82,6 +103,29 @@ public final class QwenExecutionRunner implements LatticeSource {
         return outcome.copy();
     }
 
+    private CompletableFuture<QwenExecutionContext.Outcome> submitVariant(
+            QwenExecutionRunner variant, QwenExecutionContext context) {
+        gpu.ensureHealthy();
+        while (true) {
+            int count = active.get();
+            if (count < 0) throw new IllegalStateException("Qwen runner admission is closed");
+            if (count == Integer.MAX_VALUE) throw new IllegalStateException("too many active quanta");
+            if (active.compareAndSet(count, count + 1)) break;
+        }
+        CompletableFuture<QwenExecutionContext.Outcome> completion;
+        try {
+            completion = variant.submit(context);
+        } catch (RuntimeException | Error failure) {
+            if (active.decrementAndGet() == Integer.MIN_VALUE) signalComplete();
+            throw failure;
+        }
+        // Caller-visible futures can be cancelled independently of admitted GPU work.
+        context.completion().whenComplete((ignored, failure) -> {
+            if (active.decrementAndGet() == Integer.MIN_VALUE) signalComplete();
+        });
+        return completion;
+    }
+
     /// Called by producers; each partition is bound to one immutable plan instruction.
     boolean offerReady(int instructionId, QwenExecutionContext context) {
         return this.ready.offer(instructionId, context);
@@ -113,14 +157,31 @@ public final class QwenExecutionRunner implements LatticeSource {
         Objects.requireNonNull(consumer, "consumer");
         Objects.requireNonNull(stopCondition, "stopCondition");
         if (requested <= 0 || finished.get()) return 0;
-        return this.generator.drain(consumer, stopCondition, requested);
+        return drain(consumer, stopCondition, requested);
+    }
+
+    private long drain(Consumer<AbstractFrame> consumer, Function<AbstractFrame, Boolean> stop, long requested) {
+        if (this.variantRunners.isEmpty()) return this.generator.drain(consumer, stop, requested);
+        // Only mixed-topology/manual sources need this per-pull stop witness. The ordinary
+        // runtime uses a concrete runner, retaining its existing allocation-free drain path.
+        boolean[] stopped = {false};
+        Function<AbstractFrame, Boolean> guardedStop = frame -> {
+            stopped[0] = stop.apply(frame);
+            return stopped[0];
+        };
+        long count = this.generator.drain(consumer, guardedStop, requested);
+        for (var variant : this.variantRunners.values()) {
+            if (stopped[0] || count >= requested) break;
+            count += variant.generator.drain(consumer, guardedStop, requested - count);
+        }
+        return count;
     }
 
     @Override
     public void request(long requested) {
         if (requested <= 0 || finished.get()) return;
         LatticeReceiver receiver = downstream.get();
-        if (receiver != null) this.generator.drain(receiver::push, NEVER_STOP, requested);
+        if (receiver != null) drain(receiver::push, NEVER_STOP, requested);
     }
 
     @Override
@@ -130,6 +191,7 @@ public final class QwenExecutionRunner implements LatticeSource {
 
     public void completeGracefully() {
         int old = active.getAndUpdate(value -> value | Integer.MIN_VALUE);
+        for (var variant : this.variantRunners.values()) variant.completeGracefully();
         if ((old & Integer.MAX_VALUE) == 0) signalComplete();
     }
 
@@ -153,6 +215,7 @@ public final class QwenExecutionRunner implements LatticeSource {
     /// Waits until the downstream completion callback has returned to its source owner.
     void awaitTermination() {
         this.termination.join();
+        for (var variant : this.variantRunners.values()) variant.awaitTermination();
     }
 
     @Override

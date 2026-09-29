@@ -369,6 +369,71 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("BF16 residual add is not implemented by this GPU");
     }
 
+    public void attentionProducersBf16(
+            long input,
+            long q4,
+            long q5,
+            long queryNorm,
+            long keyNorm,
+            long queryKey,
+            long gate,
+            long keys,
+            long values,
+            int rows,
+            int hidden,
+            int queryHeads,
+            int keyHeads,
+            int headDim,
+            int rotaryDim,
+            long start,
+            float epsilon,
+            double theta,
+            long q4Bytes,
+            long q5Bytes) {
+        throw new UnsupportedOperationException("attention producer region is not implemented");
+    }
+
+    public void q3FfnStreamedBf16(
+            long input,
+            long gateWeights,
+            long downWeights,
+            long output,
+            long slots,
+            long accumulators,
+            int rows,
+            int hidden,
+            int intermediate,
+            long gateBytes,
+            long downBytes) {
+        throw new UnsupportedOperationException("streamed FFN region is not implemented");
+    }
+
+    public void q3GateUpSwiGluBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        throw new UnsupportedOperationException("Q3 gate/up SwiGLU region is not implemented");
+    }
+
+    /// Writes the rounded residual and normalizes that BF16 representation in one region.
+    public void residualRmsNormBf16(
+            long residual, long delta, long weight, long hidden, long normalized, int rows, int width, float epsilon) {
+        throw new UnsupportedOperationException("residual RMSNorm region is not implemented");
+    }
+
+    /// Produces control values without exposing long-lived A/B projection buffers.
+    public void gdnProjectControlFp32(
+            long input,
+            long aWeight,
+            long bWeight,
+            long aLog,
+            long dtBias,
+            long g,
+            long beta,
+            int rows,
+            int width,
+            int heads) {
+        throw new UnsupportedOperationException("GDN projection/control region is not implemented");
+    }
+
     public void swiGluBf16(long gateUpAddress, long outputAddress, int rows, int intermediateSize) {
         throw new UnsupportedOperationException("BF16 SwiGLU is not implemented by this GPU");
     }

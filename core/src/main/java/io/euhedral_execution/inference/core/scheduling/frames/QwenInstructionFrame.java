@@ -66,10 +66,12 @@ public abstract class QwenInstructionFrame extends AbstractFrame {
         }
         try {
             this.gpu.submit(() -> perform(current, this.instruction));
+            if (!this.gpu.asynchronous()) this.gpu.synchronize();
         } catch (RuntimeException | Error failure) {
             // A launch or post-launch host operation may fail after earlier work was submitted.
-            // Error recovery must drain the device before Euhedral releases this frame's buffers.
-            if (this.gpu.asynchronous()) {
+            // A streamed FFN owns internal streams even when its outer execution mode is SYNC.
+            // Neither a failed submission nor a failed completion barrier proves they retired.
+            if (this.gpu.asynchronous() || this.instruction.kind() == QwenExecutionPlan.Kind.FFN_STREAMED) {
                 try {
                     this.gpu.synchronize();
                 } catch (RuntimeException | Error synchronizationFailure) {
@@ -88,7 +90,6 @@ public abstract class QwenInstructionFrame extends AbstractFrame {
             }
             throw failure;
         }
-        if (!this.gpu.asynchronous()) this.gpu.synchronize();
         this.completed = true;
     }
 

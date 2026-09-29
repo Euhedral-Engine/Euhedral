@@ -21,7 +21,7 @@ public final class EngineExecutionFixture {
         return (short) (Float.floatToIntBits(value) >>> 16);
     }
 
-    public static final class SamplingGpu extends QwenExecutionFixtures.RecordingGpu {
+    public static class SamplingGpu extends QwenExecutionFixtures.RecordingGpu {
         public final List<Long> embeddingAddresses = new java.util.concurrent.CopyOnWriteArrayList<>();
         private final int vocabularySize;
         private final Map<Long, int[]> uploadedTokenIds = new java.util.concurrent.ConcurrentHashMap<>();

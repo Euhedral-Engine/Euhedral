@@ -15,6 +15,8 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     private final long[] projectionByteSizes;
     private final long[] firstLayerAddresses;
     private final long[] firstLayerByteSizes;
+    private final long[] storageByteSizes;
+    private final int[] storageOwners;
     private long normalizedAddress;
     private long hiddenStateAddress;
     private boolean closed;
@@ -40,6 +42,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
                 List.of(),
                 plan.bufferSpecs(),
                 logitsRequirement);
+        if (plan.reusePrefillStorage()) configureRegionStorage();
         if (!plan.hasFirstLayer()) {
             throw new IllegalArgumentException("first-layer buffers require a first-layer plan");
         }
@@ -68,6 +71,8 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         this.projectionByteSizes = new long[projectionWidths.size()];
         this.firstLayerAddresses = new long[QwenExecutionPlan.Buffer.values().length];
         this.firstLayerByteSizes = new long[QwenExecutionPlan.Buffer.values().length];
+        this.storageOwners = new int[this.firstLayerByteSizes.length];
+        for (int index = 0; index < this.storageOwners.length; index++) this.storageOwners[index] = index;
         try {
             this.byteSize = Math.multiplyExact(Math.multiplyExact((long) tokenCount, hiddenSize), Short.BYTES);
         } catch (ArithmeticException overflow) {
@@ -94,6 +99,26 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
             this.firstLayerByteSizes[index] =
                     Math.multiplyExact(Math.multiplyExact((long) rows, spec.width()), elementBytes);
         }
+        this.storageByteSizes = this.firstLayerByteSizes.clone();
+    }
+
+    /// Fixed lifetime pairs in the combined prefill graph, not a general lifetime allocator.
+    private void configureRegionStorage() {
+        // Each previous value's final consumer precedes the next producer through the layer DAG.
+        reuse(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE, QwenExecutionPlan.Buffer.HIDDEN_STATE);
+        reuse(QwenExecutionPlan.Buffer.POST_MIXER_NORMALIZED, QwenExecutionPlan.Buffer.INPUT_NORMALIZED);
+        reuse(QwenExecutionPlan.Buffer.FFN_DELTA, QwenExecutionPlan.Buffer.MIXER_DELTA);
+        reuse(QwenExecutionPlan.Buffer.SWIGLU, QwenExecutionPlan.Buffer.VALUE_Z_PROJECTED);
+        reuse(QwenExecutionPlan.Buffer.FFN_STAGING, QwenExecutionPlan.Buffer.VALUE_Z_PROJECTED);
+        reuse(QwenExecutionPlan.Buffer.FFN_ACCUMULATORS, QwenExecutionPlan.Buffer.QK_PROJECTED);
+    }
+
+    private void reuse(QwenExecutionPlan.Buffer value, QwenExecutionPlan.Buffer owner) {
+        int from = value.ordinal(), to = owner.ordinal();
+        if (this.firstLayerByteSizes[from] == 0 || this.firstLayerByteSizes[to] == 0) return;
+        this.storageOwners[from] = to;
+        this.storageByteSizes[to] = Math.max(this.storageByteSizes[to], this.firstLayerByteSizes[from]);
+        this.storageByteSizes[from] = 0;
     }
 
     /// Allocate only after the submission owns this object, so partial failure remains reclaimable.
@@ -103,8 +128,8 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         }
         if (hasFirstLayerBuffers()) {
             for (int index = 0; index < this.firstLayerByteSizes.length; index++) {
-                if (this.firstLayerByteSizes[index] != 0) {
-                    this.firstLayerAddresses[index] = allocate(this.firstLayerByteSizes[index]);
+                if (this.storageByteSizes[index] != 0) {
+                    this.firstLayerAddresses[index] = allocate(this.storageByteSizes[index]);
                 }
             }
             this.hiddenStateAddress = this.firstLayerAddresses[QwenExecutionPlan.Buffer.HIDDEN_STATE.ordinal()];
@@ -165,7 +190,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     /// Returns a named instruction-graph buffer while this workspace is live.
     public long address(QwenExecutionPlan.Buffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
-        long address = this.firstLayerAddresses[buffer.ordinal()];
+        long address = this.firstLayerAddresses[this.storageOwners[buffer.ordinal()]];
         if (this.closed || address == 0) {
             throw new IllegalStateException("instruction buffer is unavailable: " + buffer);
         }
@@ -176,6 +201,10 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     public long detachAddress(QwenExecutionPlan.Buffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         int index = buffer.ordinal();
+        for (int value = 0; value < this.storageOwners.length; value++) {
+            if (value != index && this.firstLayerByteSizes[value] > 0 && this.storageOwners[value] == index)
+                throw new IllegalStateException("shared region storage cannot be detached: " + buffer);
+        }
         long address = this.firstLayerAddresses[index];
         if (this.closed || address == 0) {
             throw new IllegalStateException("instruction buffer cannot be detached: " + buffer);
