@@ -1,0 +1,56 @@
+[tools]
+gradle = "9.6.1"
+java = "25.0.2"
+zig = "0.16.0"
+
+[tasks."format-check"]
+description = "Check Java formatting."
+run = "./gradlew spotlessCheck"
+
+[tasks.format]
+description = "Apply Java formatting."
+run = "./gradlew spotlessApply"
+
+[tasks.test]
+description = "Run all CPU Java tests."
+run = "./gradlew test"
+
+[tasks."native-build"]
+description = "Build the Linux host CUDA product."
+run = "./gradlew nativeBuildLinuxX64"
+
+[tasks."native-test"]
+description = "Run native Python/CUDA tests (requires an available GPU)."
+run = "python3 -m unittest discover -s native/tests -p 'test_*.py'"
+
+[tasks."native-verify"]
+description = "Build and verify both Linux and Windows native products."
+run = "./gradlew nativeVerify"
+
+[tasks."cuda-test"]
+description = "Run core and API CUDA integration tests; reserve the GPU first."
+run = "./gradlew :core:cudaIntegrationTest :api:cudaIntegrationTest --rerun-tasks"
+
+[tasks."benchmark-validate"]
+description = "Validate the baseline benchmark configuration without running it."
+run = "./gradlew :benchmark:run --args='run benchmark/configs/baseline.json --validate-only'"
+
+[tasks."benchmark-smoke"]
+description = "Run a short model benchmark; reserve the GPU first."
+run = "./gradlew :benchmark:run --args='run benchmark/configs/smoke.json'"
+
+[tasks."benchmark-baseline"]
+description = "Run the full baseline; reserve the GPU first."
+run = "./gradlew :benchmark:run --args='run benchmark/configs/baseline.json'"
+
+[tasks."full-build"]
+description = "Build, format-check, test, verify and package both CUDA products and the API."
+run = "./gradlew nativeVerify nativePackage :api:bootJar build"
+
+[tasks."test-deploy"]
+description = "Exercise cutover, rollback and cleanup-order tests without Docker writes."
+run = "python3 -m unittest discover -s scripts -p 'test_*.py'"
+
+[tasks.deploy]
+description = "Pull main, build and deploy, check inference, then remove old Euhedral images."
+run = "python3 scripts/deploy-main.py"

@@ -7,7 +7,7 @@ on:
       - "native.gradle.kts"
       - "build.gradle.kts"
       - "api/build.gradle.kts"
-      - ".mise.toml"
+      - "mise.toml"
       - ".github/workflows/native-package.yaml"
   workflow_dispatch:
 

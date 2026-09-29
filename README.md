@@ -18,7 +18,7 @@ This is a multi-module Gradle project:
 - Gradle 9.6.1 (the committed wrapper handles the rest)
 - Zig 0.16.0 for native builds; CUDA 13.1+ headers and libraries are resolved automatically
 
-The optional `.mise.toml` records compatible tool versions. Install them or activate your
+The `mise.toml` records compatible tool versions and common tasks. Install them or activate your
 preferred toolchain manager before using the Gradle wrapper.
 
 ## Building
@@ -99,6 +99,28 @@ distribution):
 ```
 
 This is a host-specific alternative to NVIDIA Container Toolkit, not an image-bundled driver.
+
+On the configured deployment host, run `mise run deploy` from a clean, checked-out `main`.
+The task pulls `origin/main` with fast-forward only, builds an image from exactly that commit,
+switches `euhedral-inference-serve` on localhost port 18080, checks Docker health, `/health`,
+`/v1/models`, the expected public model ID, and a one-token chat completion. If the candidate
+fails before verification, it restores and verifies the previous container. **After** verification,
+it removes old Euhedral deployment and experimental probe containers and all previous
+`euhedral-inference:*` image tags; rollback images are not retained. Other projects' containers
+and images are not touched. Defaults for the artifact, tokenizer, driver libraries, port, and
+public model ID are defined in `scripts/deploy-main.py`; override them with the
+`EUHEDRAL_DEPLOY_MODEL`, `EUHEDRAL_DEPLOY_TOKENIZER`, `EUHEDRAL_DEPLOY_DRIVER`,
+`EUHEDRAL_DEPLOY_PTX`, `EUHEDRAL_DEPLOY_PORT`, and `EUHEDRAL_DEPLOY_MODEL_ID` environment
+variables when moving hosts. This script expects the explicit NVIDIA device and driver mounts
+shown above, not NVIDIA Container Toolkit.
+
+Common `mise run` tasks: `format-check`, `format`, `test`, `native-build`, `native-test`,
+`native-verify`, `cuda-test`, `benchmark-validate`, `benchmark-smoke`,
+`benchmark-baseline`, `full-build`, `test-deploy`, and `deploy`. `full-build` performs
+formatting checks, CPU tests, both native product builds/verification/packaging, and the API
+boot JAR. Reserve the GPU and temporarily stop the serving container before running
+`native-test`, `cuda-test`, `benchmark-smoke`, or `benchmark-baseline`; those tasks do not
+stop or restart a production service on their own.
 
 ## Testing
 
