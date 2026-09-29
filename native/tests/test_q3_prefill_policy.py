@@ -18,6 +18,43 @@ int wmma64(int mode, unsigned rows, unsigned width, unsigned outputs) {
 int select(int mode, unsigned rows, unsigned width, unsigned outputs, int has64, int has_wmma) {
     return (int)euhedral_q3_select_prefill(mode, rows, width, outputs, has64, has_wmma);
 }
+int use_k32_cb(int mode, unsigned rows, unsigned width, unsigned outputs) {
+#ifdef EUHEDRAL_Q3_HAS_K32_COMPACT_B_POLICY
+    return euhedral_q3_use_k32_compact_b_prefill(mode, rows, width, outputs);
+#else
+    (void)mode; (void)rows; (void)width; (void)outputs;
+    return 0;
+#endif
+}
+int select_with_k32_cb(int mode, unsigned rows, unsigned width, unsigned outputs,
+        int has_cb, int has64, int has_wmma) {
+#ifdef EUHEDRAL_Q3_HAS_K32_COMPACT_B_POLICY
+    return (int)euhedral_q3_select_prefill_with_k32_compact_b(
+            mode, rows, width, outputs, has_cb, has64, has_wmma);
+#else
+    (void)has_cb;
+    return (int)euhedral_q3_select_prefill(mode, rows, width, outputs, has64, has_wmma);
+#endif
+}
+int select_with_cb_input_alignment(int mode, unsigned rows, unsigned width, unsigned outputs,
+        int has_cb, int input_aligned_16, int has64, int has_wmma) {
+#ifdef EUHEDRAL_Q3_HAS_CB_ALIGNMENT_POLICY
+    return (int)euhedral_q3_select_prefill_for_input(
+            mode, rows, width, outputs, has_cb, input_aligned_16, has64, has_wmma);
+#else
+    (void)mode; (void)rows; (void)width; (void)outputs;
+    (void)has_cb; (void)input_aligned_16; (void)has64; (void)has_wmma;
+    return -1;
+#endif
+}
+int prefill_tile_rows(int selected) {
+#ifdef EUHEDRAL_Q3_HAS_K32_PREFILL_TILE_POLICY
+    return (int)euhedral_q3_prefill_tile_rows((enum euhedral_q3_prefill_kernel)selected);
+#else
+    (void)selected;
+    return -1;
+#endif
+}
 '''
 
 
@@ -39,6 +76,17 @@ class Q3PrefillPolicyTest(unittest.TestCase):
         cls.lib.select.argtypes = (ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
                                    ctypes.c_int, ctypes.c_int)
         cls.lib.select.restype = ctypes.c_int
+        cls.lib.use_k32_cb.argtypes = (ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
+        cls.lib.use_k32_cb.restype = ctypes.c_int
+        cls.lib.select_with_k32_cb.argtypes = (ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                                                ctypes.c_int, ctypes.c_int, ctypes.c_int)
+        cls.lib.select_with_k32_cb.restype = ctypes.c_int
+        cls.lib.select_with_cb_input_alignment.argtypes = (ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                                                            ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                                            ctypes.c_int, ctypes.c_int)
+        cls.lib.select_with_cb_input_alignment.restype = ctypes.c_int
+        cls.lib.prefill_tile_rows.argtypes = (ctypes.c_int,)
+        cls.lib.prefill_tile_rows.restype = ctypes.c_int
 
     @classmethod
     def tearDownClass(cls):
@@ -99,6 +147,107 @@ class Q3PrefillPolicyTest(unittest.TestCase):
         self.assertEqual(P64, select(3, 64, *down, 1, 1))
         self.assertEqual(NONE, select(3, 64, *down, 0, 1))
         self.assertEqual(NONE, select(0, 64, *down, 1, 1))
+
+    def test_compact_b_route_is_only_used_for_measured_shapes(self):
+        NONE, P32, P64, WMMA, K32_CB = 0, 1, 2, 3, 4
+        cases = (
+            (64, 5120, 34816, P64),
+            (256, 5120, 34816, P64),
+            (1024, 5120, 34816, P64),
+            (256, 6144, 5120, P32),
+            (1024, 6144, 5120, P64),
+            (64, 17408, 5120, WMMA),
+            (256, 17408, 5120, P64),
+            (1024, 17408, 5120, P64),
+        )
+        for rows, width, outputs, fallback in cases:
+            with self.subTest(rows=rows, width=width, outputs=outputs):
+                self.assertEqual(1, self.lib.use_k32_cb(2, rows, width, outputs))
+                self.assertEqual(K32_CB, self.lib.select_with_k32_cb(
+                    2, rows, width, outputs, 1, 1, 1))
+                self.assertEqual(fallback, self.lib.select_with_k32_cb(
+                    2, rows, width, outputs, 0, 1, 1))
+
+        excluded = (
+            (64, 6144, 5120, P32),       # measured regression: mixer M=64
+            (255, 6144, 5120, P32),      # adjacent to the qualified M=256 shape
+            (257, 6144, 5120, P32),
+            (1023, 6144, 5120, P64),     # adjacent to the qualified M=1024 shape
+            (1025, 6144, 5120, P64),
+            (63, 5120, 34816, P32),      # immediately below tile64 eligibility
+            (65, 5120, 34816, P64),
+            (255, 5120, 34816, P64),
+            (257, 5120, 34816, P64),
+            (1023, 5120, 34816, P64),
+            (1025, 5120, 34816, P64),
+            (63, 17408, 5120, P32),
+            (65, 17408, 5120, P64),
+            (255, 17408, 5120, P64),
+            (257, 17408, 5120, P64),
+            (1023, 17408, 5120, P64),
+            (1025, 17408, 5120, P64),
+            (128, 5120, 34816, P64),     # unmeasured; leave AUTO unchanged
+            (512, 6144, 5120, P64),      # existing mixer tile64 route
+            (256, 6144, 5121, P32),      # different operator shape
+        )
+        for rows, width, outputs, fallback in excluded:
+            with self.subTest(excluded=(rows, width, outputs)):
+                self.assertEqual(0, self.lib.use_k32_cb(2, rows, width, outputs))
+                self.assertEqual(fallback, self.lib.select_with_k32_cb(
+                    2, rows, width, outputs, 1, 1, 1))
+
+        for rows, width, outputs, _ in cases:
+            with self.subTest(mode=3, rows=rows, width=width):
+                self.assertEqual(0, self.lib.use_k32_cb(3, rows, width, outputs))
+                self.assertEqual(P64, self.lib.select_with_k32_cb(
+                    3, rows, width, outputs, 1, 1, 1))
+        self.assertEqual(NONE, self.lib.select_with_k32_cb(0, 256, 5120, 34816, 1, 1, 1))
+
+    def test_cb_requires_aligned_bf16_input_pointer(self):
+        K32_CB = 4
+        cases = (
+            (64, 5120, 34816, 2),
+            (256, 5120, 34816, 2),
+            (1024, 5120, 34816, 2),
+            (256, 6144, 5120, 1),
+            (1024, 6144, 5120, 2),
+            (64, 17408, 5120, 3),
+            (256, 17408, 5120, 2),
+            (1024, 17408, 5120, 2),
+        )
+        for rows, width, outputs, fallback in cases:
+            with self.subTest(rows=rows, width=width, outputs=outputs):
+                choose = self.lib.select_with_cb_input_alignment
+                self.assertEqual(K32_CB, choose(2, rows, width, outputs, 1, 1, 1, 1))
+                self.assertEqual(fallback, choose(2, rows, width, outputs, 1, 0, 1, 1))
+                self.assertEqual(fallback, choose(2, rows, width, outputs, 0, 1, 1, 1))
+        self.assertEqual(2, self.lib.select_with_cb_input_alignment(
+            3, 256, 5120, 34816, 1, 0, 1, 1))
+
+    def test_missing_optional_kernel_recomputes_legacy_tile_size(self):
+        K32_CB = 4
+        cases = (
+            (64, 5120, 34816, 64),   # qualified gate/up: legacy tile64
+            (256, 5120, 34816, 64),
+            (256, 6144, 5120, 32),   # qualified mixer: legacy tile32
+            (1024, 6144, 5120, 64),
+            (64, 17408, 5120, 64),   # legacy WMMA still has a 64-row grid
+            (64, 6144, 5120, 32),    # measured mixer regression
+            (63, 5120, 34816, 32),   # below the production tile64 crossover
+        )
+        for rows, width, outputs, fallback_tile in cases:
+            with self.subTest(rows=rows, width=width, outputs=outputs):
+                legacy = self.lib.select(2, rows, width, outputs, 1, 1)
+                without_cb = self.lib.select_with_k32_cb(
+                    2, rows, width, outputs, 0, 1, 1)
+                self.assertEqual(legacy, without_cb)
+                self.assertEqual(fallback_tile, self.lib.prefill_tile_rows(without_cb))
+                selected = self.lib.select_with_k32_cb(
+                    2, rows, width, outputs, 1, 1, 1)
+                expected = K32_CB if self.lib.use_k32_cb(2, rows, width, outputs) else legacy
+                self.assertEqual(expected, selected)
+                self.assertEqual(64 if expected in (2, 3, K32_CB) else 32,
+                                 self.lib.prefill_tile_rows(selected))
 
 
 if __name__ == '__main__':

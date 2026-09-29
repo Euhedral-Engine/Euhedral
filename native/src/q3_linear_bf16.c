@@ -17,7 +17,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction function;
-static CUfunction decode1, decode2, decode4, prefill, prefill64, prefill64_wmma;
+static CUfunction decode1, decode2, decode4, prefill, prefill64, prefill64_wmma, prefill64_k32_cb;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction optional_kernel(const char* name) {
     CUfunction loaded = NULL;
@@ -32,6 +32,7 @@ static void initialize(void) {
     prefill = optional_kernel("euhedral_q3_prefill");
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
     prefill64_wmma = optional_kernel("euhedral_q3_prefill_64_wmma");
+    prefill64_k32_cb = optional_kernel("euhedral_q3_prefill_64_k32_cb");
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -72,9 +73,12 @@ static int linear_q3(const void* input, const void* weights, void* output,
     // retains the 32-row route; explicit 64-row requests fail below.
     enum euhedral_q3_prefill_kernel prefill_kernel = EUHEDRAL_Q3_PREFILL_NONE;
     if (mode == 2 || mode == 3) {
-        prefill_kernel = euhedral_q3_select_prefill(mode, rows, in_features, out_features,
+        // CB uses 16-byte vector loads; qualified K row strides are multiples of 16.
+        int input_aligned_16 = ((uintptr_t)input & 15u) == 0u;
+        prefill_kernel = euhedral_q3_select_prefill_for_input(mode, rows, in_features, out_features,
+                prefill64_k32_cb != NULL, input_aligned_16,
                 prefill64 != NULL, prefill64_wmma != NULL);
-        wide_prefill = prefill_kernel == EUHEDRAL_Q3_PREFILL64 || prefill_kernel == EUHEDRAL_Q3_PREFILL64_WMMA;
+        wide_prefill = euhedral_q3_prefill_tile_rows(prefill_kernel) == 64u;
         grid = (((uint64_t)rows + (wide_prefill ? 63 : 31)) / (wide_prefill ? 64 : 32))
                 * (((uint64_t)out_features + 31) / 32);
         if (grid > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
@@ -86,6 +90,7 @@ static int linear_q3(const void* input, const void* weights, void* output,
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
     CUfunction selected = mode == 1 ? (row_tile == 1 ? decode1 : row_tile == 2 ? decode2 : decode4)
             : mode == 0 ? function
+            : prefill_kernel == EUHEDRAL_Q3_PREFILL64_K32_CB ? prefill64_k32_cb
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64_WMMA ? prefill64_wmma
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64 ? prefill64
             : prefill_kernel == EUHEDRAL_Q3_PREFILL32 ? prefill : NULL;
