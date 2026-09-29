@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
     paths:
+      - "api/**"
+      - "core/**"
+      - "benchmark/**"
+      - "gradle/**"
+      - "settings.gradle.kts"
+      - "gradle.properties"
       - "native/**"
       - "native.gradle.kts"
       - "build.gradle.kts"
@@ -12,6 +18,12 @@ on:
       - ".github/workflows/native-package.yaml"
   pull_request:
     paths:
+      - "api/**"
+      - "core/**"
+      - "benchmark/**"
+      - "gradle/**"
+      - "settings.gradle.kts"
+      - "gradle.properties"
       - "native/**"
       - "native.gradle.kts"
       - "build.gradle.kts"
