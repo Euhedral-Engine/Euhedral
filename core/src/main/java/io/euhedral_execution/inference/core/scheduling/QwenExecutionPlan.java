@@ -36,6 +36,7 @@ public final class QwenExecutionPlan {
         RESIDUAL_RMS_NORM,
         GDN_PROJECT_CONTROL,
         Q3_GATE_UP_SWIGLU,
+        Q3_FFN_DOWN,
         FFN_STREAMED,
         SWIGLU,
         ATTENTION_QK_NORM_ROPE,
@@ -210,7 +211,10 @@ public final class QwenExecutionPlan {
     /// Row threshold for the attention producer and gate/up regions (one 64-row prefill tile).
     private static final int REGION_MIN_ROWS = 64;
     /// Exact geometry at which the streamed FFN region is qualified; elsewhere gate/up + down is used.
-    private static final int STREAMED_FFN_ROWS = 256;
+    private static boolean streamedFfnRows(int rows) {
+        return rows == 64 || rows == 1024;
+    }
+
     private static final int STREAMED_FFN_HIDDEN = 5120;
     private static final int STREAMED_FFN_INTERMEDIATE = 17408;
     /// Two bounded BF16 feature slots of 4096 features each.
@@ -259,7 +263,7 @@ public final class QwenExecutionPlan {
         QwenExecutionPlan family = this.owner;
         if (kind == QwenExecutionContext.ExecutionKind.DECODE || family.regionPrefill == null) return family;
         if (rows < REGION_MIN_ROWS) return family.smallPrefill;
-        if (rows == STREAMED_FFN_ROWS && family.streamedPrefill != null) return family.streamedPrefill;
+        if (streamedFfnRows(rows) && family.streamedPrefill != null) return family.streamedPrefill;
         return family.regionPrefill;
     }
 
@@ -516,9 +520,13 @@ public final class QwenExecutionPlan {
             }
             List<Integer> dependencies = remapDependencies(first.dependencies(), remapped);
             remapped[first.id()] = result.size();
+            boolean ffnDown = producers
+                    && first.kind() == Kind.Q3_LINEAR
+                    && first.inputBuffers().equals(List.of(Buffer.SWIGLU))
+                    && first.outputBuffers().equals(List.of(Buffer.FFN_DELTA));
             result.add(new Instruction(
                     result.size(),
-                    first.kind(),
+                    ffnDown ? Kind.Q3_FFN_DOWN : first.kind(),
                     dependencies,
                     first.weights(),
                     producers && first.kind() == Kind.ATTENTION_CAUSAL

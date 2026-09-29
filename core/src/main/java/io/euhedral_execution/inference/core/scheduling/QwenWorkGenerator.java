@@ -53,6 +53,7 @@ public final class QwenWorkGenerator {
                     || instruction.kind() == QwenExecutionPlan.Kind.RMS_NORM_UNIT_OFFSET) {
                 rmsManagers.put(instruction.id(), rmsNormManager(instruction));
             } else if (instruction.kind() == QwenExecutionPlan.Kind.Q3_LINEAR
+                    || instruction.kind() == QwenExecutionPlan.Kind.Q3_FFN_DOWN
                     || instruction.kind() == QwenExecutionPlan.Kind.Q4_LINEAR
                     || instruction.kind() == QwenExecutionPlan.Kind.Q5_LINEAR
                     || instruction.kind() == QwenExecutionPlan.Kind.BF16_LINEAR) {
@@ -222,7 +223,7 @@ public final class QwenWorkGenerator {
             case RMS_NORM, RMS_NORM_UNIT_OFFSET ->
                 Objects.requireNonNull(this.rmsNormFrames.get(instruction.id()))
                         .getOrCreate(context, FRAME_POOL_PASSWORD);
-            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR ->
+            case Q3_LINEAR, Q3_FFN_DOWN, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR ->
                 Objects.requireNonNull(this.linearFrames.get(instruction.id()))
                         .getOrCreate(context, FRAME_POOL_PASSWORD);
             case GDN_CONTROL,

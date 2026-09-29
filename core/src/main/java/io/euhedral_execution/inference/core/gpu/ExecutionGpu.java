@@ -408,6 +408,12 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("streamed FFN region is not implemented");
     }
 
+    /// Consumes the FFN's BF16 activation. Non-CUDA backends retain ordinary Q3 semantics.
+    public void q3FfnDownBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        linearQ3Bf16(input, weights, output, rows, width, outputs, weightBytes);
+    }
+
     public void q3GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
         throw new UnsupportedOperationException("Q3 gate/up SwiGLU region is not implemented");

@@ -67,7 +67,7 @@ class QwenRegionsTest(unittest.TestCase):
             self.assertEqual(0, gpu.function(C.byref(symbol), gpu.module, b'euhedral_q3_gate_up_swiglu_bf16'),
                              'gate/up SwiGLU region is unavailable')
             rng = random.Random(524)
-            for rows, width, outputs in [(1, 128, 32), (65, 256, 96), (256, 5120, 64)]:
+            for rows, width, outputs in [(1, 128, 32), (65, 256, 96), (65, 256, 192), (129, 256, 128), (256, 5120, 64)]:
                 with contextlib.ExitStack() as case:
                     def upload(data):
                         ptr = gpu.upload(data)
@@ -97,6 +97,13 @@ class QwenRegionsTest(unittest.TestCase):
                         gpu.launch('euhedral_q3_gate_up_swiglu_bf16', ((rows + 63) // 64) * (outputs // 32), args)
                         self.assertEqual(gpu.download(reference, rows * outputs), gpu.download(actual, rows * outputs),
                                          f'gate/up BF16 boundary differs for {(rows, width, outputs, special)}')
+                        if outputs % 64 == 0:
+                            for tile in (64, 128):
+                                gpu.launch(f'euhedral_q3_gate_up_swiglu_{tile}x32',
+                                           ((rows + tile - 1) // tile) * (outputs // 64), args)
+                                self.assertEqual(gpu.download(reference, rows * outputs),
+                                                 gpu.download(actual, rows * outputs),
+                                                 f'paired {tile} boundary differs for {(rows, width, outputs, special)}')
 
     def test_control_region_preserves_fp32_projection_control_order(self):
         source = b'#include "qwen_layer_linear.cu"\n#include "qwen_gdn_ops.cu"\n'

@@ -78,6 +78,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle residualAddBf16;
     private final MethodHandle residualRmsNormBf16;
     private final MethodHandle q3GateUpSwiGluBf16;
+    private final MethodHandle q3FfnDownBf16;
     private final MethodHandle q3FfnStreamedBf16;
     private final MethodHandle attentionProducersBf16;
     private final MethodHandle gdnProjectControlFp32;
@@ -263,6 +264,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                                     ValueLayout.JAVA_INT,
                                     ValueLayout.JAVA_LONG,
                                     ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.q3FfnDownBf16 = symbols.find("euhedral_cuda_q3_ffn_down_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
                     .orElse(null);
             this.q3GateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_gate_up_swiglu_bf16")
                     .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
@@ -1136,7 +1140,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             long downBytes) {
         ensureOpen();
         requireAddresses(input, gateWeights, downWeights, output, slots, accumulators);
-        if (rows != 256 || hidden != 5120 || intermediate != 17408 || gateBytes <= 0 || downBytes <= 0)
+        if ((rows != 64 && rows != 1024) || hidden != 5120 || intermediate != 17408 || gateBytes <= 0 || downBytes <= 0)
             throw new IllegalArgumentException("streamed FFN geometry is not qualified");
         if (q3FfnStreamedBf16 == null) throw new UnsupportedOperationException("native streamed FFN unavailable");
         invokeLayer(
@@ -1153,6 +1157,29 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 intermediate,
                 gateBytes,
                 downBytes);
+    }
+
+    @Override
+    public void q3FfnDownBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        if (q3FfnDownBf16 == null) {
+            linearQ3Bf16(input, weights, output, rows, width, outputs, weightBytes);
+            return;
+        }
+        if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
+            throw new IllegalArgumentException("invalid Q3 FFN down dimensions");
+        invokeLayer(
+                "Q3 FFN down",
+                q3FfnDownBf16,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(weights),
+                MemorySegment.ofAddress(output),
+                rows,
+                width,
+                outputs,
+                weightBytes);
     }
 
     @Override

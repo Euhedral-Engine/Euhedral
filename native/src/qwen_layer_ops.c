@@ -1,5 +1,6 @@
 #include "cuda_kernel_loader.h"
 #include "euhedral_cuda.h"
+#include "qwen_ffn_policy.h"
 #include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdint.h>
@@ -25,8 +26,10 @@ static int attention_anchor;
 static int ffn_anchor;
 static CUmodule ffn_module;
 static CUfunction gate_up_swiglu;
+static CUfunction gate_up64x32, gate_up128x32, ffn_down128x64;
 static CUfunction ffn_stream_gate;
 static CUfunction ffn_stream_down;
+static CUfunction stream_gate64, stream_gate128, stream_down64, stream_down128;
 static CUmodule quantized_module;
 static CUmodule q45_module;
 static CUmodule gdn_module;
@@ -122,6 +125,13 @@ static void initialize(void) {
         euhedral_cuda_load_kernel(&ffn_anchor, "qwen_ffn.cu", "euhedral_q3_gate_up_swiglu_bf16",
                 &ffn_module, &gate_up_swiglu);
         if (ffn_module) {
+            get_function(ffn_module, &gate_up64x32, "euhedral_q3_gate_up_swiglu_64x32");
+            get_function(ffn_module, &gate_up128x32, "euhedral_q3_gate_up_swiglu_128x32");
+            get_function(ffn_module, &ffn_down128x64, "euhedral_q3_ffn_down_128x64");
+            get_function(ffn_module, &stream_gate64, "stream_gate_up_64x32");
+            get_function(ffn_module, &stream_gate128, "stream_gate_up_128x32");
+            get_function(ffn_module, &stream_down64, "stream_down_64x64");
+            get_function(ffn_module, &stream_down128, "stream_down_128x64");
             get_function(ffn_module, &ffn_stream_gate, "stream_gate_up");
             get_function(ffn_module, &ffn_stream_down, "stream_down");
         }
@@ -382,8 +392,11 @@ int euhedral_cuda_q3_ffn_streamed_bf16(
         void* slots, float* accumulators, uint32_t rows, uint32_t hidden, uint32_t intermediate,
         uint64_t gate_bytes, uint64_t down_bytes) {
     if (!input || !gate_weights || !down_weights || !output || !slots || !accumulators
-            || rows != 256 || hidden != 5120 || intermediate != 17408
-            || ((uintptr_t)input & 15u) != 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+            || !euhedral_ffn_streamed_rows(rows) || hidden != 5120 || intermediate != 17408
+            || ((uintptr_t)input & 15u) != 0 || ((uintptr_t)slots & 15u) != 0
+            || ((uintptr_t)gate_weights & 3u) != 0 || ((uintptr_t)down_weights & 3u) != 0
+            || ((uintptr_t)accumulators & 3u) != 0 || ((uintptr_t)output & 1u) != 0)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     uint32_t gate_outputs = intermediate * 2u;
     uint64_t gate_groups = (uint64_t)gate_outputs * (hidden / 64u);
     uint64_t down_groups = (uint64_t)hidden * (intermediate / 64u);
@@ -395,7 +408,16 @@ int euhedral_cuda_q3_ffn_streamed_bf16(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    if (!ffn_stream_gate || !ffn_stream_down) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    CUfunction gate = rows == 64u ? stream_gate64 : stream_gate128;
+    CUfunction down = rows == 64u ? stream_down64 : stream_down128;
+    uint32_t row_tile = rows == 64u ? 64u : 128u, gate_tile = 32u, down_tile = 64u;
+    if (!gate || !down) {
+        // An older source bundle retains the old K32 continuation shape. Select its
+        // functions and all three matching launch dimensions together.
+        gate = ffn_stream_gate; down = ffn_stream_down;
+        row_tile = 64u; gate_tile = 16u; down_tile = 32u;
+    }
+    if (!gate || !down) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     cudaStream_t producer = (cudaStream_t)euhedral_cuda_submission_stream();
     cudaStream_t consumer = NULL;
     cudaEvent_t ready[2] = {NULL, NULL}, release[2] = {NULL, NULL};
@@ -414,13 +436,13 @@ int euhedral_cuda_q3_ffn_streamed_bf16(
         void* staging = (unsigned char*)slots + (uint64_t)slot * rows * 4096u * 2u;
         if (part >= 2u) FFN_TRY(cudaStreamWaitEvent(producer, release[slot], 0));
         void* gate_args[] = {&input, &gate_weights, &staging, &rows, &hidden, &gate_outputs, &gate_scale, &begin, &count};
-        FFN_TRY(cuLaunchKernel(ffn_stream_gate, (rows / 64u) * (count / 16u), 1, 1, 128, 1, 1, 0,
+        FFN_TRY(cuLaunchKernel(gate, (rows / row_tile) * (count / gate_tile), 1, 1, 128, 1, 1, 0,
                 (CUstream)producer, gate_args, NULL));
         FFN_TRY(cudaEventRecord(ready[slot], producer));
         FFN_TRY(cudaStreamWaitEvent(consumer, ready[slot], 0));
         void* down_args[] = {&staging, &down_weights, &output, &rows, &intermediate, &hidden, &down_scale,
                 &accumulators, &begin, &count};
-        FFN_TRY(cuLaunchKernel(ffn_stream_down, (rows / 64u) * (hidden / 32u), 1, 1, 128, 1, 1, 0,
+        FFN_TRY(cuLaunchKernel(down, (rows / row_tile) * (hidden / down_tile), 1, 1, 128, 1, 1, 0,
                 (CUstream)consumer, down_args, NULL));
         FFN_TRY(cudaEventRecord(release[slot], consumer));
     }
@@ -458,9 +480,36 @@ int euhedral_cuda_q3_gate_up_swiglu_bf16(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    if (!gate_up_swiglu) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    uint32_t tile_rows = euhedral_ffn_gate_tile_rows(rows, width, outputs);
+    CUfunction selected = tile_rows == 64u ? gate_up64x32 : tile_rows == 128u ? gate_up128x32 : NULL;
+    // Older source bundles keep the matching old symbol AND its old launch tile.
+    if (selected) grid = (((uint64_t)rows + tile_rows - 1u) / tile_rows) * (outputs / 64u);
+    else selected = gate_up_swiglu;
+    if (!selected) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     void* parameters[] = {&input, &weights, &output, &rows, &width, &outputs, &scale_offset};
-    return launch_and_synchronize(gate_up_swiglu, (uint32_t)grid, 128, parameters);
+    return launch_and_synchronize(selected, (uint32_t)grid, 128, parameters);
+}
+
+int euhedral_cuda_q3_ffn_down_bf16(
+        const void* input, const void* weights, void* output, uint32_t rows,
+        uint32_t width, uint32_t outputs, uint64_t weight_bytes) {
+    if (!input || !weights || !output || !rows || !width || !outputs || !weight_bytes)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    if (!euhedral_ffn_down_wide(rows, width, outputs) || ((uintptr_t)input & 15u) != 0
+            || ((uintptr_t)weights & 3u) != 0)
+        return euhedral_cuda_linear_q3_prefill_bf16(input, weights, output, rows, width, outputs, weight_bytes);
+    uint64_t groups = (uint64_t)outputs * (width / 64u);
+    uint64_t scale_offset = (groups * 24u + 255u) & ~UINT64_C(255);
+    if (weight_bytes != scale_offset + groups * 2u) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (!ffn_down128x64)
+        return euhedral_cuda_linear_q3_prefill_bf16(input, weights, output, rows, width, outputs, weight_bytes);
+    uint32_t grid = (rows / 128u) * (outputs / 64u);
+    void* parameters[] = {&input, &weights, &output, &rows, &width, &outputs, &scale_offset};
+    return launch_and_synchronize(ffn_down128x64, grid, 128, parameters);
 }
 
 int euhedral_cuda_residual_rms_norm_bf16(

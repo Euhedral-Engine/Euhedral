@@ -43,9 +43,14 @@ class QwenStreamedFfnLifecycleTest {
     }
 
     private static void runCase(Scenario scenario, boolean asynchronous, boolean nativeSucceeded) throws Exception {
+        for (int rows : new int[] {64, 1024}) runCase(scenario, asynchronous, nativeSucceeded, rows);
+    }
+
+    private static void runCase(Scenario scenario, boolean asynchronous, boolean nativeSucceeded, int rows)
+            throws Exception {
         var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
-        var plan = new QwenExecutionPlan(weights).forExecution(QwenExecutionContext.ExecutionKind.PREFILL, 256);
-        var sequence = new QwenSequenceState(901);
+        var plan = new QwenExecutionPlan(weights).forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
+        var sequence = new QwenSequenceState(2048);
         var gpu = new HoldingGpu(scenario, asynchronous);
         gpu.nativeSucceeded = nativeSucceeded;
         var context = new QwenExecutionContext(
@@ -53,7 +58,7 @@ class QwenStreamedFfnLifecycleTest {
                 sequence,
                 QwenExecutionContext.ExecutionKind.PREFILL,
                 0,
-                new int[256],
+                new int[rows],
                 QwenLogitsRequirement.NONE);
         var runner = new QwenExecutionRunner(plan, gpu);
         new DefaultExecutor().input(runner);
@@ -169,7 +174,7 @@ class QwenStreamedFfnLifecycleTest {
                 int intermediate,
                 long gateBytes,
                 long downBytes) {
-            assertEquals(256, rows);
+            assertTrue(rows == 64 || rows == 1024);
             assertEquals(5120, hidden);
             assertEquals(17408, intermediate);
             borrowed = Set.of(input, output, slots, accumulators);
