@@ -17,27 +17,17 @@ __device__ __forceinline__ float qwen_gdn_reduce_sum(float value, float* scratch
     return result;
 }
 
-/// Sums one value per thread of a 128-thread CTA with the same addition tree as `qwen_gdn_reduce_sum`.
-/// Stride 64 runs through shared memory; warp 0 folds stride 32 in registers, finishes strides 16..1
-/// with shuffles, and lane 0 publishes the result through `scratch[0]`.
-__device__ __forceinline__ float qwen_gdn_reduce_sum_128(float value, float* scratch) {
-    scratch[threadIdx.x] = value;
-    __syncthreads();
-    if (threadIdx.x < 64) scratch[threadIdx.x] += scratch[threadIdx.x + 64];
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float sum = scratch[threadIdx.x] + scratch[threadIdx.x + 32];
-        sum += __shfl_down_sync(0xffffffffu, sum, 16);
-        sum += __shfl_down_sync(0xffffffffu, sum, 8);
-        sum += __shfl_down_sync(0xffffffffu, sum, 4);
-        sum += __shfl_down_sync(0xffffffffu, sum, 2);
-        sum += __shfl_down_sync(0xffffffffu, sum, 1);
-        if (threadIdx.x == 0) scratch[0] = sum;
-    }
-    __syncthreads();
-    const float result = scratch[0];
-    __syncthreads();
-    return result;
+/// Sums 128 values held four per lane (`lane`, `lane + 32`, `lane + 64`, `lane + 96`) with the addition
+/// tree of `qwen_gdn_reduce_sum`: stride 64 pairs `e0 + e2` and `e1 + e3`, stride 32 joins them, then
+/// shuffles finish strides 16..1. Every lane receives lane 0's result.
+__device__ __forceinline__ float qwen_gdn_warp_sum_128(float e0, float e1, float e2, float e3) {
+    float sum = __fadd_rn(__fadd_rn(e0, e2), __fadd_rn(e1, e3));
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, 16));
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, 8));
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, 4));
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, 2));
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, 1));
+    return __shfl_sync(0xffffffffu, sum, 0);
 }
 
 __device__ __forceinline__ float qwen_gdn_sigmoid(float value) {
@@ -50,21 +40,22 @@ __device__ __forceinline__ float qwen_gdn_silu(float value) {
 
 extern "C" __global__ void euhedral_gdn_control_fp32(
         const float* aProjection, const float* bProjection, const float* aLog, const float* dtBias,
-        float* gOutput, float* betaOutput, uint32_t rows, uint32_t heads) {
+        float* alphaOutput, float* betaOutput, uint32_t rows, uint32_t heads) {
     const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<uint64_t>(rows) * heads) return;
     const uint32_t head = static_cast<uint32_t>(index % heads);
     const float shifted = aProjection[index] + dtBias[head];
     const float softplus = fmaxf(shifted, 0.0f) + log1pf(expf(-fabsf(shifted)));
-    gOutput[index] = -expf(aLog[head]) * softplus;
+    alphaOutput[index] = expf(-expf(aLog[head]) * softplus);
     betaOutput[index] = qwen_gdn_sigmoid(bProjection[index]);
 }
 
 // One CTA owns both FP32 projections for one (row, head). Activation loads are shared,
 // while each projection retains the original 128-lane FMA stripes and addition tree.
+// The decay factor alpha = exp(g) is produced once per (row, head) for every recurrence consumer.
 extern "C" __global__ __launch_bounds__(128) void euhedral_gdn_project_control_fp32(
         const __nv_bfloat16* input, const __nv_bfloat16* aWeight, const __nv_bfloat16* bWeight,
-        const float* aLog, const float* dtBias, float* gOutput, float* betaOutput,
+        const float* aLog, const float* dtBias, float* alphaOutput, float* betaOutput,
         uint32_t rows, uint32_t width, uint32_t heads) {
     const uint64_t index = blockIdx.x;
     if (index >= static_cast<uint64_t>(rows) * heads) return;
@@ -92,7 +83,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_gdn_project_control_f
     if (threadIdx.x == 0) {
         const float shifted = partialA[0] + dtBias[head];
         const float softplus = fmaxf(shifted, 0.0f) + log1pf(expf(-fabsf(shifted)));
-        gOutput[index] = -expf(aLog[head]) * softplus;
+        alphaOutput[index] = expf(-expf(aLog[head]) * softplus);
         betaOutput[index] = qwen_gdn_sigmoid(partialB[0]);
     }
 }
@@ -136,42 +127,91 @@ extern "C" __global__ void euhedral_gdn_convolution_bf16(
     }
 }
 
-extern "C" __global__ void euhedral_gdn_recurrence_bf16(
-        const __nv_bfloat16* convolved, const float* g, const float* beta,
+/// Columns of one value head owned by a warp. Its lanes hold four state elements per column, so the
+/// warp reuses one query/key load, one normalization and one alpha/beta pair across all columns.
+#define QWEN_GDN_WARP_COLUMNS 8
+
+/// One warp owns `QWEN_GDN_WARP_COLUMNS` contiguous value columns of one value head. Recurrent state
+/// stays in registers across every row and is loaded and stored once. Grid: valueHeads * 16 warps,
+/// launched as 32-thread CTAs. Reductions use `qwen_gdn_warp_sum_128`, so no barrier is needed.
+extern "C" __global__ __launch_bounds__(32) void euhedral_gdn_recurrence_bf16(
+        const __nv_bfloat16* convolved, const float* alpha, const float* beta,
         float* recurrentState, __nv_bfloat16* output, uint32_t rows,
         uint32_t keyHeads, uint32_t valueHeads, uint32_t keyHeadDim,
         uint32_t valueHeadDim, float outputScale) {
-    const uint32_t valueRow = blockIdx.x;
-    const uint32_t valueHead = valueRow / valueHeadDim;
-    const uint32_t valueColumn = valueRow % valueHeadDim;
-    if (valueHead >= valueHeads || blockDim.x != keyHeadDim) return;
+    constexpr uint32_t columns = QWEN_GDN_WARP_COLUMNS;
+    if (blockDim.x != 32 || keyHeadDim != 128 || valueHeadDim != 128) return;
+    const uint32_t tilesPerHead = valueHeadDim / columns;
+    const uint32_t valueHead = blockIdx.x / tilesPerHead;
+    const uint32_t column0 = (blockIdx.x % tilesPerHead) * columns;
+    if (valueHead >= valueHeads) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t queryKeyWidth = 2 * keyHeads * keyHeadDim;
     const uint32_t convolvedWidth = queryKeyWidth + valueHeads * valueHeadDim;
     const uint32_t keyHead = valueHead / (valueHeads / keyHeads);
-    const uint32_t lane = threadIdx.x;
-    const uint64_t stateOffset = (static_cast<uint64_t>(valueHead) * valueHeadDim + valueColumn) * keyHeadDim;
-    float stateValue = recurrentState[stateOffset + lane];
-    __shared__ float scratch[128];
-
+    float state[columns][4];
+#pragma unroll
+    for (uint32_t c = 0; c < columns; c++) {
+        const uint64_t base = (static_cast<uint64_t>(valueHead) * valueHeadDim + column0 + c) * keyHeadDim;
+#pragma unroll
+        for (uint32_t j = 0; j < 4; j++) state[c][j] = recurrentState[base + lane + 32 * j];
+    }
     for (uint32_t row = 0; row < rows; row++) {
         const uint64_t rowOffset = static_cast<uint64_t>(row) * convolvedWidth;
-        const uint32_t queryBase = keyHead * keyHeadDim;
-        const uint32_t keyBase = keyHeads * keyHeadDim + queryBase;
-        const uint32_t valueBase = queryKeyWidth + valueHead * valueHeadDim + valueColumn;
-        const float query = __bfloat162float(convolved[rowOffset + queryBase + lane]);
-        const float key = __bfloat162float(convolved[rowOffset + keyBase + lane]);
-        const float normalizedKey = key * rsqrtf(qwen_gdn_reduce_sum_128(key * key, scratch) + 1.0e-6f);
-        const float normalizedQuery = query * rsqrtf(qwen_gdn_reduce_sum_128(query * query, scratch) + 1.0e-6f);
-        const float stateKeyDot = qwen_gdn_reduce_sum_128(stateValue * normalizedKey, scratch);
-        const float alpha = expf(g[static_cast<uint64_t>(row) * valueHeads + valueHead]);
-        const float delta = beta[static_cast<uint64_t>(row) * valueHeads + valueHead]
-                * (__bfloat162float(convolved[rowOffset + valueBase]) - alpha * stateKeyDot);
-        stateValue = alpha * stateValue + delta * normalizedKey;
-        const float outputSum = qwen_gdn_reduce_sum_128(stateValue * normalizedQuery, scratch);
-        if (lane == 0) output[static_cast<uint64_t>(row) * valueHeads * valueHeadDim + valueRow]
-                = __float2bfloat16_rn(outputSum * outputScale);
+        const uint64_t queryBase = rowOffset + keyHead * keyHeadDim + lane;
+        const uint64_t keyBase = rowOffset + keyHeads * keyHeadDim + keyHead * keyHeadDim + lane;
+        float query[4], key[4];
+#pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            query[j] = __bfloat162float(convolved[queryBase + 32 * j]);
+            key[j] = __bfloat162float(convolved[keyBase + 32 * j]);
+        }
+        const float keyInverse = rsqrtf(qwen_gdn_warp_sum_128(__fmul_rn(key[0], key[0]), __fmul_rn(key[1], key[1]),
+                __fmul_rn(key[2], key[2]), __fmul_rn(key[3], key[3])) + 1.0e-6f);
+        const float queryInverse = rsqrtf(qwen_gdn_warp_sum_128(__fmul_rn(query[0], query[0]),
+                __fmul_rn(query[1], query[1]), __fmul_rn(query[2], query[2]), __fmul_rn(query[3], query[3])) + 1.0e-6f);
+        float normalizedKey[4], normalizedQuery[4];
+#pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            normalizedKey[j] = key[j] * keyInverse;
+            normalizedQuery[j] = query[j] * queryInverse;
+        }
+        const float rowAlpha = alpha[static_cast<uint64_t>(row) * valueHeads + valueHead];
+        const float rowBeta = beta[static_cast<uint64_t>(row) * valueHeads + valueHead];
+        float stateKeyDot[columns], value[columns];
+#pragma unroll
+        for (uint32_t c = 0; c < columns; c++) {
+            value[c] = __bfloat162float(convolved[rowOffset + queryKeyWidth + valueHead * valueHeadDim + column0 + c]);
+            stateKeyDot[c] = qwen_gdn_warp_sum_128(__fmul_rn(state[c][0], normalizedKey[0]),
+                    __fmul_rn(state[c][1], normalizedKey[1]), __fmul_rn(state[c][2], normalizedKey[2]),
+                    __fmul_rn(state[c][3], normalizedKey[3]));
+        }
+        float outputSum[columns];
+#pragma unroll
+        for (uint32_t c = 0; c < columns; c++) {
+            // Explicit FMA: the compiler already fuses this product-subtract; pinning it keeps the rounding independent of the driver.
+            const float delta = rowBeta * __fmaf_rn(-rowAlpha, stateKeyDot[c], value[c]);
+#pragma unroll
+            for (uint32_t j = 0; j < 4; j++) state[c][j] = rowAlpha * state[c][j] + delta * normalizedKey[j];
+            outputSum[c] = qwen_gdn_warp_sum_128(__fmul_rn(state[c][0], normalizedQuery[0]),
+                    __fmul_rn(state[c][1], normalizedQuery[1]), __fmul_rn(state[c][2], normalizedQuery[2]),
+                    __fmul_rn(state[c][3], normalizedQuery[3]));
+        }
+        // Lane c publishes column c; the select chain keeps the array in registers.
+        float mine = outputSum[0];
+#pragma unroll
+        for (uint32_t c = 1; c < columns; c++) mine = lane == c ? outputSum[c] : mine;
+        if (lane < columns) {
+            output[static_cast<uint64_t>(row) * valueHeads * valueHeadDim + valueHead * valueHeadDim + column0 + lane]
+                    = __float2bfloat16_rn(mine * outputScale);
+        }
     }
-    recurrentState[stateOffset + lane] = stateValue;
+#pragma unroll
+    for (uint32_t c = 0; c < columns; c++) {
+        const uint64_t base = (static_cast<uint64_t>(valueHead) * valueHeadDim + column0 + c) * keyHeadDim;
+#pragma unroll
+        for (uint32_t j = 0; j < 4; j++) recurrentState[base + lane + 32 * j] = state[c][j];
+    }
 }
 
 extern "C" __global__ void euhedral_gdn_gated_rms_norm_bf16(

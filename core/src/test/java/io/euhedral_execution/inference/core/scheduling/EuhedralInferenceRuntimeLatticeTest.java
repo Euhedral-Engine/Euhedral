@@ -722,7 +722,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 long bProjectionAddress,
                 long aLogAddress,
                 long dtBiasAddress,
-                long gOutputAddress,
+                long alphaOutputAddress,
                 long betaOutputAddress,
                 int rows,
                 int heads) {}
@@ -746,7 +746,7 @@ class EuhedralInferenceRuntimeLatticeTest {
         @Override
         public void gdnRecurrenceBf16(
                 long convolvedAddress,
-                long gAddress,
+                long alphaAddress,
                 long betaAddress,
                 long recurrentStateAddress,
                 long outputAddress,

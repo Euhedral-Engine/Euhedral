@@ -60,7 +60,7 @@ final class QwenFirstLayerCpuReference {
         float[] beta = new float[valueHeads];
         for (int head = 0; head < valueHeads; head++) {
             float shifted = a[head] + dtBias[head];
-            g[head] = (float) (-Math.exp(aLog[head]) * softplus(shifted));
+            g[head] = (float) Math.exp((float) (-Math.exp(aLog[head]) * softplus(shifted)));
             beta[head] = sigmoid(b[head]);
         }
 
@@ -250,7 +250,7 @@ final class QwenFirstLayerCpuReference {
                 int stateOffset = (valueHead * valueHeadDim + valueColumn) * keyHeadDim;
                 float dot = 0.0f;
                 for (int k = 0; k < keyHeadDim; k++) dot += state[stateOffset + k] * key[k];
-                float alpha = (float) Math.exp(g[valueHead]);
+                float alpha = g[valueHead];
                 float delta = beta[valueHead] * (bf16ToFloat(convolved[valueBase + valueColumn]) - alpha * dot);
                 float sum = 0.0f;
                 for (int k = 0; k < keyHeadDim; k++) {

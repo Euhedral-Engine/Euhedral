@@ -54,7 +54,7 @@ public final class QwenExecutionPlan {
         VALUE_Z_PROJECTED,
         A_PROJECTED,
         B_PROJECTED,
-        GDN_G,
+        GDN_ALPHA,
         GDN_BETA,
         GDN_CONVOLVED,
         GDN_RECURRENT,
@@ -779,7 +779,7 @@ public final class QwenExecutionPlan {
                 List.of(4, 5),
                 List.of(aLog, dtBias),
                 List.of(Buffer.A_PROJECTED, Buffer.B_PROJECTED),
-                List.of(Buffer.GDN_G, Buffer.GDN_BETA),
+                List.of(Buffer.GDN_ALPHA, Buffer.GDN_BETA),
                 valueHeads,
                 valueHeads));
         nodes.add(node(
@@ -796,7 +796,7 @@ public final class QwenExecutionPlan {
                 Kind.GDN_RECURRENCE,
                 List.of(6, 7),
                 List.of(),
-                List.of(Buffer.GDN_CONVOLVED, Buffer.GDN_G, Buffer.GDN_BETA),
+                List.of(Buffer.GDN_CONVOLVED, Buffer.GDN_ALPHA, Buffer.GDN_BETA),
                 List.of(Buffer.GDN_RECURRENT),
                 convolutionChannels,
                 valueProjected));
@@ -882,7 +882,7 @@ public final class QwenExecutionPlan {
                 spec(Buffer.VALUE_Z_PROJECTED, valueZProjected, ElementType.BF16),
                 spec(Buffer.A_PROJECTED, valueHeads, ElementType.FP32),
                 spec(Buffer.B_PROJECTED, valueHeads, ElementType.FP32),
-                spec(Buffer.GDN_G, valueHeads, ElementType.FP32),
+                spec(Buffer.GDN_ALPHA, valueHeads, ElementType.FP32),
                 spec(Buffer.GDN_BETA, valueHeads, ElementType.FP32),
                 spec(Buffer.GDN_CONVOLVED, convolutionChannels, ElementType.BF16),
                 spec(Buffer.GDN_RECURRENT, valueProjected, ElementType.BF16),
@@ -1044,7 +1044,7 @@ public final class QwenExecutionPlan {
                         List.of(aProjectionId, bProjectionId),
                         List.of(aLog, dtBias),
                         List.of(Buffer.A_PROJECTED, Buffer.B_PROJECTED),
-                        List.of(Buffer.GDN_G, Buffer.GDN_BETA),
+                        List.of(Buffer.GDN_ALPHA, Buffer.GDN_BETA),
                         valueHeads,
                         valueHeads);
                 int convolutionId = addNode(
@@ -1063,7 +1063,7 @@ public final class QwenExecutionPlan {
                         layerIndex,
                         List.of(controlId, convolutionId),
                         List.of(),
-                        List.of(Buffer.GDN_CONVOLVED, Buffer.GDN_G, Buffer.GDN_BETA),
+                        List.of(Buffer.GDN_CONVOLVED, Buffer.GDN_ALPHA, Buffer.GDN_BETA),
                         List.of(Buffer.GDN_RECURRENT),
                         gdnConvolutionWidth,
                         gdnValueWidth);
@@ -1289,7 +1289,7 @@ public final class QwenExecutionPlan {
                 spec(Buffer.VALUE_Z_PROJECTED, valueZWidth, ElementType.BF16),
                 spec(Buffer.A_PROJECTED, valueHeads, ElementType.FP32),
                 spec(Buffer.B_PROJECTED, valueHeads, ElementType.FP32),
-                spec(Buffer.GDN_G, valueHeads, ElementType.FP32),
+                spec(Buffer.GDN_ALPHA, valueHeads, ElementType.FP32),
                 spec(Buffer.GDN_BETA, valueHeads, ElementType.FP32),
                 spec(Buffer.GDN_CONVOLVED, convolutionWidth, ElementType.BF16),
                 spec(Buffer.GDN_RECURRENT, valueWidth, ElementType.BF16),

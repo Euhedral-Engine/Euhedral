@@ -131,19 +131,59 @@ class QwenRegionsTest(unittest.TestCase):
                     x, wa, wb = upload(values(rows * width)), upload(values(heads * width)), upload(values(heads * width))
                     alog = upload(struct.pack('<' + 'f' * heads, *[rng.uniform(-4, 2) for _ in range(heads)]))
                     bias = upload(struct.pack('<' + 'f' * heads, *[rng.uniform(-4, 4) for _ in range(heads)]))
-                    a, b, g, beta, fg, fb = [alloc(rows * heads * 4) for _ in range(6)]
+                    a, b, alpha, beta, fused_alpha, fb = [alloc(rows * heads * 4) for _ in range(6)]
                     for weight, out in [(wa, a), (wb, b)]:
                         gpu.launch('euhedral_linear_bf16_to_float', rows * heads,
                                    [C.c_uint64(p) for p in (x, weight, out)] +
                                    [C.c_uint(v) for v in (rows, width, heads)])
                     gpu.launch('euhedral_gdn_control_fp32', (rows * heads + 127) // 128,
-                               [C.c_uint64(p) for p in (a, b, alog, bias, g, beta)] +
+                               [C.c_uint64(p) for p in (a, b, alog, bias, alpha, beta)] +
                                [C.c_uint(rows), C.c_uint(heads)])
                     gpu.launch('euhedral_gdn_project_control_fp32', rows * heads,
-                               [C.c_uint64(p) for p in (x, wa, wb, alog, bias, fg, fb)] +
+                               [C.c_uint64(p) for p in (x, wa, wb, alog, bias, fused_alpha, fb)] +
                                [C.c_uint(v) for v in (rows, width, heads)])
-                    self.assertEqual(gpu.download(g, rows * heads * 4), gpu.download(fg, rows * heads * 4))
+                    self.assertEqual(gpu.download(alpha, rows * heads * 4), gpu.download(fused_alpha, rows * heads * 4))
                     self.assertEqual(gpu.download(beta, rows * heads * 4), gpu.download(fb, rows * heads * 4))
+
+    def test_alpha_is_exp_of_fp32_stored_g(self):
+        # Old contract: control stored g in FP32 and recurrence computed expf(g). Alpha must equal that.
+        source = (b'#include "qwen_layer_linear.cu"\n#include "qwen_gdn_ops.cu"\n'
+                  b'extern "C" __global__ void reference_g(const float* a, const float* aLog, const float* dtBias,\n'
+                  b'        float* g, uint32_t rows, uint32_t heads) {\n'
+                  b'    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;\n'
+                  b'    if (i >= static_cast<uint64_t>(rows) * heads) return;\n'
+                  b'    const float shifted = a[i] + dtBias[i % heads];\n'
+                  b'    const float softplus = fmaxf(shifted, 0.0f) + log1pf(expf(-fabsf(shifted)));\n'
+                  b'    g[i] = -expf(aLog[i % heads]) * softplus;\n}\n'
+                  b'extern "C" __global__ void reference_exp(const float* g, float* out, uint32_t count) {\n'
+                  b'    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;\n'
+                  b'    if (i < count) out[i] = expf(g[i]);\n}\n')
+        rng = random.Random(4417)
+        rows, heads = 512, 48
+        count = rows * heads
+        with contextlib.ExitStack() as scope:
+            gpu = Gpu(source)
+            scope.callback(gpu.close)
+            def upload(data):
+                ptr = gpu.upload(data)
+                scope.callback(gpu.free, ptr)
+                return ptr
+            def alloc():
+                ptr = gpu.zeros(count * 4, 0xA5)
+                scope.callback(gpu.free, ptr)
+                return ptr
+            a = upload(struct.pack('<' + 'f' * count, *[rng.uniform(-30, 30) for _ in range(count)]))
+            b = upload(struct.pack('<' + 'f' * count, *[rng.uniform(-8, 8) for _ in range(count)]))
+            alog = upload(struct.pack('<' + 'f' * heads, *[rng.uniform(-6, 3) for _ in range(heads)]))
+            bias = upload(struct.pack('<' + 'f' * heads, *[rng.uniform(-6, 6) for _ in range(heads)]))
+            g, expected, alpha, beta = alloc(), alloc(), alloc(), alloc()
+            gpu.launch('reference_g', (count + 127) // 128, [C.c_uint64(p) for p in (a, alog, bias, g)] +
+                       [C.c_uint(rows), C.c_uint(heads)])
+            gpu.launch('reference_exp', (count + 127) // 128, [C.c_uint64(g), C.c_uint64(expected), C.c_uint(count)])
+            gpu.launch('euhedral_gdn_control_fp32', (count + 127) // 128,
+                       [C.c_uint64(p) for p in (a, b, alog, bias, alpha, beta)] + [C.c_uint(rows), C.c_uint(heads)])
+            self.assertEqual(gpu.download(expected, count * 4), gpu.download(alpha, count * 4),
+                             'alpha differs from expf of the FP32-stored g')
 
     def test_residual_norm_preserves_both_bf16_boundaries(self):
         source = b'#include "qwen_elementwise.cu"\n#include "rms_norm_bf16.cu"\n'

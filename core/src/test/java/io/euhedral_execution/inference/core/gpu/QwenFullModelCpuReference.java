@@ -61,7 +61,7 @@ final class QwenFullModelCpuReference {
                 float[] g = new float[valueHeads];
                 float[] beta = new float[valueHeads];
                 for (int head = 0; head < valueHeads; head++) {
-                    g[head] = (float) (-Math.exp(aLog[head]) * softplus(a[head] + dtBias[head]));
+                    g[head] = (float) Math.exp((float) (-Math.exp(aLog[head]) * softplus(a[head] + dtBias[head])));
                     beta[head] = sigmoid(b[head]);
                 }
                 short[] convolved = convolution(
