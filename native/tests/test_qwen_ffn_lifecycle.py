@@ -52,6 +52,11 @@ static int cuLaunchKernel(void* fn, unsigned gx, unsigned gy, unsigned gz,
     if(!result) pending |= 1 << (int)(uintptr_t)stream;
     return result;
 }
+static int euhedral_launch_kernel(void* fn, unsigned gx, unsigned gy, unsigned gz,
+        unsigned bx, unsigned by, unsigned bz, unsigned shared, void* stream, void** args, void** extra) {
+    return cuLaunchKernel(fn,gx,gy,gz,bx,by,bz,shared,stream,args,extra);
+}
+static void euhedral_cuda_pdl_register(void* function) {(void)function;}
 static int cudaStreamSynchronize(void* stream) {
     int result=step(7,stream);
     if(!result && fail_drains) result=43;

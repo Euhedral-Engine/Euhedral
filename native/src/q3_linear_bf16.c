@@ -34,6 +34,10 @@ static void initialize(void) {
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
     prefill64_wmma = optional_kernel("euhedral_q3_prefill_64_wmma");
     prefill64_k32_cb = optional_kernel("euhedral_q3_prefill_64_k32_cb");
+    // The decode kernels begin with euhedral_pdl_begin() (see cuda_kernel_loader.h).
+    euhedral_cuda_pdl_register(decode1);
+    euhedral_cuda_pdl_register(decode2);
+    euhedral_cuda_pdl_register(decode4);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -97,7 +101,7 @@ static int linear_q3(const void* input, const void* weights, void* output,
             : prefill_kernel == EUHEDRAL_Q3_PREFILL32_S104 ? prefill_s104
             : prefill_kernel == EUHEDRAL_Q3_PREFILL32 ? prefill : NULL;
     if (selected == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-    CUresult status = cuLaunchKernel(selected, (unsigned int)grid, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);
+    CUresult status = euhedral_launch_kernel(selected, (unsigned int)grid, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);
     if (status != CUDA_SUCCESS) return (int)status;
     if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t sync = cudaDeviceSynchronize();

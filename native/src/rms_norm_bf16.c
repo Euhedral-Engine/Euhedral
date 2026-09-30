@@ -19,6 +19,7 @@ static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static void initialize(void) {
     init_status = euhedral_cuda_load_kernel((const void*)&once, "rms_norm_bf16.cu", "euhedral_rms_norm_bf16", &module, &function);
+    if (init_status == EUHEDRAL_CUDA_SUCCESS) euhedral_cuda_pdl_register(function);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -44,7 +45,7 @@ static int rms_norm_bf16_with_offset(const void* input, const void* weight, void
     CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
     unsigned int rows_arg = rows, width_arg = width;
     void* params[] = {&input_ptr, &weight_ptr, &output_ptr, &rows_arg, &width_arg, &epsilon, &weight_offset};
-    CUresult status = cuLaunchKernel(function, rows, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);
+    CUresult status = euhedral_launch_kernel(function, rows, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);
     if (status != CUDA_SUCCESS) return (int)status;
     if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t sync = cudaDeviceSynchronize();

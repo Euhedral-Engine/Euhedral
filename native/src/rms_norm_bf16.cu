@@ -1,3 +1,4 @@
+#include "pdl.cuh"
 static __device__ __forceinline__ float bf16_to_float(unsigned short value) {
     return __uint_as_float((unsigned int)value << 16);
 }
@@ -9,6 +10,7 @@ static __device__ __forceinline__ unsigned short float_to_bf16(float value) {
 extern "C" __global__ __launch_bounds__(128) void euhedral_rms_norm_bf16(
         const unsigned short* input, const unsigned short* weight, unsigned short* output,
         unsigned int rows, unsigned int width, float epsilon, float weight_offset) {
+    euhedral_pdl_begin();
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
     __shared__ float partial[128];

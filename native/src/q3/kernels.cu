@@ -2,6 +2,7 @@
 #include "strategies/decode.cuh"
 #include "strategies/prefill.cuh"
 #include "strategies/k32_prefill.cuh"
+#include "pdl.cuh"
 
 // MMA leaves per CTA AUTO tile. WmmaLeaf remains the portable reference; the
 // explicit leaves' FP32 accumulators are tested bitwise against it (see
@@ -28,6 +29,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_linear_bf16(
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_decode_##R( \
         const unsigned short* input, const unsigned char* weights, unsigned short* output, \
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) { \
+    euhedral_pdl_begin(); \
     q3::cooperative_decode<R>(input, weights, output, rows, in_features, out_features, scale_offset); \
 }
 EUHEDRAL_Q3_DECODE_KERNEL(1)

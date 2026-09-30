@@ -133,3 +133,67 @@ int euhedral_cuda_load_kernel(const void* anchor, const char* source_name, const
     }
     return status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 }
+
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PDL_CAPACITY 64
+static _Atomic(CUfunction) pdl_functions[PDL_CAPACITY];
+static atomic_uint pdl_count;
+static atomic_int pdl_mode = -1;
+#ifdef _WIN32
+static __declspec(thread) int pdl_selected;
+#else
+static _Thread_local int pdl_selected;
+#endif
+
+/* Decode chains select PDL for the calling thread; every other launch stays ordinary. */
+void euhedral_cuda_pdl_select(int enabled) {
+    pdl_selected = enabled != 0;
+}
+
+void euhedral_cuda_pdl_register(CUfunction function) {
+    if (function == NULL) return;
+    unsigned int slot = atomic_fetch_add(&pdl_count, 1u);
+    if (slot < PDL_CAPACITY) atomic_store(&pdl_functions[slot], function);
+}
+
+static int pdl_enabled(void) {
+    int mode = atomic_load(&pdl_mode);
+    if (mode < 0) {
+        const char* value = getenv("EUHEDRAL_PDL");
+        mode = value == NULL || strcmp(value, "0") != 0;  /* EUHEDRAL_PDL=0 disables it everywhere */
+        atomic_store(&pdl_mode, mode);
+    }
+    return mode;
+}
+
+static int pdl_registered(CUfunction function) {
+    unsigned int count = atomic_load(&pdl_count);
+    if (count > PDL_CAPACITY) count = PDL_CAPACITY;
+    for (unsigned int index = 0; index < count; index++)
+        if (atomic_load(&pdl_functions[index]) == function) return 1;
+    return 0;
+}
+
+CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
+        unsigned int block_x, unsigned int block_y, unsigned int block_z, unsigned int shared_bytes,
+        CUstream stream, void** parameters, void** extra) {
+    if (stream == NULL || extra != NULL || !pdl_selected || !pdl_enabled() || !pdl_registered(function))
+        return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
+                parameters, extra);
+    CUlaunchAttribute attribute;
+    memset(&attribute, 0, sizeof(attribute));
+    attribute.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    attribute.value.programmaticStreamSerializationAllowed = 1;
+    CUlaunchConfig config;
+    memset(&config, 0, sizeof(config));
+    config.gridDimX = grid_x; config.gridDimY = grid_y; config.gridDimZ = grid_z;
+    config.blockDimX = block_x; config.blockDimY = block_y; config.blockDimZ = block_z;
+    config.sharedMemBytes = shared_bytes;
+    config.hStream = stream;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    return cuLaunchKernelEx(&config, function, parameters, NULL);
+}

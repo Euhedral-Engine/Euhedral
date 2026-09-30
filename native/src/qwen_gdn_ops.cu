@@ -1,5 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "pdl.cuh"
 
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
@@ -41,6 +42,7 @@ __device__ __forceinline__ float qwen_gdn_silu(float value) {
 extern "C" __global__ void euhedral_gdn_control_fp32(
         const float* aProjection, const float* bProjection, const float* aLog, const float* dtBias,
         float* alphaOutput, float* betaOutput, uint32_t rows, uint32_t heads) {
+    euhedral_pdl_begin();
     const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<uint64_t>(rows) * heads) return;
     const uint32_t head = static_cast<uint32_t>(index % heads);
@@ -93,6 +95,7 @@ extern "C" __global__ void euhedral_gdn_convolution_bf16(
         const __nv_bfloat16* convolutionWeights, __nv_bfloat16* convolutionState,
         __nv_bfloat16* output, uint32_t rows, uint32_t queryKeyWidth,
         uint32_t valueWidth, uint32_t convolutionWidth, uint32_t kernelSize) {
+    euhedral_pdl_begin();
     const uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= convolutionWidth) return;
     const uint32_t historyWidth = kernelSize - 1;
@@ -139,6 +142,7 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_gdn_recurrence_bf16(
         float* recurrentState, __nv_bfloat16* output, uint32_t rows,
         uint32_t keyHeads, uint32_t valueHeads, uint32_t keyHeadDim,
         uint32_t valueHeadDim, float outputScale) {
+    euhedral_pdl_begin();
     constexpr uint32_t columns = QWEN_GDN_WARP_COLUMNS;
     if (blockDim.x != 32 || keyHeadDim != 128 || valueHeadDim != 128) return;
     const uint32_t tilesPerHead = valueHeadDim / columns;
@@ -218,6 +222,7 @@ extern "C" __global__ void euhedral_gdn_gated_rms_norm_bf16(
         const __nv_bfloat16* recurrent, const __nv_bfloat16* valueZ,
         const __nv_bfloat16* normWeight, __nv_bfloat16* output,
         uint32_t rows, uint32_t valueHeads, uint32_t headDim, float epsilon) {
+    euhedral_pdl_begin();
     const uint32_t rowHead = blockIdx.x;
     const uint32_t row = rowHead / valueHeads;
     const uint32_t head = rowHead % valueHeads;

@@ -1,5 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "pdl.cuh"
 
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
@@ -84,6 +85,7 @@ extern "C" __global__ void euhedral_linear_bf16_to_float(
         uint32_t rows,
         uint32_t inFeatures,
         uint32_t outFeatures) {
+    euhedral_pdl_begin();
     const uint64_t outputIndex = static_cast<uint64_t>(blockIdx.x);
     if (outputIndex >= static_cast<uint64_t>(rows) * outFeatures) return;
     const uint32_t row = static_cast<uint32_t>(outputIndex / outFeatures);

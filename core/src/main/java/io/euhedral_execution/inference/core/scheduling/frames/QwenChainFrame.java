@@ -12,6 +12,10 @@ import io.euhedral_execution.inference.core.scheduling.QwenWorkGenerator;
 /// completion round trip is unnecessary: the chain records one completion event after the last
 /// launch and finalizes every instruction's temporary resources when it retires.
 public final class QwenChainFrame extends QwenInstructionFrame {
+    /// Programmatic dependent launch won 12 of 12 paired forks (about +1% decode) at a 64-token
+    /// context but only 10 of 12 at 1024, so it is enabled only below this starting position.
+    static final long PDL_MAX_START_POSITION = 1024;
+
     private final QwenWorkGenerator generator;
     private final QwenInstructionFrame[] performers;
     private int performed;
@@ -31,6 +35,17 @@ public final class QwenChainFrame extends QwenInstructionFrame {
     @Override
     protected void perform(QwenExecutionContext context, QwenExecutionPlan.Instruction ignored) {
         var instructions = context.plan().instructions();
+        // Decode kernels begin with griddepcontrol.wait, so short-context chains may overlap launch tails.
+        boolean overlap = context.startPosition() < PDL_MAX_START_POSITION;
+        if (overlap) gpu().programmaticDependentLaunch(true);
+        try {
+            launch(context, instructions);
+        } finally {
+            if (overlap) gpu().programmaticDependentLaunch(false);
+        }
+    }
+
+    private void launch(QwenExecutionContext context, java.util.List<QwenExecutionPlan.Instruction> instructions) {
         for (int index = 0; index < instructions.size(); index++) {
             QwenInstructionFrame performer = this.performers[index];
             if (performer == null) {

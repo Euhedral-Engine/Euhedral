@@ -47,6 +47,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle streamSynchronize;
     private final MethodHandle streamSelect;
     private final MethodHandle streamClear;
+    private final MethodHandle pdlSelect;
     private final MethodHandle eventCreate;
     private final MethodHandle eventRecord;
     private final MethodHandle eventQuery;
@@ -148,6 +149,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                             symbols,
                             "euhedral_cuda_stream_select",
                             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG))
+                    : null;
+            this.pdlSelect = asynchronous
+                    ? symbols.find("euhedral_cuda_pdl_select")
+                            .map(symbol ->
+                                    linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
+                            .orElse(null)
                     : null;
             this.streamClear = asynchronous
                     ? bind(linker, symbols, "euhedral_cuda_stream_clear", FunctionDescriptor.ofVoid())
@@ -463,6 +470,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             throw failure;
         } catch (Throwable failure) {
             throw new GpuMemoryException("CUDA submission stream invocation failed", failure);
+        }
+    }
+
+    @Override
+    public void programmaticDependentLaunch(boolean enabled) {
+        if (pdlSelect == null) return;
+        try {
+            pdlSelect.invokeExact(enabled ? 1 : 0);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA programmatic dependent launch selection failed", failure);
         }
     }
 
