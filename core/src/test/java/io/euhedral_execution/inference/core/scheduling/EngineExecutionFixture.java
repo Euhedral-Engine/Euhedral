@@ -260,7 +260,7 @@ public final class EngineExecutionFixture {
         }
 
         @Override
-        public void attentionKvAppendBf16(
+        public void attentionKvAppendNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,
                 long keyCacheAddress,
@@ -273,7 +273,7 @@ public final class EngineExecutionFixture {
         }
 
         @Override
-        public void attentionProducersBf16(
+        public void attentionProducersNvfp4(
                 long input,
                 long q4,
                 long q5,
@@ -299,7 +299,7 @@ public final class EngineExecutionFixture {
         }
 
         @Override
-        public void attentionCausalBf16(
+        public void attentionCausalNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,
                 long keyCacheAddress,
@@ -310,6 +310,7 @@ public final class EngineExecutionFixture {
                 int keyValueHeads,
                 int headDim,
                 int cacheLength,
-                long startPosition) {}
+                long startPosition,
+                long scratchAddress) {}
     }
 }

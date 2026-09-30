@@ -9,18 +9,28 @@ import org.junit.jupiter.api.Test;
 class QwenFullModelCpuReferenceTest {
 
     @Test
+    void nvfp4ReferenceSaturatesLargeFiniteValuesBeforeDistanceComparison() {
+        for (float sign : new float[] {-1, 1}) {
+            short[] row = new short[256];
+            java.util.Arrays.fill(row, floatToBf16(sign * 1e30f));
+            // A constant row maps to its DC coefficient. Saturation gives
+            // E2M1 maximum * E4M3 maximum, then inverse H256 divides by 16.
+            double expected = sign * 6.0 * 448.0 / 16.0;
+            for (double value : Nvfp4KvReference.represented(row, 0)) assertEquals(expected, value);
+        }
+    }
+
+    @Test
     void singleTokenAttentionMapsGroupedValuesAndAppliesPerQueryGate() {
         int queryHeads = 4;
         int keyValueHeads = 2;
-        int headDim = 2;
-        short[] gateValue = new short[] {
-            floatToBf16(0.0f), floatToBf16(1.0f),
-            floatToBf16(2.0f), floatToBf16(3.0f),
-            floatToBf16(4.0f), floatToBf16(5.0f),
-            floatToBf16(6.0f), floatToBf16(7.0f),
-            floatToBf16(10.0f), floatToBf16(20.0f),
-            floatToBf16(30.0f), floatToBf16(40.0f)
-        };
+        int headDim = 256;
+        short[] gateValue = new short[(queryHeads + keyValueHeads) * headDim];
+        for (int i = 0; i < queryHeads * headDim; i++) gateValue[i] = floatToBf16((i % 7) / 4.0f);
+        // H256 maps each constant row to one coefficient; these scales/codes are exact.
+        for (int h = 0; h < keyValueHeads; h++)
+            java.util.Arrays.fill(
+                    gateValue, (queryHeads + h) * headDim, (queryHeads + h + 1) * headDim, floatToBf16(3.0f * (h + 1)));
 
         short[] output =
                 QwenFullModelCpuReference.singleTokenAttentionContext(gateValue, queryHeads, keyValueHeads, headDim);

@@ -86,7 +86,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                         int promptTokenCount = tokenizer.encodeWithModelSpecialTokens(prompt).length;
                         StringBuilder output = new StringBuilder();
                         List<Long> callbackPositions = new ArrayList<>();
-                        List<Long> callbackFreeMemory = new ArrayList<>();
+                        List<Long> decodeCallbackFreeMemory = new ArrayList<>();
                         AtomicReference<Object> recurrentState = new AtomicReference<>();
                         AtomicReference<Object> kvState = new AtomicReference<>();
 
@@ -109,7 +109,13 @@ class QwenGenerationSessionCudaIntegrationTest {
                             long generatedCount = session.generatedTokenIds().size();
                             assertTrue(session.currentTokenPosition() >= promptTokenCount + generatedCount - 1L);
                             assertTrue(session.currentTokenPosition() <= promptTokenCount + generatedCount);
-                            callbackFreeMemory.add(gpu.deviceMemoryInfo().freeBytes());
+                            // The first text callback follows prefill, before lazy split-KV
+                            // scratch reservation. Compare steady-state decode callbacks only;
+                            // scratch address stability and ownership have separate exact tests.
+                            if (session.currentTokenPosition() > promptTokenCount) {
+                                decodeCallbackFreeMemory.add(
+                                        gpu.deviceMemoryInfo().freeBytes());
+                            }
                         });
 
                         assertTrue(generated.size() >= 4, "model stopped before several decode quanta");
@@ -130,12 +136,12 @@ class QwenGenerationSessionCudaIntegrationTest {
                                         .forLayer(3)
                                         .length());
                         assertTrue(callbackPositions.size() >= 3, "incremental decoder did not emit token text");
-                        assertTrue(callbackFreeMemory.size() >= 3);
-                        long minimumCallbackFree = callbackFreeMemory.stream()
+                        assertTrue(decodeCallbackFreeMemory.size() >= 3);
+                        long minimumCallbackFree = decodeCallbackFreeMemory.stream()
                                 .mapToLong(Long::longValue)
                                 .min()
                                 .orElseThrow();
-                        long maximumCallbackFree = callbackFreeMemory.stream()
+                        long maximumCallbackFree = decodeCallbackFreeMemory.stream()
                                 .mapToLong(Long::longValue)
                                 .max()
                                 .orElseThrow();

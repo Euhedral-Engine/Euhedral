@@ -1,5 +1,33 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "attention/nvfp4_kv.cuh"
+#include "attention/nvfp4_attention.cuh"
+#include "attention/nvfp4_prefill32.cuh"
+#include "attention/nvfp4_decode_tc.cuh"
+
+// Four warp-owned rows per CTA. Page-table entries point to token-major pages;
+// each head row has 128 packed-code bytes followed by 16 E4M3 scale bytes.
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_kv_append_nvfp4(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
+        unsigned char* const* keyPages, unsigned char* const* valuePages,
+        unsigned int rows, unsigned int queryWidth, unsigned int keyValueWidth,
+        unsigned long long startPosition) {
+    const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const unsigned int heads = keyValueWidth / 256;
+    const unsigned int rowHead = blockIdx.x * 4 + warp;
+    if (rowHead >= rows * heads) return;
+    const unsigned int row = rowHead / heads, head = rowHead % heads;
+    const unsigned long long position = startPosition + row;
+    const unsigned long long source = (unsigned long long)row * (queryWidth + keyValueWidth)
+            + queryWidth + head * 256;
+    const unsigned int offset = ((position % 256) * heads + head) * 144;
+    unsigned char* key = keyPages[position / 256] + offset;
+    unsigned char* value = valuePages[position / 256] + offset;
+    __shared__ float scratch[4][256];
+    nvfp4kv::quantize_row(queryKey + source, key, key + 128, scratch[warp], lane);
+    nvfp4kv::quantize_row(gateValue + source, value, value + 128, scratch[warp], lane);
+}
+
 
 using uint32_t = unsigned int;
 using uint64_t = unsigned long long;
@@ -61,7 +89,7 @@ static __device__ __forceinline__ void qk_norm_rope(
         result = lane < half ? value * cosine - paired * sine : value * cosine + paired * sine;
     }
     // The in-place query path cannot overwrite another warp's RoPE pair read.
-    if (CACHE) __syncthreads();
+    __syncthreads();
     if (CACHE && !isQuery)
         keyCache[(startPosition + row) * keyValueHeads * headDim
                 + static_cast<uint64_t>(head - queryHeads) * headDim + lane] = __float2bfloat16_rn(result);

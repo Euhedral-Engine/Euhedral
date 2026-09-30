@@ -709,7 +709,7 @@ class QwenGenerationSessionTest {
         public void swiGluBf16(long gateUpAddress, long outputAddress, int rows, int intermediateSize) {}
 
         @Override
-        public void attentionProducersBf16(
+        public void attentionProducersNvfp4(
                 long input,
                 long q4,
                 long q5,
@@ -753,7 +753,7 @@ class QwenGenerationSessionTest {
         }
 
         @Override
-        public void attentionKvAppendBf16(
+        public void attentionKvAppendNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,
                 long keyCacheAddress,
@@ -766,7 +766,7 @@ class QwenGenerationSessionTest {
         }
 
         @Override
-        public void attentionCausalBf16(
+        public void attentionCausalNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,
                 long keyCacheAddress,
@@ -777,6 +777,7 @@ class QwenGenerationSessionTest {
                 int keyValueHeads,
                 int headDim,
                 int cacheLength,
-                long startPosition) {}
+                long startPosition,
+                long scratchAddress) {}
     }
 }

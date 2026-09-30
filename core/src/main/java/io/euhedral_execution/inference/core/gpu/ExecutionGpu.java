@@ -217,7 +217,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_LONG,
             ValueLayout.JAVA_FLOAT,
             ValueLayout.JAVA_DOUBLE);
-    protected static final FunctionDescriptor ATTENTION_KV_APPEND_BF16 = FunctionDescriptor.of(
+    protected static final FunctionDescriptor ATTENTION_KV_APPEND_NVFP4 = FunctionDescriptor.of(
             ValueLayout.JAVA_INT,
             ValueLayout.ADDRESS,
             ValueLayout.ADDRESS,
@@ -227,7 +227,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_LONG);
-    protected static final FunctionDescriptor ATTENTION_CAUSAL_BF16 = FunctionDescriptor.of(
+    protected static final FunctionDescriptor ATTENTION_CAUSAL_NVFP4 = FunctionDescriptor.of(
             ValueLayout.JAVA_INT,
             ValueLayout.ADDRESS,
             ValueLayout.ADDRESS,
@@ -239,7 +239,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
-            ValueLayout.JAVA_LONG);
+            ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS);
     protected static final int CUDA_FORMAT_MISMATCH = -3;
 
     protected static MethodHandle bind(
@@ -388,7 +389,7 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("BF16 residual add is not implemented by this GPU");
     }
 
-    public void attentionProducersBf16(
+    public void attentionProducersNvfp4(
             long input,
             long q4,
             long q5,
@@ -485,7 +486,7 @@ public abstract class ExecutionGpu implements GpuMemory {
     }
 
     /// Appends the current compact K/V projections to one layer's sequence-owned cache.
-    public void attentionKvAppendBf16(
+    public void attentionKvAppendNvfp4(
             long queryKeyAddress,
             long gateValueAddress,
             long keyCacheAddress,
@@ -498,7 +499,7 @@ public abstract class ExecutionGpu implements GpuMemory {
     }
 
     /// Evaluates causal GQA against the already-appended cache and applies the Q gate.
-    public void attentionCausalBf16(
+    public void attentionCausalNvfp4(
             long queryKeyAddress,
             long gateValueAddress,
             long keyCacheAddress,
@@ -509,7 +510,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             int keyValueHeads,
             int headDim,
             int cacheLength,
-            long startPosition) {
+            long startPosition,
+            long scratchAddress) {
         throw new UnsupportedOperationException("Qwen causal attention is not implemented");
     }
 }

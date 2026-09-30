@@ -93,8 +93,39 @@ decode:
 - C: gate/up+SwiGLU into two bounded feature slots consumed by a down pass that carries FP32
   accumulators across feature regions. It owns internal CUDA streams even in SYNC outer mode.
 - D: joint BF16 A/B projection + GDN control, submitted before the heavy Q4/Q5 projections.
-- F: Q4/Q5 attention producers with in-place query normalization and direct K/V cache writes,
-  committed once at successful completion.
+- F: Q4/Q5 attention producers with in-place Q/K normalization and RoPE, followed by
+  NVFP4 K/V page writes, committed once at successful completion.
+
+Full attention stores K and V in sequence-owned 256-token pages. Each D256 head is
+rotated by normalized H256 and encoded as 128 bytes of E2M1 codes plus 16 E4M3
+scales (one per contiguous group of 16 values). Device page tables contain raw
+addresses; growing a sequence allocates new pages without copying existing KV
+payloads. The completion callback publishes appended length, and sequence cleanup
+releases pages and any decode scratch only after admitted GPU work has drained.
+
+Queries use the same H256 transform; the weighted value sum is transformed back
+before applying the query gate. Prefill uses 32-query by 32-key tiles with FP16
+tensor-core operands, FP32 accumulation, and online softmax, without a quadratic
+score allocation. Single-token decode splits the visible prefix across CTAs and
+merges FP32 softmax statistics. At GQA ratio six and a prefix of at least 1024
+tokens, each tensor-core CTA shares one K/V expansion across all six query heads;
+shorter prefixes and other head ratios retain warp-based FP32 decode.
+KV expansion to FP16 is exact; cache quantization and FP16 query/probability operands
+are numerical approximation boundaries, so this path does not promise bitwise
+agreement with the former BF16 cache.
+
+Correctness is defined against the represented NVFP4 values, not accumulated
+BF16-model hidden states or logits. Codec rounding, saturation, signed values,
+and normalized Hadamard ordering are checked independently. Both prefill and
+decode must match an FP64 represented-value attention oracle within the existing
+FP16/MMA and BF16-output tolerance. Page payload preservation, append positions,
+sequence state, ownership, and lifecycle invariants remain exact. Memcheck,
+racecheck, initcheck, synccheck, and operation beyond 64K on the target device
+remain required. Matching upstream V inputs is diagnostic evidence only.
+
+Decode scratch is reserved lazily on the first decode, then reused until sequence
+release. This one-time allocation is not a steady-state memory leak; release and
+scratch-address stability remain independently enforced.
 
 The complete model admits only native-supported projection/attention geometry (128-aligned hidden
 width, 256-wide attention heads, a GDN convolution kernel of 2..32, and RMS epsilon representable

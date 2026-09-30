@@ -1,64 +1,103 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-/// Sequence-owned, growing BF16 key/value storage for one full-attention layer.
+/// Sequence-owned NVFP4 pages for one full-attention layer. Existing KV payloads
+/// never move. The sequence lease serializes reservation with attention; close
+/// runs after GPU completion. Each D256 row holds 128 code and 16 scale bytes.
 public final class AttentionKvState implements AutoCloseable {
-
+    public static final int PAGE_TOKENS = 256;
+    public static final int HEAD_ROW_BYTES = 144;
     private final ExecutionGpu gpu;
-    private final int keyValueWidth;
-    private final List<Long> retiredAddresses = new ArrayList<>();
-    private long address;
+    private final long planePageBytes;
+    private final List<Long> pages = new ArrayList<>();
+    private final List<Long> retiredTables = new ArrayList<>();
+    private long table;
+    private int tableSlots;
     private int capacity;
     private int length;
+    private long decodeScratch;
+    private int scratchHeads;
     private boolean closed;
 
     public AttentionKvState(ExecutionGpu gpu, int keyValueWidth) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
-        if (keyValueWidth <= 0) throw new IllegalArgumentException("keyValueWidth must be positive");
-        this.keyValueWidth = keyValueWidth;
+        if (keyValueWidth <= 0 || keyValueWidth % 256 != 0)
+            throw new IllegalArgumentException("NVFP4 KV requires complete D256 heads");
+        this.planePageBytes = Math.multiplyExact((long) PAGE_TOKENS * HEAD_ROW_BYTES, keyValueWidth / 256);
     }
 
-    /// Ensures an append is contiguous and makes room without discarding existing keys or values.
+    /// Reserves contiguous append rows without publishing them to consumers.
     public void prepareAppend(long startPosition, int tokenCount) {
         ensureOpen();
-        if (startPosition != this.length || tokenCount <= 0) {
+        if (startPosition != this.length || tokenCount <= 0)
             throw new IllegalArgumentException("KV append must begin at the current sequence length");
-        }
         int required = Math.toIntExact(Math.addExact(startPosition, tokenCount));
         if (required <= this.capacity) return;
-        int nextCapacity = this.capacity == 0 ? Math.max(1, required) : this.capacity;
-        while (nextCapacity < required) {
-            nextCapacity = nextCapacity > Integer.MAX_VALUE / 2 ? required : nextCapacity * 2;
+        int count = Math.toIntExact(((long) required + PAGE_TOKENS - 1) / PAGE_TOKENS);
+        int nextCapacity = Math.toIntExact((long) count * PAGE_TOKENS);
+        // Retain ownership of successful allocations if a later operation fails.
+        while (this.pages.size() < count) this.pages.add(allocate(2 * this.planePageBytes));
+        int slots = Math.max(1, this.tableSlots);
+        while (slots < count) slots = Math.multiplyExact(slots, 2);
+        long nextTable = this.table;
+        if (slots != this.tableSlots) nextTable = allocate((long) slots * 2 * Long.BYTES);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment entries = arena.allocate((long) slots * 2 * Long.BYTES, Long.BYTES);
+            for (int i = 0; i < count; i++) {
+                entries.setAtIndex(ValueLayout.JAVA_LONG, i, this.pages.get(i));
+                entries.setAtIndex(ValueLayout.JAVA_LONG, slots + i, this.pages.get(i) + this.planePageBytes);
+            }
+            // Synchronous transfer, not queued upload-buffer submission. No device
+            // reader can still use this layer's table during reservation.
+            this.gpu.copyHostToDevice(nextTable, entries, entries.byteSize());
+        } catch (RuntimeException | Error failure) {
+            if (nextTable != this.table) this.retiredTables.add(nextTable);
+            throw failure;
         }
-        grow(nextCapacity);
+        if (nextTable != this.table && this.table != 0) this.retiredTables.add(this.table);
+        this.table = nextTable;
+        this.tableSlots = slots;
+        this.capacity = nextCapacity;
+        releaseRetired();
     }
 
-    /// Publishes appended tokens only after the synchronous GPU append completed successfully.
+    /// Called by the frame's GPU-completion edge, never merely after submission.
     public void commitAppend(int tokenCount) {
         ensureOpen();
-        if (tokenCount <= 0 || (long) this.length + tokenCount > this.capacity) {
+        if (tokenCount <= 0 || (long) this.length + tokenCount > this.capacity)
             throw new IllegalArgumentException("KV append exceeds reserved capacity");
-        }
         this.length = Math.addExact(this.length, tokenCount);
-        if (this.gpu.asynchronous()) releaseRetired();
     }
 
+    /// Device pointer to the K page-address table, not to BF16 payloads.
     public long keyCacheAddress() {
         ensureOpen();
-        if (this.address == 0) throw new IllegalStateException("KV cache has not been allocated");
-        return this.address;
+        if (this.table == 0) throw new IllegalStateException("KV cache has not been allocated");
+        return this.table;
     }
 
+    /// Device pointer to the V page-address table.
     public long valueCacheAddress() {
+        return Math.addExact(keyCacheAddress(), (long) this.tableSlots * Long.BYTES);
+    }
+
+    /// Split-KV scratch is sequence-owned and allocated only for decode.
+    public long decodeScratchAddress(int queryHeads) {
         ensureOpen();
-        if (this.address == 0) throw new IllegalStateException("KV cache has not been allocated");
-        return Math.addExact(
-                this.address,
-                Math.multiplyExact(Math.multiplyExact((long) this.capacity, this.keyValueWidth), Short.BYTES));
+        if (queryHeads <= 0) throw new IllegalArgumentException("queryHeads must be positive");
+        if (this.decodeScratch == 0) {
+            this.decodeScratch = allocate(Math.multiplyExact((long) queryHeads, 64L * 258 * Float.BYTES));
+            this.scratchHeads = queryHeads;
+        }
+        if (queryHeads != this.scratchHeads) throw new IllegalArgumentException("decode head geometry changed");
+        return this.decodeScratch;
     }
 
     public int capacity() {
@@ -77,86 +116,55 @@ public final class AttentionKvState implements AutoCloseable {
         Throwable failure = null;
         try {
             releaseRetired();
-        } catch (Throwable cleanupFailure) {
-            failure = combine(failure, cleanupFailure);
+        } catch (Throwable error) {
+            failure = combine(failure, error);
         }
-        if (this.address != 0) {
+        for (int i = this.pages.size() - 1; i >= 0; i--) {
             try {
-                this.gpu.free(this.address);
-                this.address = 0;
-                this.capacity = 0;
-                this.length = 0;
-            } catch (Throwable cleanupFailure) {
-                failure = combine(failure, cleanupFailure);
+                this.gpu.free(this.pages.get(i));
+                this.pages.remove(i);
+            } catch (Throwable error) {
+                failure = combine(failure, error);
             }
         }
-        this.closed = this.address == 0 && this.retiredAddresses.isEmpty();
+        if (this.table != 0) {
+            try {
+                this.gpu.free(this.table);
+                this.table = 0;
+            } catch (Throwable error) {
+                failure = combine(failure, error);
+            }
+        }
+        if (this.decodeScratch != 0) {
+            try {
+                this.gpu.free(this.decodeScratch);
+                this.decodeScratch = 0;
+            } catch (Throwable error) {
+                failure = combine(failure, error);
+            }
+        }
+        this.closed =
+                this.pages.isEmpty() && this.retiredTables.isEmpty() && this.table == 0 && this.decodeScratch == 0;
         if (failure != null) throw propagate(failure);
+    }
+
+    private long allocate(long bytes) {
+        long address = this.gpu.allocate(bytes);
+        if (address == 0) throw new IllegalStateException("GPU returned a null attention KV allocation");
+        return address;
     }
 
     private void releaseRetired() {
         Throwable failure = null;
-        for (int index = this.retiredAddresses.size() - 1; index >= 0; index--) {
-            long retired = this.retiredAddresses.get(index);
+        for (int i = this.retiredTables.size() - 1; i >= 0; i--) {
             try {
-                this.gpu.free(retired);
-                this.retiredAddresses.remove(index);
-            } catch (Throwable cleanupFailure) {
-                failure = combine(failure, cleanupFailure);
+                this.gpu.free(this.retiredTables.get(i));
+                this.retiredTables.remove(i);
+            } catch (Throwable error) {
+                failure = combine(failure, error);
             }
         }
         if (failure != null) throw propagate(failure);
-    }
-
-    private void grow(int newCapacity) {
-        long newByteSize = cacheByteSize(newCapacity);
-        long newAddress = this.gpu.allocate(newByteSize);
-        if (newAddress == 0) throw new IllegalStateException("GPU returned a null attention KV allocation");
-        try {
-            if (this.address != 0) {
-                long oldPlaneBytes = planeByteSize(this.length);
-                if (oldPlaneBytes > 0) {
-                    this.gpu.copyDeviceToDevice(newAddress, this.address, oldPlaneBytes);
-                    this.gpu.copyDeviceToDevice(
-                            newAddress + planeByteSize(newCapacity), valueCacheAddress(), oldPlaneBytes);
-                }
-            }
-        } catch (RuntimeException | Error copyFailure) {
-            if (this.gpu.asynchronous()) {
-                this.retiredAddresses.add(newAddress);
-            } else {
-                try {
-                    this.gpu.free(newAddress);
-                } catch (Throwable cleanupFailure) {
-                    copyFailure.addSuppressed(cleanupFailure);
-                }
-            }
-            throw copyFailure;
-        }
-
-        long oldAddress = this.address;
-        this.address = newAddress;
-        this.capacity = newCapacity;
-        if (oldAddress != 0) {
-            if (this.gpu.asynchronous()) {
-                this.retiredAddresses.add(oldAddress);
-                return;
-            }
-            try {
-                this.gpu.free(oldAddress);
-            } catch (RuntimeException | Error freeFailure) {
-                this.retiredAddresses.add(oldAddress);
-                throw freeFailure;
-            }
-        }
-    }
-
-    private long cacheByteSize(int tokenCapacity) {
-        return Math.multiplyExact(2L, planeByteSize(tokenCapacity));
-    }
-
-    private long planeByteSize(int tokenCapacity) {
-        return Math.multiplyExact(Math.multiplyExact((long) tokenCapacity, this.keyValueWidth), Short.BYTES);
     }
 
     private void ensureOpen() {
