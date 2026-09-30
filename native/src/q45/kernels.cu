@@ -1,6 +1,7 @@
 #include "strategies/decode.cuh"
 #include "strategies/prefill.cuh"
 #include "attention_cache.cuh"
+#include "pdl.cuh"
 
 // Q4/Q5 kernels, structured like the Q3 module: format layout and code
 // unpacking are Q4/Q5-specific; the cooperative decode, compact K prefetch,
@@ -18,6 +19,7 @@
 extern "C" __global__ __launch_bounds__(128) void euhedral_q##B##_decode_##R( \
         const unsigned short* input, const unsigned char* weights, unsigned short* output, \
         unsigned int rows, unsigned int in_features, unsigned int out_features) { \
+    euhedral_pdl_begin(); \
     q45::cooperative_decode<B, R>(input, weights, output, rows, in_features, out_features); \
 }
 EUHEDRAL_Q45_DECODE_KERNEL(4, 1)

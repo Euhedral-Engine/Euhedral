@@ -37,6 +37,12 @@ int euhedral_cuda_load_kernel(const void* anchor, const char* source_name,
             ? EUHEDRAL_CUDA_SUCCESS : EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 }
 void* euhedral_cuda_submission_stream(void) { return NULL; }
+void euhedral_cuda_pdl_register(CUfunction function) { (void)function; }
+CUresult euhedral_launch_kernel(CUfunction function, unsigned int gx, unsigned int gy, unsigned int gz,
+        unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared, CUstream stream,
+        void** parameters, void** extra) {
+    return cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared, stream, parameters, extra);
+}
 #include "q3_linear_bf16.c"
 '''
 

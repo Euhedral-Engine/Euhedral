@@ -1,6 +1,7 @@
 #pragma once
 #include "nvfp4_kv.cuh"
 #include <mma.h>
+#include "pdl.cuh"
 
 // Up to 16 grouped query heads x 32 keys per split; K and V share the same staging storage. Accumulation
 // and online softmax are FP32; rotated Q and probabilities are FP16 MMA operands.
@@ -11,6 +12,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_tc_n
         __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
         unsigned int headDim, unsigned int cacheLength, unsigned long long start,
         float* partial, unsigned int splits) {
+    euhedral_pdl_begin();
     using namespace nvcuda;
     const unsigned int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const unsigned int kh = blockIdx.x / splits, split = blockIdx.x % splits;

@@ -72,6 +72,10 @@ public abstract class ExecutionGpu implements GpuMemory {
         operation.run();
     }
 
+    /// Lets the calling thread's following launches overlap their predecessor's tail (CUDA programmatic
+    /// dependent launch) when this GPU supports it. Only stream-ordered decode chains enable it.
+    public void programmaticDependentLaunch(boolean enabled) {}
+
     /// Initializes sequence state on the same stream as later async instructions.
     public void prepare(Runnable initialization) {
         initialization.run();

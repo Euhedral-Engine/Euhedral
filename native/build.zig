@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
     } else {
         b.installArtifact(library);
     }
+    b.installFile("src/pdl.cuh", "share/euhedral_cuda/pdl.cuh");
     b.installFile("src/q3_embedding.cu", "share/euhedral_cuda/q3_embedding.cu");
     b.installFile("src/rms_norm_bf16.cu", "share/euhedral_cuda/rms_norm_bf16.cu");
     b.installFile("src/q3_linear_bf16.cu", "share/euhedral_cuda/q3_linear_bf16.cu");

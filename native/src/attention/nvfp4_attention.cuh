@@ -1,6 +1,7 @@
 #pragma once
 #include "nvfp4_kv.cuh"
 #include <mma.h>
+#include "pdl.cuh"
 
 namespace nvfp4kv {
 
@@ -149,6 +150,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp
         __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
         unsigned int headDim, unsigned int cacheLength, unsigned long long start,
         float* partial, unsigned int splits) {
+    euhedral_pdl_begin();
     const unsigned int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const unsigned int head = blockIdx.x / splits, split = blockIdx.x % splits;
     const unsigned int kh = head / (queryHeads / keyHeads);
@@ -198,6 +200,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp
 extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4(
         const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial,
         unsigned int queryHeads, unsigned int keyHeads, unsigned int splits) {
+    euhedral_pdl_begin();
     if (threadIdx.x >= 32) return;
     const unsigned int lane = threadIdx.x, head = blockIdx.x;
     const float* source = partial + (unsigned long long)head * splits * 258;

@@ -1,5 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "pdl.cuh"
 
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
@@ -12,6 +13,7 @@ __device__ __forceinline__ float euhedral_silu(float value) {
 extern "C" __global__ void euhedral_residual_add_bf16(
         const __nv_bfloat16* residual, const __nv_bfloat16* delta,
         __nv_bfloat16* output, uint32_t elementCount) {
+    euhedral_pdl_begin();
     const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < elementCount) {
         output[index] = __float2bfloat16_rn(
@@ -22,6 +24,7 @@ extern "C" __global__ void euhedral_residual_add_bf16(
 extern "C" __global__ void euhedral_swiglu_bf16(
         const __nv_bfloat16* gateUp, __nv_bfloat16* output,
         uint32_t rows, uint32_t intermediateSize) {
+    euhedral_pdl_begin();
     const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const uint64_t count = static_cast<uint64_t>(rows) * intermediateSize;
     if (index >= count) return;

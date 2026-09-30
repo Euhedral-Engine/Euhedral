@@ -74,7 +74,7 @@ static int get_function(CUmodule module, CUfunction* function, const char* name)
     return (int)cuModuleGetFunction(function, module, name);
 }
 
-static void initialize(void) {
+static void initialize_modules(void) {
     init_status = euhedral_cuda_load_kernel(
             &quantized_anchor, "qwen_layer_linear.cu", "euhedral_linear_quantized_bf16", &quantized_module, &linear_quantized);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
@@ -155,6 +155,26 @@ static void initialize(void) {
     }
 }
 
+// Every kernel registered here begins with euhedral_pdl_begin(), so stream-serialized
+// programmatic dependent launch is safe for it (see cuda_kernel_loader.h).
+static void initialize(void) {
+    initialize_modules();
+    euhedral_cuda_pdl_register(linear_bf16_to_float);
+    for (int format = 0; format < 2; format++)
+        for (int tile = 0; tile < 3; tile++) euhedral_cuda_pdl_register(q45_decode[format][tile]);
+    euhedral_cuda_pdl_register(gdn_control);
+    euhedral_cuda_pdl_register(gdn_convolution);
+    euhedral_cuda_pdl_register(gdn_recurrence);
+    euhedral_cuda_pdl_register(gdn_gated_rms_norm);
+    euhedral_cuda_pdl_register(residual_add);
+    euhedral_cuda_pdl_register(swiglu);
+    euhedral_cuda_pdl_register(attention_qk_norm_rope);
+    euhedral_cuda_pdl_register(attention_append_nvfp4);
+    euhedral_cuda_pdl_register(attention_decode_nvfp4);
+    euhedral_cuda_pdl_register(attention_decode_tc_nvfp4);
+    euhedral_cuda_pdl_register(attention_merge_nvfp4);
+}
+
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
     (void)state; (void)parameter; (void)context;
@@ -173,7 +193,7 @@ static int ensure_initialized(void) {
 }
 
 static int launch_and_synchronize(CUfunction function, uint32_t grid_x, uint32_t block_x, void** parameters) {
-    CUresult status = cuLaunchKernel(function, grid_x, 1, 1, block_x, 1, 1, 0,
+    CUresult status = euhedral_launch_kernel(function, grid_x, 1, 1, block_x, 1, 1, 0,
             euhedral_cuda_submission_stream(), parameters, NULL);
     if (status != CUDA_SUCCESS) return (int)status;
     if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
@@ -491,13 +511,13 @@ int euhedral_cuda_q3_ffn_streamed_bf16(
         void* staging = (unsigned char*)slots + (uint64_t)slot * rows * 4096u * 2u;
         if (part >= 2u) FFN_TRY(cudaStreamWaitEvent(producer, release[slot], 0));
         void* gate_args[] = {&input, &gate_weights, &staging, &rows, &hidden, &gate_outputs, &gate_scale, &begin, &count};
-        FFN_TRY(cuLaunchKernel(gate, (rows / row_tile) * (count / gate_tile), 1, 1, 128, 1, 1, 0,
+        FFN_TRY(euhedral_launch_kernel(gate, (rows / row_tile) * (count / gate_tile), 1, 1, 128, 1, 1, 0,
                 (CUstream)producer, gate_args, NULL));
         FFN_TRY(cudaEventRecord(ready[slot], producer));
         FFN_TRY(cudaStreamWaitEvent(consumer, ready[slot], 0));
         void* down_args[] = {&staging, &down_weights, &output, &rows, &intermediate, &hidden, &down_scale,
                 &accumulators, &begin, &count};
-        FFN_TRY(cuLaunchKernel(down, (rows / row_tile) * (hidden / down_tile), 1, 1, 128, 1, 1, 0,
+        FFN_TRY(euhedral_launch_kernel(down, (rows / row_tile) * (hidden / down_tile), 1, 1, 128, 1, 1, 0,
                 (CUstream)consumer, down_args, NULL));
         FFN_TRY(cudaEventRecord(release[slot], consumer));
     }
@@ -686,10 +706,10 @@ int euhedral_cuda_attention_producers_bf16(
     void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
             &head_dim, &rotary_dim, &start, &epsilon, &theta, &keys};
     void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width, &values, &query_width, &start};
-    status = (int)cuLaunchKernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
-    if (status == 0) status = (int)cuLaunchKernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
+    status = (int)euhedral_launch_kernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    if (status == 0) status = (int)euhedral_launch_kernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
             head_dim, 1, 1, 0, stream, norm_args, NULL);
-    if (status == 0) status = (int)cuLaunchKernel(attention_value_cache, (uint32_t)grid, 1, 1,
+    if (status == 0) status = (int)euhedral_launch_kernel(attention_value_cache, (uint32_t)grid, 1, 1,
             128, 1, 1, 0, stream, q5_args, NULL);
     // One owner and one completion edge cover both physical cache producers.
     // Failed partial submission must drain before borrowed cache/workspace can retire.
@@ -737,12 +757,12 @@ int euhedral_cuda_attention_producers_nvfp4(
     void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width};
     uint32_t key_width = key_heads * head_dim;
     void* append_args[] = {&query_key, &gate, &keys, &values, &rows, &query_width, &key_width, &start};
-    status = (int)cuLaunchKernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
-    if (status == 0) status = (int)cuLaunchKernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
+    status = (int)euhedral_launch_kernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    if (status == 0) status = (int)euhedral_launch_kernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
             head_dim, 1, 1, 0, stream, norm_args, NULL);
-    if (status == 0) status = (int)cuLaunchKernel(q45_prefill64[1], (uint32_t)grid, 1, 1,
+    if (status == 0) status = (int)euhedral_launch_kernel(q45_prefill64[1], (uint32_t)grid, 1, 1,
             128, 1, 1, 0, stream, q5_args, NULL);
-    if (status == 0) status = (int)cuLaunchKernel(attention_append_nvfp4,
+    if (status == 0) status = (int)euhedral_launch_kernel(attention_append_nvfp4,
             (uint32_t)(((uint64_t)rows * key_heads + 3) / 4), 1, 1, 128, 1, 1, 0, stream, append_args, NULL);
     // One owner and one completion edge cover both physical cache producers.
     // Failed partial submission must drain before borrowed cache/workspace can retire.
@@ -883,9 +903,9 @@ int euhedral_cuda_attention_causal_nvfp4(
     int tensor_decode = query_heads / key_heads == 6 && length >= 1024;
     CUfunction decode = tensor_decode ? attention_decode_tc_nvfp4 : attention_decode_nvfp4;
     uint32_t decode_grid = (tensor_decode ? key_heads : query_heads) * splits;
-    status = (int)cuLaunchKernel(decode, decode_grid, 1, 1,
+    status = (int)euhedral_launch_kernel(decode, decode_grid, 1, 1,
             128, 1, 1, 0, stream, args, NULL);
-    if (status == 0) status = (int)cuLaunchKernel(attention_merge_nvfp4, query_heads, 1, 1,
+    if (status == 0) status = (int)euhedral_launch_kernel(attention_merge_nvfp4, query_heads, 1, 1,
             128, 1, 1, 0, stream, merge, NULL);
     if (status != 0 || stream == NULL) {
         int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);

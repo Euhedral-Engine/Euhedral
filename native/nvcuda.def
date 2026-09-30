@@ -8,4 +8,5 @@ EXPORTS
     cuModuleUnload
     cuGetErrorString
     cuLaunchKernel
+    cuLaunchKernelEx
     cuLaunchKernel_ptsz

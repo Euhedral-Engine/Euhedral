@@ -4,6 +4,7 @@
 #include "attention/nvfp4_attention.cuh"
 #include "attention/nvfp4_prefill32.cuh"
 #include "attention/nvfp4_decode_tc.cuh"
+#include "pdl.cuh"
 
 // Four warp-owned rows per CTA. Page-table entries point to token-major pages;
 // each head row has 128 packed-code bytes followed by 16 E4M3 scale bytes.
@@ -12,6 +13,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_kv_append_n
         unsigned char* const* keyPages, unsigned char* const* valuePages,
         unsigned int rows, unsigned int queryWidth, unsigned int keyValueWidth,
         unsigned long long startPosition) {
+    euhedral_pdl_begin();
     const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const unsigned int heads = keyValueWidth / 256;
     const unsigned int rowHead = blockIdx.x * 4 + warp;
@@ -100,6 +102,7 @@ extern "C" __global__ void euhedral_attention_qk_norm_rope_bf16(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* queryNorm, const __nv_bfloat16* keyNorm,
         __nv_bfloat16* output, uint32_t rows, uint32_t queryHeads, uint32_t keyValueHeads,
         uint32_t headDim, uint32_t rotaryDim, uint64_t startPosition, float epsilon, double ropeTheta) {
+    euhedral_pdl_begin();
     qk_norm_rope<false>(queryKey, queryNorm, keyNorm, output, rows, queryHeads, keyValueHeads,
             headDim, rotaryDim, startPosition, epsilon, ropeTheta, nullptr);
 }
