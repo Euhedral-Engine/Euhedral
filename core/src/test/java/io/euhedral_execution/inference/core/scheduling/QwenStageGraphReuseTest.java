@@ -1,7 +1,9 @@
 package io.euhedral_execution.inference.core.scheduling;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -77,11 +79,13 @@ class QwenStageGraphReuseTest {
             }
         });
 
-        assertThrows(OutOfMemoryError.class, () -> receiver.get().push(frame));
+        // Escaping into Euhedral, the Error would complete the graph's source or end the worker.
+        assertDoesNotThrow(() -> receiver.get().push(frame));
         this.lattice.drive();
-        assertTrue(context.outcome().isDone(), "an Error must not strand the quantum outside the executor catch");
-        assertEquals(
-                QwenExecutionContext.Status.FAILED, context.outcome().join().status());
+        assertTrue(context.outcome().isDone(), "an Error must not strand the quantum");
+        var outcome = context.outcome().join();
+        assertEquals(QwenExecutionContext.Status.FAILED, outcome.status());
+        assertInstanceOf(OutOfMemoryError.class, outcome.failure());
         runtime.close();
     }
 
@@ -128,10 +132,13 @@ class QwenStageGraphReuseTest {
         var first = context(plan, 401);
         runtime.submit(first);
         AbstractFrame failedStage = pullOne();
-        RuntimeException thrown = assertThrows(RuntimeException.class, failedStage::execute);
-        failedStage.doFinallyWithError(thrown);
+        // The stage records its failure instead of throwing into Euhedral, which then runs doFinally.
+        failedStage.execute();
+        failedStage.doFinally();
         this.lattice.drive();
-        assertEquals(QwenExecutionContext.Status.FAILED, first.outcome().join().status());
+        var failed = first.outcome().join();
+        assertEquals(QwenExecutionContext.Status.FAILED, failed.status());
+        assertSame(failure, failed.failure());
 
         gpu.afterEmbedding = () -> {};
         var second = context(plan, 402);
@@ -235,8 +242,8 @@ class QwenStageGraphReuseTest {
         var context = context(plan, 503);
         runtime.submit(context);
         AbstractFrame stage = pullOne();
-        RuntimeException failure = assertThrows(RuntimeException.class, stage::execute);
-        stage.doFinallyWithError(failure);
+        stage.execute();
+        stage.doFinally();
         this.lattice.drive();
 
         assertEquals(

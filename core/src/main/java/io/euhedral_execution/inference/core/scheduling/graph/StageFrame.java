@@ -12,6 +12,10 @@ import java.lang.invoke.VarHandle;
 ///
 /// Once published, a frame is handled by one thread at a time. Its incoming-edge count is the only
 /// state that concurrent predecessors touch before publication.
+///
+/// `execute` never throws. A failed submission is recorded on the quantum, because an `Error`
+/// escaping into Euhedral would complete this graph's source or end the worker. Euhedral therefore
+/// finalizes a stage through `doFinallyWithError` only when it rejected the frame without running it.
 public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     private static final VarHandle ARRIVALS;
@@ -69,10 +73,10 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         this.attempted = true;
         try {
             owner.stream().submit(this, owner.overlapLaunches());
-        } catch (Error fatal) {
-            // Euhedral finalizes Exceptions only; account for this frame before the Error escapes.
-            owner.stageFailed(fatal);
-            throw fatal;
+        } catch (Throwable failure) {
+            // doFinally drops this frame's live count and publishes no successor.
+            owner.fail(failure);
+            return;
         }
         this.submitted = true;
     }
@@ -89,9 +93,12 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         else this.graph.stageFinished();
     }
 
+    /// Euhedral rejected this frame without running it: its worker cache retired, or no downstream was
+    /// routable. The stage never submitted, so the quantum fails. The rejection may be an instance that
+    /// Euhedral shares, so it is only referenced as the cause.
     @Override
-    public final void doFinallyWithError(Throwable failure) {
-        this.graph.stageFailed(failure);
+    public final void doFinallyWithError(Throwable rejection) {
+        this.graph.stageFailed(new IllegalStateException("Euhedral rejected stage " + this.stage, rejection));
     }
 
     /// Satisfies one incoming edge. Exactly one caller sees the final arrival.

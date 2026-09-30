@@ -191,35 +191,38 @@ public final class QwenExecutionContext implements StageQuantum {
         }
     }
 
-    void begin(ExecutionGpu gpu) {
-        begin(gpu, null, null, NO_OP);
+    /// Claims this quantum's single admission. A claimed quantum always reaches a terminal outcome, so
+    /// a failed admission can never be retried into a second lease or workspace.
+    void claim() {
+        if (!this.submitted.compareAndSet(false, true)) {
+            throw new DuplicateAdmissionException();
+        }
     }
 
     /// Package-private hook to deterministically exercise cancellation at the lease-claim boundary.
     void begin(ExecutionGpu gpu, Runnable beforeClaim) {
-        begin(gpu, null, null, beforeClaim);
+        claim();
+        if (!begin(gpu, null, null, beforeClaim)) publishOutcome();
     }
 
     /// Claims the sequence and prepares quantum-owned storage with `stream` selected, so any
-    /// initialization it queues precedes every stage of the quantum. The quantum proceeds only if its
-    /// outcome is still open afterwards; a failed preparation has already reached its terminal outcome.
-    void begin(ExecutionGpu gpu, GpuStream stream, Consumer<? super QwenExecutionContext> terminalConsumer) {
-        begin(gpu, stream, terminalConsumer, NO_OP);
+    /// initialization it queues precedes every stage of the quantum. Returns whether the quantum
+    /// proceeds to its stages. Otherwise its terminal outcome is prepared, and the caller publishes it
+    /// once the stream is no longer selected.
+    boolean begin(ExecutionGpu gpu, GpuStream stream, Consumer<? super QwenExecutionContext> terminalConsumer) {
+        return begin(gpu, stream, terminalConsumer, NO_OP);
     }
 
-    private void begin(
+    private boolean begin(
             ExecutionGpu gpu,
             GpuStream stream,
             Consumer<? super QwenExecutionContext> terminalConsumer,
             Runnable beforeClaim) {
-        if (!this.submitted.compareAndSet(false, true)) {
-            throw new DuplicateAdmissionException();
-        }
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.terminalConsumer = terminalConsumer;
         if (this.sequence.cancellationRequested()) {
-            this.outcome.complete(new Outcome(Status.CANCELLED, null));
-            return;
+            this.pendingOutcome = new Outcome(Status.CANCELLED, null);
+            return false;
         }
         try {
             long end = Math.addExact(this.startPosition, this.tokenIds.length);
@@ -237,8 +240,8 @@ public final class QwenExecutionContext implements StageQuantum {
                 this.lease = this.sequence.claimExecution(this.startPosition);
             } catch (IllegalStateException claimFailure) {
                 if (this.sequence.terminalState() == QwenSequenceState.TerminalState.CANCELLED) {
-                    this.outcome.complete(new Outcome(Status.CANCELLED, null));
-                    return;
+                    this.pendingOutcome = new Outcome(Status.CANCELLED, null);
+                    return false;
                 }
                 throw claimFailure;
             }
@@ -251,12 +254,14 @@ public final class QwenExecutionContext implements StageQuantum {
                             this.plan.weights().config().hiddenSize(),
                             this.plan.projectionWidths());
             this.workspace.allocateBuffers();
+            return true;
         } catch (RuntimeException | Error error) {
             // Initialization can queue zeroes before a later allocation fails. Keep every allocation
             // when the stream cannot prove that those writes stopped.
             if (stream != null) stream.recover(error);
             fail(error);
-            finish();
+            retire(null);
+            return false;
         }
     }
 
@@ -393,6 +398,11 @@ public final class QwenExecutionContext implements StageQuantum {
         this.pendingOutcome = completed;
     }
 
+    /// Whether this quantum has reached its terminal outcome, published or not.
+    boolean terminal() {
+        return this.pendingOutcome != null || this.outcome.isDone();
+    }
+
     /// Completes the caller-visible outcome prepared by [#retire].
     @Override
     public void publishOutcome() {
@@ -409,13 +419,6 @@ public final class QwenExecutionContext implements StageQuantum {
     void finish() {
         retire(null);
         publishOutcome();
-    }
-
-    /// Terminal cleanup for a quantum driven outside a stage graph.
-    void finish(Consumer<? super QwenExecutionContext> terminalConsumer, ExecutionGpu gpu) {
-        if (this.gpu == null) this.gpu = Objects.requireNonNull(gpu, "gpu");
-        if (terminalConsumer != null) this.terminalConsumer = terminalConsumer;
-        finish();
     }
 
     private void retainLogits(ExecutionGpu gpu) {

@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.scheduling;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -14,9 +15,15 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 class QwenExecutionContextTest {
 
@@ -79,6 +86,145 @@ class QwenExecutionContextTest {
         assertTrue(gpu.frees.isEmpty());
         assertEquals(0, runtime.activeQuanta());
         runtime.close();
+    }
+
+    @Test
+    void admissionThatFailsBeforePreparationFailsTheQuantumAndRejectsARetry() throws Exception {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
+        var selectionFailure = new IllegalStateException("stream selection failed");
+        var failSelection = new AtomicBoolean(true);
+        var gpu = new QwenExecutionFixtures.RecordingGpu() {
+            @Override
+            public GpuStream openStream() {
+                return new InlineGpuStream() {
+                    @Override
+                    public void submit(Runnable launches, boolean overlapPredecessor) {
+                        if (failSelection.get()) throw selectionFailure;
+                        launches.run();
+                    }
+                };
+            }
+        };
+        var runtime = QwenExecutionFixtures.runtime(plan, gpu);
+        var sequence = new QwenSequenceState(905);
+        var context =
+                new QwenExecutionContext(plan, sequence, QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+
+        assertSame(selectionFailure, assertThrows(IllegalStateException.class, () -> runtime.submit(context)));
+        assertEquals(
+                QwenExecutionContext.Status.FAILED, context.outcome().join().status());
+        failSelection.set(false);
+        // A retry would claim a second lease and workspace that the finished outcome never releases.
+        assertThrows(QwenExecutionContext.DuplicateAdmissionException.class, () -> runtime.submit(context));
+        assertFalse(sequence.isExecutionClaimed());
+        assertTrue(gpu.allocations.isEmpty());
+        assertEquals(0, runtime.activeQuanta());
+
+        var next =
+                new QwenExecutionContext(plan, sequence, QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+        assertEquals(
+                QwenExecutionContext.Status.SUCCESS,
+                runtime.submit(next).get(2, TimeUnit.SECONDS).status());
+        runtime.close();
+    }
+
+    @Test
+    void outcomeReachedAtAdmissionIsPublishedWithTheStreamDeselected() {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
+        var selected = new AtomicInteger();
+        var gpu = new QwenExecutionFixtures.RecordingGpu() {
+            @Override
+            public GpuStream openStream() {
+                return new InlineGpuStream() {
+                    @Override
+                    public void submit(Runnable launches, boolean overlapPredecessor) {
+                        selected.incrementAndGet();
+                        try {
+                            launches.run();
+                        } finally {
+                            selected.decrementAndGet();
+                        }
+                    }
+                };
+            }
+        };
+        var runtime = QwenExecutionFixtures.runtime(plan, gpu);
+        var cancelledSequence = new QwenSequenceState(906);
+        cancelledSequence.cancel();
+        var cancelled = new QwenExecutionContext(
+                plan, cancelledSequence, QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+        var invalid = new QwenExecutionContext(
+                plan, new QwenSequenceState(907), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {
+                    Integer.MAX_VALUE
+                });
+        List<Integer> selectedAtOutcome = new ArrayList<>();
+        cancelled.outcome().whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        invalid.outcome().whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+
+        assertEquals(
+                QwenExecutionContext.Status.CANCELLED,
+                runtime.submit(cancelled).join().status());
+        assertEquals(
+                QwenExecutionContext.Status.FAILED,
+                runtime.submit(invalid).join().status());
+        // An outcome callback that launched work would otherwise land on the graph's stream.
+        assertEquals(List.of(0, 0), selectedAtOutcome);
+        runtime.close();
+    }
+
+    @Test
+    void admissionRefusedByAClosedRuntimeFailsTheQuantum() {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
+        var runtime = QwenExecutionFixtures.runtime(plan, new QwenExecutionFixtures.RecordingGpu());
+        runtime.close();
+        var context = new QwenExecutionContext(
+                plan, new QwenSequenceState(908), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+
+        assertThrows(IllegalStateException.class, () -> runtime.submit(context));
+        assertEquals(
+                QwenExecutionContext.Status.FAILED, context.outcome().join().status());
+        assertThrows(QwenExecutionContext.DuplicateAdmissionException.class, () -> runtime.submit(context));
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void closeDuringGraphBuildReleasesTheNewGraphsStream() throws Exception {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
+        var building = new CountDownLatch(1);
+        var closed = new CountDownLatch(1);
+        var streamClosed = new AtomicBoolean();
+        var gpu = new QwenExecutionFixtures.RecordingGpu() {
+            @Override
+            public GpuStream openStream() {
+                building.countDown();
+                try {
+                    closed.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                return new InlineGpuStream() {
+                    @Override
+                    public void close() {
+                        streamClosed.set(true);
+                    }
+                };
+            }
+        };
+        var runtime = QwenExecutionFixtures.runtime(plan, gpu);
+        var context = new QwenExecutionContext(
+                plan, new QwenSequenceState(909), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+        try (var admission = Executors.newSingleThreadExecutor()) {
+            Future<?> submitted = admission.submit(() -> runtime.submit(context));
+            assertTrue(building.await(10, TimeUnit.SECONDS));
+            runtime.close();
+            closed.countDown();
+            var failure = assertThrows(ExecutionException.class, () -> submitted.get(10, TimeUnit.SECONDS));
+            assertInstanceOf(IllegalStateException.class, failure.getCause());
+        }
+        assertTrue(streamClosed.get(), "close() never saw this graph, so its build must release the stream");
+        assertEquals(
+                QwenExecutionContext.Status.FAILED, context.outcome().join().status());
     }
 
     @Test

@@ -642,7 +642,7 @@ public final class QwenExecutionPlan {
         return this.bufferSpecs;
     }
 
-    /// Prefill views owned by this plan, for runner admission of requalified quanta.
+    /// The prefill views this plan owns besides its own topology; empty for a view or a reference plan.
     List<QwenExecutionPlan> executionVariants() {
         if (this.owner != this || this.regionPrefill == null) return List.of();
         return this.streamedPrefill == null

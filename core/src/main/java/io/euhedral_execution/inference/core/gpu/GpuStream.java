@@ -20,11 +20,12 @@ public interface GpuStream extends AutoCloseable {
     void submit(Runnable launches, boolean overlapPredecessor);
 
     /// Registers a device-completion boundary after all work submitted so far. The listener runs
-    /// exactly once, possibly before this call returns. A thrown exception means nothing was armed.
+    /// exactly once, possibly before this call returns. A thrown exception means nothing was armed and
+    /// the listener never runs.
     long notifyRetired(RetirementListener listener);
 
     /// Confirms a notified boundary from an ordinary thread after its listener ran. Returns the device
-    /// failure, or null when every operation submitted before the boundary completed.
+    /// failure, or null when every operation submitted before the boundary completed; never throws.
     Throwable confirmRetired(long ticket);
 
     /// Blocks until all submitted work has finished. Only recovery and teardown use it.
