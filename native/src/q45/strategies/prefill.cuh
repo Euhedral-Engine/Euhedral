@@ -52,7 +52,7 @@ static __device__ __forceinline__ void tiled_prefill(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features,
         PrefillShared<Tile, A_STRIDE>& staging, __nv_bfloat16* b_hi, __nv_bfloat16* b_lo,
-        Writeback writeback = Writeback{}) {
+        unsigned int block, Writeback writeback = Writeback{}) {
     using Shared = PrefillShared<Tile, A_STRIDE>;
     static_assert(__is_trivial(typename Shared::Activation), "A wrapper must be trivial");
     static_assert(__is_trivial(typename Shared::Result), "result wrapper must be trivial");
@@ -61,8 +61,8 @@ static __device__ __forceinline__ void tiled_prefill(
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     // Quotient-and-remainder form: out_features + kCols - 1 could wrap for valid ABI sizes.
     const unsigned int output_tiles = out_features / Tile::kCols + (out_features % Tile::kCols != 0u);
-    const unsigned int row_start = (blockIdx.x / output_tiles) * Tile::kRows;
-    const unsigned int out_start = (blockIdx.x % output_tiles) * Tile::kCols;
+    const unsigned int row_start = (block / output_tiles) * Tile::kRows;
+    const unsigned int out_start = (block % output_tiles) * Tile::kCols;
     const Layout<BITS> w(weights, in_features, out_features);
     typename Leaf::Acc acc;
     Leaf::fill(acc);

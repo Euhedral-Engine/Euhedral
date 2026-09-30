@@ -82,6 +82,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle q3FfnStreamedBf16;
     private final MethodHandle attentionProducersBf16;
     private final MethodHandle gdnProjectControlFp32;
+    private final MethodHandle gdnProjectionsBf16;
     private final MethodHandle swiGluBf16;
     private final MethodHandle zeroDeviceMemory;
     private final MethodHandle attentionQkNormRopeBf16;
@@ -300,6 +301,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                                     ValueLayout.JAVA_INT,
                                     ValueLayout.JAVA_INT,
                                     ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            this.gdnProjectionsBf16 = symbols.find("euhedral_cuda_gdn_projections_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
                     .orElse(null);
             this.residualAddBf16 = bind(linker, symbols, "euhedral_cuda_residual_add_bf16", RESIDUAL_ADD_BF16);
             this.swiGluBf16 = bind(linker, symbols, "euhedral_cuda_swiglu_bf16", SWIGLU_BF16);
@@ -1260,6 +1278,54 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 rows,
                 width,
                 heads);
+    }
+
+    @Override
+    public void gdnProjectionsBf16(
+            long input,
+            long q4Weights,
+            long q5Weights,
+            long queryKeyOutput,
+            long valueZOutput,
+            int rows,
+            int hidden,
+            int queryKeyWidth,
+            int valueZWidth,
+            long q4Bytes,
+            long q5Bytes) {
+        if (gdnProjectionsBf16 == null) {
+            super.gdnProjectionsBf16(
+                    input,
+                    q4Weights,
+                    q5Weights,
+                    queryKeyOutput,
+                    valueZOutput,
+                    rows,
+                    hidden,
+                    queryKeyWidth,
+                    valueZWidth,
+                    q4Bytes,
+                    q5Bytes);
+            return;
+        }
+        ensureOpen();
+        requireAddresses(input, q4Weights, q5Weights, queryKeyOutput, valueZOutput);
+        if (rows <= 0 || hidden <= 0 || queryKeyWidth <= 0 || valueZWidth <= 0 || q4Bytes <= 0 || q5Bytes <= 0)
+            throw new IllegalArgumentException("invalid GDN projection dimensions");
+        invokeLayer(
+                "GDN projections",
+                gdnProjectionsBf16,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(q4Weights),
+                MemorySegment.ofAddress(q5Weights),
+                MemorySegment.ofAddress(queryKeyOutput),
+                MemorySegment.ofAddress(valueZOutput),
+                rows,
+                hidden,
+                queryKeyWidth,
+                valueZWidth,
+                q4Bytes,
+                q5Bytes);
     }
 
     @Override

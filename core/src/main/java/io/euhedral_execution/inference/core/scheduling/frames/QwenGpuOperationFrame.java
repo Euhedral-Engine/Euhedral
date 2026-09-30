@@ -74,6 +74,7 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                                 context.inputTokenCount(),
                                 instruction.inputWidth(),
                                 instruction.outputWidth());
+            case GDN_PROJECTIONS -> runGdnProjections(context, instruction);
             case GDN_CONTROL -> runControl(context, instruction);
             case GDN_CONVOLUTION -> runConvolution(context, instruction);
             case GDN_RECURRENCE -> runRecurrence(context, instruction);
@@ -88,6 +89,23 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                 throw new IllegalArgumentException(
                         "GPU operation frame received unsupported instruction: " + instruction.kind());
         }
+    }
+
+    private void runGdnProjections(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
+        QwenConfig config = context.plan().weights().config();
+        int valueZWidth = 2 * config.linearNumValueHeads() * config.linearValueHeadDim();
+        gpu().gdnProjectionsBf16(
+                        input(context, instruction, 0),
+                        instruction.weightAddress(0),
+                        instruction.weightAddress(1),
+                        output(context, instruction, 0),
+                        output(context, instruction, 1),
+                        context.inputTokenCount(),
+                        instruction.inputWidth(),
+                        instruction.outputWidth(),
+                        valueZWidth,
+                        instruction.weightByteSize(0),
+                        instruction.weightByteSize(1));
     }
 
     private void runControl(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {

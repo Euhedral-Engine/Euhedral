@@ -42,10 +42,34 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q##B##_##NAME( \
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE]; \
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE]; \
     q45::tiled_prefill<B, Tile, A_STRIDE, B_STRIDE, q45::LEAF<Tile>>( \
-            input, weights, output, rows, in_features, out_features, staging, b_hi, b_lo); \
+            input, weights, output, rows, in_features, out_features, staging, b_hi, b_lo, blockIdx.x); \
 }
 EUHEDRAL_Q45_PREFILL_KERNEL(4, prefill, Prefill32, 72, 72, Q45_PREFILL_LEAF)
 EUHEDRAL_Q45_PREFILL_KERNEL(5, prefill, Prefill32, 72, 72, Q45_PREFILL_LEAF)
 EUHEDRAL_Q45_PREFILL_KERNEL(4, prefill_64, Prefill64, 72, 72, Q45_PREFILL64_LEAF)
 EUHEDRAL_Q45_PREFILL_KERNEL(5, prefill_64, Prefill64, 72, 72, Q45_PREFILL64_LEAF)
 #undef EUHEDRAL_Q45_PREFILL_KERNEL
+
+// One launch for a Q4 and a Q5 projection of the same activations: the first
+// Q4 tile blocks run the Q4 weights, the rest run the Q5 weights. Each block is
+// the same 64-row tile kernel as euhedral_q4_prefill_64 / euhedral_q5_prefill_64,
+// so the outputs are bitwise identical to two launches. It removes the idle
+// tail of the small Q4 grid; the host uses it only where that wins.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q45_prefill_64_grouped(
+        const unsigned short* input, const unsigned char* q4_weights, unsigned short* q4_output,
+        const unsigned char* q5_weights, unsigned short* q5_output, unsigned int rows,
+        unsigned int in_features, unsigned int q4_features, unsigned int q5_features) {
+    using Tile = q45::Prefill64;
+    __shared__ q45::PrefillShared<Tile, 72> staging;
+    __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * 72];
+    __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * 72];
+    const unsigned int row_tiles = rows / Tile::kRows + (rows % Tile::kRows != 0u);
+    const unsigned int q4_blocks = row_tiles * (q4_features / Tile::kCols + (q4_features % Tile::kCols != 0u));
+    if (blockIdx.x < q4_blocks)
+        q45::tiled_prefill<4, Tile, 72, 72, q45::Q45_PREFILL64_LEAF<Tile>>(
+                input, q4_weights, q4_output, rows, in_features, q4_features, staging, b_hi, b_lo, blockIdx.x);
+    else
+        q45::tiled_prefill<5, Tile, 72, 72, q45::Q45_PREFILL64_LEAF<Tile>>(
+                input, q5_weights, q5_output, rows, in_features, q5_features, staging, b_hi, b_lo,
+                blockIdx.x - q4_blocks);
+}

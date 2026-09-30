@@ -32,5 +32,5 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_value_cache
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * 72];
     q45::tiled_prefill<5, Tile, 72, 72, q45::MmaPingPongLeaf<Tile>, q45::ValueCacheWriteback>(
             input, weights, output, rows, in_features, out_features, staging, b_hi, b_lo,
-            {cache, query_width, start});
+            blockIdx.x, {cache, query_width, start});
 }

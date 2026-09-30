@@ -179,6 +179,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_project_control_fp32(
         const float* a_log, const float* dt_bias, float* alpha, float* beta,
         uint32_t rows, uint32_t width, uint32_t heads);
 
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_projections_bf16(
+        const void* input, const void* q4, const void* q5, void* qk_output, void* value_z_output,
+        uint32_t rows, uint32_t hidden, uint32_t qk_width, uint32_t value_z_width,
+        uint64_t q4_bytes, uint64_t q5_bytes);
+
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_add_bf16(
         const void* device_residual,
         const void* device_delta,
