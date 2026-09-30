@@ -119,7 +119,7 @@ final class QwenFullModelCpuReference {
                 || queryHeads <= 0
                 || keyValueHeads <= 0
                 || queryHeads % keyValueHeads != 0
-                || headDim <= 0
+                || headDim != 256
                 || gateValue.length != Math.multiplyExact(queryHeads + keyValueHeads, headDim)) {
             throw new IllegalArgumentException("attention gate/value dimensions are invalid");
         }
@@ -128,10 +128,11 @@ final class QwenFullModelCpuReference {
         int groupsPerKeyValueHead = queryHeads / keyValueHeads;
         for (int queryHead = 0; queryHead < queryHeads; queryHead++) {
             int valueHead = queryHead / groupsPerKeyValueHead;
+            double[] represented = Nvfp4KvReference.represented(gateValue, valuesOffset + valueHead * headDim);
             for (int lane = 0; lane < headDim; lane++) {
                 int outputIndex = queryHead * headDim + lane;
                 float gate = bf16ToFloat(gateValue[outputIndex]);
-                float value = bf16ToFloat(gateValue[valuesOffset + valueHead * headDim + lane]);
+                float value = (float) represented[lane];
                 float sigmoid = 1.0f / (1.0f + (float) Math.exp(-gate));
                 output[outputIndex] = floatToBf16(value * sigmoid);
             }

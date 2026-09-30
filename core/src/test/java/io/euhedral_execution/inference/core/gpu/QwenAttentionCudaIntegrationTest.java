@@ -63,7 +63,7 @@ class QwenAttentionCudaIntegrationTest {
 
                 cache.prepareAppend(0, prefillRows);
                 long gateValueAppendDevice = gateValueDevice;
-                gpu.attentionKvAppendBf16(
+                gpu.attentionKvAppendNvfp4(
                         normalizedDevice,
                         gateValueAppendDevice,
                         cache.keyCacheAddress(),
@@ -77,7 +77,7 @@ class QwenAttentionCudaIntegrationTest {
                         expectedNormalized, expectedNormalized, gateValue, gateValue, prefillRows, QUERY_HEADS, 0);
                 long outputDevice = gpu.allocate((long) prefillRows * QUERY_WIDTH * Short.BYTES);
                 try {
-                    gpu.attentionCausalBf16(
+                    gpu.attentionCausalNvfp4(
                             normalizedDevice,
                             gateValueDevice,
                             cache.keyCacheAddress(),
@@ -88,7 +88,8 @@ class QwenAttentionCudaIntegrationTest {
                             KEY_VALUE_HEADS,
                             HEAD_DIM,
                             cache.length(),
-                            0);
+                            0,
+                            cache.decodeScratchAddress(QUERY_HEADS));
                     short[] actual =
                             CudaGpuOperationsIntegrationTest.download(gpu, arena, outputDevice, expectedOutput.length);
                     assertBf16Close(expectedOutput, actual, 0.03f);
@@ -126,7 +127,7 @@ class QwenAttentionCudaIntegrationTest {
                             0.012f);
 
                     cache.prepareAppend(decodePosition, 1);
-                    gpu.attentionKvAppendBf16(
+                    gpu.attentionKvAppendNvfp4(
                             decodeNormalizedDevice,
                             decodeGateValueDevice,
                             cache.keyCacheAddress(),
@@ -148,7 +149,7 @@ class QwenAttentionCudaIntegrationTest {
                             1,
                             QUERY_HEADS,
                             decodePosition);
-                    gpu.attentionCausalBf16(
+                    gpu.attentionCausalNvfp4(
                             decodeNormalizedDevice,
                             decodeGateValueDevice,
                             cache.keyCacheAddress(),
@@ -159,7 +160,8 @@ class QwenAttentionCudaIntegrationTest {
                             KEY_VALUE_HEADS,
                             HEAD_DIM,
                             cache.length(),
-                            decodePosition);
+                            decodePosition,
+                            cache.decodeScratchAddress(QUERY_HEADS));
                     assertBf16Close(
                             expectedDecodeOutput,
                             CudaGpuOperationsIntegrationTest.download(
@@ -229,6 +231,13 @@ class QwenAttentionCudaIntegrationTest {
             int rows,
             int queryHeads,
             long startPosition) {
+        double[][] keys = new double[cachedQueryKey.length / QUERY_KEY_WIDTH * KEY_VALUE_HEADS][];
+        double[][] values = new double[keys.length][];
+        for (int i = 0; i < keys.length; i++) {
+            int offset = (i / KEY_VALUE_HEADS) * QUERY_KEY_WIDTH + QUERY_WIDTH + (i % KEY_VALUE_HEADS) * HEAD_DIM;
+            keys[i] = Nvfp4KvReference.represented(cachedQueryKey, offset);
+            values[i] = Nvfp4KvReference.represented(cachedGateValue, offset);
+        }
         List<Short> output = new ArrayList<>();
         int groupSize = queryHeads / KEY_VALUE_HEADS;
         for (int row = 0; row < rows; row++) {
@@ -239,11 +248,10 @@ class QwenAttentionCudaIntegrationTest {
                 List<Float> scores = new ArrayList<>(absolutePosition + 1);
                 float maximum = Float.NEGATIVE_INFINITY;
                 for (int keyPosition = 0; keyPosition <= absolutePosition; keyPosition++) {
-                    int keyOffset = keyPosition * QUERY_KEY_WIDTH + QUERY_WIDTH + keyHead * HEAD_DIM;
                     float dot = 0.0f;
                     for (int dimension = 0; dimension < HEAD_DIM; dimension++) {
                         dot += CudaGpuOperationsIntegrationTest.bf16ToFloat(queryRows[queryOffset + dimension])
-                                * CudaGpuOperationsIntegrationTest.bf16ToFloat(cachedQueryKey[keyOffset + dimension]);
+                                * keys[keyPosition * KEY_VALUE_HEADS + keyHead][dimension];
                     }
                     float score = dot * (float) (1.0 / Math.sqrt(HEAD_DIM));
                     scores.add(score);
@@ -258,11 +266,9 @@ class QwenAttentionCudaIntegrationTest {
                 for (int dimension = 0; dimension < HEAD_DIM; dimension++) {
                     float value = 0.0f;
                     for (int keyPosition = 0; keyPosition < scores.size(); keyPosition++) {
-                        int valueOffset = keyPosition * GATE_VALUE_WIDTH + QUERY_WIDTH + keyHead * HEAD_DIM;
                         value += scores.get(keyPosition)
                                 / denominator
-                                * CudaGpuOperationsIntegrationTest.bf16ToFloat(
-                                        cachedGateValue[valueOffset + dimension]);
+                                * values[keyPosition * KEY_VALUE_HEADS + keyHead][dimension];
                     }
                     int gateOffset = row * GATE_VALUE_WIDTH + head * HEAD_DIM + dimension;
                     float gate = CudaGpuOperationsIntegrationTest.bf16ToFloat(queryGateValue[gateOffset]);

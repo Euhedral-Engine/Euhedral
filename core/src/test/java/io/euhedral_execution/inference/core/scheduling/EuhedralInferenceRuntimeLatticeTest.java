@@ -796,7 +796,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 double ropeTheta) {}
 
         @Override
-        public void attentionKvAppendBf16(
+        public void attentionKvAppendNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,
                 long keyCacheAddress,
@@ -809,7 +809,7 @@ class EuhedralInferenceRuntimeLatticeTest {
         }
 
         @Override
-        public void attentionCausalBf16(
+        public void attentionCausalNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,
                 long keyCacheAddress,
@@ -820,7 +820,8 @@ class EuhedralInferenceRuntimeLatticeTest {
                 int keyValueHeads,
                 int headDim,
                 int cacheLength,
-                long startPosition) {}
+                long startPosition,
+                long scratchAddress) {}
 
         @Override
         public void synchronize() {}

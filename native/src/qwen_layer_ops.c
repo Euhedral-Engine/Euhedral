@@ -55,6 +55,7 @@ static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
+static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_decode_tc_nvfp4, attention_merge_nvfp4;
 static CUfunction attention_norm_cache;
 static CUfunction attention_value_cache;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
@@ -125,6 +126,12 @@ static void initialize(void) {
             &attention_module,
             &attention_qk_norm_rope);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
+    status = get_function(attention_module, &attention_append_nvfp4, "euhedral_attention_kv_append_nvfp4");
+    if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_prefill_nvfp4, "euhedral_attention_prefill32_nvfp4");
+    if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_decode_nvfp4, "euhedral_attention_decode_nvfp4");
+    if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_decode_tc_nvfp4, "euhedral_attention_decode_tc_nvfp4");
+    if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_merge_nvfp4, "euhedral_attention_merge_nvfp4");
+    if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     get_function(attention_module, &attention_norm_cache, "euhedral_attention_qk_norm_cache_bf16");
     status = get_function(attention_module, &attention_kv_append, "euhedral_attention_kv_append_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
@@ -690,6 +697,89 @@ int euhedral_cuda_attention_producers_bf16(
     return status;
 }
 
+int euhedral_cuda_attention_producers_nvfp4(
+        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
+        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
+        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
+        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes) {
+    if (!input || !q4 || !q5 || !query_norm || !key_norm || !query_key || !gate || !keys || !values
+            || rows < 64 || hidden == 0 || hidden % 64 != 0 || !query_heads || !key_heads
+            || query_heads % key_heads != 0 || head_dim != 256 || !rotary_dim || rotary_dim > head_dim
+            || (rotary_dim & 1u) || !isfinite(epsilon) || epsilon <= 0 || !isfinite(theta) || theta <= 0
+            || start > UINT64_MAX - rows) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint64_t heads = (uint64_t)query_heads + key_heads;
+    uint64_t projected = heads * head_dim;
+    uint64_t grid = ((uint64_t)rows + 63u) / 64u * (projected / 32u);
+    uint64_t norm_grid = (uint64_t)rows * heads;
+    if (projected > UINT32_MAX || grid > UINT32_MAX || norm_grid > UINT32_MAX
+            || start + rows > UINT64_MAX / ((uint64_t)key_heads * head_dim * 2u))
+        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    uint32_t width = (uint32_t)projected, query_width = query_heads * head_dim;
+    uint64_t expected4, expected5;
+    int status = quantized_byte_size(hidden, width, 4, &expected4);
+    if (status != 0) return status;
+    status = quantized_byte_size(hidden, width, 5, &expected5);
+    if (status != 0) return status;
+    if (q4_bytes != expected4 || q5_bytes != expected5) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    status = euhedral_cuda_bind_thread_context();
+    if (status != 0) return status;
+    status = ensure_initialized();
+    if (status != 0) return status;
+    if (q45_status != 0 || !q45_prefill64[0] || !attention_qk_norm_rope || !q45_prefill64[1] || !attention_append_nvfp4)
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    CUstream stream = euhedral_cuda_submission_stream();
+    void* q4_args[] = {&input, &q4, &query_key, &rows, &hidden, &width};
+    void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
+            &head_dim, &rotary_dim, &start, &epsilon, &theta};
+    void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width};
+    uint32_t key_width = key_heads * head_dim;
+    void* append_args[] = {&query_key, &gate, &keys, &values, &rows, &query_width, &key_width, &start};
+    status = (int)cuLaunchKernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    if (status == 0) status = (int)cuLaunchKernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
+            head_dim, 1, 1, 0, stream, norm_args, NULL);
+    if (status == 0) status = (int)cuLaunchKernel(q45_prefill64[1], (uint32_t)grid, 1, 1,
+            128, 1, 1, 0, stream, q5_args, NULL);
+    if (status == 0) status = (int)cuLaunchKernel(attention_append_nvfp4,
+            (uint32_t)(((uint64_t)rows * key_heads + 3) / 4), 1, 1, 128, 1, 1, 0, stream, append_args, NULL);
+    // One owner and one completion edge cover both physical cache producers.
+    // Failed partial submission must drain before borrowed cache/workspace can retire.
+    if (status != 0 || stream == NULL) {
+        int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);
+        if (status == 0) status = drained;
+    }
+    return status;
+}
+
+int euhedral_cuda_attention_kv_append_nvfp4(
+        const void* device_query_key,
+        const void* device_gate_value,
+        void* device_key_cache,
+        void* device_value_cache,
+        uint32_t rows,
+        uint32_t query_width,
+        uint32_t key_value_width,
+        uint64_t start_position) {
+    if (device_query_key == NULL || device_gate_value == NULL || device_key_cache == NULL || device_value_cache == NULL
+            || rows == 0 || query_width == 0 || key_value_width == 0 || query_width % key_value_width != 0
+            || key_value_width % 256 != 0 || query_width % 256 != 0
+            || start_position > UINT32_MAX - (uint64_t)rows)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    const uint64_t count = (uint64_t)rows * key_value_width;
+    if (count > UINT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    CUdeviceptr query_key = (CUdeviceptr)(uintptr_t)device_query_key;
+    CUdeviceptr gate_value = (CUdeviceptr)(uintptr_t)device_gate_value;
+    CUdeviceptr key_cache = (CUdeviceptr)(uintptr_t)device_key_cache;
+    CUdeviceptr value_cache = (CUdeviceptr)(uintptr_t)device_value_cache;
+    uint32_t rows_arg = rows, query_width_arg = query_width, key_value_width_arg = key_value_width;
+    void* parameters[] = {&query_key, &gate_value, &key_cache, &value_cache,
+            &rows_arg, &query_width_arg, &key_value_width_arg, &start_position};
+    return launch_and_synchronize(attention_append_nvfp4, (uint32_t)((count / 256 + 3) / 4), 128, parameters);
+}
+
 int euhedral_cuda_attention_qk_norm_rope_bf16(
         const void* device_query_key,
         const void* device_query_norm,
@@ -754,6 +844,51 @@ int euhedral_cuda_attention_kv_append_bf16(
     void* parameters[] = {&query_key, &gate_value, &key_cache, &value_cache,
             &rows_arg, &query_width_arg, &key_value_width_arg, &start_position};
     return launch_and_synchronize(attention_kv_append, (uint32_t)((count + 255) / 256), 256, parameters);
+}
+
+int euhedral_cuda_attention_causal_nvfp4(
+        const void* query_key, const void* gate, const void* keys, const void* values, void* output,
+        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
+        uint32_t cache_length, uint64_t start, void* scratch) {
+    if (!query_key || !gate || !keys || !values || !output || !rows || !query_heads || !key_heads
+            || query_heads % key_heads != 0 || head_dim != 256 || !cache_length
+            || start > cache_length || rows > cache_length - start || (rows == 1 && !scratch))
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint64_t grid = ((uint64_t)rows + 31) / 32 * query_heads;
+    if (grid > UINT32_MAX || (uint64_t)query_heads * 64 > UINT32_MAX)
+        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != 0) return status;
+    status = ensure_initialized();
+    if (status != 0) return status;
+    if (rows > 1) {
+        void* args[] = {&query_key, &gate, &keys, &values, &output, &rows, &query_heads,
+                &key_heads, &head_dim, &cache_length, &start};
+        return launch_and_synchronize(attention_prefill_nvfp4, (uint32_t)grid, 128, args);
+    }
+    // Decode must only attend the prefix ending at its query, even when a caller
+    // supplies a longer physical cache. Scratch reserves 64 * heads * 258 floats.
+    uint32_t length = (uint32_t)start + 1;
+    uint32_t splits = (uint32_t)(((uint64_t)length + 255) / 256);
+    if (splits > 64) splits = 64;
+    CUstream stream = euhedral_cuda_submission_stream();
+    void* args[] = {&query_key, &gate, &keys, &values, &output, &rows, &query_heads,
+            &key_heads, &head_dim, &length, &start, &scratch, &splits};
+    void* merge[] = {&gate, &output, &scratch, &query_heads, &key_heads, &splits};
+    // The measured Qwen GQA-6 route amortizes one K/V expansion across six queries.
+    // Warp decode remains lower-latency for short contexts and other head geometries.
+    int tensor_decode = query_heads / key_heads == 6 && length >= 1024;
+    CUfunction decode = tensor_decode ? attention_decode_tc_nvfp4 : attention_decode_nvfp4;
+    uint32_t decode_grid = (tensor_decode ? key_heads : query_heads) * splits;
+    status = (int)cuLaunchKernel(decode, decode_grid, 1, 1,
+            128, 1, 1, 0, stream, args, NULL);
+    if (status == 0) status = (int)cuLaunchKernel(attention_merge_nvfp4, query_heads, 1, 1,
+            128, 1, 1, 0, stream, merge, NULL);
+    if (status != 0 || stream == NULL) {
+        int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);
+        if (status == 0) status = drained;
+    }
+    return status;
 }
 
 int euhedral_cuda_attention_causal_bf16(

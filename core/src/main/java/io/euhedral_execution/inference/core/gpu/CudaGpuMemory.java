@@ -80,14 +80,14 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle q3GateUpSwiGluBf16;
     private final MethodHandle q3FfnDownBf16;
     private final MethodHandle q3FfnStreamedBf16;
-    private final MethodHandle attentionProducersBf16;
+    private final MethodHandle attentionProducersNvfp4;
     private final MethodHandle gdnProjectControlFp32;
     private final MethodHandle gdnProjectionsBf16;
     private final MethodHandle swiGluBf16;
     private final MethodHandle zeroDeviceMemory;
     private final MethodHandle attentionQkNormRopeBf16;
-    private final MethodHandle attentionKvAppendBf16;
-    private final MethodHandle attentionCausalBf16;
+    private final MethodHandle attentionKvAppendNvfp4;
+    private final MethodHandle attentionCausalNvfp4;
     private volatile boolean closed;
 
     public CudaGpuMemory(Path libraryPath) {
@@ -223,7 +223,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.gdnRecurrenceBf16 = bind(linker, symbols, "euhedral_cuda_gdn_recurrence_bf16", GDN_RECURRENCE_BF16);
             this.gdnGatedRmsNormBf16 =
                     bind(linker, symbols, "euhedral_cuda_gdn_gated_rms_norm_bf16", GDN_GATED_RMS_NORM_BF16);
-            this.attentionProducersBf16 = symbols.find("euhedral_cuda_attention_producers_bf16")
+            this.attentionProducersNvfp4 = symbols.find("euhedral_cuda_attention_producers_nvfp4")
                     .map(symbol -> linker.downcallHandle(
                             symbol,
                             FunctionDescriptor.of(
@@ -324,10 +324,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
             this.attentionQkNormRopeBf16 =
                     bind(linker, symbols, "euhedral_cuda_attention_qk_norm_rope_bf16", ATTENTION_QK_NORM_ROPE_BF16);
-            this.attentionKvAppendBf16 =
-                    bind(linker, symbols, "euhedral_cuda_attention_kv_append_bf16", ATTENTION_KV_APPEND_BF16);
-            this.attentionCausalBf16 =
-                    bind(linker, symbols, "euhedral_cuda_attention_causal_bf16", ATTENTION_CAUSAL_BF16);
+            this.attentionKvAppendNvfp4 =
+                    bind(linker, symbols, "euhedral_cuda_attention_kv_append_nvfp4", ATTENTION_KV_APPEND_NVFP4);
+            this.attentionCausalNvfp4 =
+                    bind(linker, symbols, "euhedral_cuda_attention_causal_nvfp4", ATTENTION_CAUSAL_NVFP4);
             this.stream = asynchronous ? (long) this.streamCreate.invokeExact() : 0L;
             if (asynchronous && this.stream == 0L) throw new GpuMemoryException("CUDA stream creation failed");
         } catch (RuntimeException exception) {
@@ -1089,7 +1089,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     @Override
-    public void attentionProducersBf16(
+    public void attentionProducersNvfp4(
             long input,
             long q4,
             long q5,
@@ -1121,11 +1121,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 || start < 0
                 || q4Bytes <= 0
                 || q5Bytes <= 0) throw new IllegalArgumentException("invalid attention producer geometry");
-        if (attentionProducersBf16 == null)
+        if (attentionProducersNvfp4 == null)
             throw new UnsupportedOperationException("native attention producers unavailable");
         invokeLayer(
                 "attention producer region",
-                attentionProducersBf16,
+                attentionProducersNvfp4,
                 MemorySegment.ofAddress(input),
                 MemorySegment.ofAddress(q4),
                 MemorySegment.ofAddress(q5),
@@ -1415,7 +1415,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     @Override
-    public void attentionKvAppendBf16(
+    public void attentionKvAppendNvfp4(
             long queryKeyAddress,
             long gateValueAddress,
             long keyCacheAddress,
@@ -1436,7 +1436,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         Math.addExact(startPosition, rows);
         invokeLayer(
                 "Qwen attention KV append",
-                attentionKvAppendBf16,
+                attentionKvAppendNvfp4,
                 MemorySegment.ofAddress(queryKeyAddress),
                 MemorySegment.ofAddress(gateValueAddress),
                 MemorySegment.ofAddress(keyCacheAddress),
@@ -1448,7 +1448,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     @Override
-    public void attentionCausalBf16(
+    public void attentionCausalNvfp4(
             long queryKeyAddress,
             long gateValueAddress,
             long keyCacheAddress,
@@ -1459,7 +1459,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int keyValueHeads,
             int headDim,
             int cacheLength,
-            long startPosition) {
+            long startPosition,
+            long scratchAddress) {
         ensureOpen();
         requireAddresses(queryKeyAddress, gateValueAddress, keyCacheAddress, valueCacheAddress, outputAddress);
         if (rows <= 0
@@ -1472,9 +1473,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 || Math.addExact(startPosition, rows) > cacheLength) {
             throw new IllegalArgumentException("causal attention dimensions are invalid");
         }
+        if (rows == 1) requireAddresses(scratchAddress);
         invokeLayer(
                 "Qwen causal attention",
-                attentionCausalBf16,
+                attentionCausalNvfp4,
                 MemorySegment.ofAddress(queryKeyAddress),
                 MemorySegment.ofAddress(gateValueAddress),
                 MemorySegment.ofAddress(keyCacheAddress),
@@ -1485,7 +1487,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 keyValueHeads,
                 headDim,
                 cacheLength,
-                startPosition);
+                startPosition,
+                MemorySegment.ofAddress(scratchAddress));
     }
 
     @Override

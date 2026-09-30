@@ -102,7 +102,7 @@ class QwenAttentionProducerTransactionTest {
         }
 
         @Override
-        public void attentionProducersBf16(
+        public void attentionProducersNvfp4(
                 long input,
                 long q4,
                 long q5,

@@ -189,7 +189,7 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
         QwenConfig config = context.plan().weights().config();
         AttentionKvState state = attentionState(context, instruction);
         state.prepareAppend(context.startPosition(), context.inputTokenCount());
-        gpu().attentionProducersBf16(
+        gpu().attentionProducersNvfp4(
                         input(context, instruction, 0),
                         instruction.weightAddress(0),
                         instruction.weightAddress(1),
@@ -220,7 +220,7 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
         int keyValueWidth = config.numKeyValueHeads() * config.attentionHeadDim();
         AttentionKvState state = attentionState(context, instruction);
         state.prepareAppend(context.startPosition(), context.inputTokenCount());
-        gpu().attentionKvAppendBf16(
+        gpu().attentionKvAppendNvfp4(
                         input(context, instruction, 0),
                         input(context, instruction, 1),
                         state.keyCacheAddress(),
@@ -254,7 +254,7 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
     private void runAttentionCausal(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         QwenConfig config = context.plan().weights().config();
         AttentionKvState state = attentionState(context, instruction);
-        gpu().attentionCausalBf16(
+        gpu().attentionCausalNvfp4(
                         input(context, instruction, 0),
                         input(context, instruction, 1),
                         state.keyCacheAddress(),
@@ -265,7 +265,8 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                         config.numKeyValueHeads(),
                         config.attentionHeadDim(),
                         state.length(),
-                        context.startPosition());
+                        context.startPosition(),
+                        context.inputTokenCount() == 1 ? state.decodeScratchAddress(config.numAttentionHeads()) : 0);
     }
 
     private void runResidualAdd(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
