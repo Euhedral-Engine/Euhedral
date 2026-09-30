@@ -6,6 +6,7 @@ import io.euhedral_execution.core.impl.FrameManager;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.scheduling.frames.EmbeddingFrame;
 import io.euhedral_execution.inference.core.scheduling.frames.LinearFrame;
+import io.euhedral_execution.inference.core.scheduling.frames.QwenChainFrame;
 import io.euhedral_execution.inference.core.scheduling.frames.QwenGpuOperationFrame;
 import io.euhedral_execution.inference.core.scheduling.frames.QwenInstructionFrame;
 import io.euhedral_execution.inference.core.scheduling.frames.RmsNormFrame;
@@ -29,6 +30,7 @@ public final class QwenWorkGenerator {
     private final Map<Integer, FrameManager<QwenExecutionContext, RmsNormFrame>> rmsNormFrames;
     private final Map<Integer, FrameManager<QwenExecutionContext, LinearFrame>> linearFrames;
     private final Map<Integer, FrameManager<QwenExecutionContext, QwenGpuOperationFrame>> operationFrames;
+    private final FrameManager<QwenExecutionContext, QwenChainFrame> chainFrames;
     // These fields are owned exclusively by the serialized source pull/request path.
     private int nextInstructionId;
     private int pendingInstructionId = -1;
@@ -79,6 +81,26 @@ public final class QwenWorkGenerator {
         this.rmsNormFrames = Map.copyOf(rmsManagers);
         this.linearFrames = Map.copyOf(linearManagers);
         this.operationFrames = Map.copyOf(operationManagers);
+        this.chainFrames = gpu.asynchronous() ? chainManager(plan.instructions().getFirst()) : null;
+    }
+
+    private FrameManager<QwenExecutionContext, QwenChainFrame> chainManager(QwenExecutionPlan.Instruction first) {
+        var manager = new FrameManager<QwenExecutionContext, QwenChainFrame>(FRAME_POOL_CAPACITY, FRAME_POOL_PASSWORD);
+        manager.setFactory(new FrameFactory<>(
+                (idHash, context) -> new QwenChainFrame(idHash, manager, context, first, this.gpu, this),
+                (context, frame) -> frame.replace(context)));
+        return manager;
+    }
+
+    /// Builds an unpooled frame that a chain frame drives; it is never published to Euhedral.
+    public QwenInstructionFrame newPerformer(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
+        return switch (instruction.kind()) {
+            case EMBEDDING -> new EmbeddingFrame(0L, null, context, instruction, this.gpu, this);
+            case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNormFrame(0L, null, context, instruction, this.gpu, this);
+            case Q3_LINEAR, Q3_FFN_DOWN, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR ->
+                new LinearFrame(0L, null, context, instruction, this.gpu, this);
+            default -> new QwenGpuOperationFrame(0L, null, context, instruction, this.gpu, this);
+        };
     }
 
     private FrameManager<QwenExecutionContext, EmbeddingFrame> embeddingManager(
@@ -117,12 +139,15 @@ public final class QwenWorkGenerator {
     }
 
     void start(QwenExecutionContext context) {
+        if (this.chainFrames != null && context.kind() == QwenExecutionContext.ExecutionKind.DECODE) {
+            context.markChained();
+        }
         enqueueReady(context, this.plan.instructions().getFirst().id());
     }
 
     public void completed(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction, Throwable error) {
         if (error != null) context.fail(error);
-        if (!context.hasFailureOrCancellation()) {
+        if (!context.chained() && !context.hasFailureOrCancellation()) {
             try {
                 for (int successorId : this.plan.successors(instruction.id())) {
                     if (context.dependencyCompleted(successorId)) {
@@ -219,6 +244,7 @@ public final class QwenWorkGenerator {
     }
 
     private QwenInstructionFrame create(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
+        if (context.chained()) return this.chainFrames.getOrCreate(context, FRAME_POOL_PASSWORD);
         return switch (instruction.kind()) {
             case EMBEDDING -> this.embeddingFrames.getOrCreate(context, FRAME_POOL_PASSWORD);
             case RMS_NORM, RMS_NORM_UNIT_OFFSET ->

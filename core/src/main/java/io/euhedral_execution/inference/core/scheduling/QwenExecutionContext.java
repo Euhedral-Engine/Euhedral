@@ -51,6 +51,7 @@ public final class QwenExecutionContext {
     private QwenExecutionWorkspace workspace;
     private QwenDeviceLogits logitsOutput;
     private long temporaryTokenIdsAddress;
+    private volatile boolean chained;
 
     public QwenExecutionContext(
             QwenExecutionPlan plan,
@@ -155,6 +156,19 @@ public final class QwenExecutionContext {
     /// Returns the first operation failure, if one has been recorded.
     public Throwable failure() {
         return this.failure.get();
+    }
+
+    public ExecutionKind kind() {
+        return this.kind;
+    }
+
+    /// A chained quantum launches every instruction from one frame, in plan order, on one stream.
+    public boolean chained() {
+        return this.chained;
+    }
+
+    void markChained() {
+        this.chained = true;
     }
 
     boolean dependencyCompleted(int instructionId) {
