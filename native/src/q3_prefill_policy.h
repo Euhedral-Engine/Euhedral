@@ -35,6 +35,7 @@ enum euhedral_q3_prefill_kernel {
     EUHEDRAL_Q3_PREFILL64,
     EUHEDRAL_Q3_PREFILL64_WMMA,
     EUHEDRAL_Q3_PREFILL64_K32_CB,
+    EUHEDRAL_Q3_PREFILL32_S104,
 };
 static inline enum euhedral_q3_prefill_kernel euhedral_q3_select_prefill(int mode, uint32_t rows,
         uint32_t in_features, uint32_t out_features, int has_prefill64, int has_prefill64_wmma) {
@@ -50,7 +51,7 @@ static inline int euhedral_q3_use_k32_compact_b_prefill(int mode, uint32_t rows,
         uint32_t in_features, uint32_t out_features) {
     if (mode != 2) return 0;
     if (in_features == 6144 && out_features == 5120)
-        return rows == 256 || rows == 1024;
+        return rows == 256 || rows == 512 || rows == 1024;
     if ((in_features == 5120 && out_features == 34816)
             || (in_features == 17408 && out_features == 5120))
         return rows == 64 || rows == 256 || rows == 1024;
@@ -67,12 +68,33 @@ static inline enum euhedral_q3_prefill_kernel euhedral_q3_select_prefill_with_k3
             has_prefill64, has_prefill64_wmma);
 }
 
+// The 104-element-stride 32-row kernel wins on the GDN output mixer only where the grid has one or
+// three 32-row tiles; everywhere else the 88-element kernel is at least as fast.
+static inline int euhedral_q3_use_s104_prefill(int mode, uint32_t rows,
+        uint32_t in_features, uint32_t out_features) {
+    return mode == 2 && in_features == 6144 && out_features == 5120
+            && (rows <= 32 || (rows >= 65 && rows <= 96));
+}
+
 #define EUHEDRAL_Q3_HAS_CB_ALIGNMENT_POLICY 1
 static inline enum euhedral_q3_prefill_kernel euhedral_q3_select_prefill_for_input(
         int mode, uint32_t rows, uint32_t in_features, uint32_t out_features,
         int has_prefill64_k32_cb, int input_aligned_16, int has_prefill64, int has_prefill64_wmma) {
     return euhedral_q3_select_prefill_with_k32_compact_b(mode, rows, in_features, out_features,
             has_prefill64_k32_cb && input_aligned_16, has_prefill64, has_prefill64_wmma);
+}
+
+static inline enum euhedral_q3_prefill_kernel euhedral_q3_select_prefill_s104(
+        int mode, uint32_t rows, uint32_t in_features, uint32_t out_features,
+        int has_prefill64_k32_cb, int input_aligned_16, int has_prefill64, int has_prefill64_wmma,
+        int has_s104) {
+    enum euhedral_q3_prefill_kernel selected = euhedral_q3_select_prefill_for_input(mode, rows,
+            in_features, out_features, has_prefill64_k32_cb, input_aligned_16, has_prefill64,
+            has_prefill64_wmma);
+    if (selected == EUHEDRAL_Q3_PREFILL32 && has_s104
+            && euhedral_q3_use_s104_prefill(mode, rows, in_features, out_features))
+        return EUHEDRAL_Q3_PREFILL32_S104;
+    return selected;
 }
 
 #define EUHEDRAL_Q3_HAS_K32_PREFILL_TILE_POLICY 1

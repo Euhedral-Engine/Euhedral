@@ -46,7 +46,7 @@ template<int COLS, int WARPS, int STRIDE = kGroup>
 static __device__ __forceinline__ void stage_weight_tile(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const Layout& w, unsigned int out_start,
         unsigned int out_features, unsigned int k_base, unsigned int warp, unsigned int lane) {
-    static_assert(STRIDE >= kGroup && STRIDE % 16 == 0, "WMMA B stride must cover the K group");
+    static_assert(STRIDE >= kGroup && STRIDE % 8 == 0, "WMMA B stride must cover the K group");
     for (unsigned int col = warp; col < COLS; col += WARPS) {
         unsigned int codes = 0;
         float scale = 0.0f;

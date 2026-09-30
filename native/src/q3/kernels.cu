@@ -35,14 +35,32 @@ EUHEDRAL_Q3_DECODE_KERNEL(2)
 EUHEDRAL_Q3_DECODE_KERNEL(4)
 #undef EUHEDRAL_Q3_DECODE_KERNEL
 
-// 32 token rows x 32 outputs; general Q3 prefill route.
+// 32 token rows x 32 outputs; general Q3 prefill route. Shared strides of 88 elements (176 bytes)
+// keep the 16-byte ldmatrix rows conflict-free; residency drops from 6 to 5 CTA/SM.
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features,
         unsigned long long scale_offset) {
     using Tile = q3::Prefill32;
-    constexpr int A_STRIDE = 80;
-    constexpr int B_STRIDE = Tile::kRows == 32 ? 80 : 64;
+    constexpr int A_STRIDE = 88;
+    constexpr int B_STRIDE = 88;
+    __shared__ q3::PrefillShared<Tile, A_STRIDE> staging;
+    __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE];
+    __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];
+    q3::tiled_prefill<Tile, A_STRIDE, B_STRIDE, q3::Q3_PREFILL_LEAF<Tile>>(input, weights, output, rows, in_features, out_features, scale_offset,
+            staging, b_hi, b_lo);
+}
+
+// Same 32-row kernel with 104-element strides. It removes the same conflicts but lowers residency to
+// 4 CTA/SM, which pays only where the grid is one or three row tiles (measured on the GDN output
+// mixer). Optional symbol: host dispatch selects it for that shape only and otherwise uses the 88 kernel.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_s104(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features,
+        unsigned long long scale_offset) {
+    using Tile = q3::Prefill32;
+    constexpr int A_STRIDE = 104;
+    constexpr int B_STRIDE = 104;
     __shared__ q3::PrefillShared<Tile, A_STRIDE> staging;
     __shared__ __align__(32) __nv_bfloat16 b_hi[Tile::kCols * B_STRIDE];
     __shared__ __align__(32) __nv_bfloat16 b_lo[Tile::kCols * B_STRIDE];

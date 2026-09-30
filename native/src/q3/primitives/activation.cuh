@@ -11,7 +11,7 @@ template<int ROWS, int K_TILE, int THREADS, int STRIDE = K_TILE>
 static __device__ __forceinline__ void stage_activation_tile(
         __nv_bfloat16* tile, const unsigned short* input, unsigned int rows, unsigned int in_features,
         unsigned int row_start, unsigned int k_base, unsigned int thread) {
-    static_assert(STRIDE >= K_TILE && STRIDE % 16 == 0, "WMMA A stride must cover the K tile");
+    static_assert(STRIDE >= K_TILE && STRIDE % 8 == 0, "WMMA A stride must cover the K tile");
     for (unsigned int i = thread; i < ROWS * K_TILE; i += THREADS) {
         unsigned int r = row_start + i / K_TILE, k = k_base + i % K_TILE;
         tile[(i / K_TILE) * STRIDE + i % K_TILE] = __float2bfloat16(r < rows && k < in_features

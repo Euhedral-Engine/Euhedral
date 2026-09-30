@@ -5,10 +5,24 @@ namespace k32_probe {
 using Tile = q3::Prefill64;
 using Leaf = q3::MmaSyncLeaf<Tile>;
 
+// Physical shared geometry. A rows are padded from 32 to 40 elements (80 bytes), which
+// spreads the 16-byte ldmatrix rows over all banks. B columns keep 32 elements but the four
+// 16-byte chunks of each column are XOR-rotated by the column pair index, so the eight
+// column rows of one ldmatrix phase land on distinct bank groups. Logical K order is unchanged.
+constexpr unsigned int kAStride = 40;
+static __device__ __forceinline__ unsigned int b_index(unsigned int col, unsigned int k) {
+    return col * 32u + (((((k >> 3) ^ (col >> 1)) & 3u) << 3) | (k & 7u));
+}
+// The FFN stream kernels keep their own dense B columns and pass SWIZZLE = false.
+template<bool SWIZZLE>
+static __device__ __forceinline__ unsigned int b_position(unsigned int col, unsigned int k) {
+    return SWIZZLE ? b_index(col, k) : col * 32u + k;
+}
+
 // The stage (including mbarriers) and result have disjoint CTA lifetimes.
 union alignas(32) Shared {
     struct Stage {
-        __nv_bfloat16 a[2][2][32 * 32];       // [slot][M branch][local row, K]
+        __nv_bfloat16 a[2][2][32 * 40];       // [slot][M branch][local row, K], padded rows
         __nv_bfloat16 b[2][2][2][16 * 32];    // [slot][N branch][hi/lo][column, K]
         alignas(8) unsigned long long ready[4][2];
         alignas(8) unsigned long long release[4][2];
@@ -22,8 +36,8 @@ union alignas(32) Shared {
     __device__ Shared(ActivateStage) : stage() {}
     __device__ Shared(ActivateResult) : result() {}
 };
-static_assert(sizeof(Shared::Stage) == 16512, "K32 stage budget changed");
-static_assert(sizeof(Shared) == 16512, "K32 shared overlay changed");
+static_assert(sizeof(Shared::Stage) == 18560, "K32 stage budget changed");
+static_assert(sizeof(Shared) == 18560, "K32 shared overlay changed");
 static_assert(__is_trivial(Shared::Stage), "stage must have trivial storage");
 static_assert(__is_trivial(Shared::Result), "result must have trivial storage");
 
@@ -80,7 +94,7 @@ static __device__ __forceinline__ void produce_a(
             hi = (hi & 32767u) > 32640u ? 32767u : hi;
             fields[j] = lo | (hi << 16);
         }
-        unsigned int dst = static_cast<unsigned int>(__cvta_generic_to_shared(a + local_row * 32 + local_k));
+        unsigned int dst = static_cast<unsigned int>(__cvta_generic_to_shared(a + local_row * kAStride + local_k));
         asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::
                 "r"(dst), "r"(fields[0]), "r"(fields[1]), "r"(fields[2]), "r"(fields[3]) : "memory");
     }
@@ -88,6 +102,7 @@ static __device__ __forceinline__ void produce_a(
 
 // Each N16 branch is decoded by its own producer warp. K32 uses three packed
 // words and one scale per column; the two K16 halves share this acquisition.
+template<bool SWIZZLE>
 static __device__ __forceinline__ void produce_b(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const q3::Layout& w,
         unsigned int outputs, unsigned int first_col, unsigned int base,
@@ -112,7 +127,7 @@ static __device__ __forceinline__ void produce_b(
             unsigned int second = __shfl_sync(0xffffffffu, word, (bit >> 5) + 1, 8);
             unsigned int codes = static_cast<unsigned int>(
                     ((static_cast<unsigned long long>(second) << 32) | first) >> (bit & 31u)) & 63u;
-            q3::stage_split_pair(hi, lo, col * 32u + half * 16u + sublane * 2u, codes, scale);
+            q3::stage_split_pair(hi, lo, b_position<SWIZZLE>(col, half * 16u + sublane * 2u), codes, scale);
         }
     }
 }
@@ -142,6 +157,7 @@ static __device__ __forceinline__ void prefetch_compact_b(
     }
 }
 
+template<bool SWIZZLE>
 static __device__ __forceinline__ void stage_compact_b(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const CompactB& next,
         unsigned int lane) {
@@ -158,7 +174,7 @@ static __device__ __forceinline__ void stage_compact_b(
             unsigned int second = __shfl_sync(0xffffffffu, next.words[j], (bit >> 5) + 1, 8);
             unsigned int codes = static_cast<unsigned int>(
                     ((static_cast<unsigned long long>(second) << 32) | first) >> (bit & 31u)) & 63u;
-            q3::stage_split_pair(hi, lo, col * 32u + half * 16u + sublane * 2u, codes, scale);
+            q3::stage_split_pair(hi, lo, b_position<SWIZZLE>(col, half * 16u + sublane * 2u), codes, scale);
         }
     }
 }
@@ -194,7 +210,7 @@ static __device__ __forceinline__ void run(
     if (generations) {
         if (owns_a) produce_a(stage.a[0][m_branch], input, rows, width,
                 first_row, m_branch, 0, lane);
-        else produce_b(stage.b[0][n_branch][0], stage.b[0][n_branch][1],
+        else produce_b<true>(stage.b[0][n_branch][0], stage.b[0][n_branch][1],
                 weights_layout, outputs, first_col + n_branch * 16u, 0, lane);
         arrive(&stage.ready[owned_branch][0]);
     }
@@ -207,7 +223,7 @@ static __device__ __forceinline__ void run(
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
             if (owns_a) produce_a(stage.a[next & 1u][m_branch], input, rows, width,
                     first_row, m_branch, next * 32u, lane);
-            else produce_b(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
+            else produce_b<true>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
                     weights_layout, outputs, first_col + n_branch * 16u, next * 32u, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -224,10 +240,10 @@ static __device__ __forceinline__ void run(
             unsigned int af[2][4], bf[2][4];
             #pragma unroll
             for (unsigned int m = 0; m < 2; ++m)
-                q3::ldmatrix_x4(af[m], a + (m * 16u + (lane & 15u)) * 32u
+                q3::ldmatrix_x4(af[m], a + (m * 16u + (lane & 15u)) * kAStride
                         + half * 16u + (lane >> 4) * 8u);
             unsigned int col = (lane & 7u) + ((lane >> 4) << 3);
-            unsigned int index = col * 32u + half * 16u + ((lane >> 3) & 1u) * 8u;
+            unsigned int index = b_index(col, half * 16u + ((lane >> 3) & 1u) * 8u);
             q3::ldmatrix_x4(bf[0], hi + index);
             q3::ldmatrix_x4(bf[1], lo + index);
             if (half == 1u) {
@@ -247,7 +263,7 @@ static __device__ __forceinline__ void run(
             const unsigned int next = gen + 1u;
             if (next >= 2u)
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
-            stage_compact_b(stage.b[next & 1u][n_branch][0],
+            stage_compact_b<true>(stage.b[next & 1u][n_branch][0],
                     stage.b[next & 1u][n_branch][1], compact_next, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -257,7 +273,7 @@ static __device__ __forceinline__ void run(
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
             if (owns_a) produce_a(stage.a[next & 1u][m_branch], input, rows, width,
                     first_row, m_branch, next * 32u, lane);
-            else produce_b(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
+            else produce_b<true>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
                     weights_layout, outputs, first_col + n_branch * 16u, next * 32u, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }

@@ -2,8 +2,8 @@
 #include "qwen_ffn_streamed.cu"
 
 // Region B: pair the independent N16 branches as gate/up columns and apply SwiGLU in the
-// epilogue. Frozen CB helpers and the K32/A/compact-B/MMA schedule are reused unchanged; the
-// schedule is duplicated here so the qualified CB source stays byte-identical. The template
+// epilogue. CB helpers and the K32/A/compact-B/MMA schedule are reused; the schedule is duplicated
+// here, so the A/B index math in `paired_gate_up` must stay in sync with k32_prefill.cuh. The template
 // flags mirror the CB leaf signature; only <false,false,false,true> is instantiated, and folding
 // them changes generated SASS, so they stay until the kernel is requalified.
 namespace qwen_ffn {
@@ -39,7 +39,7 @@ static __device__ __forceinline__ void paired_gate_up(
     if (generations) {
         if (owns_a) produce_a(stage.a[0][m_branch], input, rows, width,
                 first_row, m_branch, 0, lane);
-        else produce_b(stage.b[0][n_branch][0], stage.b[0][n_branch][1],
+        else produce_b<true>(stage.b[0][n_branch][0], stage.b[0][n_branch][1],
                 weights_layout, outputs, first_col + n_branch * (outputs / 2u), 0, lane);
         arrive(&stage.ready[owned_branch][0]);
     }
@@ -52,7 +52,7 @@ static __device__ __forceinline__ void paired_gate_up(
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
             if (owns_a) produce_a(stage.a[next & 1u][m_branch], input, rows, width,
                     first_row, m_branch, next * 32u, lane);
-            else produce_b(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
+            else produce_b<true>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
                     weights_layout, outputs, first_col + n_branch * (outputs / 2u), next * 32u, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -69,10 +69,10 @@ static __device__ __forceinline__ void paired_gate_up(
             unsigned int af[2][4], bf[2][4];
             #pragma unroll
             for (unsigned int m = 0; m < 2; ++m)
-                q3::ldmatrix_x4(af[m], a + (m * 16u + (lane & 15u)) * 32u
+                q3::ldmatrix_x4(af[m], a + (m * 16u + (lane & 15u)) * kAStride
                         + half * 16u + (lane >> 4) * 8u);
             unsigned int col = (lane & 7u) + ((lane >> 4) << 3);
-            unsigned int index = col * 32u + half * 16u + ((lane >> 3) & 1u) * 8u;
+            unsigned int index = b_index(col, half * 16u + ((lane >> 3) & 1u) * 8u);
             q3::ldmatrix_x4(bf[0], hi + index);
             q3::ldmatrix_x4(bf[1], lo + index);
             if (half == 1u) {
@@ -92,7 +92,7 @@ static __device__ __forceinline__ void paired_gate_up(
             const unsigned int next = gen + 1u;
             if (next >= 2u)
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
-            stage_compact_b(stage.b[next & 1u][n_branch][0],
+            stage_compact_b<true>(stage.b[next & 1u][n_branch][0],
                     stage.b[next & 1u][n_branch][1], compact_next, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -102,7 +102,7 @@ static __device__ __forceinline__ void paired_gate_up(
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
             if (owns_a) produce_a(stage.a[next & 1u][m_branch], input, rows, width,
                     first_row, m_branch, next * 32u, lane);
-            else produce_b(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
+            else produce_b<true>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
                     weights_layout, outputs, first_col + n_branch * (outputs / 2u), next * 32u, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
