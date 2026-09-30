@@ -14,7 +14,7 @@ class FfnOwnershipTest(unittest.TestCase):
         with contextlib.ExitStack() as scope:
             gpu = Gpu(SOURCE.encode()); scope.callback(gpu.close)
             rng = random.Random(719)
-            for rows in (64, 129):
+            for rows in (64, 100, 129):
                 for special in (False, True):
                     with self.subTest(rows=rows, special=special), contextlib.ExitStack() as case:
                         def upload(data):
