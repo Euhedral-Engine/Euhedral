@@ -28,6 +28,9 @@ EUHEDRAL_Q45_DECODE_KERNEL(5, 2)
 EUHEDRAL_Q45_DECODE_KERNEL(5, 4)
 #undef EUHEDRAL_Q45_DECODE_KERNEL
 
+// Shared strides of 72 elements (144 bytes) spread the eight ldmatrix rows of
+// one phase across distinct banks; the earlier 64 and 80 element strides made
+// the fragment loads conflict.
 // Prefill entry points: _prefill is the 32 x 32 tile, _prefill_64 the 64 x 32
 // tile that reuses each decoded weight tile across twice as many rows.
 #define EUHEDRAL_Q45_PREFILL_KERNEL(B, NAME, TILE, A_STRIDE, B_STRIDE, LEAF) \
@@ -41,8 +44,8 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q##B##_##NAME( \
     q45::tiled_prefill<B, Tile, A_STRIDE, B_STRIDE, q45::LEAF<Tile>>( \
             input, weights, output, rows, in_features, out_features, staging, b_hi, b_lo); \
 }
-EUHEDRAL_Q45_PREFILL_KERNEL(4, prefill, Prefill32, 80, 80, Q45_PREFILL_LEAF)
-EUHEDRAL_Q45_PREFILL_KERNEL(5, prefill, Prefill32, 80, 80, Q45_PREFILL_LEAF)
-EUHEDRAL_Q45_PREFILL_KERNEL(4, prefill_64, Prefill64, 80, 64, Q45_PREFILL64_LEAF)
-EUHEDRAL_Q45_PREFILL_KERNEL(5, prefill_64, Prefill64, 80, 64, Q45_PREFILL64_LEAF)
+EUHEDRAL_Q45_PREFILL_KERNEL(4, prefill, Prefill32, 72, 72, Q45_PREFILL_LEAF)
+EUHEDRAL_Q45_PREFILL_KERNEL(5, prefill, Prefill32, 72, 72, Q45_PREFILL_LEAF)
+EUHEDRAL_Q45_PREFILL_KERNEL(4, prefill_64, Prefill64, 72, 72, Q45_PREFILL64_LEAF)
+EUHEDRAL_Q45_PREFILL_KERNEL(5, prefill_64, Prefill64, 72, 72, Q45_PREFILL64_LEAF)
 #undef EUHEDRAL_Q45_PREFILL_KERNEL
