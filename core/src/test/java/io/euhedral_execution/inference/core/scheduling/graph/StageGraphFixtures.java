@@ -48,6 +48,7 @@ final class StageGraphFixtures {
         final List<String> kernels = Collections.synchronizedList(new ArrayList<>());
         final List<String> threads = Collections.synchronizedList(new ArrayList<>());
         final List<Registration> registrations = Collections.synchronizedList(new ArrayList<>());
+        final List<Long> confirmed = Collections.synchronizedList(new ArrayList<>());
         final ConcurrentHashMap<Long, Throwable> failures = new ConcurrentHashMap<>();
         final AtomicInteger recoveries = new AtomicInteger();
         final AtomicLong tickets = new AtomicLong();
@@ -100,6 +101,7 @@ final class StageGraphFixtures {
 
         @Override
         public Throwable confirmRetired(long ticket) {
+            this.confirmed.add(ticket);
             return this.failures.remove(ticket);
         }
 
@@ -121,6 +123,7 @@ final class StageGraphFixtures {
     static final class TestStage extends StageFrame {
         final List<Boolean> retirements = Collections.synchronizedList(new ArrayList<>());
         volatile RuntimeException failure;
+        volatile Error error;
         volatile Runnable beforeLaunch;
         volatile int launches;
 
@@ -136,6 +139,8 @@ final class StageGraphFixtures {
             ((RecordingStream) graph().stream()).kernel("k" + stage());
             RuntimeException injected = this.failure;
             if (injected != null) throw injected;
+            Error fatal = this.error;
+            if (fatal != null) throw fatal;
         }
 
         @Override

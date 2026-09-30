@@ -156,7 +156,7 @@ class InferenceEngineTest {
     }
 
     @Test
-    void concurrentSessionsShareRuntimeWithoutRunnerCollision() throws Exception {
+    void concurrentSessionsShareOneRuntime() throws Exception {
         var bootstrap = new FakeBootstrap();
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
@@ -172,7 +172,7 @@ class InferenceEngineTest {
             assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS));
             var b = executor.submit(() -> second.generate("!", 3, ignored -> {}));
             try {
-                // A second quantum must wait, rather than fail while the first runner is attached.
+                // Concurrent quanta run on separate graphs; the second one waits instead of failing.
                 assertThrows(
                         java.util.concurrent.TimeoutException.class,
                         () -> b.get(100, java.util.concurrent.TimeUnit.MILLISECONDS));

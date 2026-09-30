@@ -18,8 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// FFM binding for the stable Euhedral CUDA C ABI.
 ///
@@ -27,7 +27,7 @@ import java.util.logging.Logger;
 /// inside the native calls and are never exposed as dereferenceable Java memory.
 public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
-    private static final Logger LOG = Logger.getLogger(CudaGpuMemory.class.getName());
+    private static final Logger LOG = LoggerFactory.getLogger(CudaGpuMemory.class);
     private static final int MAX_CACHED_EVENTS = 256;
     private final Arena arena;
     private final MethodHandle malloc;
@@ -325,7 +325,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     public void poison(Throwable failure) {
         Objects.requireNonNull(failure, "failure");
         if (poisoned.compareAndSet(null, failure)) {
-            LOG.log(Level.SEVERE, "CUDA recovery failed; retaining GPU allocations until process restart", failure);
+            LOG.error("CUDA recovery failed; retaining GPU allocations until process restart", failure);
         }
         // Every armed boundary still reaches its owner, which now observes the poison and retains
         // the storage that its unproven device work may still reference.
@@ -350,16 +350,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         try {
             completion.listener.retired(ticket, driverThread);
         } catch (Throwable failure) {
-            LOG.log(Level.SEVERE, "CUDA retirement listener failed", failure);
+            LOG.error("CUDA retirement listener failed", failure);
         }
     }
 
     private void destroyEvent(long event) {
         try {
             int status = (int) eventDestroy.invokeExact(event);
-            if (status != 0) LOG.log(Level.WARNING, "CUDA event destruction failed with status {0}", status);
+            if (status != 0) LOG.warn("CUDA event destruction failed with status {}", status);
         } catch (Throwable failure) {
-            LOG.log(Level.WARNING, "CUDA event destruction failed", failure);
+            LOG.warn("CUDA event destruction failed", failure);
         }
     }
 
@@ -426,6 +426,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             Objects.requireNonNull(listener, "listener");
             long event = 0;
             long ticket = 0;
+            Completion completion = null;
             try {
                 Long cached = availableEvents.poll();
                 event = cached == null ? (long) eventCreate.invokeExact() : cached;
@@ -434,11 +435,15 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 if (status != 0) throw new GpuMemoryException("CUDA event record", status);
                 ticket = nextCompletion.incrementAndGet();
                 if (ticket <= 0) throw new IllegalStateException("CUDA completion identifiers exhausted");
-                completions.put(ticket, new Completion(event, listener));
+                completion = new Completion(event, listener);
+                completions.put(ticket, completion);
                 status = (int) completionNotify.invokeExact(this.handle, completionCallback, ticket);
                 if (status != 0) throw new GpuMemoryException("CUDA completion notification", status);
                 return ticket;
             } catch (Throwable failure) {
+                // A concurrent poison() already announced this boundary to its listener, whose owner
+                // will confirm it and observe the poison. It stays armed; a throw would retire it twice.
+                if (completion != null && !completion.announced.compareAndSet(false, true)) return ticket;
                 // Nothing was armed. The caller must prove device retirement before releasing storage.
                 if (ticket != 0) completions.remove(ticket);
                 if (event != 0) destroyEvent(event);

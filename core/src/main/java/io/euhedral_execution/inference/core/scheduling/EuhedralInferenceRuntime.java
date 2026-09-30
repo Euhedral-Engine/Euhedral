@@ -77,7 +77,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// Admits one quantum. The returned future completes after its device work retired and the
-    /// quantum's graph was recycled.
+    /// quantum's graph was recycled. A quantum is admitted at most once: when admission itself fails,
+    /// the failure is thrown and the quantum's outcome is failed as well.
     public CompletableFuture<QwenExecutionContext.Outcome> submit(
             QwenExecutionContext context, Consumer<? super QwenExecutionContext> terminalConsumer) {
         Objects.requireNonNull(context, "context");
@@ -86,13 +87,24 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         if (view.executionOwner() != this.plan) {
             throw new IllegalArgumentException("quantum belongs to another execution plan");
         }
-        this.gpu.ensureHealthy();
-        GraphPool pool = pool(view);
-        StageGraph graph = pool.acquire();
+        context.claim();
+        GraphPool pool;
+        StageGraph graph;
+        try {
+            this.gpu.ensureHealthy();
+            pool = pool(view);
+            graph = pool.acquire();
+        } catch (RuntimeException | Error failure) {
+            context.fail(failure);
+            context.finish();
+            throw failure;
+        }
         try {
             graph.source().admit();
         } catch (RuntimeException | Error failure) {
             pool.recycle(graph);
+            context.fail(failure);
+            context.finish();
             throw failure;
         }
         boolean started = false;
@@ -101,15 +113,13 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             try {
                 stream.submit(() -> context.begin(this.gpu, stream, terminalConsumer), false);
             } catch (RuntimeException | Error failure) {
-                if (!(failure instanceof QwenExecutionContext.DuplicateAdmissionException)
-                        && !context.completion().isDone()) {
-                    stream.recover(failure);
-                    context.fail(failure);
-                    context.finish();
-                }
+                // The stream failed around the preparation; prove it idle before storage is released.
+                stream.recover(failure);
+                context.fail(failure);
+                context.retire(null);
                 throw failure;
             }
-            if (!context.completion().isDone()) {
+            if (!context.terminal()) {
                 // From here the graph owns the quantum; its retirement recycles the graph.
                 started = true;
                 graph.start(context);
@@ -119,6 +129,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             if (!started) {
                 pool.recycle(graph);
                 graph.source().terminated();
+                // Outcome callbacks never run with the graph's stream selected.
+                context.publishOutcome();
             }
         }
     }
@@ -127,8 +139,14 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         GraphPool pool = this.pools.get(view);
         if (pool != null) return pool;
         synchronized (this.closeLock) {
-            if (this.closed) throw new IllegalStateException("inference runtime is closed");
+            ensureOpen();
             return this.pools.computeIfAbsent(view, GraphPool::new);
+        }
+    }
+
+    private void ensureOpen() {
+        synchronized (this.closeLock) {
+            if (this.closed) throw new IllegalStateException("inference runtime is closed");
         }
     }
 
@@ -193,10 +211,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
 
         private StageGraph build() {
-            synchronized (EuhedralInferenceRuntime.this.closeLock) {
-                if (EuhedralInferenceRuntime.this.closed)
-                    throw new IllegalStateException("inference runtime is closed");
-            }
+            ensureOpen();
             ExecutionGpu gpu = EuhedralInferenceRuntime.this.gpu;
             GpuStream stream = gpu.openStream();
             StageGraph graph;
@@ -216,15 +231,18 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 }
                 throw failure;
             }
-            synchronized (this.built) {
-                this.built.add(graph);
-            }
-            // Attached once per reusable graph, never per quantum.
-            EuhedralInferenceRuntime.this.lattice.addUpstream(graph.source());
             synchronized (EuhedralInferenceRuntime.this.closeLock) {
-                // A close that raced this build has already completed every source it saw.
-                if (EuhedralInferenceRuntime.this.closed) graph.source().completeGracefully();
+                // A close that ran during this build saw no such graph; it would never release it.
+                if (EuhedralInferenceRuntime.this.closed) {
+                    graph.close();
+                    throw new IllegalStateException("inference runtime is closed");
+                }
+                synchronized (this.built) {
+                    this.built.add(graph);
+                }
             }
+            // Attached once per reusable graph, never per quantum. A close from here on completes it.
+            EuhedralInferenceRuntime.this.lattice.addUpstream(graph.source());
             return graph;
         }
 

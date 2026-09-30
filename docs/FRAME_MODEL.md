@@ -47,7 +47,10 @@ Admission is small:
 3. publish the root stages to the graph's source.
 
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
-terminal outcome at admission, after the stream proves that queued initialization stopped.
+terminal outcome at admission, after the stream proves that queued initialization stopped. A quantum is
+admitted at most once: if admission itself fails, the failure is thrown and the quantum's outcome fails
+too, so it can never be retried into a second lease. An outcome reached at admission is published only
+after the graph's stream is deselected, so outcome callbacks never launch onto it.
 
 ## The Qwen `LatticeSource`
 
@@ -70,7 +73,8 @@ how many stages a graph has.
 
 Each reusable graph attaches its source to the lattice once, when the graph is built. A worker draining
 one graph's source therefore never holds another quantum's ready frames, and independent quanta are
-scheduled independently.
+scheduled independently. Euhedral offers a source to the workers registered when it is attached; graphs
+are built on first use, after the lattice has started.
 
 ## Readiness, fan-out, and fan-in
 
@@ -134,7 +138,7 @@ enqueues the retirement frame, and that frame:
 1. confirms the boundary (and on failure proves the device idle or poisons it);
 2. runs each attempted stage's retirement hook: commit on success, release temporaries always;
 3. releases quantum storage and publishes sequence state (`QwenExecutionContext.retire`);
-4. returns the graph to its pool;
+4. returns the graph to its pool and ends the quantum's admission count;
 5. publishes the outcome.
 
 The graph is reusable before the caller observes the outcome, so the next token finds an idle graph.
@@ -167,9 +171,14 @@ quantum that does not succeed leaves its sequence terminal, so no partial update
   storage is released. If that also fails, the device is poisoned and every allocation is retained
   until the process restarts.
 - A CUDA driver callback never calls CUDA, runs a frame, or releases memory.
-- Euhedral finalizes `Exception`s; a stage that hits an `Error` records the failure and drops its live
-  count before the `Error` escapes, so the quantum still retires.
-- A graph is recycled only after its quantum's device work retired and its storage was released.
+- No frame throws into Euhedral. A failed submission, an `Error` included, is recorded on the quantum:
+  an escaping `Error` would complete the graph's source or end the worker.
+- Euhedral finalizes a frame it rejected without running it (its worker cache retired, or nothing was
+  routable) through `doFinallyWithError`. A rejected stage fails its quantum. A rejected
+  device-completion or retirement frame is finished on the rejecting thread, which is never a driver
+  callback, so the quantum still retires once.
+- A graph is recycled only after its quantum's boundary was confirmed: its device work retired and its
+  storage was released, or the device was poisoned and that storage stays owned.
 
 ## Measured behaviour
 

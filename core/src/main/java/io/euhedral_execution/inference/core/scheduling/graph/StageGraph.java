@@ -5,6 +5,8 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// One reusable runtime instance of a static stage DAG.
 ///
@@ -37,6 +39,7 @@ public final class StageGraph implements AutoCloseable {
         void recycle(StageGraph graph);
     }
 
+    private static final Logger LOG = LoggerFactory.getLogger(StageGraph.class);
     private static final long NO_TICKET = 0L;
 
     private final StageTopology topology;
@@ -189,7 +192,8 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Terminal work for the bound quantum; runs on an ordinary worker after device retirement.
+    /// Terminal work for the bound quantum; runs on an ordinary worker after device retirement. Every
+    /// failure before recycling is recorded on the quantum, whose outcome is always published.
     void retire(long ticket) {
         StageQuantum retiring = this.quantum;
         Throwable deviceFailure = ticket == NO_TICKET ? null : this.stream.confirmRetired(ticket);
@@ -212,10 +216,11 @@ public final class StageGraph implements AutoCloseable {
         // The next quantum may reuse this graph before this one's outcome is observed.
         this.quantum = null;
         this.recycler.recycle(this);
+        // The quantum stops counting as active before its outcome becomes visible.
         try {
-            retiring.publishOutcome();
-        } finally {
             this.source.terminated();
+        } finally {
+            retiring.publishOutcome();
         }
     }
 
@@ -227,6 +232,9 @@ public final class StageGraph implements AutoCloseable {
     }
 
     /// The single device-completion boundary of a quantum. The driver callback only publishes it.
+    ///
+    /// Its `execute` never throws: the graph may serve another quantum as soon as it is recycled, so
+    /// `doFinallyWithError` means only that Euhedral rejected the frame without running it.
     static final class Retirement extends AbstractFrame implements GpuStream.RetirementListener {
         private final StageGraph graph;
         private long ticket;
@@ -250,15 +258,25 @@ public final class StageGraph implements AutoCloseable {
 
         @Override
         public void execute() {
-            this.graph.retire(this.ticket);
+            try {
+                this.graph.retire(this.ticket);
+            } catch (RuntimeException | Error failure) {
+                // Only admission accounting can fail here, after the outcome was published.
+                LOG.error("Qwen quantum retirement failed", failure);
+            }
         }
 
         /// The graph may already serve another quantum; this frame's state is not touched again.
         @Override
         public void doFinally() {}
 
+        /// Euhedral rejected the frame without running it: its worker cache retired, or no downstream
+        /// was routable. The quantum still retires exactly once, and the rejecting thread is an
+        /// ordinary worker or admission thread, never a driver callback: retire it here.
         @Override
-        public void doFinallyWithError(Throwable failure) {}
+        public void doFinallyWithError(Throwable rejection) {
+            execute();
+        }
     }
 
     /// A device-completion edge. Its producer arms it after submission; the driver callback publishes
@@ -311,9 +329,13 @@ public final class StageGraph implements AutoCloseable {
             this.graph.stageFinished();
         }
 
+        /// `execute` never throws, so Euhedral rejected this frame without running it. The producer's
+        /// boundary must still be confirmed and the edge resolved once; the rejecting thread is never a
+        /// driver callback, so the edge is finished here.
         @Override
-        public void doFinallyWithError(Throwable failure) {
-            this.graph.stageFailed(failure);
+        public void doFinallyWithError(Throwable rejection) {
+            execute();
+            doFinally();
         }
     }
 }

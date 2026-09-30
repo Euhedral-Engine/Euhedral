@@ -6,8 +6,10 @@ import static io.euhedral_execution.inference.core.scheduling.graph.StageGraphFi
 import static io.euhedral_execution.inference.core.scheduling.graph.StageGraphFixtures.run;
 import static io.euhedral_execution.inference.core.scheduling.graph.StageGraphFixtures.stage;
 import static io.euhedral_execution.inference.core.scheduling.graph.StageGraphFixtures.take;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -155,10 +157,16 @@ class StageGraphTest {
     void recycledGraphIsReusableBeforeTheOutcomeIsPublished() {
         StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
         TestQuantum quantum = start(graph);
-        quantum.onOutcome = () -> assertEquals(List.of(graph), this.recycler.recycled);
+        // Recorded, not asserted, inside the hook: the retirement frame never lets a failure escape.
+        List<Object> atOutcome = new ArrayList<>();
+        quantum.onOutcome = () -> {
+            atOutcome.add(List.copyOf(this.recycler.recycled));
+            atOutcome.add(this.source.activeGraphs());
+        };
         this.stream.retireOnNotify = true;
         drain(this.source);
         assertEquals(1, quantum.outcomes.get());
+        assertEquals(List.of(List.of(graph), 0), atOutcome, "recycled and no longer active once the outcome is seen");
         assertNull(graph.quantum(), "no stale quantum remains bound");
     }
 
@@ -250,6 +258,89 @@ class StageGraphTest {
         assertEquals(List.of("release:0", "release:1", "retire", "outcome"), quantum.events);
         assertEquals(1, quantum.outcomes.get(), "terminal failure is published exactly once");
         assertEquals("FAILED", quantum.outcome.join());
+    }
+
+    @Test
+    void stageErrorIsRecordedAndNeverEscapesIntoEuhedral() {
+        StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        OutOfMemoryError exhaustion = new OutOfMemoryError("injected host exhaustion");
+        stage(graph, 1).error = exhaustion;
+        run(take(this.source).getFirst());
+        AbstractFrame failing = take(this.source).getFirst();
+
+        // Escaping into Euhedral, the Error would complete this graph's source or end the worker.
+        assertDoesNotThrow(failing::execute);
+        failing.doFinally();
+        assertSame(exhaustion, quantum.failure.get());
+        assertTrue(take(this.source).isEmpty(), "C never becomes ready");
+        assertEquals(1, this.stream.armed(), "the quantum still retires through its single boundary");
+
+        this.stream.retireNext(true);
+        drain(this.source);
+        assertEquals(List.of("release:0", "release:1", "retire", "outcome"), quantum.events);
+        assertEquals("FAILED", quantum.outcome.join());
+    }
+
+    @Test
+    void rejectedStageFailsTheQuantumWithoutTouchingEuhedralsSharedRejection() {
+        StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        IllegalStateException shared = new IllegalStateException("Frame was rejected because its cache retired");
+        run(take(this.source).getFirst());
+        // Euhedral finalizes a frame it could not deliver without running it.
+        take(this.source).getFirst().doFinallyWithError(shared);
+
+        assertEquals(0, stage(graph, 1).launches);
+        assertTrue(take(this.source).isEmpty(), "C never becomes ready");
+        assertNotSame(shared, quantum.failure.get());
+        assertSame(shared, quantum.failure.get().getCause());
+        quantum.fail(new IllegalStateException("later failure"));
+        assertEquals(0, shared.getSuppressed().length, "failures never accumulate on Euhedral's instance");
+
+        this.stream.retireNext(true);
+        drain(this.source);
+        assertEquals(List.of("release:0", "retire", "outcome"), quantum.events);
+        assertEquals("FAILED", quantum.outcome.join());
+    }
+
+    @Test
+    void rejectedRetirementFrameStillRetiresTheQuantumOnce() {
+        StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        drain(this.source);
+        this.stream.retireNext(true);
+        List<AbstractFrame> retirement = take(this.source);
+        assertEquals(1, retirement.size());
+
+        retirement.getFirst().doFinallyWithError(new IllegalStateException("no routable downstream"));
+
+        assertEquals(List.of("commit:0", "commit:1", "commit:2", "retire", "outcome"), quantum.events);
+        assertEquals("SUCCESS", quantum.outcome.join());
+        assertEquals(List.of(graph), this.recycler.recycled);
+        assertEquals(0, this.source.activeGraphs());
+        assertTrue(take(this.source).isEmpty());
+    }
+
+    @Test
+    void rejectedDeviceCompletionEdgeIsStillConfirmedAndResolvedOnce() {
+        StageTopology topology =
+                StageTopology.of(dependencies(new int[0], new int[] {0}), new Boundary[][] {{}, {Boundary.RETIRED}});
+        StageGraph graph = graph(topology, this.stream, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        run(take(this.source).getFirst());
+        this.stream.retireNext(true);
+        List<AbstractFrame> edge = take(this.source);
+        assertEquals(1, edge.size());
+
+        edge.getFirst().doFinallyWithError(new IllegalStateException("no routable downstream"));
+
+        assertEquals(List.of(1L), this.stream.confirmed, "the producer's boundary is confirmed");
+        assertEquals(List.of(stage(graph, 1)), take(this.source), "the consumer is published once");
+        run(stage(graph, 1));
+        this.stream.retireNext(true);
+        drain(this.source);
+        assertEquals("SUCCESS", quantum.outcome.join());
     }
 
     @Test

@@ -98,7 +98,8 @@ int euhedral_cuda_copy_host_to_device(
     cudaError_t status = stream == NULL
             ? cudaMemcpy(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice)
             : cudaMemcpyAsync(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice, stream);
-    // EmbeddingFrame closes its host arena on return, so an async upload must finish here.
+    // Callers may release pageable host memory on return (the KV page-table arena does), so an async
+    // upload must finish here.
     if (status == cudaSuccess && stream != NULL) status = cudaStreamSynchronize(stream);
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int) status;
 }
@@ -148,7 +149,8 @@ int euhedral_cuda_copy_device_to_device(
     cudaError_t status = stream == NULL
             ? cudaMemcpy(destination_address, source_address, (size_t)byte_size, cudaMemcpyDeviceToDevice)
             : cudaMemcpyAsync(destination_address, source_address, (size_t)byte_size, cudaMemcpyDeviceToDevice, stream);
-    // Async KV growth retains its old allocation until the recorded completion event.
+    // With a submission stream selected the copy is queued on it; the caller keeps both allocations
+    // until that stream's work has retired.
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 
