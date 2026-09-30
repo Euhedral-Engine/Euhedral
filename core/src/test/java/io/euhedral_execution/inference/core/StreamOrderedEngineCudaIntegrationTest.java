@@ -56,14 +56,20 @@ class StreamOrderedEngineCudaIntegrationTest {
             assertTrue(
                     engine.tokenizer().encodeWithModelSpecialTokens(PROMPT).length > 4,
                     "test prompt must exercise multiple prefill quanta");
-            // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest.
+            // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest,
+            // and the execution graphs keep their workspace storage for later quanta.
             long loaded = engine.allocatedDeviceBytes();
+            assertEquals(0, engine.retainedWorkspaceBytes());
             first = generateSession(engine);
-            assertEquals(loaded, engine.allocatedDeviceBytes(), "the first session kept device allocations");
+            long retained = engine.retainedWorkspaceBytes();
+            assertTrue(retained > 0, "the graphs retained no workspace storage");
+            assertEquals(loaded + retained, engine.allocatedDeviceBytes(), "the first session kept device allocations");
             Result second = generateSession(engine);
-            assertEquals(loaded, engine.allocatedDeviceBytes(), "the second session kept device allocations");
+            assertEquals(retained, engine.retainedWorkspaceBytes(), "an equal session grew the retained storage");
+            assertEquals(
+                    loaded + retained, engine.allocatedDeviceBytes(), "the second session kept device allocations");
             Result third = generateSession(engine);
-            assertEquals(loaded, engine.allocatedDeviceBytes(), "the third session kept device allocations");
+            assertEquals(loaded + retained, engine.allocatedDeviceBytes(), "the third session kept device allocations");
             assertEquals(first, second, "a new session did not reproduce the same sequence");
             assertEquals(second, third, "a later session did not reproduce the same sequence");
         }

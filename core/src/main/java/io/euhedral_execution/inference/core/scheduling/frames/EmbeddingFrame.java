@@ -26,7 +26,7 @@ public final class EmbeddingFrame extends QwenStageFrame {
         for (int index = 0; index < ids.length; index++) {
             host.set(ValueLayout.JAVA_INT, (long) index * Integer.BYTES, ids[index]);
         }
-        long tokenBuffer = context.allocateTemporaryTokenIds(gpu(), bytes);
+        long tokenBuffer = context.workspace().tokenIdsAddress(bytes);
         gpu().copyUploadToDevice(tokenBuffer, upload);
         gpu().embedQ3(
                         tokenBuffer,
@@ -40,13 +40,9 @@ public final class EmbeddingFrame extends QwenStageFrame {
 
     @Override
     protected void releaseTemporary(QwenExecutionContext context) {
-        try {
-            context.releaseTemporaryTokenIds(gpu());
-        } finally {
-            ExecutionGpu.UploadBuffer upload = this.pendingUpload;
-            this.pendingUpload = null;
-            // A poisoned GPU cannot prove that DMA has stopped reading pinned host memory.
-            if (upload != null && gpu().completionProven()) upload.close();
-        }
+        ExecutionGpu.UploadBuffer upload = this.pendingUpload;
+        this.pendingUpload = null;
+        // A poisoned GPU cannot prove that DMA has stopped reading pinned host memory.
+        if (upload != null && gpu().completionProven()) upload.close();
     }
 }

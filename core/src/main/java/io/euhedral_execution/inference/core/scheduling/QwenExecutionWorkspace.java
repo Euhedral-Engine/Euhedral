@@ -1,13 +1,26 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
-/// GPU storage scoped to one Qwen submission; hidden states are BF16 values in token-major order.
+/// GPU storage bound to one Qwen submission; hidden states are BF16 values in token-major order.
+///
+/// A workspace is the quantum's view of its buffers. Production workspaces borrow their allocations
+/// from the executing graph's [QwenWorkspaceStorage]: [#allocateBuffers] acquires them at admission and
+/// [#close] releases the binding at retirement, leaving the allocations for the graph's next quantum.
+/// A workspace constructed from a [GpuMemory] owns private storage and frees it on close.
 public final class QwenExecutionWorkspace implements AutoCloseable {
 
-    private final GpuMemory gpuMemory;
+    private static final int BUFFER_SLOTS = QwenExecutionPlan.Buffer.values().length;
+    private static final int TOKEN_IDS_SLOT = BUFFER_SLOTS;
+    private static final int HIDDEN_SLOT = BUFFER_SLOTS + 1;
+    private static final int NORMALIZED_SLOT = BUFFER_SLOTS + 2;
+    private static final int PROJECTION_SLOTS = BUFFER_SLOTS + 3;
+
+    private final QwenWorkspaceStorage storage;
+    private final boolean ownsStorage;
     private final int tokenCount;
     private final int hiddenSize;
     private final long byteSize;
@@ -19,6 +32,8 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     private final int[] storageOwners;
     private long normalizedAddress;
     private long hiddenStateAddress;
+    private long tokenIdsAddress;
+    private boolean allocated;
     private boolean closed;
 
     QwenExecutionWorkspace(GpuMemory gpuMemory, int tokenCount, int hiddenSize) {
@@ -26,7 +41,29 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     }
 
     QwenExecutionWorkspace(GpuMemory gpuMemory, int tokenCount, int hiddenSize, List<Integer> projectionWidths) {
-        this(gpuMemory, tokenCount, hiddenSize, projectionWidths, List.of(), QwenLogitsRequirement.ALL_TOKENS);
+        this(ownedStorage(gpuMemory), true, tokenCount, hiddenSize, projectionWidths);
+    }
+
+    /// Borrows `storage` for a plan without first-layer buffers.
+    QwenExecutionWorkspace(
+            QwenWorkspaceStorage storage, int tokenCount, int hiddenSize, List<Integer> projectionWidths) {
+        this(storage, false, tokenCount, hiddenSize, projectionWidths);
+    }
+
+    private QwenExecutionWorkspace(
+            QwenWorkspaceStorage storage,
+            boolean ownsStorage,
+            int tokenCount,
+            int hiddenSize,
+            List<Integer> projectionWidths) {
+        this(
+                storage,
+                ownsStorage,
+                tokenCount,
+                hiddenSize,
+                projectionWidths,
+                List.of(),
+                QwenLogitsRequirement.ALL_TOKENS);
     }
 
     QwenExecutionWorkspace(GpuMemory gpuMemory, int tokenCount, QwenExecutionPlan plan) {
@@ -35,8 +72,27 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
 
     QwenExecutionWorkspace(
             GpuMemory gpuMemory, int tokenCount, QwenExecutionPlan plan, QwenLogitsRequirement logitsRequirement) {
+        this(ownedStorage(gpuMemory), true, tokenCount, plan, logitsRequirement);
+    }
+
+    /// Borrows `storage` for a first-layer plan.
+    QwenExecutionWorkspace(
+            QwenWorkspaceStorage storage,
+            int tokenCount,
+            QwenExecutionPlan plan,
+            QwenLogitsRequirement logitsRequirement) {
+        this(storage, false, tokenCount, plan, logitsRequirement);
+    }
+
+    private QwenExecutionWorkspace(
+            QwenWorkspaceStorage storage,
+            boolean ownsStorage,
+            int tokenCount,
+            QwenExecutionPlan plan,
+            QwenLogitsRequirement logitsRequirement) {
         this(
-                gpuMemory,
+                storage,
+                ownsStorage,
                 tokenCount,
                 plan.weights().config().hiddenSize(),
                 List.of(),
@@ -49,13 +105,15 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     }
 
     private QwenExecutionWorkspace(
-            GpuMemory gpuMemory,
+            QwenWorkspaceStorage storage,
+            boolean ownsStorage,
             int tokenCount,
             int hiddenSize,
             List<Integer> projectionWidths,
             List<QwenExecutionPlan.BufferSpec> firstLayerBuffers,
             QwenLogitsRequirement logitsRequirement) {
-        this.gpuMemory = Objects.requireNonNull(gpuMemory, "gpuMemory");
+        this.storage = Objects.requireNonNull(storage, "storage");
+        this.ownsStorage = ownsStorage;
         Objects.requireNonNull(projectionWidths, "projectionWidths");
         Objects.requireNonNull(firstLayerBuffers, "firstLayerBuffers");
         Objects.requireNonNull(logitsRequirement, "logitsRequirement");
@@ -69,9 +127,9 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         this.hiddenSize = hiddenSize;
         this.projectionAddresses = new long[projectionWidths.size()];
         this.projectionByteSizes = new long[projectionWidths.size()];
-        this.firstLayerAddresses = new long[QwenExecutionPlan.Buffer.values().length];
-        this.firstLayerByteSizes = new long[QwenExecutionPlan.Buffer.values().length];
-        this.storageOwners = new int[this.firstLayerByteSizes.length];
+        this.firstLayerAddresses = new long[BUFFER_SLOTS];
+        this.firstLayerByteSizes = new long[BUFFER_SLOTS];
+        this.storageOwners = new int[BUFFER_SLOTS];
         for (int index = 0; index < this.storageOwners.length; index++) this.storageOwners[index] = index;
         try {
             this.byteSize = Math.multiplyExact(Math.multiplyExact((long) tokenCount, hiddenSize), Short.BYTES);
@@ -102,6 +160,10 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         this.storageByteSizes = this.firstLayerByteSizes.clone();
     }
 
+    private static QwenWorkspaceStorage ownedStorage(GpuMemory gpuMemory) {
+        return new QwenWorkspaceStorage(Objects.requireNonNull(gpuMemory, "gpuMemory"));
+    }
+
     /// Fixed lifetime pairs in the combined prefill graph, not a general lifetime allocator.
     private void configureRegionStorage() {
         // Each previous value's final consumer precedes the next producer through the layer DAG.
@@ -121,36 +183,38 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         this.storageByteSizes[from] = 0;
     }
 
-    /// Allocate only after the submission owns this object, so partial failure remains reclaimable.
+    /// Acquires this submission's buffers once it owns the workspace. Storage that a partial failure
+    /// already acquired stays with its storage owner, which reclaims it.
     void allocateBuffers() {
-        if (this.closed || this.hiddenStateAddress != 0) {
+        if (this.closed || this.allocated) {
             throw new IllegalStateException("workspace has already been allocated or closed");
         }
+        this.allocated = true;
         if (hasFirstLayerBuffers()) {
             for (int index = 0; index < this.firstLayerByteSizes.length; index++) {
                 if (this.storageByteSizes[index] != 0) {
-                    this.firstLayerAddresses[index] = allocate(this.storageByteSizes[index]);
+                    this.firstLayerAddresses[index] = this.storage.acquire(index, this.storageByteSizes[index]);
                 }
             }
             this.hiddenStateAddress = this.firstLayerAddresses[QwenExecutionPlan.Buffer.HIDDEN_STATE.ordinal()];
             this.normalizedAddress = this.firstLayerAddresses[QwenExecutionPlan.Buffer.INPUT_NORMALIZED.ordinal()];
             return;
         }
-        this.hiddenStateAddress = allocate(this.byteSize);
+        this.hiddenStateAddress = this.storage.acquire(HIDDEN_SLOT, this.byteSize);
         if (this.projectionByteSizes.length != 0) {
-            this.normalizedAddress = allocate(this.byteSize);
+            this.normalizedAddress = this.storage.acquire(NORMALIZED_SLOT, this.byteSize);
             for (int index = 0; index < this.projectionByteSizes.length; index++) {
-                this.projectionAddresses[index] = allocate(this.projectionByteSizes[index]);
+                this.projectionAddresses[index] =
+                        this.storage.acquire(PROJECTION_SLOTS + index, this.projectionByteSizes[index]);
             }
         }
     }
 
-    private long allocate(long bytes) {
-        long address = this.gpuMemory.allocate(bytes);
-        if (address == 0) {
-            throw new IllegalStateException("GPU returned a null workspace address");
-        }
-        return address;
+    /// Returns device storage for this submission's `bytes` bytes of token IDs.
+    public long tokenIdsAddress(long bytes) {
+        if (this.closed) throw new IllegalStateException("Qwen execution workspace is closed");
+        if (this.tokenIdsAddress == 0) this.tokenIdsAddress = this.storage.acquire(TOKEN_IDS_SLOT, bytes);
+        return this.tokenIdsAddress;
     }
 
     public int tokenCount() {
@@ -209,6 +273,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         if (this.closed || address == 0) {
             throw new IllegalStateException("instruction buffer cannot be detached: " + buffer);
         }
+        this.storage.detach(index);
         this.firstLayerAddresses[index] = 0;
         return address;
     }
@@ -241,78 +306,20 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         return this.closed;
     }
 
+    /// Ends this submission's binding. Borrowed storage stays allocated for its owner's next quantum;
+    /// owned storage is freed, and a failed free leaves the workspace open so close can be retried.
     @Override
     public void close() {
         if (this.closed) {
             return;
         }
-        Throwable failure = null;
-        if (hasFirstLayerBuffers()) {
-            for (int index = 0; index < this.firstLayerAddresses.length; index++) {
-                try {
-                    if (this.firstLayerAddresses[index] != 0) {
-                        this.gpuMemory.free(this.firstLayerAddresses[index]);
-                        this.firstLayerAddresses[index] = 0;
-                    }
-                } catch (RuntimeException | Error cleanupFailure) {
-                    failure = combine(failure, cleanupFailure);
-                }
-            }
-            this.hiddenStateAddress = 0;
-            this.normalizedAddress = 0;
-            this.closed = allFirstLayerAddressesReleased();
-            if (failure instanceof Error error) {
-                throw error;
-            }
-            if (failure != null) {
-                throw (RuntimeException) failure;
-            }
-            return;
-        }
-        for (int index = 0; index < this.projectionAddresses.length; index++) {
-            try {
-                if (this.projectionAddresses[index] != 0) {
-                    this.gpuMemory.free(this.projectionAddresses[index]);
-                    this.projectionAddresses[index] = 0;
-                }
-            } catch (RuntimeException | Error cleanupFailure) {
-                failure = combine(failure, cleanupFailure);
-            }
-        }
-        try {
-            if (this.normalizedAddress != 0) {
-                this.gpuMemory.free(this.normalizedAddress);
-                this.normalizedAddress = 0;
-            }
-        } catch (RuntimeException | Error cleanupFailure) {
-            failure = combine(failure, cleanupFailure);
-        }
-        try {
-            if (this.hiddenStateAddress != 0) {
-                this.gpuMemory.free(this.hiddenStateAddress);
-                this.hiddenStateAddress = 0;
-            }
-        } catch (RuntimeException | Error cleanupFailure) {
-            failure = combine(failure, cleanupFailure);
-        }
-        this.closed = this.hiddenStateAddress == 0 && this.normalizedAddress == 0;
-        for (long address : this.projectionAddresses) {
-            this.closed &= address == 0;
-        }
-        if (failure != null) {
-            if (failure instanceof Error error) {
-                throw error;
-            }
-            throw (RuntimeException) failure;
-        }
-    }
-
-    private static Throwable combine(Throwable first, Throwable next) {
-        if (first == null) {
-            return next;
-        }
-        first.addSuppressed(next);
-        return first;
+        if (this.ownsStorage) this.storage.close();
+        this.closed = true;
+        Arrays.fill(this.firstLayerAddresses, 0);
+        Arrays.fill(this.projectionAddresses, 0);
+        this.hiddenStateAddress = 0;
+        this.normalizedAddress = 0;
+        this.tokenIdsAddress = 0;
     }
 
     private boolean hasFirstLayerBuffers() {
@@ -320,12 +327,5 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
             if (byteSize != 0) return true;
         }
         return false;
-    }
-
-    private boolean allFirstLayerAddressesReleased() {
-        for (long address : this.firstLayerAddresses) {
-            if (address != 0) return false;
-        }
-        return true;
     }
 }

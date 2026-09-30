@@ -401,6 +401,13 @@ final class QwenExecutionFixtures {
         }
     }
 
+    /// Every device allocation was freed exactly once, in any order.
+    static void assertEachAllocationFreedOnce(RecordingGpu gpu) {
+        org.junit.jupiter.api.Assertions.assertEquals(
+                gpu.allocations.stream().sorted().toList(),
+                gpu.frees.stream().sorted().toList());
+    }
+
     static EuhedralInferenceRuntime runtime(QwenExecutionPlan plan, ExecutionGpu gpu) {
         return new EuhedralInferenceRuntime(inlineLattice(), plan, gpu);
     }

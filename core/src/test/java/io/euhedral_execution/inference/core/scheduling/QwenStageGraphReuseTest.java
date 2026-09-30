@@ -192,8 +192,8 @@ class QwenStageGraphReuseTest {
         reused.doFinally();
         this.lattice.drive();
         assertEquals(QwenExecutionContext.Status.FAILED, second.outcome().join().status());
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
         runtime.close();
+        QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
 
     @Test
@@ -253,6 +253,8 @@ class QwenStageGraphReuseTest {
         assertEquals(0, gpu.hostReleases, "uncertain DMA may still read the pinned upload");
         assertThrows(IllegalStateException.class, () -> runtime.submit(context(plan, 504)));
         runtime.close();
+        assertEquals(0, gpu.nativeFrees, "closing the runtime keeps the poisoned graph's workspace storage");
+        assertTrue(runtime.retainedWorkspaceBytes() > 0);
     }
 
     @Test
@@ -360,12 +362,13 @@ class QwenStageGraphReuseTest {
         assertEquals(
                 QwenExecutionContext.Status.CANCELLED, cancelledOutcome.join().status());
         assertTrue(gpu.operations.isEmpty(), "a cancelled root submits nothing");
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
+        assertTrue(gpu.frees.isEmpty(), "the graph keeps its workspace storage");
         var next = context(plan, 404);
         var nextOutcome = runtime.submit(next);
         this.lattice.drive();
         assertEquals(QwenExecutionContext.Status.SUCCESS, nextOutcome.join().status());
         runtime.close();
+        QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
 
     @Test

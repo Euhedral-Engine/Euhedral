@@ -64,6 +64,11 @@ class QwenExecutionContextTest {
         }
 
         @Override
+        public boolean completionProven() {
+            return !poisoned;
+        }
+
+        @Override
         public void free(long address) {
             if (poisoned) throw new IllegalStateException("unproven allocation retained");
             super.free(address);
@@ -300,11 +305,12 @@ class QwenExecutionContextTest {
         assertEquals(List.of("embed", "norm", "linear:201", "linear:202"), gpu.operations);
         assertEquals(0, gpu.synchronizations, "stream order, not device barriers, sequences the stages");
         assertNotEquals(outputs.get(0), outputs.get(1));
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
-        assertFalse(gpu.frees.contains(QwenExecutionFixtures.MODEL_ADDRESS));
+        assertTrue(gpu.frees.isEmpty(), "the graph retains its workspace storage for its next quantum");
         assertTrue(context.workspace().isClosed());
         assertEquals(2, sequence.currentTokenPosition());
         runtime.close();
+        QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
+        assertFalse(gpu.frees.contains(QwenExecutionFixtures.MODEL_ADDRESS));
     }
 
     @Test
@@ -421,9 +427,9 @@ class QwenExecutionContextTest {
                 QwenExecutionContext.Status.CANCELLED,
                 outcome.get(5, TimeUnit.SECONDS).status());
         assertEquals(List.of("embed"), gpu.operations);
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
         assertTrue(context.workspace().isClosed());
         runtime.close();
+        QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
 
     @Test
@@ -444,51 +450,41 @@ class QwenExecutionContextTest {
                 outcome.get(5, TimeUnit.SECONDS).status());
         assertSame(failure, outcome.get().failure());
         assertEquals(List.of("embed", "norm", "linear:201"), gpu.operations);
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
-        assertFalse(gpu.frees.contains(QwenExecutionFixtures.MODEL_ADDRESS));
         runtime.close();
+        QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
+        assertFalse(gpu.frees.contains(QwenExecutionFixtures.MODEL_ADDRESS));
     }
 
     @Test
-    void failedTemporaryFreeIsRetriedAtTerminalCleanup() throws Exception {
+    void retirementReleasesTheWorkspaceBindingWithoutFreeingDeviceStorage() throws Exception {
         var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
         var gpu = new QwenExecutionFixtures.RecordingGpu();
+        // Nothing is freed on the retirement path, so a free failure cannot fail the quantum.
         gpu.freeFailures = 1;
         var context = new QwenExecutionContext(
                 plan, new QwenSequenceState(14), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
         var runtime = QwenExecutionFixtures.runtime(plan, gpu);
         var outcome = runtime.submit(context);
         assertEquals(
-                QwenExecutionContext.Status.FAILED,
+                QwenExecutionContext.Status.SUCCESS,
                 outcome.get(5, TimeUnit.SECONDS).status());
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
-        runtime.close();
-    }
-
-    @Test
-    void failedWorkspaceFreeIsRetriedBeforePublishingOutcome() {
-        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
-        var gpu = new QwenExecutionFixtures.RecordingGpu();
-        gpu.failAddressOnce = 1000;
-        var context = new QwenExecutionContext(
-                plan, new QwenSequenceState(20), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
-        var runtime = QwenExecutionFixtures.runtime(plan, gpu);
-        var outcome = runtime.submit(context);
-        assertEquals(QwenExecutionContext.Status.FAILED, outcome.join().status());
         assertTrue(context.workspace().isClosed());
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
-        runtime.close();
+        assertThrows(IllegalStateException.class, () -> context.workspace().hiddenStateAddress());
+        assertTrue(gpu.frees.isEmpty());
+        assertEquals(2, gpu.allocations.size(), "hidden state and token IDs");
+        // Release happens once the runtime proves every graph retired; a failed free is reported there.
+        assertThrows(IllegalStateException.class, runtime::close);
+        assertEquals(1, gpu.frees.size());
     }
 
     @Test
-    void partiallyAllocatedWorkspaceRemainsOwnedWhenConstructionCleanupFails() {
+    void partiallyAllocatedWorkspaceStaysWithItsGraphForTheNextQuantum() {
         var plan = new QwenExecutionPlan(
                 QwenExecutionFixtures.weights(),
                 QwenExecutionFixtures.norm(),
                 List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
         var gpu = new QwenExecutionFixtures.RecordingGpu();
         gpu.failAllocationAt = 2;
-        gpu.freeFailures = 1;
         var context = new QwenExecutionContext(
                 plan, new QwenSequenceState(103), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
         var runtime = QwenExecutionFixtures.runtime(plan, gpu);
@@ -496,9 +492,17 @@ class QwenExecutionContextTest {
         assertEquals(
                 QwenExecutionContext.Status.FAILED,
                 runtime.submit(context).join().status());
-        assertEquals(gpu.allocations, gpu.frees);
+        assertEquals(1, gpu.allocations.size());
+        assertTrue(gpu.frees.isEmpty(), "the failed admission queued nothing; its graph keeps the allocation");
         assertTrue(context.workspace().isClosed());
+
+        var next = new QwenExecutionContext(
+                plan, new QwenSequenceState(104), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+        assertEquals(
+                QwenExecutionContext.Status.SUCCESS, runtime.submit(next).join().status());
+        assertEquals(4, gpu.allocations.size(), "the next quantum reused the first slot and filled the rest");
         runtime.close();
+        QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
 
     @Test

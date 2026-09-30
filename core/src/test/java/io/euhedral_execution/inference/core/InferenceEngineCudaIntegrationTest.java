@@ -54,7 +54,12 @@ class InferenceEngineCudaIntegrationTest {
                         session.currentTokenPosition());
                 assertTrue(engine.allocatedDeviceBytes() > loaded, "sequence did not retain device state");
             }
-            assertEquals(loaded, engine.allocatedDeviceBytes(), "session device memory was not released");
+            // Execution graphs keep their workspace storage; everything the session owned is released.
+            assertTrue(engine.retainedWorkspaceBytes() > 0);
+            assertEquals(
+                    loaded + engine.retainedWorkspaceBytes(),
+                    engine.allocatedDeviceBytes(),
+                    "session device memory was not released");
             System.out.println("Generated text: " + output);
             System.out.println("Allocated device bytes with the model loaded: " + loaded);
         }

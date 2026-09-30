@@ -56,7 +56,6 @@ public final class QwenExecutionContext implements StageQuantum {
     private QwenSequenceState.ExecutionLease lease;
     private QwenExecutionWorkspace workspace;
     private QwenDeviceLogits logitsOutput;
-    private long temporaryTokenIdsAddress;
     private ExecutionGpu gpu;
     private Consumer<? super QwenExecutionContext> terminalConsumer;
     private Outcome pendingOutcome;
@@ -174,23 +173,6 @@ public final class QwenExecutionContext implements StageQuantum {
         return this.kind;
     }
 
-    /// Allocates this quantum's temporary token-ID upload buffer.
-    public long allocateTemporaryTokenIds(ExecutionGpu gpu, long bytes) {
-        this.temporaryTokenIdsAddress = gpu.allocate(bytes);
-        if (this.temporaryTokenIdsAddress == 0) {
-            throw new IllegalStateException("GPU returned a null token-ID address");
-        }
-        return this.temporaryTokenIdsAddress;
-    }
-
-    /// Releases the temporary token-ID upload buffer when its embedding instruction is finalized.
-    public void releaseTemporaryTokenIds(ExecutionGpu gpu) {
-        if (this.temporaryTokenIdsAddress != 0) {
-            gpu.free(this.temporaryTokenIdsAddress);
-            this.temporaryTokenIdsAddress = 0;
-        }
-    }
-
     /// Claims this quantum's single admission. A claimed quantum always reaches a terminal outcome, so
     /// a failed admission can never be retried into a second lease or workspace.
     void claim() {
@@ -202,23 +184,29 @@ public final class QwenExecutionContext implements StageQuantum {
     /// Package-private hook to deterministically exercise cancellation at the lease-claim boundary.
     void begin(ExecutionGpu gpu, Runnable beforeClaim) {
         claim();
-        if (!begin(gpu, null, null, beforeClaim)) publishOutcome();
+        if (!begin(gpu, null, null, new QwenWorkspaceStorage(gpu), beforeClaim)) publishOutcome();
     }
 
-    /// Claims the sequence and prepares quantum-owned storage with `stream` selected, so any
+    /// Claims the sequence and binds the executing graph's `storage` with `stream` selected, so any
     /// initialization it queues precedes every stage of the quantum. Returns whether the quantum
     /// proceeds to its stages. Otherwise its terminal outcome is prepared, and the caller publishes it
     /// once the stream is no longer selected.
-    boolean begin(ExecutionGpu gpu, GpuStream stream, Consumer<? super QwenExecutionContext> terminalConsumer) {
-        return begin(gpu, stream, terminalConsumer, NO_OP);
+    boolean begin(
+            ExecutionGpu gpu,
+            GpuStream stream,
+            Consumer<? super QwenExecutionContext> terminalConsumer,
+            QwenWorkspaceStorage storage) {
+        return begin(gpu, stream, terminalConsumer, storage, NO_OP);
     }
 
     private boolean begin(
             ExecutionGpu gpu,
             GpuStream stream,
             Consumer<? super QwenExecutionContext> terminalConsumer,
+            QwenWorkspaceStorage storage,
             Runnable beforeClaim) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
+        Objects.requireNonNull(storage, "storage");
         this.terminalConsumer = terminalConsumer;
         if (this.sequence.cancellationRequested()) {
             this.pendingOutcome = new Outcome(Status.CANCELLED, null);
@@ -247,9 +235,9 @@ public final class QwenExecutionContext implements StageQuantum {
             }
             initializeSequenceState(gpu);
             this.workspace = this.plan.hasFirstLayer()
-                    ? new QwenExecutionWorkspace(gpu, this.tokenIds.length, this.plan, this.logitsRequirement)
+                    ? new QwenExecutionWorkspace(storage, this.tokenIds.length, this.plan, this.logitsRequirement)
                     : new QwenExecutionWorkspace(
-                            gpu,
+                            storage,
                             this.tokenIds.length,
                             this.plan.weights().config().hiddenSize(),
                             this.plan.projectionWidths());
@@ -331,11 +319,6 @@ public final class QwenExecutionContext implements StageQuantum {
         }
         if (deviceFailure != null) fail(deviceFailure);
         ExecutionGpu gpu = this.gpu;
-        try {
-            releaseTemporaryTokenIds(gpu);
-        } catch (Throwable cleanupFailure) {
-            fail(cleanupFailure);
-        }
         if (this.failure.get() == null && !this.sequence.cancellationRequested()) {
             try {
                 retainLogits(gpu);

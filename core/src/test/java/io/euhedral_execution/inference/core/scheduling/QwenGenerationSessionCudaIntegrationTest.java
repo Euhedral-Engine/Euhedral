@@ -147,8 +147,10 @@ class QwenGenerationSessionCudaIntegrationTest {
                                 session.sequenceState().terminalState());
                         assertThrows(IllegalStateException.class, () -> recurrent.forLayer(0));
                         assertThrows(IllegalStateException.class, () -> attention.forLayer(3));
+                        // The runtime's graphs keep their workspace storage for later quanta.
+                        assertTrue(runtime.retainedWorkspaceBytes() > 0);
                         assertEquals(
-                                allocatedAfterWeights,
+                                allocatedAfterWeights + runtime.retainedWorkspaceBytes(),
                                 gpu.allocatedBytes(),
                                 "session close did not release its persistent KV/GDN state and sampled logits");
                     } finally {
