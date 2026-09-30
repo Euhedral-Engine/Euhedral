@@ -17,10 +17,11 @@ import java.util.function.Consumer;
 
 /// Admits Qwen quanta into reusable frame graphs and owns the Euhedral sources that run them.
 ///
-/// Admission acquires an idle graph for the quantum's plan view, prepares quantum-owned resources on
-/// that graph's stream, and publishes the root stages. After that it is out of the execution path:
-/// the stages publish their successors, Euhedral schedules every stage, and the quantum's retirement
-/// frame recycles the graph before publishing the outcome.
+/// Admission acquires an idle graph for the quantum's plan view, binds the graph's workspace storage and
+/// prepares quantum-owned resources on that graph's stream, and publishes the root stages. After that it
+/// is out of the execution path: the stages publish their successors, Euhedral schedules every stage,
+/// and the quantum's retirement frame recycles the graph, with its storage, before publishing the
+/// outcome.
 ///
 /// Each graph publishes through its own source, attached to the lattice once when the graph is built.
 /// Independent quanta therefore stay independently schedulable: a worker draining one graph's source
@@ -89,20 +90,21 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
         context.claim();
         GraphPool pool;
-        StageGraph graph;
+        PooledGraph pooled;
         try {
             this.gpu.ensureHealthy();
             pool = pool(view);
-            graph = pool.acquire();
+            pooled = pool.acquire();
         } catch (RuntimeException | Error failure) {
             context.fail(failure);
             context.finish();
             throw failure;
         }
+        StageGraph graph = pooled.graph();
         try {
             graph.source().admit();
         } catch (RuntimeException | Error failure) {
-            pool.recycle(graph);
+            pool.recycle(pooled);
             context.fail(failure);
             context.finish();
             throw failure;
@@ -111,7 +113,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         try {
             GpuStream stream = graph.stream();
             try {
-                stream.submit(() -> context.begin(this.gpu, stream, terminalConsumer), false);
+                stream.submit(() -> context.begin(this.gpu, stream, terminalConsumer, pooled.storage()), false);
             } catch (RuntimeException | Error failure) {
                 // The stream failed around the preparation; prove it idle before storage is released.
                 stream.recover(failure);
@@ -127,7 +129,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             return context.completion().copy();
         } finally {
             if (!started) {
-                pool.recycle(graph);
+                pool.recycle(pooled);
                 graph.source().terminated();
                 // Outcome callbacks never run with the graph's stream selected.
                 context.publishOutcome();
@@ -178,6 +180,13 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         if (failure != null) throw failure;
     }
 
+    /// Device bytes the graphs' reusable workspace storage retains between quanta.
+    public long retainedWorkspaceBytes() {
+        long bytes = 0;
+        for (GraphPool pool : this.pools.values()) bytes += pool.retainedWorkspaceBytes();
+        return bytes;
+    }
+
     /// Admitted quanta whose graphs have not yet retired.
     public int activeQuanta() {
         int active = 0;
@@ -191,29 +200,35 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return false;
     }
 
+    /// A reusable graph and the workspace storage its quanta bind. Both are recycled together, only
+    /// after the graph's quantum retired, so storage is never shared by two live quanta.
+    private record PooledGraph(StageGraph graph, QwenWorkspaceStorage storage) {}
+
     /// Idle graphs of one plan view. Graphs are built only when every existing one is in use.
     private final class GraphPool {
         private final QwenExecutionPlan view;
-        private final MpmcQueue<StageGraph> idle = new MpmcQueue<>(16, 2);
-        private final List<StageGraph> built = new ArrayList<>();
+        private final MpmcQueue<PooledGraph> idle = new MpmcQueue<>(16, 2);
+        private final List<PooledGraph> built = new ArrayList<>();
 
         private GraphPool(QwenExecutionPlan view) {
             this.view = view;
         }
 
-        StageGraph acquire() {
-            StageGraph graph = this.idle.poll();
+        PooledGraph acquire() {
+            PooledGraph graph = this.idle.poll();
             return graph != null ? graph : build();
         }
 
-        void recycle(StageGraph graph) {
+        void recycle(PooledGraph graph) {
             if (!this.idle.offer(graph)) throw new IllegalStateException("idle graph pool rejected a graph");
         }
 
-        private StageGraph build() {
+        private PooledGraph build() {
             ensureOpen();
             ExecutionGpu gpu = EuhedralInferenceRuntime.this.gpu;
             GpuStream stream = gpu.openStream();
+            QwenWorkspaceStorage storage = new QwenWorkspaceStorage(gpu);
+            PooledGraph[] pooled = new PooledGraph[1];
             StageGraph graph;
             try {
                 List<QwenExecutionPlan.Instruction> instructions = this.view.instructions();
@@ -222,7 +237,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                         (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu),
                         stream,
                         new QwenExecutionSource(),
-                        this::recycle);
+                        retired -> recycle(pooled[0]));
             } catch (RuntimeException | Error failure) {
                 try {
                     stream.close();
@@ -231,6 +246,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 }
                 throw failure;
             }
+            pooled[0] = new PooledGraph(graph, storage);
             synchronized (EuhedralInferenceRuntime.this.closeLock) {
                 // A close that ran during this build saw no such graph; it would never release it.
                 if (EuhedralInferenceRuntime.this.closed) {
@@ -238,12 +254,12 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     throw new IllegalStateException("inference runtime is closed");
                 }
                 synchronized (this.built) {
-                    this.built.add(graph);
+                    this.built.add(pooled[0]);
                 }
             }
             // Attached once per reusable graph, never per quantum. A close from here on completes it.
             EuhedralInferenceRuntime.this.lattice.addUpstream(graph.source());
-            return graph;
+            return pooled[0];
         }
 
         /// Closes each graph's admission, then waits until its accepted quantum retired and Euhedral
@@ -251,7 +267,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         void completeSources() {
             List<StageGraph> graphs;
             synchronized (this.built) {
-                graphs = List.copyOf(this.built);
+                graphs = this.built.stream().map(PooledGraph::graph).toList();
             }
             RuntimeException failure = null;
             for (StageGraph graph : graphs) {
@@ -276,30 +292,50 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         int activeQuanta() {
             int active = 0;
             synchronized (this.built) {
-                for (StageGraph graph : this.built) active += graph.source().activeGraphs();
+                for (PooledGraph pooled : this.built)
+                    active += pooled.graph().source().activeGraphs();
             }
             return active;
         }
 
         boolean attached() {
             synchronized (this.built) {
-                for (StageGraph graph : this.built) if (graph.source().isAttached()) return true;
+                for (PooledGraph pooled : this.built)
+                    if (pooled.graph().source().isAttached()) return true;
             }
             return false;
         }
 
+        long retainedWorkspaceBytes() {
+            long bytes = 0;
+            synchronized (this.built) {
+                for (PooledGraph pooled : this.built) bytes += pooled.storage().retainedBytes();
+            }
+            return bytes;
+        }
+
+        /// Releases each retired graph's stream and storage. A GPU that cannot prove its submitted work
+        /// stopped keeps the storage, which stays counted: queued kernels may still reference it.
         void close() {
             RuntimeException failure = null;
+            boolean proven = EuhedralInferenceRuntime.this.gpu.completionProven();
             synchronized (this.built) {
-                for (StageGraph graph : this.built) {
+                for (PooledGraph pooled : this.built) {
                     try {
-                        graph.close();
+                        pooled.graph().close();
+                    } catch (RuntimeException closeFailure) {
+                        if (failure == null) failure = closeFailure;
+                        else failure.addSuppressed(closeFailure);
+                    }
+                    if (!proven) continue;
+                    try {
+                        pooled.storage().close();
                     } catch (RuntimeException closeFailure) {
                         if (failure == null) failure = closeFailure;
                         else failure.addSuppressed(closeFailure);
                     }
                 }
-                this.built.clear();
+                this.built.removeIf(pooled -> pooled.storage().isClosed());
             }
             if (failure != null) throw failure;
         }

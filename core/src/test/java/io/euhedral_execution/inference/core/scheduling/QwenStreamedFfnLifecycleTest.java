@@ -60,18 +60,23 @@ class QwenStreamedFfnLifecycleTest {
             assertEquals(expected, outcome.get(2, TimeUnit.SECONDS).status());
             if (scenario == Scenario.UNPROVEN_DRAIN || scenario == Scenario.UNPROVEN_DRAIN_AFTER_SUCCESSFUL_LAUNCH) {
                 assertTrue(gpu.poisoned);
-                assertTrue(gpu.borrowed.stream().noneMatch(gpu.freed()::contains));
             } else {
                 assertFalse(gpu.pending);
-                assertTrue(gpu.freed().containsAll(gpu.borrowed));
             }
+            // The graph retains the borrowed slots for its next quantum; only closing the runtime frees them.
+            assertTrue(gpu.borrowed.stream().noneMatch(gpu.freed()::contains));
             if (scenario == Scenario.COMPLETION_REGISTRATION) assertTrue(gpu.stream.recoveries > 0);
         } finally {
             context.cancel();
             runtime.close();
-            // A poisoned device retains the sequence's persistent state as well.
-            if (gpu.poisoned) assertThrows(IllegalStateException.class, sequence::complete);
-            else sequence.complete();
+            // A poisoned device retains the sequence's persistent state and the graph's storage as well.
+            if (gpu.poisoned) {
+                assertTrue(gpu.borrowed.stream().noneMatch(gpu.freed()::contains));
+                assertThrows(IllegalStateException.class, sequence::complete);
+            } else {
+                assertTrue(gpu.freed().containsAll(gpu.borrowed));
+                sequence.complete();
+            }
         }
     }
 
