@@ -78,3 +78,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_ffn_down_128x64(
  const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) {
  __shared__ qwen_ffn_tiles::Storage<4,32> s;qwen_ffn_down::run<4,32>(x,w,y,m,k,n,scale,nullptr,0,k,s);
 }
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_ffn_down_64x64(
+ const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) {
+ __shared__ qwen_ffn_tiles::Storage<2,32> s;qwen_ffn_down::run<2,32>(x,w,y,m,k,n,scale,nullptr,0,k,s);
+}
