@@ -163,7 +163,29 @@ calling worker to its CUDA device before their first kernel load and before each
 threads while the current implementation remains single-device; multi-device context selection and
 cross-device model residency are not implemented.
 
+### Asynchronous decode chains
+
+Under `ASYNC_EXPERIMENTAL`, a DECODE quantum is not scheduled instruction by instruction. `QwenWorkGenerator`
+publishes one `QwenChainFrame`, which launches every plan instruction in plan order on a single CUDA stream and then
+registers one completion event for the whole quantum. Plan order is topological (every dependency points to an earlier
+instruction) and stream order already sequences the kernels, so no per-instruction host callback is needed. Each
+instruction's success-only finalization (`gpuCompleted`, such as the KV append commit) and temporary-resource release run
+when that one completion fires, in instruction order. Attention reads its cache length as `startPosition + tokens`
+because the append's commit is deferred until completion. PREFILL quanta keep the per-instruction dependency
+scheduling across worker streams.
+
+Measured on the compact Q3 artifact (RTX 5070 Ti, greedy): per-instruction completion left the GPU idle about 55% of the
+decode window because each kernel waited on a host callback; one chain per token cut in-token idle to 0.8% of the window
+and decode from about 11 to 26 tokens/s. The remaining idle is token-boundary host work (logits readback, CPU
+sampling, workspace allocation). A CUDA Graph was rejected on that evidence: kernel-to-kernel gaps are already
+0.26 us at the median.
+
+Decode chains that start below 1024 tokens also launch their kernels with CUDA programmatic dependent launch
+(`euhedral_cuda_pdl_select`). Every kernel registered for it begins with `griddepcontrol.wait`
+(`native/src/pdl.cuh`), so it cannot read a predecessor's output early. It won 12 of 12 paired forks (about +1%)
+at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches. `EUHEDRAL_PDL=0` disables it.
+
 The architecture allows a future scheduler to defer GPU capacity, choose a CPU-capable operation,
 coalesce ready frames, or run another sequence without changing instruction dependencies. This slice
 does not yet generalize the graph across later layers or implement KV cache, full attention, MTP,
-sampling, batching, CUDA Graphs, serving APIs, or asynchronous GPU completion.
+sampling, batching, CUDA Graphs, or serving APIs.

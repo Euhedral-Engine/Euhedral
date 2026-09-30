@@ -89,7 +89,7 @@ class EuhedralInferenceRuntimeLatticeTest {
         var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
         try (var caller = java.util.concurrent.Executors.newSingleThreadExecutor()) {
             var context = new QwenExecutionContext(
-                    plan, new QwenSequenceState(5801), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+                    plan, new QwenSequenceState(5801), QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1});
             var outcome = caller.submit(() -> runtime.execute(List.of(context)));
             for (int instruction = 0; instruction < plan.instructions().size(); instruction++) {
                 assertFalse(outcome.isDone(), "dependencies became terminal before GPU completion");
@@ -98,6 +98,37 @@ class EuhedralInferenceRuntimeLatticeTest {
             assertEquals(
                     QwenExecutionContext.Status.SUCCESS,
                     outcome.get(10, TimeUnit.SECONDS).getFirst().status());
+            assertEquals(0, gpu.synchronizations, "normal async execution must not use a device-wide barrier");
+        } finally {
+            runtime.closeCompletionSink();
+            lattice.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void asyncDecodeLaunchesEveryInstructionInOneChainWithOneCompletion() throws Exception {
+        BitSet cpus = twoWorkerCpus();
+        assumeTrue(!cpus.isEmpty());
+        var lattice = createLattice(cpus);
+        var gpu = new DeferredGpu();
+        var plan = new QwenExecutionPlan(
+                QwenExecutionFixtures.weights(),
+                QwenExecutionFixtures.norm(),
+                List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
+        lattice.start();
+        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        try (var caller = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var context = new QwenExecutionContext(
+                    plan, new QwenSequenceState(5802), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
+            var outcome = caller.submit(() -> runtime.execute(List.of(context)));
+            // One completion covers the whole quantum: stream order already sequences its kernels.
+            gpu.completeNext();
+            assertEquals(
+                    QwenExecutionContext.Status.SUCCESS,
+                    outcome.get(10, TimeUnit.SECONDS).getFirst().status());
+            assertTrue(context.chained());
+            assertEquals(0, gpu.pendingCompletions(), "a chained quantum must defer exactly one completion");
             assertEquals(0, gpu.synchronizations, "normal async execution must not use a device-wide barrier");
         } finally {
             runtime.closeCompletionSink();
@@ -124,6 +155,10 @@ class EuhedralInferenceRuntimeLatticeTest {
         public void deferCompletion(Runnable completed, Consumer<Throwable> failed) {
             pending.offer(completed);
             available.release();
+        }
+
+        int pendingCompletions() {
+            return available.availablePermits();
         }
 
         void completeNext() throws InterruptedException {
