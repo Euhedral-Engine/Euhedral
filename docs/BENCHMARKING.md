@@ -110,7 +110,6 @@ against the working directory, which is the repository root under `./gradlew :be
 | `overwrite`, `append` | `false` | Required when `output` exists. `append` is JSONL only. |
 | `gpuMemory` | `false` | Record device free/total memory before and after each iteration, outside timing. |
 | `gpuHeadroomMiB` | `1024` | Free memory required beyond the artifact size before loading. |
-| `gpuExecutionMode` | `SYNC` | `SYNC` (default) or `ASYNC_EXPERIMENTAL`. The latter submits GPU work to a CUDA stream and finalizes completed instructions through Euhedral completion frames. |
 | `q3DispatchMode` | `AUTO` | `SCALAR` retains the reference implementation; `DECODE` and `PREFILL` force independently callable kernels; `AUTO` selects by token-row count. |
 | `q3SmallRowThreshold` | `8` | `AUTO` uses decode at or below this row count and tiled prefill above it. Zero forces all nonempty Q3 projections through prefill. Recorded with the dispatch mode in run snapshots. |
 | `shutdownTimeoutSeconds` | `10` | Engine shutdown timeout. |
@@ -161,13 +160,11 @@ before each sample outside timing, and records every sample plus BF16 absolute-e
 against scalar. Decode must match scalar bitwise; tiled prefill must stay within one BF16 step
 or 0.001 absolute error near zero. A failed gate is recorded as `failed` and aborts the screen;
 such timing samples are not eligible results. That cache-clear size targets the current GPU; it is not a portable guarantee of
-complete cache eviction. Engine CPU selection, generation scenarios, dispatch selection, and async
-execution settings do not control these deliberately isolated operator calls.
+complete cache eviction. Engine CPU selection, generation scenarios, and dispatch selection do not
+control these deliberately isolated operator calls.
 
 These screens are for rejecting poor candidates and measuring the row crossover. They do not
-replace full-model numerical qualification or independent JVM forks of `run`. Keep all production
-comparisons in the same `gpuExecutionMode`, including the existing per-worker persistent-stream
-mode when comparing against the async baseline.
+replace full-model numerical qualification or independent JVM forks of `run`.
 
 ## Packed Q4/Q5 operator screens
 
@@ -291,7 +288,8 @@ below is illustrative; its values are not a measurement.
   "timings": {"tokenization": 0, "prefill": 0, "firstTokenSample": 0, "timeToFirstToken": 0, "decode": 0,
               "decodeQuantaSum": 0, "finalCommit": 0, "timeToLastToken": 0, "endToEnd": 0},
   "throughput": {"prefillTokensPerSecond": 0.0, "decodeTokensPerSecond": 0.0, "endToEndOutputTokensPerSecond": 0.0},
-  "engine": {"schemaVersion": 1, "tuning": {"workerProcessorIds": [0, 1], "prefillChunkTokens": 512, "gpuExecutionMode": "SYNC"},
+  "engine": {"schemaVersion": 2, "tuning": {"workerProcessorIds": [0, 1], "prefillChunkTokens": 512,
+             "q3DispatchMode": "AUTO", "q3SmallRowThreshold": 8},
              "workerCoreIds": [0], "model": {}, "generation": {}, "runtime": {}},
   "gpuMemory": {"beforeFreeBytes": 0, "afterFreeBytes": 0, "totalBytes": 0}
 }
@@ -299,8 +297,10 @@ below is illustrative; its values are not a measurement.
 
 `engine` is the engine's `InferenceRunSnapshot`: tuning, worker cores, model identity and dimensions,
 generation settings, and Java/Euhedral/native identity. Values the runtime does not expose, such as
-the CUDA runtime version, are `"unavailable"`. `gpuMemory` is null unless `gpuMemory` is enabled; it
-is device-wide, so it includes other processes.
+the CUDA runtime version, are `"unavailable"`. Snapshot version 2 dropped `tuning.gpuExecutionMode`:
+every run submits stream-ordered work asynchronously. Version-1 rows remain readable and ignore that
+field. `gpuMemory` is null unless `gpuMemory` is enabled; it is device-wide, so it includes other
+processes.
 
 ## Importing external results
 
