@@ -80,7 +80,7 @@ class AsyncInferenceEngineCudaIntegrationTest {
     private static Result generateSession(InferenceEngine engine) throws Exception {
         try (var session = engine.createSession(GenerationConfig.greedy(91L))) {
             StringBuilder output = new StringBuilder();
-            List<Integer> tokens = session.generate(PROMPT, 5, output::append);
+            List<Integer> tokens = session.generate(PROMPT, 300, output::append);
             long position = session.currentTokenPosition();
             long visible = tokens.stream()
                     .filter(id -> !engine.tokenizer().isGenerationEosToken(id))
