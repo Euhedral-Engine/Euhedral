@@ -44,8 +44,9 @@ class FfnOwnershipTest(unittest.TestCase):
                                            [p(region),p(weights),p(actual),u(rows),u(width),u(outputs),p(scale),p(state),u(start),u(count)])
                             self.assertEqual(oracle,gpu.download(state,rows*outputs*4),'FP32 boundary')
                             self.assertEqual(gpu.download(expected,rows*outputs*2),gpu.download(actual,rows*outputs*2),'BF16 boundary')
-                        gpu.launch('euhedral_q3_ffn_down_128x64',((rows+127)//128)*(outputs//64),
-                                   [p(x),p(weights),p(actual),u(rows),u(width),u(outputs),p(scale)])
-                        self.assertEqual(gpu.download(expected,rows*outputs*2),gpu.download(actual,rows*outputs*2))
+                        for tile in (64,128):
+                            gpu.launch(f'euhedral_q3_ffn_down_{tile}x64',((rows+tile-1)//tile)*(outputs//64),
+                                       [p(x),p(weights),p(actual),u(rows),u(width),u(outputs),p(scale)])
+                            self.assertEqual(gpu.download(expected,rows*outputs*2),gpu.download(actual,rows*outputs*2),f'{tile}-row tile')
 
 if __name__=='__main__':unittest.main()

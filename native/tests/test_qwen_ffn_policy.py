@@ -11,6 +11,7 @@ HEADER = pathlib.Path(__file__).resolve().parents[1] / 'src'
 SOURCE = '''#include "qwen_ffn_policy.h"
 unsigned gate(unsigned m,unsigned k,unsigned n){return euhedral_ffn_gate_tile_rows(m,k,n);}
 int down(unsigned m,unsigned k,unsigned n){return euhedral_ffn_down_wide(m,k,n);}
+unsigned down_tile(unsigned m,unsigned k,unsigned n){return euhedral_ffn_down_tile_rows(m,k,n);}
 int streamed(unsigned m){return euhedral_ffn_streamed_rows(m);}
 '''
 
@@ -25,7 +26,7 @@ class FfnPolicyTest(unittest.TestCase):
                         '-I', str(HEADER), '-x', 'c', '-', '-o', str(library)],
                        input=SOURCE, text=True, capture_output=True, check=True)
         cls.lib = ctypes.CDLL(str(library))
-        for name in ('gate', 'down'):
+        for name in ('gate', 'down', 'down_tile'):
             getattr(cls.lib, name).argtypes = (ctypes.c_uint,) * 3
             getattr(cls.lib, name).restype = ctypes.c_uint
         cls.lib.streamed.argtypes = (ctypes.c_uint,)
@@ -39,6 +40,14 @@ class FfnPolicyTest(unittest.TestCase):
             import _ctypes
             _ctypes.FreeLibrary(handle)
         cls.temp.cleanup()
+
+    def test_down_tile_rows(self):
+        for rows in (1, 64, 255, 256, 257, 288, 320, 321, 511, 512, 513, 1023, 1024, 1025):
+            expected = 64 if 256 < rows <= 320 else 128 if rows in (256, 512, 1024) else 0
+            with self.subTest(rows=rows):
+                self.assertEqual(expected, self.lib.down_tile(rows, 17408, 5120))
+                for width, outputs in ((17409, 5120), (17408, 5184), (6144, 5120)):
+                    self.assertEqual(0, self.lib.down_tile(rows, width, outputs))
 
     def test_exact_shapes_and_adjacent_fallbacks(self):
         for rows in (1, 63, 64, 65, 128, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025):

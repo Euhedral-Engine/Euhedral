@@ -26,7 +26,7 @@ static int attention_anchor;
 static int ffn_anchor;
 static CUmodule ffn_module;
 static CUfunction gate_up_swiglu;
-static CUfunction gate_up64x32, gate_up128x32, ffn_down128x64;
+static CUfunction gate_up64x32, gate_up128x32, ffn_down128x64, ffn_down64x64;
 static CUfunction ffn_stream_gate;
 static CUfunction ffn_stream_down;
 static CUfunction stream_gate64, stream_gate128, stream_down64, stream_down128;
@@ -144,6 +144,7 @@ static void initialize(void) {
             get_function(ffn_module, &gate_up64x32, "euhedral_q3_gate_up_swiglu_64x32");
             get_function(ffn_module, &gate_up128x32, "euhedral_q3_gate_up_swiglu_128x32");
             get_function(ffn_module, &ffn_down128x64, "euhedral_q3_ffn_down_128x64");
+            get_function(ffn_module, &ffn_down64x64, "euhedral_q3_ffn_down_64x64");
             get_function(ffn_module, &stream_gate64, "stream_gate_up_64x32");
             get_function(ffn_module, &stream_gate128, "stream_gate_up_128x32");
             get_function(ffn_module, &stream_down64, "stream_down_64x64");
@@ -549,8 +550,8 @@ int euhedral_cuda_q3_ffn_down_bf16(
         uint32_t width, uint32_t outputs, uint64_t weight_bytes) {
     if (!input || !weights || !output || !rows || !width || !outputs || !weight_bytes)
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
-    if (!euhedral_ffn_down_wide(rows, width, outputs) || ((uintptr_t)input & 15u) != 0
-            || ((uintptr_t)weights & 3u) != 0)
+    uint32_t tile_rows = euhedral_ffn_down_tile_rows(rows, width, outputs);
+    if (tile_rows == 0u || ((uintptr_t)input & 15u) != 0 || ((uintptr_t)weights & 3u) != 0)
         return euhedral_cuda_linear_q3_prefill_bf16(input, weights, output, rows, width, outputs, weight_bytes);
     uint64_t groups = (uint64_t)outputs * (width / 64u);
     uint64_t scale_offset = (groups * 24u + 255u) & ~UINT64_C(255);
@@ -559,11 +560,13 @@ int euhedral_cuda_q3_ffn_down_bf16(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    if (!ffn_down128x64)
+    // Older source bundles lack the 64-row entry point; they keep the generic route for those rows.
+    CUfunction selected = tile_rows == 64u ? ffn_down64x64 : ffn_down128x64;
+    if (!selected)
         return euhedral_cuda_linear_q3_prefill_bf16(input, weights, output, rows, width, outputs, weight_bytes);
-    uint32_t grid = (rows / 128u) * (outputs / 64u);
+    uint32_t grid = ((rows + tile_rows - 1u) / tile_rows) * (outputs / 64u);
     void* parameters[] = {&input, &weights, &output, &rows, &width, &outputs, &scale_offset};
-    return launch_and_synchronize(ffn_down128x64, grid, 128, parameters);
+    return launch_and_synchronize(selected, grid, 128, parameters);
 }
 
 int euhedral_cuda_residual_rms_norm_bf16(
