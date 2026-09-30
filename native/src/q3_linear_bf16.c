@@ -17,7 +17,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction function;
-static CUfunction decode1, decode2, decode4, prefill, prefill64, prefill64_wmma, prefill64_k32_cb;
+static CUfunction decode1, decode2, decode4, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction optional_kernel(const char* name) {
     CUfunction loaded = NULL;
@@ -30,6 +30,7 @@ static void initialize(void) {
     decode2 = optional_kernel("euhedral_q3_decode_2");
     decode4 = optional_kernel("euhedral_q3_decode_4");
     prefill = optional_kernel("euhedral_q3_prefill");
+    prefill_s104 = optional_kernel("euhedral_q3_prefill_s104");
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
     prefill64_wmma = optional_kernel("euhedral_q3_prefill_64_wmma");
     prefill64_k32_cb = optional_kernel("euhedral_q3_prefill_64_k32_cb");
@@ -75,9 +76,9 @@ static int linear_q3(const void* input, const void* weights, void* output,
     if (mode == 2 || mode == 3) {
         // CB uses 16-byte vector loads; qualified K row strides are multiples of 16.
         int input_aligned_16 = ((uintptr_t)input & 15u) == 0u;
-        prefill_kernel = euhedral_q3_select_prefill_for_input(mode, rows, in_features, out_features,
+        prefill_kernel = euhedral_q3_select_prefill_s104(mode, rows, in_features, out_features,
                 prefill64_k32_cb != NULL, input_aligned_16,
-                prefill64 != NULL, prefill64_wmma != NULL);
+                prefill64 != NULL, prefill64_wmma != NULL, prefill_s104 != NULL);
         wide_prefill = euhedral_q3_prefill_tile_rows(prefill_kernel) == 64u;
         grid = (((uint64_t)rows + (wide_prefill ? 63 : 31)) / (wide_prefill ? 64 : 32))
                 * (((uint64_t)out_features + 31) / 32);
@@ -93,6 +94,7 @@ static int linear_q3(const void* input, const void* weights, void* output,
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64_K32_CB ? prefill64_k32_cb
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64_WMMA ? prefill64_wmma
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64 ? prefill64
+            : prefill_kernel == EUHEDRAL_Q3_PREFILL32_S104 ? prefill_s104
             : prefill_kernel == EUHEDRAL_Q3_PREFILL32 ? prefill : NULL;
     if (selected == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     CUresult status = cuLaunchKernel(selected, (unsigned int)grid, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);

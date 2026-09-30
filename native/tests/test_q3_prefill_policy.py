@@ -47,6 +47,9 @@ int select_with_cb_input_alignment(int mode, unsigned rows, unsigned width, unsi
     return -1;
 #endif
 }
+int select_s104(int mode, unsigned rows, unsigned width, unsigned outputs, int has_s104) {
+    return (int)euhedral_q3_select_prefill_s104(mode, rows, width, outputs, 1, 1, 1, 1, has_s104);
+}
 int prefill_tile_rows(int selected) {
 #ifdef EUHEDRAL_Q3_HAS_K32_PREFILL_TILE_POLICY
     return (int)euhedral_q3_prefill_tile_rows((enum euhedral_q3_prefill_kernel)selected);
@@ -85,6 +88,9 @@ class Q3PrefillPolicyTest(unittest.TestCase):
                                                             ctypes.c_uint, ctypes.c_int, ctypes.c_int,
                                                             ctypes.c_int, ctypes.c_int)
         cls.lib.select_with_cb_input_alignment.restype = ctypes.c_int
+        cls.lib.select_s104.argtypes = (ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                                        ctypes.c_int)
+        cls.lib.select_s104.restype = ctypes.c_int
         cls.lib.prefill_tile_rows.argtypes = (ctypes.c_int,)
         cls.lib.prefill_tile_rows.restype = ctypes.c_int
 
@@ -148,6 +154,21 @@ class Q3PrefillPolicyTest(unittest.TestCase):
         self.assertEqual(NONE, select(3, 64, *down, 0, 1))
         self.assertEqual(NONE, select(0, 64, *down, 1, 1))
 
+    def test_s104_route_is_limited_to_measured_mixer_row_counts(self):
+        P32, S104 = 1, 5
+        for rows in (1, 8, 16, 32, 65, 80, 96):
+            with self.subTest(rows=rows):
+                self.assertEqual(S104, self.lib.select_s104(2, rows, 6144, 5120, 1))
+                self.assertEqual(P32, self.lib.select_s104(2, rows, 6144, 5120, 0))
+        for rows in (33, 48, 64, 97, 128, 192):
+            with self.subTest(rows=rows):
+                self.assertEqual(P32, self.lib.select_s104(2, rows, 6144, 5120, 1))
+        for width, outputs in ((5120, 34816), (17408, 5120), (6144, 5121)):
+            self.assertNotEqual(S104, self.lib.select_s104(2, 32, width, outputs, 1))
+        for mode in (0, 1, 3):
+            self.assertNotEqual(S104, self.lib.select_s104(mode, 32, 6144, 5120, 1))
+        self.assertEqual(32, self.lib.prefill_tile_rows(S104))
+
     def test_compact_b_route_is_only_used_for_measured_shapes(self):
         NONE, P32, P64, WMMA, K32_CB = 0, 1, 2, 3, 4
         cases = (
@@ -155,6 +176,7 @@ class Q3PrefillPolicyTest(unittest.TestCase):
             (256, 5120, 34816, P64),
             (1024, 5120, 34816, P64),
             (256, 6144, 5120, P32),
+            (512, 6144, 5120, P64),
             (1024, 6144, 5120, P64),
             (64, 17408, 5120, WMMA),
             (256, 17408, 5120, P64),
@@ -187,7 +209,8 @@ class Q3PrefillPolicyTest(unittest.TestCase):
             (1023, 17408, 5120, P64),
             (1025, 17408, 5120, P64),
             (128, 5120, 34816, P64),     # unmeasured; leave AUTO unchanged
-            (512, 6144, 5120, P64),      # existing mixer tile64 route
+            (511, 6144, 5120, P32),      # adjacent to the qualified M=512 shape
+            (513, 6144, 5120, P64),
             (256, 6144, 5121, P32),      # different operator shape
         )
         for rows, width, outputs, fallback in excluded:
@@ -210,6 +233,7 @@ class Q3PrefillPolicyTest(unittest.TestCase):
             (256, 5120, 34816, 2),
             (1024, 5120, 34816, 2),
             (256, 6144, 5120, 1),
+            (512, 6144, 5120, 2),
             (1024, 6144, 5120, 2),
             (64, 17408, 5120, 3),
             (256, 17408, 5120, 2),
@@ -230,6 +254,7 @@ class Q3PrefillPolicyTest(unittest.TestCase):
             (64, 5120, 34816, 64),   # qualified gate/up: legacy tile64
             (256, 5120, 34816, 64),
             (256, 6144, 5120, 32),   # qualified mixer: legacy tile32
+            (512, 6144, 5120, 64),   # qualified mixer: legacy tile64
             (1024, 6144, 5120, 64),
             (64, 17408, 5120, 64),   # legacy WMMA still has a 64-row grid
             (64, 6144, 5120, 32),    # measured mixer regression

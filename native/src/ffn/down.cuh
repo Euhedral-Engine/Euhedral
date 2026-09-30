@@ -24,7 +24,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
         if(owns_a)qwen_ffn_tiles::activation<F>(s.a[0][mb],x,rows,count,row0,mb,0,lane);
         else {
             #pragma unroll
-            for(int t=0;t<N/16;++t)produce_b(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][1]+t*16u*32u,layout,outputs,col0+nb*N+t*16u,start,lane);
+            for(int t=0;t<N/16;++t)produce_b<false>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][1]+t*16u*32u,layout,outputs,col0+nb*N+t*16u,start,lane);
         }
         arrive(&s.ready[branch][0]);
     }
@@ -54,7 +54,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
             if(owns_a)qwen_ffn_tiles::activation<F>(s.a[n&1u][mb],x,rows,count,row0,mb,n*32u,lane);
             else {
                 #pragma unroll
-                for(int t=0;t<N/16;++t)stage_compact_b(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][1]+t*16u*32u,next[t],lane);
+                for(int t=0;t<N/16;++t)stage_compact_b<false>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][1]+t*16u*32u,next[t],lane);
             }
             arrive(&s.ready[branch][n&1u]);
         }

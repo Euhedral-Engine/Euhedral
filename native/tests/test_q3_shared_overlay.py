@@ -62,6 +62,10 @@ class Q3SharedOverlayTest(unittest.TestCase):
         self.assertIn('constexpr int A_STRIDE = 80;', kernels)
         self.assertIn('constexpr int B_STRIDE = Tile::kRows == 32 ? 80 : 64;', kernels)
         self.assertIn('Tile::kCols * B_STRIDE', kernels)
+        self.assertIn('constexpr int A_STRIDE = 88;', kernels)
+        self.assertIn('constexpr int B_STRIDE = 88;', kernels)
+        self.assertIn('constexpr int A_STRIDE = 104;', kernels)
+        self.assertIn('constexpr int B_STRIDE = 104;', kernels)
 
     def test_prefill_compact_next_group_before_current_mma(self):
         source = (ROOT / 'native/src/q3/strategies/prefill.cuh').read_text()
@@ -94,9 +98,10 @@ class Q3SharedOverlayTest(unittest.TestCase):
             gpu = Gpu(b'#include "q3/kernels.cu"\n', include_dir=PRODUCT)
             cleanup.callback(gpu.close)
             attribute = _bind(CUDA, 'cuFuncGetAttribute', [C.POINTER(I), I, P])
-            for kernel, expected_bytes in [('euhedral_q3_prefill', 15360),
+            for kernel, expected_bytes in [('euhedral_q3_prefill', 16896),
+                                           ('euhedral_q3_prefill_s104', 19968),
                                            ('euhedral_q3_prefill_64', 18432),
-                                           ('euhedral_q3_prefill_64_k32_cb', 16512)]:
+                                           ('euhedral_q3_prefill_64_k32_cb', 18560)]:
                 with self.subTest(kernel=kernel):
                     function = P()
                     _check(gpu.function(C.byref(function), gpu.module, kernel.encode()), kernel)
