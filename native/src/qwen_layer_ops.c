@@ -292,9 +292,9 @@ int euhedral_cuda_linear_bf16_to_float(
 int euhedral_cuda_gdn_control_fp32(
         const float* device_a_projection, const float* device_b_projection,
         const float* device_a_log, const float* device_dt_bias,
-        float* device_g_output, float* device_beta_output, uint32_t rows, uint32_t heads) {
+        float* device_alpha_output, float* device_beta_output, uint32_t rows, uint32_t heads) {
     if (device_a_projection == NULL || device_b_projection == NULL || device_a_log == NULL || device_dt_bias == NULL
-            || device_g_output == NULL || device_beta_output == NULL || rows == 0 || heads == 0)
+            || device_alpha_output == NULL || device_beta_output == NULL || rows == 0 || heads == 0)
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     const uint64_t count = (uint64_t)rows * heads;
     if (count > UINT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
@@ -306,10 +306,10 @@ int euhedral_cuda_gdn_control_fp32(
     CUdeviceptr b = (CUdeviceptr)(uintptr_t)device_b_projection;
     CUdeviceptr a_log = (CUdeviceptr)(uintptr_t)device_a_log;
     CUdeviceptr dt_bias = (CUdeviceptr)(uintptr_t)device_dt_bias;
-    CUdeviceptr g = (CUdeviceptr)(uintptr_t)device_g_output;
+    CUdeviceptr alpha = (CUdeviceptr)(uintptr_t)device_alpha_output;
     CUdeviceptr beta = (CUdeviceptr)(uintptr_t)device_beta_output;
     uint32_t rows_arg = rows, heads_arg = heads;
-    void* parameters[] = {&a, &b, &a_log, &dt_bias, &g, &beta, &rows_arg, &heads_arg};
+    void* parameters[] = {&a, &b, &a_log, &dt_bias, &alpha, &beta, &rows_arg, &heads_arg};
     return launch_and_synchronize(gdn_control, (uint32_t)((count + 127) / 128), 128, parameters);
 }
 
@@ -337,11 +337,11 @@ int euhedral_cuda_gdn_convolution_bf16(
 }
 
 int euhedral_cuda_gdn_recurrence_bf16(
-        const void* device_convolved, const float* device_g, const float* device_beta,
+        const void* device_convolved, const float* device_alpha, const float* device_beta,
         float* device_recurrent_state, void* device_output, uint32_t rows,
         uint32_t key_heads, uint32_t value_heads, uint32_t key_head_dim,
         uint32_t value_head_dim, float output_scale) {
-    if (device_convolved == NULL || device_g == NULL || device_beta == NULL || device_recurrent_state == NULL
+    if (device_convolved == NULL || device_alpha == NULL || device_beta == NULL || device_recurrent_state == NULL
             || device_output == NULL || rows == 0 || key_heads == 0 || value_heads == 0
             || value_heads % key_heads != 0 || key_head_dim != 128 || value_head_dim != 128
             || !isfinite(output_scale) || output_scale <= 0.0f)
@@ -353,15 +353,16 @@ int euhedral_cuda_gdn_recurrence_bf16(
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     CUdeviceptr convolved = (CUdeviceptr)(uintptr_t)device_convolved;
-    CUdeviceptr g = (CUdeviceptr)(uintptr_t)device_g;
+    CUdeviceptr alpha = (CUdeviceptr)(uintptr_t)device_alpha;
     CUdeviceptr beta = (CUdeviceptr)(uintptr_t)device_beta;
     CUdeviceptr state = (CUdeviceptr)(uintptr_t)device_recurrent_state;
     CUdeviceptr output = (CUdeviceptr)(uintptr_t)device_output;
     uint32_t rows_arg = rows, key_heads_arg = key_heads, value_heads_arg = value_heads;
     uint32_t key_dim_arg = key_head_dim, value_dim_arg = value_head_dim;
-    void* parameters[] = {&convolved, &g, &beta, &state, &output, &rows_arg,
+    void* parameters[] = {&convolved, &alpha, &beta, &state, &output, &rows_arg,
             &key_heads_arg, &value_heads_arg, &key_dim_arg, &value_dim_arg, &output_scale};
-    return launch_and_synchronize(gdn_recurrence, (uint32_t)rows_count, key_head_dim, parameters);
+    // Must match QWEN_GDN_WARP_COLUMNS (8 value columns per warp) in qwen_gdn_ops.cu.
+    return launch_and_synchronize(gdn_recurrence, (uint32_t)(rows_count / 8), 32, parameters);
 }
 
 int euhedral_cuda_gdn_gated_rms_norm_bf16(
@@ -529,9 +530,9 @@ int euhedral_cuda_residual_rms_norm_bf16(
 
 int euhedral_cuda_gdn_project_control_fp32(
         const void* input, const void* a_weight, const void* b_weight,
-        const float* a_log, const float* dt_bias, float* g, float* beta,
+        const float* a_log, const float* dt_bias, float* alpha, float* beta,
         uint32_t rows, uint32_t width, uint32_t heads) {
-    if (!input || !a_weight || !b_weight || !a_log || !dt_bias || !g || !beta
+    if (!input || !a_weight || !b_weight || !a_log || !dt_bias || !alpha || !beta
             || rows == 0 || width == 0 || heads == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     const uint64_t count = (uint64_t)rows * heads;
     if (count > INT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
@@ -540,7 +541,7 @@ int euhedral_cuda_gdn_project_control_fp32(
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     if (!gdn_project_control) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-    void* parameters[] = {&input, &a_weight, &b_weight, &a_log, &dt_bias, &g, &beta, &rows, &width, &heads};
+    void* parameters[] = {&input, &a_weight, &b_weight, &a_log, &dt_bias, &alpha, &beta, &rows, &width, &heads};
     return launch_and_synchronize(gdn_project_control, (uint32_t)count, 128, parameters);
 }
 

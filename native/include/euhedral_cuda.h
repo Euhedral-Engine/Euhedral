@@ -119,7 +119,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_control_fp32(
         const float* device_b_projection,
         const float* device_a_log,
         const float* device_dt_bias,
-        float* device_g_output,
+        float* device_alpha_output,
         float* device_beta_output,
         uint32_t rows,
         uint32_t heads);
@@ -138,7 +138,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_convolution_bf16(
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_recurrence_bf16(
         const void* device_convolved,
-        const float* device_g,
+        const float* device_alpha,
         const float* device_beta,
         float* device_recurrent_state,
         void* device_output,
@@ -176,7 +176,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_rms_norm_bf16(
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_project_control_fp32(
         const void* input, const void* a_weight, const void* b_weight,
-        const float* a_log, const float* dt_bias, float* g, float* beta,
+        const float* a_log, const float* dt_bias, float* alpha, float* beta,
         uint32_t rows, uint32_t width, uint32_t heads);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_add_bf16(

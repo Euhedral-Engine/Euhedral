@@ -276,11 +276,11 @@ class QwenLayerGpuOperationsIntegrationTest {
         float[] b = {-3.0f, 0.0f, 2.0f, 1.0f, -1.0f, 0.5f};
         float[] aLog = {-1.0f, -0.25f, 0.2f};
         float[] dtBias = {0.1f, -0.2f, 0.3f};
-        float[] expectedG = new float[a.length];
+        float[] expectedAlpha = new float[a.length];
         float[] expectedBeta = new float[b.length];
         for (int i = 0; i < a.length; i++) {
             float shifted = a[i] + dtBias[i % heads];
-            expectedG[i] = (float) (-Math.exp(aLog[i % heads]) * softplus(shifted));
+            expectedAlpha[i] = (float) Math.exp((float) (-Math.exp(aLog[i % heads]) * softplus(shifted)));
             expectedBeta[i] = (float) (1.0 / (1.0 + Math.exp(-b[i])));
         }
 
@@ -290,15 +290,16 @@ class QwenLayerGpuOperationsIntegrationTest {
             long bAddress = uploadFloats(gpu, arena, b);
             long aLogAddress = uploadFloats(gpu, arena, aLog);
             long dtBiasAddress = uploadFloats(gpu, arena, dtBias);
-            long gAddress = gpu.allocate((long) a.length * Float.BYTES);
+            long alphaAddress = gpu.allocate((long) a.length * Float.BYTES);
             long betaAddress = gpu.allocate((long) b.length * Float.BYTES);
             try {
-                gpu.gdnControlFp32(aAddress, bAddress, aLogAddress, dtBiasAddress, gAddress, betaAddress, rows, heads);
-                assertFloatEquals(expectedG, downloadFloats(gpu, arena, gAddress, a.length), 0.00002f);
+                gpu.gdnControlFp32(
+                        aAddress, bAddress, aLogAddress, dtBiasAddress, alphaAddress, betaAddress, rows, heads);
+                assertFloatEquals(expectedAlpha, downloadFloats(gpu, arena, alphaAddress, a.length), 0.00002f);
                 assertFloatEquals(expectedBeta, downloadFloats(gpu, arena, betaAddress, b.length), 0.00002f);
             } finally {
                 gpu.free(betaAddress);
-                gpu.free(gAddress);
+                gpu.free(alphaAddress);
                 gpu.free(dtBiasAddress);
                 gpu.free(aLogAddress);
                 gpu.free(bAddress);
@@ -372,7 +373,7 @@ class QwenLayerGpuOperationsIntegrationTest {
         float[] initialState = new float[valueHeads * headDim * headDim];
         for (int i = 0; i < convolved.length; i++) convolved[i] = floatToBf16((i % 37 - 18) * 0.0078125f);
         for (int i = 0; i < g.length; i++) {
-            g[i] = -0.1f - (i % 5) * 0.03f;
+            g[i] = (float) Math.exp(-0.1f - (i % 5) * 0.03f);
             beta[i] = 0.2f + (i % 7) * 0.08f;
         }
         for (int i = 0; i < initialState.length; i++) initialState[i] = (i % 19 - 9) * 0.0005f;
@@ -382,14 +383,14 @@ class QwenLayerGpuOperationsIntegrationTest {
         try (CudaGpuMemory gpu = new CudaGpuMemory(cudaLibrary());
                 Arena arena = Arena.ofConfined()) {
             long convolvedAddress = upload(gpu, arena, convolved);
-            long gAddress = uploadFloats(gpu, arena, g);
+            long alphaAddress = uploadFloats(gpu, arena, g);
             long betaAddress = uploadFloats(gpu, arena, beta);
             long stateAddress = uploadFloats(gpu, arena, initialState);
             long outputAddress = gpu.allocate((long) rows * valueWidth * Short.BYTES);
             try {
                 gpu.gdnRecurrenceBf16(
                         convolvedAddress,
-                        gAddress,
+                        alphaAddress,
                         betaAddress,
                         stateAddress,
                         outputAddress,
@@ -406,7 +407,7 @@ class QwenLayerGpuOperationsIntegrationTest {
                 gpu.free(outputAddress);
                 gpu.free(stateAddress);
                 gpu.free(betaAddress);
-                gpu.free(gAddress);
+                gpu.free(alphaAddress);
                 gpu.free(convolvedAddress);
             }
         }
@@ -666,7 +667,7 @@ class QwenLayerGpuOperationsIntegrationTest {
                 int valueBase = row * convolvedWidth + queryKeyWidth + valueHead * headDim;
                 float[] query = normalized(convolved, queryBase, headDim);
                 float[] key = normalized(convolved, keyBase, headDim);
-                float alpha = (float) Math.exp(g[row * valueHeads + valueHead]);
+                float alpha = g[row * valueHeads + valueHead];
                 float gate = beta[row * valueHeads + valueHead];
                 for (int dv = 0; dv < headDim; dv++) {
                     int stateOffset = (valueHead * headDim + dv) * headDim;

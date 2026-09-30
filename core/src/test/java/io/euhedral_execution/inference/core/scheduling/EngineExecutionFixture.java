@@ -189,7 +189,7 @@ public final class EngineExecutionFixture {
                 long bProjectionAddress,
                 long aLogAddress,
                 long dtBiasAddress,
-                long gOutputAddress,
+                long alphaOutputAddress,
                 long betaOutputAddress,
                 int rows,
                 int heads) {}
@@ -212,7 +212,7 @@ public final class EngineExecutionFixture {
         @Override
         public void gdnRecurrenceBf16(
                 long convolvedAddress,
-                long gAddress,
+                long alphaAddress,
                 long betaAddress,
                 long recurrentStateAddress,
                 long outputAddress,

@@ -937,13 +937,18 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             long bProjectionAddress,
             long aLogAddress,
             long dtBiasAddress,
-            long gOutputAddress,
+            long alphaOutputAddress,
             long betaOutputAddress,
             int rows,
             int heads) {
         ensureOpen();
         requireAddresses(
-                aProjectionAddress, bProjectionAddress, aLogAddress, dtBiasAddress, gOutputAddress, betaOutputAddress);
+                aProjectionAddress,
+                bProjectionAddress,
+                aLogAddress,
+                dtBiasAddress,
+                alphaOutputAddress,
+                betaOutputAddress);
         if (rows <= 0 || heads <= 0) throw new IllegalArgumentException("GDN control dimensions must be positive");
         invokeLayer(
                 "GDN control",
@@ -952,7 +957,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 MemorySegment.ofAddress(bProjectionAddress),
                 MemorySegment.ofAddress(aLogAddress),
                 MemorySegment.ofAddress(dtBiasAddress),
-                MemorySegment.ofAddress(gOutputAddress),
+                MemorySegment.ofAddress(alphaOutputAddress),
                 MemorySegment.ofAddress(betaOutputAddress),
                 rows,
                 heads);
@@ -999,7 +1004,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void gdnRecurrenceBf16(
             long convolvedAddress,
-            long gAddress,
+            long alphaAddress,
             long betaAddress,
             long recurrentStateAddress,
             long outputAddress,
@@ -1010,7 +1015,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int valueHeadDim,
             float outputScale) {
         ensureOpen();
-        requireAddresses(convolvedAddress, gAddress, betaAddress, recurrentStateAddress, outputAddress);
+        requireAddresses(convolvedAddress, alphaAddress, betaAddress, recurrentStateAddress, outputAddress);
         if (rows <= 0
                 || keyHeads <= 0
                 || valueHeads <= 0
@@ -1025,7 +1030,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 "GDN recurrence",
                 gdnRecurrenceBf16,
                 MemorySegment.ofAddress(convolvedAddress),
-                MemorySegment.ofAddress(gAddress),
+                MemorySegment.ofAddress(alphaAddress),
                 MemorySegment.ofAddress(betaAddress),
                 MemorySegment.ofAddress(recurrentStateAddress),
                 MemorySegment.ofAddress(outputAddress),

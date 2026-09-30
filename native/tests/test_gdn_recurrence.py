@@ -1,11 +1,12 @@
 """The packaged GDN recurrence must match the original shared-memory reduction tree bit for bit."""
 import ctypes as C
+import math
 import random
 import struct
 import unittest
 from pathlib import Path
 
-from test_q3_primitives import Gpu, NVRTC
+from test_q3_primitives import Gpu, NVRTC, _check
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCT = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
@@ -38,7 +39,7 @@ extern "C" __global__ void reference_gdn_recurrence_bf16(
         const float normalizedKey = key * rsqrtf(qwen_gdn_reduce_sum(key * key, scratch) + 1.0e-6f);
         const float normalizedQuery = query * rsqrtf(qwen_gdn_reduce_sum(query * query, scratch) + 1.0e-6f);
         const float stateKeyDot = qwen_gdn_reduce_sum(stateValue * normalizedKey, scratch);
-        const float alpha = expf(g[static_cast<uint64_t>(row) * valueHeads + valueHead]);
+        const float alpha = g[static_cast<uint64_t>(row) * valueHeads + valueHead];
         const float delta = beta[static_cast<uint64_t>(row) * valueHeads + valueHead]
                 * (__bfloat162float(convolved[rowOffset + valueBase]) - alpha * stateKeyDot);
         stateValue = alpha * stateValue + delta * normalizedKey;
@@ -69,7 +70,7 @@ def chunk(rows, seed, cancellation):
     else:
         values = [rng.gauss(0.0, 1.0) for _ in range(rows * WIDTH)]
     convolved = struct.pack(f'<{len(values)}H', *map(bf16, values))
-    g = struct.pack(f'<{rows * VALUE_HEADS}f', *[-abs(rng.gauss(0.3, 0.3)) for _ in range(rows * VALUE_HEADS)])
+    g = struct.pack(f'<{rows * VALUE_HEADS}f', *[math.exp(-abs(rng.gauss(0.3, 0.3))) for _ in range(rows * VALUE_HEADS)])
     beta = struct.pack(f'<{rows * VALUE_HEADS}f', *[rng.random() for _ in range(rows * VALUE_HEADS)])
     return convolved, g, beta
 
@@ -85,6 +86,16 @@ class GdnRecurrenceTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.gpu.close()
 
+    def launch(self, kernel, arguments):
+        # The reference keeps one 128-thread CTA per value column; production uses one warp per
+        # QWEN_GDN_WARP_COLUMNS (8) columns.
+        grid, block = (OUTPUTS, 128) if kernel.startswith('reference') else (OUTPUTS // 8, 32)
+        function = C.c_void_p()
+        _check(self.gpu.function(C.byref(function), self.gpu.module, kernel.encode()), kernel)
+        params = (C.c_void_p * len(arguments))(*[C.cast(C.pointer(v), C.c_void_p) for v in arguments])
+        _check(self.gpu.launch_kernel(function, grid, 1, 1, block, 1, 1, 0, None, params, None), kernel)
+        _check(self.gpu.sync(), kernel)
+
     def run_chunks(self, kernel, initial, chunks, rows):
         gpu = self.gpu
         state = gpu.upload(initial)
@@ -94,7 +105,7 @@ class GdnRecurrenceTest(unittest.TestCase):
                 inputs = [gpu.upload(convolved), gpu.upload(g), gpu.upload(beta)]
                 output = gpu.zeros(rows * OUTPUTS * 2, 0xa5)
                 try:
-                    gpu.launch(kernel, OUTPUTS, [C.c_uint64(inputs[0]), C.c_uint64(inputs[1]), C.c_uint64(inputs[2]),
+                    self.launch(kernel, [C.c_uint64(inputs[0]), C.c_uint64(inputs[1]), C.c_uint64(inputs[2]),
                                                  C.c_uint64(state), C.c_uint64(output), C.c_uint(rows),
                                                  C.c_uint(KEY_HEADS), C.c_uint(VALUE_HEADS), C.c_uint(DIM),
                                                  C.c_uint(DIM), C.c_float(DIM ** -0.5)])

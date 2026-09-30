@@ -317,7 +317,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             long bProjectionAddress,
             long aLogAddress,
             long dtBiasAddress,
-            long gOutputAddress,
+            long alphaOutputAddress,
             long betaOutputAddress,
             int rows,
             int heads) {
@@ -340,7 +340,7 @@ public abstract class ExecutionGpu implements GpuMemory {
 
     public void gdnRecurrenceBf16(
             long convolvedAddress,
-            long gAddress,
+            long alphaAddress,
             long betaAddress,
             long recurrentStateAddress,
             long outputAddress,
