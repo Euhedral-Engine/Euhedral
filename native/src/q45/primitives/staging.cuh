@@ -46,7 +46,7 @@ template<int ROWS, int THREADS, int STRIDE>
 static __device__ __forceinline__ void stage_activation_tile(
         __nv_bfloat16* tile, const unsigned short* input, unsigned int rows, unsigned int in_features,
         unsigned int row_start, unsigned int k_base, unsigned int thread) {
-    static_assert(STRIDE >= (int)kGroup && STRIDE % 16 == 0, "MMA A stride must cover the K group");
+    static_assert(STRIDE >= (int)kGroup && STRIDE % 8 == 0, "MMA A stride must cover the K group with 16-byte ldmatrix rows");
     for (unsigned int i = thread; i < ROWS * kGroup; i += THREADS) {
         unsigned int r = row_start + i / kGroup, k = k_base + i % kGroup;
         tile[(i / kGroup) * STRIDE + i % kGroup] =
@@ -60,7 +60,7 @@ template<int BITS, int COLS, int WARPS, int STRIDE>
 static __device__ __forceinline__ void stage_weight_tile(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const Layout<BITS>& w, unsigned int out_start,
         unsigned int out_features, unsigned int k_base, unsigned int warp, unsigned int lane) {
-    static_assert(STRIDE >= (int)kGroup && STRIDE % 16 == 0, "MMA B stride must cover the K group");
+    static_assert(STRIDE >= (int)kGroup && STRIDE % 8 == 0, "MMA B stride must cover the K group with 16-byte ldmatrix rows");
     for (unsigned int col = warp; col < COLS; col += WARPS) {
         unsigned int word = out_start + col < out_features
                 ? load_group_word<BITS>(w, w.group(out_start + col, k_base / kGroup), lane) : 0u;
