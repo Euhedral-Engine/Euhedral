@@ -53,7 +53,7 @@ class QwenGenerationSessionTest {
 
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
-    void continuesOnOneSequenceAndClosesEveryLogitsAllocation() throws Exception {
+    void continuesOnOneSequenceAndCopiesEachSampledRowInsideItsQuantum() throws Exception {
         int vocabularySize = testVocabularySize();
         var weights = QwenExecutionFixtures.statefulCompactWeights(vocabularySize);
         var plan = new QwenExecutionPlan(weights);
@@ -62,6 +62,8 @@ class QwenGenerationSessionTest {
         var lattice = createLattice();
         var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
         var session = new QwenGenerationSession(tokenizer, plan, runtime, gpu, 810, GenerationConfig.greedy(41L));
+        // The final row reaches host memory on the quantum's own stream, before the quantum retires.
+        gpu.onRowCopy = () -> assertEquals(1, runtime.activeQuanta(), "the row was copied outside its quantum");
         lattice.start();
         awaitWorker(lattice);
         try {
@@ -71,8 +73,7 @@ class QwenGenerationSessionTest {
                 firstOutput.append(text);
                 firstOutputPositions.add(session.currentTokenPosition());
                 assertEquals(0, runtime.activeQuanta());
-                assertTrue(gpu.pendingLogits.isEmpty(), "logits remained live while output was emitted");
-                assertTrue(gpu.liveLogits.isEmpty(), "a device logits allocation survived sampling");
+                assertTrue(gpu.closedLogits.isEmpty(), "device logits belong to their graph, not to a token");
             });
 
             int[] firstPromptTokens = tokenizer.encodeWithModelSpecialTokens("!");
@@ -97,8 +98,7 @@ class QwenGenerationSessionTest {
             List<Integer> secondTokens = session.generate("!", 2, text -> {
                 secondOutput.append(text);
                 assertEquals(0, runtime.activeQuanta());
-                assertTrue(gpu.pendingLogits.isEmpty(), "logits accumulated between prompt generations");
-                assertTrue(gpu.liveLogits.isEmpty(), "a device logits allocation survived sampling");
+                assertTrue(gpu.closedLogits.isEmpty(), "device logits belong to their graph, not to a token");
             });
 
             int[] continuationPromptTokens = tokenizer.encodeText("!");
@@ -125,10 +125,8 @@ class QwenGenerationSessionTest {
             assertArrayEquals(continuationPromptTokens, gpu.embeddingInputs.get(4));
             assertArrayEquals(new int[] {4}, gpu.embeddingInputs.get(5));
             assertArrayEquals(new int[] {5}, gpu.embeddingInputs.get(6));
-            assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
-            assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
-            assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
-            assertTrue(gpu.pendingLogits.isEmpty());
+            assertEquals(5, gpu.sampledLogitRows.size(), "one final-row copy per sampled token");
+            assertEquals(2, gpu.allocatedLogits.size(), "one logits buffer each for the prefill and decode graphs");
             assertEquals(0, runtime.activeQuanta());
 
             session.close();
@@ -145,6 +143,7 @@ class QwenGenerationSessionTest {
             runtime.close();
             lattice.close();
         }
+        assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
 
     @Test
@@ -184,19 +183,18 @@ class QwenGenerationSessionTest {
             assertEquals(encoded.length + 1L, session.currentTokenPosition());
             assertEquals(1, gpu.sampledLogitRows.size(), "only the final prefill chunk should sample");
             assertEquals(1, gpu.allocatedLogits.size(), "non-final prefill and final commit need no logits");
-            assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
-            assertTrue(gpu.pendingLogits.isEmpty());
             assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
             runtime.close();
             lattice.close();
         }
+        assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void constrainedGenerationMasksXmlBeforeSamplingAndClosesDeviceLogits() throws Exception {
+    void constrainedGenerationMasksXmlBeforeSampling() throws Exception {
         int vocabularySize = testVocabularySize();
         var weights = QwenExecutionFixtures.statefulCompactWeights(vocabularySize);
         var plan = new QwenExecutionPlan(weights);
@@ -215,7 +213,7 @@ class QwenGenerationSessionTest {
             assertEquals(1, generated.size());
             assertTrue(output.toString().startsWith("{"));
             assertFalse(generated.contains(xmlToken));
-            assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
+            assertEquals(1, gpu.sampledLogitRows.size());
             assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
@@ -306,9 +304,8 @@ class QwenGenerationSessionTest {
             assertArrayEquals(tokenizer.encodeWithModelSpecialTokens("!"), gpu.embeddingInputs.getFirst());
             assertEquals(List.of(0L), gpu.attentionStartPositions);
             assertEquals(1, gpu.sampledLogitRows.size());
-            assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
-            assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
-            assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
+            assertEquals(1, gpu.allocatedLogits.size());
+            assertTrue(gpu.closedLogits.isEmpty(), "the prefill graph keeps its logits buffer");
             assertEquals(1, session.currentTokenPosition());
             assertEquals(0, runtime.activeQuanta());
 
@@ -320,19 +317,20 @@ class QwenGenerationSessionTest {
             assertArrayEquals(new int[] {1}, gpu.embeddingInputs.get(2));
             assertEquals(List.of(0L, 1L, 2L), gpu.attentionStartPositions);
             assertEquals(List.of(eosToken, 1), session.generatedTokenIds());
-            assertEquals(2, gpu.allocatedLogits.size());
-            assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
+            assertEquals(2, gpu.sampledLogitRows.size());
+            assertEquals(1, gpu.allocatedLogits.size(), "the continuation reused its graph's logits buffer");
             assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
             runtime.close();
             lattice.close();
         }
+        assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void closesRetainedLogitsWhenSamplingRejectsTheDeviceRow() throws Exception {
+    void samplingThatRejectsTheHostRowFailsWithoutReleasingGraphLogits() throws Exception {
         int vocabularySize = testVocabularySize();
         var weights = QwenExecutionFixtures.statefulCompactWeights(vocabularySize);
         var plan = new QwenExecutionPlan(weights);
@@ -346,10 +344,8 @@ class QwenGenerationSessionTest {
         awaitWorker(lattice);
         try {
             assertThrows(IllegalArgumentException.class, () -> session.generate("!", 2, ignored -> {}));
-            assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
-            assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
-            assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
-            assertTrue(gpu.pendingLogits.isEmpty());
+            assertEquals(1, gpu.sampledLogitRows.size());
+            assertTrue(gpu.closedLogits.isEmpty());
             assertEquals(1, gpu.embeddingInputs.size());
             assertEquals(0, runtime.activeQuanta());
             assertTrue(session.isCancelled());
@@ -358,6 +354,7 @@ class QwenGenerationSessionTest {
             runtime.close();
             lattice.close();
         }
+        assertLogitsFreedOnceWithTheirGraphs(gpu);
     }
 
     @Test
@@ -482,14 +479,20 @@ class QwenGenerationSessionTest {
             assertEquals(
                     QwenSequenceState.TerminalState.CANCELLED,
                     session.sequenceState().terminalState());
-            assertTrue(gpu.liveLogits.isEmpty());
-            assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
             assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
             runtime.close();
             lattice.close();
         }
+        assertLogitsFreedOnceWithTheirGraphs(gpu);
+    }
+
+    /// Device logits live in their graphs' workspace storage; closing the runtime frees each once.
+    private static void assertLogitsFreedOnceWithTheirGraphs(SamplingGpu gpu) {
+        assertTrue(gpu.liveLogits.isEmpty(), "a graph's logits buffer outlived the runtime");
+        assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
+        assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
     }
 
     private static ControlPlaneLattice createLattice() {
@@ -542,6 +545,7 @@ class QwenGenerationSessionTest {
         private int sampleIndex;
         private volatile boolean invalidLogits;
         private volatile RuntimeException embeddingFailure;
+        private volatile Runnable onRowCopy = () -> {};
 
         private SamplingGpu(int vocabularySize) {
             this.vocabularySize = vocabularySize;
@@ -569,6 +573,7 @@ class QwenGenerationSessionTest {
         @Override
         public void copyDeviceToHost(MemorySegment destination, long source, long byteSize) {
             if (byteSize != (long) this.vocabularySize * Short.BYTES) return;
+            this.onRowCopy.run();
             long logitsBase = source;
             this.sampledLogitRows.add(logitsBase);
             this.pendingLogits.add(logitsBase);

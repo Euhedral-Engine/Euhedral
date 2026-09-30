@@ -14,9 +14,8 @@ public final class LinearFrame extends QwenStageFrame {
 
     @Override
     protected void perform(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
-        int rows = instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.LOGITS)
-                ? context.logitsRowCount()
-                : context.inputTokenCount();
+        boolean logits = instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.LOGITS);
+        int rows = logits ? context.logitsRowCount() : context.inputTokenCount();
         if (rows == 0) return;
         long input = context.plan().hasFirstLayer()
                 ? context.workspace().address(instruction.inputBuffers().getFirst())
@@ -73,5 +72,6 @@ public final class LinearFrame extends QwenStageFrame {
                 throw new IllegalArgumentException(
                         "linear frame received non-linear instruction: " + instruction.kind());
         }
+        if (logits) context.logitsProduced(output);
     }
 }

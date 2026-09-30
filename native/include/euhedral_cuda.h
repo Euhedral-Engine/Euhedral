@@ -43,6 +43,13 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_device_to_host(
         const void* device_address,
         uint64_t byte_size);
 
+/// Requires a pinned host destination retained, and read, only after the selected stream's work
+/// retires; the copy is queued on that stream. With no stream selected it completes before returning.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_device_to_readback(
+        void* host_address,
+        const void* device_address,
+        uint64_t byte_size);
+
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_device_to_device(
         void* destination_address,
         const void* source_address,

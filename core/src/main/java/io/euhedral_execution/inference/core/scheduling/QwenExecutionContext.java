@@ -48,6 +48,7 @@ public final class QwenExecutionContext implements StageQuantum {
     private final QwenSequenceState sequence;
     private final ExecutionKind kind;
     private final QwenLogitsRequirement logitsRequirement;
+    private final QwenHostLogits hostLogits;
     private final long startPosition;
     private final int[] tokenIds;
     private final AtomicBoolean submitted = new AtomicBoolean();
@@ -76,9 +77,30 @@ public final class QwenExecutionContext implements StageQuantum {
             long startPosition,
             int[] tokenIds,
             QwenLogitsRequirement logitsRequirement) {
+        this(plan, sequence, kind, startPosition, tokenIds, logitsRequirement, null);
+    }
+
+    /// A quantum whose caller samples its final logits row on the host. The row is copied into
+    /// `hostLogits` on the quantum's stream before retirement, and the device logits stay in the
+    /// executing graph's storage; [#logitsOutput] is then empty.
+    public QwenExecutionContext(
+            QwenExecutionPlan plan,
+            QwenSequenceState sequence,
+            ExecutionKind kind,
+            long startPosition,
+            int[] tokenIds,
+            QwenLogitsRequirement logitsRequirement,
+            QwenHostLogits hostLogits) {
         this.plan = Objects.requireNonNull(plan, "plan")
                 .forExecution(kind, Objects.requireNonNull(tokenIds, "tokenIds").length);
         this.logitsRequirement = Objects.requireNonNull(logitsRequirement, "logitsRequirement");
+        if (hostLogits != null) {
+            if (logitsRequirement == QwenLogitsRequirement.NONE)
+                throw new IllegalArgumentException("host logits require a logits row");
+            if (hostLogits.vocabularySize() != this.plan.weights().config().vocabSize())
+                throw new IllegalArgumentException("host logits do not match the model vocabulary");
+        }
+        this.hostLogits = hostLogits;
         this.sequence = Objects.requireNonNull(sequence, "sequence");
         this.kind = Objects.requireNonNull(kind, "kind");
         Objects.requireNonNull(tokenIds, "tokenIds");
@@ -130,8 +152,16 @@ public final class QwenExecutionContext implements StageQuantum {
     }
 
     /// Returns GPU-resident logits after successful completion; the caller owns and must close them.
+    /// Empty for a quantum that samples on the host.
     public Optional<QwenDeviceLogits> logitsOutput() {
         return Optional.ofNullable(this.logitsOutput);
+    }
+
+    /// Called by the stage that produced this quantum's logits rows at `address`, with the quantum's
+    /// stream selected. A host-sampling quantum queues the copy of its final row here, ahead of its
+    /// retirement boundary.
+    public void logitsProduced(long address) {
+        if (this.hostLogits != null) this.hostLogits.queueFinalRow(address, logitsRowCount());
     }
 
     CompletableFuture<Outcome> completion() {
@@ -319,7 +349,7 @@ public final class QwenExecutionContext implements StageQuantum {
         }
         if (deviceFailure != null) fail(deviceFailure);
         ExecutionGpu gpu = this.gpu;
-        if (this.failure.get() == null && !this.sequence.cancellationRequested()) {
+        if (this.hostLogits == null && this.failure.get() == null && !this.sequence.cancellationRequested()) {
             try {
                 retainLogits(gpu);
             } catch (Throwable retentionFailure) {
@@ -378,6 +408,8 @@ public final class QwenExecutionContext implements StageQuantum {
             completed = new Outcome(Status.FAILED, releaseLogits(error));
         }
         this.lease = null;
+        // The row was copied before the retirement boundary; only a successful quantum exposes it.
+        if (this.hostLogits != null) this.hostLogits.retired(completed.status() == Status.SUCCESS);
         this.pendingOutcome = completed;
     }
 
