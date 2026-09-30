@@ -46,6 +46,32 @@ public abstract class QwenInstructionFrame extends AbstractFrame {
 
     protected void gpuCompleted() {}
 
+    /// Rebinds a frame that a decode chain owns; chained frames are never pooled or published.
+    public final void bindChained(QwenExecutionContext context) {
+        this.context = Objects.requireNonNull(context, "context");
+        this.completed = false;
+    }
+
+    /// Launches this instruction on the chain frame's current submission stream.
+    public final void performChained() {
+        perform(this.context, this.instruction);
+    }
+
+    /// Runs this instruction's success-only finalization once the whole chain's device work retired.
+    public final void gpuCompletedChained() {
+        gpuCompleted();
+    }
+
+    /// Releases this instruction's temporary resources once the whole chain's device work retired.
+    public final void releaseChained(QwenExecutionContext context) {
+        try {
+            releaseTemporary(context);
+        } finally {
+            this.context = null;
+            this.completed = false;
+        }
+    }
+
     /// Clears an instruction frame that could not be published to Euhedral.
     public final void abandonBeforePublication() {
         this.context = null;

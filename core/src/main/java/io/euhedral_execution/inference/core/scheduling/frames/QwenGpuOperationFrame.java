@@ -264,7 +264,8 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                         config.numAttentionHeads(),
                         config.numKeyValueHeads(),
                         config.attentionHeadDim(),
-                        state.length(),
+                        // The append instruction reserved these rows and its commit may still be pending.
+                        Math.toIntExact(context.startPosition() + context.inputTokenCount()),
                         context.startPosition(),
                         context.inputTokenCount() == 1 ? state.decodeScratchAddress(config.numAttentionHeads()) : 0);
     }
