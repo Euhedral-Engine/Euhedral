@@ -142,8 +142,13 @@ class QwenPrefillRouteTest {
         var combined = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights())
                 .forExecution(ExecutionKind.PREFILL, 256);
         int control = firstId(combined, Kind.GDN_PROJECT_CONTROL);
-        int heavy = firstId(combined, Kind.Q4_LINEAR);
+        int heavy = firstId(combined, Kind.GDN_PROJECTIONS);
         assertTrue(control < heavy);
+        assertFalse(combined.instructions().stream()
+                .anyMatch(i -> i.kind() == Kind.Q4_LINEAR
+                        && i.outputBuffers().equals(List.of(Buffer.QK_PROJECTED))
+                        && i.layerIndex() >= 0
+                        && i.outputWidth() == 2 * 16 * 128));
     }
 
     @Test

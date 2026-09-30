@@ -282,6 +282,25 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("Q3 linear is not implemented by this GPU");
     }
 
+    /// Computes the Q4 query/key and Q5 value/gate projections of one GDN layer. The default runs
+    /// the two linear routes; a native implementation may fuse them where that is faster, with
+    /// bitwise identical outputs.
+    public void gdnProjectionsBf16(
+            long input,
+            long q4Weights,
+            long q5Weights,
+            long queryKeyOutput,
+            long valueZOutput,
+            int rows,
+            int hidden,
+            int queryKeyWidth,
+            int valueZWidth,
+            long q4Bytes,
+            long q5Bytes) {
+        linearQ4Bf16(input, q4Weights, queryKeyOutput, rows, hidden, queryKeyWidth, q4Bytes);
+        linearQ5Bf16(input, q5Weights, valueZOutput, rows, hidden, valueZWidth, q5Bytes);
+    }
+
     /// Executes one row-split Q4 projection over BF16 activations.
     public void linearQ4Bf16(
             long inputAddress,

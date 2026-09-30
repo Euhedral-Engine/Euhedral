@@ -41,6 +41,7 @@ static CUfunction linear_quantized;
 static CUfunction q45_decode[2][3];
 static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
+static CUfunction q45_grouped64;
 static int q45_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction linear_bf16_to_float;
 static CUfunction gdn_control;
@@ -57,6 +58,12 @@ static CUfunction attention_causal;
 static CUfunction attention_norm_cache;
 static CUfunction attention_value_cache;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+
+// The grouped Q4+Q5 launch of the GDN input projections wins over two launches
+// only in this row range: below it the 32-row tile of the separate route is
+// faster, above it the grouped kernel's register use costs occupancy.
+#define Q45_GROUPED_MIN_ROWS 33u
+#define Q45_GROUPED_MAX_ROWS 192u
 
 // AUTO routes Q4/Q5 prefill batches of at least this many rows to the 64-row
 // tile, which reuses each decoded weight tile across twice as many rows.
@@ -88,6 +95,8 @@ static void initialize(void) {
             if (status == CUDA_SUCCESS) status = get_function(q45_module, &q45_prefill[format], prefill_names[format]);
             if (status == CUDA_SUCCESS) status = get_function(q45_module, &q45_prefill64[format], prefill64_names[format]);
         }
+        // Optional: without it the GDN projection pair falls back to two launches.
+        get_function(q45_module, &q45_grouped64, "euhedral_q45_prefill_64_grouped");
         if (status != CUDA_SUCCESS) q45_status = (int)status;
     }
 
@@ -268,6 +277,43 @@ int euhedral_cuda_linear_quantized_bf16(
     uint32_t grid = (uint32_t)grid64;
     void* optimized_parameters[] = {&input, &weights, &output, &rows_arg, &in_arg, &out_arg};
     return launch_and_synchronize(function, grid, 128, optimized_parameters);
+}
+
+int euhedral_cuda_gdn_projections_bf16(
+        const void* input, const void* q4, const void* q5, void* qk_output, void* value_z_output,
+        uint32_t rows, uint32_t hidden, uint32_t qk_width, uint32_t value_z_width,
+        uint64_t q4_bytes, uint64_t q5_bytes) {
+    if (!input || !q4 || !q5 || !qk_output || !value_z_output || rows == 0 || qk_width == 0 || value_z_width == 0)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    const char* mode = getenv("EUHEDRAL_Q45_DISPATCH");
+    const int automatic = mode == NULL || strcmp(mode, "AUTO") == 0;
+    // Explicit decode thresholds keep the ordinary per-projection routing.
+    const int thresholds = getenv("EUHEDRAL_Q4_DECODE_MAX_ROWS") != NULL || getenv("EUHEDRAL_Q5_DECODE_MAX_ROWS") != NULL;
+    int status = EUHEDRAL_CUDA_SUCCESS;
+    if (automatic && !thresholds && rows >= Q45_GROUPED_MIN_ROWS && rows <= Q45_GROUPED_MAX_ROWS
+            && (((uintptr_t)q4 | (uintptr_t)q5) & 3u) == 0u) {
+        uint64_t expected4, expected5;
+        status = quantized_byte_size(hidden, qk_width, 4, &expected4);
+        if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        status = quantized_byte_size(hidden, value_z_width, 5, &expected5);
+        if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        if (expected4 != q4_bytes || expected5 != q5_bytes) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+        status = euhedral_cuda_bind_thread_context();
+        if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        status = ensure_initialized();
+        if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        if (q45_status == EUHEDRAL_CUDA_SUCCESS && q45_grouped64) {
+            const uint64_t row_tiles = ((uint64_t)rows + 63u) / 64u;
+            const uint64_t grid64 = row_tiles * (((uint64_t)qk_width + 31u) / 32u) + row_tiles * (((uint64_t)value_z_width + 31u) / 32u);
+            if (grid64 > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+            void* parameters[] = {&input, &q4, &qk_output, &q5, &value_z_output, &rows, &hidden, &qk_width,
+                    &value_z_width};
+            return launch_and_synchronize(q45_grouped64, (uint32_t)grid64, 128, parameters);
+        }
+    }
+    status = euhedral_cuda_linear_quantized_bf16(input, q4, qk_output, rows, hidden, qk_width, q4_bytes, 4);
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    return euhedral_cuda_linear_quantized_bf16(input, q5, value_z_output, rows, hidden, value_z_width, q5_bytes, 5);
 }
 
 int euhedral_cuda_linear_bf16_to_float(

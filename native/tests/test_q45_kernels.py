@@ -127,6 +127,26 @@ class Q45KernelTest(unittest.TestCase):
                 values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
                 self.compare_all_routes(bits, rows, width, outputs, payload, values)
 
+    def test_grouped_projection_pair_matches_separate_launches_bitwise(self):
+        gpu = self.gpu
+        for rows, width, q4_out, q5_out in [(33, 256, 96, 160), (64, 128, 64, 96), (65, 384, 70, 33), (130, 128, 32, 200)]:
+            with self.subTest(rows=rows, width=width, q4=q4_out, q5=q5_out), contextlib.ExitStack() as stack:
+                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
+                x = self.owned(stack, gpu.upload(struct.pack(f"<{len(values)}H", *values)))
+                w4 = self.owned(stack, gpu.upload(make_weights(self.rng, 4, width, q4_out)))
+                w5 = self.owned(stack, gpu.upload(make_weights(self.rng, 5, width, q5_out)))
+                tiles = (rows + 63) // 64
+                ref4 = self.run_kernel(stack, "euhedral_q4_prefill_64", tiles * ((q4_out + 31) // 32), x, w4, rows, width, q4_out)
+                ref5 = self.run_kernel(stack, "euhedral_q5_prefill_64", tiles * ((q5_out + 31) // 32), x, w5, rows, width, q5_out)
+                y4 = self.owned(stack, gpu.zeros(rows * q4_out * 2, fill=SENTINEL))
+                y5 = self.owned(stack, gpu.zeros(rows * q5_out * 2, fill=SENTINEL))
+                grid = tiles * ((q4_out + 31) // 32) + tiles * ((q5_out + 31) // 32)
+                gpu.launch("euhedral_q45_prefill_64_grouped", grid, [
+                    C.c_uint64(x), C.c_uint64(w4), C.c_uint64(y4), C.c_uint64(w5), C.c_uint64(y5),
+                    C.c_uint(rows), C.c_uint(width), C.c_uint(q4_out), C.c_uint(q5_out)])
+                self.assertEqual(gpu.download(y4, rows * q4_out * 2), ref4)
+                self.assertEqual(gpu.download(y5, rows * q5_out * 2), ref5)
+
     def test_special_values_match_the_original_kernels_bitwise(self):
         special = [0x3F80, 0xBF00, 0x7FC1, 0xFFC3, 0x7F80, 0xFF80, 0x0001, 0x8000]
         scales = [0x3555, 0xB555, 0x0001, 0x8000, 0x7BFF, 0x7C00, 0x7E11, 0xFE11]

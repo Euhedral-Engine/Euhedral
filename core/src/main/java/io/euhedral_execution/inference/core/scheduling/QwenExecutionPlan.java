@@ -35,6 +35,7 @@ public final class QwenExecutionPlan {
         RESIDUAL_ADD,
         RESIDUAL_RMS_NORM,
         GDN_PROJECT_CONTROL,
+        GDN_PROJECTIONS,
         Q3_GATE_UP_SWIGLU,
         Q3_FFN_DOWN,
         FFN_STREAMED,
@@ -404,6 +405,32 @@ public final class QwenExecutionPlan {
                         -1,
                         first.layerIndex()));
                 index += 3;
+                continue;
+            }
+            if (first.kind() == Kind.Q4_LINEAR
+                    && next != null
+                    && next.kind() == Kind.Q5_LINEAR
+                    && index + 2 < source.size()
+                    && source.get(index + 2).kind() == Kind.GDN_CONVOLUTION) {
+                if (!next.dependencies().equals(first.dependencies())
+                        || !first.inputBuffers().equals(next.inputBuffers())
+                        || !first.outputBuffers().equals(List.of(Buffer.QK_PROJECTED))
+                        || !next.outputBuffers().equals(List.of(Buffer.VALUE_Z_PROJECTED)))
+                    throw new IllegalStateException("unexpected GDN projection topology");
+                remapped[first.id()] = result.size();
+                remapped[next.id()] = result.size();
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.GDN_PROJECTIONS,
+                        remapDependencies(first.dependencies(), remapped),
+                        List.of(first.weight(), next.weight()),
+                        first.inputBuffers(),
+                        List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED),
+                        first.inputWidth(),
+                        first.outputWidth(),
+                        -1,
+                        first.layerIndex()));
+                index++;
                 continue;
             }
             if (first.kind() == Kind.RESIDUAL_ADD

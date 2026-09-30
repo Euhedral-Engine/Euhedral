@@ -66,6 +66,7 @@ public final class QwenWorkGenerator {
                     || instruction.kind() == QwenExecutionPlan.Kind.Q3_GATE_UP_SWIGLU
                     || instruction.kind() == QwenExecutionPlan.Kind.RESIDUAL_RMS_NORM
                     || instruction.kind() == QwenExecutionPlan.Kind.GDN_PROJECT_CONTROL
+                    || instruction.kind() == QwenExecutionPlan.Kind.GDN_PROJECTIONS
                     || instruction.kind() == QwenExecutionPlan.Kind.RESIDUAL_ADD
                     || instruction.kind() == QwenExecutionPlan.Kind.SWIGLU
                     || instruction.kind() == QwenExecutionPlan.Kind.ATTENTION_QK_NORM_ROPE
@@ -234,6 +235,7 @@ public final class QwenWorkGenerator {
                     Q3_GATE_UP_SWIGLU,
                     RESIDUAL_RMS_NORM,
                     GDN_PROJECT_CONTROL,
+                    GDN_PROJECTIONS,
                     RESIDUAL_ADD,
                     SWIGLU,
                     ATTENTION_QK_NORM_ROPE,
