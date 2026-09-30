@@ -18,17 +18,15 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDat
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
-import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
-import io.euhedral_execution.inference.core.scheduling.PullingLattice;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.QwenSequenceState;
+import io.euhedral_execution.inference.core.scheduling.TestExecution;
 import java.lang.foreign.Arena;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -64,8 +62,9 @@ class QwenInstructionCudaIntegrationTest {
         short[] expectedNorm = rmsNorm(expectedHidden, normWeights, tokenIds.length, width, epsilon);
         short[] expectedProjection = linearReference(expectedNorm, projection, tokenIds.length, width, outputs);
 
+        // The terminal consumer runs on the lattice worker that retires the quantum.
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
-                Arena arena = Arena.ofConfined()) {
+                Arena arena = Arena.ofShared()) {
             long embeddingAddress = upload(gpu, arena, embedding);
             long projectionAddress = upload(gpu, arena, projection);
             long normAddress = upload(gpu, arena, normWeights);
@@ -115,23 +114,25 @@ class QwenInstructionCudaIntegrationTest {
                         plan, new QwenSequenceState(30), QwenExecutionContext.ExecutionKind.PREFILL, 0, tokenIds);
                 AtomicReference<short[]> actualNorm = new AtomicReference<>();
                 AtomicReference<short[]> actualProjection = new AtomicReference<>();
-                try (var lattice = new PullingLattice()) {
-                    var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
-                    var outcome = runtime.submit(context, completed -> {
-                        actualNorm.set(download(
-                                gpu, arena, completed.workspace().normalizedStateAddress(), tokenIds.length * width));
-                        actualProjection.set(download(
-                                gpu, arena, completed.workspace().projectionAddress(0), tokenIds.length * outputs));
-                    });
-                    assertEquals(
-                            QwenExecutionContext.Status.SUCCESS,
-                            outcome.get(30, TimeUnit.SECONDS).status());
-                    assertTrue(context.workspace().isClosed());
-                    assertBf16Equals(expectedNorm, actualNorm.get(), 0.01f);
-                    assertBf16Equals(expectedProjection, actualProjection.get(), 0.03f);
-                    runtime.close();
-                    assertTrue(!runtime.isAttached());
-                }
+                QwenExecutionContext.Outcome outcome = TestExecution.run(
+                        plan,
+                        gpu,
+                        context,
+                        completed -> {
+                            actualNorm.set(download(
+                                    gpu,
+                                    arena,
+                                    completed.workspace().normalizedStateAddress(),
+                                    tokenIds.length * width));
+                            actualProjection.set(download(
+                                    gpu, arena, completed.workspace().projectionAddress(0), tokenIds.length * outputs));
+                        },
+                        30);
+                assertEquals(
+                        QwenExecutionContext.Status.SUCCESS, outcome.status(), () -> String.valueOf(outcome.failure()));
+                assertTrue(context.workspace().isClosed());
+                assertBf16Equals(expectedNorm, actualNorm.get(), 0.01f);
+                assertBf16Equals(expectedProjection, actualProjection.get(), 0.03f);
             } finally {
                 gpu.free(normAddress);
                 gpu.free(projectionAddress);

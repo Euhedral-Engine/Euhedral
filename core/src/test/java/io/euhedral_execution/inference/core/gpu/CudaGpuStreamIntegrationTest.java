@@ -133,7 +133,7 @@ class CudaGpuStreamIntegrationTest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void oneStreamPreservesUploadAndCopyOrderingAcrossSubmittingThreads() throws Exception {
         try (var gpu = new CudaGpuMemory(library());
-                var arena = Arena.ofConfined();
+                var arena = Arena.ofShared();
                 var first = Executors.newSingleThreadExecutor();
                 var second = Executors.newSingleThreadExecutor()) {
             GpuStream stream = gpu.openStream();
