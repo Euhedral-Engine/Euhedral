@@ -69,6 +69,10 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
         return this.delegate.deviceMemoryInfo();
     }
 
+    public long allocatedBytes() {
+        return this.delegate.allocatedBytes();
+    }
+
     @Override
     public void close() {
         this.delegate.close();

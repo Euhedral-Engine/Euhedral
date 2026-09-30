@@ -41,10 +41,6 @@ class QwenGenerationSessionCudaIntegrationTest {
     private static final Path DEFAULT_ARTIFACT =
             Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl");
     private static final Path DEFAULT_TOKENIZER = Path.of("/mnt/shared/qwen38-quant/source/qwen");
-    private static final long CALLBACK_FREE_MEMORY_TOLERANCE = 1L * 1024L * 1024L;
-    private static final long SESSION_RESTORE_TOLERANCE = 16L * 1024L * 1024L;
-    // First use JIT-loads process-lifetime CUDA kernel modules outside the model's ownership.
-    private static final long MODEL_RESTORE_TOLERANCE = 128L * 1024L * 1024L;
     private static final AtomicLong LATTICE_ID = new AtomicLong();
 
     @Test
@@ -66,11 +62,11 @@ class QwenGenerationSessionCudaIntegrationTest {
         try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
             ControlPlaneLattice lattice = createLattice(cpus);
             try {
-                long freeBeforeWeights = gpu.deviceMemoryInfo().freeBytes();
+                long allocatedBeforeWeights = gpu.allocatedBytes();
                 QwenModel model = QwenModel.load(artifactPath, artifact, gpu);
                 QwenWeights weights = model.weights();
                 Throwable failure = null;
-                long freeAfterWeights = gpu.deviceMemoryInfo().freeBytes();
+                long allocatedAfterWeights = gpu.allocatedBytes();
                 try {
                     QwenExecutionPlan plan = new QwenExecutionPlan(weights);
                     EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
@@ -85,7 +81,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                         int promptTokenCount = tokenizer.encodeWithModelSpecialTokens(prompt).length;
                         StringBuilder output = new StringBuilder();
                         List<Long> callbackPositions = new ArrayList<>();
-                        List<Long> decodeCallbackFreeMemory = new ArrayList<>();
+                        List<Long> decodeCallbackAllocated = new ArrayList<>();
                         AtomicReference<Object> recurrentState = new AtomicReference<>();
                         AtomicReference<Object> kvState = new AtomicReference<>();
 
@@ -113,8 +109,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                             // scratch reservation. Compare steady-state decode callbacks only;
                             // scratch address stability and ownership have separate exact tests.
                             if (session.currentTokenPosition() > promptTokenCount) {
-                                decodeCallbackFreeMemory.add(
-                                        gpu.deviceMemoryInfo().freeBytes());
+                                decodeCallbackAllocated.add(gpu.allocatedBytes());
                             }
                         });
 
@@ -136,19 +131,11 @@ class QwenGenerationSessionCudaIntegrationTest {
                                         .forLayer(3)
                                         .length());
                         assertTrue(callbackPositions.size() >= 3, "incremental decoder did not emit token text");
-                        assertTrue(decodeCallbackFreeMemory.size() >= 3);
-                        long minimumCallbackFree = decodeCallbackFreeMemory.stream()
-                                .mapToLong(Long::longValue)
-                                .min()
-                                .orElseThrow();
-                        long maximumCallbackFree = decodeCallbackFreeMemory.stream()
-                                .mapToLong(Long::longValue)
-                                .max()
-                                .orElseThrow();
-                        assertTrue(
-                                maximumCallbackFree - minimumCallbackFree <= CALLBACK_FREE_MEMORY_TOLERANCE,
-                                "retained logits caused free device memory to decline between tokens: min="
-                                        + minimumCallbackFree + ", max=" + maximumCallbackFree);
+                        assertTrue(decodeCallbackAllocated.size() >= 3);
+                        assertEquals(
+                                1,
+                                decodeCallbackAllocated.stream().distinct().count(),
+                                "device allocations changed between steady decode tokens: " + decodeCallbackAllocated);
                         assertEquals(0, runtime.activeQuanta());
                         assertTrue(lattice.isDrained());
 
@@ -160,9 +147,9 @@ class QwenGenerationSessionCudaIntegrationTest {
                                 session.sequenceState().terminalState());
                         assertThrows(IllegalStateException.class, () -> recurrent.forLayer(0));
                         assertThrows(IllegalStateException.class, () -> attention.forLayer(3));
-                        long freeAfterSession = gpu.deviceMemoryInfo().freeBytes();
-                        assertTrue(
-                                freeAfterSession >= freeAfterWeights - SESSION_RESTORE_TOLERANCE,
+                        assertEquals(
+                                allocatedAfterWeights,
+                                gpu.allocatedBytes(),
                                 "session close did not release its persistent KV/GDN state and sampled logits");
                     } finally {
                         session.close();
@@ -178,11 +165,11 @@ class QwenGenerationSessionCudaIntegrationTest {
                         else failure.addSuppressed(cleanupFailure);
                     }
                 }
-                long freeAfterWeightsRelease = gpu.deviceMemoryInfo().freeBytes();
-                if (freeAfterWeightsRelease < freeBeforeWeights - MODEL_RESTORE_TOLERANCE) {
+                long allocatedAfterWeightsRelease = gpu.allocatedBytes();
+                if (allocatedAfterWeightsRelease != allocatedBeforeWeights) {
                     IllegalStateException cleanupFailure =
-                            new IllegalStateException("generation integration leaked device memory: before="
-                                    + freeBeforeWeights + ", after=" + freeAfterWeightsRelease);
+                            new IllegalStateException("generation integration leaked device memory: allocated before="
+                                    + allocatedBeforeWeights + ", after=" + allocatedAfterWeightsRelease);
                     if (failure == null) failure = cleanupFailure;
                     else failure.addSuppressed(cleanupFailure);
                 }

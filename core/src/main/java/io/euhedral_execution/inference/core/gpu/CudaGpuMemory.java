@@ -60,6 +60,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MpmcQueue<Long> availableEvents = new MpmcQueue<>(64, 4);
     private final ConcurrentLinkedQueue<MemorySegment> pinnedUploads = new ConcurrentLinkedQueue<>();
     private final AtomicInteger pinnedUploadCount = new AtomicInteger();
+    /// The size of every live device allocation, by address; [#allocate] is the only native allocator.
+    private final ConcurrentHashMap<Long, Long> allocationSizes = new ConcurrentHashMap<>();
+    private final AtomicLong allocatedBytes = new AtomicLong();
     private final MethodHandle rmsNormBf16;
     private final MethodHandle rmsNormUnitOffsetBf16;
     private final MethodHandle linearQ3Bf16;
@@ -531,6 +534,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             MemorySegment address = (MemorySegment) malloc.invokeExact(byteSize);
             long value = address.address();
             if (value == 0) throw new GpuMemoryException("CUDA allocation returned a null address");
+            allocationSizes.put(value, byteSize);
+            allocatedBytes.addAndGet(byteSize);
             return value;
         } catch (GpuMemoryException exception) {
             throw exception;
@@ -1432,6 +1437,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             throw new GpuMemoryException("CUDA free invocation failed", throwable);
         }
         if (status != 0) throw new GpuMemoryException("CUDA free", status);
+        Long size = allocationSizes.remove(address);
+        if (size != null) allocatedBytes.addAndGet(-size);
+    }
+
+    /// Device bytes allocated through this binding and not yet freed: the resident footprint of the
+    /// model, its sequences' persistent state, and in-flight quantum workspaces. Unlike
+    /// [#deviceMemoryInfo], it excludes other processes and CUDA's own context and kernel modules, and
+    /// it stays readable after close.
+    public long allocatedBytes() {
+        return allocatedBytes.get();
     }
 
     /// Returns the current CUDA device's free and total memory, in bytes.

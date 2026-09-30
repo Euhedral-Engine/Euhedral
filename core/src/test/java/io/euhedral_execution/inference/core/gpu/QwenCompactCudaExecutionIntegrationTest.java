@@ -43,7 +43,6 @@ class QwenCompactCudaExecutionIntegrationTest {
 
     private static final int PREFIX_OUTPUT_ROWS = 64;
     private static final long REQUIRED_FREE_VRAM_RESERVE = 128L * 1024L * 1024L;
-    private static final long VRAM_RESTORE_TOLERANCE = 128L * 1024L * 1024L;
 
     @Test
     void realCompactWeightsMatchStandaloneOperatorsAndEuhedralFrames() throws Exception {
@@ -76,6 +75,7 @@ class QwenCompactCudaExecutionIntegrationTest {
         try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath);
                 Arena arena = Arena.ofShared()) {
             CudaGpuMemory.DeviceMemoryInfo before = gpu.deviceMemoryInfo();
+            long allocatedBefore = gpu.allocatedBytes();
             long requiredModelBytes = Math.addExact(
                     Math.addExact(embeddingDescriptor.byteSize(), normDescriptor.byteSize()),
                     projectionDescriptor.byteSize());
@@ -151,18 +151,16 @@ class QwenCompactCudaExecutionIntegrationTest {
                 failure = freeAll(gpu, ownedModelAddresses, failure);
             }
 
-            CudaGpuMemory.DeviceMemoryInfo after = gpu.deviceMemoryInfo();
-            if (after.freeBytes() < before.freeBytes() - VRAM_RESTORE_TOLERANCE) {
-                IllegalStateException restoreFailure =
-                        new IllegalStateException("real execution slice did not release GPU allocations: before="
-                                + before.freeBytes() + ", after=" + after.freeBytes());
+            long allocatedAfter = gpu.allocatedBytes();
+            if (allocatedAfter != allocatedBefore) {
+                IllegalStateException restoreFailure = new IllegalStateException(
+                        "real execution slice did not release GPU allocations: allocated before=" + allocatedBefore
+                                + ", after=" + allocatedAfter);
                 if (failure == null) failure = restoreFailure;
                 else failure.addSuppressed(restoreFailure);
             }
             if (failure != null) rethrow(failure);
-            System.out.printf(
-                    "Real compact CUDA execution cleanup passed: freeBefore=%d freeAfter=%d%n",
-                    before.freeBytes(), after.freeBytes());
+            System.out.printf("Real compact CUDA execution cleanup passed: allocated bytes=%d%n", allocatedAfter);
         }
     }
 
