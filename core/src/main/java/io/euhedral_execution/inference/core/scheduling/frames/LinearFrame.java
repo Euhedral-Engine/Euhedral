@@ -1,22 +1,15 @@
 package io.euhedral_execution.inference.core.scheduling.frames;
 
-import io.euhedral_execution.core.impl.FrameManager;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenWorkGenerator;
+import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 
 /// Runs one independent quantized or BF16 projection instruction.
-public final class LinearFrame extends QwenInstructionFrame {
+public final class LinearFrame extends QwenStageFrame {
 
-    public LinearFrame(
-            long idHash,
-            FrameManager<QwenExecutionContext, LinearFrame> recycler,
-            QwenExecutionContext context,
-            QwenExecutionPlan.Instruction instruction,
-            ExecutionGpu gpu,
-            QwenWorkGenerator generator) {
-        super(idHash, recycler, context, instruction, gpu, generator);
+    LinearFrame(StageGraph graph, QwenExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+        super(graph, instruction, gpu);
     }
 
     @Override

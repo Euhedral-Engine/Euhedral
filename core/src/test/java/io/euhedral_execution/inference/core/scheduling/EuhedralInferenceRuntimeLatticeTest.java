@@ -14,10 +14,8 @@ import io.euhedral_execution.core.flow_control.LatticeEdge;
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeReceiver;
 import io.euhedral_execution.core.generics.LatticeSource;
-import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
-import io.euhedral_execution.data_structures.queues.MpscQueue;
 import io.euhedral_execution.hardware_utils.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.QwenWeightLoader;
@@ -37,12 +35,10 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Execution;
@@ -56,140 +52,48 @@ class EuhedralInferenceRuntimeLatticeTest {
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    void realLatticePollsAsyncGpuCompletionFrameWithoutAnObserver() throws Exception {
+    void realLatticeDeliversARetirementThatOnlyADriverCallbackEnqueued() throws Exception {
         BitSet cpus = twoWorkerCpus();
         assumeTrue(!cpus.isEmpty());
         var lattice = createLattice(cpus);
-        var gpu = new CompletionGpu();
+        var gpu = new HeldGpu();
+        var plan = new QwenExecutionPlan(
+                QwenExecutionFixtures.weights(),
+                QwenExecutionFixtures.norm(),
+                List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
         try {
             lattice.start();
-            var runtime =
-                    new EuhedralInferenceRuntime(lattice, new QwenExecutionPlan(QwenExecutionFixtures.weights()), gpu);
-            var completed = new CountDownLatch(1);
-            gpu.signal(completed::countDown);
-            assertTrue(completed.await(10, TimeUnit.SECONDS), "lattice did not execute the signaled completion frame");
-            runtime.disconnectRunner();
-        } finally {
-            lattice.close();
-        }
-    }
-
-    @Test
-    @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    void deferredGpuWorkKeepsDependenciesPendingUntilEachCompletionFrameRuns() throws Exception {
-        BitSet cpus = twoWorkerCpus();
-        assumeTrue(!cpus.isEmpty());
-        var lattice = createLattice(cpus);
-        var gpu = new DeferredGpu();
-        var plan = new QwenExecutionPlan(
-                QwenExecutionFixtures.weights(),
-                QwenExecutionFixtures.norm(),
-                List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
-        lattice.start();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
-        try (var caller = java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            var context = new QwenExecutionContext(
-                    plan, new QwenSequenceState(5801), QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1});
-            var outcome = caller.submit(() -> runtime.execute(List.of(context)));
-            for (int instruction = 0; instruction < plan.instructions().size(); instruction++) {
-                assertFalse(outcome.isDone(), "dependencies became terminal before GPU completion");
-                gpu.completeNext();
+            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            try {
+                long sequenceId = 5800;
+                for (var kind : QwenExecutionContext.ExecutionKind.values()) {
+                    var sequence = new QwenSequenceState(++sequenceId);
+                    var outcome = runtime.submit(new QwenExecutionContext(plan, sequence, kind, 0, new int[] {1}));
+                    awaitHeld(gpu.stream, 1);
+                    assertFalse(outcome.isDone(), "every stage submitted; only the device boundary is pending");
+                    // Announced from another thread, as the CUDA driver does; nothing observes the source.
+                    Thread driver = Thread.ofPlatform().start(() -> gpu.stream.release(null));
+                    driver.join();
+                    assertEquals(
+                            QwenExecutionContext.Status.SUCCESS,
+                            outcome.get(10, TimeUnit.SECONDS).status());
+                    assertEquals(0, gpu.stream.held(), "one device-completion boundary per quantum");
+                    sequence.complete();
+                }
+                assertEquals(List.of("embed", "norm", "linear:201", "embed", "norm", "linear:201"), gpu.operations);
+                assertEquals(0, gpu.synchronizations, "ordinary execution uses no device-wide barrier");
+            } finally {
+                runtime.close();
             }
-            assertEquals(
-                    QwenExecutionContext.Status.SUCCESS,
-                    outcome.get(10, TimeUnit.SECONDS).getFirst().status());
-            assertEquals(0, gpu.synchronizations, "normal async execution must not use a device-wide barrier");
+            assertFalse(runtime.isAttached());
         } finally {
-            runtime.closeCompletionSink();
             lattice.close();
-        }
-    }
-
-    @Test
-    @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    void asyncDecodeLaunchesEveryInstructionInOneChainWithOneCompletion() throws Exception {
-        BitSet cpus = twoWorkerCpus();
-        assumeTrue(!cpus.isEmpty());
-        var lattice = createLattice(cpus);
-        var gpu = new DeferredGpu();
-        var plan = new QwenExecutionPlan(
-                QwenExecutionFixtures.weights(),
-                QwenExecutionFixtures.norm(),
-                List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
-        lattice.start();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
-        try (var caller = java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            var context = new QwenExecutionContext(
-                    plan, new QwenSequenceState(5802), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
-            var outcome = caller.submit(() -> runtime.execute(List.of(context)));
-            // One completion covers the whole quantum: stream order already sequences its kernels.
-            gpu.completeNext();
-            assertEquals(
-                    QwenExecutionContext.Status.SUCCESS,
-                    outcome.get(10, TimeUnit.SECONDS).getFirst().status());
-            assertTrue(context.chained());
-            assertEquals(0, gpu.pendingCompletions(), "a chained quantum must defer exactly one completion");
-            assertEquals(0, gpu.synchronizations, "normal async execution must not use a device-wide barrier");
-        } finally {
-            runtime.closeCompletionSink();
-            lattice.close();
-        }
-    }
-
-    private static final class DeferredGpu extends QwenExecutionFixtures.RecordingGpu {
-        private final MpscQueue<Runnable> pending = new MpscQueue<>(64);
-        private final Semaphore available = new Semaphore(0);
-        private Consumer<Runnable> completionSink;
-
-        @Override
-        public boolean asynchronous() {
-            return true;
-        }
-
-        @Override
-        public void bindCompletionSink(Consumer<Runnable> sink) {
-            this.completionSink = sink;
-        }
-
-        @Override
-        public void deferCompletion(Runnable completed, Consumer<Throwable> failed) {
-            pending.offer(completed);
-            available.release();
-        }
-
-        int pendingCompletions() {
-            return available.availablePermits();
-        }
-
-        void completeNext() throws InterruptedException {
-            assertTrue(available.tryAcquire(10, TimeUnit.SECONDS), "GPU work was never submitted");
-            Runnable completion = pending.poll();
-            assertTrue(completion != null);
-            completionSink.accept(completion);
-        }
-    }
-
-    private static final class CompletionGpu extends QwenExecutionFixtures.RecordingGpu {
-        private Consumer<Runnable> completionSink;
-
-        @Override
-        public boolean asynchronous() {
-            return true;
-        }
-
-        @Override
-        public void bindCompletionSink(Consumer<Runnable> sink) {
-            this.completionSink = sink;
-        }
-
-        void signal(Runnable completion) {
-            this.completionSink.accept(completion);
         }
     }
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void sharedRuntimeAdmitsIndependentCallsConcurrentlyToRealFabric() throws Exception {
+    void independentQuantaFromConcurrentCallersRunOnDifferentWorkers() throws Exception {
         BitSet cpus = twoWorkerCpus();
         assumeTrue(cpus.cardinality() == 2);
         var probe = new LatticeEdge(new AtomicBoolean());
@@ -203,10 +107,11 @@ class EuhedralInferenceRuntimeLatticeTest {
                     QwenExecutionFixtures.norm(),
                     List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
             var gpu = new ConcurrentGpu();
-            var admissionGate = new WorkGate(2);
+            gpu.embeddingGate = new WorkGate(2);
+            var attachments = new AtomicInteger();
             var runtime = new EuhedralInferenceRuntime(
                     source -> {
-                        admissionGate.enterIfSelected();
+                        attachments.incrementAndGet();
                         lattice.addUpstream(source);
                     },
                     plan,
@@ -221,60 +126,104 @@ class EuhedralInferenceRuntimeLatticeTest {
                             plan, new QwenSequenceState(802), QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {
                                 2
                             }))));
-                    assertTrue(admissionGate.awaitEntries(), "one runtime serialized independent input admission");
-                    assertEquals(2, admissionGate.workerCount());
-                    admissionGate.release();
+                    assertTrue(gpu.embeddingGate.awaitEntries(), "independent quanta did not run concurrently");
+                    assertEquals(2, gpu.embeddingGate.workerCount(), "independent quanta shared one worker");
+                    gpu.embeddingGate.release();
                     assertEquals(
                             QwenExecutionContext.Status.SUCCESS,
                             first.get(10, TimeUnit.SECONDS).getFirst().status());
                     assertEquals(
                             QwenExecutionContext.Status.SUCCESS,
                             second.get(10, TimeUnit.SECONDS).getFirst().status());
-                    assertFalse(runtime.hasAttachedRunner());
+                    assertEquals(2, attachments.get(), "each reusable graph attaches its source once");
+                    assertEquals(0, runtime.activeQuanta());
                 } finally {
-                    admissionGate.release();
+                    gpu.embeddingGate.release();
                 }
+                // Later quanta reuse the idle graphs: no further source is attached.
+                for (int index = 0; index < 4; index++) {
+                    assertEquals(
+                            QwenExecutionContext.Status.SUCCESS,
+                            runtime.execute(List.of(new QwenExecutionContext(
+                                            plan,
+                                            new QwenSequenceState(810 + index),
+                                            QwenExecutionContext.ExecutionKind.DECODE,
+                                            0,
+                                            new int[] {1})))
+                                    .getFirst()
+                                    .status());
+                }
+                assertEquals(2, attachments.get());
+            } finally {
+                runtime.close();
             }
+            awaitDrained(lattice);
         } finally {
             lattice.close();
         }
     }
 
     @Test
-    void disconnectReleasesTerminatedRunnerWhenDownstreamCompletionFails() {
+    void foreignPlanIsRejectedBeforeAnyGraphIsBuilt() throws Exception {
         var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
-        var gpu = new ConcurrentGpu();
-        var completionFailure = new IllegalStateException("injected downstream completion failure");
-        var runtime = new EuhedralInferenceRuntime(throwingCompletionTerminal(completionFailure), plan, gpu);
-        var runner = runtime.attachRunner();
-
-        assertSame(completionFailure, assertThrows(IllegalStateException.class, runtime::disconnectRunner));
-        assertTrue(runner.isComplete());
-        assertFalse(runner.isAttached());
-        assertFalse(runtime.hasAttachedRunner(), "runtime retained a terminated runner after callback failure");
-    }
-
-    @Test
-    void executePreservesSubmissionFailureWhenDisconnectAlsoFails() {
-        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
-        var gpu = new ConcurrentGpu();
-        var completionFailure = new IllegalStateException("injected downstream completion failure");
-        var runtime = new EuhedralInferenceRuntime(throwingCompletionTerminal(completionFailure), plan, gpu);
+        var attachments = new AtomicInteger();
+        var runtime = new EuhedralInferenceRuntime(source -> attachments.incrementAndGet(), plan, new ConcurrentGpu());
         var wrongPlan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
         var context = new QwenExecutionContext(
                 wrongPlan, new QwenSequenceState(702), QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1});
 
-        var submissionFailure = assertThrows(IllegalArgumentException.class, () -> runtime.execute(List.of(context)));
+        var failure = assertThrows(IllegalArgumentException.class, () -> runtime.execute(List.of(context)));
 
-        assertEquals("quantum belongs to another execution plan", submissionFailure.getMessage());
-        assertEquals(1, submissionFailure.getSuppressed().length);
-        assertSame(completionFailure, submissionFailure.getSuppressed()[0]);
-        assertFalse(runtime.hasAttachedRunner());
+        assertEquals("quantum belongs to another execution plan", failure.getMessage());
+        assertEquals(0, attachments.get());
+        assertTrue(runtime.execute(List.of()).isEmpty(), "empty work builds no graph");
+        assertEquals(0, attachments.get());
+        runtime.close();
+    }
+
+    @Test
+    void closeReportsADownstreamCompletionFailureAfterTheGraphsRetired() throws Exception {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
+        var completionFailure = new IllegalStateException("injected downstream completion failure");
+        var runtime = new EuhedralInferenceRuntime(
+                upstream -> {
+                    upstream.addDownstream(new LatticeReceiver() {
+                        @Override
+                        public void addUpstream(LatticeSource source) {}
+
+                        @Override
+                        public void push(AbstractFrame frame) {
+                            PullingLattice.run(frame);
+                        }
+
+                        @Override
+                        public void onError(Throwable error) {}
+
+                        @Override
+                        public void onComplete() {
+                            throw completionFailure;
+                        }
+                    });
+                    upstream.request(Long.MAX_VALUE);
+                },
+                plan,
+                new ConcurrentGpu());
+        var outcome = runtime.execute(List.of(new QwenExecutionContext(
+                plan, new QwenSequenceState(703), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1})));
+        assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.getFirst().status());
+
+        assertSame(completionFailure, assertThrows(IllegalStateException.class, runtime::close));
+        assertFalse(runtime.isAttached(), "the runtime retained a completed source after its callback failed");
+        assertThrows(
+                IllegalStateException.class,
+                () -> runtime.submit(new QwenExecutionContext(
+                        plan, new QwenSequenceState(704), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1
+                        })));
     }
 
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
-    void euhedralWorkersRunParallelBranchesAndIndependentSequencesThenDetachRunner() throws Exception {
+    void euhedralWorkersRunIndependentSequencesAndProjectionsInParallel() throws Exception {
         BitSet cpus = twoWorkerCpus();
         assumeTrue(cpus.cardinality() >= 2, "requires two available physical CPUs for concurrent workers");
         var registrationProbe = new LatticeEdge(new AtomicBoolean());
@@ -283,7 +232,6 @@ class EuhedralInferenceRuntimeLatticeTest {
         try {
             lattice.start();
             awaitWorkers(lattice, 2, registrationProbe, registeredWorkersBeforeStart + 2);
-            verifySequenceStateSurvivesRunnerTeardown(lattice);
             var plan = new QwenExecutionPlan(
                     QwenExecutionFixtures.weights(),
                     QwenExecutionFixtures.norm(),
@@ -292,54 +240,25 @@ class EuhedralInferenceRuntimeLatticeTest {
                             .toList());
             var gpu = new ConcurrentGpu();
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
-            List<EuhedralInferenceRuntime> runtimes = new ArrayList<>();
-            runtimes.add(runtime);
-            for (int index = 1; index < 16; index++) runtimes.add(new EuhedralInferenceRuntime(lattice, plan, gpu));
-            List<QwenExecutionRunner> runners = new ArrayList<>();
             List<QwenSequenceState> sequences = new ArrayList<>();
-            List<CompletableFuture<QwenExecutionContext.Outcome>> sequenceCompletions = new ArrayList<>();
+            List<CompletableFuture<QwenExecutionContext.Outcome>> completions = new ArrayList<>();
             try {
-                assertTrue(runtime.execute(List.of()).isEmpty(), "empty work must not attach an idle source");
-                assertFalse(runtime.hasAttachedRunner());
-
-                QwenSequenceState executeSequence = new QwenSequenceState(699);
-                try {
-                    var outcomes = runtime.execute(List.of(new QwenExecutionContext(
-                            plan, executeSequence, QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1})));
-                    assertEquals(1, outcomes.size());
-                    assertEquals(
-                            QwenExecutionContext.Status.SUCCESS,
-                            outcomes.getFirst().status());
-                    assertEquals(1, executeSequence.currentTokenPosition());
-                    assertFalse(runtime.hasAttachedRunner(), "execute retained its temporary lattice source");
-                } finally {
-                    executeSequence.complete();
-                }
-
                 gpu.embeddingGate = new WorkGate(2);
                 gpu.projectionGate = new WorkGate(2);
-                for (int sequenceId = 1; sequenceId <= runtimes.size(); sequenceId++) {
-                    EuhedralInferenceRuntime sequenceRuntime = runtimes.get(sequenceId - 1);
-                    runners.add(sequenceRuntime.attachRunner());
+                for (int sequenceId = 1; sequenceId <= 16; sequenceId++) {
                     QwenSequenceState sequence = new QwenSequenceState(sequenceId);
                     sequences.add(sequence);
-                }
-                for (int index = 0; index < sequences.size(); index++) {
-                    QwenExecutionContext context = new QwenExecutionContext(
-                            plan, sequences.get(index), QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {
-                                (index + 1) % QwenExecutionFixtures.VOCABULARY
-                            });
-                    sequenceCompletions.add(runtimes.get(index).submit(context));
+                    completions.add(runtime.submit(new QwenExecutionContext(
+                            plan, sequence, QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {
+                                sequenceId % QwenExecutionFixtures.VOCABULARY
+                            })));
                 }
                 try {
                     assertTrue(
                             gpu.embeddingGate.awaitEntries(),
                             "independent sequences did not execute concurrently; activeWorkers="
                                     + lattice.getActiveWorkers() + ", allowedCpus=" + cpus
-                                    + ", projectionCalls=" + gpu.projectionCalls.get()
-                                    + ", normCalls=" + gpu.normCalls.get()
-                                    + ", embeddingCalls=" + gpu.embeddingCalls.get()
-                                    + ", gatedWorkers=" + gpu.embeddingGate.workerCount());
+                                    + ", embeddingCalls=" + gpu.embeddingCalls.get());
                     assertEquals(2, gpu.embeddingGate.workerCount(), "independent sequences used the same worker");
                 } finally {
                     gpu.embeddingGate.release();
@@ -348,39 +267,97 @@ class EuhedralInferenceRuntimeLatticeTest {
                     assertTrue(
                             gpu.projectionGate.awaitEntries(),
                             "independent projection work did not overlap; activeWorkers="
-                                    + lattice.getActiveWorkers() + ", allowedCpus=" + cpus
-                                    + ", projectionCalls=" + gpu.projectionCalls.get()
-                                    + ", gatedWorkers=" + gpu.projectionGate.workerCount());
+                                    + lattice.getActiveWorkers() + ", projectionCalls="
+                                    + gpu.projectionCalls.get());
                     assertEquals(2, gpu.projectionGate.workerCount(), "projection work used the same worker");
                 } finally {
                     gpu.projectionGate.release();
                 }
-                CompletableFuture.allOf(sequenceCompletions.toArray(CompletableFuture[]::new))
+                CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new))
                         .get(30, TimeUnit.SECONDS);
-                for (var completion : sequenceCompletions) {
-                    var outcome = runtime.await(completion);
+                for (var completion : completions) {
+                    var outcome = completion.join();
                     assertEquals(
                             QwenExecutionContext.Status.SUCCESS,
                             outcome.status(),
                             () -> String.valueOf(outcome.failure()));
                 }
-
-                for (int index = 0; index < runtimes.size(); index++) {
-                    EuhedralInferenceRuntime sequenceRuntime = runtimes.get(index);
-                    sequenceRuntime.disconnectRunner();
-                    assertTrue(runners.get(index).isComplete());
-                    assertFalse(runners.get(index).isAttached(), "completed runner still has its lattice downstream");
-                    assertFalse(sequenceRuntime.hasAttachedRunner(), "runtime retained a detached runner");
-                }
-                awaitDrained(lattice);
                 for (QwenSequenceState sequence : sequences) assertEquals(1, sequence.currentTokenPosition());
+                assertEquals(0, runtime.activeQuanta());
             } finally {
                 gpu.projectionGate.release();
                 gpu.embeddingGate.release();
-                for (EuhedralInferenceRuntime sequenceRuntime : runtimes) {
-                    if (sequenceRuntime.hasAttachedRunner()) sequenceRuntime.disconnectRunner();
-                }
+                runtime.close();
                 for (QwenSequenceState sequence : sequences) sequence.complete();
+            }
+            assertFalse(runtime.isAttached());
+            awaitDrained(lattice);
+        } finally {
+            lattice.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void sequenceStateSurvivesAcrossQuantaAndPlanViewsOnTheRealLattice() throws Exception {
+        BitSet cpus = twoWorkerCpus();
+        assumeTrue(!cpus.isEmpty());
+        var lattice = createLattice(cpus);
+        try {
+            lattice.start();
+            var weights = QwenExecutionFixtures.statefulCompactWeights();
+            var plan = QwenExecutionPlan.prefix(weights, 2);
+            var gpu = new SequenceGpu();
+            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var sequence = new QwenSequenceState(700);
+            long embeddingAddress = weights.tokenEmbedding().deviceAddress();
+            try {
+                var prefill = runtime.submit(new QwenExecutionContext(
+                        plan, sequence, QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1, 2}));
+                assertEquals(
+                        QwenExecutionContext.Status.SUCCESS,
+                        prefill.get(10, TimeUnit.SECONDS).status());
+                var recurrent = (GdnSequenceStates) sequence.recurrentState();
+                var attention = (AttentionSequenceStates) sequence.kvCacheState();
+                var attentionState = attention.forLayer(1);
+                var recurrentState = recurrent.forLayer(0);
+                long convolutionAddress = recurrentState.convolutionStateAddress();
+                long recurrentAddress = recurrentState.recurrentStateAddress();
+                long kvAddress = attentionState.keyCacheAddress();
+                assertEquals(2, sequence.currentTokenPosition());
+                assertEquals(2, attentionState.length(), "the retired prefill committed its append");
+                assertFalse(gpu.freed.contains(convolutionAddress));
+                assertFalse(gpu.freed.contains(recurrentAddress));
+                assertFalse(gpu.freed.contains(kvAddress));
+
+                var decode = runtime.submit(new QwenExecutionContext(
+                        plan, sequence, QwenExecutionContext.ExecutionKind.DECODE, 2, new int[] {3}));
+                assertEquals(
+                        QwenExecutionContext.Status.SUCCESS,
+                        decode.get(10, TimeUnit.SECONDS).status());
+
+                assertEquals(3, sequence.currentTokenPosition());
+                assertSame(recurrent, sequence.recurrentState());
+                assertSame(attention, sequence.kvCacheState());
+                assertSame(recurrentState, recurrent.forLayer(0));
+                assertSame(attentionState, attention.forLayer(1));
+                assertEquals(3, attentionState.length());
+                assertEquals(convolutionAddress, gpu.lastConvolutionAddress.get());
+                assertEquals(recurrentAddress, gpu.lastRecurrentAddress.get());
+                assertEquals(2, gpu.convolutionCalls.get());
+                assertEquals(2, gpu.recurrenceCalls.get());
+                assertEquals(2, gpu.kvAppendCalls.get());
+                assertFalse(gpu.freed.contains(embeddingAddress));
+
+                sequence.complete();
+                assertTrue(gpu.freed.contains(convolutionAddress));
+                assertTrue(gpu.freed.contains(recurrentAddress));
+                assertTrue(gpu.freed.contains(kvAddress));
+                assertFalse(gpu.freed.contains(embeddingAddress));
+            } finally {
+                runtime.close();
+                if (sequence.terminalState() == QwenSequenceState.TerminalState.ACTIVE
+                        && !sequence.isExecutionClaimed()) sequence.complete();
             }
         } finally {
             lattice.close();
@@ -389,7 +366,7 @@ class EuhedralInferenceRuntimeLatticeTest {
 
     @Test
     @Timeout(value = 300, unit = TimeUnit.SECONDS)
-    void actualCompactLayerZeroSurvivesPrefillRunnerTeardownAndDecodesOnTheSameSequence() throws Exception {
+    void actualCompactLayerZeroPrefillsThenDecodesOnTheSameSequence() throws Exception {
         BitSet cpus = twoWorkerCpus();
         assumeTrue(cpus.cardinality() >= 2, "requires two available physical CPUs for lattice workers");
         Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact", DEFAULT_COMPACT_ARTIFACT.toString()));
@@ -403,7 +380,6 @@ class EuhedralInferenceRuntimeLatticeTest {
         QwenWeights weights = QwenWeightLoader.loadFirstLayer(artifactPath, artifact, gpu);
         var plan = new QwenExecutionPlan(weights);
         var lattice = createLattice(cpus);
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
         var sequence = new QwenSequenceState(701);
         long embeddingAddress = weights.tokenEmbedding().deviceAddress();
         LatticeEdge registrationProbe = new LatticeEdge(new AtomicBoolean());
@@ -411,64 +387,65 @@ class EuhedralInferenceRuntimeLatticeTest {
         try {
             lattice.start();
             awaitWorkers(lattice, 2, registrationProbe, registeredWorkersBeforeStart + 2);
-
-            QwenExecutionRunner prefillRunner = runtime.attachRunner();
-            QwenGdnSequenceState recurrent;
-            long convolutionAddress;
-            long recurrentAddress;
+            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             try {
                 var prefill = runtime.submit(new QwenExecutionContext(
                         plan, sequence, QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1814, 1815}));
-                var outcome = runtime.await(prefill);
+                var outcome = prefill.get(60, TimeUnit.SECONDS);
                 assertEquals(
                         QwenExecutionContext.Status.SUCCESS, outcome.status(), () -> String.valueOf(outcome.failure()));
-                recurrent = (QwenGdnSequenceState) sequence.recurrentState();
-                convolutionAddress = recurrent.convolutionStateAddress();
-                recurrentAddress = recurrent.recurrentStateAddress();
-            } finally {
-                runtime.disconnectRunner();
-            }
+                QwenGdnSequenceState recurrent = (QwenGdnSequenceState) sequence.recurrentState();
+                long convolutionAddress = recurrent.convolutionStateAddress();
+                long recurrentAddress = recurrent.recurrentStateAddress();
+                assertEquals(2, sequence.currentTokenPosition());
+                assertFalse(gpu.freed.contains(convolutionAddress));
+                assertFalse(gpu.freed.contains(recurrentAddress));
+                assertFalse(gpu.freed.contains(embeddingAddress));
 
-            assertTrue(prefillRunner.isComplete());
-            assertFalse(prefillRunner.isAttached());
-            assertSame(recurrent, sequence.recurrentState());
-            assertEquals(2, sequence.currentTokenPosition());
-            assertFalse(gpu.freed.contains(convolutionAddress));
-            assertFalse(gpu.freed.contains(recurrentAddress));
-            assertFalse(gpu.freed.contains(embeddingAddress));
-
-            QwenExecutionRunner decodeRunner = runtime.attachRunner();
-            try {
                 var decode = runtime.submit(new QwenExecutionContext(
                         plan, sequence, QwenExecutionContext.ExecutionKind.DECODE, 2, new int[] {1816}));
-                var outcome = runtime.await(decode);
+                var decoded = decode.get(60, TimeUnit.SECONDS);
                 assertEquals(
-                        QwenExecutionContext.Status.SUCCESS, outcome.status(), () -> String.valueOf(outcome.failure()));
+                        QwenExecutionContext.Status.SUCCESS, decoded.status(), () -> String.valueOf(decoded.failure()));
+
+                assertSame(recurrent, sequence.recurrentState());
+                assertEquals(3, sequence.currentTokenPosition());
+                assertEquals(convolutionAddress, gpu.lastConvolutionAddress.get());
+                assertEquals(recurrentAddress, gpu.lastRecurrentAddress.get());
+                assertEquals(2, gpu.convolutionCalls.get());
+                assertEquals(2, gpu.recurrenceCalls.get());
+                assertFalse(gpu.freed.contains(embeddingAddress));
+
+                sequence.complete();
+                assertTrue(gpu.freed.contains(convolutionAddress));
+                assertTrue(gpu.freed.contains(recurrentAddress));
+                assertFalse(gpu.freed.contains(embeddingAddress));
             } finally {
-                runtime.disconnectRunner();
+                runtime.close();
             }
-
-            assertTrue(decodeRunner.isComplete());
-            assertFalse(decodeRunner.isAttached());
-            assertSame(recurrent, sequence.recurrentState());
-            assertEquals(3, sequence.currentTokenPosition());
-            assertEquals(convolutionAddress, gpu.lastConvolutionAddress.get());
-            assertEquals(recurrentAddress, gpu.lastRecurrentAddress.get());
-            assertEquals(2, gpu.convolutionCalls.get());
-            assertEquals(2, gpu.recurrenceCalls.get());
-            assertFalse(gpu.freed.contains(embeddingAddress));
-            assertTrue(lattice.isDrained());
-
-            sequence.complete();
-            assertTrue(gpu.freed.contains(convolutionAddress));
-            assertTrue(gpu.freed.contains(recurrentAddress));
-            assertFalse(gpu.freed.contains(embeddingAddress));
+            awaitDrained(lattice);
         } finally {
-            if (runtime.hasAttachedRunner()) runtime.disconnectRunner();
             if (sequence.terminalState() == QwenSequenceState.TerminalState.ACTIVE && !sequence.isExecutionClaimed()) {
                 sequence.complete();
             }
             lattice.close();
+        }
+    }
+
+    private static void awaitHeld(QwenExecutionFixtures.HoldingStream stream, int boundaries)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (stream.held() < boundaries && System.nanoTime() < deadline) Thread.sleep(1);
+        assertEquals(boundaries, stream.held(), "the quantum's stages did not all submit");
+    }
+
+    /// A synchronous test GPU whose single stream holds each retirement boundary for the test.
+    private static final class HeldGpu extends QwenExecutionFixtures.RecordingGpu {
+        final QwenExecutionFixtures.HoldingStream stream = new QwenExecutionFixtures.HoldingStream();
+
+        @Override
+        public io.euhedral_execution.inference.core.gpu.GpuStream openStream() {
+            return this.stream;
         }
     }
 
@@ -477,24 +454,6 @@ class EuhedralInferenceRuntimeLatticeTest {
         var baseShard = ControlPlaneShard.createBaseShard("EuhedralRuntimeTestShard", workers);
         return ControlPlaneLattice.getOrCreate(
                 new LatticeConfig("EuhedralRuntimeTestLattice", cpus, Duration.ofSeconds(10), baseShard));
-    }
-
-    private static LatticeTerminal throwingCompletionTerminal(RuntimeException failure) {
-        return upstream -> upstream.addDownstream(new LatticeReceiver() {
-            @Override
-            public void addUpstream(LatticeSource source) {}
-
-            @Override
-            public void push(AbstractFrame frame) {}
-
-            @Override
-            public void onError(Throwable error) {}
-
-            @Override
-            public void onComplete() {
-                throw failure;
-            }
-        });
     }
 
     private static BitSet twoWorkerCpus() {
@@ -529,81 +488,6 @@ class EuhedralInferenceRuntimeLatticeTest {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (!lattice.isDrained() && System.nanoTime() < deadline) Thread.sleep(1);
         assertTrue(lattice.isDrained(), "Euhedral workers retained runnable frames after disconnection");
-    }
-
-    private static void verifySequenceStateSurvivesRunnerTeardown(ControlPlaneLattice lattice) throws Exception {
-        var weights = QwenExecutionFixtures.statefulCompactWeights();
-        var plan = QwenExecutionPlan.prefix(weights, 2);
-        var gpu = new SequenceGpu();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
-        var sequence = new QwenSequenceState(700);
-        long embeddingAddress = weights.tokenEmbedding().deviceAddress();
-        QwenExecutionRunner prefillRunner = runtime.attachRunner();
-        try {
-            var prefill = runtime.submit(new QwenExecutionContext(
-                    plan, sequence, QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[] {1, 2}));
-            assertEquals(
-                    QwenExecutionContext.Status.SUCCESS, runtime.await(prefill).status());
-            var recurrent = (GdnSequenceStates) sequence.recurrentState();
-            var attention = (AttentionSequenceStates) sequence.kvCacheState();
-            var attentionState = attention.forLayer(1);
-            var recurrentState = recurrent.forLayer(0);
-            long convolutionAddress = recurrentState.convolutionStateAddress();
-            long recurrentAddress = recurrentState.recurrentStateAddress();
-            long kvAddress = attentionState.keyCacheAddress();
-
-            runtime.disconnectRunner();
-
-            assertTrue(prefillRunner.isComplete());
-            assertFalse(prefillRunner.isAttached());
-            assertSame(recurrent, sequence.recurrentState(), "runner teardown replaced GDN sequence state");
-            assertSame(attention, sequence.kvCacheState(), "runner teardown replaced attention KV sequence state");
-            assertEquals(2, sequence.currentTokenPosition());
-            assertEquals(2, attentionState.length());
-            assertFalse(gpu.freed.contains(convolutionAddress));
-            assertFalse(gpu.freed.contains(recurrentAddress));
-            assertFalse(gpu.freed.contains(kvAddress));
-            assertFalse(gpu.freed.contains(embeddingAddress));
-
-            QwenExecutionRunner decodeRunner = runtime.attachRunner();
-            try {
-                var decode = runtime.submit(new QwenExecutionContext(
-                        plan, sequence, QwenExecutionContext.ExecutionKind.DECODE, 2, new int[] {3}));
-                assertEquals(
-                        QwenExecutionContext.Status.SUCCESS,
-                        runtime.await(decode).status());
-            } finally {
-                runtime.disconnectRunner();
-            }
-
-            assertTrue(decodeRunner.isComplete());
-            assertFalse(decodeRunner.isAttached());
-            assertEquals(3, sequence.currentTokenPosition());
-            assertSame(recurrent, sequence.recurrentState());
-            assertSame(attention, sequence.kvCacheState());
-            assertSame(recurrentState, recurrent.forLayer(0));
-            assertSame(attentionState, attention.forLayer(1));
-            assertEquals(3, attentionState.length());
-            assertEquals(convolutionAddress, gpu.lastConvolutionAddress.get());
-            assertEquals(recurrentAddress, gpu.lastRecurrentAddress.get());
-            assertEquals(2, gpu.convolutionCalls.get());
-            assertEquals(2, gpu.recurrenceCalls.get());
-            assertEquals(2, gpu.kvAppendCalls.get());
-            assertFalse(gpu.freed.contains(recurrentAddress));
-            assertFalse(gpu.freed.contains(embeddingAddress));
-
-            sequence.complete();
-            assertTrue(gpu.freed.contains(convolutionAddress));
-            assertTrue(gpu.freed.contains(recurrentAddress));
-            assertTrue(gpu.freed.contains(kvAddress));
-            assertFalse(gpu.freed.contains(embeddingAddress));
-            assertFalse(runtime.hasAttachedRunner());
-        } finally {
-            if (runtime.hasAttachedRunner()) runtime.disconnectRunner();
-            if (sequence.terminalState() == QwenSequenceState.TerminalState.ACTIVE && !sequence.isExecutionClaimed()) {
-                sequence.complete();
-            }
-        }
     }
 
     private static final class ConcurrentGpu extends ExecutionGpu {

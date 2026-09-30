@@ -1,7 +1,6 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -93,7 +92,8 @@ class QwenGenerationSessionCudaIntegrationTest {
                         List<Integer> generated = session.generate(prompt, 5, text -> {
                             output.append(text);
                             callbackPositions.add(session.currentTokenPosition());
-                            assertFalse(runtime.hasAttachedRunner(), "runtime retained its source after a token");
+                            assertEquals(
+                                    0, runtime.activeQuanta(), "a token is emitted only after its quantum retired");
                             Object currentRecurrent = session.sequenceState().recurrentState();
                             Object currentKv = session.sequenceState().kvCacheState();
                             if (recurrentState.compareAndSet(null, currentRecurrent)) {
@@ -149,7 +149,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                                 maximumCallbackFree - minimumCallbackFree <= CALLBACK_FREE_MEMORY_TOLERANCE,
                                 "retained logits caused free device memory to decline between tokens: min="
                                         + minimumCallbackFree + ", max=" + maximumCallbackFree);
-                        assertFalse(runtime.hasAttachedRunner());
+                        assertEquals(0, runtime.activeQuanta());
                         assertTrue(lattice.isDrained());
 
                         GdnSequenceStates recurrent = (GdnSequenceStates) recurrentState.get();
@@ -166,7 +166,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                                 "session close did not release its persistent KV/GDN state and sampled logits");
                     } finally {
                         session.close();
-                        if (runtime.hasAttachedRunner()) runtime.disconnectRunner();
+                        runtime.close();
                     }
                 } catch (Throwable executionFailure) {
                     failure = executionFailure;

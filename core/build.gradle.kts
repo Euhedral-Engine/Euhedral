@@ -17,10 +17,32 @@ dependencies {
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 
+// Euhedral's ControlPlaneLattice is a process-wide singleton. Every test class that starts one runs in
+// its own JVM, so no lattice, worker, or static edge state can leak between classes.
+val latticeTestClasses = listOf(
+    "**/EuhedralInferenceRuntimeLatticeTest.class",
+    "**/QwenGenerationSessionTest.class",
+    "**/InferenceEngineTest.class",
+)
+
+val latticeTest = tasks.register<Test>("latticeTest") {
+    group = "verification"
+    description = "Run CPU tests that start the process-wide Euhedral lattice, one JVM per test class."
+    val testSourceSet = sourceSets["test"]
+    testClassesDirs = testSourceSet.output.classesDirs
+    classpath = testSourceSet.runtimeClasspath
+    include(latticeTestClasses)
+    forkEvery = 1
+    useJUnitPlatform()
+}
+
 tasks.named<Test>("test") {
-    providers.gradleProperty("euhedral.cuda.async.library").orNull?.let {
-        systemProperty("euhedral.cuda.async.library", it)
-    }
+    exclude(latticeTestClasses)
+    finalizedBy(latticeTest)
+}
+
+tasks.named("check") {
+    dependsOn(latticeTest)
 }
 
 val tokenizerReferenceDirectory = providers.gradleProperty("euhedral.qwen.tokenizer-dir")

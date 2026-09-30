@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core.gpu;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.euhedral_execution.inference.core.GpuExecutionMode;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
 import io.euhedral_execution.inference.core.InferenceTuning;
 import java.util.BitSet;
@@ -28,18 +27,16 @@ class Q3DispatchModeTest {
     }
 
     @Test
-    void immutableTuningAndSnapshotsRetainKernelAndStreamPolicies() {
+    void immutableTuningAndSnapshotsRetainKernelPolicies() {
         BitSet cpus = new BitSet();
         cpus.set(0);
         var tuning = InferenceTuning.defaults(cpus)
                 .withQ3Dispatch(Q3DispatchMode.AUTO, 8)
                 .withPrefillChunkTokens(256)
-                .withGpuExecutionMode(GpuExecutionMode.ASYNC_EXPERIMENTAL)
                 .withWorkerProcessorIds(cpus);
         var snapshot = InferenceRunSnapshot.Tuning.of(tuning);
         assertEquals(Q3DispatchMode.AUTO, snapshot.q3DispatchMode());
         assertEquals(8, snapshot.q3SmallRowThreshold());
-        assertEquals(GpuExecutionMode.ASYNC_EXPERIMENTAL, snapshot.gpuExecutionMode());
         assertThrows(IllegalArgumentException.class, () -> tuning.withQ3Dispatch(Q3DispatchMode.AUTO, -1));
         assertThrows(NullPointerException.class, () -> tuning.withQ3Dispatch(null, 4));
     }

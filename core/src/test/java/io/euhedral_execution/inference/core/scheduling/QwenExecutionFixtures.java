@@ -1,6 +1,10 @@
 package io.euhedral_execution.inference.core.scheduling;
 
+import io.euhedral_execution.core.generics.LatticeSource;
+import io.euhedral_execution.core.generics.LatticeTerminal;
+import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
@@ -352,6 +356,112 @@ final class QwenExecutionFixtures {
         public void synchronize() {
             synchronizations++;
         }
+    }
+
+    /// Euhedral's execution terminal attached with unbounded demand: each published frame runs on the
+    /// publishing thread, so a quantum on a synchronous fixture GPU finishes before `submit` returns.
+    static LatticeTerminal inlineLattice() {
+        return source -> {
+            new DefaultExecutor().input(source);
+            source.request(Long.MAX_VALUE);
+        };
+    }
+
+    /// Euhedral's execution terminal with no standing demand: `drive` pulls and runs every ready frame,
+    /// including retirement frames that a driver callback only enqueued, and leaves no demand behind.
+    static final class ManualLattice implements LatticeTerminal {
+        /// Each reusable graph attaches its own source once, when it is built.
+        final List<LatticeSource> sources = new java.util.concurrent.CopyOnWriteArrayList<>();
+        /// The most recently attached source.
+        LatticeSource source;
+
+        @Override
+        public void addUpstream(LatticeSource attached) {
+            new DefaultExecutor().input(attached);
+            this.sources.add(attached);
+            this.source = attached;
+        }
+
+        void drive() {
+            for (LatticeSource attached : this.sources)
+                attached.pull(PullingLattice::run, frame -> false, Long.MAX_VALUE);
+        }
+
+        /// Pulls from every attached source, as Euhedral's workers cycle through their upstreams.
+        long pull(
+                java.util.function.Consumer<io.euhedral_execution.core.frames.AbstractFrame> consumer,
+                java.util.function.Function<io.euhedral_execution.core.frames.AbstractFrame, Boolean> stop,
+                long demand) {
+            long pulled = 0;
+            for (LatticeSource attached : this.sources) {
+                if (pulled >= demand) break;
+                pulled += attached.pull(consumer, stop, demand - pulled);
+            }
+            return pulled;
+        }
+    }
+
+    static EuhedralInferenceRuntime runtime(QwenExecutionPlan plan, ExecutionGpu gpu) {
+        return new EuhedralInferenceRuntime(inlineLattice(), plan, gpu);
+    }
+
+    /// A stream whose device work has finished when `submit` returns, but whose retirement boundaries
+    /// stay unannounced until the test releases them.
+    static final class HoldingStream implements GpuStream {
+        final List<Long> tickets = new ArrayList<>();
+        final List<RetirementListener> listeners = new ArrayList<>();
+        final List<Throwable> failures = new ArrayList<>();
+        int recoveries;
+        private long nextTicket;
+
+        @Override
+        public synchronized void submit(Runnable launches, boolean overlapPredecessor) {
+            launches.run();
+        }
+
+        @Override
+        public synchronized long notifyRetired(RetirementListener listener) {
+            long ticket = ++this.nextTicket;
+            this.tickets.add(ticket);
+            this.listeners.add(listener);
+            return ticket;
+        }
+
+        synchronized int held() {
+            return this.listeners.size();
+        }
+
+        /// Announces the oldest held boundary from a driver thread's point of view.
+        void release(Throwable deviceFailure) {
+            long ticket;
+            RetirementListener listener;
+            synchronized (this) {
+                ticket = this.tickets.removeFirst();
+                listener = this.listeners.removeFirst();
+                if (deviceFailure != null) this.failed.put(ticket, deviceFailure);
+            }
+            listener.retired(ticket, true);
+        }
+
+        private final java.util.Map<Long, Throwable> failed = new java.util.HashMap<>();
+
+        @Override
+        public synchronized Throwable confirmRetired(long ticket) {
+            Throwable failure = this.failed.remove(ticket);
+            if (failure != null) this.failures.add(failure);
+            return failure;
+        }
+
+        @Override
+        public void synchronize() {}
+
+        @Override
+        public synchronized void recover(Throwable failure) {
+            this.recoveries++;
+        }
+
+        @Override
+        public void close() {}
     }
 
     private QwenExecutionFixtures() {}

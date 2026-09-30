@@ -14,7 +14,6 @@ import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactRe
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
-import io.euhedral_execution.inference.core.scheduling.InferenceGpuExecutor;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -107,7 +106,7 @@ public final class InferenceEngine implements AutoCloseable {
             gpu = bootstrap.openGpu(config.cudaLibraryPath(), tuning);
             model = bootstrap.loadModel(config.artifactPath(), artifact, gpu);
             QwenExecutionPlan plan = new QwenExecutionPlan(model.weights());
-            lattice = bootstrap.createLattice(config, gpu);
+            lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             return new InferenceEngine(
@@ -164,14 +163,12 @@ public final class InferenceEngine implements AutoCloseable {
         @Override
         public synchronized void close() {
             if (this.cleaned) return;
-            if (this.gpu != null) this.gpu.abortWorkerStartup();
             if (this.lattice != null) {
                 LAST_CLOSED_LATTICE.set(this.lattice);
                 this.lattice.close();
                 this.lattice = null;
             }
             if (this.model != null) {
-                if (this.gpu != null) this.gpu.ensureWorkersClosed();
                 try {
                     this.model.close();
                 } catch (RuntimeException | Error cleanup) {
@@ -290,11 +287,10 @@ public final class InferenceEngine implements AutoCloseable {
             // Fail closed: never unload resources after an unproven session shutdown.
             if (failure instanceof RuntimeException exception) throw exception;
             if (failure instanceof Error error) throw error;
-            this.runtime.closeCompletionSink();
+            this.runtime.close();
             // All inference sources have drained before fabric shutdown, even if fabric teardown is asynchronous.
             LAST_CLOSED_LATTICE.set(this.lattice);
             this.lattice.close();
-            this.gpu.ensureWorkersClosed();
             this.model.close();
             this.bootstrap.closeGpu(this.gpu);
             this.resourcesClosed = true;
@@ -364,19 +360,11 @@ public final class InferenceEngine implements AutoCloseable {
         }
 
         ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
-            return new CudaGpuMemory(
-                    path,
-                    tuning.gpuExecutionMode() == GpuExecutionMode.ASYNC_EXPERIMENTAL,
-                    tuning.q3DispatchMode(),
-                    tuning.q3SmallRowThreshold());
+            return new CudaGpuMemory(path, tuning.q3DispatchMode(), tuning.q3SmallRowThreshold());
         }
 
         QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu) throws IOException {
             return QwenModel.load(path, artifact, gpu);
-        }
-
-        ControlPlaneLattice createLattice(InferenceConfig config, ExecutionGpu gpu) {
-            return gpu.asynchronous() ? createLattice(config, new InferenceGpuExecutor(gpu)) : createLattice(config);
         }
 
         ControlPlaneLattice createLattice(InferenceConfig config) {

@@ -18,13 +18,13 @@ class AttentionKvStateTest {
             state.prepareAppend(0, 255);
             assertEquals(256, state.capacity());
             long page = gpu.tableEntries.get(state.keyCacheAddress())[0];
-            state.commitAppend(255);
+            commit(state, 255);
             state.prepareAppend(255, 2);
             assertEquals(512, state.capacity());
             assertEquals(page, gpu.tableEntries.get(state.keyCacheAddress())[0]);
             assertTrue(gpu.copySizes.isEmpty(), "growth must never copy existing KV payloads");
             assertEquals(255, state.length());
-            state.commitAppend(2);
+            commit(state, 2);
             assertEquals(257, state.length());
         }
         assertTrue(gpu.allocations.isEmpty());
@@ -40,7 +40,7 @@ class AttentionKvStateTest {
             assertEquals(
                     65536L * 4 * 144 * 2 + 256L * 8 * 2,
                     gpu.allocations.values().stream().mapToLong(Long::longValue).sum());
-            state.commitAppend(65536);
+            commit(state, 65536);
             state.prepareAppend(65536, 1);
             assertEquals(65792, state.capacity());
             assertTrue(gpu.copySizes.isEmpty());
@@ -67,11 +67,37 @@ class AttentionKvStateTest {
             assertThrows(IllegalArgumentException.class, () -> state.prepareAppend(1, 1));
             state.prepareAppend(0, 2);
             assertEquals(0, state.length());
-            state.commitAppend(2);
+            assertEquals(0, state.submittedLength(), "reserved rows are not yet submitted");
+            state.appendSubmitted(2);
+            assertEquals(2, state.submittedLength(), "the submitting quantum may read its own rows");
+            assertEquals(0, state.length(), "submitted rows are not committed");
+            assertThrows(IllegalStateException.class, () -> state.prepareAppend(0, 1), "one pending append");
+            state.commitSubmitted();
+            assertEquals(2, state.length());
             assertThrows(IllegalArgumentException.class, () -> state.prepareAppend(1, 1));
-            assertThrows(IllegalArgumentException.class, () -> state.commitAppend(257));
+            assertThrows(IllegalArgumentException.class, () -> state.appendSubmitted(257));
         }
         assertThrows(IllegalArgumentException.class, () -> new AttentionKvState(gpu, 4));
+    }
+
+    @Test
+    void discardedSubmissionNeverBecomesVisible() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 256)) {
+            state.prepareAppend(0, 3);
+            state.appendSubmitted(3);
+            state.discardSubmitted();
+            assertEquals(0, state.length());
+            assertEquals(0, state.submittedLength());
+            state.prepareAppend(0, 1);
+            commit(state, 1);
+            assertEquals(1, state.length());
+        }
+    }
+
+    private static void commit(AttentionKvState state, int tokens) {
+        state.appendSubmitted(tokens);
+        state.commitSubmitted();
     }
 
     @Test
@@ -87,7 +113,7 @@ class AttentionKvStateTest {
             assertEquals(512, state.capacity());
             assertEquals(3, gpu.allocations.size(), "two payload pages and one current table");
             assertTrue(gpu.copySizes.isEmpty());
-            state.commitAppend(257);
+            commit(state, 257);
         }
         assertTrue(gpu.allocations.isEmpty());
     }

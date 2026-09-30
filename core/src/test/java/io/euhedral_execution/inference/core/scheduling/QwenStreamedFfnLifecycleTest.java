@@ -2,13 +2,13 @@ package io.euhedral_execution.inference.core.scheduling;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.euhedral_execution.core.impl.DefaultExecutor;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+/// Borrowed streamed-FFN storage stays owned until the quantum's device work has provably retired.
 class QwenStreamedFfnLifecycleTest {
     enum Scenario {
         SUCCESS,
@@ -16,43 +16,21 @@ class QwenStreamedFfnLifecycleTest {
         COMPLETION_REGISTRATION,
         COMPLETION_FAILURE,
         CANCEL,
-        UNPROVEN_DRAIN
+        UNPROVEN_DRAIN,
+        UNPROVEN_DRAIN_AFTER_SUCCESSFUL_LAUNCH
     }
 
     @ParameterizedTest
     @EnumSource(Scenario.class)
-    void borrowedSlotsAndContinuationStayOwnedUntilCompletion(Scenario scenario) throws Exception {
-        runCase(scenario, true);
+    void borrowedSlotsAndContinuationStayOwnedUntilRetirement(Scenario scenario) throws Exception {
+        for (int rows : new int[] {64, 1024}) runCase(scenario, rows);
     }
 
-    @ParameterizedTest
-    @EnumSource(
-            value = Scenario.class,
-            names = {"PARTIAL_LAUNCH", "UNPROVEN_DRAIN"})
-    void synchronousOuterModeStillRecoversInternalStreamFailures(Scenario scenario) throws Exception {
-        runCase(scenario, false);
-    }
-
-    @org.junit.jupiter.api.Test
-    void synchronousCompletionFailureAlsoQuarantinesBorrowedStorage() throws Exception {
-        runCase(Scenario.UNPROVEN_DRAIN, false, true);
-    }
-
-    private static void runCase(Scenario scenario, boolean asynchronous) throws Exception {
-        runCase(scenario, asynchronous, false);
-    }
-
-    private static void runCase(Scenario scenario, boolean asynchronous, boolean nativeSucceeded) throws Exception {
-        for (int rows : new int[] {64, 1024}) runCase(scenario, asynchronous, nativeSucceeded, rows);
-    }
-
-    private static void runCase(Scenario scenario, boolean asynchronous, boolean nativeSucceeded, int rows)
-            throws Exception {
+    private static void runCase(Scenario scenario, int rows) throws Exception {
         var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
         var plan = new QwenExecutionPlan(weights).forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
         var sequence = new QwenSequenceState(2048);
-        var gpu = new HoldingGpu(scenario, asynchronous);
-        gpu.nativeSucceeded = nativeSucceeded;
+        var gpu = new HoldingGpu(scenario);
         var context = new QwenExecutionContext(
                 plan,
                 sequence,
@@ -60,21 +38,19 @@ class QwenStreamedFfnLifecycleTest {
                 0,
                 new int[rows],
                 QwenLogitsRequirement.NONE);
-        var runner = new QwenExecutionRunner(plan, gpu);
-        new DefaultExecutor().input(runner);
+        var lattice = new QwenExecutionFixtures.ManualLattice();
+        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
         try {
-            var outcome = runner.submit(context);
-            runner.request(plan.instructions().size());
-            assertTrue(gpu.calls > 0, "must reach the real streamed FFN frame");
-            if (gpu.completion != null) {
+            var outcome = runtime.submit(context);
+            lattice.drive();
+            assertTrue(gpu.calls > 0, "must reach the real streamed FFN stage");
+            if (scenario != Scenario.COMPLETION_REGISTRATION) {
+                assertEquals(1, gpu.stream.armed, "one device-completion boundary for the quantum");
                 assertFalse(outcome.isDone());
                 assertTrue(gpu.borrowed.stream().noneMatch(gpu.freed()::contains));
                 if (scenario == Scenario.CANCEL) sequence.cancel();
-                if (scenario == Scenario.COMPLETION_FAILURE)
-                    gpu.failure.accept(new IllegalStateException("completion"));
-                else gpu.completion.run();
-                gpu.completion = null;
-                runner.request(plan.instructions().size());
+                gpu.stream.announce();
+                lattice.drive();
             }
             var expected = scenario == Scenario.SUCCESS
                     ? QwenExecutionContext.Status.SUCCESS
@@ -82,41 +58,38 @@ class QwenStreamedFfnLifecycleTest {
                             ? QwenExecutionContext.Status.CANCELLED
                             : QwenExecutionContext.Status.FAILED;
             assertEquals(expected, outcome.get(2, TimeUnit.SECONDS).status());
-            if (scenario == Scenario.UNPROVEN_DRAIN) {
+            if (scenario == Scenario.UNPROVEN_DRAIN || scenario == Scenario.UNPROVEN_DRAIN_AFTER_SUCCESSFUL_LAUNCH) {
                 assertTrue(gpu.poisoned);
                 assertTrue(gpu.borrowed.stream().noneMatch(gpu.freed()::contains));
             } else {
                 assertFalse(gpu.pending);
                 assertTrue(gpu.freed().containsAll(gpu.borrowed));
             }
-            if (scenario == Scenario.PARTIAL_LAUNCH || scenario == Scenario.COMPLETION_REGISTRATION)
-                assertTrue(gpu.synchronizations > 0);
+            if (scenario == Scenario.COMPLETION_REGISTRATION) assertTrue(gpu.stream.recoveries > 0);
         } finally {
             context.cancel();
-            if (gpu.completion != null) gpu.completion.run();
-            runner.completeGracefully();
-            sequence.complete();
+            runtime.close();
+            // A poisoned device retains the sequence's persistent state as well.
+            if (gpu.poisoned) assertThrows(IllegalStateException.class, sequence::complete);
+            else sequence.complete();
         }
     }
 
     private static final class HoldingGpu extends EngineExecutionFixture.SamplingGpu {
         final Scenario scenario;
-        final boolean asynchronous;
+        final Stream stream = new Stream();
         Set<Long> borrowed = Set.of();
         int calls;
-        boolean pending, holdNext, poisoned, nativeSucceeded;
-        Runnable completion;
-        Consumer<Throwable> failure;
+        boolean pending, poisoned;
 
-        HoldingGpu(Scenario scenario, boolean asynchronous) {
+        HoldingGpu(Scenario scenario) {
             super(8);
             this.scenario = scenario;
-            this.asynchronous = asynchronous;
         }
 
         @Override
-        public boolean asynchronous() {
-            return this.asynchronous;
+        public GpuStream openStream() {
+            return this.stream;
         }
 
         @Override
@@ -130,35 +103,11 @@ class QwenStreamedFfnLifecycleTest {
         }
 
         @Override
-        public void synchronize() {
-            if (pending && scenario == Scenario.UNPROVEN_DRAIN) throw new IllegalStateException("drain");
-            pending = false;
-            super.synchronize();
-        }
-
-        @Override
         public synchronized void free(long address) {
-            assertFalse(pending && borrowed.contains(address), "borrowed FFN storage released before drain");
+            // A poisoned device retains every allocation, as the CUDA binding does.
+            if (poisoned) throw new IllegalStateException("GPU is poisoned; ownership is retained");
+            assertFalse(pending && borrowed.contains(address), "borrowed FFN storage released before retirement");
             super.free(address);
-        }
-
-        @Override
-        public void deferCompletion(Runnable completed, Consumer<Throwable> failed) {
-            if (!holdNext) {
-                pending = false;
-                completed.run();
-                return;
-            }
-            holdNext = false;
-            if (scenario == Scenario.COMPLETION_REGISTRATION) throw new IllegalStateException("register");
-            completion = () -> {
-                pending = false;
-                completed.run();
-            };
-            failure = error -> {
-                pending = false;
-                failed.accept(error);
-            };
         }
 
         @Override
@@ -180,11 +129,8 @@ class QwenStreamedFfnLifecycleTest {
             borrowed = Set.of(input, output, slots, accumulators);
             pending = true;
             calls++;
-            if (!nativeSucceeded
-                    && calls == 1
-                    && (scenario == Scenario.PARTIAL_LAUNCH || scenario == Scenario.UNPROVEN_DRAIN))
+            if (calls == 1 && (scenario == Scenario.PARTIAL_LAUNCH || scenario == Scenario.UNPROVEN_DRAIN))
                 throw new IllegalStateException("partial native FFN");
-            holdNext = calls == 1;
         }
 
         @Override
@@ -210,5 +156,63 @@ class QwenStreamedFfnLifecycleTest {
                 int rows,
                 int width,
                 int heads) {}
+
+        /// The quantum's device ordering: its boundary retires only when the test announces it.
+        final class Stream implements GpuStream {
+            int armed;
+            int recoveries;
+            private RetirementListener listener;
+            private long ticket;
+
+            @Override
+            public void submit(Runnable launches, boolean overlapPredecessor) {
+                launches.run();
+            }
+
+            @Override
+            public long notifyRetired(RetirementListener retired) {
+                if (scenario == Scenario.COMPLETION_REGISTRATION) throw new IllegalStateException("register");
+                this.armed++;
+                this.listener = retired;
+                return ++this.ticket;
+            }
+
+            void announce() {
+                this.listener.retired(this.ticket, true);
+            }
+
+            @Override
+            public Throwable confirmRetired(long retired) {
+                return switch (scenario) {
+                    case COMPLETION_FAILURE -> {
+                        pending = false;
+                        yield new IllegalStateException("completion");
+                    }
+                    case UNPROVEN_DRAIN, UNPROVEN_DRAIN_AFTER_SUCCESSFUL_LAUNCH -> {
+                        IllegalStateException failure = new IllegalStateException("drain");
+                        poison(failure);
+                        yield failure;
+                    }
+                    default -> {
+                        pending = false;
+                        yield null;
+                    }
+                };
+            }
+
+            @Override
+            public void synchronize() {
+                pending = false;
+            }
+
+            @Override
+            public void recover(Throwable failure) {
+                this.recoveries++;
+                pending = false;
+            }
+
+            @Override
+            public void close() {}
+        }
     }
 }

@@ -108,7 +108,6 @@ public final class BenchmarkMain {
                 + prepared.workers().coreIds());
         System.out.println("prefill chunks: " + options.prefillChunks() + "; warmup " + options.warmup()
                 + ", measured " + options.iterations() + " per scenario; generation " + options.generation()
-                + "; gpu " + options.gpuExecutionMode()
                 + "; fork " + (forkId == null ? "unspecified" : forkId));
         prepared.prompts()
                 .forEach((scenario, prompt) -> System.out.println("scenario " + scenario.name() + ": prompt "

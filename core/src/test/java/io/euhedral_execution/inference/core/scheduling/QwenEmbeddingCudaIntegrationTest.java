@@ -3,8 +3,6 @@ package io.euhedral_execution.inference.core.scheduling;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.core.generics.AbstractExecutor;
-import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
@@ -27,8 +25,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -135,22 +131,20 @@ class QwenEmbeddingCudaIntegrationTest {
                 QwenSequenceState sequence = new QwenSequenceState(501L);
                 QwenExecutionContext context = new QwenExecutionContext(
                         plan, sequence, QwenExecutionContext.ExecutionKind.PREFILL, 0L, MODEL_TOKEN_IDS);
-                QwenExecutionRunner runner = new QwenExecutionRunner(plan, gpu, terminalContext -> {
-                    QwenExecutionWorkspace workspace = terminalContext.workspace();
-                    try (Arena outputArena = Arena.ofConfined()) {
-                        MemorySegment hostOutput = outputArena.allocate(workspace.byteSize(), Short.BYTES);
-                        gpu.copyDeviceToHost(hostOutput, workspace.hiddenStateAddress(), workspace.byteSize());
-                        output.set(decodeBfloat16(hostOutput));
-                    }
-                });
-
-                try (RunnerDriver driver = new RunnerDriver(runner)) {
-                    CompletableFuture<QwenExecutionContext.Outcome> outcome = runner.submit(context);
-                    driver.request(1);
-                    assertEquals(
-                            QwenExecutionContext.Status.SUCCESS,
-                            outcome.get(10, TimeUnit.MINUTES).status());
-                }
+                QwenExecutionContext.Outcome outcome = TestExecution.run(
+                        plan,
+                        gpu,
+                        context,
+                        terminalContext -> {
+                            QwenExecutionWorkspace workspace = terminalContext.workspace();
+                            try (Arena outputArena = Arena.ofConfined()) {
+                                MemorySegment hostOutput = outputArena.allocate(workspace.byteSize(), Short.BYTES);
+                                gpu.copyDeviceToHost(hostOutput, workspace.hiddenStateAddress(), workspace.byteSize());
+                                output.set(decodeBfloat16(hostOutput));
+                            }
+                        },
+                        600);
+                assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.status());
 
                 assertTrue(context.workspace().isClosed(), "submission workspace survived terminal completion");
                 assertEmbeddingCloseToSource(output.get(), reference);
@@ -310,25 +304,5 @@ class QwenEmbeddingCudaIntegrationTest {
 
     private static Path nativeLibraryPath() {
         return Path.of(System.getProperty("euhedral.cuda.library"));
-    }
-
-    private static final class RunnerDriver implements AutoCloseable {
-
-        private final QwenExecutionRunner runner;
-        private final AbstractExecutor executor = new DefaultExecutor();
-
-        private RunnerDriver(QwenExecutionRunner runner) {
-            this.runner = runner;
-            this.executor.input(runner);
-        }
-
-        private void request(long demand) {
-            this.runner.request(demand);
-        }
-
-        @Override
-        public void close() {
-            this.runner.completeGracefully();
-        }
     }
 }

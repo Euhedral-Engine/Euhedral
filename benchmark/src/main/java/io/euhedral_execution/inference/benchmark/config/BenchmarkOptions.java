@@ -4,7 +4,6 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
-import io.euhedral_execution.inference.core.GpuExecutionMode;
 import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
@@ -51,7 +50,6 @@ public record BenchmarkOptions(
         @JsonProperty("gpuMemory") Boolean gpuMemory,
         @JsonProperty("gpuHeadroomMiB") Long gpuHeadroomMiB,
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
-        @JsonProperty("gpuExecutionMode") GpuExecutionMode gpuExecutionMode,
         @JsonProperty("q3DispatchMode") Q3DispatchMode q3DispatchMode,
         @JsonProperty("q3SmallRowThreshold") Integer q3SmallRowThreshold) {
 
@@ -77,7 +75,6 @@ public record BenchmarkOptions(
         gpuMemory = gpuMemory != null && gpuMemory;
         gpuHeadroomMiB = gpuHeadroomMiB == null ? 1024L : gpuHeadroomMiB;
         shutdownTimeoutSeconds = shutdownTimeoutSeconds == null ? 10L : shutdownTimeoutSeconds;
-        gpuExecutionMode = gpuExecutionMode == null ? GpuExecutionMode.SYNC : gpuExecutionMode;
         q3DispatchMode = q3DispatchMode == null ? Q3DispatchMode.AUTO : q3DispatchMode;
         q3SmallRowThreshold =
                 q3SmallRowThreshold == null ? Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD : q3SmallRowThreshold;
@@ -139,7 +136,6 @@ public record BenchmarkOptions(
                 gpuMemory,
                 gpuHeadroomMiB,
                 shutdownTimeoutSeconds,
-                GpuExecutionMode.SYNC,
                 null,
                 null);
     }
@@ -208,7 +204,6 @@ public record BenchmarkOptions(
                 options.gpuMemory(),
                 options.gpuHeadroomMiB(),
                 options.shutdownTimeoutSeconds(),
-                options.gpuExecutionMode(),
                 options.q3DispatchMode(),
                 options.q3SmallRowThreshold());
     }
@@ -225,9 +220,8 @@ public record BenchmarkOptions(
     public List<InferenceTuning> sweep(InferenceTuning base) {
         List<InferenceTuning> tunings = new ArrayList<>();
         for (int chunk : this.prefillChunks)
-            tunings.add(base.withPrefillChunkTokens(chunk)
-                    .withGpuExecutionMode(this.gpuExecutionMode)
-                    .withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold));
+            tunings.add(
+                    base.withPrefillChunkTokens(chunk).withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold));
         return tunings;
     }
 

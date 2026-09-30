@@ -70,7 +70,7 @@ class QwenGenerationSessionTest {
             List<Integer> firstTokens = session.generate("!", 3, text -> {
                 firstOutput.append(text);
                 firstOutputPositions.add(session.currentTokenPosition());
-                assertFalse(runtime.hasAttachedRunner());
+                assertEquals(0, runtime.activeQuanta());
                 assertTrue(gpu.pendingLogits.isEmpty(), "logits remained live while output was emitted");
                 assertTrue(gpu.liveLogits.isEmpty(), "a device logits allocation survived sampling");
             });
@@ -82,7 +82,7 @@ class QwenGenerationSessionTest {
             assertEquals(tokenizer.decode(new int[] {1, 2, 3}), firstOutput.toString());
             assertEquals(firstPromptTokens.length + 3L, session.currentTokenPosition());
             assertEquals(List.of(1, 2, 3), session.generatedTokenIds());
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
 
             Object recurrentState = session.sequenceState().recurrentState();
             Object kvState = session.sequenceState().kvCacheState();
@@ -96,7 +96,7 @@ class QwenGenerationSessionTest {
             StringBuilder secondOutput = new StringBuilder();
             List<Integer> secondTokens = session.generate("!", 2, text -> {
                 secondOutput.append(text);
-                assertFalse(runtime.hasAttachedRunner());
+                assertEquals(0, runtime.activeQuanta());
                 assertTrue(gpu.pendingLogits.isEmpty(), "logits accumulated between prompt generations");
                 assertTrue(gpu.liveLogits.isEmpty(), "a device logits allocation survived sampling");
             });
@@ -129,7 +129,7 @@ class QwenGenerationSessionTest {
             assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
             assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
             assertTrue(gpu.pendingLogits.isEmpty());
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
 
             session.close();
             assertTrue(session.isClosed());
@@ -142,6 +142,7 @@ class QwenGenerationSessionTest {
             assertThrows(IllegalStateException.class, () -> ((GdnSequenceStates) recurrentState).forLayer(0));
         } finally {
             session.close();
+            runtime.close();
             lattice.close();
         }
     }
@@ -185,9 +186,10 @@ class QwenGenerationSessionTest {
             assertEquals(1, gpu.allocatedLogits.size(), "non-final prefill and final commit need no logits");
             assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
             assertTrue(gpu.pendingLogits.isEmpty());
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
+            runtime.close();
             lattice.close();
         }
     }
@@ -214,9 +216,10 @@ class QwenGenerationSessionTest {
             assertTrue(output.toString().startsWith("{"));
             assertFalse(generated.contains(xmlToken));
             assertEquals(gpu.sampledLogitRows, gpu.sampledLogitCloses);
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
+            runtime.close();
             lattice.close();
         }
     }
@@ -257,8 +260,9 @@ class QwenGenerationSessionTest {
         }
 
         assertEquals(List.of(1), firstGeneration.get(30, TimeUnit.SECONDS));
-        assertFalse(runtime.hasAttachedRunner());
+        assertEquals(0, runtime.activeQuanta());
         session.close();
+        runtime.close();
         lattice.close();
     }
 
@@ -306,7 +310,7 @@ class QwenGenerationSessionTest {
             assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
             assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
             assertEquals(1, session.currentTokenPosition());
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
 
             gpu.selectedTokenId = 1;
             StringBuilder continuationOutput = new StringBuilder();
@@ -318,9 +322,10 @@ class QwenGenerationSessionTest {
             assertEquals(List.of(eosToken, 1), session.generatedTokenIds());
             assertEquals(2, gpu.allocatedLogits.size());
             assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
+            runtime.close();
             lattice.close();
         }
     }
@@ -346,10 +351,11 @@ class QwenGenerationSessionTest {
             assertEquals(new java.util.HashSet<>(gpu.allocatedLogits), new java.util.HashSet<>(gpu.closedLogits));
             assertTrue(gpu.pendingLogits.isEmpty());
             assertEquals(1, gpu.embeddingInputs.size());
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
             assertTrue(session.isCancelled());
         } finally {
             session.close();
+            runtime.close();
             lattice.close();
         }
     }
@@ -395,8 +401,9 @@ class QwenGenerationSessionTest {
                 session.sequenceState().terminalState());
         assertEquals(1, gpu.embeddingInputs.size());
         assertTrue(gpu.sampledLogitRows.isEmpty());
-        assertFalse(runtime.hasAttachedRunner());
+        assertEquals(0, runtime.activeQuanta());
         session.close();
+        runtime.close();
         lattice.close();
     }
 
@@ -442,8 +449,9 @@ class QwenGenerationSessionTest {
         assertTrue(session.isCancelled());
         assertEquals(
                 QwenSequenceState.TerminalState.FAILED, session.sequenceState().terminalState());
-        assertFalse(runtime.hasAttachedRunner());
+        assertEquals(0, runtime.activeQuanta());
         session.close();
+        runtime.close();
         lattice.close();
     }
 
@@ -476,9 +484,10 @@ class QwenGenerationSessionTest {
                     session.sequenceState().terminalState());
             assertTrue(gpu.liveLogits.isEmpty());
             assertEquals(gpu.allocatedLogits.size(), gpu.closedLogits.size());
-            assertFalse(runtime.hasAttachedRunner());
+            assertEquals(0, runtime.activeQuanta());
         } finally {
             session.close();
+            runtime.close();
             lattice.close();
         }
     }

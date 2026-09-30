@@ -25,18 +25,21 @@ class InferenceEngineTest {
     Path directory;
 
     @Test
-    void latticeConstructionReceivesTheLoadedGpuForWorkerBinding() throws Exception {
-        var selected = new java.util.concurrent.atomic.AtomicReference<ExecutionGpu>();
+    void successiveGenerationsShareTheEnginesOneLatticeAndRuntime() throws Exception {
+        var lattices = new java.util.concurrent.atomic.AtomicInteger();
         var bootstrap = new FakeBootstrap() {
             @Override
-            io.euhedral_execution.core.control_plane.ControlPlaneLattice createLattice(
-                    InferenceConfig config, ExecutionGpu gpu) {
-                selected.set(gpu);
-                return super.createLattice(config, gpu);
+            io.euhedral_execution.core.control_plane.ControlPlaneLattice createLattice(InferenceConfig config) {
+                lattices.incrementAndGet();
+                return super.createLattice(config);
             }
         };
         try (var engine = InferenceEngine.load(config(), bootstrap)) {
-            assertSame(bootstrap.gpu, selected.get());
+            try (var session = engine.createSession(GenerationConfig.greedy(1L))) {
+                session.generate("!", 2, ignored -> {});
+                session.generate("!", 2, ignored -> {});
+            }
+            assertEquals(1, lattices.get());
         }
     }
 

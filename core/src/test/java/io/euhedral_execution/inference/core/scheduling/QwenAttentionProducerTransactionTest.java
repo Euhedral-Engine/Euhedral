@@ -2,8 +2,7 @@ package io.euhedral_execution.inference.core.scheduling;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.euhedral_execution.core.impl.DefaultExecutor;
-import java.util.function.Consumer;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import org.junit.jupiter.api.Test;
 
 class QwenAttentionProducerTransactionTest {
@@ -23,7 +22,7 @@ class QwenAttentionProducerTransactionTest {
     }
 
     @Test
-    void cancellationKeepsCacheUncommittedUntilBothWritesFinish() throws Exception {
+    void cancellationNeverCommitsTheSubmittedAppend() throws Exception {
         runCase(false, false, true);
     }
 
@@ -34,33 +33,33 @@ class QwenAttentionProducerTransactionTest {
         var gpu = new HoldingGpu(weights.config().vocabSize(), sequence, launchFailure);
         var context = new QwenExecutionContext(
                 plan, sequence, QwenExecutionContext.ExecutionKind.PREFILL, 0, new int[64], QwenLogitsRequirement.NONE);
-        var runner = new QwenExecutionRunner(plan, gpu);
-        new DefaultExecutor().input(runner);
+        var lattice = new QwenExecutionFixtures.ManualLattice();
+        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
         try {
-            var outcome = runner.submit(context);
-            runner.request(plan.instructions().size());
-            assertTrue(gpu.called, "the real frame must submit the producer region");
-            if (!launchFailure) {
-                assertFalse(outcome.isDone());
-                assertEquals(0, gpu.cache.length(), "physical writes cannot publish the logical append");
-                if (cancel) sequence.cancel();
-                assertEquals(0, gpu.cache.length());
-                if (completionFailure) gpu.failure.accept(new IllegalStateException("injected completion failure"));
-                else gpu.completion.run();
-                gpu.completion = null;
-                runner.request(plan.instructions().size());
-            }
+            var outcome = runtime.submit(context);
+            lattice.drive();
+            assertTrue(gpu.called, "the real stage must submit the producer region");
+            assertFalse(outcome.isDone(), "the quantum waits for its device-completion boundary");
+            assertEquals(1, gpu.stream.held());
+            assertEquals(0, gpu.cache.length(), "physical writes cannot publish the logical append");
+            assertEquals(
+                    launchFailure ? 0 : 64,
+                    gpu.cache.submittedLength(),
+                    "later stages of the quantum read the submitted frontier");
+            if (cancel) sequence.cancel();
+            assertEquals(0, gpu.cache.length());
+            gpu.stream.release(completionFailure ? new IllegalStateException("injected completion failure") : null);
+            lattice.drive();
             var result = outcome.get(2, java.util.concurrent.TimeUnit.SECONDS);
             var expected = launchFailure || completionFailure
                     ? QwenExecutionContext.Status.FAILED
                     : cancel ? QwenExecutionContext.Status.CANCELLED : QwenExecutionContext.Status.SUCCESS;
             assertEquals(expected, result.status());
             if (expected == QwenExecutionContext.Status.SUCCESS) assertEquals(64, gpu.cache.length());
-            else assertEquals(launchFailure || completionFailure ? 0 : 64, gpu.lengthAtFree);
+            else assertEquals(0, gpu.lengthAtFree, "an unsuccessful quantum never publishes its append");
             context.logitsOutput().ifPresent(QwenDeviceLogits::close);
         } finally {
-            if (gpu.completion != null) gpu.completion.run();
-            runner.completeGracefully();
+            runtime.close();
             sequence.complete();
         }
     }
@@ -70,10 +69,9 @@ class QwenAttentionProducerTransactionTest {
         private final boolean launchFailure;
         private AttentionKvState cache;
         private long cacheAddress;
-        private boolean called, hold;
+        private final QwenExecutionFixtures.HoldingStream stream = new QwenExecutionFixtures.HoldingStream();
+        private boolean called;
         private int lengthAtFree = -1;
-        private Runnable completion;
-        private Consumer<Throwable> failure;
 
         HoldingGpu(int vocabulary, QwenSequenceState sequence, boolean launchFailure) {
             super(vocabulary);
@@ -82,17 +80,8 @@ class QwenAttentionProducerTransactionTest {
         }
 
         @Override
-        public boolean asynchronous() {
-            return true;
-        }
-
-        @Override
-        public void deferCompletion(Runnable completed, Consumer<Throwable> failed) {
-            if (hold) {
-                completion = completed;
-                failure = failed;
-                hold = false;
-            } else completed.run();
+        public GpuStream openStream() {
+            return this.stream;
         }
 
         @Override
@@ -131,7 +120,6 @@ class QwenAttentionProducerTransactionTest {
             assertEquals(keys, cache.keyCacheAddress());
             assertEquals(values, cache.valueCacheAddress());
             if (launchFailure) throw new IllegalStateException("injected failure after key producer");
-            hold = true;
         }
     }
 }

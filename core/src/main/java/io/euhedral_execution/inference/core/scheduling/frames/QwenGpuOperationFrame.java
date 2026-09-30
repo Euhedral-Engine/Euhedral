@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.scheduling.frames;
 
-import io.euhedral_execution.core.impl.FrameManager;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.scheduling.AttentionKvState;
@@ -9,22 +8,15 @@ import io.euhedral_execution.inference.core.scheduling.GdnSequenceStates;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.QwenGdnSequenceState;
-import io.euhedral_execution.inference.core.scheduling.QwenWorkGenerator;
+import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 
 /// Executes one stateful or elementwise GPU instruction using its immutable buffer operands.
-public final class QwenGpuOperationFrame extends QwenInstructionFrame {
+public final class QwenGpuOperationFrame extends QwenStageFrame {
 
     private AttentionKvState pendingAppendState;
-    private int pendingAppendTokens;
 
-    public QwenGpuOperationFrame(
-            long idHash,
-            FrameManager<QwenExecutionContext, QwenGpuOperationFrame> recycler,
-            QwenExecutionContext context,
-            QwenExecutionPlan.Instruction instruction,
-            ExecutionGpu gpu,
-            QwenWorkGenerator generator) {
-        super(idHash, recycler, context, instruction, gpu, generator);
+    QwenGpuOperationFrame(StageGraph graph, QwenExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+        super(graph, instruction, gpu);
     }
 
     @Override
@@ -210,8 +202,8 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                         config.ropeTheta(),
                         instruction.weightByteSize(0),
                         instruction.weightByteSize(1));
+        state.appendSubmitted(context.inputTokenCount());
         this.pendingAppendState = state;
-        this.pendingAppendTokens = context.inputTokenCount();
     }
 
     private void runAttentionKvAppend(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
@@ -229,26 +221,22 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                         queryWidth,
                         keyValueWidth,
                         context.startPosition());
+        state.appendSubmitted(context.inputTokenCount());
         this.pendingAppendState = state;
-        this.pendingAppendTokens = context.inputTokenCount();
     }
 
+    /// Publishes the appended rows once the quantum's device work has retired.
     @Override
-    protected void gpuCompleted() {
-        if (this.pendingAppendState != null) {
-            try {
-                this.pendingAppendState.commitAppend(this.pendingAppendTokens);
-            } finally {
-                this.pendingAppendState = null;
-                this.pendingAppendTokens = 0;
-            }
-        }
+    protected void commit() {
+        if (this.pendingAppendState != null) this.pendingAppendState.commitSubmitted();
     }
 
     @Override
     protected void releaseTemporary(QwenExecutionContext context) {
+        AttentionKvState state = this.pendingAppendState;
         this.pendingAppendState = null;
-        this.pendingAppendTokens = 0;
+        // A committed frontier is unaffected; an uncommitted one never becomes visible.
+        if (state != null) state.discardSubmitted();
     }
 
     private void runAttentionCausal(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
@@ -264,8 +252,9 @@ public final class QwenGpuOperationFrame extends QwenInstructionFrame {
                         config.numAttentionHeads(),
                         config.numKeyValueHeads(),
                         config.attentionHeadDim(),
-                        // The append instruction reserved these rows and its commit may still be pending.
-                        Math.toIntExact(context.startPosition() + context.inputTokenCount()),
+                        // The append stage submitted these rows earlier on this quantum's stream; they are
+                        // readable here but not committed until the quantum retires.
+                        state.submittedLength(),
                         context.startPosition(),
                         context.inputTokenCount() == 1 ? state.decodeScratchAddress(config.numAttentionHeads()) : 0);
     }

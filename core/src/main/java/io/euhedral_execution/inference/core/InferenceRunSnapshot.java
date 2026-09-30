@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
@@ -24,7 +25,8 @@ public record InferenceRunSnapshot(
         Model model,
         GenerationConfig generation,
         RuntimeIdentity runtime) {
-    public static final int SCHEMA_VERSION = 1;
+    /// Version 2 dropped `tuning.gpuExecutionMode`: every run submits asynchronously.
+    public static final int SCHEMA_VERSION = 2;
     /// Explicit value for identity the runtime does not expose.
     public static final String UNAVAILABLE = "unavailable";
 
@@ -46,36 +48,30 @@ public record InferenceRunSnapshot(
         }
     }
 
+    /// Version-1 records carried `gpuExecutionMode`; it is ignored when they are read.
+    @JsonIgnoreProperties({"gpuExecutionMode"})
     public record Tuning(
             List<Integer> workerProcessorIds,
             int prefillChunkTokens,
-            GpuExecutionMode gpuExecutionMode,
             Q3DispatchMode q3DispatchMode,
             int q3SmallRowThreshold) {
         public Tuning {
             workerProcessorIds = List.copyOf(workerProcessorIds);
-            gpuExecutionMode = gpuExecutionMode == null ? GpuExecutionMode.SYNC : gpuExecutionMode;
             q3DispatchMode = q3DispatchMode == null ? Q3DispatchMode.SCALAR : q3DispatchMode;
         }
 
-        public Tuning(List<Integer> workerProcessorIds, int prefillChunkTokens, GpuExecutionMode gpuExecutionMode) {
+        public Tuning(List<Integer> workerProcessorIds, int prefillChunkTokens) {
             this(
                     workerProcessorIds,
                     prefillChunkTokens,
-                    gpuExecutionMode,
                     Q3DispatchMode.AUTO,
                     Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD);
-        }
-
-        public Tuning(List<Integer> workerProcessorIds, int prefillChunkTokens) {
-            this(workerProcessorIds, prefillChunkTokens, GpuExecutionMode.SYNC);
         }
 
         public static Tuning of(InferenceTuning tuning) {
             return new Tuning(
                     ids(tuning.workerProcessorIds()),
                     tuning.prefillChunkTokens(),
-                    tuning.gpuExecutionMode(),
                     tuning.q3DispatchMode(),
                     tuning.q3SmallRowThreshold());
         }

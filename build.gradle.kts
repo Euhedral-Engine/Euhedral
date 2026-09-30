@@ -24,7 +24,7 @@ subprojects {
         }
         tasks.named<Test>("test") {
             exclude("**/CudaGpuMemoryIntegrationTest.class")
-            exclude("**/CudaAsyncCompletionIntegrationTest.class")
+            exclude("**/CudaGpuStreamIntegrationTest.class")
             exclude("**/QwenCompactCudaResidencyIntegrationTest.class")
             exclude("**/QwenEmbeddingCudaIntegrationTest.class")
             exclude("**/CudaGpuOperationsIntegrationTest.class")
@@ -36,7 +36,7 @@ subprojects {
             exclude("**/QwenFullModelCudaIntegrationTest.class")
             exclude("**/QwenGenerationSessionCudaIntegrationTest.class")
             exclude("**/InferenceEngineCudaIntegrationTest.class")
-            exclude("**/AsyncInferenceEngineCudaIntegrationTest.class")
+            exclude("**/StreamOrderedEngineCudaIntegrationTest.class")
             exclude("**/ChatCompletionsCudaIntegrationTest.class")
             useJUnitPlatform()
         }
@@ -48,7 +48,7 @@ subprojects {
             testClassesDirs = testSourceSet.output.classesDirs
             classpath = testSourceSet.runtimeClasspath
             include("**/CudaGpuMemoryIntegrationTest.class")
-            include("**/CudaAsyncCompletionIntegrationTest.class")
+            include("**/CudaGpuStreamIntegrationTest.class")
             include("**/QwenCompactCudaResidencyIntegrationTest.class")
             include("**/QwenEmbeddingCudaIntegrationTest.class")
             include("**/CudaGpuOperationsIntegrationTest.class")
@@ -60,7 +60,7 @@ subprojects {
             include("**/QwenFullModelCudaIntegrationTest.class")
             include("**/QwenGenerationSessionCudaIntegrationTest.class")
             include("**/InferenceEngineCudaIntegrationTest.class")
-            include("**/AsyncInferenceEngineCudaIntegrationTest.class")
+            include("**/StreamOrderedEngineCudaIntegrationTest.class")
             include("**/ChatCompletionsCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
@@ -76,6 +76,8 @@ subprojects {
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_bf16.edrl")
                             .get())
             jvmArgs("--enable-native-access=ALL-UNNAMED")
+            // Each class loads the model and may start the process-wide Euhedral lattice singleton.
+            forkEvery = 1
             environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
             val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
             environment(searchVariable, hostRuntimeDirectory + java.io.File.pathSeparator +
