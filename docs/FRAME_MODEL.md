@@ -171,6 +171,27 @@ quantum that does not succeed leaves its sequence terminal, so no partial update
   count before the `Error` escapes, so the quantum still retires.
 - A graph is recycled only after its quantum's device work retired and its storage was released.
 
+## Measured behaviour
+
+Compact Q3 artifact on an RTX 5070 Ti, greedy, against the previous decode chain frame (one frame
+launching a whole decode token; prefill still completed each instruction through a host callback).
+Six paired JVM forks, medians of fork medians:
+
+| Scenario | Chain frame | Frame DAG | Change | DAG ahead |
+|---|---|---|---|---|
+| decode 64 + 128 | 27.08 tok/s | 27.46 tok/s | +1.8% | 5/6 |
+| decode 1024 + 128 | 23.58 tok/s | 24.09 tok/s | +2.1% | 5/6 |
+| prefill 256 | 548 tok/s | 598 tok/s | +9.5% | 6/6 |
+| prefill 1024 | 591 tok/s | 626 tok/s | +5.8% | 5/6 |
+| time to first token, 64-token prompt | 186 ms | 153 ms | -17.7% | 6/6 |
+| time to first token, 1024-token prompt | 1766 ms | 1662 ms | -5.5% | 5/6 |
+
+Nsight Systems, union of kernel intervals (programmatic dependent launch overlaps adjacent kernels):
+decode keeps the GPU busy 94% of the window, with 0.06% idle inside a token, a 0.13 us median positive
+kernel gap, and one host callback per token; prefill-1024 is busy 99% with 0.34% idle and one callback
+per quantum, where the per-instruction callbacks left it 86% busy. The remaining decode idle is the
+token boundary (about 2.6 ms: logits readback, CPU sampling, and per-quantum workspace allocation).
+
 ## Plan views
 
 For a complete model, `QwenExecutionPlan.forExecution(kind, rows)` selects the topology per quantum.
