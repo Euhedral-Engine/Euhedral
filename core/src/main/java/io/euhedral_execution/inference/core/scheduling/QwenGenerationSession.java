@@ -17,8 +17,9 @@ import java.util.function.Consumer;
 
 /// Coordinates prompt and decode quanta for one persistent Qwen sequence.
 ///
-/// The tokenizer, plan, runtime, and GPU are borrowed. The session owns its sequence and one sampler;
-/// each completed prompt-to-output stream is flushed before the decoder is replaced for a later prompt.
+/// The tokenizer, plan, runtime, and GPU are borrowed. The session owns its sequence, one sampler, and
+/// the pinned host row into which each sampling quantum copies its final logits before it retires; each
+/// completed prompt-to-output stream is flushed before the decoder is replaced for a later prompt.
 public final class QwenGenerationSession implements AutoCloseable {
 
     /// Default prompt tokens per prefill quantum. Bounds per-quantum GPU workspace while the
@@ -33,6 +34,7 @@ public final class QwenGenerationSession implements AutoCloseable {
     private final ExecutionGpu gpu;
     private final QwenSequenceState sequence;
     private final QwenLogitsSampler sampler;
+    private final QwenHostLogits hostLogits;
     private final List<Integer> generatedTokenIds = new ArrayList<>();
     private final AtomicBoolean generationActive = new AtomicBoolean();
     private final AtomicBoolean cancelled = new AtomicBoolean();
@@ -91,6 +93,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         Objects.requireNonNull(config, "config");
         this.sequence = new QwenSequenceState(sequenceId);
         this.sampler = new QwenLogitsSampler(config, plan.weights().config().vocabSize());
+        this.hostLogits = new QwenHostLogits(gpu, plan.weights().config().vocabSize());
         this.decoder = tokenizer.newIncrementalDecoder();
     }
 
@@ -220,6 +223,9 @@ public final class QwenGenerationSession implements AutoCloseable {
 
     private void completeClose() {
         this.sequence.complete();
+        // The sequence completes only once no quantum holds its lease, and a quantum releases the lease
+        // after its retirement boundary, so no copy into the host row can still be queued.
+        this.hostLogits.close();
         if (this.closeListener != null) {
             this.closeListener.accept(this);
             this.closeListener = null;
@@ -241,17 +247,16 @@ public final class QwenGenerationSession implements AutoCloseable {
             if (isStopRequested()) return List.of();
             int end = Math.min(offset + this.prefillChunkTokens, promptTokenIds.length);
             long started = timing == null ? 0L : System.nanoTime();
+            boolean samples = end == promptTokenIds.length && maxNewTokens > 0;
             QwenExecutionContext prefill = new QwenExecutionContext(
                     this.plan,
                     this.sequence,
                     QwenExecutionContext.ExecutionKind.PREFILL,
                     this.sequence.currentTokenPosition(),
                     Arrays.copyOfRange(promptTokenIds, offset, end),
-                    end == promptTokenIds.length && maxNewTokens > 0
-                            ? QwenLogitsRequirement.LAST_TOKEN
-                            : QwenLogitsRequirement.NONE);
-            nextToken = executeAndSelect(
-                    prefill, end == promptTokenIds.length && maxNewTokens > 0, constraint, timing, started, true);
+                    samples ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                    samples ? this.hostLogits : null);
+            nextToken = executeAndSelect(prefill, samples, constraint, timing, started, true);
             if (isStopRequested()) return List.of();
         }
         this.promptPrefilled = true;
@@ -290,7 +295,8 @@ public final class QwenGenerationSession implements AutoCloseable {
                     QwenExecutionContext.ExecutionKind.DECODE,
                     this.sequence.currentTokenPosition(),
                     new int[] {tokenId},
-                    anotherTokenAllowed ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE);
+                    anotherTokenAllowed ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                    anotherTokenAllowed ? this.hostLogits : null);
             // Commit the final non-terminal token for continuation without sampling beyond the limit.
             nextToken = executeAndSelect(decode, anotherTokenAllowed, constraint, timing, started, false);
             if (!anotherTokenAllowed) endedNormally = !isStopRequested();
@@ -333,11 +339,8 @@ public final class QwenGenerationSession implements AutoCloseable {
                     reportQuantum(timing, context, prefill, startedNanos, executedNanos, false, executedNanos, -1);
                 return OptionalInt.empty();
             }
-            logits = context.logitsOutput()
-                    .orElseThrow(() -> new IllegalStateException("successful Qwen quantum produced no logits"));
-            int selected = constraint == null
-                    ? this.sampler.selectToken(logits, this.gpu)
-                    : this.sampler.selectToken(logits, this.gpu, constraint);
+            // The quantum copied its final row into the host logits before it retired.
+            int selected = this.sampler.selectToken(this.hostLogits, constraint);
             if (constraint != null) constraint.accept(selected);
             if (timing != null)
                 reportQuantum(timing, context, prefill, startedNanos, executedNanos, true, System.nanoTime(), selected);

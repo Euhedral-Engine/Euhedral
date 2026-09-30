@@ -138,6 +138,21 @@ int euhedral_cuda_copy_device_to_host(
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int) status;
 }
 
+int euhedral_cuda_copy_device_to_readback(
+        void* host_address,
+        const void* device_address,
+        uint64_t byte_size) {
+    if (host_address == NULL || device_address == NULL || byte_size == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    if (byte_size > SIZE_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    cudaStream_t stream = euhedral_cuda_submission_stream();
+    // The destination is pinned and owned until the stream's work retires, so a queued copy needs no
+    // synchronization here; with no stream selected the copy completes before returning.
+    cudaError_t status = stream == NULL
+            ? cudaMemcpy(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost)
+            : cudaMemcpyAsync(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost, stream);
+    return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
 int euhedral_cuda_copy_device_to_device(
         void* destination_address,
         const void* source_address,

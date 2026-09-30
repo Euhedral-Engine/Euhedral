@@ -38,6 +38,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle copyHostToDevice;
     private final MethodHandle copyUploadToDevice;
     private final MethodHandle copyDeviceToHost;
+    private final MethodHandle copyDeviceToReadback;
     private final MethodHandle copyDeviceToDevice;
     private final MethodHandle embedQ3;
     private final MethodHandle synchronize;
@@ -113,6 +114,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.copyHostToDevice = bind(linker, symbols, "euhedral_cuda_copy_host_to_device", COPY);
             this.copyUploadToDevice = bind(linker, symbols, "euhedral_cuda_copy_upload_to_device", COPY);
             this.copyDeviceToHost = bind(linker, symbols, "euhedral_cuda_copy_device_to_host", COPY);
+            this.copyDeviceToReadback = bind(linker, symbols, "euhedral_cuda_copy_device_to_readback", COPY);
             this.copyDeviceToDevice = bind(linker, symbols, "euhedral_cuda_copy_device_to_device", COPY);
             this.embedQ3 = bind(linker, symbols, "euhedral_cuda_embed_q3", EMBED_Q3);
             this.synchronize = bind(linker, symbols, "euhedral_cuda_synchronize", SYNCHRONIZE);
@@ -580,7 +582,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             return;
         }
         if (cacheable) pinnedUploadCount.decrementAndGet();
-        freePinnedUpload(allocation);
+        freePinned(allocation);
     }
 
     @Override
@@ -603,15 +605,47 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         return poisoned.get() == null;
     }
 
-    private void freePinnedUpload(MemorySegment address) {
+    /// Page-locked, so a queued copy into it needs no synchronization. The caller keeps it across the
+    /// stream boundary that proves the copy retired.
+    @Override
+    public ReadbackBuffer allocateReadbackBuffer(long byteSize) {
+        ensureOpen();
+        if (byteSize <= 0) throw new IllegalArgumentException("byteSize must be positive");
+        MemorySegment address;
+        try {
+            address = (MemorySegment) hostMalloc.invokeExact(byteSize);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA pinned readback allocation failed", failure);
+        }
+        if (address.address() == 0) throw new GpuMemoryException("CUDA pinned readback allocation returned null");
+        MemorySegment allocation = address.reinterpret(byteSize);
+        return new ReadbackBuffer(allocation, () -> freePinned(allocation));
+    }
+
+    @Override
+    public void copyDeviceToReadback(ReadbackBuffer destination, long source, long byteSize) {
+        ensureOpen();
+        Objects.requireNonNull(destination, "destination");
+        requireTransferSize(destination.segment(), byteSize, "destination");
+        requireDeviceAddress(source);
+        int status = invokeCopy(
+                copyDeviceToReadback,
+                destination.segment(),
+                MemorySegment.ofAddress(source),
+                byteSize,
+                "pinned device-to-host copy");
+        if (status != 0) throw new GpuMemoryException("pinned device-to-host copy", status);
+    }
+
+    private void freePinned(MemorySegment address) {
         ensureOpen();
         try {
             int status = (int) hostFree.invokeExact(address);
-            if (status != 0) throw new GpuMemoryException("CUDA pinned upload free", status);
+            if (status != 0) throw new GpuMemoryException("CUDA pinned host free", status);
         } catch (GpuMemoryException failure) {
             throw failure;
         } catch (Throwable failure) {
-            throw new GpuMemoryException("CUDA pinned upload free invocation failed", failure);
+            throw new GpuMemoryException("CUDA pinned host free invocation failed", failure);
         }
     }
 
@@ -1481,7 +1515,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         // before releasing the FFM upcall stub or unloading its library arena.
         synchronize();
         for (Long event; (event = availableEvents.poll()) != null; ) destroyEvent(event);
-        for (MemorySegment pinned; (pinned = pinnedUploads.poll()) != null; ) freePinnedUpload(pinned);
+        for (MemorySegment pinned; (pinned = pinnedUploads.poll()) != null; ) freePinned(pinned);
         closed = true;
         arena.close();
     }

@@ -40,6 +40,36 @@ public abstract class ExecutionGpu implements GpuMemory {
         copyHostToDevice(destination, upload.segment(), upload.segment().byteSize());
     }
 
+    /// Host memory that receives queued device-to-host copies. Its owner keeps it, and reads it, only
+    /// after every copy into it has retired; closing it earlier would leave DMA writing freed memory.
+    public record ReadbackBuffer(MemorySegment segment, Runnable release) implements AutoCloseable {
+        public ReadbackBuffer {
+            Objects.requireNonNull(segment, "segment");
+            Objects.requireNonNull(release, "release");
+        }
+
+        @Override
+        public void close() {
+            release.run();
+        }
+    }
+
+    public ReadbackBuffer allocateReadbackBuffer(long bytes) {
+        Arena arena = Arena.ofShared();
+        try {
+            return new ReadbackBuffer(arena.allocate(bytes, Long.BYTES), arena::close);
+        } catch (RuntimeException | Error failure) {
+            arena.close();
+            throw failure;
+        }
+    }
+
+    /// Copies `bytes` device bytes at `source` to the start of `destination`, queued on the selected
+    /// stream; with no stream selected it completes before returning.
+    public void copyDeviceToReadback(ReadbackBuffer destination, long source, long bytes) {
+        copyDeviceToHost(destination.segment(), source, bytes);
+    }
+
     public boolean completionProven() {
         return true;
     }

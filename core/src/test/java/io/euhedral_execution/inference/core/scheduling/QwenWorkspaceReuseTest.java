@@ -3,9 +3,11 @@ package io.euhedral_execution.inference.core.scheduling;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -171,6 +173,57 @@ class QwenWorkspaceReuseTest {
             runtime.close();
         }
         assertEquals(1, Collections.frequency(gpu.freed(), logits.get(0)), "the storage never freed caller logits");
+    }
+
+    @Test
+    void hostSamplingQuantaKeepDeviceLogitsInTheirGraphAndExposeOnlyRetiredRows() throws Exception {
+        int vocabulary = 1009;
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(vocabulary));
+        var gpu = new EngineExecutionFixture.SamplingGpu(vocabulary);
+        gpu.selectTokens(7, 9);
+        var runtime = QwenExecutionFixtures.runtime(plan, gpu);
+        var sequence = new QwenSequenceState(740);
+        var hostLogits = new QwenHostLogits(gpu, vocabulary);
+        var sampler = new QwenLogitsSampler(GenerationConfig.greedy(1L), vocabulary);
+        try {
+            List<Integer> selected = new ArrayList<>();
+            for (int position = 0; position < 2; position++) {
+                var context = new QwenExecutionContext(
+                        plan,
+                        sequence,
+                        QwenExecutionContext.ExecutionKind.DECODE,
+                        position,
+                        new int[] {1},
+                        QwenLogitsRequirement.LAST_TOKEN,
+                        hostLogits);
+                var outcome = runtime.execute(List.of(context)).getFirst();
+                assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.status(), () -> "" + outcome.failure());
+                assertTrue(context.logitsOutput().isEmpty(), "host sampling detaches no device logits");
+                selected.add(sampler.selectToken(hostLogits, null));
+            }
+            assertEquals(List.of(7, 9), selected);
+            assertEquals(1, gpu.allocatedLogits.size(), "the decode graph kept one logits buffer");
+            assertTrue(Collections.disjoint(gpu.freed(), gpu.allocatedLogits));
+
+            gpu.linearFailure = new IllegalStateException("injected projection failure");
+            var failing = new QwenExecutionContext(
+                    plan,
+                    new QwenSequenceState(741),
+                    QwenExecutionContext.ExecutionKind.DECODE,
+                    0,
+                    new int[] {1},
+                    QwenLogitsRequirement.LAST_TOKEN,
+                    hostLogits);
+            assertEquals(
+                    QwenExecutionContext.Status.FAILED,
+                    runtime.execute(List.of(failing)).getFirst().status());
+            assertThrows(IllegalStateException.class, hostLogits::row, "a failed quantum exposes no row");
+        } finally {
+            sequence.complete();
+            runtime.close();
+            hostLogits.close();
+        }
+        assertTrue(gpu.freed().containsAll(gpu.allocatedLogits));
     }
 
     private static CompletableFuture<QwenExecutionContext.Outcome> submit(
