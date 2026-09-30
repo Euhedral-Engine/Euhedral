@@ -247,6 +247,13 @@ public final class InferenceEngine implements AutoCloseable {
         return this.bootstrap.memoryInfo(this.gpu);
     }
 
+    /// Device bytes this engine owns: model weights, open sessions' persistent state, and in-flight
+    /// quantum workspaces. Other processes and CUDA's own context and kernel modules are excluded.
+    public synchronized long allocatedDeviceBytes() {
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        return this.bootstrap.allocatedBytes(this.gpu);
+    }
+
     /// Stops admission, closes sessions, detaches execution, closes the lattice, then frees model and CUDA.
     /// Do not call from a generation callback: it would wait for that same generation to finish.
     /// If cleanup throws, admission stays closed and a later close retries unreleased resources.
@@ -398,6 +405,10 @@ public final class InferenceEngine implements AutoCloseable {
 
         CudaGpuMemory.DeviceMemoryInfo memoryInfo(ExecutionGpu gpu) {
             return ((CudaGpuMemory) gpu).deviceMemoryInfo();
+        }
+
+        long allocatedBytes(ExecutionGpu gpu) {
+            return ((CudaGpuMemory) gpu).allocatedBytes();
         }
     }
 }

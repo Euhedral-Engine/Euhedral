@@ -39,46 +39,36 @@ class StreamOrderedEngineCudaIntegrationTest {
             cpus.set(cpu);
         assumeTrue(cpus.cardinality() == 2);
 
-        try (var observer = new CudaGpuMemory(Path.of(library))) {
-            long before = observer.deviceMemoryInfo().freeBytes();
-            Result reference = generate(artifact, tokenizer, Path.of(library), cpus, new ReferenceBootstrap());
-            Result streamOrdered =
-                    generate(artifact, tokenizer, Path.of(library), cpus, new InferenceEngine.Bootstrap());
-            assertEquals(reference.tokens(), streamOrdered.tokens(), "stream ordering changed committed token IDs");
-            assertEquals(reference.position(), streamOrdered.position(), "KV/GDN sequence advancement differs");
-            assertEquals(reference.output(), streamOrdered.output(), "incremental text differs");
-            assertTrue(streamOrdered.tokens().size() >= 4, "expected several decode quanta");
-            assertTrue(
-                    observer.deviceMemoryInfo().freeBytes() >= before - (128L << 20),
-                    "the engine did not release model and persistent sequence allocations");
-        }
+        Result reference = generate(artifact, tokenizer, Path.of(library), cpus, new ReferenceBootstrap());
+        Result streamOrdered = generate(artifact, tokenizer, Path.of(library), cpus, new RecordingBootstrap());
+        assertEquals(reference.tokens(), streamOrdered.tokens(), "stream ordering changed committed token IDs");
+        assertEquals(reference.position(), streamOrdered.position(), "KV/GDN sequence advancement differs");
+        assertEquals(reference.output(), streamOrdered.output(), "incremental text differs");
+        assertTrue(streamOrdered.tokens().size() >= 4, "expected several decode quanta");
     }
 
     private static Result generate(
-            Path artifact, Path tokenizer, Path library, BitSet cpus, InferenceEngine.Bootstrap bootstrap)
-            throws Exception {
+            Path artifact, Path tokenizer, Path library, BitSet cpus, RecordingBootstrap bootstrap) throws Exception {
         var config =
                 new InferenceConfig(artifact, tokenizer, library, new InferenceTuning(cpus, 4), Duration.ofSeconds(10));
+        Result first;
         try (var engine = InferenceEngine.load(config, bootstrap)) {
             assertTrue(
                     engine.tokenizer().encodeWithModelSpecialTokens(PROMPT).length > 4,
                     "test prompt must exercise multiple prefill quanta");
-            Result first = generateSession(engine);
-            long afterFirst = engine.deviceMemoryInfo().freeBytes();
+            // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest.
+            long loaded = engine.allocatedDeviceBytes();
+            first = generateSession(engine);
+            assertEquals(loaded, engine.allocatedDeviceBytes(), "the first session kept device allocations");
             Result second = generateSession(engine);
-            long afterSecond = engine.deviceMemoryInfo().freeBytes();
+            assertEquals(loaded, engine.allocatedDeviceBytes(), "the second session kept device allocations");
             Result third = generateSession(engine);
-            long afterThird = engine.deviceMemoryInfo().freeBytes();
+            assertEquals(loaded, engine.allocatedDeviceBytes(), "the third session kept device allocations");
             assertEquals(first, second, "a new session did not reproduce the same sequence");
             assertEquals(second, third, "a later session did not reproduce the same sequence");
-            // A first-use CUDA module may become resident between the first two sessions;
-            // compare warmed sessions to detect persistent per-session allocation growth.
-            assertTrue(
-                    afterThird >= afterSecond - (16L << 20),
-                    "session state accumulated after warmup: after first=" + afterFirst + ", after second="
-                            + afterSecond + ", after third=" + afterThird);
-            return first;
         }
+        assertEquals(0, bootstrap.heldBytes(), "the engine did not release model and persistent sequence allocations");
+        return first;
     }
 
     private static Result generateSession(InferenceEngine engine) throws Exception {
@@ -96,10 +86,30 @@ class StreamOrderedEngineCudaIntegrationTest {
 
     private record Result(List<Integer> tokens, long position, String output) {}
 
-    /// Loads the model on the synchronous reference GPU fixture.
-    private static final class ReferenceBootstrap extends InferenceEngine.Bootstrap {
+    /// Keeps the engine's GPU, whose allocation count stays readable after the engine closed.
+    private static class RecordingBootstrap extends InferenceEngine.Bootstrap {
+        private ExecutionGpu gpu;
+
+        /// The stream-ordered CUDA binding unless a subclass supplies another GPU.
+        ExecutionGpu create(Path path, InferenceTuning tuning) {
+            return super.openGpu(path, tuning);
+        }
+
         @Override
-        ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
+        final ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
+            this.gpu = create(path, tuning);
+            return this.gpu;
+        }
+
+        long heldBytes() {
+            return allocatedBytes(this.gpu);
+        }
+    }
+
+    /// Loads the model on the synchronous reference GPU fixture.
+    private static final class ReferenceBootstrap extends RecordingBootstrap {
+        @Override
+        ExecutionGpu create(Path path, InferenceTuning tuning) {
             return new SynchronousReferenceGpu(path);
         }
 
@@ -111,6 +121,11 @@ class StreamOrderedEngineCudaIntegrationTest {
         @Override
         CudaGpuMemory.DeviceMemoryInfo memoryInfo(ExecutionGpu gpu) {
             return ((SynchronousReferenceGpu) gpu).deviceMemoryInfo();
+        }
+
+        @Override
+        long allocatedBytes(ExecutionGpu gpu) {
+            return ((SynchronousReferenceGpu) gpu).allocatedBytes();
         }
     }
 }

@@ -27,7 +27,6 @@ import org.junit.jupiter.api.Test;
 class QwenCompactCudaResidencyIntegrationTest {
 
     private static final long EXPECTED_OBJECT_COUNT = 1_118;
-    private static final long VRAM_RESTORE_TOLERANCE_BYTES = 128L * 1024L * 1024L;
     private static final Path DEFAULT_ARTIFACT =
             Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl");
 
@@ -58,6 +57,7 @@ class QwenCompactCudaResidencyIntegrationTest {
         Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
             CudaGpuMemory.DeviceMemoryInfo before = gpu.deviceMemoryInfo();
+            long allocatedBefore = gpu.allocatedBytes();
             QwenModel model = null;
             CudaGpuMemory.DeviceMemoryInfo resident = null;
             Throwable failure = null;
@@ -73,6 +73,10 @@ class QwenCompactCudaResidencyIntegrationTest {
                 verifyCompleteAssembly(weights, descriptors, descriptorNames);
                 allocatedDeviceBytes = sumHandleBytes(weights.runtimeObjects().values());
                 assertEquals(expectedDeviceBytes, allocatedDeviceBytes, "device allocations do not cover every object");
+                assertEquals(
+                        expectedDeviceBytes,
+                        gpu.allocatedBytes() - allocatedBefore,
+                        "the model's device footprint is not exactly its runtime objects");
                 resident = gpu.deviceMemoryInfo();
                 assertTrue(resident.freeBytes() > 0, "GPU reported no VRAM headroom after model load");
             } catch (Throwable loadFailure) {
@@ -88,11 +92,11 @@ class QwenCompactCudaResidencyIntegrationTest {
                 }
             }
 
-            CudaGpuMemory.DeviceMemoryInfo after = gpu.deviceMemoryInfo();
-            if (after.freeBytes() < before.freeBytes() - VRAM_RESTORE_TOLERANCE_BYTES) {
-                IllegalStateException restoreFailure =
-                        new IllegalStateException("GPU free memory did not return near its pre-load baseline: before="
-                                + gibibytes(before.freeBytes()) + ", after=" + gibibytes(after.freeBytes()));
+            long allocatedAfter = gpu.allocatedBytes();
+            if (allocatedAfter != allocatedBefore) {
+                IllegalStateException restoreFailure = new IllegalStateException(
+                        "model teardown did not free every device allocation: allocated before=" + allocatedBefore
+                                + ", after=" + allocatedAfter);
                 if (failure == null) {
                     failure = restoreFailure;
                 } else {
@@ -103,22 +107,16 @@ class QwenCompactCudaResidencyIntegrationTest {
             if (failure != null) {
                 System.out.printf(
                         "Qwen CUDA residency validation failed: artifact=%s objects=%d requestedDeviceBytes=%d "
-                                + "freeBefore=%d freeAfter=%d%n",
-                        artifactPath, descriptors.length, allocatedDeviceBytes, before.freeBytes(), after.freeBytes());
+                                + "allocatedBefore=%d allocatedAfter=%d%n",
+                        artifactPath, descriptors.length, allocatedDeviceBytes, allocatedBefore, allocatedAfter);
                 throw failure;
             }
 
             assertNotNull(resident);
             System.out.printf(
                     "Qwen CUDA residency validation passed: artifact=%s objects=%d allocatedDeviceBytes=%d "
-                            + "freeBefore=%d freeAfterLoad=%d headroom=%d freeAfterTeardown=%d%n",
-                    artifactPath,
-                    descriptors.length,
-                    allocatedDeviceBytes,
-                    before.freeBytes(),
-                    resident.freeBytes(),
-                    resident.freeBytes(),
-                    after.freeBytes());
+                            + "freeBefore=%d freeAfterLoad=%d%n",
+                    artifactPath, descriptors.length, allocatedDeviceBytes, before.freeBytes(), resident.freeBytes());
         }
     }
 
@@ -131,6 +129,7 @@ class QwenCompactCudaResidencyIntegrationTest {
         Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
             DeviceMemoryInfo before = gpu.deviceMemoryInfo();
+            long allocatedBefore = gpu.allocatedBytes();
             int failingCopyIndex = InjectingUploadFailure.FAIL_AFTER_COPIES;
             long bytesBeforeInjectedFailure = 0;
             for (int index = 0; index <= failingCopyIndex; index++) {
@@ -147,19 +146,10 @@ class QwenCompactCudaResidencyIntegrationTest {
             assertEquals(InjectingUploadFailure.FAIL_AFTER_COPIES, failingGpu.successfulCopies());
             assertEquals(InjectingUploadFailure.FAIL_AFTER_COPIES + 1, failingGpu.allocations());
 
-            DeviceMemoryInfo after = gpu.deviceMemoryInfo();
-            assertTrue(
-                    after.freeBytes() >= before.freeBytes() - VRAM_RESTORE_TOLERANCE_BYTES,
-                    "partial-load failure leaked CUDA memory: before=" + gibibytes(before.freeBytes()) + ", after="
-                            + gibibytes(after.freeBytes()));
+            assertEquals(allocatedBefore, gpu.allocatedBytes(), "partial-load failure leaked CUDA allocations");
             System.out.printf(
-                    "Qwen CUDA partial-load rollback passed: uploads=%d allocations=%d bytesBeforeFailure=%d "
-                            + "freeBefore=%d freeAfter=%d%n",
-                    failingGpu.successfulCopies(),
-                    failingGpu.allocations(),
-                    bytesBeforeInjectedFailure,
-                    before.freeBytes(),
-                    after.freeBytes());
+                    "Qwen CUDA partial-load rollback passed: uploads=%d allocations=%d bytesBeforeFailure=%d%n",
+                    failingGpu.successfulCopies(), failingGpu.allocations(), bytesBeforeInjectedFailure);
         }
     }
 

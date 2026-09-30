@@ -113,6 +113,7 @@ class QwenEmbeddingCudaIntegrationTest {
 
         try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
             CudaGpuMemory.DeviceMemoryInfo beforeLoad = gpu.deviceMemoryInfo();
+            long allocatedBeforeLoad = gpu.allocatedBytes();
             assertTrue(
                     beforeLoad.freeBytes() >= expectedWeightBytes + (64L << 20),
                     "insufficient free VRAM for compact model: free=" + beforeLoad.freeBytes() + ", model="
@@ -126,6 +127,7 @@ class QwenEmbeddingCudaIntegrationTest {
                 assertEquals(64, weights.layers().length);
                 CudaGpuMemory.DeviceMemoryInfo resident = gpu.deviceMemoryInfo();
                 assertTrue(resident.freeBytes() > 0, "model weights did not fit on the CUDA device");
+                long residentAllocated = gpu.allocatedBytes();
 
                 QwenExecutionPlan plan = QwenExecutionPlan.embeddingOnly(weights);
                 QwenSequenceState sequence = new QwenSequenceState(501L);
@@ -148,14 +150,14 @@ class QwenEmbeddingCudaIntegrationTest {
 
                 assertTrue(context.workspace().isClosed(), "submission workspace survived terminal completion");
                 assertEmbeddingCloseToSource(output.get(), reference);
-                assertTrue(
-                        gpu.deviceMemoryInfo().freeBytes() >= resident.freeBytes() - (16L << 20),
+                assertEquals(
+                        residentAllocated,
+                        gpu.allocatedBytes(),
                         "submission completion changed model-weight residency");
             }
 
-            assertTrue(
-                    gpu.deviceMemoryInfo().freeBytes() >= beforeLoad.freeBytes() - (128L << 20),
-                    "model teardown did not restore free VRAM near its baseline");
+            assertEquals(
+                    allocatedBeforeLoad, gpu.allocatedBytes(), "model teardown did not free every device allocation");
         }
     }
 

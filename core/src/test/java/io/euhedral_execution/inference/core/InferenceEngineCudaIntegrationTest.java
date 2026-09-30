@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.hardware_utils.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.nio.file.Files;
@@ -31,37 +32,43 @@ class InferenceEngineCudaIntegrationTest {
             cpus.set(cpu);
         assumeTrue(cpus.cardinality() == 2);
         var config = new InferenceConfig(artifact, tokenizer, Path.of(library), cpus, Duration.ofSeconds(10));
-        // This handle observes VRAM only; inference uses exclusively the public engine/session surface.
-        try (var observer = new CudaGpuMemory(Path.of(library))) {
-            long before = observer.deviceMemoryInfo().freeBytes();
-            try (InferenceEngine engine = InferenceEngine.load(config)) {
-                long loaded = engine.deviceMemoryInfo().freeBytes();
-                assertTrue(before - loaded > (1L << 30), "real model was not resident");
-                StringBuilder output = new StringBuilder();
-                try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(91L))) {
-                    var tokens = session.generate("The capital of France is", 5, output::append);
-                    assertEquals(5, tokens.size(), "expected multiple real decode quanta for the fixed prompt");
-                    assertFalse(output.isEmpty());
-                    var visible = tokens.stream()
-                            .filter(id -> !engine.tokenizer().isGenerationEosToken(id))
-                            .mapToInt(Integer::intValue)
-                            .toArray();
-                    assertEquals(engine.tokenizer().decode(visible), output.toString());
-                    assertEquals(
-                            engine.tokenizer().encodeWithModelSpecialTokens("The capital of France is").length
-                                    + visible.length,
-                            session.currentTokenPosition());
-                    assertTrue(engine.deviceMemoryInfo().freeBytes() < loaded, "sequence did not retain device state");
-                }
-                long afterSession = engine.deviceMemoryInfo().freeBytes();
-                assertTrue(afterSession >= loaded - (16L << 20), "session VRAM was not restored");
-                System.out.println("Generated text: " + output);
-                System.out.println(
-                        "VRAM bytes: before=" + before + ", loaded=" + loaded + ", afterSession=" + afterSession);
+        // Only records the engine's CUDA binding, whose allocations stay readable after the engine closed;
+        // inference uses exclusively the public engine/session surface.
+        var bootstrap = new RecordingBootstrap();
+        try (InferenceEngine engine = InferenceEngine.load(config, bootstrap)) {
+            long loaded = engine.allocatedDeviceBytes();
+            assertTrue(loaded > (1L << 30), "real model was not resident");
+            StringBuilder output = new StringBuilder();
+            try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(91L))) {
+                var tokens = session.generate("The capital of France is", 5, output::append);
+                assertEquals(5, tokens.size(), "expected multiple real decode quanta for the fixed prompt");
+                assertFalse(output.isEmpty());
+                var visible = tokens.stream()
+                        .filter(id -> !engine.tokenizer().isGenerationEosToken(id))
+                        .mapToInt(Integer::intValue)
+                        .toArray();
+                assertEquals(engine.tokenizer().decode(visible), output.toString());
+                assertEquals(
+                        engine.tokenizer().encodeWithModelSpecialTokens("The capital of France is").length
+                                + visible.length,
+                        session.currentTokenPosition());
+                assertTrue(engine.allocatedDeviceBytes() > loaded, "sequence did not retain device state");
             }
-            long afterEngine = observer.deviceMemoryInfo().freeBytes();
-            assertTrue(afterEngine >= before - (16L << 20), "engine VRAM was not restored");
-            System.out.println("VRAM bytes afterEngine=" + afterEngine);
+            assertEquals(loaded, engine.allocatedDeviceBytes(), "session device memory was not released");
+            System.out.println("Generated text: " + output);
+            System.out.println("Allocated device bytes with the model loaded: " + loaded);
+        }
+        assertEquals(0, bootstrap.gpu.allocatedBytes(), "engine close did not free every device allocation");
+    }
+
+    private static final class RecordingBootstrap extends InferenceEngine.Bootstrap {
+        private CudaGpuMemory gpu;
+
+        @Override
+        ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
+            ExecutionGpu opened = super.openGpu(path, tuning);
+            this.gpu = (CudaGpuMemory) opened;
+            return opened;
         }
     }
 }

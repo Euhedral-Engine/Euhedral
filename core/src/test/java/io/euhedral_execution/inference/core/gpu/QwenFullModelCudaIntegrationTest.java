@@ -75,7 +75,6 @@ class QwenFullModelCudaIntegrationTest {
     }
 
     private static final int INITIAL_TOKEN = 1814;
-    private static final long VRAM_RESTORE_TOLERANCE = 128L * 1024L * 1024L;
     private static final float HIDDEN_TOLERANCE = 1.0f;
     private static final List<QwenExecutionPlan.Buffer> FIRST_LAYER_BOUNDARIES = List.of(
             QwenExecutionPlan.Buffer.HIDDEN_STATE,
@@ -106,7 +105,7 @@ class QwenFullModelCudaIntegrationTest {
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(QwenLayerType.GATED_DELTA_NET));
 
         try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath, mode, Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD)) {
-            long freeBefore = gpu.deviceMemoryInfo().freeBytes();
+            long allocatedBefore = gpu.allocatedBytes();
             QwenModel model = QwenModel.load(artifactPath, artifact, gpu);
             QwenWeights weights = model.weights();
             Throwable failure = null;
@@ -346,10 +345,12 @@ class QwenFullModelCudaIntegrationTest {
                     else failure.addSuppressed(cleanupFailure);
                 }
             }
-            long freeAfter = gpu.deviceMemoryInfo().freeBytes();
-            if (freeAfter < freeBefore - VRAM_RESTORE_TOLERANCE) {
-                IllegalStateException cleanupFailure = new IllegalStateException(
-                        "full model test leaked device memory: before=" + freeBefore + ", after=" + freeAfter);
+            // Every byte the model, its sequences, and their graphs allocated is released.
+            long allocatedAfter = gpu.allocatedBytes();
+            if (allocatedAfter != allocatedBefore) {
+                IllegalStateException cleanupFailure =
+                        new IllegalStateException("full model test leaked device memory: " + "allocated before="
+                                + allocatedBefore + ", after=" + allocatedAfter);
                 if (failure == null) failure = cleanupFailure;
                 else failure.addSuppressed(cleanupFailure);
             }

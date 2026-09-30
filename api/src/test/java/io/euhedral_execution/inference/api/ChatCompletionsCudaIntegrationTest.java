@@ -50,8 +50,8 @@ import tools.jackson.databind.json.JsonMapper;
 /// Starts the real application against the real `InferenceEngine` and drives it over HTTP.
 ///
 /// Run through `gradle :api:cudaIntegrationTest`. The production backend is wrapped only to count session
-/// open/close/cancel; generation runs entirely through the engine. Device memory is compared before and
-/// after each request to confirm sequence state was released.
+/// open/close/cancel; generation runs entirely through the engine. The engine's device allocations are
+/// compared before and after each request to confirm sequence state was released.
 @SpringBootTest(
         classes = {EuhedralInferenceApplication.class, ChatCompletionsCudaIntegrationTest.Tracking.class},
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -61,7 +61,6 @@ import tools.jackson.databind.json.JsonMapper;
 class ChatCompletionsCudaIntegrationTest {
     private static final String MODEL = "qwen-test";
     private static final JsonMapper JSON = JsonMapper.shared();
-    private static final long VRAM_TOLERANCE = 16L << 20;
     private static Path library;
     private static Path artifact;
     private static Path tokenizer;
@@ -110,7 +109,7 @@ class ChatCompletionsCudaIntegrationTest {
     @Test
     @Order(2)
     void chatCompletionReturnsARealAssistantAnswer() throws Exception {
-        long before = freeDeviceBytes();
+        long before = allocatedDeviceBytes();
         var response = post("{\"model\":\"" + MODEL + "\",\"temperature\":0,\"max_tokens\":24,\"messages\":["
                 + "{\"role\":\"system\",\"content\":\"Answer with a single word.\"},"
                 + "{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}");
@@ -139,7 +138,7 @@ class ChatCompletionsCudaIntegrationTest {
     @Test
     @Order(3)
     void streamingEmitsIncrementalChunksAndCleansUp() throws Exception {
-        long before = freeDeviceBytes();
+        long before = allocatedDeviceBytes();
         var request = HttpRequest.newBuilder(uri("/v1/chat/completions"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"" + MODEL + "\",\"stream\":true,"
@@ -199,7 +198,7 @@ class ChatCompletionsCudaIntegrationTest {
     @Test
     @Order(4)
     void clientAbortCancelsGenerationAndClosesTheSession() throws Exception {
-        long before = freeDeviceBytes();
+        long before = allocatedDeviceBytes();
         int maxTokens = 2000;
         String body = "{\"model\":\"" + MODEL + "\",\"stream\":true,\"max_tokens\":" + maxTokens
                 + ",\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse.\"}]}";
@@ -232,16 +231,13 @@ class ChatCompletionsCudaIntegrationTest {
         assertSessionsReleased(before);
     }
 
-    private void assertSessionsReleased(long freeBefore) {
+    private void assertSessionsReleased(long allocatedBefore) {
         assertEquals(this.tracking.opened.get(), this.tracking.closedCount.get(), "every session must be closed");
-        long freeAfter = freeDeviceBytes();
-        assertTrue(
-                freeAfter >= freeBefore - VRAM_TOLERANCE,
-                "sequence device memory was not released: before=" + freeBefore + " after=" + freeAfter);
+        assertEquals(allocatedBefore, allocatedDeviceBytes(), "sequence device memory was not released");
     }
 
-    private long freeDeviceBytes() {
-        return this.engine.deviceMemoryInfo().freeBytes();
+    private long allocatedDeviceBytes() {
+        return this.engine.allocatedDeviceBytes();
     }
 
     private HttpResponse<String> get(String path) throws Exception {
