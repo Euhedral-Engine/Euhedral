@@ -11,7 +11,6 @@ import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import io.euhedral_execution.inference.benchmark.BenchmarkFixtures;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
-import io.euhedral_execution.inference.core.GpuExecutionMode;
 import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Files;
@@ -60,34 +59,22 @@ class BenchmarkOptionsTest {
         assertFalse(options.gpuMemory());
         assertEquals(1024L, options.gpuHeadroomMiB());
         assertEquals(10L, options.shutdownTimeout().toSeconds());
-        assertEquals(GpuExecutionMode.SYNC, options.gpuExecutionMode());
     }
 
     @Test
-    void explicitAsyncModeSurvivesDefaultOutputAndPrefillSweep() throws Exception {
-        var options = load("\"gpuExecutionMode\":\"ASYNC_EXPERIMENTAL\",\"prefillChunks\":[256,512]");
-        assertEquals(GpuExecutionMode.ASYNC_EXPERIMENTAL, options.gpuExecutionMode());
-        assertEquals(
-                GpuExecutionMode.ASYNC_EXPERIMENTAL,
-                options.sweep(InferenceTuning.defaults(BenchmarkFixtures.bits(2)))
-                        .getFirst()
-                        .gpuExecutionMode());
-        assertEquals(
-                GpuExecutionMode.ASYNC_EXPERIMENTAL,
-                options.sweep(InferenceTuning.defaults(BenchmarkFixtures.bits(2)))
-                        .getLast()
-                        .gpuExecutionMode());
+    void retiredExecutionModeOptionIsRejected() {
+        // Every run submits asynchronously; a configuration that still selects a mode is stale.
+        assertThrows(Exception.class, () -> load("\"gpuExecutionMode\":\"SYNC\""));
     }
 
     @Test
     void q3PolicySurvivesDefaultOutputAndSweep() throws Exception {
-        var options = load(
-                "\"q3DispatchMode\":\"AUTO\",\"q3SmallRowThreshold\":8,\"gpuExecutionMode\":\"ASYNC_EXPERIMENTAL\"");
+        var options = load("\"q3DispatchMode\":\"AUTO\",\"q3SmallRowThreshold\":8,\"prefillChunks\":[256,512]");
         var tuning = options.sweep(InferenceTuning.defaults(BenchmarkFixtures.bits(2)))
                 .getFirst();
         assertEquals(io.euhedral_execution.inference.core.gpu.Q3DispatchMode.AUTO, tuning.q3DispatchMode());
         assertEquals(8, tuning.q3SmallRowThreshold());
-        assertEquals(GpuExecutionMode.ASYNC_EXPERIMENTAL, tuning.gpuExecutionMode());
+        assertEquals(256, tuning.prefillChunkTokens());
         assertTrue(rejection("\"q3SmallRowThreshold\":-1").contains("threshold"));
     }
 

@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.hardware_utils.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.SynchronousReferenceGpu;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,12 +18,14 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-class AsyncInferenceEngineCudaIntegrationTest {
+/// Stream-ordered generation against the synchronous reference: every kernel of the reference engine
+/// runs on no selected stream and synchronizes, which is the retired synchronous execution mode.
+class StreamOrderedEngineCudaIntegrationTest {
     private static final String PROMPT = "The capital of France is";
 
     @Test
     @Timeout(value = 1800, unit = TimeUnit.SECONDS)
-    void asyncModeMatchesSyncTokensAndReleasesPersistentStateAcrossQuanta() throws Exception {
+    void streamOrderedGenerationMatchesTheSynchronousReferenceAndReleasesState() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "CUDA library is required");
         Path artifact = Path.of(System.getProperty(
@@ -37,25 +41,25 @@ class AsyncInferenceEngineCudaIntegrationTest {
 
         try (var observer = new CudaGpuMemory(Path.of(library))) {
             long before = observer.deviceMemoryInfo().freeBytes();
-            Result synchronous = generate(artifact, tokenizer, Path.of(library), cpus, GpuExecutionMode.SYNC);
-            Result asynchronous =
-                    generate(artifact, tokenizer, Path.of(library), cpus, GpuExecutionMode.ASYNC_EXPERIMENTAL);
-            assertEquals(synchronous.tokens(), asynchronous.tokens(), "async execution changed committed token IDs");
-            assertEquals(synchronous.position(), asynchronous.position(), "KV/GDN sequence advancement differs");
-            assertEquals(synchronous.output(), asynchronous.output(), "incremental text differs");
-            assertTrue(asynchronous.tokens().size() >= 4, "expected several decode quanta");
+            Result reference = generate(artifact, tokenizer, Path.of(library), cpus, new ReferenceBootstrap());
+            Result streamOrdered =
+                    generate(artifact, tokenizer, Path.of(library), cpus, new InferenceEngine.Bootstrap());
+            assertEquals(reference.tokens(), streamOrdered.tokens(), "stream ordering changed committed token IDs");
+            assertEquals(reference.position(), streamOrdered.position(), "KV/GDN sequence advancement differs");
+            assertEquals(reference.output(), streamOrdered.output(), "incremental text differs");
+            assertTrue(streamOrdered.tokens().size() >= 4, "expected several decode quanta");
             assertTrue(
                     observer.deviceMemoryInfo().freeBytes() >= before - (128L << 20),
-                    "async engine did not release model and persistent sequence allocations");
+                    "the engine did not release model and persistent sequence allocations");
         }
     }
 
-    private static Result generate(Path artifact, Path tokenizer, Path library, BitSet cpus, GpuExecutionMode mode)
+    private static Result generate(
+            Path artifact, Path tokenizer, Path library, BitSet cpus, InferenceEngine.Bootstrap bootstrap)
             throws Exception {
-        var config = new InferenceConfig(
-                artifact, tokenizer, library, new InferenceTuning(cpus, 4, mode), Duration.ofSeconds(10));
-        try (var engine = InferenceEngine.load(config)) {
-            assertEquals(mode, engine.snapshot().tuning().gpuExecutionMode());
+        var config =
+                new InferenceConfig(artifact, tokenizer, library, new InferenceTuning(cpus, 4), Duration.ofSeconds(10));
+        try (var engine = InferenceEngine.load(config, bootstrap)) {
             assertTrue(
                     engine.tokenizer().encodeWithModelSpecialTokens(PROMPT).length > 4,
                     "test prompt must exercise multiple prefill quanta");
@@ -91,4 +95,22 @@ class AsyncInferenceEngineCudaIntegrationTest {
     }
 
     private record Result(List<Integer> tokens, long position, String output) {}
+
+    /// Loads the model on the synchronous reference GPU fixture.
+    private static final class ReferenceBootstrap extends InferenceEngine.Bootstrap {
+        @Override
+        ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
+            return new SynchronousReferenceGpu(path);
+        }
+
+        @Override
+        void closeGpu(ExecutionGpu gpu) {
+            ((SynchronousReferenceGpu) gpu).close();
+        }
+
+        @Override
+        CudaGpuMemory.DeviceMemoryInfo memoryInfo(ExecutionGpu gpu) {
+            return ((SynchronousReferenceGpu) gpu).deviceMemoryInfo();
+        }
+    }
 }

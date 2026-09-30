@@ -13,11 +13,7 @@ import java.util.Objects;
 /// `prefillChunkTokens` bounds the prompt tokens submitted per prefill quantum and therefore the
 /// per-quantum GPU workspace. It does not change the token sequence.
 public record InferenceTuning(
-        BitSet workerProcessorIds,
-        int prefillChunkTokens,
-        GpuExecutionMode gpuExecutionMode,
-        Q3DispatchMode q3DispatchMode,
-        int q3SmallRowThreshold) {
+        BitSet workerProcessorIds, int prefillChunkTokens, Q3DispatchMode q3DispatchMode, int q3SmallRowThreshold) {
     public static final int DEFAULT_PREFILL_CHUNK_TOKENS = QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS;
 
     public InferenceTuning {
@@ -25,27 +21,17 @@ public record InferenceTuning(
                 Objects.requireNonNull(workerProcessorIds, "workerProcessorIds").clone();
         if (workerProcessorIds.isEmpty()) throw new IllegalArgumentException("workerProcessorIds must not be empty");
         if (prefillChunkTokens <= 0) throw new IllegalArgumentException("prefillChunkTokens must be positive");
-        gpuExecutionMode = Objects.requireNonNull(gpuExecutionMode, "gpuExecutionMode");
         Objects.requireNonNull(q3DispatchMode, "q3DispatchMode");
         if (q3SmallRowThreshold < 0) throw new IllegalArgumentException("Q3 threshold must not be negative");
     }
 
-    public InferenceTuning(BitSet workerProcessorIds, int prefillChunkTokens, GpuExecutionMode gpuExecutionMode) {
-        this(
-                workerProcessorIds,
-                prefillChunkTokens,
-                gpuExecutionMode,
-                Q3DispatchMode.AUTO,
-                Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD);
-    }
-
     public InferenceTuning(BitSet workerProcessorIds, int prefillChunkTokens) {
-        this(workerProcessorIds, prefillChunkTokens, GpuExecutionMode.SYNC);
+        this(workerProcessorIds, prefillChunkTokens, Q3DispatchMode.AUTO, Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD);
     }
 
     /// Default tuning for the given workers: the engine's existing prefill chunk size.
     public static InferenceTuning defaults(BitSet workerProcessorIds) {
-        return new InferenceTuning(workerProcessorIds, DEFAULT_PREFILL_CHUNK_TOKENS, GpuExecutionMode.SYNC);
+        return new InferenceTuning(workerProcessorIds, DEFAULT_PREFILL_CHUNK_TOKENS);
     }
 
     /// Default tuning for a resolved selection.
@@ -54,23 +40,15 @@ public record InferenceTuning(
     }
 
     public InferenceTuning withWorkerProcessorIds(BitSet ids) {
-        return new InferenceTuning(
-                ids, this.prefillChunkTokens, this.gpuExecutionMode, this.q3DispatchMode, this.q3SmallRowThreshold);
+        return new InferenceTuning(ids, this.prefillChunkTokens, this.q3DispatchMode, this.q3SmallRowThreshold);
     }
 
     public InferenceTuning withPrefillChunkTokens(int tokens) {
-        return new InferenceTuning(
-                this.workerProcessorIds, tokens, this.gpuExecutionMode, this.q3DispatchMode, this.q3SmallRowThreshold);
-    }
-
-    public InferenceTuning withGpuExecutionMode(GpuExecutionMode mode) {
-        return new InferenceTuning(
-                this.workerProcessorIds, this.prefillChunkTokens, mode, this.q3DispatchMode, this.q3SmallRowThreshold);
+        return new InferenceTuning(this.workerProcessorIds, tokens, this.q3DispatchMode, this.q3SmallRowThreshold);
     }
 
     public InferenceTuning withQ3Dispatch(Q3DispatchMode mode, int smallRowThreshold) {
-        return new InferenceTuning(
-                this.workerProcessorIds, this.prefillChunkTokens, this.gpuExecutionMode, mode, smallRowThreshold);
+        return new InferenceTuning(this.workerProcessorIds, this.prefillChunkTokens, mode, smallRowThreshold);
     }
 
     @Override

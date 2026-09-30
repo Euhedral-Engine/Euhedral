@@ -10,7 +10,6 @@ import static io.euhedral_execution.inference.core.gpu.CudaGpuOperationsIntegrat
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
@@ -19,9 +18,10 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDat
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
+import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.scheduling.PullingLattice;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenExecutionRunner;
 import io.euhedral_execution.inference.core.scheduling.QwenSequenceState;
 import java.lang.foreign.Arena;
 import java.nio.ByteBuffer;
@@ -115,23 +115,23 @@ class QwenInstructionCudaIntegrationTest {
                         plan, new QwenSequenceState(30), QwenExecutionContext.ExecutionKind.PREFILL, 0, tokenIds);
                 AtomicReference<short[]> actualNorm = new AtomicReference<>();
                 AtomicReference<short[]> actualProjection = new AtomicReference<>();
-                QwenExecutionRunner source = new QwenExecutionRunner(plan, gpu, completed -> {
-                    actualNorm.set(download(
-                            gpu, arena, completed.workspace().normalizedStateAddress(), tokenIds.length * width));
-                    actualProjection.set(download(
-                            gpu, arena, completed.workspace().projectionAddress(0), tokenIds.length * outputs));
-                });
-                new DefaultExecutor().input(source);
-                var outcome = source.submit(context);
-                source.request(3);
-                assertEquals(
-                        QwenExecutionContext.Status.SUCCESS,
-                        outcome.get(30, TimeUnit.SECONDS).status());
-                assertTrue(context.workspace().isClosed());
-                assertBf16Equals(expectedNorm, actualNorm.get(), 0.01f);
-                assertBf16Equals(expectedProjection, actualProjection.get(), 0.03f);
-                source.completeGracefully();
-                assertTrue(source.isComplete());
+                try (var lattice = new PullingLattice()) {
+                    var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+                    var outcome = runtime.submit(context, completed -> {
+                        actualNorm.set(download(
+                                gpu, arena, completed.workspace().normalizedStateAddress(), tokenIds.length * width));
+                        actualProjection.set(download(
+                                gpu, arena, completed.workspace().projectionAddress(0), tokenIds.length * outputs));
+                    });
+                    assertEquals(
+                            QwenExecutionContext.Status.SUCCESS,
+                            outcome.get(30, TimeUnit.SECONDS).status());
+                    assertTrue(context.workspace().isClosed());
+                    assertBf16Equals(expectedNorm, actualNorm.get(), 0.01f);
+                    assertBf16Equals(expectedProjection, actualProjection.get(), 0.03f);
+                    runtime.close();
+                    assertTrue(!runtime.isAttached());
+                }
             } finally {
                 gpu.free(normAddress);
                 gpu.free(projectionAddress);

@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDat
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
+import io.euhedral_execution.inference.core.scheduling.graph.StageTopology;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -224,6 +225,7 @@ public final class QwenExecutionPlan {
     private final QwenWeights weights;
     private final List<Instruction> instructions;
     private final List<List<Integer>> successors;
+    private final StageTopology stageTopology;
     private final List<Integer> projectionWidths;
     private final List<BufferSpec> bufferSpecs;
     private final boolean firstLayer;
@@ -336,6 +338,13 @@ public final class QwenExecutionPlan {
             }
         }
         this.successors = edges.stream().map(List::copyOf).toList();
+        int[][] dependencies = new int[this.instructions.size()][];
+        for (Instruction instruction : this.instructions) {
+            dependencies[instruction.id()] = instruction.dependencies().stream()
+                    .mapToInt(Integer::intValue)
+                    .toArray();
+        }
+        this.stageTopology = StageTopology.submitted(dependencies);
         if (owner != null || !data.fullModel()) {
             this.smallPrefill = null;
             this.regionPrefill = null;
@@ -611,6 +620,14 @@ public final class QwenExecutionPlan {
 
     public List<Instruction> instructions() {
         return this.instructions;
+    }
+
+    /// The stage DAG a reusable frame graph instantiates. Every instruction dependency is a submission
+    /// edge: the consumer's operation is ordered after the producer's by the quantum's stream, so it
+    /// may launch as soon as the producer's launch succeeded. A quantum's only device-completion
+    /// boundary is its retirement, where sequence state is published and quantum storage released.
+    public StageTopology stageTopology() {
+        return this.stageTopology;
     }
 
     public List<Integer> successors(int instructionId) {

@@ -8,9 +8,9 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.util.Objects;
-import java.util.function.Consumer;
 
-/// GPU operations and their explicit completion boundary for Qwen instructions.
+/// GPU operations for Qwen stages. Production launches are ordered by a quantum-owned [GpuStream];
+/// an operation called with no stream selected runs synchronously, which only tests and diagnostics use.
 public abstract class ExecutionGpu implements GpuMemory {
 
     /// Host memory owned by one instruction until its GPU completion is proven.
@@ -44,50 +44,10 @@ public abstract class ExecutionGpu implements GpuMemory {
         return true;
     }
 
-    public boolean asynchronous() {
-        return false;
-    }
-
-    /// Reserves a persistent stream for a cloned lattice worker.
-    public long openWorker(int cpu) {
-        return cpu;
-    }
-
-    /// Releases a cloned worker's stream after its executor closes.
-    public void closeWorker(long worker) {}
-
-    /// Blocks GPU teardown while the lattice still owns worker resources.
-    public void ensureWorkersClosed() {}
-
-    /// Retires clones from an incomplete startup, before requests can be admitted.
-    public void abortWorkerStartup() {}
-
-    /// Binds a lattice worker's GPU resources around its frame body.
-    public void withWorker(long worker, Runnable operation) {
-        operation.run();
-    }
-
-    /// Runs one instruction's submission in the GPU's selected execution mode.
-    public void submit(Runnable operation) {
-        operation.run();
-    }
-
-    /// Lets the calling thread's following launches overlap their predecessor's tail (CUDA programmatic
-    /// dependent launch) when this GPU supports it. Only stream-ordered decode chains enable it.
-    public void programmaticDependentLaunch(boolean enabled) {}
-
-    /// Initializes sequence state on the same stream as later async instructions.
-    public void prepare(Runnable initialization) {
-        initialization.run();
-    }
-
-    public void deferCompletion(Runnable completed, Consumer<Throwable> failed) {
-        throw new UnsupportedOperationException("asynchronous GPU completion is not enabled");
-    }
-
-    /// Binds completed GPU work to a lattice-owned frame source before async submissions begin.
-    public void bindCompletionSink(Consumer<Runnable> completionFrames) {
-        throw new UnsupportedOperationException("asynchronous GPU completion is not enabled");
+    /// Opens a device-ordering domain for one quantum at a time. Synchronous test GPUs retire work as
+    /// it is submitted; the CUDA binding returns a real stream.
+    public GpuStream openStream() {
+        return new InlineGpuStream();
     }
 
     /// Permanently retains uncertain GPU ownership after failed recovery.

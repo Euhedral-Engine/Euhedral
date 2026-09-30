@@ -72,7 +72,8 @@ class QwenAttentionCudaIntegrationTest {
                         QUERY_WIDTH,
                         KEY_VALUE_WIDTH,
                         0);
-                cache.commitAppend(prefillRows);
+                cache.appendSubmitted(prefillRows);
+                cache.commitSubmitted();
                 expectedOutput = causalAttention(
                         expectedNormalized, expectedNormalized, gateValue, gateValue, prefillRows, QUERY_HEADS, 0);
                 long outputDevice = gpu.allocate((long) prefillRows * QUERY_WIDTH * Short.BYTES);
@@ -136,7 +137,8 @@ class QwenAttentionCudaIntegrationTest {
                             QUERY_WIDTH,
                             KEY_VALUE_WIDTH,
                             decodePosition);
-                    cache.commitAppend(1);
+                    cache.appendSubmitted(1);
+                    cache.commitSubmitted();
                     assertTrue(cache.capacity() >= 4);
                     assertTrue(cache.length() == 4);
                     short[] joinedNormalized = concat(expectedNormalized, expectedDecodeNormalized);

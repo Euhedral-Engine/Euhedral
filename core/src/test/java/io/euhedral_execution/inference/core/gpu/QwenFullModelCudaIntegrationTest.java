@@ -11,7 +11,6 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
@@ -22,10 +21,10 @@ import io.euhedral_execution.inference.core.scheduling.AttentionSequenceStates;
 import io.euhedral_execution.inference.core.scheduling.GdnSequenceStates;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenExecutionRunner;
 import io.euhedral_execution.inference.core.scheduling.QwenLogitsRequirement;
 import io.euhedral_execution.inference.core.scheduling.QwenLogitsSampler;
 import io.euhedral_execution.inference.core.scheduling.QwenSequenceState;
+import io.euhedral_execution.inference.core.scheduling.TestExecution;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -106,8 +105,7 @@ class QwenFullModelCudaIntegrationTest {
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(QwenLayerType.FULL_ATTENTION));
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(QwenLayerType.GATED_DELTA_NET));
 
-        try (CudaGpuMemory gpu =
-                new CudaGpuMemory(libraryPath, false, mode, Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD)) {
+        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath, mode, Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD)) {
             long freeBefore = gpu.deviceMemoryInfo().freeBytes();
             QwenModel model = QwenModel.load(artifactPath, artifact, gpu);
             QwenWeights weights = model.weights();
@@ -639,57 +637,56 @@ class QwenFullModelCudaIntegrationTest {
         AtomicReference<short[]> logits = new AtomicReference<>();
         AtomicReference<QwenExecutionContext> completedContext = new AtomicReference<>();
         var workspaceBytes = new java.util.concurrent.atomic.AtomicLong();
-        QwenExecutionRunner runner = new QwenExecutionRunner(plan, gpu, context -> {
-            completedContext.set(context);
-            var allocations = new java.util.HashMap<Long, Long>();
-            for (var spec : context.plan().bufferSpecs()) {
-                if (!context.workspace().hasBuffer(spec.buffer())) continue;
-                if (spec.buffer() == QwenExecutionPlan.Buffer.LOGITS) {
-                    context.logitsOutput()
-                            .ifPresent(logitsOutput -> allocations.put(
-                                    logitsOutput.deviceAddress(),
-                                    context.workspace().bufferByteSize(spec.buffer())));
-                } else
-                    allocations.merge(
-                            context.workspace().address(spec.buffer()),
-                            context.workspace().bufferByteSize(spec.buffer()),
-                            Math::max);
-            }
-            workspaceBytes.set(
-                    allocations.values().stream().mapToLong(Long::longValue).sum());
-            try (Arena arena = Arena.ofShared()) {
-                for (QwenExecutionPlan.Buffer buffer : capturedBuffers) {
-                    if (!context.workspace().hasBuffer(buffer)) continue;
-                    buffers.put(
-                            buffer,
-                            download(
-                                    gpu,
-                                    arena,
-                                    context.workspace().address(buffer),
-                                    Math.toIntExact(context.workspace().bufferByteSize(buffer) / Short.BYTES)));
-                }
-                context.logitsOutput()
-                        .ifPresent(deviceLogits -> logits.set(download(
-                                gpu,
-                                arena,
-                                deviceLogits.deviceAddress(),
-                                Math.multiplyExact(deviceLogits.tokenCount(), deviceLogits.vocabularySize()))));
-            }
-        });
-        new DefaultExecutor().input(runner);
-        try {
-            var outcome =
-                    runner.submit(new QwenExecutionContext(plan, sequence, kind, startPosition, tokenIds, requirement));
-            runner.request(plan.instructions().size());
-            QwenExecutionContext.Outcome result = outcome.get(600, TimeUnit.SECONDS);
-            RunResult run = new RunResult(completedContext.get(), buffers, logits.get(), workspaceBytes.get());
-            if (result.status() != QwenExecutionContext.Status.SUCCESS) {
-                throw new AssertionError("Euhedral graph failed: " + result.failure());
-            }
-            return run;
-        } finally {
-            runner.completeGracefully();
+        QwenExecutionContext quantum =
+                new QwenExecutionContext(plan, sequence, kind, startPosition, tokenIds, requirement);
+        QwenExecutionContext.Outcome result = TestExecution.run(
+                plan,
+                gpu,
+                quantum,
+                context -> {
+                    completedContext.set(context);
+                    var allocations = new java.util.HashMap<Long, Long>();
+                    for (var spec : context.plan().bufferSpecs()) {
+                        if (!context.workspace().hasBuffer(spec.buffer())) continue;
+                        if (spec.buffer() == QwenExecutionPlan.Buffer.LOGITS) {
+                            context.logitsOutput()
+                                    .ifPresent(logitsOutput -> allocations.put(
+                                            logitsOutput.deviceAddress(),
+                                            context.workspace().bufferByteSize(spec.buffer())));
+                        } else
+                            allocations.merge(
+                                    context.workspace().address(spec.buffer()),
+                                    context.workspace().bufferByteSize(spec.buffer()),
+                                    Math::max);
+                    }
+                    workspaceBytes.set(allocations.values().stream()
+                            .mapToLong(Long::longValue)
+                            .sum());
+                    try (Arena arena = Arena.ofShared()) {
+                        for (QwenExecutionPlan.Buffer buffer : capturedBuffers) {
+                            if (!context.workspace().hasBuffer(buffer)) continue;
+                            buffers.put(
+                                    buffer,
+                                    download(
+                                            gpu,
+                                            arena,
+                                            context.workspace().address(buffer),
+                                            Math.toIntExact(context.workspace().bufferByteSize(buffer) / Short.BYTES)));
+                        }
+                        context.logitsOutput()
+                                .ifPresent(deviceLogits -> logits.set(download(
+                                        gpu,
+                                        arena,
+                                        deviceLogits.deviceAddress(),
+                                        Math.multiplyExact(deviceLogits.tokenCount(), deviceLogits.vocabularySize()))));
+                    }
+                },
+                600);
+        RunResult run = new RunResult(completedContext.get(), buffers, logits.get(), workspaceBytes.get());
+        if (result.status() != QwenExecutionContext.Status.SUCCESS) {
+            throw new AssertionError("Euhedral graph failed: " + result.failure());
         }
+        return run;
     }
 
     @org.junit.jupiter.params.ParameterizedTest

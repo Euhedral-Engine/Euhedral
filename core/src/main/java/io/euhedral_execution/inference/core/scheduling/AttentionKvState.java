@@ -11,6 +11,12 @@ import java.util.Objects;
 /// Sequence-owned NVFP4 pages for one full-attention layer. Existing KV payloads
 /// never move. The sequence lease serializes reservation with attention; close
 /// runs after GPU completion. Each D256 row holds 128 code and 16 scale bytes.
+///
+/// Rows move through three frontiers. `capacity` is reserved: backed by pages. The submitted
+/// frontier covers rows whose writes are queued on the owning quantum's stream; later stages of that
+/// quantum may read them, because stream order runs those reads after the writes. `length` is the
+/// committed frontier, published only after the quantum's device work retired; other quanta and
+/// external readers see nothing beyond it.
 public final class AttentionKvState implements AutoCloseable {
     public static final int PAGE_TOKENS = 256;
     public static final int HEAD_ROW_BYTES = 144;
@@ -21,6 +27,7 @@ public final class AttentionKvState implements AutoCloseable {
     private long table;
     private int tableSlots;
     private int capacity;
+    private int submittedLength;
     private int length;
     private long decodeScratch;
     private int scratchHeads;
@@ -38,6 +45,8 @@ public final class AttentionKvState implements AutoCloseable {
         ensureOpen();
         if (startPosition != this.length || tokenCount <= 0)
             throw new IllegalArgumentException("KV append must begin at the current sequence length");
+        if (this.submittedLength != this.length)
+            throw new IllegalStateException("a previous KV append has not been committed or discarded");
         int required = Math.toIntExact(Math.addExact(startPosition, tokenCount));
         if (required <= this.capacity) return;
         int count = Math.toIntExact(((long) required + PAGE_TOKENS - 1) / PAGE_TOKENS);
@@ -68,12 +77,32 @@ public final class AttentionKvState implements AutoCloseable {
         releaseRetired();
     }
 
-    /// Called by the frame's GPU-completion edge, never merely after submission.
-    public void commitAppend(int tokenCount) {
+    /// Records that the writes for `tokenCount` reserved rows after the committed frontier were
+    /// submitted to the owning quantum's stream.
+    public void appendSubmitted(int tokenCount) {
         ensureOpen();
         if (tokenCount <= 0 || (long) this.length + tokenCount > this.capacity)
             throw new IllegalArgumentException("KV append exceeds reserved capacity");
-        this.length = Math.addExact(this.length, tokenCount);
+        if (this.submittedLength != this.length) throw new IllegalStateException("KV append was already submitted");
+        this.submittedLength = this.length + tokenCount;
+    }
+
+    /// Rows that a later stage of the submitting quantum may read.
+    public int submittedLength() {
+        ensureOpen();
+        return this.submittedLength;
+    }
+
+    /// Publishes the submitted frontier. Called only after the quantum's device work retired.
+    public void commitSubmitted() {
+        ensureOpen();
+        this.length = this.submittedLength;
+    }
+
+    /// Drops a submitted frontier that must not become visible, such as a failed quantum's.
+    public void discardSubmitted() {
+        if (this.closed) return;
+        this.submittedLength = this.length;
     }
 
     /// Device pointer to the K page-address table, not to BF16 payloads.

@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
@@ -13,8 +12,8 @@ import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactRe
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenExecutionRunner;
 import io.euhedral_execution.inference.core.scheduling.QwenSequenceState;
+import io.euhedral_execution.inference.core.scheduling.TestExecution;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,7 +40,6 @@ class QwenFirstLayerCudaIntegrationTest {
             QwenModel model = QwenModel.loadFirstLayer(artifactPath, artifact, gpu);
             QwenWeights weights = model.weights();
             QwenSequenceState sequence = new QwenSequenceState(0x5147454eL);
-            QwenExecutionRunner runner = null;
             try {
                 QwenExecutionPlan plan = new QwenExecutionPlan(weights);
                 List<String> instructionKinds = plan.instructions().stream()
@@ -72,34 +70,35 @@ class QwenFirstLayerCudaIntegrationTest {
                         plan, sequence, QwenExecutionContext.ExecutionKind.DECODE, 0, tokenIds);
                 AtomicReference<short[]> terminalHidden = new AtomicReference<>();
                 EnumMap<QwenExecutionPlan.Buffer, short[]> observed = new EnumMap<>(QwenExecutionPlan.Buffer.class);
-                runner = new QwenExecutionRunner(plan, gpu, completed -> {
-                    try (Arena arena = Arena.ofShared()) {
-                        for (QwenExecutionPlan.Buffer buffer : List.of(
-                                QwenExecutionPlan.Buffer.HIDDEN_STATE,
-                                QwenExecutionPlan.Buffer.INPUT_NORMALIZED,
-                                QwenExecutionPlan.Buffer.GDN_CONVOLVED,
-                                QwenExecutionPlan.Buffer.GDN_RECURRENT,
-                                QwenExecutionPlan.Buffer.GDN_NORMALIZED,
-                                QwenExecutionPlan.Buffer.MIXER_DELTA,
-                                QwenExecutionPlan.Buffer.POST_MIXER_NORMALIZED,
-                                QwenExecutionPlan.Buffer.FFN_DELTA,
-                                QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE)) {
-                            observed.put(
-                                    buffer,
-                                    CudaGpuOperationsIntegrationTest.download(
-                                            gpu,
-                                            arena,
-                                            completed.workspace().address(buffer),
-                                            Math.toIntExact(
-                                                    completed.workspace().bufferByteSize(buffer) / Short.BYTES)));
-                        }
-                        terminalHidden.set(observed.get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
-                    }
-                });
-                new DefaultExecutor().input(runner);
-                var outcome = runner.submit(context);
-                runner.request(plan.instructions().size());
-                QwenExecutionContext.Outcome completed = outcome.get(150, TimeUnit.SECONDS);
+                QwenExecutionContext.Outcome completed = TestExecution.run(
+                        plan,
+                        gpu,
+                        context,
+                        done -> {
+                            try (Arena arena = Arena.ofShared()) {
+                                for (QwenExecutionPlan.Buffer buffer : List.of(
+                                        QwenExecutionPlan.Buffer.HIDDEN_STATE,
+                                        QwenExecutionPlan.Buffer.INPUT_NORMALIZED,
+                                        QwenExecutionPlan.Buffer.GDN_CONVOLVED,
+                                        QwenExecutionPlan.Buffer.GDN_RECURRENT,
+                                        QwenExecutionPlan.Buffer.GDN_NORMALIZED,
+                                        QwenExecutionPlan.Buffer.MIXER_DELTA,
+                                        QwenExecutionPlan.Buffer.POST_MIXER_NORMALIZED,
+                                        QwenExecutionPlan.Buffer.FFN_DELTA,
+                                        QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE)) {
+                                    observed.put(
+                                            buffer,
+                                            CudaGpuOperationsIntegrationTest.download(
+                                                    gpu,
+                                                    arena,
+                                                    done.workspace().address(buffer),
+                                                    Math.toIntExact(
+                                                            done.workspace().bufferByteSize(buffer) / Short.BYTES)));
+                                }
+                                terminalHidden.set(observed.get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
+                            }
+                        },
+                        150);
                 assertNotNull(
                         sequence.recurrentState(),
                         "layer execution did not attach its persistent GDN state to the sequence");
@@ -131,7 +130,6 @@ class QwenFirstLayerCudaIntegrationTest {
                 assertTrue(context.workspace().isClosed());
                 sequence.complete();
             } finally {
-                if (runner != null) runner.completeGracefully();
                 model.close();
             }
         }

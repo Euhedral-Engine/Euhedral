@@ -1,18 +1,26 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
+import io.euhedral_execution.inference.core.scheduling.graph.StageQuantum;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
-/// Mutable state for one inference quantum. Frames own operations; this object owns their buffers
-/// and completion accounting, while its sequence reference retains sequence-lifetime state.
-public final class QwenExecutionContext {
+/// Mutable state for one inference quantum: its token range, sequence lease, workspace, and outcome.
+///
+/// While it runs, the quantum is bound to a reusable stage graph whose frames perform the operations.
+/// Its sequence reference retains sequence-lifetime state, which is published only at retirement.
+public final class QwenExecutionContext implements StageQuantum {
+
+    /// Decode quanta that start below this position overlap registered kernels with their predecessor
+    /// (programmatic dependent launch). It won 12 of 12 paired forks, about +1% decode, at a 64-token
+    /// context and only 10 of 12 at 1024, so longer contexts keep ordinary launches.
+    static final long OVERLAP_MAX_START_POSITION = 1024;
 
     private static final Throwable TERMINAL_SUCCESS = new IllegalStateException("quantum already finalized");
     private static final Runnable NO_OP = () -> {};
@@ -43,15 +51,15 @@ public final class QwenExecutionContext {
     private final long startPosition;
     private final int[] tokenIds;
     private final AtomicBoolean submitted = new AtomicBoolean();
-    private final AtomicInteger outstanding = new AtomicInteger();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final CompletableFuture<Outcome> outcome = new CompletableFuture<>();
-    private final AtomicIntegerArray remainingDependencies;
     private QwenSequenceState.ExecutionLease lease;
     private QwenExecutionWorkspace workspace;
     private QwenDeviceLogits logitsOutput;
     private long temporaryTokenIdsAddress;
-    private volatile boolean chained;
+    private ExecutionGpu gpu;
+    private Consumer<? super QwenExecutionContext> terminalConsumer;
+    private Outcome pendingOutcome;
 
     public QwenExecutionContext(
             QwenExecutionPlan plan,
@@ -80,12 +88,6 @@ public final class QwenExecutionContext {
         }
         this.startPosition = startPosition;
         this.tokenIds = tokenIds.clone();
-        this.remainingDependencies =
-                new AtomicIntegerArray(this.plan.instructions().size());
-        for (QwenExecutionPlan.Instruction instruction : this.plan.instructions()) {
-            remainingDependencies.set(
-                    instruction.id(), instruction.dependencies().size());
-        }
     }
 
     public QwenExecutionPlan plan() {
@@ -153,6 +155,16 @@ public final class QwenExecutionContext {
         return this.failure.get() != null || this.sequence.cancellationRequested();
     }
 
+    @Override
+    public boolean stopRequested() {
+        return hasFailureOrCancellation();
+    }
+
+    @Override
+    public boolean overlapLaunches() {
+        return this.kind == ExecutionKind.DECODE && this.startPosition < OVERLAP_MAX_START_POSITION;
+    }
+
     /// Returns the first operation failure, if one has been recorded.
     public Throwable failure() {
         return this.failure.get();
@@ -160,35 +172,6 @@ public final class QwenExecutionContext {
 
     public ExecutionKind kind() {
         return this.kind;
-    }
-
-    /// A chained quantum launches every instruction from one frame, in plan order, on one stream.
-    public boolean chained() {
-        return this.chained;
-    }
-
-    void markChained() {
-        this.chained = true;
-    }
-
-    boolean dependencyCompleted(int instructionId) {
-        int left = this.remainingDependencies.decrementAndGet(instructionId);
-        if (left < 0) {
-            throw new IllegalStateException("instruction dependency completed twice");
-        }
-        return left == 0;
-    }
-
-    void reserveWork() {
-        this.outstanding.incrementAndGet();
-    }
-
-    boolean releaseWork() {
-        int left = this.outstanding.decrementAndGet();
-        if (left < 0) {
-            throw new IllegalStateException("work completion exceeded admission");
-        }
-        return left == 0;
     }
 
     /// Allocates this quantum's temporary token-ID upload buffer.
@@ -209,14 +192,31 @@ public final class QwenExecutionContext {
     }
 
     void begin(ExecutionGpu gpu) {
-        begin(gpu, NO_OP);
+        begin(gpu, null, null, NO_OP);
     }
 
     /// Package-private hook to deterministically exercise cancellation at the lease-claim boundary.
     void begin(ExecutionGpu gpu, Runnable beforeClaim) {
+        begin(gpu, null, null, beforeClaim);
+    }
+
+    /// Claims the sequence and prepares quantum-owned storage with `stream` selected, so any
+    /// initialization it queues precedes every stage of the quantum. The quantum proceeds only if its
+    /// outcome is still open afterwards; a failed preparation has already reached its terminal outcome.
+    void begin(ExecutionGpu gpu, GpuStream stream, Consumer<? super QwenExecutionContext> terminalConsumer) {
+        begin(gpu, stream, terminalConsumer, NO_OP);
+    }
+
+    private void begin(
+            ExecutionGpu gpu,
+            GpuStream stream,
+            Consumer<? super QwenExecutionContext> terminalConsumer,
+            Runnable beforeClaim) {
         if (!this.submitted.compareAndSet(false, true)) {
             throw new DuplicateAdmissionException();
         }
+        this.gpu = Objects.requireNonNull(gpu, "gpu");
+        this.terminalConsumer = terminalConsumer;
         if (this.sequence.cancellationRequested()) {
             this.outcome.complete(new Outcome(Status.CANCELLED, null));
             return;
@@ -252,18 +252,11 @@ public final class QwenExecutionContext {
                             this.plan.projectionWidths());
             this.workspace.allocateBuffers();
         } catch (RuntimeException | Error error) {
-            // Initialization can enqueue zeroes before a later allocation fails. Preserve
-            // every GPU allocation when recovery cannot prove those writes have stopped.
-            if (gpu.asynchronous()) {
-                try {
-                    gpu.synchronize();
-                } catch (RuntimeException | Error synchronizationFailure) {
-                    error.addSuppressed(synchronizationFailure);
-                    gpu.poison(error);
-                }
-            }
+            // Initialization can queue zeroes before a later allocation fails. Keep every allocation
+            // when the stream cannot prove that those writes stopped.
+            if (stream != null) stream.recover(error);
             fail(error);
-            finish(null, gpu);
+            finish();
         }
     }
 
@@ -324,11 +317,15 @@ public final class QwenExecutionContext {
         }
     }
 
-    /// Runs only after all admitted frames have finished and no frame can still access the buffers.
-    void finish(java.util.function.Consumer<? super QwenExecutionContext> terminalConsumer, ExecutionGpu gpu) {
-        if (this.outcome.isDone()) {
+    /// Terminal work for a quantum whose device work has retired. Releases quantum storage, publishes
+    /// sequence state, and prepares the outcome that [#publishOutcome] reports.
+    @Override
+    public void retire(Throwable deviceFailure) {
+        if (this.outcome.isDone() || this.pendingOutcome != null) {
             return;
         }
+        if (deviceFailure != null) fail(deviceFailure);
+        ExecutionGpu gpu = this.gpu;
         try {
             releaseTemporaryTokenIds(gpu);
         } catch (Throwable cleanupFailure) {
@@ -341,9 +338,9 @@ public final class QwenExecutionContext {
                 fail(retentionFailure);
             }
         }
-        if (this.failure.get() == null && !this.sequence.cancellationRequested() && terminalConsumer != null) {
+        if (this.failure.get() == null && !this.sequence.cancellationRequested() && this.terminalConsumer != null) {
             try {
-                terminalConsumer.accept(this);
+                this.terminalConsumer.accept(this);
             } catch (Throwable consumerFailure) {
                 fail(consumerFailure);
             }
@@ -393,7 +390,32 @@ public final class QwenExecutionContext {
             completed = new Outcome(Status.FAILED, releaseLogits(error));
         }
         this.lease = null;
+        this.pendingOutcome = completed;
+    }
+
+    /// Completes the caller-visible outcome prepared by [#retire].
+    @Override
+    public void publishOutcome() {
+        Outcome completed = this.pendingOutcome;
+        if (completed == null) {
+            if (this.outcome.isDone()) return;
+            throw new IllegalStateException("quantum has not retired");
+        }
+        this.pendingOutcome = null;
         this.outcome.complete(completed);
+    }
+
+    /// Retires a quantum that never started stages, then publishes its outcome.
+    void finish() {
+        retire(null);
+        publishOutcome();
+    }
+
+    /// Terminal cleanup for a quantum driven outside a stage graph.
+    void finish(Consumer<? super QwenExecutionContext> terminalConsumer, ExecutionGpu gpu) {
+        if (this.gpu == null) this.gpu = Objects.requireNonNull(gpu, "gpu");
+        if (terminalConsumer != null) this.terminalConsumer = terminalConsumer;
+        finish();
     }
 
     private void retainLogits(ExecutionGpu gpu) {

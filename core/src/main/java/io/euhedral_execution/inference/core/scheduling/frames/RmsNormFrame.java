@@ -1,22 +1,15 @@
 package io.euhedral_execution.inference.core.scheduling.frames;
 
-import io.euhedral_execution.core.impl.FrameManager;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenWorkGenerator;
+import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 
 /// Runs the standalone BF16 RMSNorm instruction.
-public final class RmsNormFrame extends QwenInstructionFrame {
+public final class RmsNormFrame extends QwenStageFrame {
 
-    public RmsNormFrame(
-            long idHash,
-            FrameManager<QwenExecutionContext, RmsNormFrame> recycler,
-            QwenExecutionContext context,
-            QwenExecutionPlan.Instruction instruction,
-            ExecutionGpu gpu,
-            QwenWorkGenerator generator) {
-        super(idHash, recycler, context, instruction, gpu, generator);
+    RmsNormFrame(StageGraph graph, QwenExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+        super(graph, instruction, gpu);
     }
 
     @Override

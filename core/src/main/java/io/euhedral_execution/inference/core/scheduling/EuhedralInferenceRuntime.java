@@ -1,196 +1,289 @@
 package io.euhedral_execution.inference.core.scheduling;
 
-import io.euhedral_execution.core.frames.RunnableFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
-import io.euhedral_execution.core.ingest.QueueIngestSink;
-import io.euhedral_execution.data_structures.queues.PartitionedMpscQueue;
+import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.scheduling.frames.QwenStageFrame;
+import io.euhedral_execution.inference.core.scheduling.graph.QwenExecutionSource;
+import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
-/// Owns temporary execution-source attachment while borrowing model and lattice lifetimes.
-public final class EuhedralInferenceRuntime {
+/// Admits Qwen quanta into reusable frame graphs and owns the Euhedral sources that run them.
+///
+/// Admission acquires an idle graph for the quantum's plan view, prepares quantum-owned resources on
+/// that graph's stream, and publishes the root stages. After that it is out of the execution path:
+/// the stages publish their successors, Euhedral schedules every stage, and the quantum's retirement
+/// frame recycles the graph before publishing the outcome.
+///
+/// Each graph publishes through its own source, attached to the lattice once when the graph is built.
+/// Independent quanta therefore stay independently schedulable: a worker draining one graph's source
+/// never holds another quantum's ready frames.
+public final class EuhedralInferenceRuntime implements AutoCloseable {
+
+    private static final Consumer<QwenExecutionContext> NO_TERMINAL_CONSUMER = ignored -> {};
 
     private final LatticeTerminal lattice;
     private final QwenExecutionPlan plan;
     private final ExecutionGpu gpu;
-    private final QueueIngestSink completionSink;
-    private final AtomicReference<QwenExecutionRunner> attachedRunner = new AtomicReference<>();
-    private final Set<QwenExecutionRunner> executingRunners = ConcurrentHashMap.newKeySet();
-    private final Object admissionLock = new Object();
-    private final CompletableFuture<Void> admissionsDrained = new CompletableFuture<>();
-    private boolean closing;
-    private int admissions;
+    private final ConcurrentHashMap<QwenExecutionPlan, GraphPool> pools = new ConcurrentHashMap<>();
+    private final Object closeLock = new Object();
+    private boolean closed;
 
     public EuhedralInferenceRuntime(LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu) {
         this.lattice = Objects.requireNonNull(lattice, "lattice");
-        this.plan = Objects.requireNonNull(plan, "plan");
+        this.plan = Objects.requireNonNull(plan, "plan").executionOwner();
         this.gpu = Objects.requireNonNull(gpu, "gpu");
-        if (gpu.asynchronous()) {
-            var sink = new QueueIngestSink(new PartitionedMpscQueue<>(64));
-            this.lattice.addUpstream(sink.getDelegate());
-            try {
-                gpu.bindCompletionSink(completion -> {
-                    if (!sink.offer(new RunnableFrame(0L, completion)))
-                        throw new IllegalStateException("CUDA completion sink rejected a ready frame");
-                });
-            } catch (RuntimeException | Error failure) {
-                sink.complete();
-                throw failure;
-            }
-            this.completionSink = sink;
-        } else {
-            this.completionSink = null;
-        }
     }
 
-    /// Executes admitted quanta through one temporary Euhedral source and then detaches it.
+    /// Executes quanta and waits for all of their outcomes.
     public List<QwenExecutionContext.Outcome> execute(List<QwenExecutionContext> contexts)
             throws InterruptedException, ExecutionException {
-        return execute(contexts, ignored -> {});
+        return execute(contexts, NO_TERMINAL_CONSUMER);
     }
 
     /// Executes quanta while their terminal callback can still inspect the live workspace.
     public List<QwenExecutionContext.Outcome> execute(
             List<QwenExecutionContext> contexts, Consumer<? super QwenExecutionContext> terminalConsumer)
             throws InterruptedException, ExecutionException {
-        List<QwenExecutionContext> acceptedContexts = List.copyOf(Objects.requireNonNull(contexts, "contexts"));
-        if (acceptedContexts.isEmpty()) return List.of();
-        QwenExecutionPlan prefillPlan = this.plan.forExecution(
-                QwenExecutionContext.ExecutionKind.PREFILL,
-                acceptedContexts.getFirst().inputTokenCount());
-        QwenExecutionPlan executionPlan = acceptedContexts.getFirst().plan() == prefillPlan ? prefillPlan : this.plan;
-        // Each call owns its source and completion futures; the fabric schedules independent inputs.
+        List<QwenExecutionContext> accepted = List.copyOf(Objects.requireNonNull(contexts, "contexts"));
         Objects.requireNonNull(terminalConsumer, "terminalConsumer");
-        boolean homogeneous = acceptedContexts.stream().allMatch(context -> context.plan() == executionPlan);
-        var runner = homogeneous
-                ? QwenExecutionRunner.concrete(executionPlan, this.gpu, terminalConsumer)
-                : new QwenExecutionRunner(this.plan, this.gpu, terminalConsumer);
-        admit();
-        Throwable executionFailure = null;
+        List<CompletableFuture<QwenExecutionContext.Outcome>> completions = new ArrayList<>(accepted.size());
         try {
-            this.executingRunners.add(runner);
-            this.lattice.addUpstream(runner);
-            List<CompletableFuture<QwenExecutionContext.Outcome>> completions =
-                    new ArrayList<>(acceptedContexts.size());
-            for (QwenExecutionContext context : acceptedContexts) completions.add(runner.submit(context));
-            CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new))
-                    .get();
-            return completions.stream().map(CompletableFuture::join).toList();
-        } catch (InterruptedException | ExecutionException | RuntimeException | Error failure) {
-            executionFailure = failure;
-            throw failure;
-        } finally {
-            try {
-                runner.completeGracefully();
-                runner.awaitTermination();
-            } catch (RuntimeException | Error cleanupFailure) {
-                if (executionFailure == null) throw cleanupFailure;
-                if (cleanupFailure != executionFailure) executionFailure.addSuppressed(cleanupFailure);
-            } finally {
-                if (runner.isComplete() && !runner.isAttached()) this.executingRunners.remove(runner);
-                releaseAdmission();
+            for (QwenExecutionContext context : accepted) completions.add(submit(context, terminalConsumer));
+        } catch (RuntimeException | Error admissionFailure) {
+            // Quanta admitted before the failure still own device work; wait for them to retire.
+            for (var completion : completions) {
+                try {
+                    completion.join();
+                } catch (RuntimeException ignored) {
+                    // Their outcome is reported through their own futures.
+                }
             }
+            throw admissionFailure;
         }
+        CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new)).get();
+        return completions.stream().map(CompletableFuture::join).toList();
     }
 
-    /// Creates the manually managed source used by submit; execute calls own separate sources.
-    public QwenExecutionRunner attachRunner() {
-        return attachRunner(ignored -> {});
-    }
-
-    public QwenExecutionRunner attachRunner(Consumer<? super QwenExecutionContext> terminalConsumer) {
-        admit();
-        try {
-            return attachAdmittedRunner(terminalConsumer);
-        } finally {
-            releaseAdmission();
-        }
-    }
-
-    private QwenExecutionRunner attachAdmittedRunner(Consumer<? super QwenExecutionContext> terminalConsumer) {
-        QwenExecutionRunner runner = new QwenExecutionRunner(
-                this.plan, this.gpu, Objects.requireNonNull(terminalConsumer, "terminalConsumer"));
-        if (!this.attachedRunner.compareAndSet(null, runner)) {
-            throw new IllegalStateException("an execution runner is already attached to this runtime");
-        }
-        try {
-            this.lattice.addUpstream(runner);
-            return runner;
-        } catch (RuntimeException | Error attachmentFailure) {
-            try {
-                runner.completeGracefully();
-                runner.awaitTermination();
-            } catch (RuntimeException | Error cleanupFailure) {
-                attachmentFailure.addSuppressed(cleanupFailure);
-            }
-            this.attachedRunner.compareAndSet(runner, null);
-            throw attachmentFailure;
-        }
-    }
-
-    /// Submits one quantum to the currently attached source.
     public CompletableFuture<QwenExecutionContext.Outcome> submit(QwenExecutionContext context) {
-        QwenExecutionRunner runner = this.attachedRunner.get();
-        if (runner == null) throw new IllegalStateException("no execution runner is attached");
-        return runner.submit(context);
+        return submit(context, NO_TERMINAL_CONSUMER);
     }
 
-    /// Waits on the quantum's existing completion future.
-    public QwenExecutionContext.Outcome await(CompletableFuture<QwenExecutionContext.Outcome> completion)
-            throws InterruptedException, ExecutionException {
-        return Objects.requireNonNull(completion, "completion").get();
-    }
-
-    /// Closes runner admission, drains accepted quanta, and waits for Euhedral to detach the source.
-    public void disconnectRunner() {
-        for (var executing : this.executingRunners) {
-            executing.completeGracefully();
-            executing.awaitTermination();
-            if (executing.isComplete() && !executing.isAttached()) this.executingRunners.remove(executing);
+    /// Admits one quantum. The returned future completes after its device work retired and the
+    /// quantum's graph was recycled.
+    public CompletableFuture<QwenExecutionContext.Outcome> submit(
+            QwenExecutionContext context, Consumer<? super QwenExecutionContext> terminalConsumer) {
+        Objects.requireNonNull(context, "context");
+        Objects.requireNonNull(terminalConsumer, "terminalConsumer");
+        QwenExecutionPlan view = context.plan();
+        if (view.executionOwner() != this.plan) {
+            throw new IllegalArgumentException("quantum belongs to another execution plan");
         }
-        QwenExecutionRunner runner = this.attachedRunner.get();
-        if (runner == null) return;
+        this.gpu.ensureHealthy();
+        GraphPool pool = pool(view);
+        StageGraph graph = pool.acquire();
         try {
-            runner.completeGracefully();
-            runner.awaitTermination();
+            graph.source().admit();
+        } catch (RuntimeException | Error failure) {
+            pool.recycle(graph);
+            throw failure;
+        }
+        boolean started = false;
+        try {
+            GpuStream stream = graph.stream();
+            try {
+                stream.submit(() -> context.begin(this.gpu, stream, terminalConsumer), false);
+            } catch (RuntimeException | Error failure) {
+                if (!(failure instanceof QwenExecutionContext.DuplicateAdmissionException)
+                        && !context.completion().isDone()) {
+                    stream.recover(failure);
+                    context.fail(failure);
+                    context.finish();
+                }
+                throw failure;
+            }
+            if (!context.completion().isDone()) {
+                // From here the graph owns the quantum; its retirement recycles the graph.
+                started = true;
+                graph.start(context);
+            }
+            return context.completion().copy();
         } finally {
-            if (runner.isComplete() && !runner.isAttached()) this.attachedRunner.compareAndSet(runner, null);
+            if (!started) {
+                pool.recycle(graph);
+                graph.source().terminated();
+            }
         }
     }
 
-    /// Detaches the process-wide completion source only after the engine stops all admissions.
-    public void closeCompletionSink() {
-        synchronized (this.admissionLock) {
-            this.closing = true;
-            if (this.admissions == 0) this.admissionsDrained.complete(null);
-        }
-        this.admissionsDrained.join();
-        disconnectRunner();
-        if (this.completionSink != null) this.completionSink.complete();
-    }
-
-    private void admit() {
-        synchronized (this.admissionLock) {
-            if (this.closing) throw new IllegalStateException("inference runtime is closing");
-            this.admissions++;
+    private GraphPool pool(QwenExecutionPlan view) {
+        GraphPool pool = this.pools.get(view);
+        if (pool != null) return pool;
+        synchronized (this.closeLock) {
+            if (this.closed) throw new IllegalStateException("inference runtime is closed");
+            return this.pools.computeIfAbsent(view, GraphPool::new);
         }
     }
 
-    private void releaseAdmission() {
-        synchronized (this.admissionLock) {
-            if (--this.admissions == 0 && this.closing) this.admissionsDrained.complete(null);
+    /// Stops admission, waits for every accepted quantum to retire, detaches the graphs' sources from
+    /// Euhedral, and releases their streams.
+    @Override
+    public void close() {
+        synchronized (this.closeLock) {
+            if (this.closed) return;
+            this.closed = true;
         }
+        RuntimeException failure = null;
+        for (GraphPool pool : this.pools.values()) {
+            try {
+                pool.completeSources();
+            } catch (RuntimeException completionFailure) {
+                if (failure == null) failure = completionFailure;
+                else failure.addSuppressed(completionFailure);
+            }
+        }
+        for (GraphPool pool : this.pools.values()) {
+            try {
+                pool.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
+        }
+        if (failure != null) throw failure;
     }
 
-    public boolean hasAttachedRunner() {
-        return this.attachedRunner.get() != null || !this.executingRunners.isEmpty();
+    /// Admitted quanta whose graphs have not yet retired.
+    public int activeQuanta() {
+        int active = 0;
+        for (GraphPool pool : this.pools.values()) active += pool.activeQuanta();
+        return active;
+    }
+
+    /// Whether any graph's source is still attached to Euhedral.
+    public boolean isAttached() {
+        for (GraphPool pool : this.pools.values()) if (pool.attached()) return true;
+        return false;
+    }
+
+    /// Idle graphs of one plan view. Graphs are built only when every existing one is in use.
+    private final class GraphPool {
+        private final QwenExecutionPlan view;
+        private final MpmcQueue<StageGraph> idle = new MpmcQueue<>(16, 2);
+        private final List<StageGraph> built = new ArrayList<>();
+
+        private GraphPool(QwenExecutionPlan view) {
+            this.view = view;
+        }
+
+        StageGraph acquire() {
+            StageGraph graph = this.idle.poll();
+            return graph != null ? graph : build();
+        }
+
+        void recycle(StageGraph graph) {
+            if (!this.idle.offer(graph)) throw new IllegalStateException("idle graph pool rejected a graph");
+        }
+
+        private StageGraph build() {
+            synchronized (EuhedralInferenceRuntime.this.closeLock) {
+                if (EuhedralInferenceRuntime.this.closed)
+                    throw new IllegalStateException("inference runtime is closed");
+            }
+            ExecutionGpu gpu = EuhedralInferenceRuntime.this.gpu;
+            GpuStream stream = gpu.openStream();
+            StageGraph graph;
+            try {
+                List<QwenExecutionPlan.Instruction> instructions = this.view.instructions();
+                graph = new StageGraph(
+                        this.view.stageTopology(),
+                        (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu),
+                        stream,
+                        new QwenExecutionSource(),
+                        this::recycle);
+            } catch (RuntimeException | Error failure) {
+                try {
+                    stream.close();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
+            }
+            synchronized (this.built) {
+                this.built.add(graph);
+            }
+            // Attached once per reusable graph, never per quantum.
+            EuhedralInferenceRuntime.this.lattice.addUpstream(graph.source());
+            synchronized (EuhedralInferenceRuntime.this.closeLock) {
+                // A close that raced this build has already completed every source it saw.
+                if (EuhedralInferenceRuntime.this.closed) graph.source().completeGracefully();
+            }
+            return graph;
+        }
+
+        /// Closes each graph's admission, then waits until its accepted quantum retired and Euhedral
+        /// detached the source. The first failure is reported after every graph was completed.
+        void completeSources() {
+            List<StageGraph> graphs;
+            synchronized (this.built) {
+                graphs = List.copyOf(this.built);
+            }
+            RuntimeException failure = null;
+            for (StageGraph graph : graphs) {
+                try {
+                    graph.source().completeGracefully();
+                } catch (RuntimeException completionFailure) {
+                    if (failure == null) failure = completionFailure;
+                    else failure.addSuppressed(completionFailure);
+                }
+            }
+            for (StageGraph graph : graphs) {
+                try {
+                    graph.source().awaitTermination();
+                } catch (java.util.concurrent.CompletionException terminationFailure) {
+                    // A downstream completion failure was already reported by completeGracefully.
+                    if (failure == null) failure = terminationFailure;
+                }
+            }
+            if (failure != null) throw failure;
+        }
+
+        int activeQuanta() {
+            int active = 0;
+            synchronized (this.built) {
+                for (StageGraph graph : this.built) active += graph.source().activeGraphs();
+            }
+            return active;
+        }
+
+        boolean attached() {
+            synchronized (this.built) {
+                for (StageGraph graph : this.built) if (graph.source().isAttached()) return true;
+            }
+            return false;
+        }
+
+        void close() {
+            RuntimeException failure = null;
+            synchronized (this.built) {
+                for (StageGraph graph : this.built) {
+                    try {
+                        graph.close();
+                    } catch (RuntimeException closeFailure) {
+                        if (failure == null) failure = closeFailure;
+                        else failure.addSuppressed(closeFailure);
+                    }
+                }
+                this.built.clear();
+            }
+            if (failure != null) throw failure;
+        }
     }
 }

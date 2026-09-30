@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.TensorLoader;
 import io.euhedral_execution.inference.core.model_loader.artifact.CompactTensorLayout;
@@ -21,8 +20,8 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFor
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenExecutionRunner;
 import io.euhedral_execution.inference.core.scheduling.QwenSequenceState;
+import io.euhedral_execution.inference.core.scheduling.TestExecution;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -37,7 +36,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -259,56 +257,50 @@ class QwenCompactCudaExecutionIntegrationTest {
                 : QwenExecutionContext.ExecutionKind.PREFILL;
         QwenExecutionContext context = new QwenExecutionContext(plan, sequence, kind, 0, tokenIds);
         AtomicReference<FrameOutputs> captured = new AtomicReference<>();
-        QwenExecutionRunner runner = new QwenExecutionRunner(plan, gpu, completed -> {
-            try (Arena outputArena = Arena.ofShared()) {
-                captured.set(new FrameOutputs(
-                        CudaGpuOperationsIntegrationTest.download(
-                                gpu,
-                                outputArena,
-                                completed.workspace().hiddenStateAddress(),
-                                tokenCount * config.hiddenSize()),
-                        CudaGpuOperationsIntegrationTest.download(
-                                gpu,
-                                outputArena,
-                                completed.workspace().normalizedStateAddress(),
-                                tokenCount * config.hiddenSize()),
-                        CudaGpuOperationsIntegrationTest.download(
-                                gpu,
-                                outputArena,
-                                completed.workspace().projectionAddress(0),
-                                tokenCount * outputWidth)));
-            }
-        });
-        new DefaultExecutor().input(runner);
-        var outcome = runner.submit(context);
-        try {
-            runner.request(plan.instructions().size());
-            assertEquals(
-                    QwenExecutionContext.Status.SUCCESS,
-                    outcome.get(120, TimeUnit.SECONDS).status(),
-                    "Euhedral slice failed at T=" + tokenCount);
-            assertTrue(context.workspace().isClosed(), "submission workspace survived terminal completion");
-            assertEquals(tokenCount, sequence.currentTokenPosition());
-            assertTrue(captured.get() != null, "terminal frame outputs were not captured");
-            assertBf16Close(
-                    "frame EmbeddingFrame T=" + tokenCount,
-                    expectedEmbedding,
-                    captured.get().embedding(),
-                    0.001f);
-            assertBf16Close(
-                    "frame RmsNormFrame T=" + tokenCount,
-                    expectedNorm,
-                    captured.get().normalized(),
-                    0.02f);
-            assertBf16Close(
-                    "frame LinearFrame T=" + tokenCount,
-                    expectedProjection,
-                    prefixOutputRows(captured.get().projection(), tokenCount, outputWidth, referenceOutputWidth),
-                    0.05f);
-        } finally {
-            runner.completeGracefully();
-        }
-        assertTrue(runner.isComplete());
+        QwenExecutionContext.Outcome outcome = TestExecution.run(
+                plan,
+                gpu,
+                context,
+                completed -> {
+                    try (Arena outputArena = Arena.ofShared()) {
+                        captured.set(new FrameOutputs(
+                                CudaGpuOperationsIntegrationTest.download(
+                                        gpu,
+                                        outputArena,
+                                        completed.workspace().hiddenStateAddress(),
+                                        tokenCount * config.hiddenSize()),
+                                CudaGpuOperationsIntegrationTest.download(
+                                        gpu,
+                                        outputArena,
+                                        completed.workspace().normalizedStateAddress(),
+                                        tokenCount * config.hiddenSize()),
+                                CudaGpuOperationsIntegrationTest.download(
+                                        gpu,
+                                        outputArena,
+                                        completed.workspace().projectionAddress(0),
+                                        tokenCount * outputWidth)));
+                    }
+                },
+                120);
+        assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.status(), "Euhedral slice failed at T=" + tokenCount);
+        assertTrue(context.workspace().isClosed(), "submission workspace survived terminal completion");
+        assertEquals(tokenCount, sequence.currentTokenPosition());
+        assertTrue(captured.get() != null, "terminal frame outputs were not captured");
+        assertBf16Close(
+                "frame EmbeddingFrame T=" + tokenCount,
+                expectedEmbedding,
+                captured.get().embedding(),
+                0.001f);
+        assertBf16Close(
+                "frame RmsNormFrame T=" + tokenCount,
+                expectedNorm,
+                captured.get().normalized(),
+                0.02f);
+        assertBf16Close(
+                "frame LinearFrame T=" + tokenCount,
+                expectedProjection,
+                prefixOutputRows(captured.get().projection(), tokenCount, outputWidth, referenceOutputWidth),
+                0.05f);
     }
 
     private static short[] embeddingReference(Path artifactPath, TensorDescriptor descriptor, int[] tokenIds)
