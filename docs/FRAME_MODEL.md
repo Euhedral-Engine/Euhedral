@@ -331,8 +331,9 @@ decode:
   accumulators across feature regions. It forks internal CUDA streams and joins them back onto the
   quantum stream with events, so from the graph it is an ordinary stream-ordered stage.
 - D: joint BF16 A/B projection + GDN control, submitted before the heavy Q4/Q5 projections.
-- Every view keeps the attention producers as leaf frames: Q4 projection -> in-place Q/K normalization
-  and RoPE, and Q5 projection -> NVFP4 K/V page append, committed at the quantum's retirement.
+- Every view keeps the attention producers as leaf frames: Q4 projection -> Q/K normalization and RoPE
+  (into the normalized Q/K buffer), and Q5 projection -> NVFP4 K/V page append, committed at the
+  quantum's retirement.
 
 Full attention stores K and V in sequence-owned 256-token pages. Each D256 head is rotated by
 normalized H256 and encoded as 128 bytes of E2M1 codes plus 16 E4M3 scales (one per contiguous group

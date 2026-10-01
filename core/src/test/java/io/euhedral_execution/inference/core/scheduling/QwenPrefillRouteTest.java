@@ -82,7 +82,7 @@ class QwenPrefillRouteTest {
     }
 
     @Test
-    void unsupportedAttentionHeadDimensionIsRejectedBeforeSelectingAProducerView() {
+    void unsupportedAttentionHeadDimensionIsRejectedWhenThePlanIsBuilt() {
         var weights = QwenExecutionFixtures.statefulCompactWeightsWithHeadDim(128);
         assertEquals(128, weights.config().attentionHeadDim());
         assertThrows(IllegalArgumentException.class, () -> new QwenExecutionPlan(weights));
