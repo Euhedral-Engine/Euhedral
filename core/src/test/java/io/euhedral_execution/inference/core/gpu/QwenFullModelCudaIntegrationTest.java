@@ -704,91 +704,101 @@ class QwenFullModelCudaIntegrationTest {
         Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
                 QwenModel model = QwenModel.load(artifactPath, QwenArtifactReader.read(artifactPath), gpu)) {
-            var plan = new QwenExecutionPlan(model.weights());
-            var config = model.weights().config();
-            List<byte[]> expectedState = null;
-            short[] expectedLastRow = null;
-            short[] expectedHidden = null;
-            int[] tokens = new int[tokenCount];
-            Arrays.fill(tokens, INITIAL_TOKEN);
-            for (var requirement : List.of(
-                    QwenLogitsRequirement.ALL_TOKENS, QwenLogitsRequirement.LAST_TOKEN, QwenLogitsRequirement.NONE)) {
-                var sequence = new QwenSequenceState(701 + requirement.ordinal());
-                try {
-                    RunResult run = execute(
-                            gpu,
-                            plan,
-                            sequence,
-                            QwenExecutionContext.ExecutionKind.PREFILL,
-                            0,
-                            tokens,
-                            List.of(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
-                            requirement);
+            // Plumbing check under exact numerics: relaxed kernels bound their own error in
+            // RelaxedNumericsDriftCudaIntegrationTest.
+            boolean previousExact = gpu.selectExactNumerics(true);
+            try {
+                var plan = new QwenExecutionPlan(model.weights());
+                var config = model.weights().config();
+                List<byte[]> expectedState = null;
+                short[] expectedLastRow = null;
+                short[] expectedHidden = null;
+                int[] tokens = new int[tokenCount];
+                Arrays.fill(tokens, INITIAL_TOKEN);
+                for (var requirement : List.of(
+                        QwenLogitsRequirement.ALL_TOKENS,
+                        QwenLogitsRequirement.LAST_TOKEN,
+                        QwenLogitsRequirement.NONE)) {
+                    var sequence = new QwenSequenceState(701 + requirement.ordinal());
                     try {
-                        assertEquals(tokenCount, sequence.currentTokenPosition());
-                        short[] hidden = run.buffers().get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
-                        if (expectedHidden == null) expectedHidden = hidden;
-                        else assertArrayEquals(expectedHidden, hidden);
-                        List<byte[]> state = new ArrayList<>();
-                        for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
-                            if (config.layerTypes()[layer] == QwenLayerType.GATED_DELTA_NET) {
-                                var gdn = ((GdnSequenceStates) sequence.recurrentState()).forLayer(layer);
-                                long channels = 2L * config.linearNumKeyHeads() * config.linearKeyHeadDim()
-                                        + (long) config.linearNumValueHeads() * config.linearValueHeadDim();
-                                state.add(readDeviceBytes(
-                                        gpu,
-                                        gdn.convolutionStateAddress(),
-                                        channels * (config.linearConvKernelDim() - 1) * Short.BYTES));
-                                state.add(readDeviceBytes(
-                                        gpu,
-                                        gdn.recurrentStateAddress(),
-                                        (long) config.linearNumValueHeads()
-                                                * config.linearKeyHeadDim()
-                                                * config.linearValueHeadDim()
-                                                * Float.BYTES));
+                        RunResult run = execute(
+                                gpu,
+                                plan,
+                                sequence,
+                                QwenExecutionContext.ExecutionKind.PREFILL,
+                                0,
+                                tokens,
+                                List.of(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                                requirement);
+                        try {
+                            assertEquals(tokenCount, sequence.currentTokenPosition());
+                            short[] hidden = run.buffers().get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
+                            if (expectedHidden == null) expectedHidden = hidden;
+                            else assertArrayEquals(expectedHidden, hidden);
+                            List<byte[]> state = new ArrayList<>();
+                            for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
+                                if (config.layerTypes()[layer] == QwenLayerType.GATED_DELTA_NET) {
+                                    var gdn = ((GdnSequenceStates) sequence.recurrentState()).forLayer(layer);
+                                    long channels = 2L * config.linearNumKeyHeads() * config.linearKeyHeadDim()
+                                            + (long) config.linearNumValueHeads() * config.linearValueHeadDim();
+                                    state.add(readDeviceBytes(
+                                            gpu,
+                                            gdn.convolutionStateAddress(),
+                                            channels * (config.linearConvKernelDim() - 1) * Short.BYTES));
+                                    state.add(readDeviceBytes(
+                                            gpu,
+                                            gdn.recurrentStateAddress(),
+                                            (long) config.linearNumValueHeads()
+                                                    * config.linearKeyHeadDim()
+                                                    * config.linearValueHeadDim()
+                                                    * Float.BYTES));
+                                } else {
+                                    var kv = ((AttentionSequenceStates) sequence.kvCacheState()).forLayer(layer);
+                                    assertEquals(tokenCount, kv.length());
+                                    int heads = config.numKeyValueHeads();
+                                    state.add(readKvPayload(gpu, kv.keyCacheAddress(), kv.length(), heads));
+                                    state.add(readKvPayload(gpu, kv.valueCacheAddress(), kv.length(), heads));
+                                }
+                            }
+                            if (expectedState == null) expectedState = state;
+                            else
+                                for (int index = 0; index < state.size(); index++)
+                                    assertArrayEquals(
+                                            expectedState.get(index), state.get(index), "state buffer " + index);
+                            if (requirement == QwenLogitsRequirement.ALL_TOKENS) {
+                                assertEquals(tokenCount * config.vocabSize(), run.logits().length);
+                                expectedLastRow = Arrays.copyOfRange(
+                                        run.logits(),
+                                        (tokenCount - 1) * config.vocabSize(),
+                                        tokenCount * config.vocabSize());
+                            } else if (requirement == QwenLogitsRequirement.LAST_TOKEN) {
+                                assertEquals(config.vocabSize(), run.logits().length);
+                                reportError("last-row-" + tokenCount, expectedLastRow, run.logits());
+                                // All-token logits use multi-row decode (3 rows) or WMMA (33 rows), which
+                                // measured max 0.0625 and RMS 0.000818 against single-row decode. Bound
+                                // rounding by one BF16 step, with an absolute floor for near-zero
+                                // cancellation; transformer state stays exact.
+                                for (int i = 0; i < expectedLastRow.length; i++) {
+                                    short expected = expectedLastRow[i], actual = run.logits()[i];
+                                    float error = Math.abs(bf16ToFloat(expected) - bf16ToFloat(actual));
+                                    boolean adjacent = (expected < 0) == (actual < 0)
+                                            && Math.abs((expected & 0xffff) - (actual & 0xffff)) <= 1;
+                                    assertTrue(
+                                            Float.isFinite(error) && (error <= 0.001f || adjacent),
+                                            "last row index " + i);
+                                }
                             } else {
-                                var kv = ((AttentionSequenceStates) sequence.kvCacheState()).forLayer(layer);
-                                assertEquals(tokenCount, kv.length());
-                                int heads = config.numKeyValueHeads();
-                                state.add(readKvPayload(gpu, kv.keyCacheAddress(), kv.length(), heads));
-                                state.add(readKvPayload(gpu, kv.valueCacheAddress(), kv.length(), heads));
+                                assertTrue(run.context().logitsOutput().isEmpty());
                             }
-                        }
-                        if (expectedState == null) expectedState = state;
-                        else
-                            for (int index = 0; index < state.size(); index++)
-                                assertArrayEquals(expectedState.get(index), state.get(index), "state buffer " + index);
-                        if (requirement == QwenLogitsRequirement.ALL_TOKENS) {
-                            assertEquals(tokenCount * config.vocabSize(), run.logits().length);
-                            expectedLastRow = Arrays.copyOfRange(
-                                    run.logits(),
-                                    (tokenCount - 1) * config.vocabSize(),
-                                    tokenCount * config.vocabSize());
-                        } else if (requirement == QwenLogitsRequirement.LAST_TOKEN) {
-                            assertEquals(config.vocabSize(), run.logits().length);
-                            reportError("last-row-" + tokenCount, expectedLastRow, run.logits());
-                            // The single-row LM head is the contiguous Q3 decode kernel; all-token
-                            // logits use the exact multi-row decode (3 rows) or WMMA (33 rows), which
-                            // measured max 0.0625 and RMS 0.000818 against decode. Bound rounding by
-                            // one BF16 step, with an absolute floor for near-zero cancellation;
-                            // transformer state stays exact.
-                            for (int i = 0; i < expectedLastRow.length; i++) {
-                                short expected = expectedLastRow[i], actual = run.logits()[i];
-                                float error = Math.abs(bf16ToFloat(expected) - bf16ToFloat(actual));
-                                boolean adjacent = (expected < 0) == (actual < 0)
-                                        && Math.abs((expected & 0xffff) - (actual & 0xffff)) <= 1;
-                                assertTrue(
-                                        Float.isFinite(error) && (error <= 0.001f || adjacent), "last row index " + i);
-                            }
-                        } else {
-                            assertTrue(run.context().logitsOutput().isEmpty());
+                        } finally {
+                            run.closeLogits();
                         }
                     } finally {
-                        run.closeLogits();
+                        sequence.complete();
                     }
-                } finally {
-                    sequence.complete();
                 }
+            } finally {
+                gpu.selectExactNumerics(previousExact);
             }
         }
     }

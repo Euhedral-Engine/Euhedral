@@ -87,4 +87,40 @@ class FfnOwnershipTest(unittest.TestCase):
                         self.assertLessEqual(abs(f(e) - f(o)), max(abs(f(e)) / 128, 1e-3 * rms), (rows, i, f(e), f(o)))
                     self.assertLess(sum(e != o for e, o in zip(a, b)), len(a) // 20)
 
+    def test_hi_only_leaves_stay_close_to_their_exact_twins(self):
+        # Relaxed leaves stage only the BF16 rounding of code * scale (one MMA per weight); the
+        # _exact twins stage hi + lo. Random scales make lo nonzero.
+        with contextlib.ExitStack() as scope:
+            gpu = Gpu(SOURCE.encode()); scope.callback(gpu.close)
+            rng = random.Random(911)
+            p, u = C.c_uint64, C.c_uint
+            f = lambda bits: struct.unpack('<f', struct.pack('<I', bits << 16))[0]
+            def weights(outputs, width):
+                groups = outputs * (width // 64); scale = (groups * 24 + 255) & ~255
+                data = rng.randbytes(groups * 24) + bytes(scale - groups * 24) + b''.join(
+                    struct.pack('<H', rng.randrange(0x1c00, 0x2800) | (rng.randrange(2) << 15)) for _ in range(groups))
+                v = gpu.upload(data); scope.callback(gpu.free, v); return v, scale
+            for rows, tile in ((64, 64), (128, 128)):
+                width, inter = 512, 1024
+                gw, gs = weights(2 * inter, width); dw, ds = weights(width, inter)
+                x = gpu.upload(struct.pack(f'<{rows * width}H', *[rng.randrange(0x3c00, 0x4000) | (rng.randrange(2) << 15)
+                                                               for _ in range(rows * width)])); scope.callback(gpu.free, x)
+                outs = {}
+                for suffix in ('', '_exact'):
+                    mid = gpu.zeros(rows * inter * 2); scope.callback(gpu.free, mid)
+                    y = gpu.zeros(rows * width * 2); scope.callback(gpu.free, y)
+                    gpu.launch(f'euhedral_q3_gate_up_swiglu_{tile}x32{suffix}', (rows // tile) * (inter // 32),
+                               [p(x), p(gw), p(mid), u(rows), u(width), u(2 * inter), p(gs)])
+                    gpu.launch(f'euhedral_q3_ffn_down_{tile}x64{suffix}', (rows // tile) * (width // 64),
+                               [p(mid), p(dw), p(y), u(rows), u(inter), u(width), p(ds)])
+                    outs[suffix] = [struct.unpack(f'<{n}H', gpu.download(b, n * 2)) for b, n in ((mid, rows * inter), (y, rows * width))]
+                for which, (relaxed, exact) in zip(('gate/up', 'down'), zip(outs[''], outs['_exact'])):
+                    a = [f(v) for v in exact]; b = [f(v) for v in relaxed]
+                    rms = (sum(v * v for v in a) / len(a)) ** 0.5
+                    err = (sum((x - y) ** 2 for x, y in zip(a, b)) / len(a)) ** 0.5
+                    worst = max(abs(x - y) for x, y in zip(a, b))
+                    with self.subTest(rows=rows, which=which):
+                        self.assertLess(err, 1e-2 * rms, (err, rms))
+                        self.assertLess(worst, 0.5 * rms, (worst, rms))
+
 if __name__=='__main__':unittest.main()

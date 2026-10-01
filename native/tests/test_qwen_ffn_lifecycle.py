@@ -23,8 +23,9 @@ typedef void* CUfunction;
 #define cudaStreamNonBlocking 1
 #define cudaEventDisableTiming 2
 static void *ffn_stream_gate=(void*)10, *ffn_stream_down=(void*)11;
-static void *stream_gate128=(void*)10;
-static void *stream_down128=(void*)11;
+static void *stream_gate128=(void*)10, *stream_gate128_exact=(void*)10;
+static void *stream_down128=(void*)11, *stream_down128_exact=(void*)11;
+static int euhedral_cuda_exact_numerics(void) {return 0;}
 static int fail_at, call_count, asynchronous, pending, fail_drains, next_event;
 static int trace_kind[256], trace_handle[256], pending_before[256];
 static unsigned char buffers[8 << 20] __attribute__((aligned(16)));

@@ -584,7 +584,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                             output, accumulators = run(f'probe_{leaf}_{suffix}', grid, tile_rows * tile_cols)
                             self.assertEqual(accumulators, reference[1])
                             self.assertEqual(output, reference[0])
-                    kernels = {'32': ['euhedral_q3_prefill'], '64': ['euhedral_q3_prefill_64', 'euhedral_q3_prefill_64_wmma']}
+                    kernels = {'32': ['euhedral_q3_prefill_exact'], '64': ['euhedral_q3_prefill_64_exact', 'euhedral_q3_prefill_64_wmma']}
                     for kernel in kernels.get(suffix, []):
                         with self.subTest(rows=rows, width=width, outputs=outputs, kernel=kernel):
                             y = self.owned(stack, gpu.zeros(rows * outputs * 2, fill=0xa5))
@@ -636,8 +636,8 @@ class Q3PrimitiveTest(unittest.TestCase):
                 x = self.owned(stack, gpu.upload(struct.pack(f"<{len(values)}H", *values)))
                 w = self.owned(stack, gpu.upload(bytes(payload)))
                 results = {}
-                for kernel, tile_rows, tile_cols in [("euhedral_q3_prefill", 32, 32),
-                                                      ("euhedral_q3_prefill_64", 64, 32),
+                for kernel, tile_rows, tile_cols in [("euhedral_q3_prefill_exact", 32, 32),
+                                                      ("euhedral_q3_prefill_64_exact", 64, 32),
                                                       ("probe_unpadded_32", 32, 32),
                                                       ("probe_unpadded_64", 64, 32),
                                                       ("probe_tiled_64x16", 64, 16),
@@ -649,13 +649,13 @@ class Q3PrimitiveTest(unittest.TestCase):
                                                   C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(scale_offset)])
                         results[kernel] = gpu.download(y, rows * outputs * 2)
                 with self.subTest(rows=rows, width=width, outputs=outputs):
-                    self.assertNotIn(b"\xa5\xa5", [results["euhedral_q3_prefill"][i:i + 2]
+                    self.assertNotIn(b"\xa5\xa5", [results["euhedral_q3_prefill_exact"][i:i + 2]
                                                    for i in range(0, rows * outputs * 2, 2)])
-                    self.assertEqual(results["euhedral_q3_prefill_64"], results["euhedral_q3_prefill"])
-                    self.assertEqual(results["probe_unpadded_32"], results["euhedral_q3_prefill"])
-                    self.assertEqual(results["probe_unpadded_64"], results["euhedral_q3_prefill"])
-                    self.assertEqual(results["probe_tiled_64x16"], results["euhedral_q3_prefill"])
-                    self.assertEqual(results["probe_tiled_16x64"], results["euhedral_q3_prefill"])
+                    self.assertEqual(results["euhedral_q3_prefill_64_exact"], results["euhedral_q3_prefill_exact"])
+                    self.assertEqual(results["probe_unpadded_32"], results["euhedral_q3_prefill_exact"])
+                    self.assertEqual(results["probe_unpadded_64"], results["euhedral_q3_prefill_exact"])
+                    self.assertEqual(results["probe_tiled_64x16"], results["euhedral_q3_prefill_exact"])
+                    self.assertEqual(results["probe_tiled_16x64"], results["euhedral_q3_prefill_exact"])
 
     def test_prefetched_k_matches_sequential_staging_bitwise_at_boundaries(self):
         gpu = self.gpu
@@ -681,7 +681,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                     args = lambda y: [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
                                       C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)]
                     gpu.launch('probe_sequential_' + suffix, grid, args(expected))
-                    kernel = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '')
+                    kernel = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '') + '_exact'
                     gpu.launch(kernel, grid, args(actual))
                     with self.subTest(rows=rows, width=width, outputs=outputs, tile=tile):
                         self.assertEqual(gpu.download(actual, rows * outputs * 2),
@@ -708,7 +708,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                         C.c_uint64(destination), C.c_uint(rows), C.c_uint(width),
                         C.c_uint(outputs), C.c_ulonglong(scale_offset)]
                 gpu.launch('probe_sequential_64', grid, args(expected))
-                gpu.launch('euhedral_q3_prefill_64_k32_cb', grid, args(actual))
+                gpu.launch('euhedral_q3_prefill_64_k32_cb_exact', grid, args(actual))
                 with self.subTest(width=width, generations=width // 32):
                     self.assertEqual(gpu.download(actual, rows * outputs * 2),
                                      gpu.download(expected, rows * outputs * 2))
@@ -733,7 +733,7 @@ class Q3PrimitiveTest(unittest.TestCase):
                 args = lambda y: [C.c_uint64(source + 2), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows),
                                   C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(offset)]
                 gpu.launch('probe_sequential_' + suffix, grid, args(expected))
-                kernel = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '')
+                kernel = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '') + '_exact'
                 gpu.launch(kernel, grid, args(actual))
                 with self.subTest(tile=tile):
                     self.assertEqual(gpu.download(actual, rows * outputs * 2),

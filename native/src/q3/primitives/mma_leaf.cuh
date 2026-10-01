@@ -13,8 +13,15 @@ namespace q3 {
 // (test_explicit_mma_leaves_match_wmma_bitwise), not a language guarantee.
 
 // WMMA leaf: the portable fragment API.
+// B operand parts a leaf consumes: Leaf::kParts when it declares one, otherwise the exact two.
+template<class L, class = void>
+struct LeafParts { static constexpr int value = 2; };
+template<class L>
+struct LeafParts<L, decltype(void(L::kParts))> { static constexpr int value = L::kParts; };
+
 template<class Tile>
 struct WmmaLeaf {
+    static constexpr int kParts = 2;
     using Acc = Accumulators<Tile::kFrags>;
     static __device__ __forceinline__ void fill(Acc& acc) { acc.fill(); }
     template<int K_TILE, int LDA, int LDB>
@@ -52,8 +59,11 @@ static __device__ __forceinline__ void mma_16816(float (&c)[4], const unsigned i
 
 // PINGPONG keeps two fragment register sets and loads step k + 16 before
 // issuing the MMAs of step k; the MMA sequence is unchanged.
-template<class Tile, bool PINGPONG = false>
+// PARTS: B operand parts per weight. 2 consumes BF16 hi and lo (code * scale exactly); 1 consumes
+// hi only, the BF16 rounding of code * scale, with half the MMAs.
+template<class Tile, bool PINGPONG = false, int PARTS = 2>
 struct MmaSyncLeaf {
+    static constexpr int kParts = PARTS;
     struct Acc {
         float c[Tile::kFrags][2][4];  // [m][n half][fragment element]
     };
@@ -73,7 +83,7 @@ struct MmaSyncLeaf {
             const __nv_bfloat16* b_lo, unsigned int warp, unsigned int k, unsigned int lane) {
         unsigned int offset = (Tile::col(warp) + (lane & 7u) + ((lane >> 4) << 3)) * LDB + k + ((lane >> 3) & 1u) * 8u;
         ldmatrix_x4(b[0], b_hi + offset);
-        ldmatrix_x4(b[1], b_lo + offset);
+        if (PARTS > 1) ldmatrix_x4(b[1], b_lo + offset);
     }
     // Load one A fragment. Lane l addresses row l & 15 at k offset 8 * (l >> 4).
     template<int LDA>
@@ -85,7 +95,7 @@ struct MmaSyncLeaf {
     static __device__ __forceinline__ void step(Acc& acc, const unsigned int (&a)[Tile::kFrags][4],
             const unsigned int (&b)[2][4]) {
         #pragma unroll
-        for (int part = 0; part < 2; part++)
+        for (int part = 0; part < PARTS; part++)
             #pragma unroll
             for (int m = 0; m < Tile::kFrags; m++) {
                 mma_16816(acc.c[m][0], a[m], b[part][0], b[part][1]);
@@ -140,8 +150,8 @@ struct MmaSyncLeaf {
                 }
     }
 };
-template<class Tile>
-using MmaPingPongLeaf = MmaSyncLeaf<Tile, true>;
+template<class Tile, int PARTS = 2>
+using MmaPingPongLeaf = MmaSyncLeaf<Tile, true, PARTS>;
 
 
 }  // namespace q3

@@ -21,6 +21,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static CUmodule module;
 static CUfunction function;
 static CUfunction decode1, decode2, decode4, decode_wide, decode_contiguous, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
+static CUfunction prefill_exact, prefill64_exact, prefill64_k32_cb_exact, prefill_s104_exact;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 /* Alias of euhedral_cuda_select_exact_numerics, kept for existing callers. */
 int euhedral_cuda_q3_decode_select_exact(int exact) {
@@ -43,6 +44,10 @@ static void initialize(void) {
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
     prefill64_wmma = optional_kernel("euhedral_q3_prefill_64_wmma");
     prefill64_k32_cb = optional_kernel("euhedral_q3_prefill_64_k32_cb");
+    prefill_exact = optional_kernel("euhedral_q3_prefill_exact");
+    prefill_s104_exact = optional_kernel("euhedral_q3_prefill_s104_exact");
+    prefill64_exact = optional_kernel("euhedral_q3_prefill_64_exact");
+    prefill64_k32_cb_exact = optional_kernel("euhedral_q3_prefill_64_k32_cb_exact");
     // The decode kernels begin with euhedral_pdl_begin() (see cuda_kernel_loader.h).
     euhedral_cuda_pdl_register(decode1);
     euhedral_cuda_pdl_register(decode2);
@@ -118,6 +123,14 @@ static int linear_q3(const void* input, const void* weights, void* output,
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64 ? prefill64
             : prefill_kernel == EUHEDRAL_Q3_PREFILL32_S104 ? prefill_s104
             : prefill_kernel == EUHEDRAL_Q3_PREFILL32 ? prefill : NULL;
+    // Exact numerics select the hi + lo twins of the prefill kernels.
+    if ((mode == 2 || mode == 3) && euhedral_cuda_exact_numerics()) {
+        CUfunction exact = selected == prefill64_k32_cb ? prefill64_k32_cb_exact
+                : selected == prefill64 ? prefill64_exact
+                : selected == prefill_s104 ? prefill_s104_exact
+                : selected == prefill ? prefill_exact : NULL;
+        if (exact != NULL) selected = exact;
+    }
     if (selected == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     CUresult status = euhedral_launch_kernel(selected, (unsigned int)grid, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);
     if (status != CUDA_SUCCESS) return (int)status;

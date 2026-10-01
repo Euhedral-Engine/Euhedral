@@ -52,13 +52,13 @@ static __device__ __forceinline__ void stage_prefetched_activation(
     }
 }
 
-template<class Tile, int BITS, int STRIDE>
+template<class Tile, int BITS, int STRIDE, int PARTS = 2>
 static __device__ __forceinline__ void stage_prefetched_weights(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const CompactPrefetch<Tile, BITS>& next,
         unsigned int warp, unsigned int lane) {
     #pragma unroll
     for (int j = 0; j < CompactPrefetch<Tile, BITS>::kColumns; ++j)
-        stage_group_words<BITS, STRIDE>(hi, lo, warp + j * Tile::kWarps, next.words[j], lane);
+        stage_group_words<BITS, STRIDE, PARTS>(hi, lo, warp + j * Tile::kWarps, next.words[j], lane);
 }
 
 }  // namespace q45

@@ -91,8 +91,8 @@ class Q45KernelTest(unittest.TestCase):
     def routes(self, bits, rows, outputs):
         decode_tiles = (outputs + 7) // 8
         prefill_tiles = (outputs + 31) // 32
-        routes = [(f"euhedral_q{bits}_prefill", ((rows + 31) // 32) * prefill_tiles),
-                  (f"euhedral_q{bits}_prefill_64", ((rows + 63) // 64) * prefill_tiles)]
+        routes = [(f"euhedral_q{bits}_prefill_exact", ((rows + 31) // 32) * prefill_tiles),
+                  (f"euhedral_q{bits}_prefill_64_exact", ((rows + 63) // 64) * prefill_tiles)]
         for tile in (1, 2, 4):
             routes.append((f"euhedral_q{bits}_decode_{tile}", ((rows + tile - 1) // tile) * decode_tiles))
         return routes
@@ -136,12 +136,12 @@ class Q45KernelTest(unittest.TestCase):
                 w4 = self.owned(stack, gpu.upload(make_weights(self.rng, 4, width, q4_out)))
                 w5 = self.owned(stack, gpu.upload(make_weights(self.rng, 5, width, q5_out)))
                 tiles = (rows + 63) // 64
-                ref4 = self.run_kernel(stack, "euhedral_q4_prefill_64", tiles * ((q4_out + 31) // 32), x, w4, rows, width, q4_out)
-                ref5 = self.run_kernel(stack, "euhedral_q5_prefill_64", tiles * ((q5_out + 31) // 32), x, w5, rows, width, q5_out)
+                ref4 = self.run_kernel(stack, "euhedral_q4_prefill_64_exact", tiles * ((q4_out + 31) // 32), x, w4, rows, width, q4_out)
+                ref5 = self.run_kernel(stack, "euhedral_q5_prefill_64_exact", tiles * ((q5_out + 31) // 32), x, w5, rows, width, q5_out)
                 y4 = self.owned(stack, gpu.zeros(rows * q4_out * 2, fill=SENTINEL))
                 y5 = self.owned(stack, gpu.zeros(rows * q5_out * 2, fill=SENTINEL))
                 grid = tiles * ((q4_out + 31) // 32) + tiles * ((q5_out + 31) // 32)
-                gpu.launch("euhedral_q45_prefill_64_grouped", grid, [
+                gpu.launch("euhedral_q45_prefill_64_grouped_exact", grid, [
                     C.c_uint64(x), C.c_uint64(w4), C.c_uint64(y4), C.c_uint64(w5), C.c_uint64(y5),
                     C.c_uint(rows), C.c_uint(width), C.c_uint(q4_out), C.c_uint(q5_out)])
                 self.assertEqual(gpu.download(y4, rows * q4_out * 2), ref4)

@@ -200,9 +200,11 @@ class CudaGpuOperationsIntegrationTest {
                 for (int i = 0; i < input.length; i++) input[i] = floatToBf16((i % 23 - 11) * 0.125f);
                 long x = upload(gpu, arena, input), w = upload(gpu, arena, packed);
                 long y = gpu.allocate((long) rows * outputs * Short.BYTES);
+                boolean previous = gpu.selectExactNumerics(true);
                 try {
                     gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, Q3DispatchMode.SCALAR);
                     short[] expected = download(gpu, arena, y, rows * outputs);
+                    // Exact numerics: the specialized paths match the scalar reference to one BF16 step.
                     for (var mode : new Q3DispatchMode[] {Q3DispatchMode.DECODE, Q3DispatchMode.PREFILL}) {
                         gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, mode);
                         short[] actual = download(gpu, arena, y, rows * outputs);
@@ -217,7 +219,21 @@ class CudaGpuOperationsIntegrationTest {
                                         "scale edge index " + i);
                             }
                     }
+                    // Relaxed numerics stage the BF16 rounding of each code * scale: the result stays within
+                    // 1% of the output RMS of the reference, at every scale edge.
+                    gpu.selectExactNumerics(false);
+                    gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, Q3DispatchMode.PREFILL);
+                    short[] relaxed = download(gpu, arena, y, rows * outputs);
+                    double sum = 0;
+                    for (short value : expected) sum += (double) bf16ToFloat(value) * bf16ToFloat(value);
+                    double rms = Math.sqrt(sum / expected.length);
+                    for (int i = 0; i < relaxed.length; i++) {
+                        float error = Math.abs(bf16ToFloat(expected[i]) - bf16ToFloat(relaxed[i]));
+                        assertTrue(
+                                Float.isFinite(error) && error <= 0.01 * rms + 0.001, "relaxed scale edge index " + i);
+                    }
                 } finally {
+                    gpu.selectExactNumerics(previous);
                     gpu.free(y);
                     gpu.free(w);
                     gpu.free(x);

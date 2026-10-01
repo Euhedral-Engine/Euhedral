@@ -102,7 +102,7 @@ static __device__ __forceinline__ void produce_a(
 
 // Each N16 branch is decoded by its own producer warp. K32 uses three packed
 // words and one scale per column; the two K16 halves share this acquisition.
-template<bool SWIZZLE>
+template<bool SWIZZLE, int PARTS = 2>
 static __device__ __forceinline__ void produce_b(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const q3::Layout& w,
         unsigned int outputs, unsigned int first_col, unsigned int base,
@@ -127,7 +127,7 @@ static __device__ __forceinline__ void produce_b(
             unsigned int second = __shfl_sync(0xffffffffu, word, (bit >> 5) + 1, 8);
             unsigned int codes = static_cast<unsigned int>(
                     ((static_cast<unsigned long long>(second) << 32) | first) >> (bit & 31u)) & 63u;
-            q3::stage_split_pair(hi, lo, b_position<SWIZZLE>(col, half * 16u + sublane * 2u), codes, scale);
+            q3::stage_split_pair<PARTS>(hi, lo, b_position<SWIZZLE>(col, half * 16u + sublane * 2u), codes, scale);
         }
     }
 }
@@ -157,7 +157,7 @@ static __device__ __forceinline__ void prefetch_compact_b(
     }
 }
 
-template<bool SWIZZLE>
+template<bool SWIZZLE, int PARTS = 2>
 static __device__ __forceinline__ void stage_compact_b(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const CompactB& next,
         unsigned int lane) {
@@ -174,12 +174,12 @@ static __device__ __forceinline__ void stage_compact_b(
             unsigned int second = __shfl_sync(0xffffffffu, next.words[j], (bit >> 5) + 1, 8);
             unsigned int codes = static_cast<unsigned int>(
                     ((static_cast<unsigned long long>(second) << 32) | first) >> (bit & 31u)) & 63u;
-            q3::stage_split_pair(hi, lo, b_position<SWIZZLE>(col, half * 16u + sublane * 2u), codes, scale);
+            q3::stage_split_pair<PARTS>(hi, lo, b_position<SWIZZLE>(col, half * 16u + sublane * 2u), codes, scale);
         }
     }
 }
 
-template<bool EARLY_A, bool EARLY_B, bool DUMP, bool COMPACT_B = false>
+template<bool EARLY_A, bool EARLY_B, bool DUMP, bool COMPACT_B = false, int PARTS = 2>
 static __device__ __forceinline__ void run(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int width, unsigned int outputs,
@@ -192,8 +192,9 @@ static __device__ __forceinline__ void run(
     const unsigned int first_row = (blockIdx.x / output_tiles) * 64u;
     const unsigned int first_col = (blockIdx.x % output_tiles) * 32u;
     const q3::Layout weights_layout(weights, width, scale_offset);
-    typename Leaf::Acc acc;
-    Leaf::fill(acc);
+    using RunLeaf = q3::MmaSyncLeaf<Tile, false, PARTS>;
+    typename RunLeaf::Acc acc;
+    RunLeaf::fill(acc);
 
     if (threadIdx.x == 0) new (static_cast<void*>(&storage)) Shared(Shared::ActivateStage{});
     __syncthreads();
@@ -210,7 +211,7 @@ static __device__ __forceinline__ void run(
     if (generations) {
         if (owns_a) produce_a(stage.a[0][m_branch], input, rows, width,
                 first_row, m_branch, 0, lane);
-        else produce_b<true>(stage.b[0][n_branch][0], stage.b[0][n_branch][1],
+        else produce_b<true, PARTS>(stage.b[0][n_branch][0], stage.b[0][n_branch][1],
                 weights_layout, outputs, first_col + n_branch * 16u, 0, lane);
         arrive(&stage.ready[owned_branch][0]);
     }
@@ -223,7 +224,7 @@ static __device__ __forceinline__ void run(
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
             if (owns_a) produce_a(stage.a[next & 1u][m_branch], input, rows, width,
                     first_row, m_branch, next * 32u, lane);
-            else produce_b<true>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
+            else produce_b<true, PARTS>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
                     weights_layout, outputs, first_col + n_branch * 16u, next * 32u, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -245,7 +246,7 @@ static __device__ __forceinline__ void run(
             unsigned int col = (lane & 7u) + ((lane >> 4) << 3);
             unsigned int index = b_index(col, half * 16u + ((lane >> 3) & 1u) * 8u);
             q3::ldmatrix_x4(bf[0], hi + index);
-            q3::ldmatrix_x4(bf[1], lo + index);
+            if (PARTS > 1) q3::ldmatrix_x4(bf[1], lo + index);
             if (half == 1u) {
                 // All of this warp's LDSM borrows have completed. MMA below
                 // touches only fragment registers, so the slots can be reused
@@ -254,7 +255,7 @@ static __device__ __forceinline__ void run(
                 arrive(&stage.release[m_branch][gen & 1u]);
                 arrive(&stage.release[2u + n_branch][gen & 1u]);
             }
-            Leaf::step(acc, af, bf);
+            RunLeaf::step(acc, af, bf);
             if (COMPACT_B && !owns_a && half == 0u && gen + 1u < generations)
                 prefetch_compact_b(compact_next, weights_layout, outputs,
                         first_col + n_branch * 16u, (gen + 1u) * 32u, lane);
@@ -263,7 +264,7 @@ static __device__ __forceinline__ void run(
             const unsigned int next = gen + 1u;
             if (next >= 2u)
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
-            stage_compact_b<true>(stage.b[next & 1u][n_branch][0],
+            stage_compact_b<true, PARTS>(stage.b[next & 1u][n_branch][0],
                     stage.b[next & 1u][n_branch][1], compact_next, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -273,7 +274,7 @@ static __device__ __forceinline__ void run(
                 wait(&stage.release[owned_branch][next & 1u], ((next - 2u) >> 1) & 1u);
             if (owns_a) produce_a(stage.a[next & 1u][m_branch], input, rows, width,
                     first_row, m_branch, next * 32u, lane);
-            else produce_b<true>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
+            else produce_b<true, PARTS>(stage.b[next & 1u][n_branch][0], stage.b[next & 1u][n_branch][1],
                     weights_layout, outputs, first_col + n_branch * 16u, next * 32u, lane);
             arrive(&stage.ready[owned_branch][next & 1u]);
         }
@@ -288,7 +289,7 @@ static __device__ __forceinline__ void run(
     if (threadIdx.x == 0) new (static_cast<void*>(&storage)) Shared(Shared::ActivateResult{});
     __syncthreads();
     float* result = storage.result.values;
-    Leaf::store(result, acc, warp);
+    RunLeaf::store(result, acc, warp);
     __syncthreads();
     if (DUMP) for (unsigned int i = threadIdx.x; i < 64u * 32u; i += 128u)
         dump[(unsigned long long)blockIdx.x * 64u * 32u + i] = result[i];

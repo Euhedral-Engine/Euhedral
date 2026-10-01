@@ -2,8 +2,8 @@
 #include "tiles.cuh"
 namespace qwen_ffn_paired {
 using namespace qwen_ffn_tiles;
-template<int F,int N>
-static __device__ __forceinline__ void run(const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int rows,unsigned int width,unsigned int outputs,unsigned long long scale,Storage<F,N>& s,unsigned int start,unsigned int count){
+template<int F,int N,int P=1>
+static __device__ __forceinline__ void run(const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int rows,unsigned int width,unsigned int outputs,unsigned long long scale,Storage<F,N,P>& s,unsigned int start,unsigned int count){
     unsigned int lane=threadIdx.x&31u,warp=threadIdx.x>>5,mb=warp>>1,fh=warp&1u;
     bool owns_a=warp==0u||warp==3u;unsigned int nb=warp==1u?0u:1u,branch=owns_a?mb:2u+nb;
     unsigned int tiles=count/N,row0=(blockIdx.x/tiles)*(32u*F),col0=start+(blockIdx.x%tiles)*N;
@@ -15,7 +15,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
         if(owns_a)activation<F>(s.a[0][mb],x,rows,width,row0,mb,0,lane);
         else {
             #pragma unroll
-            for(int t=0;t<N/16;++t)produce_b<false>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][1]+t*16u*32u,layout,outputs,col0+t*16u+nb*(outputs/2u),0,lane);
+            for(int t=0;t<N/16;++t)produce_b<false,P>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][P-1]+t*16u*32u,layout,outputs,col0+t*16u+nb*(outputs/2u),0,lane);
         }
         arrive(&s.ready[branch][0]);
     }
@@ -30,14 +30,14 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
             #pragma unroll
             for(int pair=0;pair<2;++pair)
                 #pragma unroll
-                for(int part=0;part<2;++part){
+                for(int part=0;part<P;++part){
                     unsigned int address=static_cast<unsigned int>(__cvta_generic_to_shared(s.b[slot][pair][part]+index));
                     if(N==16)asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];":"=r"(bf[pair][part][0]),"=r"(bf[pair][part][1]):"r"(address));
                     else asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];":"=r"(bf[pair][part][0]),"=r"(bf[pair][part][1]),"=r"(bf[pair][part][2]),"=r"(bf[pair][part][3]):"r"(address));
                 }
             if(half==1u){__syncwarp();arrive(&s.release[mb][slot]);arrive(&s.release[2][slot]);arrive(&s.release[3][slot]);}
             #pragma unroll
-            for(int part=0;part<2;++part)
+            for(int part=0;part<P;++part)
                 #pragma unroll
                 for(int m=0;m<F;++m)
                     #pragma unroll
@@ -53,7 +53,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
             if(owns_a)activation<F>(s.a[n&1u][mb],x,rows,width,row0,mb,n*32u,lane);
             else {
                 #pragma unroll
-                for(int t=0;t<N/16;++t)stage_compact_b<false>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][1]+t*16u*32u,next[t],lane);
+                for(int t=0;t<N/16;++t)stage_compact_b<false,P>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][P-1]+t*16u*32u,next[t],lane);
             }
             arrive(&s.ready[branch][n&1u]);
         }
@@ -72,11 +72,13 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
             }
 }
 }
-extern "C" __global__ __launch_bounds__(128) void euhedral_q3_gate_up_swiglu_64x32(
- const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) {
- __shared__ qwen_ffn_tiles::Storage<2,32> s;qwen_ffn_paired::run<2,32>(x,w,y,m,k,n,scale,s,0,n/2u);
-}
-extern "C" __global__ __launch_bounds__(128) void euhedral_q3_gate_up_swiglu_128x32(
- const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) {
- __shared__ qwen_ffn_tiles::Storage<4,32> s;qwen_ffn_paired::run<4,32>(x,w,y,m,k,n,scale,s,0,n/2u);
-}
+// Relaxed (hi-only) leaves and their exact hi/lo twins, selected by host dispatch.
+#define EUHEDRAL_Q3_GATE_UP(NAME, F, P) \
+extern "C" __global__ __launch_bounds__(128) void NAME( \
+ const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) { \
+ __shared__ qwen_ffn_tiles::Storage<F,32,P> s;qwen_ffn_paired::run<F,32,P>(x,w,y,m,k,n,scale,s,0,n/2u); }
+EUHEDRAL_Q3_GATE_UP(euhedral_q3_gate_up_swiglu_64x32, 2, 1)
+EUHEDRAL_Q3_GATE_UP(euhedral_q3_gate_up_swiglu_128x32, 4, 1)
+EUHEDRAL_Q3_GATE_UP(euhedral_q3_gate_up_swiglu_64x32_exact, 2, 2)
+EUHEDRAL_Q3_GATE_UP(euhedral_q3_gate_up_swiglu_128x32_exact, 4, 2)
+#undef EUHEDRAL_Q3_GATE_UP

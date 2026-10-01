@@ -231,7 +231,7 @@ extern "C" __global__ void probe_held_borrower(unsigned int* out) {
                         struct.pack_into('<H', packed, offset+2*i, (0, 1, 0x03ff, 0x3555, 0xb555)[i%5])
                     with prior_nodes.Q3FragmentNodeTest.buffers(gpu, rows, width, packed) as (x, w):
                         reference = prior_nodes.Q3FragmentNodeTest.run_one(local,
-                            'euhedral_q3_prefill' + ('_64' if tile == 64 else ''),
+                            'euhedral_q3_prefill' + ('_64' if tile == 64 else '') + '_exact',
                             ((rows+tile-1)//tile)*((outputs+31)//32), x, w, rows, width, outputs, offset)
                         for cm, cn in SHAPES:
                             grid = (((outputs+32*cn-1)//(32*cn))*cn,

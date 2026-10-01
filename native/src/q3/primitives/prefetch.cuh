@@ -64,7 +64,7 @@ static __device__ __forceinline__ void stage_prefetched_activation(
     }
 }
 
-template<class Tile, int STRIDE>
+template<class Tile, int STRIDE, int PARTS = 2>
 static __device__ __forceinline__ void stage_prefetched_weights(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const CompactPrefetch<Tile>& next,
         unsigned int warp, unsigned int lane) {
@@ -76,7 +76,7 @@ static __device__ __forceinline__ void stage_prefetched_weights(
         unsigned int high = __shfl_sync(0xffffffffu, next.words[j], (bit >> 5) + 1);
         unsigned int codes = (unsigned int)((((unsigned long long)high << 32) | low) >> (bit & 31u)) & 63u;
         float scale = fp16_to_float(__shfl_sync(0xffffffffu, (unsigned int)next.scales[j], 0));
-        stage_split_pair(hi, lo, col * STRIDE + lane * 2, codes, scale);
+        stage_split_pair<PARTS>(hi, lo, col * STRIDE + lane * 2, codes, scale);
     }
 }
 

@@ -28,10 +28,11 @@ static int ffn_anchor;
 static CUmodule ffn_module;
 static CUfunction gate_up_swiglu;
 static CUfunction gate_up64x32, gate_up128x32, ffn_down128x64, ffn_down64x64;
+static CUfunction gate_up64x32_exact, gate_up128x32_exact, ffn_down128x64_exact, ffn_down64x64_exact;
 static CUfunction ffn_down_split64, ffn_down_split128, ffn_down_reduce;
 static CUfunction ffn_stream_gate;
 static CUfunction ffn_stream_down;
-static CUfunction stream_gate128, stream_down128;
+static CUfunction stream_gate128, stream_down128, stream_gate128_exact, stream_down128_exact;
 static CUmodule quantized_module;
 static CUmodule q45_module;
 static CUmodule gdn_module;
@@ -45,6 +46,14 @@ static CUfunction q45_decode_wide[2];
 static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
+static CUfunction q45_prefill_exact[2], q45_prefill64_exact[2], q45_grouped64_exact;
+
+/* Exact numerics select the hi + lo twins of the Q4/Q5 prefill kernels. */
+static CUfunction q45_prefill_kernel(int format, int wide) {
+    CUfunction exact = wide ? q45_prefill64_exact[format] : q45_prefill_exact[format];
+    if (exact != NULL && euhedral_cuda_exact_numerics()) return exact;
+    return wide ? q45_prefill64[format] : q45_prefill[format];
+}
 static int q45_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction linear_bf16_to_float;
 static CUfunction gdn_control;
@@ -104,6 +113,11 @@ static void initialize_modules(void) {
         get_function(q45_module, &q45_decode_wide[1], "euhedral_q5_decode_wide");
         // Optional: without it the GDN projection pair falls back to two launches.
         get_function(q45_module, &q45_grouped64, "euhedral_q45_prefill_64_grouped");
+        get_function(q45_module, &q45_grouped64_exact, "euhedral_q45_prefill_64_grouped_exact");
+        get_function(q45_module, &q45_prefill_exact[0], "euhedral_q4_prefill_exact");
+        get_function(q45_module, &q45_prefill_exact[1], "euhedral_q5_prefill_exact");
+        get_function(q45_module, &q45_prefill64_exact[0], "euhedral_q4_prefill_64_exact");
+        get_function(q45_module, &q45_prefill64_exact[1], "euhedral_q5_prefill_64_exact");
         if (status != CUDA_SUCCESS) q45_status = (int)status;
     }
 
@@ -150,6 +164,12 @@ static void initialize_modules(void) {
             get_function(ffn_module, &gate_up128x32, "euhedral_q3_gate_up_swiglu_128x32");
             get_function(ffn_module, &ffn_down128x64, "euhedral_q3_ffn_down_128x64");
             get_function(ffn_module, &ffn_down64x64, "euhedral_q3_ffn_down_64x64");
+            get_function(ffn_module, &gate_up64x32_exact, "euhedral_q3_gate_up_swiglu_64x32_exact");
+            get_function(ffn_module, &gate_up128x32_exact, "euhedral_q3_gate_up_swiglu_128x32_exact");
+            get_function(ffn_module, &ffn_down64x64_exact, "euhedral_q3_ffn_down_64x64_exact");
+            get_function(ffn_module, &ffn_down128x64_exact, "euhedral_q3_ffn_down_128x64_exact");
+            get_function(ffn_module, &stream_gate128_exact, "stream_gate_up_128x32_exact");
+            get_function(ffn_module, &stream_down128_exact, "stream_down_128x64_exact");
             get_function(ffn_module, &ffn_down_split64, "euhedral_q3_ffn_down_split_64x64");
             get_function(ffn_module, &ffn_down_split128, "euhedral_q3_ffn_down_split_128x64");
             get_function(ffn_module, &ffn_down_reduce, "euhedral_q3_ffn_down_reduce");
@@ -314,10 +334,10 @@ int euhedral_cuda_linear_quantized_bf16(
             function = q45_decode_wide[format];
         grid64 = (((uint64_t)rows + row_tile - 1u) / row_tile) * decode_tiles;
     } else if (route == ROUTE_PREFILL64) {
-        function = q45_prefill64[format];
+        function = q45_prefill_kernel(format, 1);
         grid64 = (((uint64_t)rows + 63u) / 64u) * prefill_tiles;
     } else {
-        function = q45_prefill[format];
+        function = q45_prefill_kernel(format, 0);
         grid64 = (((uint64_t)rows + 31u) / 32u) * prefill_tiles;
     }
     if (grid64 > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
@@ -355,7 +375,9 @@ int euhedral_cuda_gdn_projections_bf16(
             if (grid64 > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
             void* parameters[] = {&input, &q4, &qk_output, &q5, &value_z_output, &rows, &hidden, &qk_width,
                     &value_z_width};
-            return launch_and_synchronize(q45_grouped64, (uint32_t)grid64, 128, parameters);
+            CUfunction grouped = q45_grouped64_exact != NULL && euhedral_cuda_exact_numerics()
+                    ? q45_grouped64_exact : q45_grouped64;
+            return launch_and_synchronize(grouped, (uint32_t)grid64, 128, parameters);
         }
     }
     status = euhedral_cuda_linear_quantized_bf16(input, q4, qk_output, rows, hidden, qk_width, q4_bytes, 4);
@@ -503,8 +525,10 @@ int euhedral_cuda_q3_ffn_streamed_bf16(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    CUfunction gate = stream_gate128;
-    CUfunction down = stream_down128;
+    // Exact numerics stage BF16 hi + lo weights; the default stages hi only.
+    int exact = euhedral_cuda_exact_numerics();
+    CUfunction gate = exact ? stream_gate128_exact : stream_gate128;
+    CUfunction down = exact ? stream_down128_exact : stream_down128;
     uint32_t row_tile = 128u, gate_tile = 32u, down_tile = 64u;
     if (!gate || !down) {
         // An older source bundle retains the old K32 continuation shape. Select its
@@ -576,7 +600,9 @@ int euhedral_cuda_q3_gate_up_swiglu_bf16(
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     uint32_t tile_rows = euhedral_ffn_gate_tile_rows(rows, width, outputs);
-    CUfunction selected = tile_rows == 64u ? gate_up64x32 : tile_rows == 128u ? gate_up128x32 : NULL;
+    int exact = euhedral_cuda_exact_numerics();
+    CUfunction selected = tile_rows == 64u ? (exact ? gate_up64x32_exact : gate_up64x32)
+            : tile_rows == 128u ? (exact ? gate_up128x32_exact : gate_up128x32) : NULL;
     // Older source bundles keep the matching old symbol AND its old launch tile.
     if (selected) grid = (((uint64_t)rows + tile_rows - 1u) / tile_rows) * (outputs / 64u);
     else selected = gate_up_swiglu;
@@ -601,7 +627,9 @@ int euhedral_cuda_q3_ffn_down_bf16(
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     // Older source bundles lack the 64-row entry point; they keep the generic route for those rows.
-    CUfunction selected = tile_rows == 64u ? ffn_down64x64 : ffn_down128x64;
+    int exact = euhedral_cuda_exact_numerics();
+    CUfunction selected = tile_rows == 64u ? (exact ? ffn_down64x64_exact : ffn_down64x64)
+            : (exact ? ffn_down128x64_exact : ffn_down128x64);
     if (!selected)
         return euhedral_cuda_linear_q3_prefill_bf16(input, weights, output, rows, width, outputs, weight_bytes);
     uint32_t grid = ((rows + tile_rows - 1u) / tile_rows) * (outputs / 64u);
@@ -755,7 +783,7 @@ int euhedral_cuda_attention_producers_bf16(
     void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
             &head_dim, &rotary_dim, &start, &epsilon, &theta, &keys};
     void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width, &values, &query_width, &start};
-    status = (int)euhedral_launch_kernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    status = (int)euhedral_launch_kernel(q45_prefill_kernel(0, 1), (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
             head_dim, 1, 1, 0, stream, norm_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_value_cache, (uint32_t)grid, 1, 1,
@@ -806,10 +834,10 @@ int euhedral_cuda_attention_producers_nvfp4(
     void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width};
     uint32_t key_width = key_heads * head_dim;
     void* append_args[] = {&query_key, &gate, &keys, &values, &rows, &query_width, &key_width, &start};
-    status = (int)euhedral_launch_kernel(q45_prefill64[0], (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    status = (int)euhedral_launch_kernel(q45_prefill_kernel(0, 1), (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
             head_dim, 1, 1, 0, stream, norm_args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(q45_prefill64[1], (uint32_t)grid, 1, 1,
+    if (status == 0) status = (int)euhedral_launch_kernel(q45_prefill_kernel(1, 1), (uint32_t)grid, 1, 1,
             128, 1, 1, 0, stream, q5_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_append_nvfp4,
             (uint32_t)(((uint64_t)rows * key_heads + 3) / 4), 1, 1, 128, 1, 1, 0, stream, append_args, NULL);

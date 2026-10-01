@@ -348,15 +348,23 @@ the represented-NVFP4 tolerance for decode attention.
   layer) also replaces the streamed regions and their child stream (1400 us), so only 1024-row
   quanta still stream. Prefill 64 +6.4%, 256 +3.9%, 1024 +1.2%; time to first token for a 64-token
   prompt -5.3%. Splitting gate/up measured flat or slower.
+- **One MMA per weight in prefill.** Every prefill GEMM (FFN gate/up and down, the Q3 mixer, Q3
+  and Q4/Q5 projections) staged each dequantized weight as two BF16 values whose sum is code * scale
+  exactly and ran an MMA on each; the kernels were tensor-pipe bound. They now stage only the BF16
+  rounding of code * scale (relative error at most 2^-9 per weight) and run half the MMAs: gate/up
+  at 512 rows 4494 -> 3134 us, down 2492 -> 1753 us. Prefill per 1024-token prompt 1700 -> 1196 ms
+  in the trace; prefill 64/256/1024 +29.5/+27.0/+27.3% and time to first token -21% in paired
+  forks. The hi + lo kernels remain as `_exact` twins.
 - **GDN convolution.** One thread per channel walked every row although each output reads only
   the previous three inputs; 32-row blocks give 1280 CTAs at 512 rows (238 -> 68 us).
 
-Relaxed numerics: every kernel above whose FP32 accumulation order differs from its exact
-counterpart (contiguous Q3 decode, split-K FFN down) is replaced by the exact kernel under
+Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
+Q3 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under
 `EUHEDRAL_EXACT=1`, and `RelaxedNumericsDriftCudaIntegrationTest` compares the two settings end to
-end. With both relaxed kernels, a 256-token prefill and 2048 forced decode positions give a median
-hidden-state difference of 5.7%, KL 3.1e-3 and the same top-1 token at 97.3% of positions, with
-no growth (settled halves 7.1% and 6.5%): the same floor as either change alone.
+end. With all of them, a 256-token prefill and 2048 forced decode positions give a median
+hidden-state difference of 6.0%, KL 3.3e-3 and the same top-1 token at 96.8% of positions, with no
+growth (settled halves 7.2% and 6.9%). A single one-ulp perturbation (the decode attention merge
+order) gives 5.4% and KL 2.6e-3, so the combined error stays at the model's sensitivity floor.
 
 Measured and not kept:
 
