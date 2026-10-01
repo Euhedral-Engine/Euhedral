@@ -203,6 +203,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
             self.assertEqual(0, attribute(C.byref(local), 3, symbol))  # CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
             self.assertEqual(0, local.value, 'FP4 decode must not materialize a thread-local lookup table')
             for name in [b'euhedral_attention_prefill32_nvfp4', b'euhedral_attention_prefill32_nvfp4_exact',
+                         b'euhedral_attention_prefill_fa2_nvfp4',
                          b'euhedral_attention_decode_nvfp4', b'euhedral_attention_decode_nvfp4_exact']:
                 self.assertEqual(0, self.gpu.function(C.byref(symbol), self.gpu.module, name))
                 self.assertEqual(0, attribute(C.byref(local), 3, symbol))
@@ -256,6 +257,11 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                     self.gpu.launch('euhedral_attention_prefill32_nvfp4', ((rows + 31) // 32) * query_heads, args)
                     capture('prefill32')
                     np.testing.assert_allclose(observed[-1][1], observed[-2][1], rtol=1e-2, atol=1e-4)
+                    # The FlashAttention-2 leaf: 16 query rows x one KV head's query-head group per CTA.
+                    self.gpu.launch('euhedral_attention_prefill_fa2_nvfp4', ((rows + 15) // 16) * heads, args,
+                                    block=32 * (query_heads // heads))
+                    capture('prefill_fa2')
+                    np.testing.assert_allclose(observed[-1][1], observed[-3][1], rtol=1e-2, atol=1e-4)
                 else:
                     for splits in sorted({1, 3, min(64, (length + 47) // 48), min(64, length)}):
                         scratch = self.owned(scope, self.gpu.zeros(query_heads * splits * 258 * 4, 0xA5))

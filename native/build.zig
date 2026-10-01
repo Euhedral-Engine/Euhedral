@@ -118,7 +118,7 @@ pub fn build(b: *std.Build) void {
     b.installFile("src/qwen_ffn_streamed.cu", "share/euhedral_cuda/qwen_ffn_streamed.cu");
     b.installFile("src/qwen_elementwise.cu", "share/euhedral_cuda/qwen_elementwise.cu");
     b.installFile("src/qwen_attention_ops.cu", "share/euhedral_cuda/qwen_attention_ops.cu");
-    for ([_][]const u8{ "nvfp4_kv.cuh", "nvfp4_attention.cuh", "nvfp4_prefill32.cuh" }) |source| {
+    for ([_][]const u8{ "nvfp4_kv.cuh", "nvfp4_attention.cuh", "nvfp4_prefill32.cuh", "nvfp4_prefill_fa2.cuh" }) |source| {
         b.installFile(b.fmt("src/attention/{s}", .{source}), b.fmt("share/euhedral_cuda/attention/{s}", .{source}));
     }
 }
