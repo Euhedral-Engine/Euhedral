@@ -303,3 +303,60 @@ Decode quanta that start below 1024 tokens launch their kernels with CUDA progra
 
 `QwenExecutionPlan.reference(weights)` is the unfused oracle used by tests; staged plans (`prefix`,
 `embeddingOnly`, operator slices) are also reference-only.
+
+## Kernel leaves
+
+The frame DAG owns irregular scheduling; a CUDA kernel should be a homogeneous, hardware-shaped
+leaf. Each expensive kernel was examined for responsibilities that do not belong in one CTA or one
+warp role, and split only where the hardware measured faster. Paired forks against the previous
+state on an RTX 5070 Ti; operator times use weights rotated past the 48 MB L2, as the model sees
+them. Every change keeps its route's numerical contract: bitwise where the route was bitwise, and
+the represented-NVFP4 tolerance for decode attention.
+
+- **Decode attention.** 256-key splits put a 1024-token prefix on 20 tensor-core CTAs, whose MMA,
+  softmax and rescaling phases ran on two, half of one and four warps in turn. 48-key splits of the
+  plain warp kernel fill the GPU instead (decode + merge 216 -> 54 us at 1025 keys); attention per
+  decode token at 1024 context fell from 6.5 to 0.54 ms.
+- **Decode RMSNorm and BF16 projections.** One CTA per row walked each thread's columns as a chain
+  of dependent loads. Batched loads and, for a single row, 40 CTAs that each recompute the same
+  reduction and write one slice (no global intermediate): 26 -> 3.0 us and 14 -> 3.5 us.
+- **Q3, Q4 and Q5 decode.** A minority of lanes loaded each K128 block's words and shuffles
+  redistributed them; the LSU pipe ran at 80-98% while the down projection streamed about 320 GB/s.
+  The row-major layout streams at 810 GB/s when every lane loads 16 contiguous bytes, so each warp
+  now streams its own two rows in 512-byte chunks through a warp-private shared double slot and
+  every lane reads whole blocks with broadcast loads (`*_decode_wide`). Q3 time per decode token
+  fell from 25.2 to 19.3 ms; Q4/Q5 by about 1.5 ms. The remaining Q3 limit is the consumer's integer
+  work selecting each lane's bits.
+- **GDN convolution.** One thread per channel walked every row although each output reads only
+  the previous three inputs; 32-row blocks give 1280 CTAs at 512 rows (238 -> 68 us).
+
+Measured and not kept:
+
+- A dedicated producer warp feeding a TMA bulk-copy ring for Q3 decode: -29% with one L2-resident
+  weight buffer, no gain with cold weights or in the model.
+- A second CUDA lane for the GDN decode fan-out (Q4, Q5 and the BF16 pair): 90 -> 86-88 us per
+  layer, under 1% of a decode token. The branches share one DRAM bound, so the quantum's single
+  stream is not a material limit there.
+- GDN recurrence at 4, 2 or 16 value columns per warp instead of 8: all slower; narrower warps
+  repeat the query/key loads and normalizations.
+- A 64 x 32 down tile in the 64-row streamed FFN: twice the CTAs, but 4% slower in the model,
+  because the down regions overlap gate/up regions and take their SMs. Two full-width leaves on
+  the quantum stream tie the streamed regions (1411 vs 1400 us per layer).
+
+Prefill is now bound by tensor-core throughput: the FFN and projection GEMMs reach 55-80% of the
+FP16/FP32 tensor rate with the hi/lo BF16 weight split their bitwise contract requires, and split-K
+would change the FFN's FP32 accumulation order.
+
+Against the `main` that preceded these changes (six paired JVM forks, two warmups, three
+iterations). This host has two per-JVM performance modes about 13% apart on decode; three control
+forks ran in the slow one, so the table compares medians of the forks in the fast mode:
+
+| Scenario | Before | After | Change |
+|---|---|---|---|
+| decode 64 + 128 | 29.1 tok/s | 42.3 tok/s | +45% |
+| decode 1024 + 128 | 25.3 tok/s | 40.4 tok/s | +60% |
+| prefill 64 | 445.5 tok/s | 447.5 tok/s | +0.4% |
+| prefill 256 | 618 tok/s | 628 tok/s | +1.6% |
+| prefill 1024 | 651 tok/s | 662 tok/s | +1.6% |
+| time to first token, 64-token prompt | 146.6 ms | 146.5 ms | unchanged |
+| time to first token, 1024-token prompt | 1604 ms | 1574 ms | -1.9% |
