@@ -156,6 +156,26 @@ class Q45KernelTest(unittest.TestCase):
                 values = [special[i % len(special)] for i in range(rows * width)]
                 self.compare_all_routes(bits, rows, width, outputs, payload, values)
 
+    def test_wide_decode_matches_the_original_decode_bitwise(self):
+        # One partial chunk (K 512), several chunks (5120), the largest supported row (8192); one and
+        # many CTAs; finite and special scales and activations.
+        special = [0x3F80, 0xBF00, 0x7FC1, 0xFFC3, 0x7F80, 0xFF80, 0x0001, 0x8000]
+        scales = [0x3555, 0xB555, 0x0001, 0x8000, 0x7BFF, 0x7C00, 0x7E11, 0xFE11]
+        for bits in (4, 5):
+            for width, outputs in [(512, 8), (1536, 16), (5120, 4104), (8192, 24)]:
+                for mode in ("finite", "special"):
+                    with self.subTest(bits=bits, width=width, outputs=outputs, mode=mode), contextlib.ExitStack() as stack:
+                        payload = make_weights(self.rng, bits, width, outputs,
+                                               (lambda i: scales[i % len(scales)]) if mode == "special" else None)
+                        values = ([special[i % len(special)] for i in range(width)] if mode == "special"
+                                  else [to_bf16(self.rng.uniform(-2, 2)) for _ in range(width)])
+                        x = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values)))
+                        w = self.owned(stack, self.gpu.upload(payload))
+                        expected = self.run_kernel(stack, f"euhedral_q{bits}_decode_1", outputs // 8, x, w, 1, width, outputs)
+                        actual = self.run_kernel(stack, f"euhedral_q{bits}_decode_wide", outputs // 8, x, w, 1, width, outputs)
+                        self.assert_written(expected)
+                        self.assertEqual(actual, expected)
+
     def test_two_byte_aligned_input_takes_sequential_staging(self):
         for bits in (4, 5):
             for rows, width, outputs in [(1, 256, 16), (67, 256, 35)]:
