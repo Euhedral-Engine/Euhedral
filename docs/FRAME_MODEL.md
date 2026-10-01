@@ -476,6 +476,11 @@ the represented-NVFP4 tolerance for decode attention.
   256 +2.2%, 1024 +2.2%, time to first token -1.2% (64) and -2.1% (1024 tokens), 6 of 6 forks each.
   Single-row decode keeps the exact kernel: `_c4` won as an operator (16.5 -> 14.8 us) but measured
   -0.1% in decode.
+  The kernel runs about 11 warps per SM (its grid), latency-bound with registers to spare: each row's
+  inputs now load during the previous row and each local reduction keeps four partial sums (152
+  registers): 512 rows 329 -> 260 us, 64 rows 56 -> 46 us. Prefill 64 +1.1%, 256 +1.0%, 1024 +0.4%.
+  A chunked (WY) form with FP32 SIMT matrix steps measured 869 us at 512 rows, bound by shared-memory
+  load issue at one load per FMA; it needs register blocking or tensor cores before it can compete.
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill, the one-row residual norm, the prefill
 attention softmax sum, the column-owned GDN recurrence, contiguous decode attention) is replaced by the exact kernel under
