@@ -195,7 +195,7 @@ static void initialize_modules(void) {
         get_function(attention_module, &attention_decode_nvfp4_exact, "euhedral_attention_decode_nvfp4_exact");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_merge_nvfp4, "euhedral_attention_merge_nvfp4");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
-    // Optional row-owned variants (256-dimension heads), bitwise equal to the per-head kernels.
+    // Optional row-owned variant (256-dimension heads), bitwise equal to the per-head kernel.
     get_function(attention_module, &attention_qk_norm_rope_rows, "euhedral_attention_qk_norm_rope_rows_bf16");
     status = get_function(attention_module, &attention_kv_append, "euhedral_attention_kv_append_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }

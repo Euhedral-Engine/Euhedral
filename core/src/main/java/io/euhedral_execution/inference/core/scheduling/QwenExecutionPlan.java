@@ -204,7 +204,7 @@ public final class QwenExecutionPlan {
     }
 
     /// Prefill specializations derived from the full-model reference topology.
-    /// `SMALL` covers quanta below the 64-row producer tile; `STREAMED` exists only at the
+    /// `SMALL` covers quanta below the 64-row region tile; `STREAMED` exists only at the
     /// qualified streamed-FFN geometry.
     private enum PrefillView {
         SMALL,
