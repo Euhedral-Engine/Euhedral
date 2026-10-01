@@ -234,7 +234,12 @@ class ChatCompletionsCudaIntegrationTest {
     /// The engine's device bytes and the part its execution graphs retain between quanta.
     private record DeviceBytes(long allocated, long retainedWorkspace) {}
 
-    private void assertSessionsReleased(DeviceBytes before) {
+    private void assertSessionsReleased(DeviceBytes before) throws InterruptedException {
+        // The server closes a streamed session after flushing its final event, so the client can read
+        // [DONE] first. Wait for the close, bounded, instead of sampling the count once.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (this.tracking.closedCount.get() < this.tracking.opened.get() && System.nanoTime() < deadline)
+            Thread.sleep(10);
         assertEquals(this.tracking.opened.get(), this.tracking.closedCount.get(), "every session must be closed");
         // Graphs keep their workspace storage; it grows only the first time a graph runs a larger quantum.
         DeviceBytes after = deviceBytes();
