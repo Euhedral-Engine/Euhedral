@@ -287,10 +287,13 @@ normalized H256 and encoded as 128 bytes of E2M1 codes plus 16 E4M3 scales (one 
 of 16 values). Device page tables contain raw addresses; growing a sequence allocates new pages without
 copying existing KV payloads, and sequence cleanup releases pages and any decode scratch only after
 admitted GPU work has drained. Prefill uses 32-query by 32-key tiles with FP16 tensor-core operands,
-FP32 accumulation, and online softmax. Single-token decode splits the visible prefix across CTAs and
-merges FP32 softmax statistics; at GQA ratio six and a prefix of at least 1024 tokens, each tensor-core
-CTA shares one K/V expansion across all six query heads. Correctness is defined against the represented
-NVFP4 values within the existing FP16/MMA and BF16-output tolerance.
+FP32 accumulation, and online softmax. Single-token decode splits the visible prefix into about
+48-key spans (at most 64) per query head, one CTA each, and merges FP32 softmax statistics in a second
+kernel. Every warp runs the same online-softmax loop over its own keys. A tensor-core decode CTA that
+shared one K/V expansion across the six query heads of a KV head was slower at every measured length
+(64 to 32768 keys): its MMA, softmax, and rescaling phases ran on two, half of one, and all four warps
+in turn, and with 256-key splits a 1024-token prefix occupied 20 CTAs. Correctness is defined against
+the represented NVFP4 values within the existing FP16/MMA and BF16-output tolerance.
 
 Decode quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
 (`euhedral_cuda_pdl_select`): every kernel registered for it begins with `griddepcontrol.wait`
