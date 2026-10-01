@@ -114,7 +114,7 @@ class QwenRegionsTest(unittest.TestCase):
             self.assertEqual(0, gpu.function(C.byref(symbol), gpu.module, b'euhedral_gdn_project_control_fp32'),
                              'combined GDN control region is unavailable')
             rng = random.Random(9921)
-            for rows, width, heads in [(1, 129, 3), (7, 256, 8), (256, 5120, 32)]:
+            for rows, width, heads in [(1, 129, 3), (7, 256, 8), (13, 129, 8), (256, 5120, 32)]:
                 with contextlib.ExitStack() as case:
                     def upload(data):
                         ptr = gpu.upload(data)
@@ -144,6 +144,14 @@ class QwenRegionsTest(unittest.TestCase):
                                [C.c_uint(v) for v in (rows, width, heads)])
                     self.assertEqual(gpu.download(alpha, rows * heads * 4), gpu.download(fused_alpha, rows * heads * 4))
                     self.assertEqual(gpu.download(beta, rows * heads * 4), gpu.download(fb, rows * heads * 4))
+                    if heads % 4 == 0:
+                        # The 8-row x 4-head tile shares loads and keeps every output's order.
+                        tiled_alpha, tiled_beta = alloc(rows * heads * 4), alloc(rows * heads * 4)
+                        gpu.launch('euhedral_gdn_project_control_8x4_fp32', (rows + 7) // 8 * (heads // 4),
+                                   [C.c_uint64(p) for p in (x, wa, wb, alog, bias, tiled_alpha, tiled_beta)] +
+                                   [C.c_uint(v) for v in (rows, width, heads)])
+                        self.assertEqual(gpu.download(alpha, rows * heads * 4), gpu.download(tiled_alpha, rows * heads * 4))
+                        self.assertEqual(gpu.download(beta, rows * heads * 4), gpu.download(tiled_beta, rows * heads * 4))
 
     def test_alpha_is_exp_of_fp32_stored_g(self):
         # Old contract: control stored g in FP32 and recurrence computed expf(g). Alpha must equal that.
@@ -227,6 +235,42 @@ class QwenRegionsTest(unittest.TestCase):
                                          f'residual differs for {(rows, width, special)}')
                         self.assertEqual(gpu.download(reference_norm, count * 2), gpu.download(actual_norm, count * 2),
                                          f'normalization differs for {(rows, width, special)}')
+
+    def test_row_owned_qk_norm_rope_matches_the_per_head_kernels_bitwise(self):
+        source = b'#include "qwen_attention_ops.cu"\n'
+        with contextlib.ExitStack() as scope:
+            gpu = Gpu(source)
+            scope.callback(gpu.close)
+            rng = random.Random(6011)
+            p, u = C.c_uint64, C.c_uint
+            for rows, qh, kh, rotary, start in [(1, 24, 4, 64, 0), (3, 4, 2, 64, 100003), (37, 6, 2, 256, 77),
+                                                (5, 3, 1, 2, 9)]:
+                with contextlib.ExitStack() as case:
+                    def upload(data):
+                        ptr = gpu.upload(data); case.callback(gpu.free, ptr); return ptr
+                    heads, hd = qh + kh, 256
+                    count = rows * heads * hd
+                    data = struct.pack(f'<{count}H', *[0x3c00 + rng.randrange(1024) + (0x8000 if rng.random() < .5 else 0)
+                                                        for _ in range(count)])
+                    qn = upload(struct.pack(f'<{hd}H', *[0x3d00 + rng.randrange(512) for _ in range(hd)]))
+                    kn = upload(struct.pack(f'<{hd}H', *[0xbd00 + rng.randrange(512) for _ in range(hd)]))
+                    cache_bytes = (start + rows) * kh * hd * 2
+                    outputs = []
+                    for name, grid, cache in [('euhedral_attention_qk_norm_rope_bf16', rows * heads, False),
+                                              ('euhedral_attention_qk_norm_rope_rows_bf16', rows, False),
+                                              ('euhedral_attention_qk_norm_cache_bf16', rows * heads, True),
+                                              ('euhedral_attention_qk_norm_cache_rows_bf16', rows, True)]:
+                        qk = upload(data)  # in place, as production launches it
+                        args = [p(qk), p(qn), p(kn), p(qk), u(rows), u(qh), u(kh), u(hd), u(rotary), p(start),
+                                C.c_float(1e-6), C.c_double(1e7)]
+                        key = None
+                        if cache:
+                            key = gpu.zeros(cache_bytes, 0xA5); case.callback(gpu.free, key); args.append(p(key))
+                        gpu.launch(name, grid, args, block=256)
+                        outputs.append((gpu.download(qk, count * 2), gpu.download(key, cache_bytes) if cache else None))
+                    case_name = (rows, qh, kh, rotary, start)
+                    self.assertEqual(outputs[0], outputs[1], case_name)
+                    self.assertEqual(outputs[2], outputs[3], case_name)
 
     def test_relaxed_row_residual_norm_matches_the_exact_kernel_within_one_ulp(self):
         source = b'#include "qwen_elementwise.cu"\n'

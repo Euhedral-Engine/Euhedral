@@ -110,6 +110,71 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_gdn_project_control_f
     }
 }
 
+// Prefill variant: one CTA owns R rows x H heads, so each activation row and each weight row is
+// loaded once per CTA instead of once per (row, head). Every output keeps the 128-lane FMA stripes
+// and the addition tree above (strides 64 and 32 in shared memory, then 16 .. 1 within a warp), so
+// results match euhedral_gdn_project_control_fp32 bit for bit. Grid: ceil(rows / R) * (heads / H).
+template<int R, int H>
+static __device__ __forceinline__ void gdn_project_control_tile(
+        const __nv_bfloat16* input, const __nv_bfloat16* aWeight, const __nv_bfloat16* bWeight,
+        const float* aLog, const float* dtBias, float* alphaOutput, float* betaOutput,
+        uint32_t rows, uint32_t width, uint32_t heads) {
+    constexpr int kValues = 2 * R * H;
+    const uint32_t headGroups = heads / H;
+    const uint32_t firstRow = (blockIdx.x / headGroups) * R, firstHead = (blockIdx.x % headGroups) * H;
+    float sums[kValues] = {};
+    for (uint32_t k = threadIdx.x; k < width; k += 128u) {
+        float xs[R], as[H], bs[H];
+#pragma unroll
+        for (int r = 0; r < R; r++)
+            xs[r] = firstRow + r < rows ? __bfloat162float(input[static_cast<uint64_t>(firstRow + r) * width + k]) : 0.0f;
+#pragma unroll
+        for (int h = 0; h < H; h++) {
+            as[h] = __bfloat162float(aWeight[static_cast<uint64_t>(firstHead + h) * width + k]);
+            bs[h] = __bfloat162float(bWeight[static_cast<uint64_t>(firstHead + h) * width + k]);
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++)
+#pragma unroll
+            for (int h = 0; h < H; h++) {
+                sums[2 * (r * H + h)] = fmaf(xs[r], as[h], sums[2 * (r * H + h)]);
+                sums[2 * (r * H + h) + 1] = fmaf(xs[r], bs[h], sums[2 * (r * H + h) + 1]);
+            }
+    }
+    __shared__ float partial[kValues][128];
+#pragma unroll
+    for (int v = 0; v < kValues; v++) partial[v][threadIdx.x] = sums[v];
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < kValues * 64u; i += 128u) partial[i / 64u][i % 64u] += partial[i / 64u][i % 64u + 64u];
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < kValues * 32u; i += 128u) partial[i / 32u][i % 32u] += partial[i / 32u][i % 32u + 32u];
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    for (uint32_t pair = warp; pair < static_cast<uint32_t>(R * H); pair += 4u) {
+        float a = partial[2 * pair][lane], b = partial[2 * pair + 1][lane];
+#pragma unroll
+        for (int stride = 16; stride; stride >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, stride);
+            b += __shfl_down_sync(0xffffffffu, b, stride);
+        }
+        const uint32_t row = firstRow + pair / H, head = firstHead + pair % H;
+        if (lane == 0 && row < rows) {
+            const uint64_t index = static_cast<uint64_t>(row) * heads + head;
+            const float shifted = a + dtBias[head];
+            const float softplus = fmaxf(shifted, 0.0f) + log1pf(expf(-fabsf(shifted)));
+            alphaOutput[index] = expf(-expf(aLog[head]) * softplus);
+            betaOutput[index] = qwen_gdn_sigmoid(b);
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128) void euhedral_gdn_project_control_8x4_fp32(
+        const __nv_bfloat16* input, const __nv_bfloat16* aWeight, const __nv_bfloat16* bWeight,
+        const float* aLog, const float* dtBias, float* alphaOutput, float* betaOutput,
+        uint32_t rows, uint32_t width, uint32_t heads) {
+    gdn_project_control_tile<8, 4>(input, aWeight, bWeight, aLog, dtBias, alphaOutput, betaOutput, rows, width, heads);
+}
+
 /// Rows are independent apart from a sliding window of the previous `kernelSize - 1` inputs, so
 /// blockIdx.y splits them into blocks of `QWEN_GDN_CONV_ROWS` (at least the largest window): a block
 /// seeds its window from the stored state (first block) or from the preceding input rows, which
