@@ -11,7 +11,7 @@ extern "C" __global__ __launch_bounds__(128) void DOWN( \
 // Relaxed streamed gate/up runs on the balanced engine; its down keeps the down engine.
 extern "C" __global__ __launch_bounds__(128) void stream_gate_up_128x32(
  const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,unsigned int start,unsigned int count) {
- __shared__ balanced::Storage s;balanced::run_paired<qwen_ffn_tiles::Q3B>(x,w,y,m,k,n,scale,s,start,count); }
+ __shared__ balanced::Storage<4> s;balanced::run_paired<qwen_ffn_tiles::Q3B>(x,w,y,m,k,n,scale,s,start,count); }
 extern "C" __global__ __launch_bounds__(128) void stream_down_128x64(
  const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,float* state,unsigned int start,unsigned int count) {
  __shared__ qwen_ffn_tiles::Storage<4,32,1> s;qwen_ffn_down::run<4,32,false,1>(x,w,y,m,k,n,scale,state,start,count,s); }

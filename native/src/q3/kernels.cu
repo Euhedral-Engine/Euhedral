@@ -194,6 +194,6 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_k32_cb_
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_128x64(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
-    __shared__ balanced::Storage stage;
+    __shared__ balanced::Storage<4> stage;
     balanced::run<qwen_ffn_tiles::Q3B>(input, weights, output, rows, in_features, out_features, scale_offset, stage);
 }
