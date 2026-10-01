@@ -314,6 +314,102 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_gdn_recurrence_bf16(
     }
 }
 
+// Relaxed recurrence with column-owned lanes: lane l owns value column (l % C) of the warp's C columns
+// and the l / C-th of P = 32 / C contiguous key slices (128 / P keys) of that column's state row. Every
+// key reduction is local FMAs over the slice plus log2(P) shuffles across the column's slice owners,
+// instead of a 128-key tree across the whole warp per column. The key and query normalizations are
+// applied to the reduced dot products (inverse * sum(state * key)) rather than to every element.
+// Grid: valueHeads * (128 / C) warps as 32-thread CTAs. Requires 128-dimension heads and 16-byte
+// aligned rows. euhedral_gdn_recurrence_bf16 is the exact twin.
+template<int C>
+static __device__ __forceinline__ void gdn_recurrence_columns(
+        const __nv_bfloat16* convolved, const float* alpha, const float* beta, float* recurrentState,
+        __nv_bfloat16* output, uint32_t rows, uint32_t keyHeads, uint32_t valueHeads, float outputScale) {
+    constexpr uint32_t kSlices = 32 / C, kKeys = 128 / kSlices;
+    const uint32_t lane = threadIdx.x, column = lane % C, slice = lane / C;
+    const uint32_t tilesPerHead = 128 / C;
+    const uint32_t valueHead = blockIdx.x / tilesPerHead;
+    if (valueHead >= valueHeads) return;
+    const uint32_t valueColumn = (blockIdx.x % tilesPerHead) * C + column;
+    const uint32_t queryKeyWidth = 2 * keyHeads * 128;
+    const uint32_t convolvedWidth = queryKeyWidth + valueHeads * 128;
+    const uint32_t keyHead = valueHead / (valueHeads / keyHeads);
+    const uint64_t stateBase = (static_cast<uint64_t>(valueHead) * 128 + valueColumn) * 128 + slice * kKeys;
+    float state[kKeys];
+#pragma unroll
+    for (uint32_t j = 0; j < kKeys; j += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(recurrentState + stateBase + j);
+        state[j] = v.x; state[j + 1] = v.y; state[j + 2] = v.z; state[j + 3] = v.w;
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        const uint64_t rowOffset = static_cast<uint64_t>(row) * convolvedWidth;
+        const __nv_bfloat16* queryRow = convolved + rowOffset + keyHead * 128 + slice * kKeys;
+        const __nv_bfloat16* keyRow = convolved + rowOffset + keyHeads * 128 + keyHead * 128 + slice * kKeys;
+        float query[kKeys], key[kKeys];
+#pragma unroll
+        for (uint32_t j = 0; j < kKeys; j += 8) {
+            const uint4 qv = *reinterpret_cast<const uint4*>(queryRow + j);
+            const uint4 kv = *reinterpret_cast<const uint4*>(keyRow + j);
+            const unsigned int qw[4] = {qv.x, qv.y, qv.z, qv.w}, kw[4] = {kv.x, kv.y, kv.z, kv.w};
+#pragma unroll
+            for (uint32_t i = 0; i < 4; i++) {
+                query[j + 2 * i] = __uint_as_float(qw[i] << 16);
+                query[j + 2 * i + 1] = __uint_as_float(qw[i] & 0xffff0000u);
+                key[j + 2 * i] = __uint_as_float(kw[i] << 16);
+                key[j + 2 * i + 1] = __uint_as_float(kw[i] & 0xffff0000u);
+            }
+        }
+        float keySquares = 0.0f, querySquares = 0.0f, stateKey = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < kKeys; j++) {
+            keySquares = fmaf(key[j], key[j], keySquares);
+            querySquares = fmaf(query[j], query[j], querySquares);
+            stateKey = fmaf(state[j], key[j], stateKey);
+        }
+#pragma unroll
+        for (uint32_t distance = C; distance < 32; distance <<= 1) {
+            keySquares += __shfl_xor_sync(0xffffffffu, keySquares, distance);
+            querySquares += __shfl_xor_sync(0xffffffffu, querySquares, distance);
+            stateKey += __shfl_xor_sync(0xffffffffu, stateKey, distance);
+        }
+        const float keyInverse = rsqrtf(keySquares + 1.0e-6f);
+        const float queryInverse = rsqrtf(querySquares + 1.0e-6f);
+        const float rowAlpha = alpha[static_cast<uint64_t>(row) * valueHeads + valueHead];
+        const float rowBeta = beta[static_cast<uint64_t>(row) * valueHeads + valueHead];
+        const float value = __bfloat162float(convolved[rowOffset + queryKeyWidth + valueHead * 128 + valueColumn]);
+        const float delta = rowBeta * fmaf(-rowAlpha, stateKey * keyInverse, value);
+        const float update = delta * keyInverse;
+        float stateQuery = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < kKeys; j++) {
+            state[j] = fmaf(rowAlpha, state[j], update * key[j]);
+            stateQuery = fmaf(state[j], query[j], stateQuery);
+        }
+#pragma unroll
+        for (uint32_t distance = C; distance < 32; distance <<= 1)
+            stateQuery += __shfl_xor_sync(0xffffffffu, stateQuery, distance);
+        if (slice == 0)
+            output[static_cast<uint64_t>(row) * valueHeads * 128 + valueHead * 128 + valueColumn]
+                    = __float2bfloat16_rn(stateQuery * queryInverse * outputScale);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < kKeys; j += 4)
+        *reinterpret_cast<float4*>(recurrentState + stateBase + j) = make_float4(state[j], state[j + 1], state[j + 2], state[j + 3]);
+}
+
+#define QWEN_GDN_RECURRENCE_COLUMNS(C) \
+extern "C" __global__ __launch_bounds__(32) void euhedral_gdn_recurrence_c##C##_bf16( \
+        const __nv_bfloat16* convolved, const float* alpha, const float* beta, float* recurrentState, \
+        __nv_bfloat16* output, uint32_t rows, uint32_t keyHeads, uint32_t valueHeads, uint32_t keyHeadDim, \
+        uint32_t valueHeadDim, float outputScale) { \
+    euhedral_pdl_begin(); \
+    if (blockDim.x != 32 || keyHeadDim != 128 || valueHeadDim != 128) return; \
+    gdn_recurrence_columns<C>(convolved, alpha, beta, recurrentState, output, rows, keyHeads, valueHeads, outputScale); \
+}
+QWEN_GDN_RECURRENCE_COLUMNS(8)
+QWEN_GDN_RECURRENCE_COLUMNS(4)
+#undef QWEN_GDN_RECURRENCE_COLUMNS
+
 extern "C" __global__ void euhedral_gdn_gated_rms_norm_bf16(
         const __nv_bfloat16* recurrent, const __nv_bfloat16* valueZ,
         const __nv_bfloat16* normWeight, __nv_bfloat16* output,

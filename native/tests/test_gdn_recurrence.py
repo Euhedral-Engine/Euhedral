@@ -89,7 +89,8 @@ class GdnRecurrenceTest(unittest.TestCase):
     def launch(self, kernel, arguments):
         # The reference keeps one 128-thread CTA per value column; production uses one warp per
         # QWEN_GDN_WARP_COLUMNS (8) columns.
-        grid, block = (OUTPUTS, 128) if kernel.startswith('reference') else (OUTPUTS // 8, 32)
+        grid, block = (OUTPUTS, 128) if kernel.startswith('reference') else (
+                OUTPUTS // 4 if kernel.endswith('_c4_bf16') else OUTPUTS // 8, 32)
         function = C.c_void_p()
         _check(self.gpu.function(C.byref(function), self.gpu.module, kernel.encode()), kernel)
         params = (C.c_void_p * len(arguments))(*[C.cast(C.pointer(v), C.c_void_p) for v in arguments])
@@ -131,6 +132,30 @@ class GdnRecurrenceTest(unittest.TestCase):
                     self.assertEqual(expected, actual)
                     for output in actual[:-1]:
                         self.assertNotIn(b'\xa5\xa5', [output[i:i + 2] for i in range(0, len(output), 2)])
+
+    def test_column_owned_recurrences_stay_close_to_the_exact_kernel(self):
+        # The relaxed kernels reorder each key reduction and normalize the reduced dot products; over two
+        # chunks the outputs and the carried state stay within FP32 reassociation error of the exact path.
+        rng = random.Random(11)
+        initial = struct.pack(f'<{STATE_BYTES // 4}f', *[rng.gauss(0.0, 0.05) for _ in range(STATE_BYTES // 4)])
+        def floats(data, bf16_values):
+            if bf16_values:
+                return [struct.unpack('<f', struct.pack('<I', v << 16))[0] for v in struct.unpack(f'<{len(data) // 2}H', data)]
+            return list(struct.unpack(f'<{len(data) // 4}f', data))
+        def relative_rms(expected, actual):
+            num = sum((e - a) ** 2 for e, a in zip(expected, actual))
+            den = sum(e * e for e in expected)
+            return (num / den) ** 0.5
+        for rows in (1, 3, 17):
+            chunks = [chunk(rows, 300 + rows, False), chunk(rows, 400 + rows, False)]
+            expected = self.run_chunks('euhedral_gdn_recurrence_bf16', initial, chunks, rows)
+            for kernel in ('euhedral_gdn_recurrence_c8_bf16', 'euhedral_gdn_recurrence_c4_bf16'):
+                with self.subTest(rows=rows, kernel=kernel):
+                    actual = self.run_chunks(kernel, initial, chunks, rows)
+                    for e, a in zip(expected[:-1], actual[:-1]):
+                        self.assertNotIn(b'\xa5\xa5', [a[i:i + 2] for i in range(0, len(a), 2)])
+                        self.assertLess(relative_rms(floats(e, True), floats(a, True)), 4e-3)
+                    self.assertLess(relative_rms(floats(expected[-1], False), floats(actual[-1], False)), 1e-5)
 
 
 if __name__ == '__main__':
