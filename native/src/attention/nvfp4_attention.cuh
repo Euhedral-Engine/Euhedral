@@ -144,7 +144,8 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_prefill_nvf
 
 // Split the context across CTAs; each warp scans a disjoint subsequence of the
 // split using warp shuffles only. Shared memory is used once to combine warps.
-extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp4(
+// The exact twin of the relaxed kernel below: lane l owns dimensions l + 32 d.
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp4_exact(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
         const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
@@ -221,5 +222,77 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4
         const unsigned int col = head * 256 + lane + d * 32;
         const float gate = __bfloat162float(gateValue[col]);
         output[col] = __float2bfloat16_rn(values[d] / (1.0f + expf(-gate)));
+    }
+}
+
+// Relaxed decode attention: lane l owns the contiguous dimensions 8l .. 8l + 7, so each cached row costs
+// one 32-bit code load and one scale byte per lane for K and again for V (the exact kernel decodes
+// every element with its own byte loads). The query is re-laid out once through shared memory; only
+// the order of each dot product's FP32 sum differs from euhedral_attention_decode_nvfp4_exact.
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp4(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
+        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
+        unsigned int headDim, unsigned int cacheLength, unsigned long long start,
+        float* partial, unsigned int splits) {
+    euhedral_pdl_begin();
+    const unsigned int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const unsigned int head = blockIdx.x / splits, split = blockIdx.x % splits;
+    const unsigned int kh = head / (queryHeads / keyHeads);
+    const unsigned int span = (cacheLength + splits - 1) / splits;
+    const unsigned int begin = split * span, end = min(cacheLength, begin + span);
+    __shared__ float staging[4][258];
+    float q[8], acc[8] = {};
+    {
+        float rotated[8];
+#pragma unroll
+        for (int d = 0; d < 8; d++) rotated[d] = __bfloat162float(queryKey[head * 256 + lane + d * 32]);
+        nvfp4kv::hadamard256(rotated, lane);
+#pragma unroll
+        for (int d = 0; d < 8; d++) staging[warp][lane + d * 32] = rotated[d];
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 8; j++) q[j] = staging[warp][lane * 8 + j];
+        __syncwarp();
+    }
+    float maximum = -__int_as_float(0x7f800000), denominator = 0;
+    for (unsigned int token = begin + warp; token < end; token += 4) {
+        const unsigned char* key = nvfp4kv::cache_row(keyPages, token, kh, keyHeads);
+        const unsigned char* value = nvfp4kv::cache_row(valuePages, token, kh, keyHeads);
+        const unsigned int keyCodes = reinterpret_cast<const unsigned int*>(key)[lane];
+        const unsigned int valueCodes = reinterpret_cast<const unsigned int*>(value)[lane];
+        const float keyScale = nvfp4kv::e4m3_decode(key[128 + lane / 2]);
+        const float valueScale = nvfp4kv::e4m3_decode(value[128 + lane / 2]);
+        float dot = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) dot = fmaf(q[j], nvfp4kv::e2m1_decode((keyCodes >> (4 * j)) & 15u), dot);
+        const float score = nvfp4kv::warp_sum(dot * keyScale) * 0.0625f;
+        const float next = fmaxf(maximum, score);
+        const float a = expf(maximum - next), b = expf(score - next);
+        denominator = denominator * a + b;
+        const float weighted = b * valueScale;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            acc[j] = fmaf(nvfp4kv::e2m1_decode((valueCodes >> (4 * j)) & 15u), weighted, acc[j] * a);
+        maximum = next;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; j++) staging[warp][lane * 8 + j] = acc[j];
+    if (lane == 0) { staging[warp][256] = maximum; staging[warp][257] = denominator; }
+    __syncthreads();
+    if (warp == 0) {
+        float maxAll = -__int_as_float(0x7f800000);
+        for (int w = 0; w < 4; w++) maxAll = fmaxf(maxAll, staging[w][256]);
+        float sum = 0, combined[8] = {};
+        for (int w = 0; w < 4; w++) {
+            const float scale = staging[w][257] > 0 ? expf(staging[w][256] - maxAll) : 0;
+            sum += staging[w][257] * scale;
+#pragma unroll
+            for (int d = 0; d < 8; d++) combined[d] += staging[w][lane + d * 32] * scale;
+        }
+        float* destination = partial + (unsigned long long)blockIdx.x * 258;
+#pragma unroll
+        for (int d = 0; d < 8; d++) destination[lane + d * 32] = combined[d];
+        if (lane == 0) { destination[256] = maxAll; destination[257] = sum; }
     }
 }
