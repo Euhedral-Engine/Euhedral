@@ -95,20 +95,18 @@ EUHEDRAL_Q3_FFN_DOWN(euhedral_q3_ffn_down_128x64_exact, 4, 2)
 #undef EUHEDRAL_Q3_FFN_DOWN
 // Split-K down: blockIdx.y selects a 32-aligned K range; partial[split] (rows x n FP32) receives its
 // sums. The 80-320 CTAs of the unsplit leaf leave a 64-512 row quantum in one or two partial waves.
-#define EUHEDRAL_Q3_FFN_DOWN_SPLIT(NAME, F) \
-extern "C" __global__ __launch_bounds__(128) void NAME( \
- const unsigned short* x,const unsigned char* w,float* partial,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,unsigned int splits) { \
- __shared__ qwen_ffn_tiles::Storage<F,32> s; \
- unsigned int per=(k/32u+splits-1u)/splits*32u,start=blockIdx.y*per; \
- if(start>=k)return; \
- qwen_ffn_down::run<F,32,true,1>(x,w,nullptr,m,k,n,scale,partial+(unsigned long long)blockIdx.y*m*n,start,min(per,k-start),s); }
-EUHEDRAL_Q3_FFN_DOWN_SPLIT(euhedral_q3_ffn_down_split_64x64, 2)
-#undef EUHEDRAL_Q3_FFN_DOWN_SPLIT
-// The 128-row split leaf runs on the balanced engine (ffn/balanced.cuh): same K ranges and K16 order,
-// bitwise equal partials. 512 rows, four splits 1753 -> 1455 us; 256 rows, three splits 727 us.
+// The split leaves run on the balanced engine (ffn/balanced.cuh): same K ranges and K16 order, bitwise
+// equal partials. 512 rows, four splits 1753 -> 1455 us; 256 rows, three splits 727 us; 64 rows (64-row
+// tile), four splits 292 -> 278 us.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_ffn_down_split_64x64(
+ const unsigned short* x,const unsigned char* w,float* partial,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,unsigned int splits) {
+ __shared__ balanced::Storage<2> s;
+ unsigned int per=(k/32u+splits-1u)/splits*32u,start=blockIdx.y*per;
+ if(start>=k)return;
+ balanced::run<qwen_ffn_tiles::Q3B,2>(x,w,nullptr,m,k,n,scale,s,start,min(per,k-start),partial+(unsigned long long)blockIdx.y*m*n); }
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_ffn_down_split_128x64(
  const unsigned short* x,const unsigned char* w,float* partial,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,unsigned int splits) {
- __shared__ balanced::Storage s;
+ __shared__ balanced::Storage<4> s;
  unsigned int per=(k/32u+splits-1u)/splits*32u,start=blockIdx.y*per;
  if(start>=k)return;
  balanced::run<qwen_ffn_tiles::Q3B>(x,w,nullptr,m,k,n,scale,s,start,min(per,k-start),partial+(unsigned long long)blockIdx.y*m*n); }

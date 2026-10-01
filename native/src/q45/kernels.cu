@@ -134,7 +134,7 @@ EUHEDRAL_Q45_GROUPED(euhedral_q45_prefill_64_grouped_exact, 2)
 extern "C" __global__ __launch_bounds__(128) void NAME( \
         const unsigned short* input, const unsigned char* weights, unsigned short* output, \
         unsigned int rows, unsigned int in_features, unsigned int out_features) { \
-    __shared__ balanced::Storage stage; \
+    __shared__ balanced::Storage<4> stage; \
     balanced::run<qwen_ffn_tiles::Q45B<B>>(input, weights, output, rows, in_features, out_features, 0ull, stage); \
 }
 EUHEDRAL_Q45_PREFILL_WIDE(4, euhedral_q4_prefill_128x64, 4)

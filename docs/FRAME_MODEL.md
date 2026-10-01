@@ -449,6 +449,9 @@ the represented-NVFP4 tolerance for decode attention.
   The 128-row split-K FFN down moved to it too (same K ranges, bitwise equal partials), with three
   splits below 512 rows: 256 rows 953 -> 727 us, 512 rows (four splits) 1753 -> 1455 us. Prefill 256
   +5.5%, 1024 +3.1% (6 of 6 forks each).
+  The engine takes its tile height as a parameter (32F rows): the 64-row gate/up and split-K down
+  leaves moved to it as well (gate/up 588 -> 504 us, down 292 -> 278 us at 64 rows): prefill 64
+  +3.6%, time to first token for a 64-token prompt -3.9% (6 of 6 forks each).
 - **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
   128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
   the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it
