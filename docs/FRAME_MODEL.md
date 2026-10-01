@@ -470,6 +470,18 @@ the represented-NVFP4 tolerance for decode attention.
   us), so it serves quanta from 512 rows, or from 128 rows once the cache holds 2048 keys. Prefill 1024
   +0.7%, 2048 +1.7% (6 of 6 forks each); the gain grows with the context. Drift with a 1024-token
   prefix matches main (median hidden 6.2%, KL 2.9e-3).
+- **Decode attention, GQA tensor-core leaf.** At long contexts decode attention grows with the cache
+  (196 us per layer at 16K keys, 16% of a decode token): each of the six query heads of a KV head
+  re-reads and re-decodes the same NVFP4 rows one token at a time. `euhedral_attention_decode_gqa_nvfp4`
+  gives one warp per (KV head, 32-key split): each 16-key tile is expanded once into the warp's shared
+  rows for the whole query-head group, and the query heads are the N = 8 columns of the mma tiles
+  (scores K Q^T, output V^T P^T), so the output takes 64 accumulator registers and the queries and
+  probabilities enter as hi + lo FP16 parts, with the accurate expf: within about 1e-7 to 8e-5 relative
+  rms of the FP32 kernel. With the merge, 2048 keys 52 -> 42 us, 4096 keys 77 -> 54 us, 16K keys 212
+  -> 120 us per layer. Putting the query heads on the 16-row M side instead wasted half the output
+  registers and kept FP16 queries and probabilities (7.8e-4 relative rms, top-1 agreement in the drift
+  test 95.4%). It serves contexts from 2048 keys: decode 4096 + 128 +1.1% (6 of 6 forks); at 1024
+  keys it measured -0.6% and stays off.
 - **Decode attention, contiguous lanes.** The decode split kernel decoded each cached NVFP4 element
   with its own code-byte and scale-byte loads (lane l owned dimensions l + 32 d). In the relaxed
   `euhedral_attention_decode_nvfp4` lane l owns dimensions 8l .. 8l + 7: one 32-bit code word and one

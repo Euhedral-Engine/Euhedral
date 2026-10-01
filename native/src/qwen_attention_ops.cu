@@ -4,6 +4,7 @@
 #include "attention/nvfp4_attention.cuh"
 #include "attention/nvfp4_prefill32.cuh"
 #include "attention/nvfp4_prefill_fa2.cuh"
+#include "attention/nvfp4_decode_gqa.cuh"
 #include "pdl.cuh"
 
 // Four warp-owned rows per CTA. Page-table entries point to token-major pages;
