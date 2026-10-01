@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.scheduling.graph;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import java.util.ArrayDeque;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -153,6 +154,7 @@ public final class StageGraph implements AutoCloseable {
                     ? stage.submittedPredecessors[0]
                     : null;
         }
+        markPaths(this.stages);
         long preparedMarker = 0;
         try {
             if (pool.size() > 1) {
@@ -195,6 +197,30 @@ public final class StageGraph implements AutoCloseable {
     }
 
     /// Whether stages are placed over the pool's lanes; otherwise they all run on the home lane.
+    /// Links each stage to the successor that continues its longest submitted path to a sink (the first
+    /// listed on ties), so PATH placement keeps a graph's critical chain on one lane.
+    private static void markPaths(StageFrame[] stages) {
+        int[] height = new int[stages.length];
+        int[] pending = new int[stages.length];
+        ArrayDeque<StageFrame> ready = new ArrayDeque<>();
+        for (StageFrame stage : stages) {
+            pending[stage.stage()] = stage.submittedSuccessors.length;
+            if (pending[stage.stage()] == 0) ready.add(stage);
+        }
+        while (!ready.isEmpty()) {
+            StageFrame stage = ready.poll();
+            StageFrame next = null;
+            for (StageFrame successor : stage.submittedSuccessors) {
+                if (next == null || height[successor.stage()] > height[next.stage()]) next = successor;
+            }
+            height[stage.stage()] = next == null ? 1 : height[next.stage()] + 1;
+            if (next != null) next.pathPredecessor = stage;
+            for (StageFrame predecessor : stage.submittedPredecessors) {
+                if (--pending[predecessor.stage()] == 0) ready.add(predecessor);
+            }
+        }
+    }
+
     boolean spread() {
         return this.spread;
     }

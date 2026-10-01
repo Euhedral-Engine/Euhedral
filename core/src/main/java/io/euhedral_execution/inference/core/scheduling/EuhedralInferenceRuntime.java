@@ -53,12 +53,12 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return Math.min(count, LanePool.MAX_LANES);
     }
 
-    /// Stage placement over the lanes: `EUHEDRAL_LANE_PLACEMENT` (RANDOM, WORKER, CHAIN or FORK; FORK by
-    /// default).
+    /// Stage placement over the lanes: `EUHEDRAL_LANE_PLACEMENT` (RANDOM, WORKER, CHAIN, FORK or PATH; PATH
+    /// by default).
     static LanePool.Placement lanePlacement() {
         String configured = System.getenv("EUHEDRAL_LANE_PLACEMENT");
         return configured == null || configured.isBlank()
-                ? LanePool.Placement.FORK
+                ? LanePool.Placement.PATH
                 : LanePool.Placement.valueOf(configured.strip().toUpperCase(java.util.Locale.ROOT));
     }
 
