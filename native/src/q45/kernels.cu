@@ -140,3 +140,35 @@ extern "C" __global__ __launch_bounds__(128) void NAME( \
 EUHEDRAL_Q45_PREFILL_WIDE(4, euhedral_q4_prefill_128x64, 4)
 EUHEDRAL_Q45_PREFILL_WIDE(5, euhedral_q5_prefill_128x64, 4)
 #undef EUHEDRAL_Q45_PREFILL_WIDE
+
+// Relaxed grouped GDN input projections on the balanced engine: the first CTAs run the Q4 tiles and
+// the rest the Q5 tiles of one launch, bitwise equal to euhedral_q45_prefill_64_grouped. 64 rows (F = 2)
+// 383 -> 281 us; 128 rows (F = 4) 713 -> 439 us; 192 rows 987 -> 730 us.
+namespace q45 {
+template<int F>
+static __device__ __forceinline__ void balanced_grouped(
+        const unsigned short* input, const unsigned char* q4_weights, unsigned short* q4_output,
+        const unsigned char* q5_weights, unsigned short* q5_output, unsigned int rows,
+        unsigned int in_features, unsigned int q4_features, unsigned int q5_features, balanced::Storage<F>& stage) {
+    const unsigned int row_tiles = (rows + 32u * F - 1u) / (32u * F);
+    const unsigned int q4_blocks = row_tiles * ((q4_features + 63u) / 64u);
+    if (blockIdx.x < q4_blocks)
+        balanced::run<qwen_ffn_tiles::Q45B<4>, F>(input, q4_weights, q4_output, rows, in_features, q4_features, 0ull,
+                stage, 0u, 0xffffffffu, nullptr, blockIdx.x);
+    else
+        balanced::run<qwen_ffn_tiles::Q45B<5>, F>(input, q5_weights, q5_output, rows, in_features, q5_features, 0ull,
+                stage, 0u, 0xffffffffu, nullptr, blockIdx.x - q4_blocks);
+}
+}  // namespace q45
+#define EUHEDRAL_Q45_GROUPED_BALANCED(NAME, F) \
+extern "C" __global__ __launch_bounds__(128) void NAME( \
+        const unsigned short* input, const unsigned char* q4_weights, unsigned short* q4_output, \
+        const unsigned char* q5_weights, unsigned short* q5_output, unsigned int rows, \
+        unsigned int in_features, unsigned int q4_features, unsigned int q5_features) { \
+    __shared__ balanced::Storage<F> stage; \
+    q45::balanced_grouped<F>(input, q4_weights, q4_output, q5_weights, q5_output, rows, in_features, \
+            q4_features, q5_features, stage); \
+}
+EUHEDRAL_Q45_GROUPED_BALANCED(euhedral_q45_grouped_64x64, 2)
+EUHEDRAL_Q45_GROUPED_BALANCED(euhedral_q45_grouped_128x64, 4)
+#undef EUHEDRAL_Q45_GROUPED_BALANCED
