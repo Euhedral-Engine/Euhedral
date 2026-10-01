@@ -20,13 +20,14 @@ import java.util.function.Consumer;
 ///
 /// Admission acquires an idle graph for the quantum's plan view, binds the graph's workspace storage and
 /// prepares quantum-owned resources on that graph's stream, and publishes the root stages. After that it
-/// is out of the execution path: the stages publish their successors, Euhedral schedules every stage,
-/// and the quantum's retirement frame recycles the graph, with its storage, before publishing the
-/// outcome.
+/// is out of the execution path: the stages publish their successors, workers take the published frames
+/// (first come, first served, or routed through the lattice by the frame's hash), and the quantum's
+/// retirement frame recycles the graph, with its storage, before publishing the outcome. No central
+/// scheduler decides where a stage runs.
 ///
 /// Each graph publishes through its own source, attached to the lattice once when the graph is built.
-/// Independent quanta therefore stay independently schedulable: a worker draining one graph's source
-/// never holds another quantum's ready frames.
+/// Independent quanta therefore stay independent: a worker draining one graph's source never holds
+/// another quantum's ready frames.
 public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     private static final Consumer<QwenExecutionContext> NO_TERMINAL_CONSUMER = ignored -> {};

@@ -18,7 +18,8 @@ import java.util.function.Function;
 ///
 /// Admission publishes a graph's root frames and each stage publishes the successors it made ready.
 /// The source only holds ready frames: it does not know what a frame computes, which frames depend on
-/// it, or how many stages a graph has. Euhedral drives every frame through `pull` and `request`.
+/// it, or how many stages a graph has. Workers take ready frames from it through `pull` and `request`;
+/// nothing above them decides which worker takes which frame.
 ///
 /// Euhedral calls `pull` and `request` one at a time. Publishers run concurrently on workers and on
 /// driver callback threads, so the ready queue has one drain owner at a time: a worker-side publication

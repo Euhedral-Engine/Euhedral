@@ -408,7 +408,7 @@ public final class StageGraph implements AutoCloseable {
     /// The single device-completion boundary of a quantum. The driver callback only publishes it.
     ///
     /// Its `execute` never throws: the graph may serve another quantum as soon as it is recycled, so
-    /// `doFinallyWithError` means only that Euhedral rejected the frame without running it.
+    /// `doFinallyWithError` means only that the lattice rejected the frame without running it.
     static final class Retirement extends AbstractFrame implements GpuStream.RetirementListener {
         private final StageGraph graph;
         private long ticket;
@@ -444,8 +444,8 @@ public final class StageGraph implements AutoCloseable {
         @Override
         public void doFinally() {}
 
-        /// Euhedral rejected the frame without running it: its worker cache retired, or no downstream
-        /// was routable. The quantum still retires exactly once, and the rejecting thread is an
+        /// The lattice rejected the frame without running it: the worker's cache retired, or no
+        /// downstream was routable. The quantum still retires exactly once, and the rejecting thread is an
         /// ordinary worker or admission thread, never a driver callback: retire it here.
         @Override
         public void doFinallyWithError(Throwable rejection) {
@@ -508,7 +508,7 @@ public final class StageGraph implements AutoCloseable {
             this.graph.stageFinished();
         }
 
-        /// `execute` never throws, so Euhedral rejected this frame without running it. The producer's
+        /// `execute` never throws, so the lattice rejected this frame without running it. The producer's
         /// boundary must still be confirmed and the edge resolved once; the rejecting thread is never a
         /// driver callback, so the edge is finished here.
         @Override

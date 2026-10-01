@@ -1,15 +1,16 @@
 # Qwen execution model
 
 A Qwen execution plan defines a static DAG of execution stages. A reusable runtime instance represents
-those stages as independently schedulable Euhedral frames. Admission exposes only root frames through a
+those stages as independent Euhedral frames. Admission exposes only root frames through a
 Qwen-specific `LatticeSource`. Successful stages create successor readiness and publish ready
-successors back to that source. Euhedral drives every stage through its normal pull/request and
-scheduling machinery. CUDA stream order carries ordinary device dependencies; actual device completion
-is reserved for state-publication and ownership boundaries.
+successors back to that source. CUDA stream order carries ordinary device dependencies; actual device
+completion is reserved for state-publication and ownership boundaries.
 
-Euhedral-Inference defines the stages and owns model and sequence state. Euhedral-Execution decides
-when and on which worker each ready stage runs. Nothing in the Qwen runtime executes a stage body
-inline, scans for ready work, or walks the graph after admission.
+Euhedral has no central scheduler or authority; scheduling is emergent. Workers take available frames
+for themselves, or a frame is routed through the lattice by its hash, so every assignment is either
+deterministic (hashing) or first come, first served. Euhedral-Inference defines the stages and owns
+model and sequence state. Nothing in the Qwen runtime executes a stage body inline, scans for ready
+work, or walks the graph after admission.
 
 ## Immutable plan and reusable graph
 
@@ -98,8 +99,8 @@ how many stages a graph has.
   completes only after every accepted quantum has retired.
 
 Each reusable graph attaches its source to the lattice once, when the graph is built. A worker draining
-one graph's source therefore never holds another quantum's ready frames, and independent quanta are
-scheduled independently. Euhedral offers a source to the workers registered when it is attached; graphs
+one graph's source therefore never holds another quantum's ready frames, and independent quanta
+proceed independently. A source is available to the workers registered when it is attached; graphs
 are built on first use, after the lattice has started.
 
 ## Readiness, fan-out, and fan-in
@@ -110,7 +111,8 @@ A stage frame runs its operation and returns. Its finalizer, not its body, relea
 stage A submits its kernels to its lane
   -> A's doFinally satisfies each outgoing edge
      -> the arrival that completes B's incoming set publishes B to the source
-        -> Euhedral pulls or requests B and schedules it on any worker
+        -> a worker with capacity takes B (first come, first served), or the lattice
+           routes it to a worker by B's hash
 ```
 
 Fan-in state lives in the successor: an incoming-edge count reset per quantum. Concurrent predecessors

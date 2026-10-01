@@ -5,19 +5,20 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 
-/// One execution stage of a reusable [StageGraph], scheduled by Euhedral like any other frame.
+/// One execution stage of a reusable [StageGraph], an Euhedral frame like any other.
 ///
 /// A stage submits its device work to a lane of its graph's pool, chosen when it runs, and never runs
 /// a successor. It first awaits, on that lane, the markers of predecessors that ran on other lanes. After a
 /// successful submission it satisfies its outgoing edges; the edge that completes a successor's
-/// incoming set publishes that successor to the source, and Euhedral decides when and where it runs.
+/// incoming set publishes that successor to the source. No authority places it: a worker with capacity
+/// takes it first come, first served, or the lattice routes it by the frame's hash.
 ///
 /// Once published, a frame is handled by one thread at a time. Its incoming-edge count is the only
 /// state that concurrent predecessors touch before publication.
 ///
 /// `execute` never throws. A failed submission is recorded on the quantum, because an `Error`
-/// escaping into Euhedral would complete this graph's source or end the worker. Euhedral therefore
-/// finalizes a stage through `doFinallyWithError` only when it rejected the frame without running it.
+/// escaping into Euhedral would complete this graph's source or end the worker. A stage therefore
+/// reaches `doFinallyWithError` only when the lattice rejected the frame without running it.
 public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     private static final VarHandle ARRIVALS;
@@ -135,12 +136,12 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         else this.graph.stageFinished();
     }
 
-    /// Euhedral rejected this frame without running it: its worker cache retired, or no downstream was
-    /// routable. The stage never submitted, so the quantum fails. The rejection may be an instance that
-    /// Euhedral shares, so it is only referenced as the cause.
+    /// The lattice rejected this frame without running it: the worker's cache retired, or no downstream
+    /// was routable. The stage never submitted, so the quantum fails. The rejection may be an instance
+    /// the lattice shares, so it is only referenced as the cause.
     @Override
     public final void doFinallyWithError(Throwable rejection) {
-        this.graph.stageFailed(new IllegalStateException("Euhedral rejected stage " + this.stage, rejection));
+        this.graph.stageFailed(new IllegalStateException("the lattice rejected stage " + this.stage, rejection));
     }
 
     /// Satisfies one incoming edge. Exactly one caller sees the final arrival.
