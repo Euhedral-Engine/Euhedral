@@ -72,7 +72,7 @@ static int q45_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction linear_bf16_to_float;
 static CUfunction gdn_control;
 static CUfunction gdn_convolution;
-static CUfunction gdn_recurrence;
+static CUfunction gdn_recurrence, gdn_recurrence_c8, gdn_recurrence_c4;
 static CUfunction gdn_gated_rms_norm;
 static CUfunction residual_add;
 static CUfunction residual_rms_norm, residual_rms_norm_row;
@@ -150,6 +150,11 @@ static void initialize_modules(void) {
     status = get_function(gdn_module, &gdn_convolution, "euhedral_gdn_convolution_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(gdn_module, &gdn_recurrence, "euhedral_gdn_recurrence_bf16");
+    if (status == CUDA_SUCCESS) {
+        // Optional relaxed column-owned recurrences; exact numerics keep the warp-tree kernel.
+        get_function(gdn_module, &gdn_recurrence_c8, "euhedral_gdn_recurrence_c8_bf16");
+        get_function(gdn_module, &gdn_recurrence_c4, "euhedral_gdn_recurrence_c4_bf16");
+    }
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(gdn_module, &gdn_gated_rms_norm, "euhedral_gdn_gated_rms_norm_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
@@ -224,6 +229,8 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(residual_rms_norm_row);
     euhedral_cuda_pdl_register(gdn_convolution);
     euhedral_cuda_pdl_register(gdn_recurrence);
+    euhedral_cuda_pdl_register(gdn_recurrence_c8);
+    euhedral_cuda_pdl_register(gdn_recurrence_c4);
     euhedral_cuda_pdl_register(gdn_gated_rms_norm);
     euhedral_cuda_pdl_register(residual_add);
     euhedral_cuda_pdl_register(swiglu);
@@ -517,6 +524,19 @@ int euhedral_cuda_gdn_recurrence_bf16(
     uint32_t key_dim_arg = key_head_dim, value_dim_arg = value_head_dim;
     void* parameters[] = {&convolved, &alpha, &beta, &state, &output, &rows_arg,
             &key_heads_arg, &value_heads_arg, &key_dim_arg, &value_dim_arg, &output_scale};
+    // Relaxed numerics: column-owned lanes (C value columns per warp; 16-byte aligned rows and state).
+    const char* mode = getenv("EUHEDRAL_GDN_RECURRENCE");
+    int aligned = (((uintptr_t)device_convolved | (uintptr_t)device_recurrent_state) & 15u) == 0u;
+    // From two rows (prefill); single-row decode keeps the exact kernel, which measured as fast in the
+    // model (the one-row operator gain, 16.5 -> 14.8 us with four columns, did not survive). Eight
+    // columns per warp: 512 rows 580 -> 327 us. EUHEDRAL_GDN_RECURRENCE=C4|C8|EXACT overrides.
+    if (!euhedral_cuda_exact_numerics() && aligned
+            && (mode != NULL ? strcmp(mode, "EXACT") != 0 : rows > 1)) {
+        int four = mode != NULL && strcmp(mode, "C4") == 0;
+        CUfunction relaxed = four ? gdn_recurrence_c4 : gdn_recurrence_c8;
+        if (relaxed != NULL)
+            return launch_and_synchronize(relaxed, (uint32_t)(rows_count / (four ? 4 : 8)), 32, parameters);
+    }
     // Must match QWEN_GDN_WARP_COLUMNS (8 value columns per warp) in qwen_gdn_ops.cu.
     return launch_and_synchronize(gdn_recurrence, (uint32_t)(rows_count / 8), 32, parameters);
 }

@@ -437,12 +437,23 @@ the represented-NVFP4 tolerance for decode attention.
   1024-token prompt; prefill 256 +2.1%, 1024 +2.5%, time to first token -1.0% (64) and -2.4%
   (1024 tokens) (6 of 6 forks each).
 
+- **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
+  128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
+  the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it
+  slower, 622 us). In `euhedral_gdn_recurrence_c8_bf16` a lane owns one column and a 32-key slice of its
+  state row (`_c4`: four columns, 16-key slices, twice the warps), so each reduction is local FMAs
+  plus two or three shuffles, and the key and query normalizations scale the reduced dot products:
+  512 rows 580 -> 327 us. Outputs stay within about 3e-5 relative rms of the exact kernel. Prefill
+  256 +2.2%, 1024 +2.2%, time to first token -1.2% (64) and -2.1% (1024 tokens), 6 of 6 forks each.
+  Single-row decode keeps the exact kernel: `_c4` won as an operator (16.5 -> 14.8 us) but measured
+  -0.1% in decode.
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
-Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under
+Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill, the one-row residual norm, the prefill
+attention softmax sum, the column-owned GDN recurrence) is replaced by the exact kernel under
 `EUHEDRAL_EXACT=1`, and `RelaxedNumericsDriftCudaIntegrationTest` compares the two settings end to
 end. With all of them, a 256-token prefill and 2048 forced decode positions give a median
-hidden-state difference of 6.0%, KL 3.3e-3 and the same top-1 token at 96.8% of positions, with no
-growth (settled halves 7.2% and 6.9%). A single one-ulp perturbation (the decode attention merge
+hidden-state difference of 5.8%, KL 3.2e-3 and the same top-1 token at 97.0% of positions, with no
+growth (the later settled half 0.92x the earlier). A single one-ulp perturbation (the decode attention merge
 order) gives 5.4% and KL 2.6e-3, so the combined error stays at the model's sensitivity floor.
 
 Measured and not kept:
