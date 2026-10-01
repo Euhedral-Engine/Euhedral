@@ -459,6 +459,13 @@ the represented-NVFP4 tolerance for decode attention.
   From 65 rows the separate Q4/Q5 projections and the mixer use 64-row balanced tiles (128 rows: Q5
   5120 -> 7168 367 -> 258 us, Q4 292 -> 212 us, mixer 325 -> 238 us); at 64 rows the 64 x 32 and 32-row
   kernels fill more CTAs and stay. Prefill 128 +3.1%, 192 +5.2% (6 of 6 forks each).
+- **Decode attention, contiguous lanes.** The decode split kernel decoded each cached NVFP4 element
+  with its own code-byte and scale-byte loads (lane l owned dimensions l + 32 d). In the relaxed
+  `euhedral_attention_decode_nvfp4` lane l owns dimensions 8l .. 8l + 7: one 32-bit code word and one
+  scale per lane and row for K and again for V, the query re-laid out once through shared memory.
+  Only each dot product's FP32 order changes (`_exact` keeps the old kernel). 1024-token context
+  26.0 -> 19.7 us per layer; decode 1024 + 128 +1.9%, 4096 + 128 +2.1% (5 of 6 forks each), 64 + 128
+  +0.7%; drift unchanged.
 - **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
   128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
   the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it
@@ -471,7 +478,7 @@ the represented-NVFP4 tolerance for decode attention.
   -0.1% in decode.
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill, the one-row residual norm, the prefill
-attention softmax sum, the column-owned GDN recurrence) is replaced by the exact kernel under
+attention softmax sum, the column-owned GDN recurrence, contiguous decode attention) is replaced by the exact kernel under
 `EUHEDRAL_EXACT=1`, and `RelaxedNumericsDriftCudaIntegrationTest` compares the two settings end to
 end. With all of them, a 256-token prefill and 2048 forced decode positions give a median
 hidden-state difference of 5.8%, KL 3.2e-3 and the same top-1 token at 97.0% of positions, with no

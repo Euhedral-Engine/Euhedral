@@ -203,7 +203,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
             self.assertEqual(0, attribute(C.byref(local), 3, symbol))  # CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
             self.assertEqual(0, local.value, 'FP4 decode must not materialize a thread-local lookup table')
             for name in [b'euhedral_attention_prefill32_nvfp4', b'euhedral_attention_prefill32_nvfp4_exact',
-                         b'euhedral_attention_decode_nvfp4']:
+                         b'euhedral_attention_decode_nvfp4', b'euhedral_attention_decode_nvfp4_exact']:
                 self.assertEqual(0, self.gpu.function(C.byref(symbol), self.gpu.module, name))
                 self.assertEqual(0, attribute(C.byref(local), 3, symbol))
                 self.assertEqual(0, local.value, name.decode() + ' must not use thread-local decode tables')
@@ -259,7 +259,8 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                 else:
                     for splits in sorted({1, 3, min(64, (length + 47) // 48), min(64, length)}):
                         scratch = self.owned(scope, self.gpu.zeros(query_heads * splits * 258 * 4, 0xA5))
-                        for name, grid in [('euhedral_attention_decode_nvfp4', query_heads * splits)]:
+                        for name, grid in [('euhedral_attention_decode_nvfp4', query_heads * splits),
+                                           ('euhedral_attention_decode_nvfp4_exact', query_heads * splits)]:
                             self.gpu.launch(name, grid, args + [P(scratch), U(splits)])
                             self.gpu.launch('euhedral_attention_merge_nvfp4', query_heads,
                                             [P(gp), P(output), P(scratch), U(query_heads), U(heads), U(splits)])
