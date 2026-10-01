@@ -48,12 +48,25 @@ static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
 static CUfunction q45_prefill_exact[2], q45_prefill64_exact[2], q45_grouped64_exact;
+static CUfunction q45_prefill_wide5;
 
 /* Exact numerics select the hi + lo twins of the Q4/Q5 prefill kernels. */
 static CUfunction q45_prefill_kernel(int format, int wide) {
     CUfunction exact = wide ? q45_prefill64_exact[format] : q45_prefill_exact[format];
     if (exact != NULL && euhedral_cuda_exact_numerics()) return exact;
     return wide ? q45_prefill64[format] : q45_prefill[format];
+}
+
+/* Relaxed numerics: the 128 x 64 tile engine for a qualified 64-row prefill route. Sets the grid
+   and returns NULL where the 64 x 32 kernel applies. */
+static CUfunction q45_prefill_wide_kernel(int format, const void* input, uint32_t rows, uint32_t in_features,
+        uint32_t out_features, uint64_t* grid) {
+    uint32_t tile_rows = euhedral_q45_prefill_wide_rows(format ? 5u : 4u, rows, in_features, out_features);
+    if (tile_rows == 0u || euhedral_cuda_exact_numerics() || ((uintptr_t)input & 15u) != 0u) return NULL;
+    CUfunction function = format ? q45_prefill_wide5 : NULL;
+    if (function != NULL)
+        *grid = (((uint64_t)rows + tile_rows - 1u) / tile_rows) * (((uint64_t)out_features + 63u) / 64u);
+    return function;
 }
 static int q45_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction linear_bf16_to_float;
@@ -121,6 +134,8 @@ static void initialize_modules(void) {
         get_function(q45_module, &q45_prefill_exact[1], "euhedral_q5_prefill_exact");
         get_function(q45_module, &q45_prefill64_exact[0], "euhedral_q4_prefill_64_exact");
         get_function(q45_module, &q45_prefill64_exact[1], "euhedral_q5_prefill_64_exact");
+        // Optional: without it relaxed Q5 prefill keeps the 64 x 32 kernel.
+        get_function(q45_module, &q45_prefill_wide5, "euhedral_q5_prefill_128x64");
         if (status != CUDA_SUCCESS) q45_status = (int)status;
     }
 
@@ -346,8 +361,11 @@ int euhedral_cuda_linear_quantized_bf16(
             function = q45_decode_wide[format];
         grid64 = (((uint64_t)rows + row_tile - 1u) / row_tile) * decode_tiles;
     } else if (route == ROUTE_PREFILL64) {
-        function = q45_prefill_kernel(format, 1);
-        grid64 = (((uint64_t)rows + 63u) / 64u) * prefill_tiles;
+        function = q45_prefill_wide_kernel(format, device_input, rows, in_features, out_features, &grid64);
+        if (function == NULL) {
+            function = q45_prefill_kernel(format, 1);
+            grid64 = (((uint64_t)rows + 63u) / 64u) * prefill_tiles;
+        }
     } else {
         function = q45_prefill_kernel(format, 0);
         grid64 = (((uint64_t)rows + 31u) / 32u) * prefill_tiles;
@@ -800,7 +818,10 @@ int euhedral_cuda_attention_producers_bf16(
     void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
             &head_dim, &rotary_dim, &start, &epsilon, &theta, &keys};
     void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width, &values, &query_width, &start};
-    status = (int)euhedral_launch_kernel(q45_prefill_kernel(0, 1), (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    uint64_t q4_grid = grid;
+    CUfunction q4_kernel = q45_prefill_wide_kernel(0, input, rows, hidden, width, &q4_grid);
+    if (q4_kernel == NULL) q4_kernel = q45_prefill_kernel(0, 1);
+    status = (int)euhedral_launch_kernel(q4_kernel, (uint32_t)q4_grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
             head_dim, 1, 1, 0, stream, norm_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_value_cache, (uint32_t)grid, 1, 1,
@@ -851,10 +872,16 @@ int euhedral_cuda_attention_producers_nvfp4(
     void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width};
     uint32_t key_width = key_heads * head_dim;
     void* append_args[] = {&query_key, &gate, &keys, &values, &rows, &query_width, &key_width, &start};
-    status = (int)euhedral_launch_kernel(q45_prefill_kernel(0, 1), (uint32_t)grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
+    uint64_t q4_grid = grid;
+    CUfunction q4_kernel = q45_prefill_wide_kernel(0, input, rows, hidden, width, &q4_grid);
+    if (q4_kernel == NULL) q4_kernel = q45_prefill_kernel(0, 1);
+    status = (int)euhedral_launch_kernel(q4_kernel, (uint32_t)q4_grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
             head_dim, 1, 1, 0, stream, norm_args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(q45_prefill_kernel(1, 1), (uint32_t)grid, 1, 1,
+    uint64_t q5_grid = grid;
+    CUfunction q5_kernel = q45_prefill_wide_kernel(1, input, rows, hidden, width, &q5_grid);
+    if (q5_kernel == NULL) q5_kernel = q45_prefill_kernel(1, 1);
+    if (status == 0) status = (int)euhedral_launch_kernel(q5_kernel, (uint32_t)q5_grid, 1, 1,
             128, 1, 1, 0, stream, q5_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_append_nvfp4,
             (uint32_t)(((uint64_t)rows * key_heads + 3) / 4), 1, 1, 128, 1, 1, 0, stream, append_args, NULL);

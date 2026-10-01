@@ -370,6 +370,15 @@ the represented-NVFP4 tolerance for decode attention.
   numerics keep). Spreading that row over 40 CTAs that each recompute the reduction was slower
   (17.39 vs 17.23 ms per token). Decode 64 + 128 +1.0%, 1024 + 128 +1.2%, 6 of 6 forks each; drift
   unchanged.
+- **One prefill tile engine for every format.** The FFN's 128 x 64 tile (`ffn/down.cuh`: four warps,
+  K32 generations, warp-specialized A and B producers) now takes the weight format as a policy
+  (`ffn/formats.cuh`: the Q3 producer and a Q4/Q5 producer that stages a half group's four code
+  words, fifth-bit word and scale from one register per lane). At 512 rows the Q5 projections ran
+  at 33 TFLOPS on their 64 x 32 kernel against the FFN's 57; on the engine (`euhedral_q5_prefill_128x64`,
+  Q5 quanta from 256 rows) 5120 -> 12288 takes 1899 -> 1401 us and 5120 -> 7168 1149 -> 990 us.
+  It stages the same BF16 weights and accumulates K16 steps in the same order, so it matches the
+  relaxed 64 x 32 kernel bit for bit. Q4 on the engine only tied its 64 x 32 kernel (64-row tiles
+  were slower still), so Q4 keeps it. Prefill 256 +4.3%, 1024 +4.7% (6 of 6 forks each).
 
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under

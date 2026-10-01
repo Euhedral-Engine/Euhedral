@@ -1,4 +1,4 @@
-"""Q4/Q5 single-row wide-decode shape policy, exercised without CUDA or a device."""
+"""Q4/Q5 decode and wide-prefill shape policies, exercised without CUDA or a device."""
 import ctypes
 import os
 import pathlib
@@ -14,6 +14,9 @@ int wide(unsigned rows, unsigned width, unsigned outputs) {
 }
 int contiguous(unsigned rows, unsigned width, unsigned outputs) {
     return euhedral_q45_decode_contiguous_shape(rows, width, outputs);
+}
+unsigned prefill_wide(unsigned bits, unsigned rows, unsigned width, unsigned outputs) {
+    return euhedral_q45_prefill_wide_rows(bits, rows, width, outputs);
 }
 '''
 
@@ -33,6 +36,8 @@ class Q45DecodePolicyTest(unittest.TestCase):
         cls.lib.wide.restype = ctypes.c_int
         cls.lib.contiguous.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
         cls.lib.contiguous.restype = ctypes.c_int
+        cls.lib.prefill_wide.argtypes = (ctypes.c_uint,) * 4
+        cls.lib.prefill_wide.restype = ctypes.c_uint
 
     @classmethod
     def tearDownClass(cls):
@@ -55,6 +60,14 @@ class Q45DecodePolicyTest(unittest.TestCase):
         for rows, width, outputs in [(2, 5120, 4096), (0, 5120, 4096), (1, 512, 4096), (1, 1536, 4096),
                                      (1, 5120, 4100), (1, 5120, 0)]:
             self.assertEqual(0, contiguous(rows, width, outputs), (rows, width, outputs))
+
+    def test_wide_prefill_only_for_q5_quanta_from_256_rows(self):
+        wide = self.lib.prefill_wide
+        for rows, width, outputs in [(256, 5120, 12288), (512, 5120, 7168), (1024, 32, 32)]:
+            self.assertEqual(128, wide(5, rows, width, outputs), (rows, width, outputs))
+        for bits, rows, width, outputs in [(4, 512, 5120, 7168), (5, 255, 5120, 7168), (5, 512, 5136, 7168),
+                                           (5, 512, 5120, 7176), (5, 512, 0, 7168), (5, 512, 5120, 0)]:
+            self.assertEqual(0, wide(bits, rows, width, outputs), (bits, rows, width, outputs))
 
 
 if __name__ == '__main__':

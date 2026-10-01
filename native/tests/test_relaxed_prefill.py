@@ -72,6 +72,24 @@ class RelaxedPrefillTest(unittest.TestCase):
                                            [P(x), P(w), P(y), U(rows), U(width), U(outputs)])
                                 result.append(struct.unpack(f'<{rows * outputs}H', gpu.download(y, rows * outputs * 2)))
                             self.assert_close(result[0], result[1], (name, rows, width, outputs))
+            # The 128 x 64 tile engine (ffn/down.cuh with the Q4/Q5 producer of ffn/formats.cuh) stages
+            # the same BF16 hi weights and accumulates K16 MMA steps in the same order as the relaxed
+            # 64 x 32 kernel, so on partial row and column tiles it matches that kernel bit for bit.
+            for bits in (4, 5):
+                for rows, width, outputs in [(64, 256, 64), (100, 512, 96), (300, 1024, 160)]:
+                    with contextlib.ExitStack() as stack:
+                        w = gpu.upload(make_weights(rng, bits, width, outputs, scales)); stack.callback(gpu.free, w)
+                        x = gpu.upload(struct.pack(f'<{rows * width}H', *[rng.randrange(0x3c00, 0x4000) | (rng.randrange(2) << 15)
+                                                                       for _ in range(rows * width)]))
+                        stack.callback(gpu.free, x)
+                        def run(symbol, grid):
+                            y = gpu.zeros(rows * outputs * 2, fill=0xa5); stack.callback(gpu.free, y)
+                            gpu.launch(symbol, grid, [P(x), P(w), P(y), U(rows), U(width), U(outputs)])
+                            return struct.unpack(f'<{rows * outputs}H', gpu.download(y, rows * outputs * 2))
+                        relaxed = run(f'euhedral_q{bits}_prefill_64', ((rows + 63) // 64) * ((outputs + 31) // 32))
+                        wide = run(f'euhedral_q{bits}_prefill_128x64', ((rows + 127) // 128) * ((outputs + 63) // 64))
+                        self.assertNotIn(0xa5a5, wide)
+                        self.assertEqual(relaxed, wide, (bits, rows, width, outputs))
             with contextlib.ExitStack() as stack:
                 rows, width, q4_out, q5_out = 100, 256, 64, 96
                 w4 = gpu.upload(make_weights(rng, 4, width, q4_out, scales)); stack.callback(gpu.free, w4)
