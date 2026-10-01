@@ -111,8 +111,11 @@ int euhedral_cuda_copy_upload_to_device(
     if (device_address == NULL || host_address == NULL || byte_size == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     if (byte_size > SIZE_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     cudaStream_t stream = euhedral_cuda_submission_stream();
-    if (stream == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
-    cudaError_t status = cudaMemcpyAsync(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice, stream);
+    // The source is pinned and retained through stream completion, so a queued copy needs no
+    // synchronization; with no stream selected it completes before returning, like every operation.
+    cudaError_t status = stream == NULL
+            ? cudaMemcpy(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice)
+            : cudaMemcpyAsync(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice, stream);
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 

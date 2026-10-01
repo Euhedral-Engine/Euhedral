@@ -1,7 +1,6 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
@@ -11,6 +10,11 @@ import java.util.Objects;
 /// Sequence-owned NVFP4 pages for one full-attention layer. Existing KV payloads
 /// never move. The sequence lease serializes reservation with attention; close
 /// runs after GPU completion. Each D256 row holds 128 code and 16 scale bytes.
+///
+/// Reservation runs inside the owning quantum with its stream selected. A grown page table is
+/// uploaded from pinned staging by a copy queued on that stream, ahead of the stages that read the
+/// table, so reservation never waits for the device. The staging and any outgrown table stay owned
+/// until the append is committed or discarded, which happens only after the quantum retired.
 ///
 /// Rows move through three frontiers. `capacity` is reserved: backed by pages. The submitted
 /// frontier covers rows whose writes are queued on the owning quantum's stream; later stages of that
@@ -24,6 +28,7 @@ public final class AttentionKvState implements AutoCloseable {
     private final long planePageBytes;
     private final List<Long> pages = new ArrayList<>();
     private final List<Long> retiredTables = new ArrayList<>();
+    private final List<ExecutionGpu.UploadBuffer> pendingStaging = new ArrayList<>();
     private long table;
     private int tableSlots;
     private int capacity;
@@ -55,17 +60,22 @@ public final class AttentionKvState implements AutoCloseable {
         while (this.pages.size() < count) this.pages.add(allocate(2 * this.planePageBytes));
         int slots = Math.max(1, this.tableSlots);
         while (slots < count) slots = Math.multiplyExact(slots, 2);
+        long tableBytes = (long) slots * 2 * Long.BYTES;
         long nextTable = this.table;
-        if (slots != this.tableSlots) nextTable = allocate((long) slots * 2 * Long.BYTES);
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment entries = arena.allocate((long) slots * 2 * Long.BYTES, Long.BYTES);
+        if (slots != this.tableSlots) nextTable = allocate(tableBytes);
+        try {
+            ExecutionGpu.UploadBuffer staging = this.gpu.allocateUploadBuffer(tableBytes);
+            // Owned until retirement from here on: a queued copy may read it even if this call fails.
+            this.pendingStaging.add(staging);
+            MemorySegment entries = staging.segment();
+            entries.fill((byte) 0);
             for (int i = 0; i < count; i++) {
-                entries.setAtIndex(ValueLayout.JAVA_LONG, i, this.pages.get(i));
-                entries.setAtIndex(ValueLayout.JAVA_LONG, slots + i, this.pages.get(i) + this.planePageBytes);
+                entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, i, this.pages.get(i));
+                entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, slots + i, this.pages.get(i) + this.planePageBytes);
             }
-            // Synchronous transfer, not queued upload-buffer submission. No device
-            // reader can still use this layer's table during reservation.
-            this.gpu.copyHostToDevice(nextTable, entries, entries.byteSize());
+            // No reader of this layer's table precedes this stage in the quantum, and the previous
+            // quantum retired before the lease was granted, so the stream orders the rewrite.
+            this.gpu.copyUploadToDevice(nextTable, staging);
         } catch (RuntimeException | Error failure) {
             if (nextTable != this.table) this.retiredTables.add(nextTable);
             throw failure;
@@ -74,7 +84,6 @@ public final class AttentionKvState implements AutoCloseable {
         this.table = nextTable;
         this.tableSlots = slots;
         this.capacity = nextCapacity;
-        releaseRetired();
     }
 
     /// Records that the writes for `tokenCount` reserved rows after the committed frontier were
@@ -97,12 +106,15 @@ public final class AttentionKvState implements AutoCloseable {
     public void commitSubmitted() {
         ensureOpen();
         this.length = this.submittedLength;
+        releaseRetired();
     }
 
-    /// Drops a submitted frontier that must not become visible, such as a failed quantum's.
+    /// Drops a submitted frontier that must not become visible, such as a failed quantum's. Called
+    /// after the quantum's device work retired, so it also releases what the reservation retired.
     public void discardSubmitted() {
         if (this.closed) return;
         this.submittedLength = this.length;
+        releaseRetired();
     }
 
     /// Device pointer to the K page-address table, not to BF16 payloads.
@@ -183,7 +195,13 @@ public final class AttentionKvState implements AutoCloseable {
         return address;
     }
 
+    /// Releases staging and outgrown tables once no queued work can reference them. A GPU that cannot
+    /// prove its submitted work stopped keeps the staging, and its frees fail, keeping the tables.
     private void releaseRetired() {
+        if (!this.pendingStaging.isEmpty() && this.gpu.completionProven()) {
+            for (ExecutionGpu.UploadBuffer staging : this.pendingStaging) staging.close();
+            this.pendingStaging.clear();
+        }
         Throwable failure = null;
         for (int i = this.retiredTables.size() - 1; i >= 0; i--) {
             try {
