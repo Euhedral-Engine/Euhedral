@@ -27,12 +27,37 @@ quantum at a time:
   `QwenGpuOperationFrame`);
 - successor references, wired at construction;
 - one frame per device-completion edge and one retirement frame;
-- a persistent CUDA stream and its own `QwenExecutionSource`.
+- a persistent CUDA stream and its own `QwenExecutionSource`;
+- its workspace storage (`QwenWorkspaceStorage`), which the runtime's pool keeps with the graph.
 
 Per quantum, the graph only resets fan-in counters and per-stage flags and binds the
-`QwenExecutionContext`. No frame, wrapper, successor list, or graph is created on the hot path.
-`EuhedralInferenceRuntime` keeps a pool of idle graphs per plan view and builds another graph only when
-every existing one is running a quantum, for example for concurrent sequences.
+`QwenExecutionContext`. No frame, wrapper, successor list, graph, or device buffer is created on the hot
+path. `EuhedralInferenceRuntime` keeps a pool of idle graphs per plan view and builds another graph only
+when every existing one is running a quantum, for example for concurrent sequences.
+
+## Resource lifetimes
+
+Each resource lives as long as its natural owner, so the token boundary neither allocates nor frees:
+
+- Workspace storage belongs to the graph. A quantum's `QwenExecutionWorkspace` acquires its buffers,
+  including the token-ID buffer, from the graph's storage at admission and releases the binding at
+  retirement without freeing anything; the next quantum on the graph finds the same allocations. The
+  storage is a fixed table of slots, one per buffer. A slot keeps the largest allocation a binding asked
+  for, so storage is bounded by the graph's largest quantum, never by token count. A larger quantum
+  replaces only its undersized slots, at admission, while the graph is idle. Because the pool recycles a
+  graph only after its quantum retired, storage is never shared by two live quanta. The runtime frees it
+  when it closes, and only when the device proves completion; `retainedWorkspaceBytes()` reports it, so
+  the engine's device bytes after a session closes are exactly the weights plus that storage.
+- A sampling quantum copies its final logits row into its session's pinned `QwenHostLogits` row. The
+  logits stage queues the device-to-host copy on the quantum stream right after the LM head, so the
+  quantum's single retirement boundary proves the row complete; the CPU reads it only after a
+  successful outcome, converting into a reusable FP32 scratch row. Device logits stay in the graph's
+  storage. One sequence samples serially, so one row per session suffices and sessions never share one.
+  Callers that read logits on the device instead receive the detached buffer, as before.
+- Pinned staging for uploads (token IDs, KV page tables) comes from the binding's small cache and stays
+  owned by the quantum that queued the copy until it retires.
+- Persistent sequence state (KV pages, page tables, GDN state, decode scratch) belongs to the sequence
+  and is released when it completes.
 
 `QwenExecutionContext` is the quantum: its token range, sequence lease, workspace, failure and
 cancellation state, and outcome. It is the graph's `StageQuantum` binding.
@@ -43,7 +68,8 @@ Admission is small:
 
 1. acquire an idle graph for the quantum's plan view;
 2. prepare quantum-owned resources with the graph's stream selected (sequence lease, persistent state on
-   first use, workspace), so any initialization it queues precedes every stage;
+   first use, the binding of the graph's workspace storage), so any initialization it queues precedes
+   every stage;
 3. publish the root stages to the graph's source.
 
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
@@ -137,7 +163,7 @@ enqueues the retirement frame, and that frame:
 
 1. confirms the boundary (and on failure proves the device idle or poisons it);
 2. runs each attempted stage's retirement hook: commit on success, release temporaries always;
-3. releases quantum storage and publishes sequence state (`QwenExecutionContext.retire`);
+3. releases the quantum's workspace binding and publishes sequence state (`QwenExecutionContext.retire`);
 4. returns the graph to its pool and ends the quantum's admission count;
 5. publishes the outcome.
 
@@ -153,6 +179,12 @@ Persistent sequence state has distinct frontiers. For NVFP4 attention KV (`Atten
   (`appendSubmitted`). Later stages of the same quantum, such as causal attention, read this frontier,
   because stream order runs their reads after the writes;
 - committed: `length()`, published only at the quantum's retirement (`commitSubmitted`).
+
+Reservation runs inside the owning quantum with its stream selected. A grown page table is filled into
+pinned staging and uploaded by a copy queued on that stream, ahead of the stages that read it, so
+reservation never waits for the device. The staging and any outgrown table are released when the
+append is committed or discarded, after retirement: nothing in the quantum references the old table,
+but freeing it mid-quantum would synchronize with the queued work.
 
 Other quanta and external readers never see beyond the committed frontier. A failed or cancelled
 quantum never commits (`discardSubmitted`). The sequence position is likewise published only at
@@ -177,8 +209,9 @@ quantum that does not succeed leaves its sequence terminal, so no partial update
   routable) through `doFinallyWithError`. A rejected stage fails its quantum. A rejected
   device-completion or retirement frame is finished on the rejecting thread, which is never a driver
   callback, so the quantum still retires once.
-- A graph is recycled only after its quantum's boundary was confirmed: its device work retired and its
-  storage was released, or the device was poisoned and that storage stays owned.
+- A graph is recycled, with its workspace storage, only after its quantum's boundary was confirmed: its
+  device work retired, or the device was poisoned and that storage stays owned. A poisoned device also
+  keeps the graphs' storage, the sessions' pinned rows, and queued staging when the runtime closes.
 
 ## Measured behaviour
 
@@ -198,8 +231,31 @@ Six paired JVM forks, medians of fork medians:
 Nsight Systems, union of kernel intervals (programmatic dependent launch overlaps adjacent kernels):
 decode keeps the GPU busy 94% of the window, with 0.06% idle inside a token, a 0.13 us median positive
 kernel gap, and one host callback per token; prefill-1024 is busy 99% with 0.34% idle and one callback
-per quantum, where the per-instruction callbacks left it 86% busy. The remaining decode idle is the
-token boundary (about 2.6 ms: logits readback, CPU sampling, and per-quantum workspace allocation).
+per quantum, where the per-instruction callbacks left it 86% busy.
+
+The remaining decode idle was the token boundary. Attributed without a profiler, the host part of
+it (retirement callback to the next quantum's first launch) took 0.70 ms per token; the 2.6 ms that
+Nsight reported is a profiler-inflated mean. Of the 0.70 ms, 23 `cudaMalloc` and 23 `cudaFree` of the
+per-quantum workspace and token IDs cost about 0.14 ms, and the synchronous pageable logits readback
+with its fresh host row and `float[]` about 0.19 ms; CPU argmax was 0.20 ms. Prefill synchronized
+the quantum stream once per full-attention layer whenever a quantum grew its KV pages (32 times per
+1024-token prompt), draining the device queue each time. Keeping workspace storage with the graph,
+copying the sampled row to pinned host memory before retirement, and queuing page-table uploads
+removed all of that. Twelve paired JVM forks against the previous `main` (two warmups, three
+iterations; paired-difference medians):
+
+| Scenario | Before | After | Change | After ahead |
+|---|---|---|---|---|
+| decode 64 + 128 | 28.64 tok/s | 28.92 tok/s | +1.0% | 10/12 |
+| decode 1024 + 128 | 24.98 tok/s | 25.16 tok/s | +0.7% | 9/12 |
+| prefill 1024 | 650.4 tok/s | 651.6 tok/s | +0.2% | 8/12 |
+| prefill 256 | 617.3 tok/s | 619.7 tok/s | +0.2% | 7/12 |
+
+The host boundary is now 0.37 ms with no device allocation, free, or synchronous copy and no host
+allocation; CPU sampling (0.20 ms argmax, 0.07 ms BF16-to-FP32 conversion) is most of what remains.
+Prefill-1024 runs without a stream synchronization: the GPU is busy 99.93% of the window, with one
+gap above 100 us, the boundary between its two quanta. Time to first token did not change beyond
+run-to-run noise.
 
 ## Plan views
 
