@@ -28,11 +28,21 @@ public final class QwenLogitsSampler {
         this.scratch = new float[vocabularySize];
     }
 
-    /// Samples the final logits row that a successful quantum copied into `logits`.
+    /// Samples the final logits row that a successful quantum copied into `logits`, or returns the token
+    /// that its greedy device selection chose.
     public int selectToken(QwenHostLogits logits, IntPredicate allowed) {
         Objects.requireNonNull(logits, "logits");
         requireVocabulary(logits.vocabularySize());
+        if (logits.hasSelection()) {
+            if (allowed != null || !greedy()) throw new IllegalStateException("device selection is greedy only");
+            return logits.selectedToken();
+        }
         return select(logits.row(), allowed);
+    }
+
+    /// Whether this sampler selects the argmax, which a device selection reproduces exactly.
+    public boolean greedy() {
+        return this.sampler.greedy();
     }
 
     /// Copies only the final vocabulary row and does not close or otherwise claim the logits allocation.

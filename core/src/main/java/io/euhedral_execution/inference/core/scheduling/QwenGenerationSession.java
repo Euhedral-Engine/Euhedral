@@ -241,6 +241,8 @@ public final class QwenGenerationSession implements AutoCloseable {
             throws InterruptedException, ExecutionException {
         List<Integer> callTokenIds = new ArrayList<>();
         if (isStopRequested()) return List.of();
+        // A greedy, unconstrained call selects each token on the device and reads back only its ID.
+        this.hostLogits.selectOnDevice(this.sampler.greedy() && constraint == null);
 
         OptionalInt nextToken = OptionalInt.empty();
         for (int offset = 0; offset < promptTokenIds.length; offset += this.prefillChunkTokens) {

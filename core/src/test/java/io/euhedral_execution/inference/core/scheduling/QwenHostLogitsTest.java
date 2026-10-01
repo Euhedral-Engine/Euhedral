@@ -69,11 +69,91 @@ class QwenHostLogitsTest {
         assertTrue(gpu.proven);
     }
 
+    @Test
+    void deviceSelectionReadsBackOnlyTheSelectedToken() {
+        var gpu = new ReadbackGpu();
+        gpu.selectable = true;
+        var logits = new QwenHostLogits(gpu, 4);
+        logits.selectOnDevice(true);
+        logits.queueFinalRow(1000, 3);
+        assertEquals(List.of(1000 + 2L * 4 * Short.BYTES), gpu.selected, "the argmax reads the final row");
+        assertFalse(logits.hasSelection(), "the selection has not retired");
+        logits.retired(true);
+        assertTrue(logits.hasSelection());
+        assertEquals(2, logits.selectedToken());
+        assertThrows(IllegalStateException.class, logits::row, "no row was copied");
+        assertEquals(List.of((long) Long.BYTES), gpu.copyBytes, "only the 8-byte key crosses to the host");
+
+        logits.queueFinalRow(1000, 1);
+        logits.retired(false);
+        assertFalse(logits.hasSelection(), "a failed quantum never exposes its selection");
+        assertThrows(IllegalStateException.class, logits::selectedToken);
+
+        logits.selectOnDevice(false);
+        logits.queueFinalRow(1000, 1);
+        logits.retired(true);
+        assertFalse(logits.hasSelection());
+        assertEquals((short) 1000, logits.row().get(ValueLayout.JAVA_SHORT, 0), "host sampling copies the row");
+
+        gpu.proven = true;
+        logits.close();
+        assertEquals(List.of(gpu.deviceWord), gpu.frees, "the device word is freed with the session");
+        assertEquals(2, gpu.releases, "the pinned key and row are released");
+    }
+
+    @Test
+    void aGpuWithoutDeviceSelectionCopiesTheRowInstead() {
+        var gpu = new ReadbackGpu();
+        var logits = new QwenHostLogits(gpu, 4);
+        logits.selectOnDevice(true);
+        logits.queueFinalRow(1000, 1);
+        logits.retired(true);
+        assertFalse(logits.hasSelection());
+        assertEquals((short) 1000, logits.row().get(ValueLayout.JAVA_SHORT, 0));
+    }
+
+    @Test
+    void aRowWithNoSelectableLogitFailsLikeTheHostArgmax() {
+        var gpu = new ReadbackGpu();
+        gpu.selectable = true;
+        gpu.key = 0;
+        var logits = new QwenHostLogits(gpu, 4);
+        logits.selectOnDevice(true);
+        logits.queueFinalRow(1000, 1);
+        logits.retired(true);
+        assertThrows(IllegalArgumentException.class, logits::selectedToken);
+    }
+
     private static final class ReadbackGpu extends QwenExecutionFixtures.RecordingGpu {
         final List<Long> sources = new ArrayList<>();
+        final List<Long> selected = new ArrayList<>();
+        final List<Long> copyBytes = new ArrayList<>();
         int allocations;
         int releases;
         boolean proven = true;
+        boolean selectable;
+        long deviceWord;
+        long key = 0xFFFF_FFFFL - 2;
+
+        ReadbackGpu() {
+            // Device words far from the logits addresses the tests pass.
+            this.nextAddress.set(1L << 40);
+        }
+
+        @Override
+        public long allocate(long byteSize) {
+            this.deviceWord = super.allocate(byteSize);
+            return this.deviceWord;
+        }
+
+        @Override
+        public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
+            if (!this.selectable) return false;
+            assertEquals(4, count);
+            assertEquals(this.deviceWord, resultAddress);
+            this.selected.add(logitsAddress);
+            return true;
+        }
 
         @Override
         public ReadbackBuffer allocateReadbackBuffer(long bytes) {
@@ -87,6 +167,11 @@ class QwenHostLogitsTest {
 
         @Override
         public void copyDeviceToHost(MemorySegment destination, long source, long byteSize) {
+            this.copyBytes.add(byteSize);
+            if (source == this.deviceWord && byteSize == Long.BYTES) {
+                destination.set(ValueLayout.JAVA_LONG, 0, this.key);
+                return;
+            }
             this.sources.add(source);
             destination.set(ValueLayout.JAVA_SHORT, 0, (short) source);
         }
