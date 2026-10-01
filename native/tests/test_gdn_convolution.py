@@ -18,7 +18,7 @@ def bf16(value):
 @unittest.skipIf(NVRTC is None, str(SKIP_REASON))
 class GdnConvolutionTest(unittest.TestCase):
     def test_row_blocks_match_the_sequential_kernel_with_carried_state(self):
-        source = b'#include "qwen_gdn_ops.cu"\n' + (HERE / 'fixtures/gdn_convolution_reference.cu').read_bytes()
+        source = b'#include "gdn/kernels.cu"\n' + (HERE / 'fixtures/gdn_convolution_reference.cu').read_bytes()
         gpu = Gpu(source)
         try:
             rng = random.Random(1291)

@@ -235,7 +235,7 @@ class ScalarQuantizedKernelTest(unittest.TestCase):
 
     def test_capped_grid_matches_one_block_per_output_bitwise(self):
         rng = random.Random(0x5CA1)
-        gpu = Gpu((HERE.parent / "src/qwen_layer_linear.cu").read_bytes())
+        gpu = Gpu((HERE.parent / "src/linear/kernels.cu").read_bytes())
         try:
             for bits in (4, 5):
                 rows, width, outputs = 7, 256, 37

@@ -12,7 +12,7 @@ COMPOSITIONS = ((1, 1), (2, 1), (4, 1), (1, 2), (1, 4), (2, 2))
 class Q3ClusterTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.gpu = Gpu(b'#include "q3/cluster_kernels.cu"\n', cpp_std=17)
+        cls.gpu = Gpu(b'#include "experiments/q3/cluster_kernels.cu"\n', cpp_std=17)
         try:
             cls.baseline = Gpu(b'#include "q3/kernels.cu"\n')
         except BaseException:

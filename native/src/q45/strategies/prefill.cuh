@@ -4,7 +4,7 @@
 #include "../primitives/writeback.cuh"
 // The MMA leaves and warp tiles are format-independent: they consume staged
 // BF16 A and B hi/lo tiles, so Q4/Q5 share them with Q3.
-#include "../../q3/primitives/mma_leaf.cuh"
+#include "q3/primitives/mma_leaf.cuh"
 
 namespace q45 {
 using q3::WarpTile;

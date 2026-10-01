@@ -12,7 +12,7 @@ from test_q3_primitives import Gpu, NVRTC, CUDA, ROOT, _check
 class QwenRegionsTest(unittest.TestCase):
     def test_attention_producers_write_only_reserved_cache_rows(self):
         from test_q45_kernels import make_weights
-        source = b'#include "q45/kernels.cu"\n#include "qwen_attention_ops.cu"\n'
+        source = b'#include "q45/kernels.cu"\n#include "attention/kernels.cu"\n'
         with contextlib.ExitStack() as scope:
             gpu = Gpu(source)
             scope.callback(gpu.close)
@@ -59,7 +59,7 @@ class QwenRegionsTest(unittest.TestCase):
                             self.assertEqual(a[begin:begin + qw * 2], b[begin:begin + qw * 2])
 
     def test_gate_up_region_keeps_bf16_round_before_swiglu(self):
-        source = b'#include "qwen_ffn.cu"\n#include "q3/kernels.cu"\n#include "qwen_elementwise.cu"\n'
+        source = b'#include "ffn/kernels.cu"\n#include "q3/kernels.cu"\n#include "elementwise/kernels.cu"\n'
         with contextlib.ExitStack() as scope:
             gpu = Gpu(source)
             scope.callback(gpu.close)
@@ -106,7 +106,7 @@ class QwenRegionsTest(unittest.TestCase):
                                                  f'paired {tile} boundary differs for {(rows, width, outputs, special)}')
 
     def test_control_region_preserves_fp32_projection_control_order(self):
-        source = b'#include "qwen_layer_linear.cu"\n#include "qwen_gdn_ops.cu"\n'
+        source = b'#include "linear/kernels.cu"\n#include "gdn/kernels.cu"\n'
         with contextlib.ExitStack() as scope:
             gpu = Gpu(source)
             scope.callback(gpu.close)
@@ -155,7 +155,7 @@ class QwenRegionsTest(unittest.TestCase):
 
     def test_alpha_is_exp_of_fp32_stored_g(self):
         # Old contract: control stored g in FP32 and recurrence computed expf(g). Alpha must equal that.
-        source = (b'#include "qwen_layer_linear.cu"\n#include "qwen_gdn_ops.cu"\n'
+        source = (b'#include "linear/kernels.cu"\n#include "gdn/kernels.cu"\n'
                   b'extern "C" __global__ void reference_g(const float* a, const float* aLog, const float* dtBias,\n'
                   b'        float* g, uint32_t rows, uint32_t heads) {\n'
                   b'    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;\n'
@@ -194,7 +194,7 @@ class QwenRegionsTest(unittest.TestCase):
                              'alpha differs from expf of the FP32-stored g')
 
     def test_residual_norm_preserves_both_bf16_boundaries(self):
-        source = b'#include "qwen_elementwise.cu"\n#include "rms_norm_bf16.cu"\n'
+        source = b'#include "elementwise/kernels.cu"\n#include "norm/kernels.cu"\n'
         with contextlib.ExitStack() as scope:
             gpu = Gpu(source)
             scope.callback(gpu.close)
@@ -237,7 +237,7 @@ class QwenRegionsTest(unittest.TestCase):
                                          f'normalization differs for {(rows, width, special)}')
 
     def test_row_owned_qk_norm_rope_matches_the_per_head_kernels_bitwise(self):
-        source = b'#include "qwen_attention_ops.cu"\n'
+        source = b'#include "attention/kernels.cu"\n'
         with contextlib.ExitStack() as scope:
             gpu = Gpu(source)
             scope.callback(gpu.close)
@@ -273,7 +273,7 @@ class QwenRegionsTest(unittest.TestCase):
                     self.assertEqual(outputs[2], outputs[3], case_name)
 
     def test_relaxed_row_residual_norm_matches_the_exact_kernel_within_one_ulp(self):
-        source = b'#include "qwen_elementwise.cu"\n'
+        source = b'#include "elementwise/kernels.cu"\n'
         with contextlib.ExitStack() as scope:
             gpu = Gpu(source)
             scope.callback(gpu.close)

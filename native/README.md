@@ -6,30 +6,47 @@ The minimum CUDA header/runtime ABI is 13.1.x. An installed newer CUDA 13.x tool
 when its headers and target libraries are complete. The host must also provide the CUDA driver library and NVRTC runtime; the driver must
 support the target GPU. This native layer does not install or manage NVIDIA drivers.
 
-`euhedral_cuda.c` is limited to memory allocation, memory queries, and synchronous copies.
-`q3_embedding.c` owns the embedding C ABI and runtime compilation setup, while
-`q3_embedding.cu` contains the actual Q3 row-split embedding kernel. The build installs the `.cu`
-source at `share/euhedral_cuda/q3_embedding.cu` relative to the native library prefix. NVRTC compiles
-it once per process for `compute_90`, and the CUDA driver JITs that PTX for the active device.
-The operation reads model weights directly from their GPU allocation and writes BF16 hidden states;
-it supports only `Q3_G64_FP16` with `ROW_SPLIT_K128_V1`. Its calling frame synchronizes before
-publishing a successor.
+## Source layout
 
-`rms_norm_bf16.c` and `q3_linear_bf16.c` provide independent synchronous C ABI operations;
-their `.cu` files contain the kernels. `cuda_kernel_loader.c` loads their separately installed
-source assets and compiles them once per process. These operators accept opaque device addresses
-and know nothing about Euhedral frames. The Q3 linear operation consumes the same row-split Q3
-representation as embedding and writes BF16 output; RMSNorm consumes and writes BF16 rows.
+`src/host/` holds the C ABI compiled into the library. `euhedral_cuda.c` is limited to memory
+allocation, memory queries, streams, markers and copies; `cuda_kernel_loader.c` loads an installed
+CUDA module root and compiles it once per process with NVRTC for `compute_90`, and the CUDA driver
+JITs that PTX for the active device. `q3_embedding.c`, `rms_norm_bf16.c`, `q3_linear_bf16.c` and
+`qwen_layer_ops.c` own the operator entry points; the `*_policy.h` headers hold the shape-only
+dispatch decisions their tests exercise without a GPU. These operators accept opaque device
+addresses and know nothing about Euhedral frames.
+
+Every other file under `src/` is CUDA source, installed unchanged at the same relative path under
+`share/euhedral_cuda/` next to the library. Each domain folder's `kernels.cu` is the NVRTC module
+root the host loads; its headers are that module's leaves and strategies:
+
+| Folder | Module contents |
+| --- | --- |
+| `common/` | Shared device helpers (`pdl.cuh`: programmatic dependent launch). |
+| `embedding/` | Q3 row-split embedding (`ROW_SPLIT_K128_V1`) to BF16 hidden states. |
+| `norm/` | Standalone BF16 RMSNorm. |
+| `elementwise/` | Residual add, residual RMSNorm and SwiGLU. |
+| `linear/` | Generic quantized and BF16-to-FP32 linear fallbacks. |
+| `q3/`, `q45/` | Q3 and Q4/Q5 weight formats: layout, numerics, primitives, decode and prefill strategies. |
+| `gemm/` | The prefill tensor-core tile engines (`tiles.cuh`, `balanced.cuh`) and their weight producers (`formats.cuh`), shared by `q3/`, `q45/` and `ffn/`. |
+| `ffn/` | Gate/up SwiGLU, down (unsplit, split-K and reduce) and the streamed FFN regions. |
+| `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
+| `attention/` | NVFP4 KV append, QK norm/RoPE, decode and prefill attention leaves. |
+| `experiments/` | Test-only research modules (Q3 cluster, fragment, hierarchical and pipeline kernels); no host dispatch loads them. |
+
+Includes within a folder are relative; includes across folders name the path from the tree root
+(`common/pdl.cuh`, `gemm/balanced.cuh`), which NVRTC resolves through the installed root.
 
 `native-products.json` defines the two supported targets: `x86_64-linux-gnu` (`linux-x64`)
 and `x86_64-windows-gnu` (`windows-x64`). There is no macOS CUDA product. The normal Gradle
 `nativeBuild` and `:api:bootJar` paths build both products. `nativePackage` writes
 `build/distributions/euhedral-cuda-native.zip` with the selected products. Zig installs each
-product at `build/native/<product>/lib/<library>` and its seven runtime-compiled CUDA sources
-at `build/native/<product>/share/euhedral_cuda/*.cu`. The Spring Boot JAR build produces
+product at `build/native/<product>/lib/<library>` and its runtime-compiled CUDA tree at
+`build/native/<product>/share/euhedral_cuda/`; `nativeVerify` checks that the installed tree
+matches `src/` exactly. The Spring Boot JAR build produces
 the native ZIP alongside the application JAR, but does not embed native files: Java FFM loads
-the library from a filesystem path, with `.cu` files adjacent in the installed product layout.
-The ZIP contains the native library and `.cu` sources, not NVIDIA CUDA runtime libraries.
+the library from a filesystem path, with the CUDA sources adjacent in the installed product layout.
+The ZIP contains the native library and CUDA sources, not NVIDIA CUDA runtime libraries.
 Deploy target-matching CUDA runtime and NVRTC (including builtins) separately, or use the
 container image, which installs the pinned Linux CUDA user-space runtime libraries.
 
@@ -83,13 +100,13 @@ memory to keep the whole compact model resident:
 
 The runtime needs a compatible NVIDIA driver installed on the host (or injected by NVIDIA
 Container Toolkit), along with target-matching CUDA user-space runtime/NVRTC libraries and
-the CUDA headers used by NVRTC to compile the installed `.cu` sources. Set
+the CUDA headers used by NVRTC to compile the installed CUDA sources. Set
 `EUHEDRAL_CUDA_INCLUDE_DIR` to their include directory. Driver stubs and development import
 libraries are for linking only, not runtime deployment.
 
 ## Opt-in Q3 temporal fragment pipeline
 
-`q3/pipeline_kernels.cu` is a separate C++17 NVRTC translation unit, not a production
+`experiments/q3/pipeline_kernels.cu` is a separate C++17 NVRTC translation unit, not a production
 Q3 dispatch mode. Its `euhedral_q3_pipeline_<rows>_<cm>x<cn>` entry points take the
 same Q3 matrix arguments as the fragment-node kernels, followed by a nullable
 `unsigned long long* observations`. Launch 256 threads per CTA, with a 2D grid

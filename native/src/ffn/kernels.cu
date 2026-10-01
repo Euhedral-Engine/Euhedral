@@ -1,5 +1,5 @@
 #include "q3/strategies/k32_prefill.cuh"
-#include "qwen_ffn_streamed.cu"
+#include "streamed.cuh"
 
 // Region B: pair the independent N16 branches as gate/up columns and apply SwiGLU in the
 // epilogue. CB helpers and the K32/A/compact-B/MMA schedule are reused; the schedule is duplicated

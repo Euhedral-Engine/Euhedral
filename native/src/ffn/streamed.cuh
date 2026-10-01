@@ -1,5 +1,5 @@
-#include "ffn/gate_up.cuh"
-#include "ffn/down.cuh"
+#include "gate_up.cuh"
+#include "down.cuh"
 // Separate entrypoints keep small-row register/shared budgets independent of the wide leaf.
 #define FFN_REGION(F, P, GATE, DOWN) \
 extern "C" __global__ __launch_bounds__(128) void GATE( \

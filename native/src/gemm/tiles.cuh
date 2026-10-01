@@ -1,5 +1,5 @@
 #pragma once
-#include "../q3/strategies/k32_prefill.cuh"
+#include "q3/strategies/k32_prefill.cuh"
 namespace qwen_ffn_tiles {
 using namespace k32_probe;
 // P: B operand parts per weight. 2 stages BF16 hi and lo, whose sum is code * scale exactly (the

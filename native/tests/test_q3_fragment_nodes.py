@@ -12,11 +12,11 @@ SHAPES = ((1, 1), (2, 1), (4, 1), (1, 2), (1, 4), (2, 2))
 @unittest.skipIf(NVRTC is None, 'pinned NVRTC unavailable')
 class Q3FragmentNodeTest(unittest.TestCase):
     def test_fragment_nodes_publish_once_and_fan_out_to_siblings(self):
-        source = ROOT / 'native/src/q3/fragment_kernels.cu'
+        source = ROOT / 'native/src/experiments/q3/fragment_kernels.cu'
         self.assertTrue(source.is_file(), 'intermediate fragment-node kernels are missing')
-        with self.gpu(b'#include "q3/fragment_kernels.cu"\n', 17) as nodes, \
-             self.gpu(b'#include "q3/hierarchical_kernels.cu"\n', 17) as hierarchical, \
-             self.gpu(b'#include "q3/cluster_kernels.cu"\n', 17) as replicated, \
+        with self.gpu(b'#include "experiments/q3/fragment_kernels.cu"\n', 17) as nodes, \
+             self.gpu(b'#include "experiments/q3/hierarchical_kernels.cu"\n', 17) as hierarchical, \
+             self.gpu(b'#include "experiments/q3/cluster_kernels.cu"\n', 17) as replicated, \
              self.gpu(b'#include "q3/kernels.cu"\n', 14) as local:
             rng = random.Random(0xF12A)
             for tile, rows, width, outputs in ((32, 33, 65, 35), (64, 65, 192, 65),
@@ -50,9 +50,9 @@ class Q3FragmentNodeTest(unittest.TestCase):
         product = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
         for relative in ('fragment_kernels.cu', 'strategies/fragments.cuh', 'strategies/hierarchical.cuh'):
             with self.subTest(source=relative):
-                self.assertEqual((ROOT / 'native/src/q3' / relative).read_bytes(),
-                                 (product / 'q3' / relative).read_bytes())
-        with self.gpu(b'#include "q3/fragment_kernels.cu"\n', 17, include_dir=product) as gpu:
+                self.assertEqual((ROOT / 'native/src/experiments/q3' / relative).read_bytes(),
+                                 (product / 'experiments/q3' / relative).read_bytes())
+        with self.gpu(b'#include "experiments/q3/fragment_kernels.cu"\n', 17, include_dir=product) as gpu:
             self.assertTrue(gpu.module.value)
 
     @staticmethod

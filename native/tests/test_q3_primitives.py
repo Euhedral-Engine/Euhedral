@@ -13,7 +13,7 @@ import struct
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "native" / "src" / "q3_linear_bf16.cu"
+SOURCE = ROOT / "native" / "src" / "q3" / "kernels.cu"
 RUNTIME = ROOT / "build" / "cuda-dev" / "linux-x64" / "runtime"
 INCLUDE = ROOT / "build" / "cuda-dev" / "linux-x64" / "include"
 P, I = C.c_void_p, C.c_int

@@ -1,5 +1,5 @@
 // Frozen single-CTA-per-channel GDN convolution (before row blocks); test oracle only.
-// It relies on qwen_gdn_silu from qwen_gdn_ops.cu, which the test includes first.
+// It relies on qwen_gdn_silu from gdn/kernels.cu, which the test includes first.
 extern "C" __global__ void reference_gdn_convolution_bf16(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* valueZ,
         const __nv_bfloat16* convolutionWeights, __nv_bfloat16* convolutionState,

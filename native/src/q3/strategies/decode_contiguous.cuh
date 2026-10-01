@@ -1,6 +1,6 @@
 #pragma once
 #include "decode.cuh"
-#include "pdl.cuh"
+#include "common/pdl.cuh"
 
 namespace q3 {
 // Single-row decode with contiguous lane ownership.

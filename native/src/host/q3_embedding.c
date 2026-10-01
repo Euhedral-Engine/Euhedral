@@ -88,7 +88,7 @@ static char* load_q3_embedding_source(void) {
     int path_length = snprintf(
             source_path,
             sizeof(source_path),
-            "%.*s/../share/euhedral_cuda/q3_embedding.cu",
+            "%.*s/../share/euhedral_cuda/embedding/kernels.cu",
             (int) directory_length,
             module_path);
     if (path_length < 0 || (size_t) path_length >= sizeof(source_path)) {
@@ -138,7 +138,7 @@ static void initialize_q3_embedding_kernel(void) {
     }
 
     nvrtcProgram program = NULL;
-    nvrtcResult compiler_status = nvrtcCreateProgram(&program, source, "q3_embedding.cu", 0, NULL, NULL);
+    nvrtcResult compiler_status = nvrtcCreateProgram(&program, source, "embedding/kernels.cu", 0, NULL, NULL);
     if (compiler_status != NVRTC_SUCCESS) {
         fprintf(stderr, "Euhedral CUDA Q3 embedding: NVRTC program creation failed: %s\n",
                 nvrtcGetErrorString(compiler_status));

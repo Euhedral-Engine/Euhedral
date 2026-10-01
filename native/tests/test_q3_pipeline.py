@@ -23,9 +23,9 @@ class PipelineGpu(Gpu):
 
 
 def pipeline_source():
-    candidate = ROOT / 'native/src/q3/pipeline_kernels.cu'
+    candidate = ROOT / 'native/src/experiments/q3/pipeline_kernels.cu'
     # Prior implementation is a compiling RED baseline, not an emulated pipeline.
-    return b'#include "q3/pipeline_kernels.cu"\n' if candidate.exists() else b'#include "q3/fragment_kernels.cu"\n'
+    return b'#include "experiments/q3/pipeline_kernels.cu"\n' if candidate.exists() else b'#include "experiments/q3/fragment_kernels.cu"\n'
 
 
 def controlled_pipeline_source():
@@ -36,8 +36,8 @@ def controlled_pipeline_source():
     has acquired zero. This makes useful overlap a deterministic capability test,
     rather than relying on a timestamp after work that may already have finished.
     """
-    header = (ROOT / 'native/src/q3/strategies/pipelined_fragments.cuh').read_text()
-    header = header.replace('#include "fragments.cuh"', '#include "q3/strategies/fragments.cuh"\n#include <cuda/atomic>')
+    header = (ROOT / 'native/src/experiments/q3/strategies/pipelined_fragments.cuh').read_text()
+    header = header.replace('#include "fragments.cuh"', '#include "experiments/q3/strategies/fragments.cuh"\n#include <cuda/atomic>')
     header = header.replace('    const Layout packed(weights, width, scale_offset);', '''
     using ProbeFlag = cuda::atomic_ref<unsigned int, cuda::thread_scope_block>;
     __shared__ unsigned int held[Tile::kWarps], staged[Node::kBranches];
@@ -66,7 +66,7 @@ def controlled_pipeline_source():
                         || !ProbeFlag(staged[b_branch]).load(cuda::memory_order_acquire)) {}
             }
             consume_fragment_node<Tile>(acc, lease);''')
-    kernels = (ROOT / 'native/src/q3/pipeline_kernels.cu').read_text()
+    kernels = (ROOT / 'native/src/experiments/q3/pipeline_kernels.cu').read_text()
     return (header + kernels.replace('#include "strategies/pipelined_fragments.cuh"', '')).encode()
 
 
@@ -90,10 +90,10 @@ def run_pipeline(gpu, tile, cm, cn, grid, x, w, rows, width, outputs, offset, ob
 class Q3PipelineTest(unittest.TestCase):
     def test_installed_pipeline_compiles_and_matches_source(self):
         product = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
-        for relative in ('q3/pipeline_kernels.cu', 'q3/strategies/pipelined_fragments.cuh'):
+        for relative in ('experiments/q3/pipeline_kernels.cu', 'experiments/q3/strategies/pipelined_fragments.cuh'):
             self.assertEqual((ROOT / 'native/src' / relative).read_bytes(),
                              (product / relative).read_bytes())
-        with closing(PipelineGpu(b'#include "q3/pipeline_kernels.cu"\n',
+        with closing(PipelineGpu(b'#include "experiments/q3/pipeline_kernels.cu"\n',
                                  include_dir=product, cpp_std=17)) as gpu:
             for tile in (32, 64):
                 for cm, cn in SHAPES:
@@ -102,22 +102,22 @@ class Q3PipelineTest(unittest.TestCase):
                            f'euhedral_q3_pipeline_{tile}_{cm}x{cn}'.encode()), 'installed symbol')
 
     def test_steady_state_has_no_broad_barriers(self):
-        header = (ROOT / 'native/src/q3/strategies/pipelined_fragments.cuh').read_text()
+        header = (ROOT / 'native/src/experiments/q3/strategies/pipelined_fragments.cuh').read_text()
         self.assertNotIn('__syncthreads', header)
         self.assertEqual(header.count('placement.cluster.sync();'), 2)
         body = header.split('if (warp < Node::kBranches) {', 1)[1].split('// Terminal DSM lifetime join:', 1)[0]
         self.assertNotIn('cluster.sync', body)
-        prior = (ROOT / 'native/src/q3/strategies/fragments.cuh').read_text()
+        prior = (ROOT / 'native/src/experiments/q3/strategies/fragments.cuh').read_text()
         lifecycle = prior.split('struct FragmentNode {', 1)[1].split('// The placement routes', 1)[0]
         self.assertEqual(lifecycle.count('__syncthreads();'), 5)
         loop = prior.split('for (unsigned int base = 0, generation = 0;', 1)[1].split('aggregate_output', 1)[0]
         self.assertEqual(loop.count('placement.cluster.sync();'), 2)
-        hierarchy = (ROOT / 'native/src/q3/strategies/hierarchical.cuh').read_text()
+        hierarchy = (ROOT / 'native/src/experiments/q3/strategies/hierarchical.cuh').read_text()
         parent = hierarchy.split('void stage_owned_k(', 1)[1].split('// Keep the DSM', 1)[0]
         self.assertEqual(parent.count('__syncthreads();'), 1)  # sixth CTA barrier in PR #10
 
     def test_fragment_storage_has_independent_generation_slots(self):
-        source = b'''#include "q3/strategies/pipelined_fragments.cuh"
+        source = b'''#include "experiments/q3/strategies/pipelined_fragments.cuh"
 extern "C" __global__ void probe_slots(unsigned int* out) {
     if (threadIdx.x == 0) *out = q3::PipelinedFragmentNode<q3::Prefill32>::kSlots;
 }
@@ -191,8 +191,8 @@ extern "C" __global__ void probe_held_borrower(unsigned int* out) {
     if (threadIdx.x == 0) { out[6] = payload[0]; out[7] = payload[1]; }
 }
 '''
-        header = (ROOT / 'native/src/q3/strategies/pipelined_fragments.cuh').read_text()
-        header = header.replace('#include "fragments.cuh"', '#include "q3/strategies/fragments.cuh"')
+        header = (ROOT / 'native/src/experiments/q3/strategies/pipelined_fragments.cuh').read_text()
+        header = header.replace('#include "fragments.cuh"', '#include "experiments/q3/strategies/fragments.cuh"')
         for bypass_reuse in (True, False):
             source = header.replace('if (g.value >= kSlots)', 'if (false)') if bypass_reuse else header
             with closing(Gpu((source+probe).encode(), cpp_std=17)) as gpu:
@@ -216,9 +216,9 @@ extern "C" __global__ void probe_held_borrower(unsigned int* out) {
 
     def compare_predecessors(self, source, require_overlap=False):
         with closing(PipelineGpu(source, cpp_std=17)) as gpu, \
-             closing(Gpu(b'#include "q3/fragment_kernels.cu"\n', cpp_std=17)) as nodes, \
-             closing(Gpu(b'#include "q3/hierarchical_kernels.cu"\n', cpp_std=17)) as direct, \
-             closing(Gpu(b'#include "q3/cluster_kernels.cu"\n', cpp_std=17)) as replicated, \
+             closing(Gpu(b'#include "experiments/q3/fragment_kernels.cu"\n', cpp_std=17)) as nodes, \
+             closing(Gpu(b'#include "experiments/q3/hierarchical_kernels.cu"\n', cpp_std=17)) as direct, \
+             closing(Gpu(b'#include "experiments/q3/cluster_kernels.cu"\n', cpp_std=17)) as replicated, \
              closing(Gpu(b'#include "q3/kernels.cu"\n')) as local:
             rng = random.Random(0x710E)
             for tile in (32, 64):

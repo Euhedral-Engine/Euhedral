@@ -1,6 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include "pdl.cuh"
+#include "common/pdl.cuh"
 
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;

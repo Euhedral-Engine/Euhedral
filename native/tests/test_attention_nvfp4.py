@@ -71,7 +71,7 @@ def unpack_rows(data):
 class Nvfp4AttentionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.gpu = Gpu(b'#include "qwen_attention_ops.cu"\n' + br'''
+        cls.gpu = Gpu(b'#include "attention/kernels.cu"\n' + br'''
 extern "C" __global__ void probe_nvfp4_encode(const float* input, unsigned char* output, unsigned int count) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = nvfp4kv::e2m1_encode(input[i]);

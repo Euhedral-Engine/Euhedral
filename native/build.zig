@@ -38,28 +38,12 @@ pub fn build(b: *std.Build) void {
         }),
         .linkage = .dynamic,
     });
-    library.root_module.addCSourceFile(.{
-        .file = b.path("src/euhedral_cuda.c"),
-        .flags = &.{"-std=c11", "-fvisibility=hidden"},
-    });
-    library.root_module.addCSourceFile(.{
-        .file = b.path("src/q3_embedding.c"),
-        .flags = &.{"-std=c11", "-fvisibility=hidden"},
-    });
-    library.root_module.addCSourceFile(.{
-        .file = b.path("src/cuda_kernel_loader.c"),
-        .flags = &.{"-std=c11", "-fvisibility=hidden"},
-    });
-    library.root_module.addCSourceFile(.{
-        .file = b.path("src/rms_norm_bf16.c"),
-        .flags = &.{"-std=c11", "-fvisibility=hidden"},
-    });
-    library.root_module.addCSourceFile(.{
-        .file = b.path("src/q3_linear_bf16.c"),
-        .flags = &.{"-std=c11", "-fvisibility=hidden"},
-    });
-    library.root_module.addCSourceFile(.{
-        .file = b.path("src/qwen_layer_ops.c"),
+    library.root_module.addCSourceFiles(.{
+        .root = b.path("src/host"),
+        .files = &.{
+            "euhedral_cuda.c", "q3_embedding.c", "cuda_kernel_loader.c",
+            "rms_norm_bf16.c", "q3_linear_bf16.c", "qwen_layer_ops.c",
+        },
         .flags = &.{"-std=c11", "-fvisibility=hidden"},
     });
     library.root_module.addIncludePath(b.path("include"));
@@ -83,42 +67,12 @@ pub fn build(b: *std.Build) void {
     } else {
         b.installArtifact(library);
     }
-    b.installFile("src/pdl.cuh", "share/euhedral_cuda/pdl.cuh");
-    b.installFile("src/q3_embedding.cu", "share/euhedral_cuda/q3_embedding.cu");
-    b.installFile("src/rms_norm_bf16.cu", "share/euhedral_cuda/rms_norm_bf16.cu");
-    b.installFile("src/q3_linear_bf16.cu", "share/euhedral_cuda/q3_linear_bf16.cu");
-    const q3_sources = [_][]const u8{
-        "kernels.cu", "cluster_kernels.cu", "hierarchical_kernels.cu", "fragment_kernels.cu", "numeric.cuh", "layout.cuh",
-        "primitives/packed_load.cuh", "primitives/activation.cuh",
-        "primitives/decode.cuh", "primitives/staging.cuh", "primitives/prefetch.cuh", "primitives/mma.cuh", "primitives/mma_leaf.cuh",
-        "primitives/accumulation.cuh", "primitives/writeback.cuh",
-        "strategies/scalar.cuh", "strategies/decode.cuh", "strategies/decode_wide.cuh", "strategies/decode_contiguous.cuh", "strategies/prefill.cuh", "strategies/k32_prefill.cuh", "strategies/cluster_reuse.cuh",
-        "strategies/hierarchical.cuh", "strategies/fragments.cuh",
-        "pipeline_kernels.cu", "strategies/pipelined_fragments.cuh",
-    };
-    for (q3_sources) |source| {
-        b.installFile(b.fmt("src/q3/{s}", .{source}), b.fmt("share/euhedral_cuda/q3/{s}", .{source}));
-    }
-    b.installFile("src/qwen_layer_linear.cu", "share/euhedral_cuda/qwen_layer_linear.cu");
-    b.installFile("src/q45_linear_bf16.cu", "share/euhedral_cuda/q45_linear_bf16.cu");
-    const q45_sources = [_][]const u8{
-        "kernels.cu", "numeric.cuh", "layout.cuh", "attention_cache.cuh",
-        "primitives/decode.cuh", "primitives/packed_load.cuh", "primitives/staging.cuh",
-        "primitives/prefetch.cuh", "primitives/writeback.cuh",
-        "strategies/decode.cuh", "strategies/decode_wide.cuh", "strategies/decode_contiguous.cuh", "strategies/prefill.cuh",
-    };
-    for (q45_sources) |source| {
-        b.installFile(b.fmt("src/q45/{s}", .{source}), b.fmt("share/euhedral_cuda/q45/{s}", .{source}));
-    }
-    b.installFile("src/qwen_gdn_ops.cu", "share/euhedral_cuda/qwen_gdn_ops.cu");
-    for ([_][]const u8{ "tiles.cuh", "formats.cuh", "balanced.cuh", "gate_up.cuh", "down.cuh" }) |source| {
-        b.installFile(b.fmt("src/ffn/{s}", .{source}), b.fmt("share/euhedral_cuda/ffn/{s}", .{source}));
-    }
-    b.installFile("src/qwen_ffn.cu", "share/euhedral_cuda/qwen_ffn.cu");
-    b.installFile("src/qwen_ffn_streamed.cu", "share/euhedral_cuda/qwen_ffn_streamed.cu");
-    b.installFile("src/qwen_elementwise.cu", "share/euhedral_cuda/qwen_elementwise.cu");
-    b.installFile("src/qwen_attention_ops.cu", "share/euhedral_cuda/qwen_attention_ops.cu");
-    for ([_][]const u8{ "nvfp4_kv.cuh", "nvfp4_attention.cuh", "nvfp4_prefill32.cuh", "nvfp4_prefill_fa2.cuh", "nvfp4_decode_gqa.cuh" }) |source| {
-        b.installFile(b.fmt("src/attention/{s}", .{source}), b.fmt("share/euhedral_cuda/attention/{s}", .{source}));
-    }
+    // Every CUDA source is an NVRTC asset, installed at its source-relative path so module roots
+    // (<domain>/kernels.cu) and their includes resolve against share/euhedral_cuda.
+    b.installDirectory(.{
+        .source_dir = b.path("src"),
+        .install_dir = .prefix,
+        .install_subdir = "share/euhedral_cuda",
+        .include_extensions = &.{ ".cu", ".cuh" },
+    });
 }
