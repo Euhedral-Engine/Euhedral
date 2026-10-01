@@ -3,7 +3,8 @@
 #include "../q45/layout.cuh"
 #include "../q45/primitives/staging.cuh"
 // B-operand formats of the tile engine (down.cuh). Each stages one 16-column x K32 tile, column-major
-// (col * 32 + k), from a compact register prefetch: lanes 8c..8c+7 own column c of each 4-column pass.
+// with swizzled chunks (k32_probe::b_index), from a compact register prefetch: lanes 8c..8c+7 own
+// column c of each 4-column pass.
 namespace qwen_ffn_tiles {
 struct Q3B {
     using Layout = q3::Layout;
@@ -11,12 +12,12 @@ struct Q3B {
     static __device__ __forceinline__ Layout layout(const unsigned char* w,unsigned int width,unsigned int,unsigned long long scale){return Layout(w,width,scale);}
     template<int P>
     static __device__ __forceinline__ void produce(__nv_bfloat16* hi,__nv_bfloat16* lo,const Layout& w,unsigned int outputs,unsigned int col,unsigned int base,unsigned int lane){
-        k32_probe::produce_b<false,P>(hi,lo,w,outputs,col,base,lane);}
+        k32_probe::produce_b<true,P>(hi,lo,w,outputs,col,base,lane);}
     static __device__ __forceinline__ void prefetch(Compact& next,const Layout& w,unsigned int outputs,unsigned int col,unsigned int base,unsigned int lane){
         k32_probe::prefetch_compact_b(next,w,outputs,col,base,lane);}
     template<int P>
     static __device__ __forceinline__ void stage(__nv_bfloat16* hi,__nv_bfloat16* lo,const Compact& next,unsigned int lane){
-        k32_probe::stage_compact_b<false,P>(hi,lo,next,lane);}
+        k32_probe::stage_compact_b<true,P>(hi,lo,next,lane);}
 };
 // Q4/Q5: a K32 half group is 4 code words (16 bytes) and, for Q5, one fifth-bit word. Sublanes 0-3
 // hold the code words, sublane 4 the fifth-bit word and sublane 5 the FP16 scale, one register per pass.
@@ -47,7 +48,7 @@ struct Q45B {
                 unsigned int code=__shfl_sync(0xffffffffu,next.words[j],h*2u+(sublane>>2),8);
                 unsigned int pair=(code>>((sublane&3u)*8u))&0xffu;
                 if(BITS==5)pair|=((high>>(h*16u+sublane*2u))&3u)<<8;
-                q45::stage_split_pair<BITS,P>(hi,lo,col*32u+h*16u+sublane*2u,pair,scale);}
+                q45::stage_split_pair<BITS,P>(hi,lo,k32_probe::b_index(col,h*16u+sublane*2u),pair,scale);}
         }
     }
     template<int P>

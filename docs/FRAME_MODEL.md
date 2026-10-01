@@ -377,8 +377,17 @@ the represented-NVFP4 tolerance for decode attention.
   at 33 TFLOPS on their 64 x 32 kernel against the FFN's 57; on the engine (`euhedral_q5_prefill_128x64`,
   Q5 quanta from 256 rows) 5120 -> 12288 takes 1899 -> 1401 us and 5120 -> 7168 1149 -> 990 us.
   It stages the same BF16 weights and accumulates K16 steps in the same order, so it matches the
-  relaxed 64 x 32 kernel bit for bit. Q4 on the engine only tied its 64 x 32 kernel (64-row tiles
-  were slower still), so Q4 keeps it. Prefill 256 +4.3%, 1024 +4.7% (6 of 6 forks each).
+  relaxed 64 x 32 kernel bit for bit. Prefill 256 +4.3%, 1024 +4.7% (6 of 6 forks each).
+- **Swizzled engine tiles; Q4 and the Q3 mixer on the engine.** Nsight Compute counted 75% of the
+  engine's shared-load wavefronts in gate/up as bank conflicts: A rows and B columns were stored
+  densely at a 64-byte stride, so each eight-row ldmatrix phase hit two 16-byte bank groups. Every
+  engine tile now stores chunk c of row r at c ^ ((r >> 1) & 3), the swizzle the K32 compact-B
+  kernel already used for B. Gate/up per 1024-token prompt 405 -> 381 ms, down 206 -> 191 ms, Q5
+  166 -> 152 ms. With it, Q4 also wins on the engine (512 rows: 5120 -> 7168 898 -> 787 us,
+  5120 -> 4096 524 -> 506 us), and the 6144 -> 5120 mixer output from 256 rows moves off the K32
+  compact-B kernel (512 rows 734 -> 600 us). Both match their previous relaxed kernels bit for bit.
+  Prefill per 1024-token prompt 1129 -> 1058 ms in the trace; prefill 256 +5.8%, 1024 +7.2% and time
+  to first token for a 64-token prompt -4.7% (6 of 6 forks each).
 
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under

@@ -61,6 +61,9 @@ int prefill_tile_rows(int selected) {
     return -1;
 #endif
 }
+int engine(int mode, unsigned rows, unsigned width, unsigned outputs) {
+    return euhedral_q3_prefill_engine_shape(mode, rows, width, outputs);
+}
 '''
 
 
@@ -98,6 +101,7 @@ class Q3PrefillPolicyTest(unittest.TestCase):
         cls.lib.prefill_tile_rows.restype = ctypes.c_int
         cls.lib.decode_wide.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
         cls.lib.decode_wide.restype = ctypes.c_int
+        cls.lib.engine.restype = ctypes.c_int
 
     @classmethod
     def tearDownClass(cls):
@@ -111,6 +115,14 @@ class Q3PrefillPolicyTest(unittest.TestCase):
         for rows, width, outputs in [(2, 5120, 8), (0, 5120, 8), (1, 384, 8), (1, 640, 8), (1, 33280, 8),
                                      (1, 0, 8), (1, 5120, 12), (1, 5120, 0)]:
             self.assertEqual(0, wide(rows, width, outputs), (rows, width, outputs))
+
+    def test_tile_engine_serves_only_auto_mixer_quanta_from_256_rows(self):
+        engine = self.lib.engine
+        for rows in (256, 512, 1024, 4096):
+            self.assertEqual(1, engine(2, rows, 6144, 5120), rows)
+        for mode, rows, width, outputs in [(2, 255, 6144, 5120), (3, 512, 6144, 5120), (1, 512, 6144, 5120),
+                                           (2, 512, 5120, 34816), (2, 512, 17408, 5120), (2, 512, 6144, 5184)]:
+            self.assertEqual(0, engine(mode, rows, width, outputs), (mode, rows, width, outputs))
 
     def test_mixer_wins_only_after_integrated_crossover(self):
         for rows in (1, 32, 63, 64, 65, 95, 96, 97, 112, 127, 128, 129, 256, 511):

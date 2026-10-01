@@ -84,6 +84,14 @@ static inline enum euhedral_q3_prefill_kernel euhedral_q3_select_prefill_with_k3
             has_prefill64, has_prefill64_wmma);
 }
 
+// Relaxed AUTO prefill quanta of the 6144 -> 5120 mixer from 256 rows run on the 128 x 64 tile engine,
+// bitwise equal to the K32 compact-B kernel: 256 rows 396 -> 362 us, 512 734 -> 637 us, 1024 1445 ->
+// 1257 us with cold weights.
+static inline int euhedral_q3_prefill_engine_shape(int mode, uint32_t rows, uint32_t in_features,
+        uint32_t out_features) {
+    return mode == 2 && rows >= 256u && in_features == 6144u && out_features == 5120u;
+}
+
 // The 104-element-stride 32-row kernel wins on the GDN output mixer only where the grid has one or
 // three 32-row tiles; everywhere else the 88-element kernel is at least as fast.
 static inline int euhedral_q3_use_s104_prefill(int mode, uint32_t rows,
