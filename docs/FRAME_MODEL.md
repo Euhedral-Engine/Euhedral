@@ -388,6 +388,13 @@ the represented-NVFP4 tolerance for decode attention.
   compact-B kernel (512 rows 734 -> 600 us). Both match their previous relaxed kernels bit for bit.
   Prefill per 1024-token prompt 1129 -> 1058 ms in the trace; prefill 256 +5.8%, 1024 +7.2% and time
   to first token for a 64-token prompt -4.7% (6 of 6 forks each).
+- **Prefill attention KV staging.** The 32-query attention tile expanded each cached NVFP4 element
+  with its own page lookup, code-byte and scale-byte load; at about 5 TFLOPS it took 62 ms per
+  1024-token prompt. Each thread now expands whole 16-element groups (one 8-byte code load, one
+  scale, two 16-byte shared stores; the same exact FP16 values), and four threads share each query
+  row's softmax statistics instead of one, so the denominator is summed in four partial sums
+  (`euhedral_attention_prefill32_nvfp4_exact` keeps the key-ordered sum). 62 -> 18 ms per
+  1024-token prompt; prefill 256 +1.5%, 1024 +4.1% (6 of 6 forks each); drift unchanged.
 
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under

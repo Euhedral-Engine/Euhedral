@@ -82,6 +82,7 @@ static CUfunction attention_qk_norm_rope;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
+static CUfunction attention_prefill_nvfp4_exact;
 static CUfunction attention_norm_cache;
 static CUfunction attention_value_cache;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
@@ -168,6 +169,8 @@ static void initialize_modules(void) {
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     status = get_function(attention_module, &attention_append_nvfp4, "euhedral_attention_kv_append_nvfp4");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_prefill_nvfp4, "euhedral_attention_prefill32_nvfp4");
+    if (status == CUDA_SUCCESS)
+        get_function(attention_module, &attention_prefill_nvfp4_exact, "euhedral_attention_prefill32_nvfp4_exact");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_decode_nvfp4, "euhedral_attention_decode_nvfp4");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_merge_nvfp4, "euhedral_attention_merge_nvfp4");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
@@ -1009,7 +1012,10 @@ int euhedral_cuda_attention_causal_nvfp4(
     if (rows > 1) {
         void* args[] = {&query_key, &gate, &keys, &values, &output, &rows, &query_heads,
                 &key_heads, &head_dim, &cache_length, &start};
-        return launch_and_synchronize(attention_prefill_nvfp4, (uint32_t)grid, 128, args);
+        // Exact numerics keep the key-ordered softmax sum.
+        CUfunction prefill = attention_prefill_nvfp4_exact != NULL && euhedral_cuda_exact_numerics()
+                ? attention_prefill_nvfp4_exact : attention_prefill_nvfp4;
+        return launch_and_synchronize(prefill, (uint32_t)grid, 128, args);
     }
     // Decode must only attend the prefix ending at its query, even when a caller
     // supplies a longer physical cache. Scratch reserves 64 * heads * 258 floats.
