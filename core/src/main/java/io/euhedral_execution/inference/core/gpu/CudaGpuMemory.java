@@ -87,7 +87,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle q3FfnDownSplitBf16;
     private final MethodHandle selectExactNumerics;
     private final MethodHandle q3FfnStreamedBf16;
-    private final MethodHandle attentionProducersNvfp4;
     private final MethodHandle gdnProjectControlFp32;
     private final MethodHandle gdnProjectionsBf16;
     private final MethodHandle swiGluBf16;
@@ -209,32 +208,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.gdnRecurrenceBf16 = bind(linker, symbols, "euhedral_cuda_gdn_recurrence_bf16", GDN_RECURRENCE_BF16);
             this.gdnGatedRmsNormBf16 =
                     bind(linker, symbols, "euhedral_cuda_gdn_gated_rms_norm_bf16", GDN_GATED_RMS_NORM_BF16);
-            this.attentionProducersNvfp4 = symbols.find("euhedral_cuda_attention_producers_nvfp4")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_FLOAT,
-                                    ValueLayout.JAVA_DOUBLE,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
             this.q3FfnStreamedBf16 = symbols.find("euhedral_cuda_q3_ffn_streamed_bf16")
                     .map(symbol -> linker.downcallHandle(
                             symbol,
@@ -1127,66 +1100,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 valueHeads,
                 headDim,
                 epsilon);
-    }
-
-    @Override
-    public void attentionProducersNvfp4(
-            long input,
-            long q4,
-            long q5,
-            long queryNorm,
-            long keyNorm,
-            long queryKey,
-            long gate,
-            long keys,
-            long values,
-            int rows,
-            int hidden,
-            int queryHeads,
-            int keyHeads,
-            int headDim,
-            int rotaryDim,
-            long start,
-            float epsilon,
-            double theta,
-            long q4Bytes,
-            long q5Bytes) {
-        ensureOpen();
-        requireAddresses(input, q4, q5, queryNorm, keyNorm, queryKey, gate, keys, values);
-        if (rows < 64
-                || hidden <= 0
-                || queryHeads <= 0
-                || keyHeads <= 0
-                || headDim != 256
-                || rotaryDim <= 0
-                || start < 0
-                || q4Bytes <= 0
-                || q5Bytes <= 0) throw new IllegalArgumentException("invalid attention producer geometry");
-        if (attentionProducersNvfp4 == null)
-            throw new UnsupportedOperationException("native attention producers unavailable");
-        invokeLayer(
-                "attention producer region",
-                attentionProducersNvfp4,
-                MemorySegment.ofAddress(input),
-                MemorySegment.ofAddress(q4),
-                MemorySegment.ofAddress(q5),
-                MemorySegment.ofAddress(queryNorm),
-                MemorySegment.ofAddress(keyNorm),
-                MemorySegment.ofAddress(queryKey),
-                MemorySegment.ofAddress(gate),
-                MemorySegment.ofAddress(keys),
-                MemorySegment.ofAddress(values),
-                rows,
-                hidden,
-                queryHeads,
-                keyHeads,
-                headDim,
-                rotaryDim,
-                start,
-                epsilon,
-                theta,
-                q4Bytes,
-                q5Bytes);
     }
 
     @Override

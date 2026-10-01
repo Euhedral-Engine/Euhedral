@@ -152,14 +152,15 @@ Placement (`EUHEDRAL_LANE_PLACEMENT`): PATH (default) lets each stage continue t
 predecessor whose longest remaining path runs through it, fixed when the graph is built, so a graph's
 critical chain keeps one lane in every quantum and the other branches of a fan-out take random lanes;
 FORK lets whichever successor of a stage runs first continue its lane; CHAIN keeps only linear chains
-on one lane; RANDOM and WORKER (the submitting worker's lane) spread every stage. Decode graphs spread their stages; prefill graphs keep every stage on their home
-lane, because their kernels already fill the GPU and a cross-lane wait only adds latency there.
+on one lane; RANDOM and WORKER (the submitting worker's lane) spread every stage. Every graph spreads
+its stages, decode and prefill alike.
 
 With stages on different lanes the stream no longer orders every write after earlier reads and
 writes of the same storage, so the plan adds those edges explicitly
 (`QwenExecutionPlan.withStorageHazards`, counting aliased region storage as one buffer) wherever the
 data dependencies do not already imply them. Decode keeps the GDN Q4 and Q5 projections as separate
-leaf frames so they can run on different lanes.
+leaf frames, and every view keeps the attention producers as four leaf frames (Q projection -> QK norm
+and RoPE, KV projection -> cache append), so those branches can run on different lanes.
 
 Measured on decode 64/1024 + 128 (Nsight Systems token period, then six paired forks):
 
@@ -175,6 +176,12 @@ Measured on decode 64/1024 + 128 (Nsight Systems token period, then six paired f
   1024 + 128 +0.29% (6 of 6). Under FORK the side branch of a fan-out (the GDN control projection, the
   attention value projection) can run first and take the chain's lane, moving the long branch to a
   new lane behind a cross-lane wait; PATH decides statically, with no race on the claim.
+- Prefill attention producers as leaf frames instead of one fused frame (six paired forks each, prefill
+  64 / 256 / 1024): spreading prefill graphs alone -1.0% / +0.35% / +0.00%; the leaf frames alone
+  -0.09% / -0.32% / -0.06%; both together +1.32% (5 of 6) / +1.44% (6 of 6) / +0.50% (6 of 6). The
+  frames expose the KV branch and the lanes run it beside the Q branch; neither helps without the
+  other. Keeping the region storage aliasing with the leaf frames measured +1.77% / -0.07% / +0.01%
+  against dropping it, so the prefill workspace keeps its size.
 
 Direct operator calls with no stream selected still run synchronously; only tests and diagnostics use
 them.
@@ -310,8 +317,8 @@ its owner.
 
 ```text
 prefill:
-  M == 64 or 1024 and FFN 5120 x 17408 -> streamed C + A + D + F
-  otherwise, M >= 64                    -> combined A + B + D + F
+  M == 64 or 1024 and FFN 5120 x 17408 -> streamed C + A + D
+  otherwise, M >= 64                    -> combined A + B + D
   M < 64                                -> A + D, ordinary FFN and attention
 
 decode:
@@ -324,8 +331,8 @@ decode:
   accumulators across feature regions. It forks internal CUDA streams and joins them back onto the
   quantum stream with events, so from the graph it is an ordinary stream-ordered stage.
 - D: joint BF16 A/B projection + GDN control, submitted before the heavy Q4/Q5 projections.
-- F: Q4/Q5 attention producers with in-place Q/K normalization and RoPE, followed by NVFP4 K/V page
-  writes, committed at the quantum's retirement.
+- Every view keeps the attention producers as leaf frames: Q4 projection -> in-place Q/K normalization
+  and RoPE, and Q5 projection -> NVFP4 K/V page append, committed at the quantum's retirement.
 
 Full attention stores K and V in sequence-owned 256-token pages. Each D256 head is rotated by
 normalized H256 and encoded as 128 bytes of E2M1 codes plus 16 E4M3 scales (one per contiguous group

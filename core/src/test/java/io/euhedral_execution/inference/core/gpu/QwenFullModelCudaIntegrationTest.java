@@ -499,7 +499,7 @@ class QwenFullModelCudaIntegrationTest {
                             .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.FFN_STREAMED);
                     assertEquals(rows == 1024, streamed, "streamed FFN qualification M=" + rows);
                     assertTrue(selected.instructions().stream()
-                            .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_PRODUCERS));
+                            .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_KV_APPEND));
                     int[] tokens = new int[rows];
                     for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
                     RouteResult expected = runRoute(gpu, model, reference, rows, tokens, 900 + rows);

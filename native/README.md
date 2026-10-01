@@ -32,6 +32,7 @@ root the host loads; its headers are that module's leaves and strategies:
 | `ffn/` | Gate/up SwiGLU, down (unsplit, split-K and reduce) and the streamed FFN regions. |
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
 | `attention/` | NVFP4 KV append, QK norm/RoPE, decode and prefill attention leaves. |
+| `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
 | `experiments/` | Test-only research modules (Q3 cluster, fragment, hierarchical and pipeline kernels); no host dispatch loads them. |
 
 Includes within a folder are relative; includes across folders name the path from the tree root

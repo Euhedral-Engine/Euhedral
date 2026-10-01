@@ -5,14 +5,14 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import org.junit.jupiter.api.Test;
 
-class QwenAttentionProducerTransactionTest {
+class QwenAttentionAppendTransactionTest {
     @Test
-    void cacheCommitWaitsForBothProducers() throws Exception {
+    void cacheCommitWaitsForTheAppendsRetirement() throws Exception {
         runCase(false, false, false);
     }
 
     @Test
-    void failureBetweenPhysicalProducersDoesNotCommit() throws Exception {
+    void failedAppendLaunchDoesNotCommit() throws Exception {
         runCase(true, false, false);
     }
 
@@ -38,7 +38,7 @@ class QwenAttentionProducerTransactionTest {
         try {
             var outcome = runtime.submit(context);
             lattice.drive();
-            assertTrue(gpu.called, "the real stage must submit the producer region");
+            assertTrue(gpu.called, "the real append stage must submit");
             assertFalse(outcome.isDone(), "the quantum waits for its device-completion boundary");
             assertEquals(1, gpu.stream.held());
             assertEquals(0, gpu.cache.length(), "physical writes cannot publish the logical append");
@@ -91,35 +91,23 @@ class QwenAttentionProducerTransactionTest {
         }
 
         @Override
-        public void attentionProducersNvfp4(
-                long input,
-                long q4,
-                long q5,
-                long queryNorm,
-                long keyNorm,
+        public void attentionKvAppendNvfp4(
                 long queryKey,
-                long gate,
+                long gateValue,
                 long keys,
                 long values,
                 int rows,
-                int hidden,
-                int queryHeads,
-                int keyHeads,
-                int headDim,
-                int rotaryDim,
-                long start,
-                float epsilon,
-                double theta,
-                long q4Bytes,
-                long q5Bytes) {
+                int queryWidth,
+                int keyValueWidth,
+                long start) {
             called = true;
             cache = ((AttentionSequenceStates) sequence.kvCacheState()).forLayer(1);
             cacheAddress = keys;
-            assertTrue(cache.capacity() >= rows, "reservation must precede either physical write");
+            assertTrue(cache.capacity() >= rows, "reservation must precede the physical write");
             assertEquals(0, cache.length());
             assertEquals(keys, cache.keyCacheAddress());
             assertEquals(values, cache.valueCacheAddress());
-            if (launchFailure) throw new IllegalStateException("injected failure after key producer");
+            if (launchFailure) throw new IllegalStateException("injected append launch failure");
         }
     }
 }

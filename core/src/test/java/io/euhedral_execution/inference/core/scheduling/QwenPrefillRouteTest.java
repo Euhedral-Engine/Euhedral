@@ -110,7 +110,7 @@ class QwenPrefillRouteTest {
         assertSame(small, plan.forExecution(ExecutionKind.PREFILL, 63));
         assertTrue(has(small, Kind.RESIDUAL_RMS_NORM));
         assertTrue(has(small, Kind.GDN_PROJECT_CONTROL));
-        assertFalse(has(small, Kind.ATTENTION_PRODUCERS));
+        assertTrue(has(small, Kind.ATTENTION_KV_APPEND));
         assertFalse(has(small, Kind.Q3_GATE_UP_SWIGLU));
         assertFalse(has(small, Kind.FFN_STREAMED));
         assertFalse(small.reusePrefillStorage());
@@ -321,15 +321,15 @@ class QwenPrefillRouteTest {
         assertEquals(layers, count(plan, Kind.Q3_GATE_UP_SWIGLU));
         assertFalse(has(plan, Kind.FFN_STREAMED));
         assertFalse(has(plan, Kind.SWIGLU));
-        assertTrue(has(plan, Kind.ATTENTION_PRODUCERS));
-        assertFalse(has(plan, Kind.ATTENTION_KV_APPEND));
-        assertFalse(has(plan, Kind.ATTENTION_QK_NORM_ROPE));
+        // The attention producers stay leaf frames: Q4 -> QK norm/RoPE and Q5 -> cache append.
+        assertTrue(has(plan, Kind.ATTENTION_KV_APPEND));
+        assertTrue(has(plan, Kind.ATTENTION_QK_NORM_ROPE));
+        assertTrue(hasBuffer(plan, Buffer.ATTENTION_QK_NORMALIZED));
         assertTrue(has(plan, Kind.GDN_PROJECT_CONTROL));
         assertFalse(has(plan, Kind.BF16_LINEAR));
         assertFalse(has(plan, Kind.GDN_CONTROL));
         assertTrue(has(plan, Kind.RESIDUAL_RMS_NORM));
-        for (var buffer :
-                List.of(Buffer.GATE_UP, Buffer.A_PROJECTED, Buffer.B_PROJECTED, Buffer.ATTENTION_QK_NORMALIZED)) {
+        for (var buffer : List.of(Buffer.GATE_UP, Buffer.A_PROJECTED, Buffer.B_PROJECTED)) {
             assertFalse(hasBuffer(plan, buffer), buffer.name());
             assertFalse(plan.instructions().stream()
                     .anyMatch(i -> i.inputBuffers().contains(buffer)
