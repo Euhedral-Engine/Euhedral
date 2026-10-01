@@ -19,6 +19,34 @@ class QwenLogitsSamplerTest {
     private static final long LOGITS_ADDRESS = 4096L;
 
     @Test
+    void pairedConversionMatchesTheExactPerValueConversionForEveryBf16PatternAndAnOddTail() {
+        for (int length : new int[] {65_536, 65_537, 1, 3}) {
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment row = arena.allocate((long) length * Short.BYTES, Short.BYTES);
+                for (int index = 0; index < length; index++) {
+                    row.set(ValueLayout.JAVA_SHORT, (long) index * Short.BYTES, (short) (index * 40503 + 7));
+                }
+                if (length >= 65_536) {
+                    for (int bits = 0; bits < 65_536; bits++)
+                        row.set(ValueLayout.JAVA_SHORT, (long) bits * Short.BYTES, (short) bits);
+                }
+                float[] converted = new float[length];
+                QwenLogitsSampler.convertBf16(row, converted);
+                for (int index = 0; index < length; index++) {
+                    short bits = row.get(ValueLayout.JAVA_SHORT, (long) index * Short.BYTES);
+                    float expected = Float.intBitsToFloat(Short.toUnsignedInt(bits) << 16);
+                    if (Float.isNaN(expected)) assertTrue(Float.isNaN(converted[index]), "pattern " + index);
+                    else
+                        assertEquals(
+                                Float.floatToRawIntBits(expected),
+                                Float.floatToRawIntBits(converted[index]),
+                                "length " + length + " index " + index);
+                }
+            }
+        }
+    }
+
+    @Test
     void greedySelectionCopiesOnlyTheFinalBf16VocabularyRowAndPreservesLogitsOwnership() {
         short[] values = {
             bf16(9.0f), bf16(0.0f), bf16(1.0f),

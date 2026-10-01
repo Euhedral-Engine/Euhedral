@@ -6,12 +6,19 @@ import io.euhedral_execution.inference.core.sampling.TokenSampler;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.util.Objects;
 import java.util.function.IntPredicate;
 
 /// Bridges Qwen BF16 logits to the independent host-side token sampler.
 /// Keep one instance per generation so its seeded random state and scratch row are request-local.
 public final class QwenLogitsSampler {
+
+    /// Two adjacent BF16 logits as the device wrote them.
+    private static final ValueLayout.OfInt BF16_PAIR =
+            ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    private static final ValueLayout.OfShort BF16 = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     private final TokenSampler sampler;
     private final float[] scratch;
@@ -56,12 +63,26 @@ public final class QwenLogitsSampler {
     /// Converts a BF16 row exactly to FP32 in the reusable scratch row, masking disallowed tokens.
     private int select(MemorySegment row, IntPredicate allowed) {
         float[] hostLogits = this.scratch;
-        for (int tokenId = 0; tokenId < hostLogits.length; tokenId++) {
-            short bf16Bits = row.get(ValueLayout.JAVA_SHORT, (long) tokenId * Short.BYTES);
-            hostLogits[tokenId] = allowed != null && !allowed.test(tokenId)
-                    ? Float.NEGATIVE_INFINITY
-                    : Float.intBitsToFloat(Short.toUnsignedInt(bf16Bits) << 16);
+        convertBf16(row, hostLogits);
+        if (allowed != null) {
+            for (int tokenId = 0; tokenId < hostLogits.length; tokenId++) {
+                if (!allowed.test(tokenId)) hostLogits[tokenId] = Float.NEGATIVE_INFINITY;
+            }
         }
         return this.sampler.selectToken(hostLogits);
+    }
+
+    /// BF16 is the upper half of FP32, so each value converts exactly by a shift. The row is read two
+    /// values per load; it is read once, from memory that the device just wrote.
+    static void convertBf16(MemorySegment row, float[] out) {
+        int pairs = out.length & ~1;
+        for (int tokenId = 0; tokenId < pairs; tokenId += 2) {
+            int pair = row.get(BF16_PAIR, (long) tokenId * Short.BYTES);
+            out[tokenId] = Float.intBitsToFloat(pair << 16);
+            out[tokenId + 1] = Float.intBitsToFloat(pair & 0xFFFF0000);
+        }
+        if (pairs != out.length) {
+            out[pairs] = Float.intBitsToFloat(Short.toUnsignedInt(row.get(BF16, (long) pairs * Short.BYTES)) << 16);
+        }
     }
 }
