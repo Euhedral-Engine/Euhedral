@@ -1,12 +1,14 @@
 package io.euhedral_execution.inference.core.scheduling.graph;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 
 /// One execution stage of a reusable [StageGraph], scheduled by Euhedral like any other frame.
 ///
-/// A stage submits its device work to its quantum's stream and never runs a successor. After a
+/// A stage submits its device work to a lane of its graph's pool, chosen when it runs, and never runs
+/// a successor. It first awaits, on that lane, the markers of predecessors that ran on other lanes. After a
 /// successful submission it satisfies its outgoing edges; the edge that completes a successor's
 /// incoming set publishes that successor to the source, and Euhedral decides when and where it runs.
 ///
@@ -19,10 +21,12 @@ import java.lang.invoke.VarHandle;
 public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     private static final VarHandle ARRIVALS;
+    private static final VarHandle CONTINUED;
 
     static {
         try {
             ARRIVALS = MethodHandles.lookup().findVarHandle(StageFrame.class, "arrivals", int.class);
+            CONTINUED = MethodHandles.lookup().findVarHandle(StageFrame.class, "continued", int.class);
         } catch (ReflectiveOperationException failure) {
             throw new ExceptionInInitializerError(failure);
         }
@@ -33,9 +37,21 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     private final int inDegree;
     StageFrame[] submittedSuccessors;
     StageGraph.RetiredEdge[] retiredEdges;
+    StageFrame[] submittedPredecessors;
+    /// The only predecessor when this stage continues a linear chain; null otherwise.
+    StageFrame chainPredecessor;
+    /// Recorded on this stage's lane after it submits when it has successors (multi-lane pools only).
+    long marker;
+    /// The lane this stage submitted to in the current quantum. Successors read it after their final
+    /// arrival, which orders it after this stage's submission.
+    int lane;
 
     @SuppressWarnings("unused")
     private volatile int arrivals;
+
+    /// 1 once a successor continued this stage's lane in the current quantum (FORK placement).
+    @SuppressWarnings("unused")
+    private volatile int continued;
 
     boolean attempted;
     boolean submitted;
@@ -60,6 +76,11 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         return this.graph;
     }
 
+    /// The lane stream this stage submits to, selected while [#submit()] runs.
+    protected final GpuStream laneStream() {
+        return this.graph.pool().lane(this.lane);
+    }
+
     public final int stage() {
         return this.stage;
     }
@@ -71,8 +92,27 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         StageGraph owner = this.graph;
         if (owner.stopRequested()) return;
         this.attempted = true;
+        LanePool pool = owner.pool();
+        int lane = owner.spread() ? pool.choose(this.stage, continuedLane(pool, owner)) : owner.home();
+        this.lane = lane;
+        GpuStream stream = pool.lane(lane);
         try {
-            owner.stream().submit(this, owner.overlapLaunches());
+            boolean awaited = false;
+            if (pool.size() > 1) {
+                if (this.submittedPredecessors.length == 0 && lane != owner.home()) {
+                    stream.await(owner.prepared());
+                    awaited = true;
+                }
+                for (StageFrame predecessor : this.submittedPredecessors) {
+                    if (predecessor.lane == lane) continue;
+                    stream.await(predecessor.marker);
+                    awaited = true;
+                }
+                owner.used(lane);
+            }
+            // A launch that waits on another lane does not overlap its stream predecessor.
+            stream.submit(this, owner.overlapLaunches() && !awaited);
+            if (this.marker != 0) stream.mark(this.marker);
         } catch (Throwable failure) {
             // doFinally drops this frame's live count and publishes no successor.
             owner.fail(failure);
@@ -106,8 +146,24 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         return (int) ARRIVALS.getAndAdd(this, 1) + 1 == this.inDegree;
     }
 
+    /// The lane this stage may continue under the pool's placement, or -1.
+    private int continuedLane(LanePool pool, StageGraph owner) {
+        if (pool.placement() == LanePool.Placement.CHAIN) {
+            return this.chainPredecessor == null ? -1 : this.chainPredecessor.lane;
+        }
+        if (pool.placement() != LanePool.Placement.FORK || pool.size() == 1) return -1;
+        if (this.submittedPredecessors.length == 0) return owner.home();
+        // Latest predecessor first: it is the most recent work in its lane.
+        for (int index = this.submittedPredecessors.length - 1; index >= 0; index--) {
+            StageFrame predecessor = this.submittedPredecessors[index];
+            if ((int) CONTINUED.compareAndExchange(predecessor, 0, 1) == 0) return predecessor.lane;
+        }
+        return -1;
+    }
+
     final void reset() {
         ARRIVALS.set(this, 0);
+        CONTINUED.set(this, 0);
         this.attempted = false;
         this.submitted = false;
     }

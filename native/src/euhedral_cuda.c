@@ -212,6 +212,12 @@ int euhedral_cuda_completion_event_record(uint64_t value, uint64_t stream) {
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 
+int euhedral_cuda_stream_wait_event(uint64_t stream, uint64_t value) {
+    if (stream == 0 || value == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    cudaError_t status = cudaStreamWaitEvent((cudaStream_t)(uintptr_t)stream, (cudaEvent_t)(uintptr_t)value, 0);
+    return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
 int euhedral_cuda_completion_event_query(uint64_t value) {
     if (value == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     cudaError_t status = cudaEventQuery((cudaEvent_t)(uintptr_t)value);

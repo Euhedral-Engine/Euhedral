@@ -50,6 +50,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle pdlSelect;
     private final MethodHandle eventCreate;
     private final MethodHandle eventRecord;
+    private final MethodHandle streamWaitEvent;
     private final MethodHandle eventQuery;
     private final MethodHandle eventDestroy;
     private final MethodHandle completionNotify;
@@ -150,6 +151,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     linker,
                     symbols,
                     "euhedral_cuda_completion_event_record",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+            this.streamWaitEvent = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_stream_wait_event",
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
             this.eventQuery = bind(
                     linker,
@@ -476,6 +482,46 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 if (failure instanceof Error error) throw error;
                 throw new GpuMemoryException("CUDA completion registration failed", failure);
             }
+        }
+
+        @Override
+        public long openMarker() {
+            ensureOpen();
+            long event;
+            try {
+                event = (long) eventCreate.invokeExact();
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA marker creation invocation failed", failure);
+            }
+            if (event == 0) throw new GpuMemoryException("CUDA marker creation returned null");
+            return event;
+        }
+
+        @Override
+        public void mark(long marker) {
+            int status;
+            try {
+                status = (int) eventRecord.invokeExact(marker, this.handle);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA marker record invocation failed", failure);
+            }
+            if (status != 0) throw new GpuMemoryException("CUDA marker record", status);
+        }
+
+        @Override
+        public void await(long marker) {
+            int status;
+            try {
+                status = (int) streamWaitEvent.invokeExact(this.handle, marker);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA marker wait invocation failed", failure);
+            }
+            if (status != 0) throw new GpuMemoryException("CUDA marker wait", status);
+        }
+
+        @Override
+        public void closeMarker(long marker) {
+            if (marker != 0) destroyEvent(marker);
         }
 
         @Override

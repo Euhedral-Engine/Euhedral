@@ -24,7 +24,9 @@ class QwenPrefillRouteTest {
         // Same fused topology as short prefill, but its own plan: graphs and logits stay per view.
         assertNotSame(small, decode);
         assertNotSame(plan, decode);
-        assertEquals(kinds(small), kinds(decode));
+        // Decode keeps the GDN Q4 and Q5 projections as separate leaf frames.
+        assertFalse(has(decode, Kind.GDN_PROJECTIONS));
+        assertEquals(count(small, Kind.GDN_PROJECTIONS), count(decode, Kind.Q4_LINEAR) - count(small, Kind.Q4_LINEAR));
         assertEquals(small.bufferSpecs(), decode.bufferSpecs());
         assertTrue(has(decode, Kind.RESIDUAL_RMS_NORM));
         assertTrue(has(decode, Kind.GDN_PROJECT_CONTROL));
@@ -32,6 +34,51 @@ class QwenPrefillRouteTest {
         assertEquals(kinds(reference), kinds(plan));
         assertEquals(reference.bufferSpecs(), plan.bufferSpecs());
         assertFalse(plan.reusePrefillStorage());
+    }
+
+    @Test
+    void topologyOrdersEveryPairOfStagesThatShareStorage() {
+        var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
+        var plan = new QwenExecutionPlan(weights);
+        for (var view : List.of(
+                plan,
+                plan.forExecution(ExecutionKind.DECODE, 1),
+                plan.forExecution(ExecutionKind.PREFILL, 1),
+                plan.forExecution(ExecutionKind.PREFILL, 512),
+                plan.forExecution(ExecutionKind.PREFILL, 1024))) {
+            var topology = view.stageTopology();
+            int count = topology.size();
+            var reach = new java.util.BitSet[count];
+            for (int stage = 0; stage < count; stage++) reach[stage] = new java.util.BitSet(count);
+            for (int stage = 0; stage < count; stage++) {
+                for (int successor : topology.submittedSuccessors(stage)) {
+                    reach[successor].or(reach[stage]);
+                    reach[successor].set(stage);
+                }
+            }
+            var owners = new java.util.EnumMap<Buffer, Buffer>(Buffer.class);
+            if (view.reusePrefillStorage())
+                for (var pair : QwenExecutionPlan.REGION_STORAGE) owners.put(pair.getKey(), pair.getValue());
+            var instructions = view.instructions();
+            for (var later : instructions) {
+                for (var earlier : instructions.subList(0, later.id())) {
+                    boolean conflict = false;
+                    for (Buffer written : later.outputBuffers())
+                        for (Buffer touched : concat(earlier.inputBuffers(), earlier.outputBuffers()))
+                            conflict |= owners.getOrDefault(written, written) == owners.getOrDefault(touched, touched);
+                    for (Buffer read : later.inputBuffers())
+                        for (Buffer written : earlier.outputBuffers())
+                            conflict |= owners.getOrDefault(read, read) == owners.getOrDefault(written, written);
+                    if (conflict) assertTrue(reach[later.id()].get(earlier.id()), earlier + " -> " + later);
+                }
+            }
+        }
+    }
+
+    private static List<Buffer> concat(List<Buffer> first, List<Buffer> second) {
+        var all = new java.util.ArrayList<>(first);
+        all.addAll(second);
+        return all;
     }
 
     @Test

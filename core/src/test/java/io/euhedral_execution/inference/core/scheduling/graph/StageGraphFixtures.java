@@ -54,6 +54,8 @@ final class StageGraphFixtures {
         final AtomicLong tickets = new AtomicLong();
         volatile boolean retireOnNotify;
         volatile RuntimeException registrationFailure;
+        final AtomicLong markers = new AtomicLong();
+        final List<Long> closedMarkers = Collections.synchronizedList(new ArrayList<>());
         int selectedDepth;
         boolean closed;
 
@@ -63,6 +65,29 @@ final class StageGraphFixtures {
             if (this.selectedDepth <= 0) throw new AssertionError("kernel launched without its stream selected");
             this.kernels.add(name);
             this.threads.add(Thread.currentThread().getName());
+        }
+
+        /// Markers are numbered per stream from `base` so a test can tell lanes apart.
+        long base;
+
+        @Override
+        public long openMarker() {
+            return this.base + this.markers.incrementAndGet();
+        }
+
+        @Override
+        public void mark(long marker) {
+            this.kernels.add("mark:" + marker);
+        }
+
+        @Override
+        public void await(long marker) {
+            this.kernels.add("await:" + marker);
+        }
+
+        @Override
+        public void closeMarker(long marker) {
+            this.closedMarkers.add(marker);
         }
 
         @Override
@@ -136,7 +161,7 @@ final class StageGraphFixtures {
             Runnable hook = this.beforeLaunch;
             if (hook != null) hook.run();
             this.launches++;
-            ((RecordingStream) graph().stream()).kernel("k" + stage());
+            ((RecordingStream) laneStream()).kernel("k" + stage());
             RuntimeException injected = this.failure;
             if (injected != null) throw injected;
             Error fatal = this.error;

@@ -16,6 +16,7 @@ import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
 import io.euhedral_execution.inference.core.scheduling.frames.QwenStageFrame;
+import io.euhedral_execution.inference.core.scheduling.graph.LanePool;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -174,7 +175,8 @@ class QwenStageGraphReuseTest {
                 };
             }
         };
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        // One lane: the quantum's single stream is the one that must prove idleness.
+        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu, 1, LanePool.Placement.CHAIN);
         var first = context(plan, 501);
         runtime.submit(first);
         AbstractFrame stage = pullOne();

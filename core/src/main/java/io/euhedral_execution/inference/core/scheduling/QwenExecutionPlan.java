@@ -14,7 +14,9 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFor
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import io.euhedral_execution.inference.core.scheduling.graph.StageTopology;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /// Immutable operation instructions and dependency edges for the loaded Qwen text model.
@@ -207,6 +209,8 @@ public final class QwenExecutionPlan {
     /// qualified streamed-FFN geometry.
     private enum PrefillView {
         SMALL,
+        /// The small topology for decode, with the GDN Q4 and Q5 projections as separate leaf frames.
+        DECODE,
         REGIONS,
         STREAMED
     }
@@ -240,6 +244,71 @@ public final class QwenExecutionPlan {
     private final QwenExecutionPlan decode;
     private final QwenExecutionPlan regionPrefill;
     private final QwenExecutionPlan streamedPrefill;
+
+    /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
+    static final List<Map.Entry<Buffer, Buffer>> REGION_STORAGE = List.of(
+            Map.entry(Buffer.FINAL_HIDDEN_STATE, Buffer.HIDDEN_STATE),
+            Map.entry(Buffer.POST_MIXER_NORMALIZED, Buffer.INPUT_NORMALIZED),
+            Map.entry(Buffer.FFN_DELTA, Buffer.MIXER_DELTA),
+            Map.entry(Buffer.SWIGLU, Buffer.VALUE_Z_PROJECTED),
+            Map.entry(Buffer.FFN_STAGING, Buffer.VALUE_Z_PROJECTED),
+            Map.entry(Buffer.FFN_ACCUMULATORS, Buffer.QK_PROJECTED),
+            Map.entry(Buffer.FFN_PARTIALS, Buffer.QK_PROJECTED));
+
+    /// Adds the ordering edges that a single device stream used to provide implicitly. For every
+    /// storage (aliased buffers count as one when `reuseStorage`), each reader is ordered after the
+    /// last writer, and each writer after the last writer and every reader since it. Edges the
+    /// dependencies already imply transitively are not added.
+    static int[][] withStorageHazards(List<Instruction> instructions, int[][] dependencies, boolean reuseStorage) {
+        int count = instructions.size();
+        Map<Buffer, Buffer> owners = new EnumMap<>(Buffer.class);
+        if (reuseStorage)
+            for (Map.Entry<Buffer, Buffer> pair : REGION_STORAGE) owners.put(pair.getKey(), pair.getValue());
+        int storages = Buffer.values().length;
+        int[] lastWriter = new int[storages];
+        java.util.Arrays.fill(lastWriter, -1);
+        List<List<Integer>> readers = new ArrayList<>(storages);
+        for (int storage = 0; storage < storages; storage++) readers.add(new ArrayList<>());
+        java.util.BitSet[] ancestors = new java.util.BitSet[count];
+        int[][] ordered = new int[count][];
+        for (int stage = 0; stage < count; stage++) {
+            Instruction instruction = instructions.get(stage);
+            java.util.LinkedHashSet<Integer> edges = new java.util.LinkedHashSet<>();
+            java.util.BitSet reach = new java.util.BitSet(count);
+            for (int dependency : dependencies[stage]) {
+                edges.add(dependency);
+                reach.or(ancestors[dependency]);
+                reach.set(dependency);
+            }
+            java.util.TreeSet<Integer> required = new java.util.TreeSet<>();
+            for (Buffer buffer : instruction.inputBuffers()) {
+                int storage = owners.getOrDefault(buffer, buffer).ordinal();
+                if (lastWriter[storage] >= 0) required.add(lastWriter[storage]);
+            }
+            for (Buffer buffer : instruction.outputBuffers()) {
+                int storage = owners.getOrDefault(buffer, buffer).ordinal();
+                if (lastWriter[storage] >= 0) required.add(lastWriter[storage]);
+                required.addAll(readers.get(storage));
+            }
+            // Latest first: an earlier requirement is often already an ancestor of a later one.
+            for (int producer : required.descendingSet()) {
+                if (producer == stage || reach.get(producer)) continue;
+                edges.add(producer);
+                reach.or(ancestors[producer]);
+                reach.set(producer);
+            }
+            ancestors[stage] = reach;
+            ordered[stage] = edges.stream().mapToInt(Integer::intValue).toArray();
+            for (Buffer buffer : instruction.inputBuffers())
+                readers.get(owners.getOrDefault(buffer, buffer).ordinal()).add(stage);
+            for (Buffer buffer : instruction.outputBuffers()) {
+                int storage = owners.getOrDefault(buffer, buffer).ordinal();
+                lastWriter[storage] = stage;
+                readers.get(storage).clear();
+            }
+        }
+        return ordered;
+    }
 
     /// Builds the production plan. For a complete model, prefill quanta automatically select the
     /// retained region architecture by row count and geometry; decode runs the small topology.
@@ -353,7 +422,9 @@ public final class QwenExecutionPlan {
                     .mapToInt(Integer::intValue)
                     .toArray();
         }
-        this.stageTopology = StageTopology.submitted(dependencies);
+        // Stages may run on different device lanes, so the topology also orders every pair of stages
+        // that touch the same storage (one of them writing) which the data dependencies leave unordered.
+        this.stageTopology = StageTopology.submitted(withStorageHazards(this.instructions, dependencies, reuseStorage));
         if (owner != null || !data.fullModel()) {
             this.smallPrefill = null;
             this.decode = null;
@@ -363,7 +434,7 @@ public final class QwenExecutionPlan {
         }
         QwenConfig config = weights.config();
         this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
-        this.decode = prefillPlan(weights, data, PrefillView.SMALL, this);
+        this.decode = prefillPlan(weights, data, PrefillView.DECODE, this);
         this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
         this.streamedPrefill =
                 config.hiddenSize() == STREAMED_FFN_HIDDEN && config.intermediateSize() == STREAMED_FFN_INTERMEDIATE
@@ -387,7 +458,7 @@ public final class QwenExecutionPlan {
     /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows,
     /// F attention producers with direct cache writes plus B gate/up+SwiGLU (or C streamed FFN).
     private static PlanData prefillView(PlanData data, PrefillView view) {
-        boolean producers = view != PrefillView.SMALL;
+        boolean producers = view != PrefillView.SMALL && view != PrefillView.DECODE;
         boolean streamed = view == PrefillView.STREAMED;
         List<Instruction> source = earlyControlOrder(data.instructions());
         List<Instruction> result = new ArrayList<>();
@@ -431,7 +502,8 @@ public final class QwenExecutionPlan {
                     && next != null
                     && next.kind() == Kind.Q5_LINEAR
                     && index + 2 < source.size()
-                    && source.get(index + 2).kind() == Kind.GDN_CONVOLUTION) {
+                    && source.get(index + 2).kind() == Kind.GDN_CONVOLUTION
+                    && view != PrefillView.DECODE) {
                 if (!next.dependencies().equals(first.dependencies())
                         || !first.inputBuffers().equals(next.inputBuffers())
                         || !first.outputBuffers().equals(List.of(Buffer.QK_PROJECTED))

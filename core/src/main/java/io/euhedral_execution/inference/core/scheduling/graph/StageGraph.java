@@ -5,15 +5,21 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /// One reusable runtime instance of a static stage DAG.
 ///
 /// The graph is built once: its stage frames, their successor references, and one frame per
-/// device-completion edge are wired at construction and rebound to each quantum. A quantum owns the
-/// graph's stream while it runs, so every stage submits to the same device ordering whichever worker
-/// Euhedral schedules it on.
+/// device-completion edge are wired at construction and rebound to each quantum.
+///
+/// Stages submit to the lanes of a [LanePool], choosing a lane each time they run. The graph's home
+/// lane prepares the quantum and carries its retirement boundary. Every stage with successors records
+/// a reusable marker after submitting; a successor that runs on another lane awaits it on the device,
+/// and a root on another lane awaits the quantum's preparation marker. Before the retirement boundary
+/// every other lane the quantum used joins the home lane the same way, so that boundary covers all of
+/// the quantum's device work.
 ///
 /// Admission publishes only the root stages. A stage that submitted successfully satisfies its
 /// outgoing edges; a submission edge is satisfied at once and a device-completion edge when the
@@ -43,7 +49,13 @@ public final class StageGraph implements AutoCloseable {
     private static final long NO_TICKET = 0L;
 
     private final StageTopology topology;
-    private final GpuStream stream;
+    private final LanePool pool;
+    private final boolean ownsPool;
+    private final int home;
+    private final long prepared;
+    private final long[] tails;
+    private final AtomicLong usedLanes = new AtomicLong();
+    private final boolean spread;
     private final QwenExecutionSource source;
     private final Recycler recycler;
     private final long routingSeed = ThreadLocalRandom.current().nextLong();
@@ -54,14 +66,50 @@ public final class StageGraph implements AutoCloseable {
     private StageQuantum quantum;
     private boolean overlap;
 
+    /// Builds a graph that owns one stream: every stage keeps that stream's order.
     public StageGraph(
             StageTopology topology,
             StageFactory factory,
             GpuStream stream,
             QwenExecutionSource source,
             Recycler recycler) {
+        this(
+                topology,
+                factory,
+                source,
+                recycler,
+                LanePool.single(Objects.requireNonNull(stream, "stream")),
+                true,
+                true);
+    }
+
+    /// Builds a graph whose stages run on the lanes of a shared `pool`, which outlives the graph. With
+    /// `spread`, stages are placed over the pool's lanes; otherwise every stage keeps the graph's home
+    /// lane, so the graph still has its own device ordering but no cross-lane edges.
+    public StageGraph(
+            StageTopology topology,
+            StageFactory factory,
+            LanePool pool,
+            boolean spread,
+            QwenExecutionSource source,
+            Recycler recycler) {
+        this(topology, factory, source, recycler, pool, false, spread);
+    }
+
+    private StageGraph(
+            StageTopology topology,
+            StageFactory factory,
+            QwenExecutionSource source,
+            Recycler recycler,
+            LanePool pool,
+            boolean ownsPool,
+            boolean spread) {
+        this.spread = spread;
         this.topology = Objects.requireNonNull(topology, "topology");
-        this.stream = Objects.requireNonNull(stream, "stream");
+        this.pool = Objects.requireNonNull(pool, "pool");
+        this.ownsPool = ownsPool;
+        this.home = pool.nextHome();
+        this.tails = new long[pool.size()];
         this.source = Objects.requireNonNull(source, "source");
         this.recycler = Objects.requireNonNull(recycler, "recycler");
         Objects.requireNonNull(factory, "factory");
@@ -73,18 +121,56 @@ public final class StageGraph implements AutoCloseable {
             }
             this.stages[stage] = frame;
         }
+        int[] predecessorCounts = new int[this.stages.length];
         for (int stage = 0; stage < this.stages.length; stage++) {
             int[] submitted = topology.submittedSuccessors(stage);
             StageFrame[] successors = new StageFrame[submitted.length];
-            for (int index = 0; index < submitted.length; index++) successors[index] = this.stages[submitted[index]];
+            for (int index = 0; index < submitted.length; index++) {
+                successors[index] = this.stages[submitted[index]];
+                predecessorCounts[submitted[index]]++;
+            }
             this.stages[stage].submittedSuccessors = successors;
             int[] retired = topology.retiredSuccessors(stage);
             RetiredEdge[] edges = new RetiredEdge[retired.length];
             for (int index = 0; index < retired.length; index++) {
-                edges[index] = new RetiredEdge(this, this.stages[retired[index]]);
+                edges[index] = new RetiredEdge(this, this.stages[stage], this.stages[retired[index]]);
             }
             this.stages[stage].retiredEdges = edges;
         }
+        for (int stage = 0; stage < this.stages.length; stage++) {
+            this.stages[stage].submittedPredecessors = new StageFrame[predecessorCounts[stage]];
+            predecessorCounts[stage] = 0;
+        }
+        for (StageFrame producer : this.stages) {
+            for (StageFrame successor : producer.submittedSuccessors) {
+                successor.submittedPredecessors[predecessorCounts[successor.stage()]++] = producer;
+            }
+        }
+        // A stage continues a linear chain when its only predecessor has no other successor.
+        for (StageFrame stage : this.stages) {
+            stage.chainPredecessor = stage.submittedPredecessors.length == 1
+                            && stage.submittedPredecessors[0].submittedSuccessors.length == 1
+                    ? stage.submittedPredecessors[0]
+                    : null;
+        }
+        long preparedMarker = 0;
+        try {
+            if (pool.size() > 1) {
+                preparedMarker = pool.lane(this.home).openMarker();
+                for (StageFrame stage : this.stages) {
+                    if (stage.submittedSuccessors.length > 0)
+                        stage.marker = pool.lane(this.home).openMarker();
+                }
+                for (int lane = 0; lane < this.tails.length; lane++) {
+                    if (lane != this.home) this.tails[lane] = pool.lane(lane).openMarker();
+                }
+            }
+        } catch (RuntimeException | Error failure) {
+            this.prepared = preparedMarker;
+            closeMarkers();
+            throw failure;
+        }
+        this.prepared = preparedMarker;
         int[] rootStages = topology.roots();
         this.roots = new StageFrame[rootStages.length];
         for (int index = 0; index < rootStages.length; index++) this.roots[index] = this.stages[rootStages[index]];
@@ -95,9 +181,41 @@ public final class StageGraph implements AutoCloseable {
         return this.topology;
     }
 
-    /// The device ordering that every stage of the bound quantum submits to.
+    /// The home lane: the device ordering that prepares and retires the bound quantum.
     public GpuStream stream() {
-        return this.stream;
+        return this.pool.lane(this.home);
+    }
+
+    LanePool pool() {
+        return this.pool;
+    }
+
+    int home() {
+        return this.home;
+    }
+
+    /// Whether stages are placed over the pool's lanes; otherwise they all run on the home lane.
+    boolean spread() {
+        return this.spread;
+    }
+
+    long prepared() {
+        return this.prepared;
+    }
+
+    void used(int lane) {
+        long bit = 1L << lane;
+        if ((this.usedLanes.get() & bit) == 0) this.usedLanes.getAndUpdate(mask -> mask | bit);
+    }
+
+    /// Proves every lane this quantum used idle after a failed submission or boundary registration.
+    void recover(Throwable failure) {
+        long lanes = this.usedLanes.get() | (1L << this.home);
+        while (lanes != 0) {
+            int lane = Long.numberOfTrailingZeros(lanes);
+            lanes &= lanes - 1;
+            this.pool.lane(lane).recover(failure);
+        }
     }
 
     /// The quantum currently bound to this graph.
@@ -129,6 +247,9 @@ public final class StageGraph implements AutoCloseable {
         this.overlap = quantum.overlapLaunches();
         for (StageFrame stage : this.stages) stage.reset();
         this.retirement.reset();
+        this.usedLanes.set(1L << this.home);
+        // Roots on other lanes order behind the preparation already submitted to the home lane.
+        if (this.prepared != 0) this.pool.lane(this.home).mark(this.prepared);
         // Admission holds one count so that fast roots cannot retire the quantum before all publish.
         this.live.set(this.roots.length + 1);
         for (StageFrame root : this.roots) this.source.publish(root);
@@ -183,11 +304,20 @@ public final class StageGraph implements AutoCloseable {
     /// No stage of this quantum can run again. Arms the quantum's single device-completion boundary.
     private void quiesce() {
         Retirement terminal = this.retirement;
+        GpuStream home = this.pool.lane(this.home);
         try {
-            this.stream.notifyRetired(terminal);
+            // Every other lane this quantum used joins the home lane on the device.
+            long others = this.usedLanes.get() & ~(1L << this.home);
+            while (others != 0) {
+                int lane = Long.numberOfTrailingZeros(others);
+                others &= others - 1;
+                this.pool.lane(lane).mark(this.tails[lane]);
+                home.await(this.tails[lane]);
+            }
+            home.notifyRetired(terminal);
         } catch (RuntimeException | Error failure) {
             this.quantum.fail(failure);
-            this.stream.recover(failure);
+            recover(failure);
             this.source.publish(terminal);
         }
     }
@@ -196,7 +326,8 @@ public final class StageGraph implements AutoCloseable {
     /// failure before recycling is recorded on the quantum, whose outcome is always published.
     void retire(long ticket) {
         StageQuantum retiring = this.quantum;
-        Throwable deviceFailure = ticket == NO_TICKET ? null : this.stream.confirmRetired(ticket);
+        Throwable deviceFailure =
+                ticket == NO_TICKET ? null : this.pool.lane(this.home).confirmRetired(ticket);
         if (deviceFailure != null) retiring.fail(deviceFailure);
         boolean committed = !retiring.stopRequested();
         for (StageFrame stage : this.stages) {
@@ -224,11 +355,28 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Releases the graph's stream. Only an unbound graph whose work has retired may be closed.
+    /// Releases the graph's markers, and its stream when it owns one. Only an unbound graph whose work
+    /// has retired may be closed.
     @Override
     public void close() {
         if (this.quantum != null) throw new IllegalStateException("stage graph still runs a quantum");
-        this.stream.close();
+        closeMarkers();
+        if (this.ownsPool) this.pool.close();
+    }
+
+    private void closeMarkers() {
+        GpuStream any = this.pool.lane(this.home);
+        for (StageFrame stage : this.stages) {
+            if (stage == null || stage.marker == 0) continue;
+            any.closeMarker(stage.marker);
+            stage.marker = 0;
+        }
+        for (int lane = 0; lane < this.tails.length; lane++) {
+            if (this.tails[lane] == 0) continue;
+            any.closeMarker(this.tails[lane]);
+            this.tails[lane] = 0;
+        }
+        if (this.prepared != 0) any.closeMarker(this.prepared);
     }
 
     /// The single device-completion boundary of a quantum. The driver callback only publishes it.
@@ -283,23 +431,28 @@ public final class StageGraph implements AutoCloseable {
     /// it, and an ordinary worker confirms retirement before satisfying the consumer's edge.
     static final class RetiredEdge extends AbstractFrame implements GpuStream.RetirementListener {
         private final StageGraph graph;
+        private final StageFrame producer;
         private final StageFrame consumer;
+        private GpuStream stream;
         private long ticket;
 
-        RetiredEdge(StageGraph graph, StageFrame consumer) {
+        RetiredEdge(StageGraph graph, StageFrame producer, StageFrame consumer) {
             super(0L);
             this.graph = graph;
+            this.producer = producer;
             this.consumer = consumer;
             randomizeHash(graph.routingSeed);
         }
 
+        /// Arms the boundary on the lane the producer submitted to.
         void arm() {
             this.graph.addLive();
+            this.stream = this.graph.pool.lane(this.producer.lane);
             try {
-                this.graph.stream.notifyRetired(this);
+                this.stream.notifyRetired(this);
             } catch (RuntimeException | Error failure) {
                 this.graph.fail(failure);
-                this.graph.stream.recover(failure);
+                this.graph.recover(failure);
                 this.graph.stageFinished();
             }
         }
@@ -313,7 +466,7 @@ public final class StageGraph implements AutoCloseable {
 
         @Override
         public void execute() {
-            Throwable failure = this.graph.stream.confirmRetired(this.ticket);
+            Throwable failure = this.stream.confirmRetired(this.ticket);
             if (failure != null) {
                 this.graph.fail(failure);
                 return;

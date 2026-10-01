@@ -122,6 +122,39 @@ class StageGraphTest {
     }
 
     @Test
+    void crossLaneDependenciesAreOrderedByMarkersAndUsedLanesJoinTheHomeLaneBeforeRetirement() {
+        RecordingStream home = this.stream, side = new RecordingStream(), idle = new RecordingStream();
+        side.base = 100;
+        idle.base = 200;
+        // Stage 2 runs on lane 1; every other stage on lane 0 (the graph's home lane). Lane 2 stays unused.
+        LanePool pool = new LanePool(
+                new RecordingStream[] {home, side, idle}, LanePool.Placement.RANDOM, stage -> stage == 2 ? 1 : 0);
+        StageGraph graph =
+                new StageGraph(DIAMOND, StageGraphFixtures.TestStage::new, pool, true, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        run(take(this.source).getFirst());
+        take(this.source);
+        run(stage(graph, 2));
+        run(stage(graph, 1));
+        run(take(this.source).getFirst());
+        // Markers 1-4: preparation, then stages 0, 1 and 2; lanes 1 and 2 get tails 101 and 201.
+        assertEquals(List.of("await:2", "k2", "mark:4"), side.kernels.subList(0, 3));
+        assertEquals(List.of("mark:1", "k0", "mark:2", "k1", "mark:3"), home.kernels.subList(0, 5));
+        assertEquals("await:4", home.kernels.get(5), "stage 3 awaits the side lane's producer");
+        assertEquals("k3", home.kernels.get(6));
+        assertEquals(List.of("mark:101"), side.kernels.subList(3, 4), "quiesce marks the used side lane");
+        assertEquals("await:101", home.kernels.get(7));
+        assertTrue(idle.kernels.isEmpty(), "an unused lane is not joined");
+        assertEquals(1, home.armed());
+        home.retireNext(false);
+        drain(this.source);
+        assertEquals("SUCCESS", quantum.outcome.join());
+        graph.close();
+        assertFalse(home.closed, "a shared pool outlives its graphs");
+        assertEquals(Set.of(1L, 2L, 3L, 4L, 101L, 201L), new HashSet<>(home.closedMarkers));
+    }
+
+    @Test
     void submissionEdgeReleasesTheSuccessorBeforeTheProducersDeviceWorkRetires() {
         StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
         TestQuantum quantum = start(graph);
