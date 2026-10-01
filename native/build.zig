@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
         "primitives/packed_load.cuh", "primitives/activation.cuh",
         "primitives/decode.cuh", "primitives/staging.cuh", "primitives/prefetch.cuh", "primitives/mma.cuh", "primitives/mma_leaf.cuh",
         "primitives/accumulation.cuh", "primitives/writeback.cuh",
-        "strategies/scalar.cuh", "strategies/decode.cuh", "strategies/decode_wide.cuh", "strategies/prefill.cuh", "strategies/k32_prefill.cuh", "strategies/cluster_reuse.cuh",
+        "strategies/scalar.cuh", "strategies/decode.cuh", "strategies/decode_wide.cuh", "strategies/decode_contiguous.cuh", "strategies/prefill.cuh", "strategies/k32_prefill.cuh", "strategies/cluster_reuse.cuh",
         "strategies/hierarchical.cuh", "strategies/fragments.cuh",
         "pipeline_kernels.cu", "strategies/pipelined_fragments.cuh",
     };

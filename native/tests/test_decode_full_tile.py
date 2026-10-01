@@ -5,7 +5,7 @@ import random
 import struct
 import unittest
 
-from test_q3_primitives import Gpu, NVRTC, SKIP_REASON, PROBES
+from test_q3_primitives import Gpu, NVRTC, SKIP_REASON, PROBES, bf16_value
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -141,6 +141,53 @@ extern "C" __global__ void policy(unsigned int* out,unsigned int r,unsigned int 
                     finally:
                         gpu.free(x)
                         gpu.free(w)
+        finally:
+            gpu.close()
+
+    def test_q3_contiguous_decode_stays_within_one_bf16_ulp_of_the_exact_oracle(self):
+        # Contiguous lane ownership reorders the FP32 accumulation, so results are not bitwise; every
+        # finite output must stay within one BF16 ulp of euhedral_q3_decode_1, few may differ at all,
+        # and non-finite activations must make the same outputs non-finite.
+        gpu = Gpu(b'#include "q3/kernels.cu"\n')
+        try:
+            rng = random.Random(1201)
+            differing = total = 0
+            for width, outputs in [(1024, 16), (2048, 48), (5120, 4096), (6144, 1024), (17408, 512)]:
+                groups = width // 64
+                scale = (outputs * groups * 24 + 255) & ~255
+                payload = bytearray(rng.randrange(256) for _ in range(scale + outputs * groups * 2))
+                # Scales are finite, as the artifact writes them; special activations cover inf and NaN.
+                for mode in ['finite', 'special']:
+                    for i in range(outputs * groups):
+                        struct.pack_into('<H', payload, scale + i * 2, rng.randrange(0x2000, 0x2c00) | (rng.randrange(2) << 15))
+                    w = gpu.upload(payload)
+                    values = [rng.randrange(0x3c00, 0x4100) | (rng.randrange(2) << 15) for _ in range(width)]
+                    if mode == 'special':
+                        values[rng.randrange(width)] = rng.choice([0x7f80, 0xff80, 0x7fc1])
+                    x = gpu.upload(struct.pack(f'<{width}H', *values))
+                    try:
+                        result = []
+                        for symbol, rows_per_cta in [('euhedral_q3_decode_1', 8), ('euhedral_q3_decode_contiguous', 16)]:
+                            y = gpu.zeros(outputs * 2, fill=0xa5)
+                            try:
+                                gpu.launch(symbol, outputs // rows_per_cta, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(1),
+                                                                           C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(scale)])
+                                result.append(struct.unpack(f'<{outputs}H', gpu.download(y, outputs * 2)))
+                            finally:
+                                gpu.free(y)
+                        for oracle, actual in zip(*result):
+                            o, a = bf16_value(oracle), bf16_value(actual)
+                            finite = o == o and abs(o) != float('inf')
+                            self.assertEqual(finite, a == a and abs(a) != float('inf'), (width, outputs, mode))
+                            if finite:
+                                total += 1
+                                if oracle != actual:
+                                    differing += 1
+                                    self.assertLessEqual(abs(a - o), abs(o) / 128 + 1e-30, (width, outputs, mode, o, a))
+                    finally:
+                        gpu.free(x)
+                        gpu.free(w)
+            self.assertLess(differing, total / 1000, (differing, total))
         finally:
             gpu.close()
 

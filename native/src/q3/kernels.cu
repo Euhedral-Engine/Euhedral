@@ -1,6 +1,7 @@
 #include "strategies/scalar.cuh"
 #include "strategies/decode.cuh"
 #include "strategies/decode_wide.cuh"
+#include "strategies/decode_contiguous.cuh"
 #include "strategies/prefill.cuh"
 #include "strategies/k32_prefill.cuh"
 #include "pdl.cuh"
@@ -37,6 +38,16 @@ EUHEDRAL_Q3_DECODE_KERNEL(1)
 EUHEDRAL_Q3_DECODE_KERNEL(2)
 EUHEDRAL_Q3_DECODE_KERNEL(4)
 #undef EUHEDRAL_Q3_DECODE_KERNEL
+
+// Single-row decode with contiguous lane ownership (strategies/decode_contiguous.cuh): each lane
+// owns 32 whole codes. Not bitwise: FP32 accumulation is reordered relative to the exact oracle
+// kernels below. 128 threads, 16 rows per CTA. Optional symbol: host dispatch selects it for the
+// shapes in euhedral_q3_decode_contiguous_shape unless exact decode is selected.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_decode_contiguous(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
+    q3::contiguous_decode(input, weights, output, in_features, out_features, scale_offset);
+}
 
 // Single-row decode with warp-local wide streaming (strategies/decode_wide.cuh): every lane loads
 // 16 contiguous weight bytes and each warp stages its own rows. Bitwise identical to

@@ -2,6 +2,9 @@
 #include "q3_prefill_policy.h"
 #include <cuda_runtime_api.h>
 #include <math.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -17,8 +20,31 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction function;
-static CUfunction decode1, decode2, decode4, decode_wide, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
+static CUfunction decode1, decode2, decode4, decode_wide, decode_contiguous, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+/* Single-row decode numerics: 0 selects the contiguous kernel (reordered FP32 accumulation), 1 the
+ * exact kernels that reproduce the scalar reference bit for bit. -1 until first read; the initial
+ * value comes from EUHEDRAL_Q3_DECODE=EXACT. */
+static atomic_int exact_decode = -1;
+
+static int q3_decode_exact(void) {
+    int value = atomic_load(&exact_decode);
+    if (value < 0) {
+        const char* mode = getenv("EUHEDRAL_Q3_DECODE");
+        int initial = mode != NULL && strcmp(mode, "EXACT") == 0;
+        atomic_compare_exchange_strong(&exact_decode, &value, initial);
+        value = atomic_load(&exact_decode);
+    }
+    return value;
+}
+
+/* Selects exact (nonzero) or contiguous (zero) single-row decode for later launches in this process
+ * and returns the previous selection. Intended for numerical comparisons against the exact oracle. */
+int euhedral_cuda_q3_decode_select_exact(int exact) {
+    int previous = q3_decode_exact();
+    atomic_store(&exact_decode, exact != 0);
+    return previous;
+}
 static CUfunction optional_kernel(const char* name) {
     CUfunction loaded = NULL;
     return cuModuleGetFunction(&loaded, module, name) == CUDA_SUCCESS ? loaded : NULL;
@@ -30,6 +56,7 @@ static void initialize(void) {
     decode2 = optional_kernel("euhedral_q3_decode_2");
     decode4 = optional_kernel("euhedral_q3_decode_4");
     decode_wide = optional_kernel("euhedral_q3_decode_wide");
+    decode_contiguous = optional_kernel("euhedral_q3_decode_contiguous");
     prefill = optional_kernel("euhedral_q3_prefill");
     prefill_s104 = optional_kernel("euhedral_q3_prefill_s104");
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
@@ -40,6 +67,7 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(decode2);
     euhedral_cuda_pdl_register(decode4);
     euhedral_cuda_pdl_register(decode_wide);
+    euhedral_cuda_pdl_register(decode_contiguous);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -95,9 +123,13 @@ static int linear_q3(const void* input, const void* weights, void* output,
     unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
     unsigned long long scale_arg = scale_offset;
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
-    int wide_decode = mode == 1 && decode_wide != NULL && ((uintptr_t)weights & 15u) == 0u
+    int contiguous = mode == 1 && decode_contiguous != NULL && !q3_decode_exact()
+            && ((uintptr_t)input & 15u) == 0u && ((uintptr_t)weights & 3u) == 0u
+            && euhedral_q3_decode_contiguous_shape(rows, in_features, out_features);
+    if (contiguous) grid = out_features / 16u;
+    int wide_decode = !contiguous && mode == 1 && decode_wide != NULL && ((uintptr_t)weights & 15u) == 0u
             && euhedral_q3_decode_wide_shape(rows, in_features, out_features);
-    CUfunction selected = wide_decode ? decode_wide
+    CUfunction selected = contiguous ? decode_contiguous : wide_decode ? decode_wide
             : mode == 1 ? (row_tile == 1 ? decode1 : row_tile == 2 ? decode2 : decode4)
             : mode == 0 ? function
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64_K32_CB ? prefill64_k32_cb

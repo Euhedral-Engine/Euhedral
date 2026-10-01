@@ -760,20 +760,18 @@ class QwenFullModelCudaIntegrationTest {
                         } else if (requirement == QwenLogitsRequirement.LAST_TOKEN) {
                             assertEquals(config.vocabSize(), run.logits().length);
                             reportError("last-row-" + tokenCount, expectedLastRow, run.logits());
-                            if (tokenCount == 3) assertArrayEquals(expectedLastRow, run.logits());
-                            else {
-                                // WMMA versus decode measured max 0.0625 and RMS 0.000818.
-                                // Bound rounding by one BF16 step, with an absolute floor
-                                // for near-zero cancellation; transformer state stays exact.
-                                for (int i = 0; i < expectedLastRow.length; i++) {
-                                    short expected = expectedLastRow[i], actual = run.logits()[i];
-                                    float error = Math.abs(bf16ToFloat(expected) - bf16ToFloat(actual));
-                                    boolean adjacent = (expected < 0) == (actual < 0)
-                                            && Math.abs((expected & 0xffff) - (actual & 0xffff)) <= 1;
-                                    assertTrue(
-                                            Float.isFinite(error) && (error <= 0.001f || adjacent),
-                                            "last row index " + i);
-                                }
+                            // The single-row LM head is the contiguous Q3 decode kernel; all-token
+                            // logits use the exact multi-row decode (3 rows) or WMMA (33 rows), which
+                            // measured max 0.0625 and RMS 0.000818 against decode. Bound rounding by
+                            // one BF16 step, with an absolute floor for near-zero cancellation;
+                            // transformer state stays exact.
+                            for (int i = 0; i < expectedLastRow.length; i++) {
+                                short expected = expectedLastRow[i], actual = run.logits()[i];
+                                float error = Math.abs(bf16ToFloat(expected) - bf16ToFloat(actual));
+                                boolean adjacent = (expected < 0) == (actual < 0)
+                                        && Math.abs((expected & 0xffff) - (actual & 0xffff)) <= 1;
+                                assertTrue(
+                                        Float.isFinite(error) && (error <= 0.001f || adjacent), "last row index " + i);
                             }
                         } else {
                             assertTrue(run.context().logitsOutput().isEmpty());
