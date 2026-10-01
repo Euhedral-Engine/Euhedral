@@ -176,6 +176,36 @@ class Q45KernelTest(unittest.TestCase):
                         self.assert_written(expected)
                         self.assertEqual(actual, expected)
 
+    def test_contiguous_decode_stays_within_one_bf16_ulp_of_the_exact_decode(self):
+        # Contiguous lane ownership reorders the FP32 accumulation: every finite output stays within
+        # one BF16 ulp of euhedral_q*_decode_1, few differ, and non-finite activations make the same
+        # outputs non-finite.
+        f = lambda bits: struct.unpack('<f', struct.pack('<I', bits << 16))[0]
+        differing = total = 0
+        for bits in (4, 5):
+            for width, outputs in [(1024, 8), (2048, 24), (5120, 4104)]:
+                for mode in ('finite', 'special'):
+                    with contextlib.ExitStack() as stack:
+                        payload = make_weights(self.rng, bits, width, outputs,
+                                               lambda i: self.rng.randrange(0x2000, 0x2c00) | (self.rng.randrange(2) << 15))
+                        values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(width)]
+                        if mode == 'special':
+                            values[self.rng.randrange(width)] = self.rng.choice([0x7F80, 0xFF80, 0x7FC1])
+                        x = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values)))
+                        w = self.owned(stack, self.gpu.upload(payload))
+                        expected = self.run_kernel(stack, f"euhedral_q{bits}_decode_1", outputs // 8, x, w, 1, width, outputs)
+                        actual = self.run_kernel(stack, f"euhedral_q{bits}_decode_contiguous", outputs // 8, x, w, 1, width, outputs)
+                        for e, a in zip(struct.unpack(f"<{outputs}H", expected), struct.unpack(f"<{outputs}H", actual)):
+                            o, c = f(e), f(a)
+                            finite = o == o and abs(o) != float('inf')
+                            self.assertEqual(finite, c == c and abs(c) != float('inf'), (bits, width, mode))
+                            if finite:
+                                total += 1
+                                if e != a:
+                                    differing += 1
+                                    self.assertLessEqual(abs(c - o), abs(o) / 128 + 1e-30, (bits, width, o, c))
+        self.assertLess(differing, max(1, total // 1000), (differing, total))
+
     def test_two_byte_aligned_input_takes_sequential_staging(self):
         for bits in (4, 5):
             for rows, width, outputs in [(1, 256, 16), (67, 256, 35)]:

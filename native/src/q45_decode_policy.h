@@ -13,4 +13,11 @@ static inline int euhedral_q45_decode_wide_shape(uint32_t rows, uint32_t in_feat
             && out_features % 8u == 0 && out_features / 8u > 512u;
 }
 
+// Single-row Q4/Q5 decode uses the contiguous-ownership kernel (8 rows per CTA, 1024-K slices) unless
+// exact numerics are selected. With cold weights: Q5 5120 -> 12288 64 -> 52 us, 5120 -> 7168
+// 42 -> 31 us; Q4 5120 -> 4096 21 -> 15 us, 5120 -> 7168 34 -> 25 us.
+static inline int euhedral_q45_decode_contiguous_shape(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    return rows == 1 && in_features != 0 && in_features % 1024u == 0 && out_features != 0 && out_features % 8u == 0;
+}
+
 #endif

@@ -348,6 +348,10 @@ the represented-NVFP4 tolerance for decode attention.
   layer) also replaces the streamed regions and their child stream (1400 us), so only 1024-row
   quanta still stream. Prefill 64 +6.4%, 256 +3.9%, 1024 +1.2%; time to first token for a 64-token
   prompt -5.3%. Splitting gate/up measured flat or slower.
+- **Q4/Q5 decode, contiguous ownership.** The same shape as Q3: a half group is 16 code bytes plus
+  one 32-bit word of fifth bits, so a lane reads its 32 codes with one 16-byte load
+  (`euhedral_q4_decode_contiguous`, `euhedral_q5_decode_contiguous`): Q5 5120 -> 12288 64 -> 52 us,
+  Q4 5120 -> 4096 21 -> 15 us, near 800 GB/s. Decode 64 + 128 +6.2%, 1024 + 128 +7.2%.
 - **One MMA per weight in prefill.** Every prefill GEMM (FFN gate/up and down, the Q3 mixer, Q3
   and Q4/Q5 projections) staged each dequantized weight as two BF16 values whose sum is code * scale
   exactly and ran an MMA on each; the kernels were tensor-pipe bound. They now stage only the BF16
@@ -359,7 +363,7 @@ the represented-NVFP4 tolerance for decode attention.
   the previous three inputs; 32-row blocks give 1280 CTAs at 512 rows (238 -> 68 us).
 
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
-Q3 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under
+Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under
 `EUHEDRAL_EXACT=1`, and `RelaxedNumericsDriftCudaIntegrationTest` compares the two settings end to
 end. With all of them, a 256-token prefill and 2048 forced decode positions give a median
 hidden-state difference of 6.0%, KL 3.3e-3 and the same top-1 token at 96.8% of positions, with no
