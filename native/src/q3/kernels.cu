@@ -188,9 +188,15 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_k32_cb_
             out_features, scale_offset, nullptr, storage);
 }
 
-// Relaxed 128 x 64 prefill on the balanced tile engine (ffn/balanced.cuh with the Q3 producer of
+// Relaxed 64- and 128-row prefill on the balanced tile engine (ffn/balanced.cuh with the Q3 producer of
 // ffn/formats.cuh). Same BF16 hi weights and K16 order as euhedral_q3_prefill_64_k32_cb, so it
 // matches that kernel bit for bit. Requires in_features % 32 == 0 and a 16-byte aligned input.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64x64(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
+    __shared__ balanced::Storage<2> stage;
+    balanced::run<qwen_ffn_tiles::Q3B, 2>(input, weights, output, rows, in_features, out_features, scale_offset, stage);
+}
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_128x64(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {

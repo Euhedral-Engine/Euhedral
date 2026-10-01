@@ -22,7 +22,7 @@ static CUmodule module;
 static CUfunction function;
 static CUfunction decode1, decode2, decode4, decode_wide, decode_contiguous, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
 static CUfunction prefill_exact, prefill64_exact, prefill64_k32_cb_exact, prefill_s104_exact;
-static CUfunction prefill_engine;
+static CUfunction prefill_engine, prefill_engine64;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 /* Alias of euhedral_cuda_select_exact_numerics, kept for existing callers. */
 int euhedral_cuda_q3_decode_select_exact(int exact) {
@@ -50,6 +50,7 @@ static void initialize(void) {
     prefill64_exact = optional_kernel("euhedral_q3_prefill_64_exact");
     prefill64_k32_cb_exact = optional_kernel("euhedral_q3_prefill_64_k32_cb_exact");
     prefill_engine = optional_kernel("euhedral_q3_prefill_128x64");
+    prefill_engine64 = optional_kernel("euhedral_q3_prefill_64x64");
     // The decode kernels begin with euhedral_pdl_begin() (see cuda_kernel_loader.h).
     euhedral_cuda_pdl_register(decode1);
     euhedral_cuda_pdl_register(decode2);
@@ -133,12 +134,14 @@ static int linear_q3(const void* input, const void* weights, void* output,
                 : selected == prefill ? prefill_exact : NULL;
         if (exact != NULL) selected = exact;
     }
-    // Relaxed numerics: the qualified mixer shape runs on the 128 x 64 tile engine.
-    else if (mode == 2 && prefill_engine != NULL && ((uintptr_t)input & 15u) == 0u
-            && ((uintptr_t)weights & 3u) == 0u
-            && euhedral_q3_prefill_engine_shape(mode, rows, in_features, out_features)) {
-        selected = prefill_engine;
-        grid = (((uint64_t)rows + 127u) / 128u) * (((uint64_t)out_features + 63u) / 64u);
+    // Relaxed numerics: the qualified mixer shape runs on the balanced tile engine.
+    else if (mode == 2 && ((uintptr_t)input & 15u) == 0u && ((uintptr_t)weights & 3u) == 0u) {
+        uint32_t engine_rows = euhedral_q3_prefill_engine_rows(mode, rows, in_features, out_features);
+        CUfunction engine = engine_rows == 128u ? prefill_engine : engine_rows == 64u ? prefill_engine64 : NULL;
+        if (engine != NULL) {
+            selected = engine;
+            grid = (((uint64_t)rows + engine_rows - 1u) / engine_rows) * (((uint64_t)out_features + 63u) / 64u);
+        }
     }
     if (selected == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     CUresult status = euhedral_launch_kernel(selected, (unsigned int)grid, 1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL);

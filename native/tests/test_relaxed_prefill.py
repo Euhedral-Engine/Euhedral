@@ -44,11 +44,13 @@ class RelaxedPrefillTest(unittest.TestCase):
                         # The 128 x 64 tile engine matches the relaxed K32 compact-B kernel bit for bit.
                         outs = []
                         for symbol, grid in [('euhedral_q3_prefill_64_k32_cb', ((rows + 63) // 64) * (outputs // 32)),
-                                             ('euhedral_q3_prefill_128x64', ((rows + 127) // 128) * ((outputs + 63) // 64))]:
+                                             ('euhedral_q3_prefill_128x64', ((rows + 127) // 128) * ((outputs + 63) // 64)),
+                                             ('euhedral_q3_prefill_64x64', ((rows + 63) // 64) * ((outputs + 63) // 64))]:
                             y = gpu.zeros(rows * outputs * 2, fill=0xa5); stack.callback(gpu.free, y)
                             gpu.launch(symbol, grid, [P(x), P(w), P(y), U(rows), U(width), U(outputs), C.c_ulonglong(scale)])
                             outs.append(gpu.download(y, rows * outputs * 2))
                         self.assertEqual(outs[0], outs[1], ('engine', rows, width, outputs))
+                        self.assertEqual(outs[0], outs[2], ('engine 64', rows, width, outputs))
                     for name, tile in [('euhedral_q3_prefill', 32), ('euhedral_q3_prefill_s104', 32),
                                        ('euhedral_q3_prefill_64', 64), ('euhedral_q3_prefill_64_k32_cb', 64)]:
                         result = []
@@ -96,9 +98,10 @@ class RelaxedPrefillTest(unittest.TestCase):
                             gpu.launch(symbol, grid, [P(x), P(w), P(y), U(rows), U(width), U(outputs)])
                             return struct.unpack(f'<{rows * outputs}H', gpu.download(y, rows * outputs * 2))
                         relaxed = run(f'euhedral_q{bits}_prefill_64', ((rows + 63) // 64) * ((outputs + 31) // 32))
-                        wide = run(f'euhedral_q{bits}_prefill_128x64', ((rows + 127) // 128) * ((outputs + 63) // 64))
-                        self.assertNotIn(0xa5a5, wide)
-                        self.assertEqual(relaxed, wide, (bits, rows, width, outputs))
+                        for name, tile in ((f'euhedral_q{bits}_prefill_128x64', 128), (f'euhedral_q{bits}_prefill_64x64', 64)):
+                            wide = run(name, ((rows + tile - 1) // tile) * ((outputs + 63) // 64))
+                            self.assertNotIn(0xa5a5, wide)
+                            self.assertEqual(relaxed, wide, (name, rows, width, outputs))
             with contextlib.ExitStack() as stack:
                 rows, width, q4_out, q5_out = 100, 256, 64, 96
                 w4 = gpu.upload(make_weights(rng, 4, width, q4_out, scales)); stack.callback(gpu.free, w4)
