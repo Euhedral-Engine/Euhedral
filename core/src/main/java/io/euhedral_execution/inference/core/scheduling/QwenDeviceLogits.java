@@ -4,7 +4,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import java.lang.foreign.MemorySegment;
 import java.util.Objects;
 
-/// Caller-owned BF16 logits retained on the GPU after a quantum workspace is released.
+/// Caller-owned BF16 logits, detached from a quantum's workspace for callers that read logits on the GPU.
 public final class QwenDeviceLogits implements AutoCloseable {
 
     private final ExecutionGpu gpu;

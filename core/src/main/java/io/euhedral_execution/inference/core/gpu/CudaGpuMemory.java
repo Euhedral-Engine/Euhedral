@@ -1478,7 +1478,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     /// Device bytes allocated through this binding and not yet freed: the resident footprint of the
-    /// model, its sequences' persistent state, and in-flight quantum workspaces. Unlike
+    /// model, its sequences' persistent state, and the execution graphs' workspace storage. Unlike
     /// [#deviceMemoryInfo], it excludes other processes and CUDA's own context and kernel modules, and
     /// it stays readable after close.
     public long allocatedBytes() {
