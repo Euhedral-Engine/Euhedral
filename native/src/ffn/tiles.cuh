@@ -2,10 +2,12 @@
 #include "../q3/strategies/k32_prefill.cuh"
 namespace qwen_ffn_tiles {
 using namespace k32_probe;
-template<int F,int N>
+// P: B operand parts per weight. 2 stages BF16 hi and lo, whose sum is code * scale exactly (the
+// exact kernels); 1 stages hi only, the BF16 rounding of code * scale, and runs half the MMAs.
+template<int F,int N,int P=1>
 struct alignas(32) Storage {
     __nv_bfloat16 a[2][2][F*16*32];
-    __nv_bfloat16 b[2][2][2][N*32];
+    __nv_bfloat16 b[2][2][P][N*32];
     alignas(8) unsigned long long ready[4][2],release[4][2];
 };
 template<int F>

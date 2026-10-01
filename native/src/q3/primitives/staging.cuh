@@ -27,14 +27,19 @@ static __device__ __forceinline__ unsigned int split_entry(unsigned int raw, flo
 // Both splits complete in registers before any shared store, so no store
 // waits on the other element's conversion chain.
 // SCOPE: thread-local; elements i and i + 1 are owned by the calling thread.
+// PARTS 2 stages hi and lo (hi + lo is code * scale exactly); PARTS 1 stages hi only, the BF16
+// rounding of code * scale, and leaves `lo` untouched.
+template<int PARTS = 2>
 static __device__ __forceinline__ void stage_split_pair(
         __nv_bfloat16* hi, __nv_bfloat16* lo, unsigned int i, unsigned int codes, float scale) {
     unsigned int e0 = split_entry(codes & 7u, scale);
     unsigned int e1 = split_entry((codes >> 3) & 7u, scale);
     hi[i] = __ushort_as_bfloat16((unsigned short)(e0 >> 16));
-    lo[i] = __ushort_as_bfloat16((unsigned short)e0);
     hi[i + 1] = __ushort_as_bfloat16((unsigned short)(e1 >> 16));
-    lo[i + 1] = __ushort_as_bfloat16((unsigned short)e1);
+    if (PARTS > 1) {
+        lo[i] = __ushort_as_bfloat16((unsigned short)e0);
+        lo[i + 1] = __ushort_as_bfloat16((unsigned short)e1);
+    }
 }
 
 // Decode and stage one K group for COLS output columns into borrowed hi/lo tiles
@@ -42,7 +47,7 @@ static __device__ __forceinline__ void stage_split_pair(
 // stages columns warp, warp + WARPS, ...; columns >= out_features stage zeros.
 // SCOPE: each warp is warp-collective over its columns; no barrier. The strategy
 // must barrier before MMA consumption and again before re-staging.
-template<int COLS, int WARPS, int STRIDE = kGroup>
+template<int COLS, int WARPS, int STRIDE = kGroup, int PARTS = 2>
 static __device__ __forceinline__ void stage_weight_tile(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const Layout& w, unsigned int out_start,
         unsigned int out_features, unsigned int k_base, unsigned int warp, unsigned int lane) {
@@ -55,7 +60,7 @@ static __device__ __forceinline__ void stage_weight_tile(
             codes = load_packed_pair(w, g, lane);
             scale = load_group_scale(w, g, lane);
         }
-        stage_split_pair(hi, lo, col * STRIDE + lane * 2, codes, scale);
+        stage_split_pair<PARTS>(hi, lo, col * STRIDE + lane * 2, codes, scale);
     }
 }
 

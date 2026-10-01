@@ -75,7 +75,7 @@ static __device__ __forceinline__ void tiled_prefill(
                 row_start, out_start, 0, threadIdx.x, warp, lane);
         for (unsigned int base = 0; base < in_features; base += kGroup) {
             stage_prefetched_activation<Tile, BITS, A_STRIDE>(a, next, threadIdx.x);
-            stage_prefetched_weights<Tile, BITS, B_STRIDE>(b_hi, b_lo, next, warp, lane);
+            stage_prefetched_weights<Tile, BITS, B_STRIDE, q3::LeafParts<Leaf>::value>(b_hi, b_lo, next, warp, lane);
             __syncthreads();
             if (base + kGroup < in_features)
                 prefetch_compact_tile(next, input, w, rows, in_features, out_features,
@@ -87,7 +87,7 @@ static __device__ __forceinline__ void tiled_prefill(
         for (unsigned int base = 0; base < in_features; base += kGroup) {
             stage_activation_tile<Tile::kRows, kThreads, A_STRIDE>(
                     a, input, rows, in_features, row_start, base, threadIdx.x);
-            stage_weight_tile<BITS, Tile::kCols, Tile::kWarps, B_STRIDE>(
+            stage_weight_tile<BITS, Tile::kCols, Tile::kWarps, B_STRIDE, q3::LeafParts<Leaf>::value>(
                     b_hi, b_lo, w, out_start, out_features, base, warp, lane);
             __syncthreads();
             Leaf::template consume<kGroup, A_STRIDE, B_STRIDE>(acc, a, b_hi, b_lo, warp);

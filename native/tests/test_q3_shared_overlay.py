@@ -56,7 +56,7 @@ class Q3SharedOverlayTest(unittest.TestCase):
         self.assertIn('values[Tile::kRows * A_STRIDE]', source)
         self.assertIn('tile[(i / K_TILE) * STRIDE + i % K_TILE]',
                       (ROOT / 'native/src/q3/primitives/activation.cuh').read_text())
-        self.assertIn('stage_split_pair(hi, lo, col * STRIDE + lane * 2, codes, scale);',
+        self.assertIn('stage_split_pair<PARTS>(hi, lo, col * STRIDE + lane * 2, codes, scale);',
                       (ROOT / 'native/src/q3/primitives/staging.cuh').read_text())
         self.assertIn('Leaf::template consume<kGroup, A_STRIDE, B_STRIDE>', source)
         self.assertIn('constexpr int A_STRIDE = 80;', kernels)
@@ -73,7 +73,7 @@ class Q3SharedOverlayTest(unittest.TestCase):
         self.assertIn('(reinterpret_cast<unsigned long long>(input) & 3ull) == 0ull', source)
         self.assertIn('(in_features & 1u) == 0u', source)
         self.assertIn('stage_activation_tile<Tile::kRows, kGroup, kThreads, A_STRIDE>', source)
-        self.assertIn('stage_weight_tile<Tile::kCols, Tile::kWarps, B_STRIDE>', source)
+        self.assertIn('stage_weight_tile<Tile::kCols, Tile::kWarps, B_STRIDE, q3::LeafParts<Leaf>::value>', source)
         self.assertIn('prefetch_compact_tile(next, input, w,', source)
         self.assertIn('stage_prefetched_activation', source)
         self.assertIn('stage_prefetched_weights', source)
@@ -98,10 +98,10 @@ class Q3SharedOverlayTest(unittest.TestCase):
             gpu = Gpu(b'#include "q3/kernels.cu"\n', include_dir=PRODUCT)
             cleanup.callback(gpu.close)
             attribute = _bind(CUDA, 'cuFuncGetAttribute', [C.POINTER(I), I, P])
-            for kernel, expected_bytes in [('euhedral_q3_prefill', 16896),
-                                           ('euhedral_q3_prefill_s104', 19968),
-                                           ('euhedral_q3_prefill_64', 18432),
-                                           ('euhedral_q3_prefill_64_k32_cb', 18560)]:
+            for kernel, expected_bytes in [('euhedral_q3_prefill_exact', 16896),
+                                           ('euhedral_q3_prefill_s104_exact', 19968),
+                                           ('euhedral_q3_prefill_64_exact', 18432),
+                                           ('euhedral_q3_prefill_64_k32_cb_exact', 18560)]:
                 with self.subTest(kernel=kernel):
                     function = P()
                     _check(gpu.function(C.byref(function), gpu.module, kernel.encode()), kernel)

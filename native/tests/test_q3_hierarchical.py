@@ -31,7 +31,7 @@ class HierarchicalPrefillTest(unittest.TestCase):
                     buffers.callback(direct.free, x)
                     w = direct.upload(packed)
                     buffers.callback(direct.free, w)
-                    base = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '')
+                    base = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '') + '_exact'
                     reference = self.run_one(local, base, ((rows + tile - 1)//tile) * ((outputs + 31)//32),
                                              x, w, rows, width, outputs, offset)
                     for cm, cn in SHAPES:

@@ -41,7 +41,7 @@ class QwenRegionsTest(unittest.TestCase):
                     key, value, fused_key, fused_value = [alloc(cache_bytes) for _ in range(4)]
                     norm_args = [p(qk), p(qn), p(kn), p(normalized), u(rows), u(qh), u(kh), u(hd), u(32), p(start), C.c_float(1e-6), C.c_double(1e6)]
                     gpu.launch('euhedral_attention_qk_norm_rope_bf16', rows * (qh + kh), norm_args)
-                    gpu.launch('euhedral_q5_prefill_64', ((rows + 63) // 64) * (projected // 32),
+                    gpu.launch('euhedral_q5_prefill_64_exact', ((rows + 63) // 64) * (projected // 32),
                                [p(x), p(weight), p(gv), u(rows), u(width), u(projected)])
                     gpu.launch('euhedral_attention_kv_append_bf16', (rows * kw + 127) // 128,
                                [p(normalized), p(gv), p(key), p(value), u(rows), u(qw), u(kw), p(start)])
@@ -90,7 +90,7 @@ class QwenRegionsTest(unittest.TestCase):
                         x = upload(struct.pack('<' + 'H' * (rows * width), *[rng.choice(bits) for _ in range(rows * width)]))
                         args = [C.c_uint64(x), C.c_uint64(w), C.c_uint64(gate_up), C.c_uint(rows),
                                 C.c_uint(width), C.c_uint(outputs), C.c_uint64(scale)]
-                        gpu.launch('euhedral_q3_prefill_64_k32_cb', ((rows + 63) // 64) * (outputs // 32), args)
+                        gpu.launch('euhedral_q3_prefill_64_k32_cb_exact', ((rows + 63) // 64) * (outputs // 32), args)
                         gpu.launch('euhedral_swiglu_bf16', (rows * (outputs // 2) + 127) // 128,
                                    [C.c_uint64(gate_up), C.c_uint64(reference), C.c_uint(rows), C.c_uint(outputs // 2)])
                         args[2] = C.c_uint64(actual)

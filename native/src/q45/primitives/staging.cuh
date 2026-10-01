@@ -16,26 +16,28 @@ static __device__ __forceinline__ unsigned int split_entry(int code, float scale
 // Stage a lane's two weights (K = i, i + 1) from its code pair. Both splits
 // complete in registers before any shared store.
 // SCOPE: thread-local; elements i and i + 1 are owned by the calling thread.
-template<int BITS>
+template<int BITS, int PARTS = 2>
 static __device__ __forceinline__ void stage_split_pair(
         __nv_bfloat16* hi, __nv_bfloat16* lo, unsigned int i, unsigned int pair, float scale) {
     unsigned int e0 = split_entry(unpack_code<BITS>(pair, 0), scale);
     unsigned int e1 = split_entry(unpack_code<BITS>(pair, 1), scale);
     hi[i] = __ushort_as_bfloat16((unsigned short)(e0 >> 16));
-    lo[i] = __ushort_as_bfloat16((unsigned short)e0);
     hi[i + 1] = __ushort_as_bfloat16((unsigned short)(e1 >> 16));
-    lo[i + 1] = __ushort_as_bfloat16((unsigned short)e1);
+    if (PARTS > 1) {
+        lo[i] = __ushort_as_bfloat16((unsigned short)e0);
+        lo[i + 1] = __ushort_as_bfloat16((unsigned short)e1);
+    }
 }
 
 // Stage one decoded G64 word set for column `col` (column-major B tile with
 // physical stride STRIDE). Out-of-matrix columns pass an all-zero word set,
 // which stages zero weights. SCOPE: warp-collective.
-template<int BITS, int STRIDE>
+template<int BITS, int STRIDE, int PARTS = 2>
 static __device__ __forceinline__ void stage_group_words(
         __nv_bfloat16* hi, __nv_bfloat16* lo, unsigned int col, unsigned int word, unsigned int lane) {
     unsigned int pair = group_pair<BITS>(word, lane);
     float scale = group_scale<BITS>(word);
-    stage_split_pair<BITS>(hi, lo, col * STRIDE + lane * 2, pair, scale);
+    stage_split_pair<BITS, PARTS>(hi, lo, col * STRIDE + lane * 2, pair, scale);
 }
 
 // Copy a ROWS x kGroup BF16 activation tile into a borrowed shared tile (row
@@ -56,7 +58,7 @@ static __device__ __forceinline__ void stage_activation_tile(
 
 // Decode and stage one K group for COLS output columns, loading as it goes.
 // Each warp stages columns warp, warp + WARPS, ... SCOPE: per-warp collective.
-template<int BITS, int COLS, int WARPS, int STRIDE>
+template<int BITS, int COLS, int WARPS, int STRIDE, int PARTS = 2>
 static __device__ __forceinline__ void stage_weight_tile(
         __nv_bfloat16* hi, __nv_bfloat16* lo, const Layout<BITS>& w, unsigned int out_start,
         unsigned int out_features, unsigned int k_base, unsigned int warp, unsigned int lane) {
@@ -64,7 +66,7 @@ static __device__ __forceinline__ void stage_weight_tile(
     for (unsigned int col = warp; col < COLS; col += WARPS) {
         unsigned int word = out_start + col < out_features
                 ? load_group_word<BITS>(w, w.group(out_start + col, k_base / kGroup), lane) : 0u;
-        stage_group_words<BITS, STRIDE>(hi, lo, col, word, lane);
+        stage_group_words<BITS, STRIDE, PARTS>(hi, lo, col, word, lane);
     }
 }
 

@@ -38,7 +38,7 @@ class Q3ClusterTest(unittest.TestCase):
             try:
                 w = gpu.upload(packed)
                 try:
-                    reference = self.run_kernel('euhedral_q3_prefill' + ('_64' if tile_rows == 64 else ''),
+                    reference = self.run_kernel('euhedral_q3_prefill' + ('_64' if tile_rows == 64 else '') + '_exact',
                                                 x, w, rows, width, outputs, scale_offset,
                                                 ((rows + tile_rows - 1) // tile_rows) * ((outputs + 31) // 32),
                                                 gpu=self.baseline)

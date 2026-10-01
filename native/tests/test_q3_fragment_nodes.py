@@ -27,7 +27,7 @@ class Q3FragmentNodeTest(unittest.TestCase):
                 for i in range(outputs * groups):
                     struct.pack_into('<H', packed, offset + 2 * i, 0x2e00 + i % 16)
                 with self.buffers(nodes, rows, width, packed) as (x, w):
-                    base = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '')
+                    base = 'euhedral_q3_prefill' + ('_64' if tile == 64 else '') + '_exact'
                     reference = self.run_one(local, base,
                         ((rows + tile-1)//tile)*((outputs+31)//32), x, w, rows, width, outputs, offset)
                     for cm, cn in SHAPES:
