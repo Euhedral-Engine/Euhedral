@@ -8,5 +8,4 @@ extern "C" __global__ __launch_bounds__(128) void GATE( \
 extern "C" __global__ __launch_bounds__(128) void DOWN( \
  const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,float* state,unsigned int start,unsigned int count) { \
  __shared__ qwen_ffn_tiles::Storage<F,32> s;qwen_ffn_down::run<F,32>(x,w,y,m,k,n,scale,state,start,count,s); }
-FFN_REGION(2, stream_gate_up_64x32, stream_down_64x64)
 FFN_REGION(4, stream_gate_up_128x32, stream_down_128x64)

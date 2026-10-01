@@ -55,7 +55,7 @@ class FfnPolicyTest(unittest.TestCase):
                 self.assertEqual(64 if rows == 64 else 128 if rows in (256,512,1024) else 0,
                                  self.lib.gate(rows,5120,34816))
                 self.assertEqual(int(rows in (256,512,1024)), self.lib.down(rows,17408,5120))
-                self.assertEqual(int(rows in (64,1024)), self.lib.streamed(rows))
+                self.assertEqual(int(rows == 1024), self.lib.streamed(rows))
                 for width, outputs in ((5121,34816),(5120,34880),(6144,5120)):
                     self.assertEqual(0,self.lib.gate(rows,width,outputs))
                 for width, outputs in ((17409,5120),(17408,5184),(6144,5120)):

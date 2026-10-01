@@ -23,7 +23,7 @@ class QwenStreamedFfnLifecycleTest {
     @ParameterizedTest
     @EnumSource(Scenario.class)
     void borrowedSlotsAndContinuationStayOwnedUntilRetirement(Scenario scenario) throws Exception {
-        for (int rows : new int[] {64, 1024}) runCase(scenario, rows);
+        runCase(scenario, 1024);
     }
 
     private static void runCase(Scenario scenario, int rows) throws Exception {

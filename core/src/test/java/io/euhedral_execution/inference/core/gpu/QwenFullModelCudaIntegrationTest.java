@@ -489,25 +489,32 @@ class QwenFullModelCudaIntegrationTest {
                 QwenModel model = QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu)) {
             var production = new QwenExecutionPlan(model.weights());
             var reference = QwenExecutionPlan.reference(model.weights());
-            for (int rows : new int[] {64, 256, 512, 1024}) {
-                var selected = production.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
-                boolean streamed =
-                        selected.instructions().stream().anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.FFN_STREAMED);
-                assertEquals(rows == 64 || rows == 1024, streamed, "streamed FFN qualification M=" + rows);
-                assertTrue(selected.instructions().stream()
-                        .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_PRODUCERS));
-                int[] tokens = new int[rows];
-                for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
-                RouteResult expected = runRoute(gpu, model, reference, rows, tokens, 900 + rows);
-                RouteResult actual = runRoute(gpu, model, production, rows, tokens, 901 + rows);
-                assertArrayEquals(expected.hidden(), actual.hidden(), "hidden M=" + rows);
-                assertArrayEquals(expected.logits(), actual.logits(), "logits M=" + rows);
-                assertEquals(expected.state(), actual.state(), "state M=" + rows);
-                assertArrayEquals(expected.decodeLogits(), actual.decodeLogits(), "decode M=" + rows);
-                assertEquals(expected.decodeState(), actual.decodeState(), "decode state M=" + rows);
-                System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows + " streamed=" + streamed
-                        + " workspace_bytes=" + actual.workspaceBytes()
-                        + " reference_workspace_bytes=" + expected.workspaceBytes());
+            // The route structure is bitwise against the reference under exact numerics; relaxed-order
+            // kernels (split-K down, contiguous decode) are bounded by RelaxedNumericsDriftCudaIntegrationTest.
+            boolean previous = gpu.selectExactNumerics(true);
+            try {
+                for (int rows : new int[] {64, 256, 512, 1024}) {
+                    var selected = production.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
+                    boolean streamed = selected.instructions().stream()
+                            .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.FFN_STREAMED);
+                    assertEquals(rows == 1024, streamed, "streamed FFN qualification M=" + rows);
+                    assertTrue(selected.instructions().stream()
+                            .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_PRODUCERS));
+                    int[] tokens = new int[rows];
+                    for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
+                    RouteResult expected = runRoute(gpu, model, reference, rows, tokens, 900 + rows);
+                    RouteResult actual = runRoute(gpu, model, production, rows, tokens, 901 + rows);
+                    assertArrayEquals(expected.hidden(), actual.hidden(), "hidden M=" + rows);
+                    assertArrayEquals(expected.logits(), actual.logits(), "logits M=" + rows);
+                    assertEquals(expected.state(), actual.state(), "state M=" + rows);
+                    assertArrayEquals(expected.decodeLogits(), actual.decodeLogits(), "decode M=" + rows);
+                    assertEquals(expected.decodeState(), actual.decodeState(), "decode state M=" + rows);
+                    System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows + " streamed=" + streamed
+                            + " workspace_bytes=" + actual.workspaceBytes()
+                            + " reference_workspace_bytes=" + expected.workspaceBytes());
+                }
+            } finally {
+                gpu.selectExactNumerics(previous);
             }
         }
     }

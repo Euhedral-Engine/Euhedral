@@ -428,6 +428,13 @@ public abstract class ExecutionGpu implements GpuMemory {
         linearQ3Bf16(input, weights, output, rows, width, outputs, weightBytes);
     }
 
+    /// Split-K FFN down: `partials` holds FP32 sums of each K split (width * 4 floats per row) before
+    /// one BF16 rounding. Backends without it, and shapes outside its policy, run [#q3FfnDownBf16].
+    public void q3FfnDownSplitBf16(
+            long input, long weights, long output, long partials, int rows, int width, int outputs, long weightBytes) {
+        q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
+    }
+
     public void q3GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
         throw new UnsupportedOperationException("Q3 gate/up SwiGLU region is not implemented");

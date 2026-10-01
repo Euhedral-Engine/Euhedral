@@ -20,7 +20,15 @@ static inline uint32_t euhedral_ffn_down_tile_rows(uint32_t rows, uint32_t width
     if (rows > 256u && rows <= 320u) return 64u;
     return euhedral_ffn_down_wide(rows, width, outputs) ? 128u : 0u;
 }
+// Split-K down: four K splits for 64-512 row quanta, whose unsplit down runs 80-320 CTAs in one or
+// two partial waves. Measured with cold weights, whole FFN per layer: 64 rows 1558 -> 1253 us
+// (1400 us for the streamed regions), 128 rows 2222 -> 1816 us, 256 rows 3785 -> 3570 us; the
+// down alone at 512 rows 2480 -> 2342 us. Splitting gate/up measured flat or slower.
+static inline uint32_t euhedral_ffn_down_splits(uint32_t rows, uint32_t width, uint32_t outputs) {
+    return width == 17408u && outputs == 5120u && rows >= 64u && rows <= 512u ? 4u : 0u;
+}
+// 64-row quanta use full-width gate/up and split-K down instead of streamed regions.
 static inline int euhedral_ffn_streamed_rows(uint32_t rows) {
-    return rows == 64u || rows == 1024u;
+    return rows == 1024u;
 }
 #endif

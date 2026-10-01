@@ -22,28 +22,9 @@ static CUmodule module;
 static CUfunction function;
 static CUfunction decode1, decode2, decode4, decode_wide, decode_contiguous, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-/* Single-row decode numerics: 0 selects the contiguous kernel (reordered FP32 accumulation), 1 the
- * exact kernels that reproduce the scalar reference bit for bit. -1 until first read; the initial
- * value comes from EUHEDRAL_Q3_DECODE=EXACT. */
-static atomic_int exact_decode = -1;
-
-static int q3_decode_exact(void) {
-    int value = atomic_load(&exact_decode);
-    if (value < 0) {
-        const char* mode = getenv("EUHEDRAL_Q3_DECODE");
-        int initial = mode != NULL && strcmp(mode, "EXACT") == 0;
-        atomic_compare_exchange_strong(&exact_decode, &value, initial);
-        value = atomic_load(&exact_decode);
-    }
-    return value;
-}
-
-/* Selects exact (nonzero) or contiguous (zero) single-row decode for later launches in this process
- * and returns the previous selection. Intended for numerical comparisons against the exact oracle. */
+/* Alias of euhedral_cuda_select_exact_numerics, kept for existing callers. */
 int euhedral_cuda_q3_decode_select_exact(int exact) {
-    int previous = q3_decode_exact();
-    atomic_store(&exact_decode, exact != 0);
-    return previous;
+    return euhedral_cuda_select_exact_numerics(exact);
 }
 static CUfunction optional_kernel(const char* name) {
     CUfunction loaded = NULL;
@@ -123,7 +104,7 @@ static int linear_q3(const void* input, const void* weights, void* output,
     unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
     unsigned long long scale_arg = scale_offset;
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
-    int contiguous = mode == 1 && decode_contiguous != NULL && !q3_decode_exact()
+    int contiguous = mode == 1 && decode_contiguous != NULL && !euhedral_cuda_exact_numerics()
             && ((uintptr_t)input & 15u) == 0u && ((uintptr_t)weights & 3u) == 0u
             && euhedral_q3_decode_contiguous_shape(rows, in_features, out_features);
     if (contiguous) grid = out_features / 16u;

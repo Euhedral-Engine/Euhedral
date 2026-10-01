@@ -23,8 +23,8 @@ typedef void* CUfunction;
 #define cudaStreamNonBlocking 1
 #define cudaEventDisableTiming 2
 static void *ffn_stream_gate=(void*)10, *ffn_stream_down=(void*)11;
-static void *stream_gate64=(void*)10, *stream_gate128=(void*)10;
-static void *stream_down64=(void*)11, *stream_down128=(void*)11;
+static void *stream_gate128=(void*)10;
+static void *stream_down128=(void*)11;
 static int fail_at, call_count, asynchronous, pending, fail_drains, next_event;
 static int trace_kind[256], trace_handle[256], pending_before[256];
 static unsigned char buffers[8 << 20] __attribute__((aligned(16)));
@@ -80,7 +80,7 @@ int probe(int injected_call, int async_mode) {
     uint64_t gg=34816ull*80, dg=5120ull*272;
     uint64_t gb=((gg*24+255)&~255ull)+gg*2, db=((dg*24+255)&~255ull)+dg*2;
     return euhedral_cuda_q3_ffn_streamed_bf16(buffers,buffers,buffers,buffers,buffers,
-            (float*)buffers,64,5120,17408,gb,db);
+            (float*)buffers,1024,5120,17408,gb,db);
 }
 int calls(void) {return call_count;}
 int kind(int i) {return trace_kind[i];}

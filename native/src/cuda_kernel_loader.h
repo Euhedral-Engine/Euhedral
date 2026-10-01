@@ -18,6 +18,11 @@ int euhedral_cuda_load_kernel(
  * launch with it; EUHEDRAL_PDL=0 disables it everywhere. */
 void euhedral_cuda_pdl_register(CUfunction function);
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_pdl_select(int enabled);
+/* Exact numerics: nonzero routes every kernel whose FP32 accumulation order was relaxed back to the
+ * exact kernels that reproduce the scalar references bit for bit (the numerical oracle). Initialized
+ * from EUHEDRAL_EXACT=1 (or the older EUHEDRAL_Q3_DECODE=EXACT); settable for comparisons. */
+int euhedral_cuda_exact_numerics(void);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_select_exact_numerics(int exact);
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
         unsigned int block_x, unsigned int block_y, unsigned int block_z, unsigned int shared_bytes,
         CUstream stream, void** parameters, void** extra);

@@ -173,6 +173,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         reuse(QwenExecutionPlan.Buffer.SWIGLU, QwenExecutionPlan.Buffer.VALUE_Z_PROJECTED);
         reuse(QwenExecutionPlan.Buffer.FFN_STAGING, QwenExecutionPlan.Buffer.VALUE_Z_PROJECTED);
         reuse(QwenExecutionPlan.Buffer.FFN_ACCUMULATORS, QwenExecutionPlan.Buffer.QK_PROJECTED);
+        reuse(QwenExecutionPlan.Buffer.FFN_PARTIALS, QwenExecutionPlan.Buffer.QK_PROJECTED);
     }
 
     private void reuse(QwenExecutionPlan.Buffer value, QwenExecutionPlan.Buffer owner) {

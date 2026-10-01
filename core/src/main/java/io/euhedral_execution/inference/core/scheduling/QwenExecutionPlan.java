@@ -70,6 +70,7 @@ public final class QwenExecutionPlan {
         FFN_DELTA,
         FFN_STAGING,
         FFN_ACCUMULATORS,
+        FFN_PARTIALS,
         FINAL_NORMALIZED,
         LOGITS,
         SLICE_PROJECTION
@@ -213,9 +214,13 @@ public final class QwenExecutionPlan {
     /// Row threshold for the attention producer and gate/up regions (one 64-row prefill tile).
     private static final int REGION_MIN_ROWS = 64;
     /// Exact geometry at which the streamed FFN region is qualified; elsewhere gate/up + down is used.
+    /// 64-row quanta run full-width gate/up and split-K down instead (1253 vs 1400 us per layer).
     private static boolean streamedFfnRows(int rows) {
-        return rows == 64 || rows == 1024;
+        return rows == 1024;
     }
+
+    /// K splits of the FFN down's FP32 partials (euhedral_ffn_down_splits in qwen_ffn_policy.h).
+    private static final int FFN_DOWN_SPLITS = 4;
 
     private static final int STREAMED_FFN_HIDDEN = 5120;
     private static final int STREAMED_FFN_INTERMEDIATE = 17408;
@@ -560,6 +565,9 @@ public final class QwenExecutionPlan {
                     && first.kind() == Kind.Q3_LINEAR
                     && first.inputBuffers().equals(List.of(Buffer.SWIGLU))
                     && first.outputBuffers().equals(List.of(Buffer.FFN_DELTA));
+            boolean splitDown = ffnDown
+                    && first.inputWidth() == STREAMED_FFN_INTERMEDIATE
+                    && first.outputWidth() == STREAMED_FFN_HIDDEN;
             result.add(new Instruction(
                     result.size(),
                     ffnDown ? Kind.Q3_FFN_DOWN : first.kind(),
@@ -568,7 +576,7 @@ public final class QwenExecutionPlan {
                     producers && first.kind() == Kind.ATTENTION_CAUSAL
                             ? List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED)
                             : first.inputBuffers(),
-                    first.outputBuffers(),
+                    splitDown ? List.of(Buffer.FFN_DELTA, Buffer.FFN_PARTIALS) : first.outputBuffers(),
                     first.inputWidth(),
                     first.outputWidth(),
                     first.outputBufferIndex(),
@@ -582,6 +590,9 @@ public final class QwenExecutionPlan {
                 .filter(spec -> needsGateUp || spec.buffer() != Buffer.GATE_UP)
                 .filter(spec -> spec.buffer() != Buffer.A_PROJECTED && spec.buffer() != Buffer.B_PROJECTED)
                 .toList());
+        if (result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.FFN_PARTIALS))) {
+            buffers.add(spec(Buffer.FFN_PARTIALS, FFN_DOWN_SPLITS * STREAMED_FFN_HIDDEN, ElementType.FP32));
+        }
         if (result.stream().anyMatch(i -> i.kind() == Kind.FFN_STREAMED)) {
             buffers.add(spec(Buffer.FFN_STAGING, STREAMED_FFN_STAGING_WIDTH, ElementType.BF16));
             buffers.add(spec(Buffer.FFN_ACCUMULATORS, STREAMED_FFN_HIDDEN, ElementType.FP32));

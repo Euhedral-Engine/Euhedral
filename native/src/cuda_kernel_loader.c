@@ -148,6 +148,26 @@ static __declspec(thread) int pdl_selected;
 static _Thread_local int pdl_selected;
 #endif
 
+static atomic_int exact_numerics = -1;
+
+int euhedral_cuda_exact_numerics(void) {
+    int value = atomic_load(&exact_numerics);
+    if (value < 0) {
+        const char* exact = getenv("EUHEDRAL_EXACT");
+        const char* q3 = getenv("EUHEDRAL_Q3_DECODE");
+        int initial = (exact != NULL && strcmp(exact, "1") == 0) || (q3 != NULL && strcmp(q3, "EXACT") == 0);
+        atomic_compare_exchange_strong(&exact_numerics, &value, initial);
+        value = atomic_load(&exact_numerics);
+    }
+    return value;
+}
+
+int euhedral_cuda_select_exact_numerics(int exact) {
+    int previous = euhedral_cuda_exact_numerics();
+    atomic_store(&exact_numerics, exact != 0);
+    return previous;
+}
+
 /* Decode chains select PDL for the calling thread; every other launch stays ordinary. */
 void euhedral_cuda_pdl_select(int enabled) {
     pdl_selected = enabled != 0;
