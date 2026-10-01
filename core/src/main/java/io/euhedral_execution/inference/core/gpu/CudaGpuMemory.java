@@ -29,6 +29,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CudaGpuMemory.class);
     private static final int MAX_CACHED_EVENTS = 256;
+    /// EUHEDRAL_CUDA_KERNEL_UNAVAILABLE: an optional kernel did not load.
+    private static final int KERNEL_UNAVAILABLE = -4;
     private final Arena arena;
     private final MethodHandle malloc;
     private final MethodHandle free;
@@ -89,6 +91,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle gdnProjectControlFp32;
     private final MethodHandle gdnProjectionsBf16;
     private final MethodHandle swiGluBf16;
+    private final MethodHandle argmaxBf16;
     private final MethodHandle zeroDeviceMemory;
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
@@ -322,6 +325,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     .orElse(null);
             this.residualAddBf16 = bind(linker, symbols, "euhedral_cuda_residual_add_bf16", RESIDUAL_ADD_BF16);
             this.swiGluBf16 = bind(linker, symbols, "euhedral_cuda_swiglu_bf16", SWIGLU_BF16);
+            this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
             this.attentionQkNormRopeBf16 =
                     bind(linker, symbols, "euhedral_cuda_attention_qk_norm_rope_bf16", ATTENTION_QK_NORM_ROPE_BF16);
@@ -1416,6 +1420,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 MemorySegment.ofAddress(outputAddress),
                 rows,
                 width);
+    }
+
+    @Override
+    public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
+        ensureOpen();
+        requireAddresses(logitsAddress, resultAddress);
+        if (count <= 0) throw new IllegalArgumentException("logit count must be positive");
+        int status;
+        try {
+            status = (int) argmaxBf16.invokeExact(
+                    MemorySegment.ofAddress(logitsAddress), count, MemorySegment.ofAddress(resultAddress));
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("BF16 argmax invocation failed", throwable);
+        }
+        if (status == KERNEL_UNAVAILABLE) return false;
+        if (status != 0) throw new GpuMemoryException("BF16 argmax", status);
+        return true;
     }
 
     @Override

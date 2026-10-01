@@ -193,6 +193,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.ADDRESS,
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT);
+    protected static final FunctionDescriptor ARGMAX_BF16 =
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS);
     protected static final FunctionDescriptor SWIGLU_BF16 = FunctionDescriptor.of(
             ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT);
     protected static final FunctionDescriptor ZERO_DEVICE_MEMORY =
@@ -381,6 +383,14 @@ public abstract class ExecutionGpu implements GpuMemory {
 
     public void residualAddBf16(long residualAddress, long deltaAddress, long outputAddress, int rows, int width) {
         throw new UnsupportedOperationException("BF16 residual add is not implemented by this GPU");
+    }
+
+    /// Greedy selection over `count` BF16 logits at `logitsAddress`: queues a kernel that writes one
+    /// 64-bit key to `resultAddress`, whose low word is `0xFFFFFFFF` minus the host argmax's token ID
+    /// (0 when no logit is selectable). False, with nothing queued, when this GPU cannot select on the
+    /// device.
+    public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
+        return false;
     }
 
     public void attentionProducersNvfp4(

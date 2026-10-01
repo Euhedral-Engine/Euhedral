@@ -4,13 +4,17 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.sampling.TokenSampler;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.SplittableRandom;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
@@ -281,6 +285,41 @@ class CudaGpuOperationsIntegrationTest {
                 gpu.free(outputDevice);
                 gpu.free(weightDevice);
                 gpu.free(inputDevice);
+            }
+        }
+    }
+
+    @Test
+    void deviceArgmaxSelectsTheHostArgmaxIncludingTiesAndSpecialValues() throws Exception {
+        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
+        int vocabulary = 248_320;
+        SplittableRandom random = new SplittableRandom(91);
+        short[] row = new short[vocabulary];
+        for (int i = 0; i < row.length; i++) row[i] = floatToBf16((float) random.nextGaussian() * 3.0f);
+        row[17] = (short) 0x7FC1; // NaN never wins
+        row[1000] = (short) 0xFF80; // negative infinity never wins
+        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath);
+                Arena arena = Arena.ofConfined()) {
+            long result = gpu.allocate(Long.BYTES);
+            try {
+                for (int peak : new int[] {vocabulary - 1, 151_000, 40, 0}) {
+                    row[peak] = floatToBf16(40.0f); // equal maxima: the lowest token ID wins
+                    float[] logits = new float[vocabulary];
+                    for (int i = 0; i < row.length; i++) logits[i] = Float.intBitsToFloat(row[i] << 16);
+                    int expected = new TokenSampler(GenerationConfig.greedy(1L), vocabulary).selectToken(logits);
+                    long device = upload(gpu, arena, row);
+                    try {
+                        assertTrue(gpu.argmaxBf16(device, vocabulary, result));
+                        MemorySegment key = arena.allocate(Long.BYTES);
+                        gpu.copyDeviceToHost(key, result, Long.BYTES);
+                        long bits = key.get(ValueLayout.JAVA_LONG, 0);
+                        assertEquals(expected, (int) (0xFFFF_FFFFL - (bits & 0xFFFF_FFFFL)), "peak " + peak);
+                    } finally {
+                        gpu.free(device);
+                    }
+                }
+            } finally {
+                gpu.free(result);
             }
         }
     }

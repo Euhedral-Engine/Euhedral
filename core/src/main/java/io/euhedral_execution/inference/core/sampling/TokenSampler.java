@@ -30,13 +30,18 @@ public final class TokenSampler {
         return this.vocabularySize;
     }
 
+    /// Whether every selection is the argmax of the logits.
+    public boolean greedy() {
+        return this.config.greedy() || this.config.temperature() <= 0.0f;
+    }
+
     public int selectToken(float[] logits) {
         Objects.requireNonNull(logits, "logits");
         if (logits.length != this.vocabularySize) {
             throw new IllegalArgumentException(
                     "expected " + this.vocabularySize + " vocabulary logits, got " + logits.length);
         }
-        if (this.config.greedy() || this.config.temperature() <= 0.0f) return argmax(logits);
+        if (greedy()) return argmax(logits);
 
         // Scale scores before applying the filters; top-k ties prefer the lower token ID. Only the
         // candidates' entries of the reused score row are written and read.

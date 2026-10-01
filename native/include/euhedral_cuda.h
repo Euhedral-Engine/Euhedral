@@ -211,6 +211,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_add_bf16(
         uint32_t rows,
         uint32_t width);
 
+/* Greedy selection over `count` BF16 logits: writes one 64-bit key to `device_result` whose low word
+ * is 0xFFFFFFFF minus the selected token ID (the lowest ID among equal maxima, never NaN or negative
+ * infinity), or 0 when no logit is selectable. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_argmax_bf16(const void* device_logits, uint32_t count, void* device_result);
+
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_swiglu_bf16(
         const void* device_gate_up,
         void* device_output,

@@ -173,7 +173,7 @@ Measured on decode 64/1024 + 128 (Nsight Systems token period, then six paired f
   table; finer per-kernel frames are the next step for this mechanism.
 - PATH against FORK (32 lanes, six paired forks, one build): decode 64 + 128 +0.57% (5 of 6), decode
   1024 + 128 +0.29% (6 of 6). Under FORK the side branch of a fan-out (the GDN control projection, the
-  attention value projection) often runs first and takes the chain's lane, moving the long branch to a
+  attention value projection) can run first and take the chain's lane, moving the long branch to a
   new lane behind a cross-lane wait; PATH decides statically, with no race on the claim.
 
 Direct operator calls with no stream selected still run synchronously; only tests and diagnostics use
@@ -289,7 +289,17 @@ iterations; paired-difference medians):
 The host boundary is now 0.37 ms with no device allocation, free, or synchronous copy and no host
 allocation; CPU sampling (0.20 ms argmax, 0.07 ms BF16-to-FP32 conversion) is most of what remains.
 Prefill-1024 runs without a stream synchronization: the GPU is busy 99.93% of the window, with one
-gap above 100 us, the boundary between its two quanta. Time to first token did not change beyond
+gap above 100 us, the boundary between its two quanta.
+
+That boundary was still the largest idle block of a decode token: 395 us of a 16.1 ms token, against
+about 160 us of idle inside it. After the LM head the 0.5 MB logits row reached the host in 21 us and
+retirement was confirmed at 68 us; the next token's ID was uploaded at 349 us, after the host had
+converted and scanned 248K logits. A greedy, unconstrained call now selects on the device:
+`euhedral_argmax_bf16` (`native/src/sampling/`), one 1024-thread CTA over the final row, writes a
+64-bit key whose order is the host argmax's (the lowest token ID among equal maxima, never NaN or
+negative infinity, -0 equal to +0), and the quantum copies back those 8 bytes instead of the row.
+Sampling with temperature or a vocabulary constraint still copies the row. Six paired forks: decode
+64 + 128 +0.96% (6 of 6), decode 1024 + 128 +0.84% (6 of 6). Time to first token did not change beyond
 run-to-run noise.
 
 ## Plan views

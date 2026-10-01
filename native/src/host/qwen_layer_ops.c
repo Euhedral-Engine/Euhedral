@@ -23,6 +23,7 @@ static int quantized_anchor;
 static int q45_anchor;
 static int gdn_anchor;
 static int elementwise_anchor;
+static int sampling_anchor;
 static int attention_anchor;
 static int ffn_anchor;
 static CUmodule ffn_module;
@@ -38,6 +39,7 @@ static CUmodule q45_module;
 static CUmodule gdn_module;
 static CUmodule elementwise_module;
 static CUmodule attention_module;
+static CUmodule sampling_module;
 static CUfunction linear_quantized;
 // Q4/Q5 kernels indexed by [bits == 5]: cooperative decode for 1, 2 and 4
 // token rows per CTA, and 32- and 64-row prefill tiles.
@@ -76,6 +78,7 @@ static CUfunction gdn_convolution;
 static CUfunction gdn_recurrence, gdn_recurrence_c8, gdn_recurrence_c4;
 static CUfunction gdn_gated_rms_norm;
 static CUfunction residual_add;
+static CUfunction argmax_bf16;
 static CUfunction residual_rms_norm, residual_rms_norm_row;
 static CUfunction gdn_project_control, gdn_project_control_tiled;
 static CUfunction swiglu;
@@ -171,6 +174,9 @@ static void initialize_modules(void) {
     get_function(elementwise_module, &residual_rms_norm_row, "euhedral_residual_rms_norm_row_bf16");
     status = get_function(elementwise_module, &swiglu, "euhedral_swiglu_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
+    // Optional: without it greedy selection stays on the host.
+    euhedral_cuda_load_kernel(&sampling_anchor, "sampling/kernels.cu", "euhedral_argmax_bf16", &sampling_module,
+            &argmax_bf16);
 
     init_status = euhedral_cuda_load_kernel(
             &attention_anchor,
@@ -235,6 +241,7 @@ static void initialize(void) {
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_wide[format]);
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_contiguous[format]);
     euhedral_cuda_pdl_register(gdn_control);
+    euhedral_cuda_pdl_register(argmax_bf16);
     euhedral_cuda_pdl_register(gdn_project_control);
     euhedral_cuda_pdl_register(residual_rms_norm);
     euhedral_cuda_pdl_register(residual_rms_norm_row);
@@ -804,6 +811,19 @@ int euhedral_cuda_residual_add_bf16(
     uint32_t count_arg = (uint32_t)count;
     void* parameters[] = {&residual, &delta, &output, &count_arg};
     return launch_and_synchronize(residual_add, (uint32_t)((count + 255) / 256), 256, parameters);
+}
+
+int euhedral_cuda_argmax_bf16(const void* device_logits, uint32_t count, void* device_result) {
+    if (device_logits == NULL || device_result == NULL || count == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (argmax_bf16 == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    CUdeviceptr logits = (CUdeviceptr)(uintptr_t)device_logits;
+    CUdeviceptr result = (CUdeviceptr)(uintptr_t)device_result;
+    void* parameters[] = {&logits, &count, &result};
+    return launch_and_synchronize(argmax_bf16, 1, 1024, parameters);
 }
 
 int euhedral_cuda_swiglu_bf16(
