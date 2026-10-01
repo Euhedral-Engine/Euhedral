@@ -49,7 +49,7 @@ Each resource lives as long as its natural owner, so the token boundary neither 
   when it closes, and only when the device proves completion; `retainedWorkspaceBytes()` reports it, so
   the engine's device bytes after a session closes are exactly the weights plus that storage.
 - A sampling quantum copies its final logits row into its session's pinned `QwenHostLogits` row. The
-  logits stage queues the device-to-host copy on the quantum stream right after the LM head, so the
+  logits stage queues the device-to-host copy on its own lane right after the LM head, so the
   quantum's single retirement boundary proves the row complete; the CPU reads it only after a
   successful outcome, converting into a reusable FP32 scratch row. Device logits stay in the graph's
   storage. One sequence samples serially, so one row per session suffices and sessions never share one.
@@ -107,7 +107,7 @@ are built on first use, after the lattice has started.
 A stage frame runs its operation and returns. Its finalizer, not its body, releases its successors:
 
 ```text
-stage A submits its kernels to the quantum stream
+stage A submits its kernels to its lane
   -> A's doFinally satisfies each outgoing edge
      -> the arrival that completes B's incoming set publishes B to the source
         -> Euhedral pulls or requests B and schedules it on any worker
@@ -127,21 +127,50 @@ The graph also counts live work: published frames that have not finished and arm
 edges. When that count reaches zero, no stage of the quantum can run again, whether it succeeded,
 failed, or was cancelled.
 
-## Quantum-owned CUDA ordering
+## Device lanes
 
-CPU scheduling and CUDA ordering are separate. A quantum owns its graph's stream while it runs, and every
-stage submits to that stream with it selected on the submitting thread, whichever Euhedral worker runs
-the stage:
+CPU scheduling and CUDA ordering are separate. The runtime owns a pool of CUDA streams, its lanes
+(`EUHEDRAL_LANES`, by default one per available processor, at most 64). Each graph has a home lane,
+which prepares its quantum and carries its retirement boundary. A stage chooses its lane each time it
+runs and submits with that lane selected on the submitting thread, whichever Euhedral worker runs it:
 
 ```text
-worker 3: frame A -> kernel A on the quantum stream
-worker 8: frame B -> kernel B on the same stream
-worker 1: frame C -> kernel C on the same stream
-device:   A -> B -> C
+worker 3: frame A -> kernel A on lane 5, record marker A
+worker 8: frame B -> kernel B on lane 5 (continues A's lane)
+worker 1: frame C -> await marker A on lane 9, kernel C on lane 9 (fork)
+worker 6: frame D -> await marker C on lane 5, kernel D on lane 5 (join)
+device:   A -> B -> D, and A -> C -> D
 ```
 
-Stages submitted by concurrent workers (fan-out branches) are ordered by their launch calls; a join is
-submitted only after all of its predecessors' launches returned. Streams are not tied to workers.
+Every stage with successors records a reusable marker after submitting. A successor that runs on
+another lane awaits it on the device (`cudaStreamWaitEvent`); one on the same lane relies on stream
+order; a root on another lane awaits the quantum's preparation marker. Before the retirement boundary
+every other lane the quantum used joins the home lane the same way, so the single boundary covers all
+of the quantum's work. A launch that awaited another lane does not use programmatic dependent launch.
+
+Placement (`EUHEDRAL_LANE_PLACEMENT`): FORK (default) lets the first successor of a stage continue
+its lane and forks the other branches to random lanes, so lanes cross only where branches split or
+join; CHAIN keeps only linear chains on one lane; RANDOM and WORKER (the submitting worker's lane)
+spread every stage. Decode graphs spread their stages; prefill graphs keep every stage on their home
+lane, because their kernels already fill the GPU and a cross-lane wait only adds latency there.
+
+With stages on different lanes the stream no longer orders every write after earlier reads and
+writes of the same storage, so the plan adds those edges explicitly
+(`QwenExecutionPlan.withStorageHazards`, counting aliased region storage as one buffer) wherever the
+data dependencies do not already imply them. Decode keeps the GDN Q4 and Q5 projections as separate
+leaf frames so they can run on different lanes.
+
+Measured on decode 64/1024 + 128 (Nsight Systems token period, then six paired forks):
+
+- RANDOM and CHAIN placement made decode 1-4% slower as lanes grew (2 to 32): every cross-lane edge
+  costs a device-side wait and loses programmatic dependent launch, and most decode edges are on the
+  critical chain.
+- FORK placement with 2 to 32 lanes: 16.75 -> 16.65-16.71 ms per token; 32 lanes against one, decode
+  +0.3% (64) and +0.6% (1024), 6 of 6 forks each, prefill unchanged. Spreading prefill graphs too
+  cost 1.1% at 256 tokens. Three hand-placed lanes (the side branches of each layer's projection
+  fan-out) measured +1.0-1.4%, so the current frame granularity leaves most of the overlap on the
+  table; finer per-kernel frames are the next step for this mechanism.
+
 Direct operator calls with no stream selected still run synchronously; only tests and diagnostics use
 them.
 
@@ -158,7 +187,8 @@ them.
   reserved for host consumption, state publication, storage release, and crossing ordering domains.
 
 A quantum's own retirement is its single device-completion boundary. When the live count reaches zero,
-the graph records one event on the quantum stream and registers one host callback. The callback
+the graph joins its used lanes into its home lane, records one event there and registers one host
+callback. The callback
 enqueues the retirement frame, and that frame:
 
 1. confirms the boundary (and on failure proves the device idle or poisons it);
@@ -175,7 +205,7 @@ There is one CUDA host callback per quantum, not one per kernel.
 Persistent sequence state has distinct frontiers. For NVFP4 attention KV (`AttentionKvState`):
 
 - reserved: `capacity`, rows backed by pages (`prepareAppend`);
-- submitted: `submittedLength()`, rows whose writes are queued on the owning quantum's stream
+- submitted: `submittedLength()`, rows whose writes are queued on the owning quantum's lanes
   (`appendSubmitted`). Later stages of the same quantum, such as causal attention, read this frontier,
   because stream order runs their reads after the writes;
 - committed: `length()`, published only at the quantum's retirement (`commitSubmitted`).

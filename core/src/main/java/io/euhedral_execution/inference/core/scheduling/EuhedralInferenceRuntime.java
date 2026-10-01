@@ -5,6 +5,7 @@ import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.scheduling.frames.QwenStageFrame;
+import io.euhedral_execution.inference.core.scheduling.graph.LanePool;
 import io.euhedral_execution.inference.core.scheduling.graph.QwenExecutionSource;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 import java.util.ArrayList;
@@ -36,11 +37,84 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     private final ConcurrentHashMap<QwenExecutionPlan, GraphPool> pools = new ConcurrentHashMap<>();
     private final Object closeLock = new Object();
     private boolean closed;
+    /// Device lanes shared by every graph, opened with the first graph.
+    private LanePool lanes;
+    private final Object laneLock = new Object();
+    private final int laneCount;
+    private final LanePool.Placement placement;
 
+    /// Lanes in the shared pool: `EUHEDRAL_LANES`, by default one per available processor (at most 64).
+    static int laneCount() {
+        String configured = System.getenv("EUHEDRAL_LANES");
+        int count = configured == null || configured.isBlank()
+                ? Runtime.getRuntime().availableProcessors()
+                : Integer.parseInt(configured.strip());
+        if (count < 1) throw new IllegalArgumentException("EUHEDRAL_LANES must be positive");
+        return Math.min(count, LanePool.MAX_LANES);
+    }
+
+    /// Stage placement over the lanes: `EUHEDRAL_LANE_PLACEMENT` (RANDOM, WORKER, CHAIN or FORK; FORK by
+    /// default).
+    static LanePool.Placement lanePlacement() {
+        String configured = System.getenv("EUHEDRAL_LANE_PLACEMENT");
+        return configured == null || configured.isBlank()
+                ? LanePool.Placement.FORK
+                : LanePool.Placement.valueOf(configured.strip().toUpperCase(java.util.Locale.ROOT));
+    }
+
+    /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime closed
+    /// releases its streams itself, because close() never saw it.
+    private LanePool lanes() {
+        synchronized (this.laneLock) {
+            synchronized (this.closeLock) {
+                if (this.lanes != null) return this.lanes;
+            }
+            GpuStream[] streams = new GpuStream[this.laneCount];
+            LanePool pool;
+            try {
+                for (int lane = 0; lane < streams.length; lane++) streams[lane] = this.gpu.openStream();
+                pool = new LanePool(streams, this.placement);
+            } catch (RuntimeException | Error failure) {
+                for (GpuStream stream : streams) {
+                    if (stream == null) continue;
+                    try {
+                        stream.close();
+                    } catch (RuntimeException | Error closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+                throw failure;
+            }
+            synchronized (this.closeLock) {
+                if (!this.closed) {
+                    this.lanes = pool;
+                    return pool;
+                }
+            }
+            pool.close();
+            throw new IllegalStateException("inference runtime is closed");
+        }
+    }
+
+    /// A runtime whose lane pool takes its size and placement from the environment.
     public EuhedralInferenceRuntime(LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu) {
+        this(lattice, plan, gpu, laneCount(), lanePlacement());
+    }
+
+    /// A runtime whose graphs share `laneCount` device lanes, placing stages by `placement`.
+    public EuhedralInferenceRuntime(
+            LatticeTerminal lattice,
+            QwenExecutionPlan plan,
+            ExecutionGpu gpu,
+            int laneCount,
+            LanePool.Placement placement) {
         this.lattice = Objects.requireNonNull(lattice, "lattice");
         this.plan = Objects.requireNonNull(plan, "plan").executionOwner();
         this.gpu = Objects.requireNonNull(gpu, "gpu");
+        if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
+            throw new IllegalArgumentException("laneCount must be 1 to " + LanePool.MAX_LANES);
+        this.laneCount = laneCount;
+        this.placement = Objects.requireNonNull(placement, "placement");
     }
 
     /// Executes quanta and waits for all of their outcomes.
@@ -177,6 +251,18 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 else failure.addSuppressed(closeFailure);
             }
         }
+        LanePool lanes;
+        synchronized (this.closeLock) {
+            lanes = this.lanes;
+        }
+        if (lanes != null) {
+            try {
+                lanes.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
+        }
         if (failure != null) throw failure;
     }
 
@@ -226,26 +312,21 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         private PooledGraph build() {
             ensureOpen();
             ExecutionGpu gpu = EuhedralInferenceRuntime.this.gpu;
-            GpuStream stream = gpu.openStream();
+            LanePool lanes = lanes();
             QwenWorkspaceStorage storage = new QwenWorkspaceStorage(gpu);
             PooledGraph[] pooled = new PooledGraph[1];
-            StageGraph graph;
-            try {
-                List<QwenExecutionPlan.Instruction> instructions = this.view.instructions();
-                graph = new StageGraph(
-                        this.view.stageTopology(),
-                        (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu),
-                        stream,
-                        new QwenExecutionSource(),
-                        retired -> recycle(pooled[0]));
-            } catch (RuntimeException | Error failure) {
-                try {
-                    stream.close();
-                } catch (RuntimeException | Error closeFailure) {
-                    failure.addSuppressed(closeFailure);
-                }
-                throw failure;
-            }
+            List<QwenExecutionPlan.Instruction> instructions = this.view.instructions();
+            StageGraph graph = new StageGraph(
+                    this.view.stageTopology(),
+                    (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu),
+                    lanes,
+                    // Decode quanta leave the GPU idle between dependent kernels, so their independent
+                    // branches spread over lanes; prefill quanta fill the GPU and keep their home lane.
+                    this.view
+                            == EuhedralInferenceRuntime.this.plan.forExecution(
+                                    QwenExecutionContext.ExecutionKind.DECODE, 1),
+                    new QwenExecutionSource(),
+                    retired -> recycle(pooled[0]));
             pooled[0] = new PooledGraph(graph, storage);
             synchronized (EuhedralInferenceRuntime.this.closeLock) {
                 // A close that ran during this build saw no such graph; it would never release it.

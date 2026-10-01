@@ -166,14 +166,9 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
 
     /// Fixed lifetime pairs in the combined prefill graph, not a general lifetime allocator.
     private void configureRegionStorage() {
-        // Each previous value's final consumer precedes the next producer through the layer DAG.
-        reuse(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE, QwenExecutionPlan.Buffer.HIDDEN_STATE);
-        reuse(QwenExecutionPlan.Buffer.POST_MIXER_NORMALIZED, QwenExecutionPlan.Buffer.INPUT_NORMALIZED);
-        reuse(QwenExecutionPlan.Buffer.FFN_DELTA, QwenExecutionPlan.Buffer.MIXER_DELTA);
-        reuse(QwenExecutionPlan.Buffer.SWIGLU, QwenExecutionPlan.Buffer.VALUE_Z_PROJECTED);
-        reuse(QwenExecutionPlan.Buffer.FFN_STAGING, QwenExecutionPlan.Buffer.VALUE_Z_PROJECTED);
-        reuse(QwenExecutionPlan.Buffer.FFN_ACCUMULATORS, QwenExecutionPlan.Buffer.QK_PROJECTED);
-        reuse(QwenExecutionPlan.Buffer.FFN_PARTIALS, QwenExecutionPlan.Buffer.QK_PROJECTED);
+        // Each previous value's final consumer precedes the next producer through the stage topology,
+        // which orders every pair of stages touching one storage (QwenExecutionPlan.withStorageHazards).
+        for (var pair : QwenExecutionPlan.REGION_STORAGE) reuse(pair.getKey(), pair.getValue());
     }
 
     private void reuse(QwenExecutionPlan.Buffer value, QwenExecutionPlan.Buffer owner) {

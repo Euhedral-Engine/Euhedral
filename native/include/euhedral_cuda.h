@@ -286,6 +286,8 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_select(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_stream_clear(void);
 EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_completion_event_create(void);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_record(uint64_t event, uint64_t stream);
+/// Orders work submitted to `stream` afterwards behind the work recorded in `event` (device side).
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_wait_event(uint64_t stream, uint64_t event);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_query(uint64_t event);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_destroy(uint64_t event);
 /// Schedules a notification after preceding stream work and the recorded event.

@@ -28,6 +28,21 @@ public interface GpuStream extends AutoCloseable {
     /// failure, or null when every operation submitted before the boundary completed; never throws.
     Throwable confirmRetired(long ticket);
 
+    /// Opens a reusable cross-stream marker. Synchronous streams need none and return 0.
+    default long openMarker() {
+        return 0L;
+    }
+
+    /// Records `marker` after all work submitted to this stream so far.
+    default void mark(long marker) {}
+
+    /// Orders work submitted to this stream from now on behind the last recording of `marker`, on the
+    /// device; the host does not wait.
+    default void await(long marker) {}
+
+    /// Releases a marker from [#openMarker()] once no recorded or awaited use remains outstanding.
+    default void closeMarker(long marker) {}
+
     /// Blocks until all submitted work has finished. Only recovery and teardown use it.
     void synchronize();
 
