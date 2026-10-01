@@ -303,6 +303,8 @@ val nativeTasks = products.associate { product ->
         inputs.dir(library)
         if (windows) inputs.dir(imports)
         outputs.dir(nativeRoot.map { it.dir(id) })
+        // Zig installs but never removes: clear the CUDA tree so a deleted source leaves no stale copy.
+        doFirst { delete(nativeRoot.get().dir("$id/share/euhedral_cuda")) }
         doFirst {
             val required = if (windows) listOf("cuda.lib", "cudart.lib", "nvrtc.lib")
                 else listOf("libcuda.so", "libcudart.so", "libnvrtc.so")

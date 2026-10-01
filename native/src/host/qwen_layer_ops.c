@@ -83,13 +83,11 @@ static CUfunction residual_rms_norm, residual_rms_norm_row;
 static CUfunction gdn_project_control, gdn_project_control_tiled;
 static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
-static CUfunction attention_qk_norm_rope_rows, attention_norm_cache_rows;
+static CUfunction attention_qk_norm_rope_rows;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
 static CUfunction attention_prefill_nvfp4_exact, attention_decode_nvfp4_exact, attention_prefill_fa2, attention_decode_gqa;
-static CUfunction attention_norm_cache;
-static CUfunction attention_value_cache;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 // The grouped Q4+Q5 launch of the GDN input projections wins over two launches
@@ -116,7 +114,6 @@ static void initialize_modules(void) {
     q45_status = euhedral_cuda_load_kernel(
             &q45_anchor, "q45/kernels.cu", "euhedral_q4_decode_1", &q45_module, &q45_decode[0][0]);
     if (q45_status == EUHEDRAL_CUDA_SUCCESS) {
-        get_function(q45_module, &attention_value_cache, "euhedral_attention_value_cache_bf16");
         static const char* const decode_names[2][3] = {
                 {"euhedral_q4_decode_1", "euhedral_q4_decode_2", "euhedral_q4_decode_4"},
                 {"euhedral_q5_decode_1", "euhedral_q5_decode_2", "euhedral_q5_decode_4"}};
@@ -198,10 +195,8 @@ static void initialize_modules(void) {
         get_function(attention_module, &attention_decode_nvfp4_exact, "euhedral_attention_decode_nvfp4_exact");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_merge_nvfp4, "euhedral_attention_merge_nvfp4");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
-    get_function(attention_module, &attention_norm_cache, "euhedral_attention_qk_norm_cache_bf16");
     // Optional row-owned variants (256-dimension heads), bitwise equal to the per-head kernels.
     get_function(attention_module, &attention_qk_norm_rope_rows, "euhedral_attention_qk_norm_rope_rows_bf16");
-    get_function(attention_module, &attention_norm_cache_rows, "euhedral_attention_qk_norm_cache_rows_bf16");
     status = get_function(attention_module, &attention_kv_append, "euhedral_attention_kv_append_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(attention_module, &attention_causal, "euhedral_attention_causal_bf16");
@@ -856,121 +851,6 @@ int euhedral_cuda_zero_device_memory(void* device_address, uint64_t byte_size) {
     if (result != cudaSuccess) return (int)result;
     result = cudaDeviceSynchronize();
     return result == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)result;
-}
-
-int euhedral_cuda_attention_producers_bf16(
-        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
-        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
-        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
-        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes) {
-    if (!input || !q4 || !q5 || !query_norm || !key_norm || !query_key || !gate || !keys || !values
-            || rows < 64 || hidden == 0 || hidden % 64 != 0 || !query_heads || !key_heads
-            || query_heads % key_heads != 0 || head_dim != 256 || !rotary_dim || rotary_dim > head_dim
-            || (rotary_dim & 1u) || !isfinite(epsilon) || epsilon <= 0 || !isfinite(theta) || theta <= 0
-            || start > UINT64_MAX - rows) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
-    uint64_t heads = (uint64_t)query_heads + key_heads;
-    uint64_t projected = heads * head_dim;
-    uint64_t grid = ((uint64_t)rows + 63u) / 64u * (projected / 32u);
-    uint64_t norm_grid = (uint64_t)rows * heads;
-    if (projected > UINT32_MAX || grid > UINT32_MAX || norm_grid > UINT32_MAX
-            || start + rows > UINT64_MAX / ((uint64_t)key_heads * head_dim * 2u))
-        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
-    uint32_t width = (uint32_t)projected, query_width = query_heads * head_dim;
-    uint64_t expected4, expected5;
-    int status = quantized_byte_size(hidden, width, 4, &expected4);
-    if (status != 0) return status;
-    status = quantized_byte_size(hidden, width, 5, &expected5);
-    if (status != 0) return status;
-    if (q4_bytes != expected4 || q5_bytes != expected5) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
-    status = euhedral_cuda_bind_thread_context();
-    if (status != 0) return status;
-    status = ensure_initialized();
-    if (status != 0) return status;
-    if (q45_status != 0 || !q45_prefill64[0] || !attention_norm_cache || !attention_value_cache)
-        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-    CUstream stream = euhedral_cuda_submission_stream();
-    void* q4_args[] = {&input, &q4, &query_key, &rows, &hidden, &width};
-    void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
-            &head_dim, &rotary_dim, &start, &epsilon, &theta, &keys};
-    void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width, &values, &query_width, &start};
-    uint64_t q4_grid = grid;
-    CUfunction q4_kernel = q45_prefill_wide_kernel(0, input, rows, hidden, width, &q4_grid);
-    if (q4_kernel == NULL) q4_kernel = q45_prefill_kernel(0, 1);
-    status = (int)euhedral_launch_kernel(q4_kernel, (uint32_t)q4_grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
-    if (status == 0) status = attention_norm_cache_rows != NULL
-            ? (int)euhedral_launch_kernel(attention_norm_cache_rows, rows, 1, 1, 256, 1, 1, 0, stream, norm_args, NULL)
-            : (int)euhedral_launch_kernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
-                    head_dim, 1, 1, 0, stream, norm_args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(attention_value_cache, (uint32_t)grid, 1, 1,
-            128, 1, 1, 0, stream, q5_args, NULL);
-    // One owner and one completion edge cover both physical cache producers.
-    // Failed partial submission must drain before borrowed cache/workspace can retire.
-    if (status != 0 || stream == NULL) {
-        int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);
-        if (status == 0) status = drained;
-    }
-    return status;
-}
-
-int euhedral_cuda_attention_producers_nvfp4(
-        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
-        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
-        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
-        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes) {
-    if (!input || !q4 || !q5 || !query_norm || !key_norm || !query_key || !gate || !keys || !values
-            || rows < 64 || hidden == 0 || hidden % 64 != 0 || !query_heads || !key_heads
-            || query_heads % key_heads != 0 || head_dim != 256 || !rotary_dim || rotary_dim > head_dim
-            || (rotary_dim & 1u) || !isfinite(epsilon) || epsilon <= 0 || !isfinite(theta) || theta <= 0
-            || start > UINT64_MAX - rows) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
-    uint64_t heads = (uint64_t)query_heads + key_heads;
-    uint64_t projected = heads * head_dim;
-    uint64_t grid = ((uint64_t)rows + 63u) / 64u * (projected / 32u);
-    uint64_t norm_grid = (uint64_t)rows * heads;
-    if (projected > UINT32_MAX || grid > UINT32_MAX || norm_grid > UINT32_MAX
-            || start + rows > UINT64_MAX / ((uint64_t)key_heads * head_dim * 2u))
-        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
-    uint32_t width = (uint32_t)projected, query_width = query_heads * head_dim;
-    uint64_t expected4, expected5;
-    int status = quantized_byte_size(hidden, width, 4, &expected4);
-    if (status != 0) return status;
-    status = quantized_byte_size(hidden, width, 5, &expected5);
-    if (status != 0) return status;
-    if (q4_bytes != expected4 || q5_bytes != expected5) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
-    status = euhedral_cuda_bind_thread_context();
-    if (status != 0) return status;
-    status = ensure_initialized();
-    if (status != 0) return status;
-    if (q45_status != 0 || !q45_prefill64[0] || !attention_qk_norm_rope || !q45_prefill64[1] || !attention_append_nvfp4)
-        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-    CUstream stream = euhedral_cuda_submission_stream();
-    void* q4_args[] = {&input, &q4, &query_key, &rows, &hidden, &width};
-    void* norm_args[] = {&query_key, &query_norm, &key_norm, &query_key, &rows, &query_heads, &key_heads,
-            &head_dim, &rotary_dim, &start, &epsilon, &theta};
-    void* q5_args[] = {&input, &q5, &gate, &rows, &hidden, &width};
-    uint32_t key_width = key_heads * head_dim;
-    void* append_args[] = {&query_key, &gate, &keys, &values, &rows, &query_width, &key_width, &start};
-    uint64_t q4_grid = grid;
-    CUfunction q4_kernel = q45_prefill_wide_kernel(0, input, rows, hidden, width, &q4_grid);
-    if (q4_kernel == NULL) q4_kernel = q45_prefill_kernel(0, 1);
-    status = (int)euhedral_launch_kernel(q4_kernel, (uint32_t)q4_grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
-    if (status == 0) status = attention_qk_norm_rope_rows != NULL
-            ? (int)euhedral_launch_kernel(attention_qk_norm_rope_rows, rows, 1, 1, 256, 1, 1, 0, stream, norm_args, NULL)
-            : (int)euhedral_launch_kernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
-                    head_dim, 1, 1, 0, stream, norm_args, NULL);
-    uint64_t q5_grid = grid;
-    CUfunction q5_kernel = q45_prefill_wide_kernel(1, input, rows, hidden, width, &q5_grid);
-    if (q5_kernel == NULL) q5_kernel = q45_prefill_kernel(1, 1);
-    if (status == 0) status = (int)euhedral_launch_kernel(q5_kernel, (uint32_t)q5_grid, 1, 1,
-            128, 1, 1, 0, stream, q5_args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(attention_append_nvfp4,
-            (uint32_t)(((uint64_t)rows * key_heads + 3) / 4), 1, 1, 128, 1, 1, 0, stream, append_args, NULL);
-    // One owner and one completion edge cover both physical cache producers.
-    // Failed partial submission must drain before borrowed cache/workspace can retire.
-    if (status != 0 || stream == NULL) {
-        int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);
-        if (status == 0) status = drained;
-    }
-    return status;
 }
 
 int euhedral_cuda_attention_kv_append_nvfp4(

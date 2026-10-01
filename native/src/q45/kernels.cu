@@ -2,7 +2,6 @@
 #include "strategies/decode_wide.cuh"
 #include "strategies/decode_contiguous.cuh"
 #include "strategies/prefill.cuh"
-#include "attention_cache.cuh"
 #include "common/pdl.cuh"
 #include "ffn/down.cuh"
 #include "gemm/balanced.cuh"

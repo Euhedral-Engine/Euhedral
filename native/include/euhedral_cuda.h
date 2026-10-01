@@ -226,11 +226,6 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_zero_device_memory(void* device_address, 
 
 // NVFP4 K/V arguments are device page-address tables. Pages contain 256 tokens,
 // token-major heads, with 128 E2M1 code bytes and 16 E4M3 scales per D256 head.
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_producers_nvfp4(
-        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
-        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
-        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
-        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_kv_append_nvfp4(
         const void* query_key, const void* gate, void* keys, void* values,
         uint32_t rows, uint32_t query_width, uint32_t key_width, uint64_t start);
@@ -239,12 +234,6 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
         uint32_t cache_length, uint64_t start, void* scratch);
-
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_producers_bf16(
-        const void* input, const void* q4, const void* q5, const void* query_norm, const void* key_norm,
-        void* query_key, void* gate, void* keys, void* values, uint32_t rows, uint32_t hidden,
-        uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t rotary_dim,
-        uint64_t start, float epsilon, double theta, uint64_t q4_bytes, uint64_t q5_bytes);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         const void* device_query_key,
