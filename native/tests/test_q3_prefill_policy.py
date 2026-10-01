@@ -62,7 +62,7 @@ int prefill_tile_rows(int selected) {
 #endif
 }
 int engine(int mode, unsigned rows, unsigned width, unsigned outputs) {
-    return euhedral_q3_prefill_engine_shape(mode, rows, width, outputs);
+    return (int)euhedral_q3_prefill_engine_rows(mode, rows, width, outputs);
 }
 '''
 
@@ -116,11 +116,13 @@ class Q3PrefillPolicyTest(unittest.TestCase):
                                      (1, 0, 8), (1, 5120, 12), (1, 5120, 0)]:
             self.assertEqual(0, wide(rows, width, outputs), (rows, width, outputs))
 
-    def test_tile_engine_serves_only_auto_mixer_quanta_from_256_rows(self):
+    def test_tile_engine_serves_auto_mixer_quanta_above_64_rows(self):
         engine = self.lib.engine
         for rows in (256, 512, 1024, 4096):
-            self.assertEqual(1, engine(2, rows, 6144, 5120), rows)
-        for mode, rows, width, outputs in [(2, 255, 6144, 5120), (3, 512, 6144, 5120), (1, 512, 6144, 5120),
+            self.assertEqual(128, engine(2, rows, 6144, 5120), rows)
+        for rows in (65, 128, 255):
+            self.assertEqual(64, engine(2, rows, 6144, 5120), rows)
+        for mode, rows, width, outputs in [(2, 64, 6144, 5120), (3, 512, 6144, 5120), (1, 512, 6144, 5120),
                                            (2, 512, 5120, 34816), (2, 512, 17408, 5120), (2, 512, 6144, 5184)]:
             self.assertEqual(0, engine(mode, rows, width, outputs), (mode, rows, width, outputs))
 

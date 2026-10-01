@@ -61,12 +61,14 @@ class Q45DecodePolicyTest(unittest.TestCase):
                                      (1, 5120, 4100), (1, 5120, 0)]:
             self.assertEqual(0, contiguous(rows, width, outputs), (rows, width, outputs))
 
-    def test_wide_prefill_for_q4_and_q5_quanta_from_256_rows(self):
+    def test_wide_prefill_for_q4_and_q5_quanta_above_64_rows(self):
         wide = self.lib.prefill_wide
         for bits, rows, width, outputs in [(5, 256, 5120, 12288), (5, 512, 5120, 7168), (4, 512, 5120, 4096),
                                            (4, 1024, 32, 32)]:
             self.assertEqual(128, wide(bits, rows, width, outputs), (bits, rows, width, outputs))
-        for bits, rows, width, outputs in [(3, 512, 5120, 7168), (4, 255, 5120, 4096), (5, 255, 5120, 7168), (5, 512, 5136, 7168),
+        for bits, rows in [(4, 65), (5, 128), (4, 255)]:
+            self.assertEqual(64, wide(bits, rows, 5120, 7168), (bits, rows))
+        for bits, rows, width, outputs in [(3, 512, 5120, 7168), (4, 64, 5120, 4096), (5, 1, 5120, 7168), (5, 512, 5136, 7168),
                                            (5, 512, 5120, 7176), (5, 512, 0, 7168), (5, 512, 5120, 0)]:
             self.assertEqual(0, wide(bits, rows, width, outputs), (bits, rows, width, outputs))
 

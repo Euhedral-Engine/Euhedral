@@ -456,6 +456,9 @@ the represented-NVFP4 tolerance for decode attention.
   tiles up to 64 rows and 128-row tiles above: 64 rows 383 -> 281 us, 128 rows 713 -> 439 us,
   192 rows 987 -> 730 us, bitwise equal. Prefill 64 +3.6%, 128 +5.1%, time to first token for a 64-token
   prompt -3.4% (6 of 6 forks each).
+  From 65 rows the separate Q4/Q5 projections and the mixer use 64-row balanced tiles (128 rows: Q5
+  5120 -> 7168 367 -> 258 us, Q4 292 -> 212 us, mixer 325 -> 238 us); at 64 rows the 64 x 32 and 32-row
+  kernels fill more CTAs and stay. Prefill 128 +3.1%, 192 +5.2% (6 of 6 forks each).
 - **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
   128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
   the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it
