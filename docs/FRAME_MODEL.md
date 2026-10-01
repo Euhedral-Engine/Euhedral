@@ -361,6 +361,15 @@ the represented-NVFP4 tolerance for decode attention.
   forks. The hi + lo kernels remain as `_exact` twins.
 - **GDN convolution.** One thread per channel walked every row although each output reads only
   the previous three inputs; 32-row blocks give 1280 CTAs at 512 rows (238 -> 68 us).
+- **Decode fusion.** With every decode GEMV near the DRAM roofline (750-850 GB/s), the remaining
+  decode time is small kernels and the gaps between about 995 launches per token. Decode now runs
+  its own instance of the short-prefill topology: rounded residual add + RMSNorm is one region and
+  the GDN A/B projection + control another (772 launches). For one row the residual norm keeps its
+  columns in registers, eight per thread with 16-byte loads, and reduces by warp shuffles
+  (`euhedral_residual_rms_norm_row_bf16`, within one BF16 ulp of the exact kernel, which exact
+  numerics keep). Spreading that row over 40 CTAs that each recompute the reduction was slower
+  (17.39 vs 17.23 ms per token). Decode 64 + 128 +1.0%, 1024 + 128 +1.2%, 6 of 6 forks each; drift
+  unchanged.
 
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under

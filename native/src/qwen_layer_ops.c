@@ -62,7 +62,7 @@ static CUfunction gdn_convolution;
 static CUfunction gdn_recurrence;
 static CUfunction gdn_gated_rms_norm;
 static CUfunction residual_add;
-static CUfunction residual_rms_norm;
+static CUfunction residual_rms_norm, residual_rms_norm_row;
 static CUfunction gdn_project_control;
 static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
@@ -139,6 +139,7 @@ static void initialize_modules(void) {
             &elementwise_anchor, "qwen_elementwise.cu", "euhedral_residual_add_bf16", &elementwise_module, &residual_add);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     get_function(elementwise_module, &residual_rms_norm, "euhedral_residual_rms_norm_bf16");
+    get_function(elementwise_module, &residual_rms_norm_row, "euhedral_residual_rms_norm_row_bf16");
     status = get_function(elementwise_module, &swiglu, "euhedral_swiglu_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
 
@@ -194,6 +195,9 @@ static void initialize(void) {
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_wide[format]);
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_contiguous[format]);
     euhedral_cuda_pdl_register(gdn_control);
+    euhedral_cuda_pdl_register(gdn_project_control);
+    euhedral_cuda_pdl_register(residual_rms_norm);
+    euhedral_cuda_pdl_register(residual_rms_norm_row);
     euhedral_cuda_pdl_register(gdn_convolution);
     euhedral_cuda_pdl_register(gdn_recurrence);
     euhedral_cuda_pdl_register(gdn_gated_rms_norm);
@@ -686,6 +690,11 @@ int euhedral_cuda_residual_rms_norm_bf16(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     if (!residual_rms_norm) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     void* parameters[] = {&residual, &delta, &weight, &hidden, &normalized, &rows, &width, &epsilon};
+    // Relaxed numerics: one row (decode) keeps its columns in registers, eight per thread.
+    if (rows == 1 && residual_rms_norm_row != NULL && !euhedral_cuda_exact_numerics() && width % 8u == 0u
+            && width <= 8192u && (((uintptr_t)residual | (uintptr_t)delta | (uintptr_t)weight
+                    | (uintptr_t)hidden | (uintptr_t)normalized) & 15u) == 0u)
+        return launch_and_synchronize(residual_rms_norm_row, 1, (width / 8u + 31u) / 32u * 32u, parameters);
     return launch_and_synchronize(residual_rms_norm, rows, 128, parameters);
 }
 

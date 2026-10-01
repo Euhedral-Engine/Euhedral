@@ -405,13 +405,14 @@ class Gpu:
         _check(self.dtoh(buffer, ptr, size), "cuMemcpyDtoH")
         return buffer.raw
 
-    def launch(self, name, grid, arguments, synchronize=True):
+    def launch(self, name, grid, arguments, synchronize=True, block=None):
         function = P()
         _check(self.function(C.byref(function), self.module, name.encode()), name)
         params = (P * len(arguments))(*[C.cast(C.pointer(value), P) for value in arguments])
         grid_x, grid_y = grid if isinstance(grid, tuple) else (grid, 1)
-        _check(self.launch_kernel(function, grid_x, grid_y, 1, 128 if name != "probe_stripe_codes"
-                                  and name != "probe_pair_codes" else 32, 1, 1, 0, None, params, None), name)
+        if block is None:
+            block = 128 if name != "probe_stripe_codes" and name != "probe_pair_codes" else 32
+        _check(self.launch_kernel(function, grid_x, grid_y, 1, block, 1, 1, 0, None, params, None), name)
         if synchronize:
             _check(self.sync(), name)
 

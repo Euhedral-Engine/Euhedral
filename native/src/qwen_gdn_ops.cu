@@ -59,14 +59,34 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_gdn_project_control_f
         const __nv_bfloat16* input, const __nv_bfloat16* aWeight, const __nv_bfloat16* bWeight,
         const float* aLog, const float* dtBias, float* alphaOutput, float* betaOutput,
         uint32_t rows, uint32_t width, uint32_t heads) {
+    euhedral_pdl_begin();
     const uint64_t index = blockIdx.x;
     if (index >= static_cast<uint64_t>(rows) * heads) return;
     const uint32_t row = static_cast<uint32_t>(index / heads);
     const uint32_t head = static_cast<uint32_t>(index % heads);
     const uint64_t activationBase = static_cast<uint64_t>(row) * width;
     const uint64_t weightBase = static_cast<uint64_t>(head) * width;
+    // Each thread's operands are loaded in batches before its in-order FMA chain.
+    constexpr uint32_t kBatch = 10;
+    const uint32_t stride = blockDim.x;
     float a = 0.0f, b = 0.0f;
-    for (uint32_t k = threadIdx.x; k < width; k += blockDim.x) {
+    uint32_t k = threadIdx.x;
+    for (; k + (kBatch - 1) * stride < width; k += kBatch * stride) {
+        __nv_bfloat16 xs[kBatch], as[kBatch], bs[kBatch];
+#pragma unroll
+        for (uint32_t i = 0; i < kBatch; i++) {
+            xs[i] = input[activationBase + k + i * stride];
+            as[i] = aWeight[weightBase + k + i * stride];
+            bs[i] = bWeight[weightBase + k + i * stride];
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < kBatch; i++) {
+            const float x = __bfloat162float(xs[i]);
+            a = fmaf(x, __bfloat162float(as[i]), a);
+            b = fmaf(x, __bfloat162float(bs[i]), b);
+        }
+    }
+    for (; k < width; k += stride) {
         const float x = __bfloat162float(input[activationBase + k]);
         a = fmaf(x, __bfloat162float(aWeight[weightBase + k]), a);
         b = fmaf(x, __bfloat162float(bWeight[weightBase + k]), b);

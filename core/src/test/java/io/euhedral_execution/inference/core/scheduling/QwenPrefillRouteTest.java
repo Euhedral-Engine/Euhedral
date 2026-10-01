@@ -9,16 +9,26 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /// Production prefill routing: streamed C only at its qualified geometry, A+B+D+F elsewhere
-/// from 64 rows, A+D below 64 rows, and the reference topology for decode.
+/// from 64 rows, A+D below 64 rows, and A+D in a separate view for decode.
 class QwenPrefillRouteTest {
     private static final int[] QUALIFIED_ROWS = {64, 256, 512, 1024};
 
     @Test
-    void decodeKeepsTheReferenceTopology() {
+    void decodeRunsTheSmallTopologyInItsOwnView() {
         var weights = QwenExecutionFixtures.statefulCompactWeights();
         var plan = new QwenExecutionPlan(weights);
         var reference = QwenExecutionPlan.reference(weights);
-        for (int rows : new int[] {1, 64, 256}) assertSame(plan, plan.forExecution(ExecutionKind.DECODE, rows));
+        var decode = plan.forExecution(ExecutionKind.DECODE, 1);
+        var small = plan.forExecution(ExecutionKind.PREFILL, 1);
+        for (int rows : new int[] {1, 64, 256}) assertSame(decode, plan.forExecution(ExecutionKind.DECODE, rows));
+        // Same fused topology as short prefill, but its own plan: graphs and logits stay per view.
+        assertNotSame(small, decode);
+        assertNotSame(plan, decode);
+        assertEquals(kinds(small), kinds(decode));
+        assertEquals(small.bufferSpecs(), decode.bufferSpecs());
+        assertTrue(has(decode, Kind.RESIDUAL_RMS_NORM));
+        assertTrue(has(decode, Kind.GDN_PROJECT_CONTROL));
+        assertFalse(decode.reusePrefillStorage());
         assertEquals(kinds(reference), kinds(plan));
         assertEquals(reference.bufferSpecs(), plan.bufferSpecs());
         assertFalse(plan.reusePrefillStorage());
@@ -139,7 +149,7 @@ class QwenPrefillRouteTest {
                 assertFalse(has(selected, Kind.FFN_STREAMED));
                 assertCombined(weights.config().numHiddenLayers(), selected);
             }
-            assertEquals(2, plan.executionVariants().size());
+            assertEquals(3, plan.executionVariants().size());
         }
     }
 
@@ -183,7 +193,9 @@ class QwenPrefillRouteTest {
             try {
                 var context = new QwenExecutionContext(view, sequence, ExecutionKind.PREFILL, 0, new int[rows]);
                 assertSame(owner.forExecution(ExecutionKind.PREFILL, rows), context.plan());
-                assertSame(owner, context.plan().forExecution(ExecutionKind.DECODE, 1));
+                assertSame(
+                        owner.forExecution(ExecutionKind.DECODE, 1),
+                        context.plan().forExecution(ExecutionKind.DECODE, 1));
                 assertSame(owner, context.plan().executionOwner());
             } finally {
                 sequence.complete();

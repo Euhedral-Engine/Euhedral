@@ -237,11 +237,12 @@ public final class QwenExecutionPlan {
     private final boolean reuseStorage;
     private final QwenExecutionPlan owner;
     private final QwenExecutionPlan smallPrefill;
+    private final QwenExecutionPlan decode;
     private final QwenExecutionPlan regionPrefill;
     private final QwenExecutionPlan streamedPrefill;
 
     /// Builds the production plan. For a complete model, prefill quanta automatically select the
-    /// retained region architecture by row count and geometry; decode keeps the reference topology.
+    /// retained region architecture by row count and geometry; decode runs the small topology.
     /// Staged plans for partial weights (embedding-only, layer zero) remain reference-only.
     public QwenExecutionPlan(QwenWeights weights) {
         this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), null, false);
@@ -269,7 +270,10 @@ public final class QwenExecutionPlan {
         Objects.requireNonNull(kind, "kind");
         if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
         QwenExecutionPlan family = this.owner;
-        if (kind == QwenExecutionContext.ExecutionKind.DECODE || family.regionPrefill == null) return family;
+        if (family.regionPrefill == null) return family;
+        // Decode runs its own instance of the small topology: rounded residual add + RMSNorm and the
+        // joint GDN A/B projection + control are single region launches, as in short prefill quanta.
+        if (kind == QwenExecutionContext.ExecutionKind.DECODE) return family.decode;
         if (rows < REGION_MIN_ROWS) return family.smallPrefill;
         if (streamedFfnRows(rows) && family.streamedPrefill != null) return family.streamedPrefill;
         return family.regionPrefill;
@@ -352,12 +356,14 @@ public final class QwenExecutionPlan {
         this.stageTopology = StageTopology.submitted(dependencies);
         if (owner != null || !data.fullModel()) {
             this.smallPrefill = null;
+            this.decode = null;
             this.regionPrefill = null;
             this.streamedPrefill = null;
             return;
         }
         QwenConfig config = weights.config();
         this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
+        this.decode = prefillPlan(weights, data, PrefillView.SMALL, this);
         this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
         this.streamedPrefill =
                 config.hiddenSize() == STREAMED_FFN_HIDDEN && config.intermediateSize() == STREAMED_FFN_INTERMEDIATE
@@ -653,12 +659,12 @@ public final class QwenExecutionPlan {
         return this.bufferSpecs;
     }
 
-    /// The prefill views this plan owns besides its own topology; empty for a view or a reference plan.
+    /// The views this plan owns besides its own topology; empty for a view or a reference plan.
     List<QwenExecutionPlan> executionVariants() {
         if (this.owner != this || this.regionPrefill == null) return List.of();
         return this.streamedPrefill == null
-                ? List.of(this.smallPrefill, this.regionPrefill)
-                : List.of(this.smallPrefill, this.regionPrefill, this.streamedPrefill);
+                ? List.of(this.decode, this.smallPrefill, this.regionPrefill)
+                : List.of(this.decode, this.smallPrefill, this.regionPrefill, this.streamedPrefill);
     }
 
     boolean reusePrefillStorage() {
