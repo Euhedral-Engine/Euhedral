@@ -111,7 +111,7 @@ pub fn build(b: *std.Build) void {
         b.installFile(b.fmt("src/q45/{s}", .{source}), b.fmt("share/euhedral_cuda/q45/{s}", .{source}));
     }
     b.installFile("src/qwen_gdn_ops.cu", "share/euhedral_cuda/qwen_gdn_ops.cu");
-    for ([_][]const u8{ "tiles.cuh", "gate_up.cuh", "down.cuh" }) |source| {
+    for ([_][]const u8{ "tiles.cuh", "formats.cuh", "gate_up.cuh", "down.cuh" }) |source| {
         b.installFile(b.fmt("src/ffn/{s}", .{source}), b.fmt("share/euhedral_cuda/ffn/{s}", .{source}));
     }
     b.installFile("src/qwen_ffn.cu", "share/euhedral_cuda/qwen_ffn.cu");

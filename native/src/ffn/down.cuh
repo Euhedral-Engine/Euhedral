@@ -1,17 +1,18 @@
 #pragma once
 #include "tiles.cuh"
+#include "formats.cuh"
 namespace qwen_ffn_down {
 using namespace k32_probe;
 // SPLIT: the CTA accumulates K range [start, start + count) of the full activation (row stride
 // width) from zero and writes FP32 partial sums to `state`; the reduction kernel adds the splits
 // and rounds to BF16. Otherwise x is a region of `count` features continuing `state` (streamed FFN)
-// or the whole K (start 0, count width).
-template<int F,int N,bool SPLIT=false,int P=1>
+// or the whole K (start 0, count width). B selects the weight format (formats.cuh).
+template<int F,int N,bool SPLIT=false,int P=1,class B=qwen_ffn_tiles::Q3B>
 static __device__ __forceinline__ void run(const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int rows,unsigned int width,unsigned int outputs,unsigned long long scale,float* state,unsigned int start,unsigned int count,qwen_ffn_tiles::Storage<F,N,P>& s){
     unsigned int lane=threadIdx.x&31u,warp=threadIdx.x>>5,mb=warp>>1,nb=warp&1u;
     bool owns_a=warp==0u||warp==3u;unsigned int branch=owns_a?mb:2u+nb;
     unsigned int tiles=(outputs+2u*N-1u)/(2u*N),row0=(blockIdx.x/tiles)*(32u*F),col0=(blockIdx.x%tiles)*(2u*N);
-    q3::Layout layout(w,width,scale);float acc[F][N/8][4]={};
+    const typename B::Layout layout=B::layout(w,width,outputs,scale);float acc[F][N/8][4]={};
     if(!SPLIT&&start){
         #pragma unroll
         for(int m=0;m<F;++m)
@@ -23,12 +24,12 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
     }
     if(threadIdx.x<8u){unsigned int b=threadIdx.x>>1,t=threadIdx.x&1u;init(&s.ready[b][t],32u);init(&s.release[b][t],64u);}
     __syncthreads();
-    CompactB next[N/16];unsigned int generations=count/32u;
+    typename B::Compact next[N/16];unsigned int generations=count/32u;
     if(generations){
         if(owns_a)qwen_ffn_tiles::activation<F>(s.a[0][mb],x,rows,SPLIT?width:count,row0,mb,SPLIT?start:0u,lane);
         else {
             #pragma unroll
-            for(int t=0;t<N/16;++t)produce_b<false,P>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][P-1]+t*16u*32u,layout,outputs,col0+nb*N+t*16u,start,lane);
+            for(int t=0;t<N/16;++t)B::template produce<P>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][P-1]+t*16u*32u,layout,outputs,col0+nb*N+t*16u,start,lane);
         }
         arrive(&s.ready[branch][0]);
     }
@@ -51,14 +52,14 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
                     for(int h=0;h<N/8;++h)q3::mma_16816(acc[m][h],af[m],bf[part][h/2][(h&1)*2],bf[part][h/2][(h&1)*2+1]);
             if(!owns_a&&half==0u&&gen+1u<generations){
                 #pragma unroll
-                for(int t=0;t<N/16;++t)prefetch_compact_b(next[t],layout,outputs,col0+nb*N+t*16u,start+(gen+1u)*32u,lane);
+                for(int t=0;t<N/16;++t)B::prefetch(next[t],layout,outputs,col0+nb*N+t*16u,start+(gen+1u)*32u,lane);
             }
         }
         if(gen+1u<generations){unsigned int n=gen+1u;if(n>=2u)wait(&s.release[branch][n&1u],((n-2u)>>1)&1u);
             if(owns_a)qwen_ffn_tiles::activation<F>(s.a[n&1u][mb],x,rows,SPLIT?width:count,row0,mb,(SPLIT?start:0u)+n*32u,lane);
             else {
                 #pragma unroll
-                for(int t=0;t<N/16;++t)stage_compact_b<false,P>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][P-1]+t*16u*32u,next[t],lane);
+                for(int t=0;t<N/16;++t)B::template stage<P>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][P-1]+t*16u*32u,next[t],lane);
             }
             arrive(&s.ready[branch][n&1u]);
         }
