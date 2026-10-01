@@ -25,7 +25,11 @@ public final class LanePool implements AutoCloseable {
         /// The first successor of a stage to run continues that stage's lane; the other branches of a
         /// fan-out fork to random lanes. A join continues the lane of a predecessor no other successor
         /// continued. Cross-lane edges then occur only where branches split or meet.
-        FORK
+        FORK,
+        /// A stage continues the lane of the predecessor whose longest remaining path runs through it, so
+        /// each graph's critical chain keeps one lane in every quantum; the other branches of a fan-out
+        /// take random lanes. Static, so no successor races for a lane.
+        PATH
     }
 
     /// Markers record which lanes a quantum used in one 64-bit mask.
@@ -78,14 +82,15 @@ public final class LanePool implements AutoCloseable {
     }
 
     /// The lane for `stage`, given the lane it may continue (-1 for none): its chain predecessor's
-    /// under CHAIN, an unclaimed predecessor's (or the graph's home lane for a root) under FORK.
+    /// under CHAIN, an unclaimed predecessor's (or the graph's home lane for a root) under FORK, its
+    /// path predecessor's (or the home lane for a root) under PATH.
     int choose(int stage, int continued) {
         if (this.lanes.length == 1) return 0;
         if (this.fixed != null) return this.fixed.applyAsInt(stage);
         return switch (this.placement) {
             case RANDOM -> ThreadLocalRandom.current().nextInt(this.lanes.length);
             case WORKER -> worker();
-            case CHAIN, FORK ->
+            case CHAIN, FORK, PATH ->
                 continued >= 0 ? continued : ThreadLocalRandom.current().nextInt(this.lanes.length);
         };
     }

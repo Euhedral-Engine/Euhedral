@@ -148,10 +148,11 @@ order; a root on another lane awaits the quantum's preparation marker. Before th
 every other lane the quantum used joins the home lane the same way, so the single boundary covers all
 of the quantum's work. A launch that awaited another lane does not use programmatic dependent launch.
 
-Placement (`EUHEDRAL_LANE_PLACEMENT`): FORK (default) lets the first successor of a stage continue
-its lane and forks the other branches to random lanes, so lanes cross only where branches split or
-join; CHAIN keeps only linear chains on one lane; RANDOM and WORKER (the submitting worker's lane)
-spread every stage. Decode graphs spread their stages; prefill graphs keep every stage on their home
+Placement (`EUHEDRAL_LANE_PLACEMENT`): PATH (default) lets each stage continue the lane of the
+predecessor whose longest remaining path runs through it, fixed when the graph is built, so a graph's
+critical chain keeps one lane in every quantum and the other branches of a fan-out take random lanes;
+FORK lets whichever successor of a stage runs first continue its lane; CHAIN keeps only linear chains
+on one lane; RANDOM and WORKER (the submitting worker's lane) spread every stage. Decode graphs spread their stages; prefill graphs keep every stage on their home
 lane, because their kernels already fill the GPU and a cross-lane wait only adds latency there.
 
 With stages on different lanes the stream no longer orders every write after earlier reads and
@@ -170,6 +171,10 @@ Measured on decode 64/1024 + 128 (Nsight Systems token period, then six paired f
   cost 1.1% at 256 tokens. Three hand-placed lanes (the side branches of each layer's projection
   fan-out) measured +1.0-1.4%, so the current frame granularity leaves most of the overlap on the
   table; finer per-kernel frames are the next step for this mechanism.
+- PATH against FORK (32 lanes, six paired forks, one build): decode 64 + 128 +0.57% (5 of 6), decode
+  1024 + 128 +0.29% (6 of 6). Under FORK the side branch of a fan-out (the GDN control projection, the
+  attention value projection) often runs first and takes the chain's lane, moving the long branch to a
+  new lane behind a cross-lane wait; PATH decides statically, with no race on the claim.
 
 Direct operator calls with no stream selected still run synchronously; only tests and diagnostics use
 them.

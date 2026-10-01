@@ -155,6 +155,33 @@ class StageGraphTest {
     }
 
     @Test
+    void pathPlacementKeepsTheLongestChainOnTheHomeLaneWhicheverBranchRunsFirst() {
+        RecordingStream home = this.stream, side = new RecordingStream(), other = new RecordingStream();
+        side.base = 100;
+        other.base = 200;
+        // 0 -> 1 -> 3 -> 4 is the longest path; 0 -> 2 -> 4 is the side branch.
+        StageTopology topology = StageTopology.submitted(new int[][] {{}, {0}, {0}, {1}, {2, 3}});
+        LanePool pool = new LanePool(new RecordingStream[] {home, side, other}, LanePool.Placement.PATH);
+        StageGraph graph =
+                new StageGraph(topology, StageGraphFixtures.TestStage::new, pool, true, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        run(take(this.source).getFirst());
+        take(this.source);
+        run(stage(graph, 2));
+        run(stage(graph, 1));
+        run(take(this.source).getFirst());
+        run(take(this.source).getFirst());
+        assertEquals(
+                List.of("k0", "k1", "k3", "k4"),
+                home.kernels.stream().filter(name -> name.startsWith("k")).toList(),
+                "the side branch running first does not take the chain's lane");
+        home.retireNext(false);
+        drain(this.source);
+        assertEquals("SUCCESS", quantum.outcome.join());
+        graph.close();
+    }
+
+    @Test
     void submissionEdgeReleasesTheSuccessorBeforeTheProducersDeviceWorkRetires() {
         StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
         TestQuantum quantum = start(graph);

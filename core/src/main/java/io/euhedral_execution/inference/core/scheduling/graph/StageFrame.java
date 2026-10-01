@@ -40,6 +40,8 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     StageFrame[] submittedPredecessors;
     /// The only predecessor when this stage continues a linear chain; null otherwise.
     StageFrame chainPredecessor;
+    /// The predecessor whose longest remaining path continues through this stage; null otherwise.
+    StageFrame pathPredecessor;
     /// Recorded on this stage's lane after it submits when it has successors (multi-lane pools only).
     long marker;
     /// The lane this stage submitted to in the current quantum. Successors read it after their final
@@ -151,7 +153,12 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         if (pool.placement() == LanePool.Placement.CHAIN) {
             return this.chainPredecessor == null ? -1 : this.chainPredecessor.lane;
         }
-        if (pool.placement() != LanePool.Placement.FORK || pool.size() == 1) return -1;
+        if (pool.size() == 1) return -1;
+        if (pool.placement() == LanePool.Placement.PATH) {
+            if (this.submittedPredecessors.length == 0) return owner.home();
+            return this.pathPredecessor == null ? -1 : this.pathPredecessor.lane;
+        }
+        if (pool.placement() != LanePool.Placement.FORK) return -1;
         if (this.submittedPredecessors.length == 0) return owner.home();
         // Latest predecessor first: it is the most recent work in its lane.
         for (int index = this.submittedPredecessors.length - 1; index >= 0; index--) {
