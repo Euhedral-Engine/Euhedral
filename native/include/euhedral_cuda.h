@@ -93,9 +93,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_bf16(
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_decode_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
-/* Selects exact (nonzero) or contiguous (zero) single-row Q3 decode for later launches in this
- * process and returns the previous selection. The default is contiguous unless the environment sets
- * EUHEDRAL_Q3_DECODE=EXACT. */
+/* Selects exact numerics (nonzero) for later launches in this process and returns the previous
+ * selection: every kernel with a relaxed FP32 accumulation order (contiguous Q3 decode, split-K FFN
+ * down, ...) is replaced by its bitwise-exact counterpart. The default is relaxed unless the
+ * environment sets EUHEDRAL_EXACT=1 (or EUHEDRAL_Q3_DECODE=EXACT). The second name is an alias. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_select_exact_numerics(int exact);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_decode_select_exact(int exact);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_bf16(
         const void* input, const void* weights, void* output,
@@ -104,6 +106,12 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_64_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
 
+/* Split-K FFN down for the measured prefill shapes: K splits accumulate into `partials`
+ * (splits x rows x outputs FP32, splits = 4) and a reduction writes BF16 `output`. Other shapes, or
+ * a NULL `partials`, run euhedral_cuda_q3_ffn_down_bf16. FP32 order differs from the unsplit leaf. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_ffn_down_split_bf16(
+        const void* input, const void* weights, void* output, float* partials,
+        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_ffn_down_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);

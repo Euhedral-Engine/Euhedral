@@ -8,12 +8,8 @@ import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
-import java.lang.foreign.FunctionDescriptor;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
-import java.lang.invoke.MethodHandle;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,18 +20,19 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-/// Teacher-forced decode with the contiguous Q3 decode kernel against the exact Q3 oracle.
+/// Teacher-forced prefill and decode with every relaxed-order kernel against the exact oracle.
 ///
 /// Two sequences receive the same tokens: a prefix by prefill, then one forced token per decode
-/// quantum. Before each quantum the process-wide Q3 decode selection is switched, so sequence A
-/// always runs the exact kernels and sequence B the contiguous one; every other kernel is shared.
+/// quantum. Before each quantum the process-wide exact-numerics selection is switched, so sequence A
+/// always runs the bitwise-exact kernels and sequence B every kernel whose FP32 accumulation order
+/// was relaxed (contiguous Q3 decode, split-K FFN down, ...). Their errors combine, so this bounds
+/// the cumulative effect.
 /// Each step compares the final hidden state (before the final norm) and the logits row. Errors
 /// must stay small and must not grow with position: the recurrent GDN and KV state carry any
 /// difference forward, so progressive drift would show as a rising trend. With
-/// `euhedral.q3.drift.candidate=exact` both sequences run the exact kernels, which must agree bitwise.
-class Q3DecodeDriftCudaIntegrationTest {
+/// `euhedral.numerics.drift.candidate=exact` both sequences run the exact kernels, which must agree bitwise.
+class RelaxedNumericsDriftCudaIntegrationTest {
 
-    private static final int PREFIX = 64;
     private static final int BURN_IN = 128;
 
     private record Step(short[] hidden, float[] logits) {}
@@ -51,21 +48,16 @@ class Q3DecodeDriftCudaIntegrationTest {
 
     @Test
     @Timeout(value = 3600, unit = TimeUnit.SECONDS)
-    void contiguousDecodeStaysWithinBoundedErrorOfTheExactOracle() throws Throwable {
-        int steps = Integer.getInteger("euhedral.q3.drift.steps", 384);
+    void relaxedKernelsStayWithinBoundedErrorOfTheExactOracle() throws Throwable {
+        int steps = Integer.getInteger("euhedral.numerics.drift.steps", 384);
+        int prefixLength = Integer.getInteger("euhedral.numerics.drift.prefix", 256);
         // Calibration: "exact" runs the exact kernels on both sequences (determinism floor).
-        int candidate = "exact".equals(System.getProperty("euhedral.q3.drift.candidate")) ? 1 : 0;
+        boolean candidate = "exact".equals(System.getProperty("euhedral.numerics.drift.candidate"));
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
-        int[] tokens = forcedTokens(QwenTokenizer.load(tokenizerDirectory), PREFIX + steps);
-        MethodHandle selectExact = Linker.nativeLinker()
-                .downcallHandle(
-                        SymbolLookup.libraryLookup(library, Arena.global())
-                                .find("euhedral_cuda_q3_decode_select_exact")
-                                .orElseThrow(),
-                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+        int[] tokens = forcedTokens(QwenTokenizer.load(tokenizerDirectory), prefixLength + steps);
         List<Metrics> metrics = new ArrayList<>();
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 QwenModel model = QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu);
@@ -75,21 +67,21 @@ class Q3DecodeDriftCudaIntegrationTest {
             var exact = new QwenSequenceState(1);
             var contiguous = new QwenSequenceState(2);
             try {
-                int[] prefix = java.util.Arrays.copyOf(tokens, PREFIX);
-                selectExact.invoke(1);
+                int[] prefix = java.util.Arrays.copyOf(tokens, prefixLength);
+                gpu.selectExactNumerics(true);
                 run(runtime, gpu, plan, exact, QwenExecutionContext.ExecutionKind.PREFILL, prefix);
-                selectExact.invoke(candidate);
+                gpu.selectExactNumerics(candidate);
                 run(runtime, gpu, plan, contiguous, QwenExecutionContext.ExecutionKind.PREFILL, prefix);
                 for (int step = 0; step < steps; step++) {
-                    int[] token = {tokens[PREFIX + step]};
-                    selectExact.invoke(1);
+                    int[] token = {tokens[prefixLength + step]};
+                    gpu.selectExactNumerics(true);
                     Step a = run(runtime, gpu, plan, exact, QwenExecutionContext.ExecutionKind.DECODE, token);
-                    selectExact.invoke(candidate);
+                    gpu.selectExactNumerics(candidate);
                     Step b = run(runtime, gpu, plan, contiguous, QwenExecutionContext.ExecutionKind.DECODE, token);
-                    metrics.add(compare(PREFIX + step, a, b));
+                    metrics.add(compare(prefixLength + step, a, b));
                 }
             } finally {
-                selectExact.invoke(0);
+                gpu.selectExactNumerics(false);
                 exact.complete();
                 contiguous.complete();
                 runtime.close();
@@ -241,7 +233,7 @@ class Q3DecodeDriftCudaIntegrationTest {
     }
 
     private static void report(List<Metrics> metrics) throws Exception {
-        String path = System.getProperty("euhedral.q3.drift.report");
+        String path = System.getProperty("euhedral.numerics.drift.report");
         if (path != null && !path.isBlank()) {
             StringBuilder csv =
                     new StringBuilder("position,hidden_relative,hidden_max,logit_max,logit_relative,kl,top_agrees\n");

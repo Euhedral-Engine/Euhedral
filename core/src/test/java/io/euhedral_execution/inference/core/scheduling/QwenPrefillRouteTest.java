@@ -73,7 +73,7 @@ class QwenPrefillRouteTest {
     void streamedFfnIsSelectedOnlyAtItsExactQualifiedGeometry() {
         var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
         var plan = new QwenExecutionPlan(weights);
-        var streamed = plan.forExecution(ExecutionKind.PREFILL, 64);
+        var streamed = plan.forExecution(ExecutionKind.PREFILL, 1024);
         int layers = weights.config().numHiddenLayers();
         assertEquals(layers, count(streamed, Kind.FFN_STREAMED));
         assertFalse(has(streamed, Kind.Q3_GATE_UP_SWIGLU));
@@ -84,8 +84,7 @@ class QwenPrefillRouteTest {
         assertEquals(5120, streamed.bufferWidth(Buffer.FFN_ACCUMULATORS));
         assertTrue(streamed.reusePrefillStorage());
         assertTopology(streamed);
-        assertSame(streamed, plan.forExecution(ExecutionKind.PREFILL, 1024));
-        for (int rows : new int[] {65, 255, 256, 257, 512, 1023, 1025}) {
+        for (int rows : new int[] {64, 65, 255, 256, 257, 512, 1023, 1025}) {
             var fallback = plan.forExecution(ExecutionKind.PREFILL, rows);
             assertNotSame(streamed, fallback, "rows=" + rows);
             assertCombined(layers, fallback);
@@ -103,6 +102,30 @@ class QwenPrefillRouteTest {
                     .anyMatch(
                             i -> i.kind() == Kind.Q3_LINEAR && i.outputBuffers().contains(Buffer.FFN_DELTA)));
         }
+    }
+
+    @Test
+    void qualifiedFfnDownSplitsKIntoBorrowedProjectionStorage() {
+        var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408));
+        for (int rows : new int[] {64, 256, 512}) {
+            var selected = plan.forExecution(ExecutionKind.PREFILL, rows);
+            var downs = selected.instructions().stream()
+                    .filter(i -> i.kind() == Kind.Q3_FFN_DOWN)
+                    .toList();
+            assertEquals(selected.weights().config().numHiddenLayers(), downs.size());
+            assertTrue(downs.stream()
+                    .allMatch(i -> i.outputBuffers().equals(List.of(Buffer.FFN_DELTA, Buffer.FFN_PARTIALS))));
+            assertEquals(4 * 5120, selected.bufferWidth(Buffer.FFN_PARTIALS));
+            var gpu = new QwenExecutionFixtures.RecordingGpu();
+            try (var workspace = new QwenExecutionWorkspace(gpu, rows, selected, QwenLogitsRequirement.NONE)) {
+                workspace.allocateBuffers();
+                assertShared(workspace, Buffer.QK_PROJECTED, Buffer.FFN_PARTIALS);
+            }
+        }
+        // Other FFN geometries keep the unsplit down and no partials buffer.
+        var other = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17280))
+                .forExecution(ExecutionKind.PREFILL, 256);
+        assertFalse(hasBuffer(other, Buffer.FFN_PARTIALS));
     }
 
     @Test
@@ -221,7 +244,7 @@ class QwenPrefillRouteTest {
     @Test
     void streamedWorkspaceHostsBoundedSlotsAndCarryInRetiredProjectionStorage() {
         var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408))
-                .forExecution(ExecutionKind.PREFILL, 64);
+                .forExecution(ExecutionKind.PREFILL, 1024);
         var gpu = new QwenExecutionFixtures.RecordingGpu();
         try (var workspace = new QwenExecutionWorkspace(gpu, 64, plan, QwenLogitsRequirement.NONE)) {
             workspace.allocateBuffers();

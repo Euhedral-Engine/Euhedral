@@ -81,6 +81,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle residualRmsNormBf16;
     private final MethodHandle q3GateUpSwiGluBf16;
     private final MethodHandle q3FfnDownBf16;
+    private final MethodHandle q3FfnDownSplitBf16;
+    private final MethodHandle selectExactNumerics;
     private final MethodHandle q3FfnStreamedBf16;
     private final MethodHandle attentionProducersNvfp4;
     private final MethodHandle gdnProjectControlFp32;
@@ -243,6 +245,24 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     .orElse(null);
             this.q3FfnDownBf16 = symbols.find("euhedral_cuda_q3_ffn_down_bf16")
                     .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
+                    .orElse(null);
+            this.selectExactNumerics = symbols.find("euhedral_cuda_select_exact_numerics")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            this.q3FfnDownSplitBf16 = symbols.find("euhedral_cuda_q3_ffn_down_split_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG)))
                     .orElse(null);
             this.q3GateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_gate_up_swiglu_bf16")
                     .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
@@ -1170,6 +1190,44 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 MemorySegment.ofAddress(input),
                 MemorySegment.ofAddress(weights),
                 MemorySegment.ofAddress(output),
+                rows,
+                width,
+                outputs,
+                weightBytes);
+    }
+
+    /// Selects exact numerics process-wide: every relaxed-order kernel (contiguous Q3 decode, split-K
+    /// FFN down) is replaced by its bitwise-exact counterpart for later launches. Returns the previous
+    /// selection. For numerical comparisons against the oracle; `EUHEDRAL_EXACT=1` sets the default.
+    public boolean selectExactNumerics(boolean exact) {
+        ensureOpen();
+        if (selectExactNumerics == null)
+            throw new UnsupportedOperationException("exact numerics selection is unavailable");
+        try {
+            return (int) selectExactNumerics.invokeExact(exact ? 1 : 0) != 0;
+        } catch (Throwable failure) {
+            throw new IllegalStateException("exact numerics selection failed", failure);
+        }
+    }
+
+    @Override
+    public void q3FfnDownSplitBf16(
+            long input, long weights, long output, long partials, int rows, int width, int outputs, long weightBytes) {
+        ensureOpen();
+        requireAddresses(input, weights, output, partials);
+        if (q3FfnDownSplitBf16 == null) {
+            q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
+            return;
+        }
+        if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
+            throw new IllegalArgumentException("invalid Q3 FFN down dimensions");
+        invokeLayer(
+                "Q3 split-K FFN down",
+                q3FfnDownSplitBf16,
+                MemorySegment.ofAddress(input),
+                MemorySegment.ofAddress(weights),
+                MemorySegment.ofAddress(output),
+                MemorySegment.ofAddress(partials),
                 rows,
                 width,
                 outputs,

@@ -28,9 +28,10 @@ static int ffn_anchor;
 static CUmodule ffn_module;
 static CUfunction gate_up_swiglu;
 static CUfunction gate_up64x32, gate_up128x32, ffn_down128x64, ffn_down64x64;
+static CUfunction ffn_down_split64, ffn_down_split128, ffn_down_reduce;
 static CUfunction ffn_stream_gate;
 static CUfunction ffn_stream_down;
-static CUfunction stream_gate64, stream_gate128, stream_down64, stream_down128;
+static CUfunction stream_gate128, stream_down128;
 static CUmodule quantized_module;
 static CUmodule q45_module;
 static CUmodule gdn_module;
@@ -149,9 +150,10 @@ static void initialize_modules(void) {
             get_function(ffn_module, &gate_up128x32, "euhedral_q3_gate_up_swiglu_128x32");
             get_function(ffn_module, &ffn_down128x64, "euhedral_q3_ffn_down_128x64");
             get_function(ffn_module, &ffn_down64x64, "euhedral_q3_ffn_down_64x64");
-            get_function(ffn_module, &stream_gate64, "stream_gate_up_64x32");
+            get_function(ffn_module, &ffn_down_split64, "euhedral_q3_ffn_down_split_64x64");
+            get_function(ffn_module, &ffn_down_split128, "euhedral_q3_ffn_down_split_128x64");
+            get_function(ffn_module, &ffn_down_reduce, "euhedral_q3_ffn_down_reduce");
             get_function(ffn_module, &stream_gate128, "stream_gate_up_128x32");
-            get_function(ffn_module, &stream_down64, "stream_down_64x64");
             get_function(ffn_module, &stream_down128, "stream_down_128x64");
             get_function(ffn_module, &ffn_stream_gate, "stream_gate_up");
             get_function(ffn_module, &ffn_stream_down, "stream_down");
@@ -501,9 +503,9 @@ int euhedral_cuda_q3_ffn_streamed_bf16(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    CUfunction gate = rows == 64u ? stream_gate64 : stream_gate128;
-    CUfunction down = rows == 64u ? stream_down64 : stream_down128;
-    uint32_t row_tile = rows == 64u ? 64u : 128u, gate_tile = 32u, down_tile = 64u;
+    CUfunction gate = stream_gate128;
+    CUfunction down = stream_down128;
+    uint32_t row_tile = 128u, gate_tile = 32u, down_tile = 64u;
     if (!gate || !down) {
         // An older source bundle retains the old K32 continuation shape. Select its
         // functions and all three matching launch dimensions together.
@@ -605,6 +607,35 @@ int euhedral_cuda_q3_ffn_down_bf16(
     uint32_t grid = ((rows + tile_rows - 1u) / tile_rows) * (outputs / 64u);
     void* parameters[] = {&input, &weights, &output, &rows, &width, &outputs, &scale_offset};
     return launch_and_synchronize(selected, grid, 128, parameters);
+}
+
+int euhedral_cuda_q3_ffn_down_split_bf16(
+        const void* input, const void* weights, void* output, float* partials,
+        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes) {
+    if (!input || !weights || !output || rows == 0 || width == 0 || outputs == 0)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint32_t splits = euhedral_ffn_down_splits(rows, width, outputs);
+    if (splits == 0u || !partials || euhedral_cuda_exact_numerics() || ((uintptr_t)input & 15u) != 0 || ((uintptr_t)weights & 3u) != 0
+            || ((uintptr_t)partials & 3u) != 0)
+        return euhedral_cuda_q3_ffn_down_bf16(input, weights, output, rows, width, outputs, weight_bytes);
+    uint64_t groups = (uint64_t)outputs * (width / 64u);
+    uint64_t scale_offset = (groups * 24u + 255u) & ~UINT64_C(255);
+    if (weight_bytes != scale_offset + groups * 2u) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    uint32_t tile_rows = rows <= 64u ? 64u : 128u;
+    CUfunction split = tile_rows == 64u ? ffn_down_split64 : ffn_down_split128;
+    if (!split || !ffn_down_reduce)
+        return euhedral_cuda_q3_ffn_down_bf16(input, weights, output, rows, width, outputs, weight_bytes);
+    uint32_t grid = ((rows + tile_rows - 1u) / tile_rows) * (outputs / 64u);
+    void* split_parameters[] = {&input, &weights, &partials, &rows, &width, &outputs, &scale_offset, &splits};
+    status = launch_and_synchronize_2d(split, grid, splits, 128, split_parameters);
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    uint32_t count = rows * outputs;
+    void* reduce_parameters[] = {&partials, &output, &count, &splits};
+    return launch_and_synchronize(ffn_down_reduce, (count + 255u) / 256u, 256, reduce_parameters);
 }
 
 int euhedral_cuda_residual_rms_norm_bf16(

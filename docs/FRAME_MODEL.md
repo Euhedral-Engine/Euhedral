@@ -333,16 +333,30 @@ the represented-NVFP4 tolerance for decode attention.
   constants, forms one FP32 dot product per half group and scales it once. It streams at 720-800
   GB/s (gate/up 136 -> 91 us, down 80 -> 48 us) and Q3 time per decode token fell to 11.1 ms. Its
   FP32 accumulation order differs from the exact kernels, which remain the oracle and are selected
-  with `EUHEDRAL_Q3_DECODE=EXACT` (or `euhedral_cuda_q3_decode_select_exact`). Against them, fewer
+  with `EUHEDRAL_EXACT=1` (or `euhedral_cuda_select_exact_numerics`). Against them, fewer
   than 0.1% of outputs differ, never by more than one BF16 ulp, and the error against an FP64
-  evaluation is unchanged. `Q3DecodeDriftCudaIntegrationTest` feeds the same forced tokens to an
-  exact and a contiguous sequence: over 2048 decode positions the final hidden state differs by a
+  evaluation is unchanged. `RelaxedNumericsDriftCudaIntegrationTest` feeds the same forced tokens to
+  an exact and a relaxed sequence: over 2048 decode positions the final hidden state differs by a
   median 5.6% and the logits by KL 2.7e-3 with no growth with position (5.5% over the first 512
   positions, 5.7% over the last). Perturbing only the decode attention merge order instead gives
   the same profile (5.4%, KL 2.6e-3), with per-position errors correlated at 0.90: one-ulp BF16
   differences settle at this level in the 64-layer recurrent model whichever operation causes them.
+- **Split-K FFN down.** Prefill quanta of 64-512 rows ran the down projection on 80-320 CTAs, one or
+  two partial waves. Four K splits each accumulate FP32 partials (`FFN_PARTIALS`, sharing the
+  retired `QK_PROJECTED` storage) and a reduction rounds once to BF16: down at 64 rows 740 -> 432
+  us, 256 rows 1480 -> 1261 us. At 64 rows the full-width gate/up plus split-K down (1253 us per
+  layer) also replaces the streamed regions and their child stream (1400 us), so only 1024-row
+  quanta still stream. Prefill 64 +6.4%, 256 +3.9%, 1024 +1.2%; time to first token for a 64-token
+  prompt -5.3%. Splitting gate/up measured flat or slower.
 - **GDN convolution.** One thread per channel walked every row although each output reads only
   the previous three inputs; 32-row blocks give 1280 CTAs at 512 rows (238 -> 68 us).
+
+Relaxed numerics: every kernel above whose FP32 accumulation order differs from its exact
+counterpart (contiguous Q3 decode, split-K FFN down) is replaced by the exact kernel under
+`EUHEDRAL_EXACT=1`, and `RelaxedNumericsDriftCudaIntegrationTest` compares the two settings end to
+end. With both relaxed kernels, a 256-token prefill and 2048 forced decode positions give a median
+hidden-state difference of 5.7%, KL 3.1e-3 and the same top-1 token at 97.3% of positions, with
+no growth (settled halves 7.1% and 6.5%): the same floor as either change alone.
 
 Measured and not kept:
 
