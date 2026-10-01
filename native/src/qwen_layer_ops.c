@@ -76,9 +76,10 @@ static CUfunction gdn_recurrence;
 static CUfunction gdn_gated_rms_norm;
 static CUfunction residual_add;
 static CUfunction residual_rms_norm, residual_rms_norm_row;
-static CUfunction gdn_project_control;
+static CUfunction gdn_project_control, gdn_project_control_tiled;
 static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
+static CUfunction attention_qk_norm_rope_rows, attention_norm_cache_rows;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
@@ -145,6 +146,7 @@ static void initialize_modules(void) {
             &gdn_anchor, "qwen_gdn_ops.cu", "euhedral_gdn_control_fp32", &gdn_module, &gdn_control);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     get_function(gdn_module, &gdn_project_control, "euhedral_gdn_project_control_fp32");
+    get_function(gdn_module, &gdn_project_control_tiled, "euhedral_gdn_project_control_8x4_fp32");
     status = get_function(gdn_module, &gdn_convolution, "euhedral_gdn_convolution_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(gdn_module, &gdn_recurrence, "euhedral_gdn_recurrence_bf16");
@@ -175,6 +177,9 @@ static void initialize_modules(void) {
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_merge_nvfp4, "euhedral_attention_merge_nvfp4");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     get_function(attention_module, &attention_norm_cache, "euhedral_attention_qk_norm_cache_bf16");
+    // Optional row-owned variants (256-dimension heads), bitwise equal to the per-head kernels.
+    get_function(attention_module, &attention_qk_norm_rope_rows, "euhedral_attention_qk_norm_rope_rows_bf16");
+    get_function(attention_module, &attention_norm_cache_rows, "euhedral_attention_qk_norm_cache_rows_bf16");
     status = get_function(attention_module, &attention_kv_append, "euhedral_attention_kv_append_bf16");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
     status = get_function(attention_module, &attention_causal, "euhedral_attention_causal_bf16");
@@ -223,6 +228,7 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(residual_add);
     euhedral_cuda_pdl_register(swiglu);
     euhedral_cuda_pdl_register(attention_qk_norm_rope);
+    euhedral_cuda_pdl_register(attention_qk_norm_rope_rows);
     euhedral_cuda_pdl_register(attention_append_nvfp4);
     euhedral_cuda_pdl_register(attention_decode_nvfp4);
     euhedral_cuda_pdl_register(attention_merge_nvfp4);
@@ -734,6 +740,9 @@ int euhedral_cuda_gdn_project_control_fp32(
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     if (!gdn_project_control) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     void* parameters[] = {&input, &a_weight, &b_weight, &a_log, &dt_bias, &alpha, &beta, &rows, &width, &heads};
+    // From eight rows, 8-row x 4-head CTAs share activation and weight loads (bitwise equal).
+    if (rows >= 8u && heads % 4u == 0u && gdn_project_control_tiled != NULL)
+        return launch_and_synchronize(gdn_project_control_tiled, (rows + 7u) / 8u * (heads / 4u), 128, parameters);
     return launch_and_synchronize(gdn_project_control, (uint32_t)count, 128, parameters);
 }
 
@@ -826,8 +835,10 @@ int euhedral_cuda_attention_producers_bf16(
     CUfunction q4_kernel = q45_prefill_wide_kernel(0, input, rows, hidden, width, &q4_grid);
     if (q4_kernel == NULL) q4_kernel = q45_prefill_kernel(0, 1);
     status = (int)euhedral_launch_kernel(q4_kernel, (uint32_t)q4_grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
-            head_dim, 1, 1, 0, stream, norm_args, NULL);
+    if (status == 0) status = attention_norm_cache_rows != NULL
+            ? (int)euhedral_launch_kernel(attention_norm_cache_rows, rows, 1, 1, 256, 1, 1, 0, stream, norm_args, NULL)
+            : (int)euhedral_launch_kernel(attention_norm_cache, (uint32_t)norm_grid, 1, 1,
+                    head_dim, 1, 1, 0, stream, norm_args, NULL);
     if (status == 0) status = (int)euhedral_launch_kernel(attention_value_cache, (uint32_t)grid, 1, 1,
             128, 1, 1, 0, stream, q5_args, NULL);
     // One owner and one completion edge cover both physical cache producers.
@@ -880,8 +891,10 @@ int euhedral_cuda_attention_producers_nvfp4(
     CUfunction q4_kernel = q45_prefill_wide_kernel(0, input, rows, hidden, width, &q4_grid);
     if (q4_kernel == NULL) q4_kernel = q45_prefill_kernel(0, 1);
     status = (int)euhedral_launch_kernel(q4_kernel, (uint32_t)q4_grid, 1, 1, 128, 1, 1, 0, stream, q4_args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
-            head_dim, 1, 1, 0, stream, norm_args, NULL);
+    if (status == 0) status = attention_qk_norm_rope_rows != NULL
+            ? (int)euhedral_launch_kernel(attention_qk_norm_rope_rows, rows, 1, 1, 256, 1, 1, 0, stream, norm_args, NULL)
+            : (int)euhedral_launch_kernel(attention_qk_norm_rope, (uint32_t)norm_grid, 1, 1,
+                    head_dim, 1, 1, 0, stream, norm_args, NULL);
     uint64_t q5_grid = grid;
     CUfunction q5_kernel = q45_prefill_wide_kernel(1, input, rows, hidden, width, &q5_grid);
     if (q5_kernel == NULL) q5_kernel = q45_prefill_kernel(1, 1);
@@ -962,6 +975,9 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
     uint32_t head_dim_arg = head_dim, rotary_dim_arg = rotary_dim;
     void* parameters[] = {&query_key, &query_norm, &key_norm, &output, &rows_arg, &query_heads_arg,
             &key_value_heads_arg, &head_dim_arg, &rotary_dim_arg, &start_position, &epsilon, &rope_theta};
+    // A single row (decode) keeps one CTA per head; from two rows one CTA per row shares the angles.
+    if (rows > 1 && attention_qk_norm_rope_rows != NULL)
+        return launch_and_synchronize(attention_qk_norm_rope_rows, rows, 256, parameters);
     return launch_and_synchronize(attention_qk_norm_rope, (uint32_t)blocks, head_dim, parameters);
 }
 

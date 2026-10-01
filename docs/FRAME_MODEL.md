@@ -395,6 +395,17 @@ the represented-NVFP4 tolerance for decode attention.
   row's softmax statistics instead of one, so the denominator is summed in four partial sums
   (`euhedral_attention_prefill32_nvfp4_exact` keeps the key-ordered sum). 62 -> 18 ms per
   1024-token prompt; prefill 256 +1.5%, 1024 +4.1% (6 of 6 forks each); drift unchanged.
+- **Prefill QK norm/RoPE and GDN control.** The QK RMSNorm + RoPE kernel ran one CTA per (row,
+  head) and computed each element's RoPE angle with FP64 `pow`, `cos` and `sin`, which this GPU
+  executes at 1/64 rate: 412 us per 512-row quantum. From two rows one CTA owns a row
+  (`euhedral_attention_qk_norm_rope_rows_bf16`), computes the row's angles once in shared memory and
+  gives each head to a warp whose shuffle tree reproduces the 256-thread RMS reduction; the RoPE
+  rotation is pinned to explicit roundings in both layouts, so they agree bit for bit. Decode keeps
+  one CTA per head. The GDN A/B projection + control ran one CTA per (row, head), each re-reading its
+  weight and activation rows; 8-row x 4-head CTAs (`euhedral_gdn_project_control_8x4_fp32`) keep
+  every output's FMA stripes and tree (bitwise equal): 209 -> 90 us. 13 + 20 -> under 1 + 9 ms per
+  1024-token prompt; prefill 256 +2.1%, 1024 +2.5%, time to first token -1.0% (64) and -2.4%
+  (1024 tokens) (6 of 6 forks each).
 
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous
 Q3/Q4/Q5 decode, split-K FFN down, single-MMA prefill) is replaced by the exact kernel under
