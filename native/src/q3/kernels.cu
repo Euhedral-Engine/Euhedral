@@ -1,5 +1,6 @@
 #include "strategies/scalar.cuh"
 #include "strategies/decode.cuh"
+#include "strategies/decode_wide.cuh"
 #include "strategies/prefill.cuh"
 #include "strategies/k32_prefill.cuh"
 #include "pdl.cuh"
@@ -36,6 +37,17 @@ EUHEDRAL_Q3_DECODE_KERNEL(1)
 EUHEDRAL_Q3_DECODE_KERNEL(2)
 EUHEDRAL_Q3_DECODE_KERNEL(4)
 #undef EUHEDRAL_Q3_DECODE_KERNEL
+
+// Single-row decode with warp-local wide streaming (strategies/decode_wide.cuh): every lane loads
+// 16 contiguous weight bytes and each warp stages its own rows. Bitwise identical to
+// euhedral_q3_decode_1. Optional symbol: host dispatch selects it for the shapes in
+// euhedral_q3_decode_wide_shape with a 16-byte aligned weight base.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_decode_wide(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
+    __shared__ q3::DecodeWideShared shared;
+    q3::wide_decode(input, weights, output, in_features, out_features, scale_offset, shared);
+}
 
 // 32 token rows x 32 outputs; general Q3 prefill route. Shared strides of 88 elements (176 bytes)
 // keep the 16-byte ldmatrix rows conflict-free; residency drops from 6 to 5 CTA/SM.

@@ -17,7 +17,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction function;
-static CUfunction decode1, decode2, decode4, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
+static CUfunction decode1, decode2, decode4, decode_wide, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 static CUfunction optional_kernel(const char* name) {
     CUfunction loaded = NULL;
@@ -29,6 +29,7 @@ static void initialize(void) {
     decode1 = optional_kernel("euhedral_q3_decode_1");
     decode2 = optional_kernel("euhedral_q3_decode_2");
     decode4 = optional_kernel("euhedral_q3_decode_4");
+    decode_wide = optional_kernel("euhedral_q3_decode_wide");
     prefill = optional_kernel("euhedral_q3_prefill");
     prefill_s104 = optional_kernel("euhedral_q3_prefill_s104");
     prefill64 = optional_kernel("euhedral_q3_prefill_64");
@@ -38,6 +39,7 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(decode1);
     euhedral_cuda_pdl_register(decode2);
     euhedral_cuda_pdl_register(decode4);
+    euhedral_cuda_pdl_register(decode_wide);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -93,7 +95,10 @@ static int linear_q3(const void* input, const void* weights, void* output,
     unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
     unsigned long long scale_arg = scale_offset;
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
-    CUfunction selected = mode == 1 ? (row_tile == 1 ? decode1 : row_tile == 2 ? decode2 : decode4)
+    int wide_decode = mode == 1 && decode_wide != NULL && ((uintptr_t)weights & 15u) == 0u
+            && euhedral_q3_decode_wide_shape(rows, in_features, out_features);
+    CUfunction selected = wide_decode ? decode_wide
+            : mode == 1 ? (row_tile == 1 ? decode1 : row_tile == 2 ? decode2 : decode4)
             : mode == 0 ? function
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64_K32_CB ? prefill64_k32_cb
             : prefill_kernel == EUHEDRAL_Q3_PREFILL64_WMMA ? prefill64_wmma

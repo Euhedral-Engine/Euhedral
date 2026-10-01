@@ -9,6 +9,9 @@ import unittest
 
 HEADER = pathlib.Path(__file__).resolve().parents[1] / 'src'
 SOURCE = '''#include "q3_prefill_policy.h"
+int decode_wide(unsigned rows, unsigned width, unsigned outputs) {
+    return euhedral_q3_decode_wide_shape(rows, width, outputs);
+}
 int route(int mode, unsigned rows, unsigned width, unsigned outputs) {
     return euhedral_q3_wide_prefill(mode, rows, width, outputs);
 }
@@ -93,11 +96,21 @@ class Q3PrefillPolicyTest(unittest.TestCase):
         cls.lib.select_s104.restype = ctypes.c_int
         cls.lib.prefill_tile_rows.argtypes = (ctypes.c_int,)
         cls.lib.prefill_tile_rows.restype = ctypes.c_int
+        cls.lib.decode_wide.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
+        cls.lib.decode_wide.restype = ctypes.c_int
 
     @classmethod
     def tearDownClass(cls):
         del cls.lib
         cls.temp.cleanup()
+
+    def test_wide_decode_requires_one_row_whole_scale_vectors_and_eight_columns(self):
+        wide = self.lib.decode_wide
+        for width, outputs in [(5120, 34816), (17408, 5120), (6144, 5120), (5120, 248320), (512, 8), (32768, 8)]:
+            self.assertEqual(1, wide(1, width, outputs), (width, outputs))
+        for rows, width, outputs in [(2, 5120, 8), (0, 5120, 8), (1, 384, 8), (1, 640, 8), (1, 33280, 8),
+                                     (1, 0, 8), (1, 5120, 12), (1, 5120, 0)]:
+            self.assertEqual(0, wide(rows, width, outputs), (rows, width, outputs))
 
     def test_mixer_wins_only_after_integrated_crossover(self):
         for rows in (1, 32, 63, 64, 65, 95, 96, 97, 112, 127, 128, 129, 256, 511):
