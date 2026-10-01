@@ -107,6 +107,43 @@ extern "C" __global__ void policy(unsigned int* out,unsigned int r,unsigned int 
                     gpu.free(w)
         finally:gpu.close()
 
+    def test_q3_wide_decode_matches_plain_decode_bitwise(self):
+        # A partial single chunk (K 512), rows ending mid-chunk (5120), several stages of the double
+        # slot (17408), the largest scale row (32768); one and many CTAs; finite and special scales;
+        # activations with both signs and BF16 specials.
+        gpu = Gpu(b'#include "q3/kernels.cu"\n')
+        try:
+            rng = random.Random(983)
+            for width, outputs in [(512, 8), (1536, 16), (5120, 24), (6144, 5120), (17408, 1024), (32768, 8)]:
+                groups = width // 64
+                scale = (outputs * groups * 24 + 255) & ~255
+                payload = bytearray(rng.randrange(256) for _ in range(scale + outputs * groups * 2))
+                specials = [0, 1, 0x8000, 0x8001, 0x3c00, 0x7bff, 0x7c00, 0x7e11, 0xfe11]
+                for mode in ['finite', 'special']:
+                    for i in range(outputs * groups):
+                        struct.pack_into('<H', payload, scale + i * 2,
+                                         specials[i % len(specials)] if mode == 'special' else rng.randrange(0x2800, 0x3800))
+                    w = gpu.upload(payload)
+                    values = [rng.choice([0x7f80, 0xff80, 0x7fc1, 0x0001, 0x8000]) if rng.randrange(97) == 0
+                              else rng.randrange(0x3d00, 0x4100) | (rng.randrange(2) << 15) for _ in range(width)]
+                    x = gpu.upload(struct.pack(f'<{width}H', *values))
+                    try:
+                        result = []
+                        for symbol in ['euhedral_q3_decode_1', 'euhedral_q3_decode_wide']:
+                            y = gpu.zeros(outputs * 2, fill=0xa5)
+                            try:
+                                gpu.launch(symbol, outputs // 8, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(1),
+                                                                  C.c_uint(width), C.c_uint(outputs), C.c_ulonglong(scale)])
+                                result.append(gpu.download(y, outputs * 2))
+                            finally:
+                                gpu.free(y)
+                        self.assertEqual(result[0], result[1], (width, outputs, mode))
+                    finally:
+                        gpu.free(x)
+                        gpu.free(w)
+        finally:
+            gpu.close()
+
 
 if __name__ == '__main__':
     unittest.main()

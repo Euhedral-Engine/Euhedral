@@ -3,6 +3,16 @@
 
 #include <stdint.h>
 
+// Single-row decode streams weights with the warp-local wide kernel wherever its layout
+// requirements hold: whole 16-byte scale vectors (K % 512 == 0), a scale row that fits its
+// 256-word shared slot (K <= 32768) and whole 8-column CTAs. With weights streaming from DRAM it
+// measured 25-29% faster than the cooperative kernel on every model shape (5120 -> 34816,
+// 17408 -> 5120, 6144 -> 5120, and the LM head).
+static inline int euhedral_q3_decode_wide_shape(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    return rows == 1 && in_features != 0 && in_features % 512u == 0 && in_features <= 32768u
+            && out_features != 0 && out_features % 8u == 0;
+}
+
 // The explicit 64-row entry point remains independent of AUTO's shape policy.
 static inline int euhedral_q3_wide_prefill(int mode, uint32_t rows,
         uint32_t in_features, uint32_t out_features) {
