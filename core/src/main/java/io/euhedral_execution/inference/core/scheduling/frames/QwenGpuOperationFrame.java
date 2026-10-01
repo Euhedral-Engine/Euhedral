@@ -180,6 +180,8 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
     private void runAttentionProducers(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         QwenConfig config = context.plan().weights().config();
         AttentionKvState state = attentionState(context, instruction);
+        // Retirement settles the reservation, including staging a failed launch leaves queued.
+        this.pendingAppendState = state;
         state.prepareAppend(context.startPosition(), context.inputTokenCount());
         gpu().attentionProducersNvfp4(
                         input(context, instruction, 0),
@@ -203,7 +205,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         instruction.weightByteSize(0),
                         instruction.weightByteSize(1));
         state.appendSubmitted(context.inputTokenCount());
-        this.pendingAppendState = state;
     }
 
     private void runAttentionKvAppend(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
@@ -211,6 +212,8 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
         int queryWidth = config.numAttentionHeads() * config.attentionHeadDim();
         int keyValueWidth = config.numKeyValueHeads() * config.attentionHeadDim();
         AttentionKvState state = attentionState(context, instruction);
+        // Retirement settles the reservation, including staging a failed launch leaves queued.
+        this.pendingAppendState = state;
         state.prepareAppend(context.startPosition(), context.inputTokenCount());
         gpu().attentionKvAppendNvfp4(
                         input(context, instruction, 0),
@@ -222,7 +225,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         keyValueWidth,
                         context.startPosition());
         state.appendSubmitted(context.inputTokenCount());
-        this.pendingAppendState = state;
     }
 
     /// Publishes the appended rows once the quantum's device work has retired.

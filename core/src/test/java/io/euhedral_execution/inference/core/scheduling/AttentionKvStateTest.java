@@ -111,10 +111,49 @@ class AttentionKvStateTest {
             gpu.failUpload = false;
             state.prepareAppend(0, 257);
             assertEquals(512, state.capacity());
-            assertEquals(3, gpu.allocations.size(), "two payload pages and one current table");
             assertTrue(gpu.copySizes.isEmpty());
             commit(state, 257);
+            assertEquals(3, gpu.allocations.size(), "two payload pages and one current table");
         }
+        assertTrue(gpu.allocations.isEmpty());
+    }
+
+    @Test
+    void grownTableIsUploadedFromStagingThatLivesUntilTheAppendSettles() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            state.prepareAppend(0, 1);
+            long first = state.keyCacheAddress();
+            assertEquals(1, gpu.stagings);
+            assertEquals(0, gpu.stagingReleases, "a queued upload may still read its staging");
+            commit(state, 1);
+            assertEquals(1, gpu.stagingReleases, "retirement releases the staging");
+
+            state.prepareAppend(1, 256);
+            long grown = state.keyCacheAddress();
+            assertNotEquals(first, grown);
+            assertTrue(gpu.allocations.containsKey(first), "freeing a table mid-quantum would wait on the device");
+            assertEquals(1, gpu.stagingReleases);
+            state.appendSubmitted(256);
+            state.discardSubmitted();
+            assertFalse(gpu.allocations.containsKey(first), "the outgrown table is released after retirement");
+            assertEquals(2, gpu.stagingReleases);
+            assertEquals(1, state.length(), "a discarded append stays invisible");
+        }
+        assertTrue(gpu.allocations.isEmpty());
+    }
+
+    @Test
+    void unprovenCompletionRetainsStagingThatQueuedCopiesMayStillRead() {
+        RecordingGpu gpu = new RecordingGpu();
+        AttentionKvState state = new AttentionKvState(gpu, 1024);
+        state.prepareAppend(0, 1);
+        gpu.proven = false;
+        state.discardSubmitted();
+        assertEquals(0, gpu.stagingReleases);
+        gpu.proven = true;
+        state.close();
+        assertEquals(1, gpu.stagingReleases);
         assertTrue(gpu.allocations.isEmpty());
     }
 
@@ -155,6 +194,24 @@ class AttentionKvStateTest {
         private final Map<Long, Long> allocations = new HashMap<>();
         private final Map<Long, long[]> tableEntries = new HashMap<>();
         private final List<Long> copySizes = new ArrayList<>();
+        private int stagings;
+        private int stagingReleases;
+        private boolean proven = true;
+
+        @Override
+        public UploadBuffer allocateUploadBuffer(long bytes) {
+            stagings++;
+            UploadBuffer allocated = super.allocateUploadBuffer(bytes);
+            return new UploadBuffer(allocated.segment(), () -> {
+                stagingReleases++;
+                allocated.close();
+            });
+        }
+
+        @Override
+        public boolean completionProven() {
+            return proven;
+        }
 
         @Override
         public long allocate(long byteSize) {

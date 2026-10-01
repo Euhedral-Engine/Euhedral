@@ -547,10 +547,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     /// Pinned staging memory is page-locked, so allocating it per quantum costs about a millisecond.
-    /// Small buffers are retained for reuse; larger ones are freed on release.
+    /// Small buffers are retained for reuse; larger ones are freed on release. A quantum holds its
+    /// token staging and, when its KV reservation grows, one page-table staging per full-attention
+    /// layer until it retires, so the cache covers a growing quantum without allocating.
     private static final long PINNED_CACHE_BYTES = 64 * 1024;
 
-    private static final int PINNED_CACHE_ENTRIES = 8;
+    private static final int PINNED_CACHE_ENTRIES = 32;
 
     @Override
     public UploadBuffer allocateUploadBuffer(long byteSize) {

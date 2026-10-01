@@ -32,7 +32,8 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_host_to_device(
         void* device_address,
         const void* host_address,
         uint64_t byte_size);
-/// Requires a pinned host allocation retained through stream completion.
+/// Requires a pinned host allocation retained through stream completion; the copy is queued on the
+/// selected stream. With no stream selected it completes before returning.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_upload_to_device(
         void* device_address,
         const void* host_address,
