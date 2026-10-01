@@ -325,8 +325,22 @@ the represented-NVFP4 tolerance for decode attention.
   The row-major layout streams at 810 GB/s when every lane loads 16 contiguous bytes, so each warp
   now streams its own two rows in 512-byte chunks through a warp-private shared double slot and
   every lane reads whole blocks with broadcast loads (`*_decode_wide`). Q3 time per decode token
-  fell from 25.2 to 19.3 ms; Q4/Q5 by about 1.5 ms. The remaining Q3 limit is the consumer's integer
-  work selecting each lane's bits.
+  fell from 25.2 to 19.3 ms; Q4/Q5 by about 1.5 ms. Those kernels stay bitwise identical to the
+  scalar reference, which fixes each lane to the K offsets lane + 32 * stripe: the remaining limit
+  was the integer work of selecting each lane's bits.
+- **Q3 decode, contiguous ownership.** Three words of a group hold exactly 32 whole codes, so in
+  `euhedral_q3_decode_contiguous` a lane owns 32 contiguous K values whose bit positions are
+  constants, forms one FP32 dot product per half group and scales it once. It streams at 720-800
+  GB/s (gate/up 136 -> 91 us, down 80 -> 48 us) and Q3 time per decode token fell to 11.1 ms. Its
+  FP32 accumulation order differs from the exact kernels, which remain the oracle and are selected
+  with `EUHEDRAL_Q3_DECODE=EXACT` (or `euhedral_cuda_q3_decode_select_exact`). Against them, fewer
+  than 0.1% of outputs differ, never by more than one BF16 ulp, and the error against an FP64
+  evaluation is unchanged. `Q3DecodeDriftCudaIntegrationTest` feeds the same forced tokens to an
+  exact and a contiguous sequence: over 2048 decode positions the final hidden state differs by a
+  median 5.6% and the logits by KL 2.7e-3 with no growth with position (5.5% over the first 512
+  positions, 5.7% over the last). Perturbing only the decode attention merge order instead gives
+  the same profile (5.4%, KL 2.6e-3), with per-position errors correlated at 0.90: one-ulp BF16
+  differences settle at this level in the 64-layer recurrent model whichever operation causes them.
 - **GDN convolution.** One thread per channel walked every row although each output reads only
   the previous three inputs; 32-row blocks give 1280 CTAs at 512 rows (238 -> 68 us).
 

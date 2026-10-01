@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+// Single-row decode uses the contiguous-ownership kernel (16 rows per CTA, 1024-K slices) when the
+// exact route is not selected. It accumulates in a different FP32 order from the exact kernels.
+static inline int euhedral_q3_decode_contiguous_shape(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    return rows == 1 && in_features != 0 && in_features % 1024u == 0 && out_features != 0 && out_features % 16u == 0;
+}
+
 // Single-row decode streams weights with the warp-local wide kernel wherever its layout
 // requirements hold: whole 16-byte scale vectors (K % 512 == 0), a scale row that fits its
 // 256-word shared slot (K <= 32768) and whole 8-column CTAs. With weights streaming from DRAM it

@@ -38,6 +38,7 @@ subprojects {
             exclude("**/InferenceEngineCudaIntegrationTest.class")
             exclude("**/StreamOrderedEngineCudaIntegrationTest.class")
             exclude("**/ChatCompletionsCudaIntegrationTest.class")
+            exclude("**/Q3DecodeDriftCudaIntegrationTest.class")
             useJUnitPlatform()
         }
         val testSourceSet = the<SourceSetContainer>()["test"]
@@ -62,6 +63,7 @@ subprojects {
             include("**/InferenceEngineCudaIntegrationTest.class")
             include("**/StreamOrderedEngineCudaIntegrationTest.class")
             include("**/ChatCompletionsCudaIntegrationTest.class")
+            include("**/Q3DecodeDriftCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -75,6 +77,10 @@ subprojects {
                     providers.gradleProperty("euhedral.qwen.reference-artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_bf16.edrl")
                             .get())
+            // Teacher-forced Q3 decode drift: length and an optional per-step CSV report.
+            systemProperty("euhedral.q3.drift.steps", providers.gradleProperty("euhedral.q3.drift.steps").orElse("384").get())
+            providers.gradleProperty("euhedral.q3.drift.report").orNull?.let { systemProperty("euhedral.q3.drift.report", it) }
+            providers.gradleProperty("euhedral.q3.drift.candidate").orNull?.let { systemProperty("euhedral.q3.drift.candidate", it) }
             jvmArgs("--enable-native-access=ALL-UNNAMED")
             // Each class loads the model and may start the process-wide Euhedral lattice singleton.
             forkEvery = 1

@@ -93,6 +93,10 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_bf16(
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_decode_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
+/* Selects exact (nonzero) or contiguous (zero) single-row Q3 decode for later launches in this
+ * process and returns the previous selection. The default is contiguous unless the environment sets
+ * EUHEDRAL_Q3_DECODE=EXACT. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_decode_select_exact(int exact);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
