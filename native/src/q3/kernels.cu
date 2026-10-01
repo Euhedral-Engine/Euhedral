@@ -6,6 +6,7 @@
 #include "strategies/k32_prefill.cuh"
 #include "pdl.cuh"
 #include "../ffn/down.cuh"
+#include "../ffn/balanced.cuh"
 
 // Production prefill entry points consume BF16 hi weights only (one MMA per weight); each has an
 // _exact twin that consumes hi + lo and reproduces the scalar reference bit for bit.
@@ -187,13 +188,12 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_k32_cb_
             out_features, scale_offset, nullptr, storage);
 }
 
-// Relaxed 128 x 64 prefill on the shared tile engine (ffn/down.cuh with the Q3 producer of
+// Relaxed 128 x 64 prefill on the balanced tile engine (ffn/balanced.cuh with the Q3 producer of
 // ffn/formats.cuh). Same BF16 hi weights and K16 order as euhedral_q3_prefill_64_k32_cb, so it
 // matches that kernel bit for bit. Requires in_features % 32 == 0 and a 16-byte aligned input.
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_128x64(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
-    __shared__ qwen_ffn_tiles::Storage<4, 32, 1> stage;
-    qwen_ffn_down::run<4, 32, false, 1, qwen_ffn_tiles::Q3B>(input, weights, output, rows, in_features,
-            out_features, scale_offset, nullptr, 0u, in_features, stage);
+    __shared__ balanced::Storage stage;
+    balanced::run<qwen_ffn_tiles::Q3B>(input, weights, output, rows, in_features, out_features, scale_offset, stage);
 }

@@ -437,6 +437,15 @@ the represented-NVFP4 tolerance for decode attention.
   1024-token prompt; prefill 256 +2.1%, 1024 +2.5%, time to first token -1.0% (64) and -2.4%
   (1024 tokens) (6 of 6 forks each).
 
+- **Balanced tile engine.** In the engine of `ffn/down.cuh` two warps load activations and two
+  dequantize weights, and all four issue MMAs, so the dequantizing warps paced every K32 generation
+  (tensor pipe active 67% of cycles). `ffn/balanced.cuh` gives every warp a quarter of the activation
+  tile and one 16-column weight tile per generation, staged through registers into the other shared
+  slot with one CTA barrier per generation (127 registers instead of 168). Same weights and K16 order,
+  so bit for bit equal. 512 rows: gate/up 3142 -> 2914 us, Q5 5120 -> 12288 1335 -> 1146 us,
+  5120 -> 7168 931 -> 716 us, the Q3 mixer 629 -> 606 us; the FFN down stayed level (1726 -> 1745 us)
+  and keeps its engine, as do the exact twins. Prefill 256 +8.9%, 1024 +8.8%, time to first token for
+  a 1024-token prompt -8.7% (6 of 6 forks each); decode unchanged.
 - **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
   128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
   the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it

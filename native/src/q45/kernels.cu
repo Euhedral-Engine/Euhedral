@@ -5,6 +5,7 @@
 #include "attention_cache.cuh"
 #include "pdl.cuh"
 #include "../ffn/down.cuh"
+#include "../ffn/balanced.cuh"
 
 // Q4/Q5 kernels, structured like the Q3 module: format layout and code
 // unpacking are Q4/Q5-specific; the cooperative decode, compact K prefetch,
@@ -124,8 +125,8 @@ EUHEDRAL_Q45_GROUPED(euhedral_q45_prefill_64_grouped, 1)
 EUHEDRAL_Q45_GROUPED(euhedral_q45_prefill_64_grouped_exact, 2)
 #undef EUHEDRAL_Q45_GROUPED
 
-// Relaxed wide-tile prefill: the FFN tile engine (ffn/down.cuh, 4 warps, K32 generations with a
-// warp-specialized A and B producer pair) with the Q4/Q5 B producer of ffn/formats.cuh, 128 rows by
+// Relaxed wide-tile prefill: the balanced tile engine (ffn/balanced.cuh, 4 warps, K32 generations,
+// every warp loading A and staging B) with the Q4/Q5 B producer of ffn/formats.cuh, 128 rows by
 // 64 output columns per CTA. BF16 hi weights only; the exact routes keep the 64 x 32 kernels above.
 // It matches the relaxed 64 x 32 kernels bit for bit (same weights, same K16 order).
 // Requires in_features % 32 == 0, a 16-byte aligned input row stride and base.
@@ -133,9 +134,8 @@ EUHEDRAL_Q45_GROUPED(euhedral_q45_prefill_64_grouped_exact, 2)
 extern "C" __global__ __launch_bounds__(128) void NAME( \
         const unsigned short* input, const unsigned char* weights, unsigned short* output, \
         unsigned int rows, unsigned int in_features, unsigned int out_features) { \
-    __shared__ qwen_ffn_tiles::Storage<F, 32, 1> stage; \
-    qwen_ffn_down::run<F, 32, false, 1, qwen_ffn_tiles::Q45B<B>>(input, weights, output, rows, in_features, \
-            out_features, 0ull, nullptr, 0u, in_features, stage); \
+    __shared__ balanced::Storage stage; \
+    balanced::run<qwen_ffn_tiles::Q45B<B>>(input, weights, output, rows, in_features, out_features, 0ull, stage); \
 }
 EUHEDRAL_Q45_PREFILL_WIDE(4, euhedral_q4_prefill_128x64, 4)
 EUHEDRAL_Q45_PREFILL_WIDE(5, euhedral_q5_prefill_128x64, 4)
