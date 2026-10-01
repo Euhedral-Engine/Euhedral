@@ -483,6 +483,10 @@ Measured and not kept:
 - Spreading the one-row residual add + RMSNorm over 40 CTAs that each recompute the reduction:
   slower than the separate kernels (17.39 vs 17.23 ms per decode token).
 - 64 x 64 tiles on the prefill tile engine: slower than 128 x 64 for every Q4/Q5 shape.
+- Prefetching the balanced engine's loads two K32 generations ahead (a second register set): 163
+  registers, three CTAs per SM instead of four, gate/up at 512 rows 2836 -> 2997 us. On the balanced
+  engine the tensor pipe is active 77% of cycles; long-scoreboard stalls (14%) are the largest
+  remainder.
 - Four engine CTAs per SM (128 registers): gate/up 3016 -> 3467 us, down 1650 -> 3430 us at 512
   rows. With the swizzle the engine keeps the tensor pipe active 67% of cycles; the rest is the B
   dequantization and address arithmetic of the producer warps, which also issue MMAs.
