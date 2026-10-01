@@ -45,7 +45,6 @@ public final class QwenExecutionPlan {
         SWIGLU,
         ATTENTION_QK_NORM_ROPE,
         ATTENTION_KV_APPEND,
-        ATTENTION_PRODUCERS,
         ATTENTION_CAUSAL
     }
 
@@ -215,7 +214,7 @@ public final class QwenExecutionPlan {
         STREAMED
     }
 
-    /// Row threshold for the attention producer and gate/up regions (one 64-row prefill tile).
+    /// Row threshold for the gate/up and down regions (one 64-row prefill tile).
     private static final int REGION_MIN_ROWS = 64;
     /// Exact geometry at which the streamed FFN region is qualified; elsewhere gate/up + down is used.
     /// 64-row quanta run full-width gate/up and split-K down instead (1253 vs 1400 us per layer).
@@ -445,20 +444,20 @@ public final class QwenExecutionPlan {
     private static QwenExecutionPlan prefillPlan(
             QwenWeights weights, PlanData data, PrefillView view, QwenExecutionPlan owner) {
         PlanData selected = prefillView(data, view);
-        // The named lifetime pairs are qualified only when the view contains both the
-        // attention producer and a fused FFN, not for a shape that falls back to ordinary FFN.
-        boolean hasAttentionProducer =
-                selected.instructions().stream().anyMatch(i -> i.kind() == Kind.ATTENTION_PRODUCERS);
+        // The named lifetime pairs are qualified only for the region views with a fused FFN, not for
+        // a shape that falls back to ordinary FFN.
+        boolean regions = view == PrefillView.REGIONS || view == PrefillView.STREAMED;
         boolean hasFusedFfn = selected.instructions().stream()
                 .anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU || i.kind() == Kind.FFN_STREAMED);
-        return new QwenExecutionPlan(weights, selected, owner, hasAttentionProducer && hasFusedFfn);
+        return new QwenExecutionPlan(weights, selected, owner, regions && hasFusedFfn);
     }
 
     /// Rewrites the reference layer DAG into the retained prefill regions:
-    /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows,
-    /// F attention producers with direct cache writes plus B gate/up+SwiGLU (or C streamed FFN).
+    /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows, B gate/up+SwiGLU
+    /// (or C streamed FFN). The attention producers stay four leaf frames (Q projection, QK norm and
+    /// RoPE, KV projection, cache append), so the KV branch runs on its own lane beside the Q branch.
     private static PlanData prefillView(PlanData data, PrefillView view) {
-        boolean producers = view != PrefillView.SMALL && view != PrefillView.DECODE;
+        boolean regions = view != PrefillView.SMALL && view != PrefillView.DECODE;
         boolean streamed = view == PrefillView.STREAMED;
         List<Instruction> source = earlyControlOrder(data.instructions());
         List<Instruction> result = new ArrayList<>();
@@ -467,37 +466,6 @@ public final class QwenExecutionPlan {
         for (int index = 0; index < source.size(); index++) {
             Instruction first = source.get(index);
             Instruction next = index + 1 < source.size() ? source.get(index + 1) : null;
-            if (producers
-                    && first.kind() == Kind.Q4_LINEAR
-                    && index + 3 < source.size()
-                    && source.get(index + 2).kind() == Kind.ATTENTION_QK_NORM_ROPE) {
-                Instruction norm = source.get(index + 2), append = source.get(index + 3);
-                if (next.kind() != Kind.Q5_LINEAR
-                        || append.kind() != Kind.ATTENTION_KV_APPEND
-                        || !next.dependencies().equals(first.dependencies())
-                        || !norm.dependencies().equals(List.of(first.id()))
-                        || !append.dependencies().equals(List.of(norm.id(), next.id())))
-                    throw new IllegalStateException("unexpected attention producer topology");
-                for (int offset = 0; offset < 4; offset++)
-                    remapped[source.get(index + offset).id()] = result.size();
-                result.add(new Instruction(
-                        result.size(),
-                        Kind.ATTENTION_PRODUCERS,
-                        remapDependencies(first.dependencies(), remapped),
-                        List.of(
-                                first.weight(),
-                                next.weight(),
-                                norm.weights().get(0),
-                                norm.weights().get(1)),
-                        first.inputBuffers(),
-                        List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED),
-                        first.inputWidth(),
-                        first.outputWidth(),
-                        -1,
-                        first.layerIndex()));
-                index += 3;
-                continue;
-            }
             if (first.kind() == Kind.Q4_LINEAR
                     && next != null
                     && next.kind() == Kind.Q5_LINEAR
@@ -580,7 +548,7 @@ public final class QwenExecutionPlan {
                 index += 2;
                 continue;
             }
-            if (producers
+            if (regions
                     && first.kind() == Kind.Q3_LINEAR
                     && next != null
                     && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
@@ -639,7 +607,7 @@ public final class QwenExecutionPlan {
             }
             List<Integer> dependencies = remapDependencies(first.dependencies(), remapped);
             remapped[first.id()] = result.size();
-            boolean ffnDown = producers
+            boolean ffnDown = regions
                     && first.kind() == Kind.Q3_LINEAR
                     && first.inputBuffers().equals(List.of(Buffer.SWIGLU))
                     && first.outputBuffers().equals(List.of(Buffer.FFN_DELTA));
@@ -651,9 +619,7 @@ public final class QwenExecutionPlan {
                     ffnDown ? Kind.Q3_FFN_DOWN : first.kind(),
                     dependencies,
                     first.weights(),
-                    producers && first.kind() == Kind.ATTENTION_CAUSAL
-                            ? List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED)
-                            : first.inputBuffers(),
+                    first.inputBuffers(),
                     splitDown ? List.of(Buffer.FFN_DELTA, Buffer.FFN_PARTIALS) : first.outputBuffers(),
                     first.inputWidth(),
                     first.outputWidth(),
@@ -663,7 +629,6 @@ public final class QwenExecutionPlan {
         boolean needsGateUp = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.GATE_UP));
         boolean needsSwiGlu = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.SWIGLU));
         List<BufferSpec> buffers = new ArrayList<>(data.bufferSpecs().stream()
-                .filter(spec -> !producers || spec.buffer() != Buffer.ATTENTION_QK_NORMALIZED)
                 .filter(spec -> needsSwiGlu || spec.buffer() != Buffer.SWIGLU)
                 .filter(spec -> needsGateUp || spec.buffer() != Buffer.GATE_UP)
                 .filter(spec -> spec.buffer() != Buffer.A_PROJECTED && spec.buffer() != Buffer.B_PROJECTED)

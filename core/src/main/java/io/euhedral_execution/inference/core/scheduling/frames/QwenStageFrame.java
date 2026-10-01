@@ -40,7 +40,6 @@ public abstract class QwenStageFrame extends StageFrame {
                     RESIDUAL_ADD,
                     SWIGLU,
                     ATTENTION_QK_NORM_ROPE,
-                    ATTENTION_PRODUCERS,
                     ATTENTION_KV_APPEND,
                     ATTENTION_CAUSAL -> new QwenGpuOperationFrame(graph, instruction, gpu);
         };

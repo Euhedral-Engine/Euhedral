@@ -273,32 +273,6 @@ public final class EngineExecutionFixture {
         }
 
         @Override
-        public void attentionProducersNvfp4(
-                long input,
-                long q4,
-                long q5,
-                long queryNorm,
-                long keyNorm,
-                long queryKey,
-                long gate,
-                long keys,
-                long values,
-                int rows,
-                int hidden,
-                int queryHeads,
-                int keyHeads,
-                int headDim,
-                int rotaryDim,
-                long start,
-                float epsilon,
-                double theta,
-                long q4Bytes,
-                long q5Bytes) {
-            this.attentionStartPositions.add(start);
-            this.keyCacheAddresses.add(keys);
-        }
-
-        @Override
         public void attentionCausalNvfp4(
                 long queryKeyAddress,
                 long gateValueAddress,

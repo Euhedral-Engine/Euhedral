@@ -723,33 +723,6 @@ class QwenGenerationSessionTest {
         public void swiGluBf16(long gateUpAddress, long outputAddress, int rows, int intermediateSize) {}
 
         @Override
-        public void attentionProducersNvfp4(
-                long input,
-                long q4,
-                long q5,
-                long queryNorm,
-                long keyNorm,
-                long queryKey,
-                long gate,
-                long keys,
-                long values,
-                int rows,
-                int hidden,
-                int queryHeads,
-                int keyHeads,
-                int headDim,
-                int rotaryDim,
-                long start,
-                float epsilon,
-                double theta,
-                long q4Bytes,
-                long q5Bytes) {
-            // Prefill quanta of 64+ rows write the cache through the producer region.
-            this.attentionStartPositions.add(start);
-            this.keyCacheAddresses.add(keys);
-        }
-
-        @Override
         public void attentionQkNormRopeBf16(
                 long queryKeyAddress,
                 long queryNormAddress,

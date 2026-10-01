@@ -71,7 +71,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
             case GDN_CONVOLUTION -> runConvolution(context, instruction);
             case GDN_RECURRENCE -> runRecurrence(context, instruction);
             case GDN_GATED_RMS_NORM -> runGatedRmsNorm(context, instruction);
-            case ATTENTION_PRODUCERS -> runAttentionProducers(context, instruction);
             case ATTENTION_QK_NORM_ROPE -> runAttentionQkNormRope(context, instruction);
             case ATTENTION_KV_APPEND -> runAttentionKvAppend(context, instruction);
             case ATTENTION_CAUSAL -> runAttentionCausal(context, instruction);
@@ -175,36 +174,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         context.startPosition(),
                         (float) config.rmsNormEpsilon(),
                         config.ropeTheta());
-    }
-
-    private void runAttentionProducers(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
-        QwenConfig config = context.plan().weights().config();
-        AttentionKvState state = attentionState(context, instruction);
-        // Retirement settles the reservation, including staging a failed launch leaves queued.
-        this.pendingAppendState = state;
-        state.prepareAppend(context.startPosition(), context.inputTokenCount());
-        gpu().attentionProducersNvfp4(
-                        input(context, instruction, 0),
-                        instruction.weightAddress(0),
-                        instruction.weightAddress(1),
-                        instruction.weightAddress(2),
-                        instruction.weightAddress(3),
-                        output(context, instruction, 0),
-                        output(context, instruction, 1),
-                        state.keyCacheAddress(),
-                        state.valueCacheAddress(),
-                        context.inputTokenCount(),
-                        instruction.inputWidth(),
-                        config.numAttentionHeads(),
-                        config.numKeyValueHeads(),
-                        config.attentionHeadDim(),
-                        (int) Math.round(config.attentionHeadDim() * config.partialRotaryFactor()),
-                        context.startPosition(),
-                        (float) config.rmsNormEpsilon(),
-                        config.ropeTheta(),
-                        instruction.weightByteSize(0),
-                        instruction.weightByteSize(1));
-        state.appendSubmitted(context.inputTokenCount());
     }
 
     private void runAttentionKvAppend(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {

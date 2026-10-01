@@ -320,11 +320,10 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     this.view.stageTopology(),
                     (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu),
                     lanes,
-                    // Decode quanta leave the GPU idle between dependent kernels, so their independent
-                    // branches spread over lanes; prefill quanta fill the GPU and keep their home lane.
-                    this.view
-                            == EuhedralInferenceRuntime.this.plan.forExecution(
-                                    QwenExecutionContext.ExecutionKind.DECODE, 1),
+                    // Independent branches of every view spread over lanes: decode leaves the GPU idle
+                    // between dependent kernels, and a prefill side branch fills the tail waves of the
+                    // chain's GEMMs.
+                    true,
                     new QwenExecutionSource(),
                     retired -> recycle(pooled[0]));
             pooled[0] = new PooledGraph(graph, storage);
