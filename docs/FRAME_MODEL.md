@@ -417,6 +417,13 @@ order) gives 5.4% and KL 2.6e-3, so the combined error stays at the model's sens
 
 Measured and not kept:
 
+- Spreading the one-row residual add + RMSNorm over 40 CTAs that each recompute the reduction:
+  slower than the separate kernels (17.39 vs 17.23 ms per decode token).
+- 64 x 64 tiles on the prefill tile engine: slower than 128 x 64 for every Q4/Q5 shape.
+- Four engine CTAs per SM (128 registers): gate/up 3016 -> 3467 us, down 1650 -> 3430 us at 512
+  rows. With the swizzle the engine keeps the tensor pipe active 67% of cycles; the rest is the B
+  dequantization and address arithmetic of the producer warps, which also issue MMAs.
+
 - A dedicated producer warp feeding a TMA bulk-copy ring for Q3 decode: -29% with one L2-resident
   weight buffer, no gain with cold weights or in the model.
 - A second CUDA lane for the GDN decode fan-out (Q4, Q5 and the BF16 pair): 90 -> 86-88 us per
