@@ -15,7 +15,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
         if(owns_a)activation<F>(s.a[0][mb],x,rows,width,row0,mb,0,lane);
         else {
             #pragma unroll
-            for(int t=0;t<N/16;++t)produce_b<false,P>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][P-1]+t*16u*32u,layout,outputs,col0+t*16u+nb*(outputs/2u),0,lane);
+            for(int t=0;t<N/16;++t)produce_b<true,P>(s.b[0][nb][0]+t*16u*32u,s.b[0][nb][P-1]+t*16u*32u,layout,outputs,col0+t*16u+nb*(outputs/2u),0,lane);
         }
         arrive(&s.ready[branch][0]);
     }
@@ -25,8 +25,8 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
         for(unsigned int half=0;half<2;++half){
             unsigned int af[F][4],bf[2][2][N/8];
             #pragma unroll
-            for(int m=0;m<F;++m)q3::ldmatrix_x4(af[m],s.a[slot][mb]+(m*16u+(lane&15u))*32u+half*16u+(lane>>4)*8u);
-            unsigned int index=(fh*(N/2u)+(lane&7u)+(N==32?((lane>>4)<<3):0u))*32u+half*16u+((lane>>3)&1u)*8u;
+            for(int m=0;m<F;++m)q3::ldmatrix_x4(af[m],s.a[slot][mb]+b_index(m*16u+(lane&15u),half*16u+(lane>>4)*8u));
+            unsigned int index=b_index(fh*(N/2u)+(lane&7u)+(N==32?((lane>>4)<<3):0u),half*16u+((lane>>3)&1u)*8u);
             #pragma unroll
             for(int pair=0;pair<2;++pair)
                 #pragma unroll
@@ -53,7 +53,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
             if(owns_a)activation<F>(s.a[n&1u][mb],x,rows,width,row0,mb,n*32u,lane);
             else {
                 #pragma unroll
-                for(int t=0;t<N/16;++t)stage_compact_b<false,P>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][P-1]+t*16u*32u,next[t],lane);
+                for(int t=0;t<N/16;++t)stage_compact_b<true,P>(s.b[n&1u][nb][0]+t*16u*32u,s.b[n&1u][nb][P-1]+t*16u*32u,next[t],lane);
             }
             arrive(&s.ready[branch][n&1u]);
         }

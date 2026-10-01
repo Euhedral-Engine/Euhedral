@@ -30,7 +30,7 @@ class RelaxedPrefillTest(unittest.TestCase):
         gpu = Gpu(b'#include "q3/kernels.cu"\n')
         rng = random.Random(1409)
         try:
-            for rows, width, outputs in [(33, 512, 64), (100, 1024, 96), (256, 512, 64)]:
+            for rows, width, outputs in [(33, 512, 64), (100, 1024, 96), (256, 512, 64), (300, 1024, 160)]:
                 with contextlib.ExitStack() as stack:
                     groups = outputs * (width // 64)
                     scale = (groups * 24 + 255) & ~255
@@ -40,6 +40,15 @@ class RelaxedPrefillTest(unittest.TestCase):
                     x = gpu.upload(struct.pack(f'<{rows * width}H', *[rng.randrange(0x3c00, 0x4000) | (rng.randrange(2) << 15)
                                                                    for _ in range(rows * width)]))
                     stack.callback(gpu.free, x)
+                    if width % 32 == 0:
+                        # The 128 x 64 tile engine matches the relaxed K32 compact-B kernel bit for bit.
+                        outs = []
+                        for symbol, grid in [('euhedral_q3_prefill_64_k32_cb', ((rows + 63) // 64) * (outputs // 32)),
+                                             ('euhedral_q3_prefill_128x64', ((rows + 127) // 128) * ((outputs + 63) // 64))]:
+                            y = gpu.zeros(rows * outputs * 2, fill=0xa5); stack.callback(gpu.free, y)
+                            gpu.launch(symbol, grid, [P(x), P(w), P(y), U(rows), U(width), U(outputs), C.c_ulonglong(scale)])
+                            outs.append(gpu.download(y, rows * outputs * 2))
+                        self.assertEqual(outs[0], outs[1], ('engine', rows, width, outputs))
                     for name, tile in [('euhedral_q3_prefill', 32), ('euhedral_q3_prefill_s104', 32),
                                        ('euhedral_q3_prefill_64', 64), ('euhedral_q3_prefill_64_k32_cb', 64)]:
                         result = []

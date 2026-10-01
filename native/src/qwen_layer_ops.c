@@ -48,7 +48,7 @@ static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
 static CUfunction q45_prefill_exact[2], q45_prefill64_exact[2], q45_grouped64_exact;
-static CUfunction q45_prefill_wide5;
+static CUfunction q45_prefill_wide[2];
 
 /* Exact numerics select the hi + lo twins of the Q4/Q5 prefill kernels. */
 static CUfunction q45_prefill_kernel(int format, int wide) {
@@ -63,7 +63,7 @@ static CUfunction q45_prefill_wide_kernel(int format, const void* input, uint32_
         uint32_t out_features, uint64_t* grid) {
     uint32_t tile_rows = euhedral_q45_prefill_wide_rows(format ? 5u : 4u, rows, in_features, out_features);
     if (tile_rows == 0u || euhedral_cuda_exact_numerics() || ((uintptr_t)input & 15u) != 0u) return NULL;
-    CUfunction function = format ? q45_prefill_wide5 : NULL;
+    CUfunction function = q45_prefill_wide[format];
     if (function != NULL)
         *grid = (((uint64_t)rows + tile_rows - 1u) / tile_rows) * (((uint64_t)out_features + 63u) / 64u);
     return function;
@@ -134,8 +134,9 @@ static void initialize_modules(void) {
         get_function(q45_module, &q45_prefill_exact[1], "euhedral_q5_prefill_exact");
         get_function(q45_module, &q45_prefill64_exact[0], "euhedral_q4_prefill_64_exact");
         get_function(q45_module, &q45_prefill64_exact[1], "euhedral_q5_prefill_64_exact");
-        // Optional: without it relaxed Q5 prefill keeps the 64 x 32 kernel.
-        get_function(q45_module, &q45_prefill_wide5, "euhedral_q5_prefill_128x64");
+        // Optional: without them relaxed prefill keeps the 64 x 32 kernels.
+        get_function(q45_module, &q45_prefill_wide[0], "euhedral_q4_prefill_128x64");
+        get_function(q45_module, &q45_prefill_wide[1], "euhedral_q5_prefill_128x64");
         if (status != CUDA_SUCCESS) q45_status = (int)status;
     }
 

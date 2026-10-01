@@ -127,7 +127,7 @@ EUHEDRAL_Q45_GROUPED(euhedral_q45_prefill_64_grouped_exact, 2)
 // Relaxed wide-tile prefill: the FFN tile engine (ffn/down.cuh, 4 warps, K32 generations with a
 // warp-specialized A and B producer pair) with the Q4/Q5 B producer of ffn/formats.cuh, 128 rows by
 // 64 output columns per CTA. BF16 hi weights only; the exact routes keep the 64 x 32 kernels above.
-// Host dispatch uses it for Q5 (q45_decode_policy.h); the Q4 instance is the measured alternative.
+// It matches the relaxed 64 x 32 kernels bit for bit (same weights, same K16 order).
 // Requires in_features % 32 == 0, a 16-byte aligned input row stride and base.
 #define EUHEDRAL_Q45_PREFILL_WIDE(B, NAME, F) \
 extern "C" __global__ __launch_bounds__(128) void NAME( \

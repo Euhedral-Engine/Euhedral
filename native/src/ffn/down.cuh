@@ -39,9 +39,9 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
         for(unsigned int half=0;half<2;++half){
             unsigned int af[F][4],bf[2][N/16][4];
             #pragma unroll
-            for(int m=0;m<F;++m)q3::ldmatrix_x4(af[m],s.a[slot][mb]+(m*16u+(lane&15u))*32u+half*16u+(lane>>4)*8u);
+            for(int m=0;m<F;++m)q3::ldmatrix_x4(af[m],s.a[slot][mb]+b_index(m*16u+(lane&15u),half*16u+(lane>>4)*8u));
             #pragma unroll
-            for(int t=0;t<N/16;++t){unsigned int index=(t*16u+(lane&7u)+((lane>>4)<<3))*32u+half*16u+((lane>>3)&1u)*8u;
+            for(int t=0;t<N/16;++t){unsigned int index=b_index(t*16u+(lane&7u)+((lane>>4)<<3),half*16u+((lane>>3)&1u)*8u);
                 q3::ldmatrix_x4(bf[0][t],s.b[slot][nb][0]+index);if(P>1)q3::ldmatrix_x4(bf[1][t],s.b[slot][nb][P-1]+index);}
             if(half==1u){__syncwarp();arrive(&s.release[mb][slot]);arrive(&s.release[2u+nb][slot]);}
             #pragma unroll

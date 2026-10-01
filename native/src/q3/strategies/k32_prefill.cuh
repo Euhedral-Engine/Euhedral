@@ -13,7 +13,7 @@ constexpr unsigned int kAStride = 40;
 static __device__ __forceinline__ unsigned int b_index(unsigned int col, unsigned int k) {
     return col * 32u + (((((k >> 3) ^ (col >> 1)) & 3u) << 3) | (k & 7u));
 }
-// The FFN stream kernels keep their own dense B columns and pass SWIZZLE = false.
+// SWIZZLE = false stages dense columns (col * 32 + k); every production producer swizzles.
 template<bool SWIZZLE>
 static __device__ __forceinline__ unsigned int b_position(unsigned int col, unsigned int k) {
     return SWIZZLE ? b_index(col, k) : col * 32u + k;
