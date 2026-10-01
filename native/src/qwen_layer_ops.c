@@ -205,6 +205,16 @@ static int launch_and_synchronize(CUfunction function, uint32_t grid_x, uint32_t
     return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
 }
 
+static int launch_and_synchronize_2d(CUfunction function, uint32_t grid_x, uint32_t grid_y, uint32_t block_x,
+        void** parameters) {
+    CUresult status = euhedral_launch_kernel(function, grid_x, grid_y, 1, block_x, 1, 1, 0,
+            euhedral_cuda_submission_stream(), parameters, NULL);
+    if (status != CUDA_SUCCESS) return (int)status;
+    if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
+    cudaError_t sync = cudaDeviceSynchronize();
+    return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
+}
+
 static int align_plane(uint64_t size, uint64_t* aligned) {
     if (size > UINT64_MAX - 255) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     *aligned = (size + 255) & ~UINT64_C(255);
@@ -414,7 +424,8 @@ int euhedral_cuda_gdn_convolution_bf16(
     uint32_t rows_arg = rows, qk_arg = query_key_width, value_arg = value_width;
     uint32_t channels_arg = convolution_width, kernel_arg = kernel_size;
     void* parameters[] = {&qk, &vz, &weights, &state, &output, &rows_arg, &qk_arg, &value_arg, &channels_arg, &kernel_arg};
-    return launch_and_synchronize(gdn_convolution, (convolution_width + 127) / 128, 128, parameters);
+    // Kernel rows are split into 32-row blocks (QWEN_GDN_CONV_ROWS in qwen_gdn_ops.cu).
+    return launch_and_synchronize_2d(gdn_convolution, (convolution_width + 127) / 128, (rows + 31) / 32, 128, parameters);
 }
 
 int euhedral_cuda_gdn_recurrence_bf16(
