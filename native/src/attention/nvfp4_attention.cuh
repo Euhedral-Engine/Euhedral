@@ -1,7 +1,7 @@
 #pragma once
 #include "nvfp4_kv.cuh"
 #include <mma.h>
-#include "pdl.cuh"
+#include "common/pdl.cuh"
 
 namespace nvfp4kv {
 

@@ -4,9 +4,9 @@
 #include "strategies/decode_contiguous.cuh"
 #include "strategies/prefill.cuh"
 #include "strategies/k32_prefill.cuh"
-#include "pdl.cuh"
-#include "../ffn/down.cuh"
-#include "../ffn/balanced.cuh"
+#include "common/pdl.cuh"
+#include "ffn/down.cuh"
+#include "gemm/balanced.cuh"
 
 // Production prefill entry points consume BF16 hi weights only (one MMA per weight); each has an
 // _exact twin that consumes hi + lo and reproduces the scalar reference bit for bit.
@@ -154,7 +154,7 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_exact(
 }
 
 // 64-row tile with the WMMA reference leaf. Optional symbol: AUTO routes shapes
-// where the explicit leaf measured slower here (q3_prefill_policy.h).
+// where the explicit leaf measured slower here (host/q3_prefill_policy.h).
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_wmma(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features,
@@ -188,8 +188,8 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64_k32_cb_
             out_features, scale_offset, nullptr, storage);
 }
 
-// Relaxed 64- and 128-row prefill on the balanced tile engine (ffn/balanced.cuh with the Q3 producer of
-// ffn/formats.cuh). Same BF16 hi weights and K16 order as euhedral_q3_prefill_64_k32_cb, so it
+// Relaxed 64- and 128-row prefill on the balanced tile engine (gemm/balanced.cuh with the Q3 producer of
+// gemm/formats.cuh). Same BF16 hi weights and K16 order as euhedral_q3_prefill_64_k32_cb, so it
 // matches that kernel bit for bit. Requires in_features % 32 == 0 and a 16-byte aligned input.
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_prefill_64x64(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,

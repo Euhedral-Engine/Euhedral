@@ -1,11 +1,11 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include "attention/nvfp4_kv.cuh"
-#include "attention/nvfp4_attention.cuh"
-#include "attention/nvfp4_prefill32.cuh"
-#include "attention/nvfp4_prefill_fa2.cuh"
-#include "attention/nvfp4_decode_gqa.cuh"
-#include "pdl.cuh"
+#include "nvfp4_kv.cuh"
+#include "nvfp4_attention.cuh"
+#include "nvfp4_prefill32.cuh"
+#include "nvfp4_prefill_fa2.cuh"
+#include "nvfp4_decode_gqa.cuh"
+#include "common/pdl.cuh"
 
 // Four warp-owned rows per CTA. Page-table entries point to token-major pages;
 // each head row has 128 packed-code bytes followed by 16 E4M3 scale bytes.

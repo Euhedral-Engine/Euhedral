@@ -100,9 +100,18 @@ int euhedral_cuda_load_kernel(const void* anchor, const char* source_name, const
         nvrtcDestroyProgram(&program);
         return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     }
-    // Resolve packaged Q3 headers relative to this source, not to the CUDA toolkit.
-    const char* options[] = {"--std=c++14", "--gpu-architecture=compute_90", include_option, source_include_option};
-    nv_status = nvrtcCompileProgram(program, 4, options);
+    char root_include_option[PATH_MAX + 16];
+    int root_length = snprintf(root_include_option, sizeof(root_include_option), "-I%.*s",
+            (int)(strlen(path) - strlen(source_name) - 1u), path);
+    if (root_length < 0 || (size_t)root_length >= sizeof(root_include_option)) {
+        nvrtcDestroyProgram(&program);
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    }
+    // Resolve packaged headers relative to this source and to the kernel tree's root (shared
+    // headers such as common/pdl.cuh), not to the CUDA toolkit.
+    const char* options[] = {"--std=c++14", "--gpu-architecture=compute_90", include_option, source_include_option,
+            root_include_option};
+    nv_status = nvrtcCompileProgram(program, 5, options);
     if (nv_status != NVRTC_SUCCESS) {
         size_t log_size = 0;
         nvrtcGetProgramLogSize(program, &log_size);

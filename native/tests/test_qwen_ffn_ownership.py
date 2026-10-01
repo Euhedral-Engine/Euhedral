@@ -6,7 +6,7 @@ import struct
 import unittest
 from test_q3_primitives import Gpu, NVRTC, CUDA, _check
 
-SOURCE = '#include "qwen_ffn.cu"\n#include "q3/kernels.cu"\n#include "q45/kernels.cu"\n#include "qwen_attention_ops.cu"\nextern "C" __global__ void hold_consumer() {\n    unsigned long long begin=clock64();\n    while(clock64()-begin<1000000ull) {}\n}\nextern "C" __global__ __launch_bounds__(128) void reference_acc(\n const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,\n unsigned int k,unsigned int n,unsigned long long scale,float* accum) {\n __shared__ k32_probe::Shared storage;\n k32_probe::run<false,false,true,true>(x,w,y,m,k,n,scale,accum,storage);\n}\n'
+SOURCE = '#include "ffn/kernels.cu"\n#include "q3/kernels.cu"\n#include "q45/kernels.cu"\n#include "attention/kernels.cu"\nextern "C" __global__ void hold_consumer() {\n    unsigned long long begin=clock64();\n    while(clock64()-begin<1000000ull) {}\n}\nextern "C" __global__ __launch_bounds__(128) void reference_acc(\n const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,\n unsigned int k,unsigned int n,unsigned long long scale,float* accum) {\n __shared__ k32_probe::Shared storage;\n k32_probe::run<false,false,true,true>(x,w,y,m,k,n,scale,accum,storage);\n}\n'
 
 @unittest.skipIf(NVRTC is None or CUDA is None, "CUDA/NVRTC unavailable")
 class FfnOwnershipTest(unittest.TestCase):

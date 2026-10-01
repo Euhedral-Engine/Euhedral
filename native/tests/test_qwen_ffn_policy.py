@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-HEADER = pathlib.Path(__file__).resolve().parents[1] / 'src'
+HEADER = pathlib.Path(__file__).resolve().parents[1] / 'src' / 'host'
 SOURCE = '''#include "qwen_ffn_policy.h"
 unsigned gate(unsigned m,unsigned k,unsigned n){return euhedral_ffn_gate_tile_rows(m,k,n);}
 int down(unsigned m,unsigned k,unsigned n){return euhedral_ffn_down_wide(m,k,n);}

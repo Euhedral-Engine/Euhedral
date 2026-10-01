@@ -1,6 +1,6 @@
 #pragma once
 #include "decode.cuh"
-#include "pdl.cuh"
+#include "common/pdl.cuh"
 
 namespace q45 {
 // Single-row Q4/Q5 decode with warp-local wide streaming (see q3/strategies/decode_wide.cuh).

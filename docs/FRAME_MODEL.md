@@ -327,7 +327,7 @@ the represented NVFP4 values within the existing FP16/MMA and BF16-output tolera
 
 Decode quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
 (`euhedral_cuda_pdl_select`): every kernel registered for it begins with `griddepcontrol.wait`
-(`native/src/pdl.cuh`), so it cannot read a predecessor's output early. It won 12 of 12 paired forks
+(`native/src/common/pdl.cuh`), so it cannot read a predecessor's output early. It won 12 of 12 paired forks
 (about +1%) at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches.
 `EUHEDRAL_PDL=0` disables it.
 
@@ -402,7 +402,7 @@ the represented-NVFP4 tolerance for decode attention.
   unchanged.
 - **One prefill tile engine for every format.** The FFN's 128 x 64 tile (`ffn/down.cuh`: four warps,
   K32 generations, warp-specialized A and B producers) now takes the weight format as a policy
-  (`ffn/formats.cuh`: the Q3 producer and a Q4/Q5 producer that stages a half group's four code
+  (`gemm/formats.cuh`: the Q3 producer and a Q4/Q5 producer that stages a half group's four code
   words, fifth-bit word and scale from one register per lane). At 512 rows the Q5 projections ran
   at 33 TFLOPS on their 64 x 32 kernel against the FFN's 57; on the engine (`euhedral_q5_prefill_128x64`,
   Q5 quanta from 256 rows) 5120 -> 12288 takes 1899 -> 1401 us and 5120 -> 7168 1149 -> 990 us.
@@ -439,7 +439,7 @@ the represented-NVFP4 tolerance for decode attention.
 
 - **Balanced tile engine.** In the engine of `ffn/down.cuh` two warps load activations and two
   dequantize weights, and all four issue MMAs, so the dequantizing warps paced every K32 generation
-  (tensor pipe active 67% of cycles). `ffn/balanced.cuh` gives every warp a quarter of the activation
+  (tensor pipe active 67% of cycles). `gemm/balanced.cuh` gives every warp a quarter of the activation
   tile and one 16-column weight tile per generation, staged through registers into the other shared
   slot with one CTA barrier per generation (127 registers instead of 168). Same weights and K16 order,
   so bit for bit equal. 512 rows: gate/up 3142 -> 2914 us, Q5 5120 -> 12288 1335 -> 1146 us,

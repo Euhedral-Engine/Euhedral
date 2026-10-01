@@ -97,13 +97,13 @@ class StreamedFfnLifecycleTest(unittest.TestCase):
         cc = shutil.which('cc')
         if cc is None:
             raise unittest.SkipTest('a host C compiler is required')
-        source = (ROOT / 'src/qwen_layer_ops.c').read_text()
+        source = (ROOT / 'src/host/qwen_layer_ops.c').read_text()
         start = source.index('int euhedral_cuda_q3_ffn_streamed_bf16(')
         end = source.index('\nint euhedral_cuda_q3_gate_up_swiglu_bf16(', start)
         cls.directory = tempfile.TemporaryDirectory(prefix='ffn-lifecycle-')
         cls.addClassCleanup(cls.directory.cleanup)
         path = pathlib.Path(cls.directory.name)
-        (path / 'probe.c').write_text(STUBS + '\n#include "' + str(ROOT / "src/qwen_ffn_policy.h") + '"\n' + source[start:end] + WRAPPER)
+        (path / 'probe.c').write_text(STUBS + '\n#include "' + str(ROOT / "src/host/qwen_ffn_policy.h") + '"\n' + source[start:end] + WRAPPER)
         subprocess.run([cc, '-std=c11', '-shared', '-fPIC', '-O0', str(path / 'probe.c'),
                         '-o', str(path / 'probe.so')], check=True, capture_output=True)
         cls.lib = ctypes.CDLL(str(path / 'probe.so'))

@@ -33,7 +33,7 @@ static CUfunction optional_kernel(const char* name) {
     return cuModuleGetFunction(&loaded, module, name) == CUDA_SUCCESS ? loaded : NULL;
 }
 static void initialize(void) {
-    init_status = euhedral_cuda_load_kernel((const void*)&once, "q3_linear_bf16.cu", "euhedral_q3_linear_bf16", &module, &function);
+    init_status = euhedral_cuda_load_kernel((const void*)&once, "q3/kernels.cu", "euhedral_q3_linear_bf16", &module, &function);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     decode1 = optional_kernel("euhedral_q3_decode_1");
     decode2 = optional_kernel("euhedral_q3_decode_2");

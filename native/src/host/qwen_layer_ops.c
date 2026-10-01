@@ -105,13 +105,13 @@ static int get_function(CUmodule module, CUfunction* function, const char* name)
 
 static void initialize_modules(void) {
     init_status = euhedral_cuda_load_kernel(
-            &quantized_anchor, "qwen_layer_linear.cu", "euhedral_linear_quantized_bf16", &quantized_module, &linear_quantized);
+            &quantized_anchor, "linear/kernels.cu", "euhedral_linear_quantized_bf16", &quantized_module, &linear_quantized);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     CUresult status = get_function(quantized_module, &linear_bf16_to_float, "euhedral_linear_bf16_to_float");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
 
     q45_status = euhedral_cuda_load_kernel(
-            &q45_anchor, "q45_linear_bf16.cu", "euhedral_q4_decode_1", &q45_module, &q45_decode[0][0]);
+            &q45_anchor, "q45/kernels.cu", "euhedral_q4_decode_1", &q45_module, &q45_decode[0][0]);
     if (q45_status == EUHEDRAL_CUDA_SUCCESS) {
         get_function(q45_module, &attention_value_cache, "euhedral_attention_value_cache_bf16");
         static const char* const decode_names[2][3] = {
@@ -148,7 +148,7 @@ static void initialize_modules(void) {
     }
 
     init_status = euhedral_cuda_load_kernel(
-            &gdn_anchor, "qwen_gdn_ops.cu", "euhedral_gdn_control_fp32", &gdn_module, &gdn_control);
+            &gdn_anchor, "gdn/kernels.cu", "euhedral_gdn_control_fp32", &gdn_module, &gdn_control);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     get_function(gdn_module, &gdn_project_control, "euhedral_gdn_project_control_fp32");
     get_function(gdn_module, &gdn_project_control_tiled, "euhedral_gdn_project_control_8x4_fp32");
@@ -165,7 +165,7 @@ static void initialize_modules(void) {
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
 
     init_status = euhedral_cuda_load_kernel(
-            &elementwise_anchor, "qwen_elementwise.cu", "euhedral_residual_add_bf16", &elementwise_module, &residual_add);
+            &elementwise_anchor, "elementwise/kernels.cu", "euhedral_residual_add_bf16", &elementwise_module, &residual_add);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     get_function(elementwise_module, &residual_rms_norm, "euhedral_residual_rms_norm_bf16");
     get_function(elementwise_module, &residual_rms_norm_row, "euhedral_residual_rms_norm_row_bf16");
@@ -174,7 +174,7 @@ static void initialize_modules(void) {
 
     init_status = euhedral_cuda_load_kernel(
             &attention_anchor,
-            "qwen_attention_ops.cu",
+            "attention/kernels.cu",
             "euhedral_attention_qk_norm_rope_bf16",
             &attention_module,
             &attention_qk_norm_rope);
@@ -201,7 +201,7 @@ static void initialize_modules(void) {
     status = get_function(attention_module, &attention_causal, "euhedral_attention_causal_bf16");
     init_status = status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : (int)status;
     if (init_status == EUHEDRAL_CUDA_SUCCESS) {
-        euhedral_cuda_load_kernel(&ffn_anchor, "qwen_ffn.cu", "euhedral_q3_gate_up_swiglu_bf16",
+        euhedral_cuda_load_kernel(&ffn_anchor, "ffn/kernels.cu", "euhedral_q3_gate_up_swiglu_bf16",
                 &ffn_module, &gate_up_swiglu);
         if (ffn_module) {
             get_function(ffn_module, &gate_up64x32, "euhedral_q3_gate_up_swiglu_64x32");
@@ -517,7 +517,7 @@ int euhedral_cuda_gdn_convolution_bf16(
     uint32_t rows_arg = rows, qk_arg = query_key_width, value_arg = value_width;
     uint32_t channels_arg = convolution_width, kernel_arg = kernel_size;
     void* parameters[] = {&qk, &vz, &weights, &state, &output, &rows_arg, &qk_arg, &value_arg, &channels_arg, &kernel_arg};
-    // Kernel rows are split into 32-row blocks (QWEN_GDN_CONV_ROWS in qwen_gdn_ops.cu).
+    // Kernel rows are split into 32-row blocks (QWEN_GDN_CONV_ROWS in gdn/kernels.cu).
     return launch_and_synchronize_2d(gdn_convolution, (convolution_width + 127) / 128, (rows + 31) / 32, 128, parameters);
 }
 
@@ -559,7 +559,7 @@ int euhedral_cuda_gdn_recurrence_bf16(
         if (relaxed != NULL)
             return launch_and_synchronize(relaxed, (uint32_t)(rows_count / (four ? 4 : 8)), 32, parameters);
     }
-    // Must match QWEN_GDN_WARP_COLUMNS (8 value columns per warp) in qwen_gdn_ops.cu.
+    // Must match QWEN_GDN_WARP_COLUMNS (8 value columns per warp) in gdn/kernels.cu.
     return launch_and_synchronize(gdn_recurrence, (uint32_t)(rows_count / 8), 32, parameters);
 }
 

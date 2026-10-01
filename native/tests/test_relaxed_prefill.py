@@ -83,7 +83,7 @@ class RelaxedPrefillTest(unittest.TestCase):
                                            [P(x), P(w), P(y), U(rows), U(width), U(outputs)])
                                 result.append(struct.unpack(f'<{rows * outputs}H', gpu.download(y, rows * outputs * 2)))
                             self.assert_close(result[0], result[1], (name, rows, width, outputs))
-            # The 128 x 64 tile engine (ffn/down.cuh with the Q4/Q5 producer of ffn/formats.cuh) stages
+            # The 128 x 64 tile engine (ffn/down.cuh with the Q4/Q5 producer of gemm/formats.cuh) stages
             # the same BF16 hi weights and accumulates K16 MMA steps in the same order as the relaxed
             # 64 x 32 kernel, so on partial row and column tiles it matches that kernel bit for bit.
             for bits in (4, 5):

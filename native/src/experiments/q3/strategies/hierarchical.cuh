@@ -1,5 +1,5 @@
 #pragma once
-#include "prefill.cuh"
+#include "q3/strategies/prefill.cuh"
 #include <cooperative_groups.h>
 
 namespace q3 {

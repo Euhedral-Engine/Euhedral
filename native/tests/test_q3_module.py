@@ -57,7 +57,7 @@ def build_dispatch_host(directory, name):
     cuda_root = ROOT / 'build/cuda-dev/linux-x64'
     libdir, runtime = cuda_root / 'lib', cuda_root / 'runtime'
     command = [shutil.which('gcc'), '-shared', '-fPIC', '-pthread', '-O2',
-               '-I', str(ROOT / 'native/include'), '-I', str(ROOT / 'native/src'),
+               '-I', str(ROOT / 'native/include'), '-I', str(ROOT / 'native/src/host'),
                '-I', str(cuda_root / 'include'), '-L', str(libdir),
                f'-Wl,-rpath,{libdir}:{runtime}', str(harness), '-lcuda', '-lcudart',
                '-o', str(library_path)]

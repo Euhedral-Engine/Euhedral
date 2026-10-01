@@ -1,7 +1,7 @@
 #pragma once
-#include "tiles.cuh"
-#include "formats.cuh"
-#include "balanced.cuh"
+#include "gemm/tiles.cuh"
+#include "gemm/formats.cuh"
+#include "gemm/balanced.cuh"
 namespace qwen_ffn_down {
 using namespace k32_probe;
 // SPLIT: the CTA accumulates K range [start, start + count) of the full activation (row stride
@@ -95,7 +95,7 @@ EUHEDRAL_Q3_FFN_DOWN(euhedral_q3_ffn_down_128x64_exact, 4, 2)
 #undef EUHEDRAL_Q3_FFN_DOWN
 // Split-K down: blockIdx.y selects a 32-aligned K range; partial[split] (rows x n FP32) receives its
 // sums. The 80-320 CTAs of the unsplit leaf leave a 64-512 row quantum in one or two partial waves.
-// The split leaves run on the balanced engine (ffn/balanced.cuh): same K ranges and K16 order, bitwise
+// The split leaves run on the balanced engine (gemm/balanced.cuh): same K ranges and K16 order, bitwise
 // equal partials. 512 rows, four splits 1753 -> 1455 us; 256 rows, three splits 727 us; 64 rows (64-row
 // tile), four splits 292 -> 278 us.
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_ffn_down_split_64x64(

@@ -1,6 +1,6 @@
 #pragma once
-#include "tiles.cuh"
-#include "balanced.cuh"
+#include "gemm/tiles.cuh"
+#include "gemm/balanced.cuh"
 namespace qwen_ffn_paired {
 using namespace qwen_ffn_tiles;
 template<int F,int N,int P=1>
@@ -78,7 +78,7 @@ static __device__ __forceinline__ void run(const unsigned short* x,const unsigne
 extern "C" __global__ __launch_bounds__(128) void NAME( \
  const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) { \
  __shared__ qwen_ffn_tiles::Storage<F,32,P> s;qwen_ffn_paired::run<F,32,P>(x,w,y,m,k,n,scale,s,0,n/2u); }
-// The relaxed leaves run on the balanced engine (ffn/balanced.cuh), bitwise equal to the above:
+// The relaxed leaves run on the balanced engine (gemm/balanced.cuh), bitwise equal to the above:
 // 512 rows 3142 -> 2914 us, 64 rows 588 -> 504 us.
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_gate_up_swiglu_64x32(
  const unsigned short* x,const unsigned char* w,unsigned short* y,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale) {

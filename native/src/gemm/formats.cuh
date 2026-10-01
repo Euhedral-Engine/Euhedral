@@ -1,7 +1,7 @@
 #pragma once
-#include "../q3/strategies/k32_prefill.cuh"
-#include "../q45/layout.cuh"
-#include "../q45/primitives/staging.cuh"
+#include "q3/strategies/k32_prefill.cuh"
+#include "q45/layout.cuh"
+#include "q45/primitives/staging.cuh"
 // B-operand formats of the tile engine (down.cuh). Each stages one 16-column x K32 tile, column-major
 // with swizzled chunks (k32_probe::b_index), from a compact register prefetch: lanes 8c..8c+7 own
 // column c of each 4-column pass.

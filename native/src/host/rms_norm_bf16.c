@@ -18,7 +18,7 @@ static CUfunction function;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static void initialize(void) {
-    init_status = euhedral_cuda_load_kernel((const void*)&once, "rms_norm_bf16.cu", "euhedral_rms_norm_bf16", &module, &function);
+    init_status = euhedral_cuda_load_kernel((const void*)&once, "norm/kernels.cu", "euhedral_rms_norm_bf16", &module, &function);
     if (init_status == EUHEDRAL_CUDA_SUCCESS) euhedral_cuda_pdl_register(function);
 }
 #ifdef _WIN32

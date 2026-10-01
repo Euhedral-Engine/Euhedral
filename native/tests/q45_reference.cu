@@ -1,4 +1,4 @@
-// Reference Q4/Q5 kernels: the pre-restructuring q45_linear_bf16.cu schedule
+// Reference Q4/Q5 kernels: the pre-restructuring q45 module schedule
 // (per-group packed loads, one row per decode CTA, 32 x 32 WMMA prefill) with
 // renamed entry points. Tests require the restructured kernels to match it
 // bitwise.

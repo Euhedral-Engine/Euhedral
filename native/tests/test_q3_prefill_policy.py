@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-HEADER = pathlib.Path(__file__).resolve().parents[1] / 'src'
+HEADER = pathlib.Path(__file__).resolve().parents[1] / 'src' / 'host'
 SOURCE = '''#include "q3_prefill_policy.h"
 int decode_wide(unsigned rows, unsigned width, unsigned outputs) {
     return euhedral_q3_decode_wide_shape(rows, width, outputs);
