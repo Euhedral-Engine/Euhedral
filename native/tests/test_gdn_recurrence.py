@@ -79,7 +79,7 @@ def chunk(rows, seed, cancellation):
 class GdnRecurrenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = (PRODUCT / 'gdn/kernels.cu').read_bytes() + REFERENCE
+        source = b'#include "gdn/kernels.cu"\n' + REFERENCE
         cls.gpu = Gpu(source, include_dir=PRODUCT)
 
     @classmethod
