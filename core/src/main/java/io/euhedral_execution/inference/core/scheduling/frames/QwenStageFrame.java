@@ -7,7 +7,7 @@ import io.euhedral_execution.inference.core.scheduling.graph.StageFrame;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 import java.util.Objects;
 
-/// A Qwen plan instruction as an independently schedulable stage.
+/// A Qwen plan instruction as an independent stage frame.
 ///
 /// The frame is built once per reusable graph with an immutable instruction and weight binding. Each
 /// quantum rebinds only the graph's context; the frame launches its operation on the quantum's stream.
