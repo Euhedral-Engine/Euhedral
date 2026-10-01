@@ -171,9 +171,12 @@ class StageGraphTest {
         run(stage(graph, 1));
         run(take(this.source).getFirst());
         run(take(this.source).getFirst());
+        // The side branch takes a random lane, which may be the home lane too; the chain never leaves it.
         assertEquals(
                 List.of("k0", "k1", "k3", "k4"),
-                home.kernels.stream().filter(name -> name.startsWith("k")).toList(),
+                home.kernels.stream()
+                        .filter(name -> name.startsWith("k") && !name.equals("k2"))
+                        .toList(),
                 "the side branch running first does not take the chain's lane");
         home.retireNext(false);
         drain(this.source);
