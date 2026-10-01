@@ -228,6 +228,58 @@ class QwenRegionsTest(unittest.TestCase):
                         self.assertEqual(gpu.download(reference_norm, count * 2), gpu.download(actual_norm, count * 2),
                                          f'normalization differs for {(rows, width, special)}')
 
+    def test_relaxed_row_residual_norm_matches_the_exact_kernel_within_one_ulp(self):
+        source = b'#include "qwen_elementwise.cu"\n'
+        with contextlib.ExitStack() as scope:
+            gpu = Gpu(source)
+            scope.callback(gpu.close)
+            rng = random.Random(4127)
+            def ordered(bits):
+                return bits - 0x10000 if bits & 0x8000 else bits
+            def is_nan(bits):
+                return (bits & 0x7f80) == 0x7f80 and (bits & 0x7f) != 0
+            for width in [8, 1024, 5120, 8192]:
+                for special in [False, True]:
+                    for in_place in [False, True]:
+                        with contextlib.ExitStack() as case:
+                            def upload(data):
+                                ptr = gpu.upload(data)
+                                case.callback(gpu.free, ptr)
+                                return ptr
+                            def alloc(size):
+                                ptr = gpu.zeros(size, 0xA5)
+                                case.callback(gpu.free, ptr)
+                                return ptr
+                            patterns = [0, 0x8000, 1, 0x8001, 0x7f80, 0xff80, 0x7fc1, 0xffc7, 0x7f81]
+                            def values(n):
+                                return struct.pack('<' + 'H' * n, *[
+                                    patterns[i % len(patterns)] if special and i % 131 < 9 else
+                                    struct.unpack('<I', struct.pack('<f', rng.uniform(-8, 8)))[0] >> 16
+                                    for i in range(n)])
+                            residual_data = values(width)
+                            exact_residual, delta, weights = upload(residual_data), upload(values(width)), upload(values(width))
+                            exact_sum, exact_norm, row_norm = alloc(width * 2), alloc(width * 2), alloc(width * 2)
+                            row_residual = upload(residual_data)
+                            row_sum = row_residual if in_place else alloc(width * 2)
+                            gpu.launch('euhedral_residual_rms_norm_bf16', 1,
+                                       [C.c_uint64(p) for p in (exact_residual, delta, weights, exact_sum, exact_norm)] +
+                                       [C.c_uint(1), C.c_uint(width), C.c_float(1e-6)])
+                            gpu.launch('euhedral_residual_rms_norm_row_bf16', 1,
+                                       [C.c_uint64(p) for p in (row_residual, delta, weights, row_sum, row_norm)] +
+                                       [C.c_uint(1), C.c_uint(width), C.c_float(1e-6)],
+                                       block=(width // 8 + 31) // 32 * 32)
+                            case_name = (width, special, in_place)
+                            self.assertEqual(gpu.download(exact_sum, width * 2), gpu.download(row_sum, width * 2),
+                                             f'residual differs for {case_name}')
+                            expected = struct.unpack(f'<{width}H', gpu.download(exact_norm, width * 2))
+                            actual = struct.unpack(f'<{width}H', gpu.download(row_norm, width * 2))
+                            for index, (e, a) in enumerate(zip(expected, actual)):
+                                if is_nan(e) or is_nan(a):
+                                    self.assertTrue(is_nan(e) and is_nan(a), f'NaN mismatch at {index} for {case_name}')
+                                else:
+                                    self.assertLessEqual(abs(ordered(e) - ordered(a)), 1,
+                                                         f'more than one BF16 ulp at {index} for {case_name}')
+
 
 if __name__ == '__main__':
     unittest.main()
