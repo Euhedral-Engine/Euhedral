@@ -137,7 +137,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                                 decodeCallbackAllocated.stream().distinct().count(),
                                 "device allocations changed between steady decode tokens: " + decodeCallbackAllocated);
                         assertEquals(0, runtime.activeQuanta());
-                        assertTrue(lattice.isDrained());
+                        assertTrue(awaitDrained(lattice), "the lattice kept work after the generation retired");
 
                         GdnSequenceStates recurrent = (GdnSequenceStates) recurrentState.get();
                         AttentionSequenceStates attention = (AttentionSequenceStates) kvState.get();
@@ -182,6 +182,17 @@ class QwenGenerationSessionCudaIntegrationTest {
                 lattice.close();
             }
         }
+    }
+
+    /// The retirement frame publishes its quantum's outcome from inside its own execution, so its worker
+    /// may still be finishing that frame when `generate` returns.
+    private static boolean awaitDrained(ControlPlaneLattice lattice) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!lattice.isDrained()) {
+            if (System.nanoTime() > deadline) return false;
+            Thread.sleep(1);
+        }
+        return true;
     }
 
     private static ControlPlaneLattice createLattice(BitSet cpus) {

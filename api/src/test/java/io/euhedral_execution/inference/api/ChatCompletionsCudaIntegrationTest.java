@@ -109,7 +109,7 @@ class ChatCompletionsCudaIntegrationTest {
     @Test
     @Order(2)
     void chatCompletionReturnsARealAssistantAnswer() throws Exception {
-        long before = allocatedDeviceBytes();
+        DeviceBytes before = deviceBytes();
         var response = post("{\"model\":\"" + MODEL + "\",\"temperature\":0,\"max_tokens\":24,\"messages\":["
                 + "{\"role\":\"system\",\"content\":\"Answer with a single word.\"},"
                 + "{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}");
@@ -138,7 +138,7 @@ class ChatCompletionsCudaIntegrationTest {
     @Test
     @Order(3)
     void streamingEmitsIncrementalChunksAndCleansUp() throws Exception {
-        long before = allocatedDeviceBytes();
+        DeviceBytes before = deviceBytes();
         var request = HttpRequest.newBuilder(uri("/v1/chat/completions"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"" + MODEL + "\",\"stream\":true,"
@@ -198,7 +198,7 @@ class ChatCompletionsCudaIntegrationTest {
     @Test
     @Order(4)
     void clientAbortCancelsGenerationAndClosesTheSession() throws Exception {
-        long before = allocatedDeviceBytes();
+        DeviceBytes before = deviceBytes();
         int maxTokens = 2000;
         String body = "{\"model\":\"" + MODEL + "\",\"stream\":true,\"max_tokens\":" + maxTokens
                 + ",\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse.\"}]}";
@@ -231,13 +231,22 @@ class ChatCompletionsCudaIntegrationTest {
         assertSessionsReleased(before);
     }
 
-    private void assertSessionsReleased(long allocatedBefore) {
+    /// The engine's device bytes and the part its execution graphs retain between quanta.
+    private record DeviceBytes(long allocated, long retainedWorkspace) {}
+
+    private void assertSessionsReleased(DeviceBytes before) {
         assertEquals(this.tracking.opened.get(), this.tracking.closedCount.get(), "every session must be closed");
-        assertEquals(allocatedBefore, allocatedDeviceBytes(), "sequence device memory was not released");
+        // Graphs keep their workspace storage; it grows only the first time a graph runs a larger quantum.
+        DeviceBytes after = deviceBytes();
+        assertTrue(after.retainedWorkspace() >= before.retainedWorkspace());
+        assertEquals(
+                before.allocated() + after.retainedWorkspace() - before.retainedWorkspace(),
+                after.allocated(),
+                "sequence device memory was not released");
     }
 
-    private long allocatedDeviceBytes() {
-        return this.engine.allocatedDeviceBytes();
+    private DeviceBytes deviceBytes() {
+        return new DeviceBytes(this.engine.allocatedDeviceBytes(), this.engine.retainedWorkspaceBytes());
     }
 
     private HttpResponse<String> get(String path) throws Exception {
