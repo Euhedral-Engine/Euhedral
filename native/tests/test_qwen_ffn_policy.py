@@ -13,6 +13,7 @@ unsigned gate(unsigned m,unsigned k,unsigned n){return euhedral_ffn_gate_tile_ro
 int down(unsigned m,unsigned k,unsigned n){return euhedral_ffn_down_wide(m,k,n);}
 unsigned down_tile(unsigned m,unsigned k,unsigned n){return euhedral_ffn_down_tile_rows(m,k,n);}
 int streamed(unsigned m){return euhedral_ffn_streamed_rows(m);}
+unsigned splits(unsigned m,unsigned k,unsigned n){return euhedral_ffn_down_splits(m,k,n);}
 '''
 
 class FfnPolicyTest(unittest.TestCase):
@@ -26,7 +27,7 @@ class FfnPolicyTest(unittest.TestCase):
                         '-I', str(HEADER), '-x', 'c', '-', '-o', str(library)],
                        input=SOURCE, text=True, capture_output=True, check=True)
         cls.lib = ctypes.CDLL(str(library))
-        for name in ('gate', 'down', 'down_tile'):
+        for name in ('gate', 'down', 'down_tile', 'splits'):
             getattr(cls.lib, name).argtypes = (ctypes.c_uint,) * 3
             getattr(cls.lib, name).restype = ctypes.c_uint
         cls.lib.streamed.argtypes = (ctypes.c_uint,)
@@ -60,6 +61,13 @@ class FfnPolicyTest(unittest.TestCase):
                     self.assertEqual(0,self.lib.gate(rows,width,outputs))
                 for width, outputs in ((17409,5120),(17408,5184),(6144,5120)):
                     self.assertEqual(0,self.lib.down(rows,width,outputs))
+    def test_split_k_down_uses_three_splits_on_the_balanced_leaf_below_512_rows(self):
+        for rows in (1, 63, 64, 65, 256, 511, 512, 513, 1024):
+            expected = 0 if rows < 64 or rows > 512 else 3 if 64 < rows < 512 else 4
+            with self.subTest(rows=rows):
+                self.assertEqual(expected, self.lib.splits(rows, 17408, 5120))
+                self.assertEqual(0, self.lib.splits(rows, 17408, 5184))
+
 
 if __name__ == '__main__':
     unittest.main()

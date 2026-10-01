@@ -9,29 +9,33 @@
 namespace balanced {
 using namespace k32_probe;
 struct alignas(32) Storage { __nv_bfloat16 a[2][128 * 32]; __nv_bfloat16 b[2][64 * 32]; };
+// K range [start, start + count) of rows of stride `width`; with `partial`, FP32 sums are written there
+// (split-K) instead of rounded BF16 outputs to y.
 template<class B>
 static __device__ __forceinline__ void run(const unsigned short* x, const unsigned char* w, unsigned short* y,
-        unsigned int rows, unsigned int width, unsigned int outputs, unsigned long long scale, Storage& s) {
+        unsigned int rows, unsigned int width, unsigned int outputs, unsigned long long scale, Storage& s,
+        unsigned int start = 0u, unsigned int count = 0xffffffffu, float* partial = nullptr) {
+    if (count == 0xffffffffu) count = width;
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, mb = warp >> 1, nb = warp & 1u;
     const unsigned int tiles = (outputs + 63u) / 64u, row0 = (blockIdx.x / tiles) * 128u, col0 = (blockIdx.x % tiles) * 64u;
     const typename B::Layout layout = B::layout(w, width, outputs, scale);
     float acc[4][4][4] = {};
     uint4 av[4];
     typename B::Compact bv;
-    const unsigned int generations = width / 32u;
+    const unsigned int generations = count / 32u;
     auto load = [&](unsigned int gen) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const unsigned int r = warp * 32u + (lane >> 2) + 8u * i, row = row0 + r;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (row < rows) v = *reinterpret_cast<const uint4*>(x + (unsigned long long)row * width + gen * 32u + (lane & 3u) * 8u);
+            if (row < rows) v = *reinterpret_cast<const uint4*>(x + (unsigned long long)row * width + start + gen * 32u + (lane & 3u) * 8u);
             unsigned int f[4] = {v.x, v.y, v.z, v.w};
             #pragma unroll
             for (int j = 0; j < 4; ++j) { unsigned int lo = f[j] & 65535u, hi = f[j] >> 16;
                 lo = (lo & 32767u) > 32640u ? 32767u : lo; hi = (hi & 32767u) > 32640u ? 32767u : hi; f[j] = lo | (hi << 16); }
             av[i] = make_uint4(f[0], f[1], f[2], f[3]);
         }
-        B::prefetch(bv, layout, outputs, col0 + warp * 16u, gen * 32u, lane);
+        B::prefetch(bv, layout, outputs, col0 + warp * 16u, start + gen * 32u, lane);
     };
     auto store = [&](unsigned int slot) {
         #pragma unroll
@@ -69,7 +73,10 @@ static __device__ __forceinline__ void run(const unsigned short* x, const unsign
             for (int i = 0; i < 4; ++i) {
                 const unsigned int row = row0 + mb * 64u + m * 16u + lane / 4u + 8u * (i >> 1);
                 const unsigned int col = col0 + nb * 32u + h * 8u + 2u * (lane % 4u) + (i & 1u);
-                if (row < rows && col < outputs) q3::write_bf16(y, row, col, outputs, acc[m][h][i]);
+                if (row < rows && col < outputs) {
+                    if (partial) partial[(unsigned long long)row * outputs + col] = acc[m][h][i];
+                    else q3::write_bf16(y, row, col, outputs, acc[m][h][i]);
+                }
             }
 }
 }

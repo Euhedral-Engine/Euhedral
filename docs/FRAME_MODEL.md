@@ -446,6 +446,9 @@ the represented-NVFP4 tolerance for decode attention.
   5120 -> 7168 931 -> 716 us, the Q3 mixer 629 -> 606 us; the FFN down stayed level (1726 -> 1745 us)
   and keeps its engine, as do the exact twins. Prefill 256 +8.9%, 1024 +8.8%, time to first token for
   a 1024-token prompt -8.7% (6 of 6 forks each); decode unchanged.
+  The 128-row split-K FFN down moved to it too (same K ranges, bitwise equal partials), with three
+  splits below 512 rows: 256 rows 953 -> 727 us, 512 rows (four splits) 1753 -> 1455 us. Prefill 256
+  +5.5%, 1024 +3.1% (6 of 6 forks each).
 - **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
   128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
   the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it

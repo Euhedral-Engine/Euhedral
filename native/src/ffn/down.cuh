@@ -1,6 +1,7 @@
 #pragma once
 #include "tiles.cuh"
 #include "formats.cuh"
+#include "balanced.cuh"
 namespace qwen_ffn_down {
 using namespace k32_probe;
 // SPLIT: the CTA accumulates K range [start, start + count) of the full activation (row stride
@@ -102,8 +103,15 @@ extern "C" __global__ __launch_bounds__(128) void NAME( \
  if(start>=k)return; \
  qwen_ffn_down::run<F,32,true,1>(x,w,nullptr,m,k,n,scale,partial+(unsigned long long)blockIdx.y*m*n,start,min(per,k-start),s); }
 EUHEDRAL_Q3_FFN_DOWN_SPLIT(euhedral_q3_ffn_down_split_64x64, 2)
-EUHEDRAL_Q3_FFN_DOWN_SPLIT(euhedral_q3_ffn_down_split_128x64, 4)
 #undef EUHEDRAL_Q3_FFN_DOWN_SPLIT
+// The 128-row split leaf runs on the balanced engine (ffn/balanced.cuh): same K ranges and K16 order,
+// bitwise equal partials. 512 rows, four splits 1753 -> 1455 us; 256 rows, three splits 727 us.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_ffn_down_split_128x64(
+ const unsigned short* x,const unsigned char* w,float* partial,unsigned int m,unsigned int k,unsigned int n,unsigned long long scale,unsigned int splits) {
+ __shared__ balanced::Storage s;
+ unsigned int per=(k/32u+splits-1u)/splits*32u,start=blockIdx.y*per;
+ if(start>=k)return;
+ balanced::run<qwen_ffn_tiles::Q3B>(x,w,nullptr,m,k,n,scale,s,start,min(per,k-start),partial+(unsigned long long)blockIdx.y*m*n); }
 // Adds the split partials of each output in split order and rounds once to BF16.
 extern "C" __global__ __launch_bounds__(256) void euhedral_q3_ffn_down_reduce(
  const float* partial,unsigned short* y,unsigned int count,unsigned int splits) {
