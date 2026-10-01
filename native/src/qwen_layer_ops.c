@@ -43,6 +43,7 @@ static CUfunction linear_quantized;
 // token rows per CTA, and 32- and 64-row prefill tiles.
 static CUfunction q45_decode[2][3];
 static CUfunction q45_decode_wide[2];
+static CUfunction q45_decode_contiguous[2];
 static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
@@ -111,6 +112,8 @@ static void initialize_modules(void) {
         // Optional: without them single-row decode keeps the cooperative kernels.
         get_function(q45_module, &q45_decode_wide[0], "euhedral_q4_decode_wide");
         get_function(q45_module, &q45_decode_wide[1], "euhedral_q5_decode_wide");
+        get_function(q45_module, &q45_decode_contiguous[0], "euhedral_q4_decode_contiguous");
+        get_function(q45_module, &q45_decode_contiguous[1], "euhedral_q5_decode_contiguous");
         // Optional: without it the GDN projection pair falls back to two launches.
         get_function(q45_module, &q45_grouped64, "euhedral_q45_prefill_64_grouped");
         get_function(q45_module, &q45_grouped64_exact, "euhedral_q45_prefill_64_grouped_exact");
@@ -189,6 +192,7 @@ static void initialize(void) {
     for (int format = 0; format < 2; format++)
         for (int tile = 0; tile < 3; tile++) euhedral_cuda_pdl_register(q45_decode[format][tile]);
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_wide[format]);
+    for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_contiguous[format]);
     euhedral_cuda_pdl_register(gdn_control);
     euhedral_cuda_pdl_register(gdn_convolution);
     euhedral_cuda_pdl_register(gdn_recurrence);
@@ -329,7 +333,11 @@ int euhedral_cuda_linear_quantized_bf16(
         // Rows per CTA: 1 and 2 exactly, otherwise 4 (the last CTA may be partial).
         const uint32_t row_tile = rows == 1 ? 1 : rows == 2 ? 2 : 4;
         function = q45_decode[format][row_tile == 1 ? 0 : row_tile == 2 ? 1 : 2];
-        if (q45_decode_wide[format] != NULL && ((uintptr_t)device_weights & 15u) == 0u
+        if (q45_decode_contiguous[format] != NULL && !euhedral_cuda_exact_numerics()
+                && (((uintptr_t)device_weights | (uintptr_t)device_input) & 15u) == 0u
+                && euhedral_q45_decode_contiguous_shape(rows, in_features, out_features))
+            function = q45_decode_contiguous[format];
+        else if (q45_decode_wide[format] != NULL && ((uintptr_t)device_weights & 15u) == 0u
                 && euhedral_q45_decode_wide_shape(rows, in_features, out_features))
             function = q45_decode_wide[format];
         grid64 = (((uint64_t)rows + row_tile - 1u) / row_tile) * decode_tiles;

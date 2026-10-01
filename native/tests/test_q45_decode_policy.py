@@ -12,6 +12,9 @@ SOURCE = '''#include "q45_decode_policy.h"
 int wide(unsigned rows, unsigned width, unsigned outputs) {
     return euhedral_q45_decode_wide_shape(rows, width, outputs);
 }
+int contiguous(unsigned rows, unsigned width, unsigned outputs) {
+    return euhedral_q45_decode_contiguous_shape(rows, width, outputs);
+}
 '''
 
 
@@ -28,6 +31,8 @@ class Q45DecodePolicyTest(unittest.TestCase):
         cls.lib = ctypes.CDLL(str(library))
         cls.lib.wide.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
         cls.lib.wide.restype = ctypes.c_int
+        cls.lib.contiguous.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
+        cls.lib.contiguous.restype = ctypes.c_int
 
     @classmethod
     def tearDownClass(cls):
@@ -42,6 +47,14 @@ class Q45DecodePolicyTest(unittest.TestCase):
         for rows, width, outputs in [(1, 5120, 4096), (2, 5120, 7168), (0, 5120, 7168), (1, 384, 7168),
                                      (1, 8704, 7168), (1, 0, 7168), (1, 5120, 7172), (1, 5120, 0)]:
             self.assertEqual(0, wide(rows, width, outputs), (rows, width, outputs))
+
+    def test_contiguous_decode_needs_one_row_whole_slices_and_eight_columns(self):
+        contiguous = self.lib.contiguous
+        for width, outputs in [(5120, 12288), (5120, 7168), (5120, 4096), (1024, 8)]:
+            self.assertEqual(1, contiguous(1, width, outputs), (width, outputs))
+        for rows, width, outputs in [(2, 5120, 4096), (0, 5120, 4096), (1, 512, 4096), (1, 1536, 4096),
+                                     (1, 5120, 4100), (1, 5120, 0)]:
+            self.assertEqual(0, contiguous(rows, width, outputs), (rows, width, outputs))
 
 
 if __name__ == '__main__':
