@@ -84,7 +84,7 @@ static CUfunction attention_qk_norm_rope_rows, attention_norm_cache_rows;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
-static CUfunction attention_prefill_nvfp4_exact, attention_decode_nvfp4_exact;
+static CUfunction attention_prefill_nvfp4_exact, attention_decode_nvfp4_exact, attention_prefill_fa2;
 static CUfunction attention_norm_cache;
 static CUfunction attention_value_cache;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
@@ -183,6 +183,8 @@ static void initialize_modules(void) {
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_prefill_nvfp4, "euhedral_attention_prefill32_nvfp4");
     if (status == CUDA_SUCCESS)
         get_function(attention_module, &attention_prefill_nvfp4_exact, "euhedral_attention_prefill32_nvfp4_exact");
+    if (status == CUDA_SUCCESS)
+        get_function(attention_module, &attention_prefill_fa2, "euhedral_attention_prefill_fa2_nvfp4");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_decode_nvfp4, "euhedral_attention_decode_nvfp4");
     if (status == CUDA_SUCCESS)
         get_function(attention_module, &attention_decode_nvfp4_exact, "euhedral_attention_decode_nvfp4_exact");
@@ -1066,7 +1068,18 @@ int euhedral_cuda_attention_causal_nvfp4(
         void* args[] = {&query_key, &gate, &keys, &values, &output, &rows, &query_heads,
                 &key_heads, &head_dim, &cache_length, &start};
         // Exact numerics keep the key-ordered softmax sum.
-        CUfunction prefill = attention_prefill_nvfp4_exact != NULL && euhedral_cuda_exact_numerics()
+        int exact = euhedral_cuda_exact_numerics();
+        // Relaxed numerics: the FlashAttention-2 leaf (16 query rows x one KV head's query-head group per
+        // CTA) wherever its grid carries enough work: 512 rows after 3584 keys 3733 -> 1481 us, 128 rows
+        // after 3968 keys 1252 -> 774 us; on small grids (64-256 rows, short context) the 32-row tile wins.
+        uint32_t group = query_heads / key_heads;
+        if (!exact && attention_prefill_fa2 != NULL && group >= 1u && group <= 8u
+                && (rows >= 512u || (rows >= 128u && (uint64_t)cache_length >= 2048u))) {
+            uint64_t fa2_grid = ((uint64_t)rows + 15u) / 16u * key_heads;
+            if (fa2_grid <= UINT32_MAX)
+                return launch_and_synchronize(attention_prefill_fa2, (uint32_t)fa2_grid, 32u * group, args);
+        }
+        CUfunction prefill = attention_prefill_nvfp4_exact != NULL && exact
                 ? attention_prefill_nvfp4_exact : attention_prefill_nvfp4;
         return launch_and_synchronize(prefill, (uint32_t)grid, 128, args);
     }

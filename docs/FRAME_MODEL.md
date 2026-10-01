@@ -459,6 +459,17 @@ the represented-NVFP4 tolerance for decode attention.
   From 65 rows the separate Q4/Q5 projections and the mixer use 64-row balanced tiles (128 rows: Q5
   5120 -> 7168 367 -> 258 us, Q4 292 -> 212 us, mixer 325 -> 238 us); at 64 rows the 64 x 32 and 32-row
   kernels fill more CTAs and stay. Prefill 128 +3.1%, 192 +5.2% (6 of 6 forks each).
+- **Prefill attention, FlashAttention-2 leaf.** The 32-row WMMA tile gives each query head its own
+  CTA, so the six query heads of a KV head each expand the same NVFP4 tiles, and it rescales its output
+  through shared memory every tile (about 15 TFLOPS). `euhedral_attention_prefill_fa2_nvfp4` gives a
+  CTA 16 query rows of one KV head's group, one warp per query head: each 32-key tile is expanded once
+  into padded FP16 rows the warps share, the rotated queries and the 16 x 256 output stay in registers
+  (253 registers, no spills), and the online softmax runs in registers with quad shuffles
+  (mma.sync m16n8k16 FP16, FP32 accumulation). 512 rows on an empty cache 340 -> 309 us, after 1536
+  keys 1690 -> 810 us, after 3584 keys 3733 -> 1481 us. With fewer CTAs it loses (64 rows 45 -> 114
+  us), so it serves quanta from 512 rows, or from 128 rows once the cache holds 2048 keys. Prefill 1024
+  +0.7%, 2048 +1.7% (6 of 6 forks each); the gain grows with the context. Drift with a 1024-token
+  prefix matches main (median hidden 6.2%, KL 2.9e-3).
 - **Decode attention, contiguous lanes.** The decode split kernel decoded each cached NVFP4 element
   with its own code-byte and scale-byte loads (lane l owned dimensions l + 32 d). In the relaxed
   `euhedral_attention_decode_nvfp4` lane l owns dimensions 8l .. 8l + 7: one 32-bit code word and one
