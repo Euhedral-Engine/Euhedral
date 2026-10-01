@@ -115,6 +115,15 @@ class RelaxedPrefillTest(unittest.TestCase):
                     outs.append([struct.unpack(f'<{rows * n}H', gpu.download(b, rows * n * 2)) for b, n in ((y4, q4_out), (y5, q5_out))])
                 for index in range(2):
                     self.assert_close(outs[0][index], outs[1][index], ('grouped', index))
+                # The balanced grouped kernels match the relaxed grouped kernel bit for bit.
+                for symbol, tile in (('euhedral_q45_grouped_64x64', 64), ('euhedral_q45_grouped_128x64', 128)):
+                    y4 = gpu.zeros(rows * q4_out * 2, fill=0xa5); stack.callback(gpu.free, y4)
+                    y5 = gpu.zeros(rows * q5_out * 2, fill=0xa5); stack.callback(gpu.free, y5)
+                    row_tiles = (rows + tile - 1) // tile
+                    balanced_grid = row_tiles * ((q4_out + 63) // 64) + row_tiles * ((q5_out + 63) // 64)
+                    gpu.launch(symbol, balanced_grid, [P(x), P(w4), P(y4), P(w5), P(y5), U(rows), U(width), U(q4_out), U(q5_out)])
+                    got = [struct.unpack(f'<{rows * n}H', gpu.download(b, rows * n * 2)) for b, n in ((y4, q4_out), (y5, q5_out))]
+                    self.assertEqual(outs[1], got, symbol)
         finally:
             gpu.close()
 

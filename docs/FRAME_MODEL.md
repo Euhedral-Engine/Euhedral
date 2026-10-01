@@ -452,6 +452,10 @@ the represented-NVFP4 tolerance for decode attention.
   The engine takes its tile height as a parameter (32F rows): the 64-row gate/up and split-K down
   leaves moved to it as well (gate/up 588 -> 504 us, down 292 -> 278 us at 64 rows): prefill 64
   +3.6%, time to first token for a 64-token prompt -3.9% (6 of 6 forks each).
+  The grouped GDN input projections (Q4 and Q5 in one launch, 33-192 rows) run on it as well, 64-row
+  tiles up to 64 rows and 128-row tiles above: 64 rows 383 -> 281 us, 128 rows 713 -> 439 us,
+  192 rows 987 -> 730 us, bitwise equal. Prefill 64 +3.6%, 128 +5.1%, time to first token for a 64-token
+  prompt -3.4% (6 of 6 forks each).
 - **GDN recurrence, column-owned lanes.** A warp owned eight value columns and reduced every column's
   128-key dot products across all 32 lanes: about 90 warp shuffles per token per warp, which bounded
   the prefill recurrence (583 us per 512-row quantum; loading each token's inputs a row ahead made it

@@ -48,6 +48,7 @@ static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
 static CUfunction q45_prefill_exact[2], q45_prefill64_exact[2], q45_grouped64_exact;
+static CUfunction q45_grouped_balanced[2]; /* 64-row and 128-row tiles */
 static CUfunction q45_prefill_wide[2];
 
 /* Exact numerics select the hi + lo twins of the Q4/Q5 prefill kernels. */
@@ -132,6 +133,8 @@ static void initialize_modules(void) {
         // Optional: without it the GDN projection pair falls back to two launches.
         get_function(q45_module, &q45_grouped64, "euhedral_q45_prefill_64_grouped");
         get_function(q45_module, &q45_grouped64_exact, "euhedral_q45_prefill_64_grouped_exact");
+        get_function(q45_module, &q45_grouped_balanced[0], "euhedral_q45_grouped_64x64");
+        get_function(q45_module, &q45_grouped_balanced[1], "euhedral_q45_grouped_128x64");
         get_function(q45_module, &q45_prefill_exact[0], "euhedral_q4_prefill_exact");
         get_function(q45_module, &q45_prefill_exact[1], "euhedral_q5_prefill_exact");
         get_function(q45_module, &q45_prefill64_exact[0], "euhedral_q4_prefill_64_exact");
@@ -424,6 +427,15 @@ int euhedral_cuda_gdn_projections_bf16(
                     &value_z_width};
             CUfunction grouped = q45_grouped64_exact != NULL && euhedral_cuda_exact_numerics()
                     ? q45_grouped64_exact : q45_grouped64;
+            // Relaxed numerics: the balanced engine, 64-row tiles up to 64 rows and 128-row tiles above.
+            int wide = rows > 64u;
+            if (!euhedral_cuda_exact_numerics() && q45_grouped_balanced[wide] != NULL
+                    && ((uintptr_t)input & 15u) == 0u && hidden % 32u == 0u) {
+                const uint64_t tiles = ((uint64_t)rows + (wide ? 127u : 63u)) / (wide ? 128u : 64u);
+                const uint64_t balanced_grid = tiles * (((uint64_t)qk_width + 63u) / 64u)
+                        + tiles * (((uint64_t)value_z_width + 63u) / 64u);
+                return launch_and_synchronize(q45_grouped_balanced[wide], (uint32_t)balanced_grid, 128, parameters);
+            }
             return launch_and_synchronize(grouped, (uint32_t)grid64, 128, parameters);
         }
     }
