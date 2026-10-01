@@ -1,4 +1,5 @@
 #include "strategies/decode.cuh"
+#include "strategies/decode_wide.cuh"
 #include "strategies/prefill.cuh"
 #include "attention_cache.cuh"
 #include "pdl.cuh"
@@ -29,6 +30,20 @@ EUHEDRAL_Q45_DECODE_KERNEL(5, 1)
 EUHEDRAL_Q45_DECODE_KERNEL(5, 2)
 EUHEDRAL_Q45_DECODE_KERNEL(5, 4)
 #undef EUHEDRAL_Q45_DECODE_KERNEL
+
+// Single-row decode with warp-local wide streaming (strategies/decode_wide.cuh). Bitwise identical
+// to euhedral_q*_decode_1. Optional symbols: host dispatch selects them for the shapes in
+// euhedral_q45_decode_wide_shape with a 16-byte aligned weight base.
+#define EUHEDRAL_Q45_DECODE_WIDE_KERNEL(B) \
+extern "C" __global__ __launch_bounds__(128) void euhedral_q##B##_decode_wide( \
+        const unsigned short* input, const unsigned char* weights, unsigned short* output, \
+        unsigned int rows, unsigned int in_features, unsigned int out_features) { \
+    __shared__ q45::DecodeWideShared<B> shared; \
+    q45::wide_decode<B>(input, weights, output, in_features, out_features, shared); \
+}
+EUHEDRAL_Q45_DECODE_WIDE_KERNEL(4)
+EUHEDRAL_Q45_DECODE_WIDE_KERNEL(5)
+#undef EUHEDRAL_Q45_DECODE_WIDE_KERNEL
 
 // Shared strides of 72 elements (144 bytes) spread the eight ldmatrix rows of
 // one phase across distinct banks; the earlier 64 and 80 element strides made

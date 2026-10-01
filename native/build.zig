@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
         "kernels.cu", "numeric.cuh", "layout.cuh", "attention_cache.cuh",
         "primitives/decode.cuh", "primitives/packed_load.cuh", "primitives/staging.cuh",
         "primitives/prefetch.cuh", "primitives/writeback.cuh",
-        "strategies/decode.cuh", "strategies/prefill.cuh",
+        "strategies/decode.cuh", "strategies/decode_wide.cuh", "strategies/prefill.cuh",
     };
     for (q45_sources) |source| {
         b.installFile(b.fmt("src/q45/{s}", .{source}), b.fmt("share/euhedral_cuda/q45/{s}", .{source}));

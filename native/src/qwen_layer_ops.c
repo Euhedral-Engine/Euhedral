@@ -1,6 +1,7 @@
 #include "cuda_kernel_loader.h"
 #include "euhedral_cuda.h"
 #include "qwen_ffn_policy.h"
+#include "q45_decode_policy.h"
 #include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdint.h>
@@ -39,6 +40,7 @@ static CUfunction linear_quantized;
 // Q4/Q5 kernels indexed by [bits == 5]: cooperative decode for 1, 2 and 4
 // token rows per CTA, and 32- and 64-row prefill tiles.
 static CUfunction q45_decode[2][3];
+static CUfunction q45_decode_wide[2];
 static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
@@ -96,6 +98,9 @@ static void initialize_modules(void) {
             if (status == CUDA_SUCCESS) status = get_function(q45_module, &q45_prefill[format], prefill_names[format]);
             if (status == CUDA_SUCCESS) status = get_function(q45_module, &q45_prefill64[format], prefill64_names[format]);
         }
+        // Optional: without them single-row decode keeps the cooperative kernels.
+        get_function(q45_module, &q45_decode_wide[0], "euhedral_q4_decode_wide");
+        get_function(q45_module, &q45_decode_wide[1], "euhedral_q5_decode_wide");
         // Optional: without it the GDN projection pair falls back to two launches.
         get_function(q45_module, &q45_grouped64, "euhedral_q45_prefill_64_grouped");
         if (status != CUDA_SUCCESS) q45_status = (int)status;
@@ -161,6 +166,7 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(linear_bf16_to_float);
     for (int format = 0; format < 2; format++)
         for (int tile = 0; tile < 3; tile++) euhedral_cuda_pdl_register(q45_decode[format][tile]);
+    for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_wide[format]);
     euhedral_cuda_pdl_register(gdn_control);
     euhedral_cuda_pdl_register(gdn_convolution);
     euhedral_cuda_pdl_register(gdn_recurrence);
@@ -291,6 +297,9 @@ int euhedral_cuda_linear_quantized_bf16(
         // Rows per CTA: 1 and 2 exactly, otherwise 4 (the last CTA may be partial).
         const uint32_t row_tile = rows == 1 ? 1 : rows == 2 ? 2 : 4;
         function = q45_decode[format][row_tile == 1 ? 0 : row_tile == 2 ? 1 : 2];
+        if (q45_decode_wide[format] != NULL && ((uintptr_t)device_weights & 15u) == 0u
+                && euhedral_q45_decode_wide_shape(rows, in_features, out_features))
+            function = q45_decode_wide[format];
         grid64 = (((uint64_t)rows + row_tile - 1u) / row_tile) * decode_tiles;
     } else if (route == ROUTE_PREFILL64) {
         function = q45_prefill64[format];
