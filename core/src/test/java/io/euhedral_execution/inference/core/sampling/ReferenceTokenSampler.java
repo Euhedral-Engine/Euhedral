@@ -1,25 +1,18 @@
 package io.euhedral_execution.inference.core.sampling;
 
-import java.util.Arrays;
 import java.util.Objects;
 import java.util.SplittableRandom;
 
-/// Selects one token from a single vocabulary-logit row using a generation-local random stream.
+/// Test oracle: TokenSampler as it was before its selection loops were optimized, kept verbatim.
 /// Create one sampler per generation; instances are not thread-safe and must not be shared concurrently.
 /// Sampling excludes NaN and negative infinity; positive infinities share probability mass equally.
-///
-/// Selection runs once per generated token on the host-serial token boundary, so each row is scanned
-/// once, and stochastic sampling reuses this generation's scratch rows instead of allocating them.
-public final class TokenSampler {
+final class ReferenceTokenSampler {
 
     private final GenerationConfig config;
     private final int vocabularySize;
     private final SplittableRandom random;
-    private double[] scaledScores;
-    private int[] candidateIds;
-    private double[] probabilities;
 
-    public TokenSampler(GenerationConfig config, int vocabularySize) {
+    ReferenceTokenSampler(GenerationConfig config, int vocabularySize) {
         this.config = Objects.requireNonNull(config, "config");
         if (vocabularySize <= 0) throw new IllegalArgumentException("vocabularySize must be positive");
         this.vocabularySize = vocabularySize;
@@ -38,27 +31,29 @@ public final class TokenSampler {
         }
         if (this.config.greedy() || this.config.temperature() <= 0.0f) return argmax(logits);
 
-        // Scale scores before applying the filters; top-k ties prefer the lower token ID. Only the
-        // candidates' entries of the reused score row are written and read.
-        if (this.scaledScores == null) {
-            this.scaledScores = new double[this.vocabularySize];
-            this.candidateIds = new int[this.vocabularySize];
-            this.probabilities = new double[this.vocabularySize];
+        // Scale scores before applying the filters; top-k ties prefer the lower token ID.
+        double[] scaledScores = new double[this.vocabularySize];
+        int[] candidateIds = new int[this.vocabularySize];
+        int candidateCount = 0;
+        for (int tokenId = 0; tokenId < logits.length; tokenId++) {
+            float logit = logits[tokenId];
+            if (Float.isNaN(logit) || logit == Float.NEGATIVE_INFINITY) continue;
+            scaledScores[tokenId] = (double) logit / this.config.temperature();
+            candidateIds[candidateCount++] = tokenId;
         }
-        double[] scaledScores = this.scaledScores;
-        int[] candidateIds = this.candidateIds;
-        int topK = this.config.topK();
-        int candidateCount = topK > 0 && topK < this.vocabularySize
-                ? scaleTopK(logits, topK, scaledScores, candidateIds)
-                : scaleAll(logits, scaledScores, candidateIds);
         if (candidateCount == 0) throw new IllegalArgumentException("logit row has no selectable token");
+
+        int topK = this.config.topK();
+        if (topK > 0 && topK < candidateCount) {
+            candidateIds = retainTopK(candidateIds, candidateCount, topK, scaledScores);
+            candidateCount = topK;
+        }
 
         // Top-p uses the normalized top-k distribution, and draw renormalizes the retained prefix.
         boolean applyTopP = this.config.topP() < 1.0f;
         if (applyTopP) sortByPriority(candidateIds, candidateCount, scaledScores);
 
-        double[] probabilities =
-                normalizedProbabilities(candidateIds, candidateCount, scaledScores, this.probabilities);
+        double[] probabilities = normalizedProbabilities(candidateIds, candidateCount, scaledScores);
         int retainedCount = candidateCount;
         if (applyTopP) {
             double cumulativeProbability = 0.0;
@@ -74,84 +69,36 @@ public final class TokenSampler {
         return draw(candidateIds, probabilities, retainedCount);
     }
 
-    /// One comparison per logit. NaN never compares greater, negative infinity never beats the initial
-    /// negative infinity, and a strict comparison keeps the lowest token ID among equal maxima.
     private static int argmax(float[] logits) {
         int bestTokenId = -1;
         float bestLogit = Float.NEGATIVE_INFINITY;
         for (int tokenId = 0; tokenId < logits.length; tokenId++) {
-            if (logits[tokenId] > bestLogit) {
-                bestLogit = logits[tokenId];
+            float logit = logits[tokenId];
+            if (Float.isNaN(logit) || logit == Float.NEGATIVE_INFINITY) continue;
+            if (bestTokenId < 0 || logit > bestLogit) {
                 bestTokenId = tokenId;
+                bestLogit = logit;
             }
         }
         if (bestTokenId < 0) throw new IllegalArgumentException("logit row has no selectable token");
         return bestTokenId;
     }
 
-    /// Scales every selectable logit and lists the candidates in token-ID order.
-    private int scaleAll(float[] logits, double[] scaledScores, int[] candidateIds) {
-        int candidateCount = 0;
-        for (int tokenId = 0; tokenId < logits.length; tokenId++) {
-            float logit = logits[tokenId];
-            if (Float.isNaN(logit) || logit == Float.NEGATIVE_INFINITY) continue;
-            scaledScores[tokenId] = (double) logit / this.config.temperature();
-            candidateIds[candidateCount++] = tokenId;
-        }
-        return candidateCount;
-    }
-
-    /// Retains the `topK` best candidates in one pass, leaving them in `candidateIds` exactly as a
-    /// worst-first heap built over every candidate in token-ID order would. With no more selectable
-    /// tokens than `topK`, every candidate is retained in token-ID order instead.
-    ///
-    /// A later candidate replaces the heap's worst entry only when it scores strictly higher: equal
-    /// scores keep the lower token ID, which is already in the heap. Dividing a non-NaN float by a
-    /// positive, finite float temperature preserves both its order and its ties in double precision
-    /// across the whole float range, so that test is made on the raw logit and only retained candidates
-    /// are scaled.
-    private int scaleTopK(float[] logits, int topK, double[] scaledScores, int[] heap) {
-        double temperature = this.config.temperature();
+    private static int[] retainTopK(int[] candidateIds, int candidateCount, int topK, double[] scores) {
+        int[] heap = new int[topK];
         int heapSize = 0;
-        int tokenId = 0;
-        for (; tokenId < logits.length && heapSize < topK; tokenId++) {
-            float logit = logits[tokenId];
-            if (Float.isNaN(logit) || logit == Float.NEGATIVE_INFINITY) continue;
-            scaledScores[tokenId] = (double) logit / temperature;
-            heap[heapSize] = tokenId;
-            siftUpWorstFirst(heap, heapSize, scaledScores);
-            heapSize++;
-        }
-        // Only when another candidate follows the first topK does the heap order apply.
-        boolean exceeded = false;
-        for (; tokenId < logits.length && !exceeded; tokenId++) {
-            float logit = logits[tokenId];
-            if (Float.isNaN(logit) || logit == Float.NEGATIVE_INFINITY) continue;
-            exceeded = true;
-            replaceWorst(logits, tokenId, temperature, scaledScores, heap, heapSize);
-        }
-        if (!exceeded) {
-            Arrays.sort(heap, 0, heapSize);
-            return heapSize;
-        }
-        // NaN and negative infinity never compare greater than a retained logit.
-        float worstLogit = logits[heap[0]];
-        for (; tokenId < logits.length; tokenId++) {
-            if (logits[tokenId] > worstLogit) {
-                replaceWorst(logits, tokenId, temperature, scaledScores, heap, heapSize);
-                worstLogit = logits[heap[0]];
+        for (int i = 0; i < candidateCount; i++) {
+            int tokenId = candidateIds[i];
+            if (heapSize < topK) {
+                heap[heapSize] = tokenId;
+                siftUpWorstFirst(heap, heapSize, scores);
+                heapSize++;
+            } else if (comparePriority(tokenId, heap[0], scores) < 0) {
+                heap[0] = tokenId;
+                siftDownWorstFirst(heap, heapSize, 0, scores);
             }
         }
-        return topK;
-    }
-
-    /// Replaces the heap's worst candidate with `tokenId` when that scores strictly higher.
-    private static void replaceWorst(
-            float[] logits, int tokenId, double temperature, double[] scaledScores, int[] heap, int heapSize) {
-        if (!(logits[tokenId] > logits[heap[0]])) return;
-        scaledScores[tokenId] = (double) logits[tokenId] / temperature;
-        heap[0] = tokenId;
-        siftDownWorstFirst(heap, heapSize, 0, scaledScores);
+        return heap;
     }
 
     private static void siftUpWorstFirst(int[] heap, int index, double[] scores) {
@@ -194,9 +141,8 @@ public final class TokenSampler {
         return Integer.compare(leftTokenId, rightTokenId);
     }
 
-    private static double[] normalizedProbabilities(
-            int[] tokenIds, int count, double[] scores, double[] probabilities) {
-        Arrays.fill(probabilities, 0, count, 0.0);
+    private static double[] normalizedProbabilities(int[] tokenIds, int count, double[] scores) {
+        double[] probabilities = new double[count];
         int positiveInfinityCount = 0;
         double maximumScore = Double.NEGATIVE_INFINITY;
         for (int i = 0; i < count; i++) {
