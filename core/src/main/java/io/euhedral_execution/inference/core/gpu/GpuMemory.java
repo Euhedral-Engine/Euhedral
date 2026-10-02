@@ -26,4 +26,10 @@ public interface GpuMemory {
     default void freeHostWeights(long address) {
         throw new UnsupportedOperationException("host-backed weights are not implemented by this GPU memory provider");
     }
+
+    /// The device address at which kernels read host weights at `hostAddress` (within an
+    /// [#allocateHostWeights] allocation) in place, over the bus.
+    default long hostWeightsDeviceAddress(long hostAddress) {
+        throw new UnsupportedOperationException("host-mapped weights are not implemented by this GPU memory provider");
+    }
 }

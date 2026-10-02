@@ -29,8 +29,9 @@ public final class GpuCapacity {
         return check(cudaLibrary, artifact, headroomMiB, residency, 0L, QwenModel.DEFAULT_STAGING_SLOTS);
     }
 
-    /// As [#check(Path, Path, long, WeightResidency)], with `hostWeightBytes` of projections held in host
-    /// memory: they count only as the staging ring that holds `stagingSlots` of the largest.
+    /// As [#check(Path, Path, long, WeightResidency)], with `hostWeightBytes` of weights held in host
+    /// memory: the host-mapped embedding takes no device memory, and staged projections count only as
+    /// the staging ring that holds `stagingSlots` of the largest.
     public static String check(
             Path cudaLibrary,
             Path artifact,
@@ -48,6 +49,7 @@ public final class GpuCapacity {
             long largest = 0;
             for (TensorDescriptor tensor : read.tensors()) {
                 if (!residency.uploads(tensor.name())) continue;
+                if (tensor.name().equals(HostWeightSelection.EMBEDDING) && host.contains(tensor.name())) continue;
                 if (host.contains(tensor.name())) largest = Math.max(largest, tensor.byteSize());
                 else weights += tensor.byteSize();
             }

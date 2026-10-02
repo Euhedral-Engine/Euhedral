@@ -68,9 +68,11 @@ final class QwenCompactWeightLoader {
             for (TensorDescriptor descriptor : descriptors.values()) {
                 if (!residency.uploads(descriptor.name())) continue;
                 if (hostBacked.contains(descriptor.name())) {
-                    handles.put(
-                            descriptor.name(),
-                            TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset));
+                    TensorHandle host = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
+                    // The embedding is a gather: kernels read its rows in place instead of staging it.
+                    if (descriptor.name().equals(HostWeightSelection.EMBEDDING))
+                        host = mapped(host, gpuMemory.hostWeightsDeviceAddress(host.hostAddress()));
+                    handles.put(descriptor.name(), host);
                     hostOffset += hostSlot(descriptor.byteSize());
                 } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
@@ -686,6 +688,19 @@ final class QwenCompactWeightLoader {
         }
     }
 
+    private static TensorHandle mapped(TensorHandle host, long deviceAddress) {
+        return new TensorHandle(
+                host.name(),
+                host.shape(),
+                host.dataType(),
+                host.format(),
+                host.layout(),
+                deviceAddress,
+                host.byteSize(),
+                host.hostAddress(),
+                true);
+    }
+
     /// Host-backed objects start on 4 KiB boundaries within the arena.
     private static long hostSlot(long byteSize) {
         return (byteSize + 4095) & ~4095L;
@@ -693,7 +708,7 @@ final class QwenCompactWeightLoader {
 
     private static void freeAll(Iterable<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
         for (TensorHandle handle : handles) {
-            if (handle.hostBacked()) continue;
+            if (handle.hostAddress() != 0) continue; // in the host arena
             try {
                 gpuMemory.free(handle.deviceAddress());
             } catch (Throwable cleanupFailure) {

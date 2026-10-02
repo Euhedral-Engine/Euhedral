@@ -1857,6 +1857,7 @@ public final class QwenExecutionPlan {
                 handle.layout(),
                 handle.deviceAddress(),
                 handle.byteSize(),
-                handle.hostAddress());
+                handle.hostAddress(),
+                handle.hostMapped());
     }
 }
