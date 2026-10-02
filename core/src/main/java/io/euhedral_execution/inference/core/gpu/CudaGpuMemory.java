@@ -1456,10 +1456,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         return available;
     }
 
+    /// Native-numerics NVFP4 decode ([ExecutionGpu#selectNvfp4NativeDecode]); EUHEDRAL_NVFP4_NATIVE_DECODE=1
+    /// selects it at construction.
+    private volatile boolean nvfp4NativeDecode = "1".equals(System.getenv("EUHEDRAL_NVFP4_NATIVE_DECODE"));
+
+    @Override
+    public void selectNvfp4NativeDecode(boolean enabled) {
+        if (enabled && !nvfp4NativeAvailable())
+            throw new UnsupportedOperationException("native NVFP4 kernels are unavailable");
+        this.nvfp4NativeDecode = enabled;
+    }
+
     @Override
     public void linearNvfp4Bf16(
             long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
-        if (rows >= NVFP4_NATIVE_MIN_ROWS && inFeatures % 128 == 0 && !ROW_EXACT.get()[0] && nvfp4NativeAvailable()) {
+        boolean route = this.nvfp4NativeDecode
+                || rows >= NVFP4_NATIVE_MIN_ROWS && !ROW_EXACT.get()[0];
+        if (route && inFeatures % 128 == 0 && nvfp4NativeAvailable()) {
             if (invokeNativeNvfp4(
                     "native NVFP4 linear",
                     this.linearNvfp4NativeBf16,
