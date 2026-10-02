@@ -31,4 +31,15 @@ class ChatPromptCorpusTest {
         assertEquals(large, ChatPromptCorpus.build(2000, ChatPromptCorpusTest::count), "deterministic");
         assertThrows(IllegalArgumentException.class, () -> ChatPromptCorpus.build(5, ChatPromptCorpusTest::count));
     }
+
+    @Test
+    void crlfCheckoutsBuildTheSamePrompts() {
+        String document = ChatPromptCorpus.document().replace("\r\n", "\n");
+        assertEquals(
+                ChatPromptCorpus.build(2000, ChatPromptCorpusTest::count, document),
+                ChatPromptCorpus.build(2000, ChatPromptCorpusTest::count, document.replace("\n", "\r\n")));
+        assertEquals(
+                ChatPromptCorpus.build(2000, ChatPromptCorpusTest::count, document),
+                ChatPromptCorpus.build(2000, ChatPromptCorpusTest::count));
+    }
 }
