@@ -511,6 +511,14 @@ DEVICE = "cpu"
 _TABLES: dict[str, Any] = {}
 
 
+def default_device() -> str:
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _torch():
     import torch  # imported lazily: the CPU path needs only NumPy
     return torch
@@ -1017,7 +1025,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ranking", type=Path, help="token frequency ranking for the draft-head shortlist")
     parser.add_argument("--draft-ids-from", type=Path, help="reuse the draft-head shortlist of this compact artifact")
     parser.add_argument("--profile", choices=PROFILES, default="compact-q3")
-    parser.add_argument("--device", default="cpu", help="cpu, or cuda to quantize on the GPU with PyTorch")
+    parser.add_argument("--device", default=default_device(),
+                        help="cuda (default when PyTorch has a CUDA device) or cpu")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
                         help="objects quantized in parallel worker processes (default: one per CPU)")
     parser.add_argument("--reference", type=Path)
