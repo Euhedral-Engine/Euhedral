@@ -213,6 +213,23 @@ int euhedral_cuda_select_exact_numerics(int exact) {
     return previous;
 }
 
+/* Row-exact execution for the calling thread (speculative verification): every operator whose kernel
+ * changes with the row count runs each row through its single-row path, so a multi-row quantum computes
+ * every row bit for bit as one-row decode would at that position. */
+#ifdef _WIN32
+static __declspec(thread) int row_exact_selected;
+#else
+static _Thread_local int row_exact_selected;
+#endif
+
+void euhedral_cuda_row_exact_select(int enabled) {
+    row_exact_selected = enabled != 0;
+}
+
+int euhedral_cuda_row_exact(void) {
+    return row_exact_selected;
+}
+
 /* Decode chains select PDL for the calling thread; every other launch stays ordinary. */
 void euhedral_cuda_pdl_select(int enabled) {
     pdl_selected = enabled != 0;

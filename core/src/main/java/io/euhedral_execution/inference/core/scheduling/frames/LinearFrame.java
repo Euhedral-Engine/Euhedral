@@ -41,6 +41,27 @@ public final class LinearFrame extends QwenStageFrame {
             if (logits) context.logitsProduced(output);
             return;
         }
+        if (context.kind() == QwenExecutionContext.ExecutionKind.VERIFY && rows > 1) {
+            // Row-exact verification: each row takes exactly the route and kernel one-row decode does.
+            int outputBytes = instruction.kind() == QwenExecutionPlan.Kind.BF16_LINEAR ? Float.BYTES : Short.BYTES;
+            for (int row = 0; row < rows; row++) {
+                launch(
+                        context,
+                        instruction,
+                        input + (long) row * instruction.inputWidth() * Short.BYTES,
+                        output + (long) row * instruction.outputWidth() * outputBytes,
+                        1);
+            }
+        } else launch(context, instruction, input, output, rows);
+        if (logits) context.logitsProduced(output);
+    }
+
+    private void launch(
+            QwenExecutionContext context,
+            QwenExecutionPlan.Instruction instruction,
+            long input,
+            long output,
+            int rows) {
         switch (instruction.kind()) {
             case Q3_FFN_DOWN -> {
                 if (instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.FFN_PARTIALS))
@@ -105,6 +126,5 @@ public final class LinearFrame extends QwenStageFrame {
                 throw new IllegalArgumentException(
                         "linear frame received non-linear instruction: " + instruction.kind());
         }
-        if (logits) context.logitsProduced(output);
     }
 }

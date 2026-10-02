@@ -66,7 +66,8 @@ class EuhedralInferenceRuntimeLatticeTest {
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             try {
                 long sequenceId = 5800;
-                for (var kind : QwenExecutionContext.ExecutionKind.values()) {
+                for (var kind : List.of(
+                        QwenExecutionContext.ExecutionKind.PREFILL, QwenExecutionContext.ExecutionKind.DECODE)) {
                     var sequence = new QwenSequenceState(++sequenceId);
                     var outcome = runtime.submit(new QwenExecutionContext(plan, sequence, kind, 0, new int[] {1}));
                     awaitHeld(gpu.stream, 1);

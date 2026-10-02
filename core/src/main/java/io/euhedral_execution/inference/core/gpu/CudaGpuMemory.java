@@ -63,6 +63,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle streamSelect;
     private final MethodHandle streamClear;
     private final MethodHandle pdlSelect;
+    private final MethodHandle rowExactSelect;
+    /// Mirrors the native thread-local row-exact selection; the native NVFP4 route is never row-exact.
+    private static final ThreadLocal<boolean[]> ROW_EXACT = ThreadLocal.withInitial(() -> new boolean[1]);
     private final MethodHandle eventCreate;
     private final MethodHandle eventRecord;
     private final MethodHandle streamWaitEvent;
@@ -257,6 +260,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     symbols,
                     "euhedral_cuda_stream_select",
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+            this.rowExactSelect = symbols.find("euhedral_cuda_row_exact_select")
+                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
+                    .orElse(null);
             this.pdlSelect = symbols.find("euhedral_cuda_pdl_select")
                     .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
                     .orElse(null);
@@ -1444,7 +1450,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void linearNvfp4Bf16(
             long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
-        if (rows >= NVFP4_NATIVE_MIN_ROWS && inFeatures % 128 == 0 && nvfp4NativeAvailable()) {
+        if (rows >= NVFP4_NATIVE_MIN_ROWS && inFeatures % 128 == 0 && !ROW_EXACT.get()[0] && nvfp4NativeAvailable()) {
             if (invokeNativeNvfp4(
                     "native NVFP4 linear",
                     this.linearNvfp4NativeBf16,
@@ -1463,7 +1469,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void nvfp4GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
-        if (rows >= NVFP4_NATIVE_REGION_MIN_ROWS && width % 128 == 0 && nvfp4NativeAvailable()) {
+        if (rows >= NVFP4_NATIVE_REGION_MIN_ROWS
+                && width % 128 == 0
+                && !ROW_EXACT.get()[0]
+                && nvfp4NativeAvailable()) {
             if (invokeNativeNvfp4(
                     "native NVFP4 gate/up SwiGLU region",
                     this.nvfp4NativeGateUpSwiGluBf16,
@@ -1838,6 +1847,20 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// Selects exact numerics process-wide: every relaxed-order kernel (contiguous Q3 decode, split-K
     /// FFN down) is replaced by its bitwise-exact counterpart for later launches. Returns the previous
     /// selection. For numerical comparisons against the oracle; `EUHEDRAL_EXACT=1` sets the default.
+    @Override
+    public void selectRowExact(boolean enabled) {
+        if (this.rowExactSelect == null) {
+            if (enabled) throw new UnsupportedOperationException("native package has no row-exact execution");
+            return;
+        }
+        try {
+            this.rowExactSelect.invokeExact(enabled ? 1 : 0);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("row-exact selection invocation failed", failure);
+        }
+        ROW_EXACT.get()[0] = enabled;
+    }
+
     public boolean selectExactNumerics(boolean exact) {
         ensureOpen();
         if (selectExactNumerics == null)

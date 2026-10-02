@@ -27,7 +27,10 @@ public final class QwenExecutionContext implements StageQuantum {
 
     public enum ExecutionKind {
         PREFILL,
-        DECODE
+        DECODE,
+        /// Speculative verification: decode's topology over several rows, each computed bit for bit as
+        /// one-row decode at its position (row-exact execution), with logits for every row.
+        VERIFY
     }
 
     public enum Status {
@@ -163,7 +166,9 @@ public final class QwenExecutionContext implements StageQuantum {
     /// stream selected. A host-sampling quantum queues the copy of its final row here, ahead of its
     /// retirement boundary.
     public void logitsProduced(long address) {
-        if (this.hostLogits != null) this.hostLogits.queueFinalRow(address, logitsRowCount());
+        if (this.hostLogits == null) return;
+        if (this.kind == ExecutionKind.VERIFY) this.hostLogits.queueRowSelections(address, logitsRowCount());
+        else this.hostLogits.queueFinalRow(address, logitsRowCount());
     }
 
     CompletableFuture<Outcome> completion() {
@@ -205,7 +210,8 @@ public final class QwenExecutionContext implements StageQuantum {
 
     @Override
     public boolean overlapLaunches() {
-        return this.kind == ExecutionKind.DECODE && this.startPosition < OVERLAP_MAX_START_POSITION;
+        return (this.kind == ExecutionKind.DECODE || this.kind == ExecutionKind.VERIFY)
+                && this.startPosition < OVERLAP_MAX_START_POSITION;
     }
 
     /// Returns the first operation failure, if one has been recorded.

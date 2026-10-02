@@ -554,8 +554,10 @@ int euhedral_cuda_gdn_recurrence_bf16(
     // From two rows (prefill); single-row decode keeps the exact kernel, which measured as fast in the
     // model (the one-row operator gain, 16.5 -> 14.8 us with four columns, did not survive). Eight
     // columns per warp: 512 rows 580 -> 327 us. EUHEDRAL_GDN_RECURRENCE=C4|C8|EXACT overrides.
+    // Row-exact selects the kernel one-row decode would. Both kernels run rows in order with the state in
+    // FP32 registers, so M rows in one launch equal M one-row launches bit for bit.
     if (!euhedral_cuda_exact_numerics() && aligned
-            && (mode != NULL ? strcmp(mode, "EXACT") != 0 : rows > 1)) {
+            && (mode != NULL ? strcmp(mode, "EXACT") != 0 : rows > 1 && !euhedral_cuda_row_exact())) {
         int four = mode != NULL && strcmp(mode, "C4") == 0;
         CUfunction relaxed = four ? gdn_recurrence_c4 : gdn_recurrence_c8;
         if (relaxed != NULL)
@@ -753,6 +755,15 @@ int euhedral_cuda_q3_ffn_down_split_bf16(
 int euhedral_cuda_residual_rms_norm_bf16(
         const void* residual, const void* delta, const void* weight,
         void* hidden, void* normalized, uint32_t rows, uint32_t width, float epsilon) {
+    if (rows > 1 && euhedral_cuda_row_exact() && residual && delta && hidden && normalized) {
+        const uint64_t stride = (uint64_t)width * 2u;
+        for (uint32_t row = 0; row < rows; ++row) {
+            int status = euhedral_cuda_residual_rms_norm_bf16((const char*)residual + row * stride, (const char*)delta + row * stride,
+                    weight, (char*)hidden + row * stride, (char*)normalized + row * stride, 1u, width, epsilon);
+            if (status != 0) return status;
+        }
+        return 0;
+    }
     if (!residual || !delta || !weight || !hidden || !normalized || rows == 0 || width == 0
             || !isfinite(epsilon) || epsilon < 0.0f) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     if (rows > INT32_MAX || (uint64_t)rows * width > UINT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
@@ -896,6 +907,16 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
         uint64_t start_position,
         float epsilon,
         double rope_theta) {
+    if (rows > 1 && euhedral_cuda_row_exact() && device_query_key != NULL && device_output != NULL) {
+        const uint64_t width = ((uint64_t)query_heads + key_value_heads) * head_dim * 2u;
+        for (uint32_t row = 0; row < rows; ++row) {
+            int status = euhedral_cuda_attention_qk_norm_rope_bf16((const char*)device_query_key + row * width, device_query_norm,
+                    device_key_norm, (char*)device_output + row * width, 1u, query_heads, key_value_heads, head_dim,
+                    rotary_dim, start_position + row, epsilon, rope_theta);
+            if (status != 0) return status;
+        }
+        return 0;
+    }
     if (device_query_key == NULL || device_query_norm == NULL || device_key_norm == NULL || device_output == NULL
             || rows == 0 || query_heads == 0 || key_value_heads == 0 || query_heads % key_value_heads != 0
             || head_dim != 256 || rotary_dim == 0 || rotary_dim > head_dim || (rotary_dim & 1) != 0
@@ -956,6 +977,16 @@ int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
         uint32_t cache_length, uint64_t start, void* scratch) {
+    if (rows > 1 && euhedral_cuda_row_exact() && query_key && gate && output) {
+        /* Row-exact: row j is one-row decode at position start + j over the keys up to it. */
+        const uint64_t width = ((uint64_t)query_heads + key_heads) * head_dim * 2u, out = (uint64_t)query_heads * head_dim * 2u;
+        for (uint32_t row = 0; row < rows; ++row) {
+            int status = euhedral_cuda_attention_causal_nvfp4((const char*)query_key + row * width, (const char*)gate + row * width,
+                    keys, values, (char*)output + row * out, 1u, query_heads, key_heads, head_dim, cache_length, start + row, scratch);
+            if (status != 0) return status;
+        }
+        return 0;
+    }
     if (!query_key || !gate || !keys || !values || !output || !rows || !query_heads || !key_heads
             || query_heads % key_heads != 0 || head_dim != 256 || !cache_length
             || start > cache_length || rows > cache_length - start || (rows == 1 && !scratch))

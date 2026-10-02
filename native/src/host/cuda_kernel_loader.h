@@ -28,6 +28,10 @@ int euhedral_cuda_load_native_kernel(
  * launch with it; EUHEDRAL_PDL=0 disables it everywhere. */
 void euhedral_cuda_pdl_register(CUfunction function);
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_pdl_select(int enabled);
+/* Row-exact execution for the calling thread: a multi-row call computes each row exactly as a one-row
+ * call at that row's position would (speculative verification against one-row decode). */
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_row_exact_select(int enabled);
+int euhedral_cuda_row_exact(void);
 /* Exact numerics: nonzero routes every kernel whose FP32 accumulation order was relaxed back to the
  * exact kernels that reproduce the scalar references bit for bit (the numerical oracle). Initialized
  * from EUHEDRAL_EXACT=1 (or the older EUHEDRAL_Q3_DECODE=EXACT); settable for comparisons. */

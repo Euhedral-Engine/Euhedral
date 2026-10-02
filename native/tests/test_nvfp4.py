@@ -91,6 +91,19 @@ class Nvfp4KernelTest(unittest.TestCase):
                 actual = self.run_kernel("euhedral_nvfp4_decode", n // 16, x, weights, n, [C.c_uint(k), C.c_uint(n)], 1)
                 self.assert_close(actual, expected, np.abs(expected).max())
 
+    def test_multi_row_decode_is_bitwise_one_row_decode(self):
+        k, n = 5120, 48
+        weights, _ = tensor(self.rng, n, k)
+        for rows in (2, 3, 4, 8):
+            with self.subTest(rows=rows):
+                x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                together = self.run_kernel(f"euhedral_nvfp4_decode_rows{rows}", n // 16, x, weights, n,
+                                           [C.c_uint(k), C.c_uint(n)], rows)
+                for row in range(rows):
+                    alone = self.run_kernel("euhedral_nvfp4_decode", n // 16, x[row:row + 1], weights, n,
+                                            [C.c_uint(k), C.c_uint(n)], 1)
+                    self.assertTrue(np.array_equal(together[row].view(np.uint32), alone[0].view(np.uint32)), f"row {row}")
+
     def test_tile_kernels_match_the_reference(self):
         for name, tile in (("euhedral_nvfp4_prefill_128x64", 128), ("euhedral_nvfp4_prefill_64x64", 64)):
             for rows, k, n in ((3, 1024, 64), (130, 2048, 96), (64, 5120, 128)):
