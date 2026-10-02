@@ -5,8 +5,10 @@ Profiles:
   compact-q3 (default): the mixed Q3/Q4/Q5/W8/Q6 inventory used by NInfer (1,118 objects).
   nvfp4: every text and MTP projection (and the LM and draft heads) in NVFP4; the token embedding
          stays Q3 (a gather, no matmul) and the vision tower is omitted (785 objects).
-  nvfp4-sd4: the nvfp4 inventory with each NVFP4 tensor's block scales drawn from a 16-entry table
-         (layout row-split-k128-sd4-v1, docs/NVFP4_COMPRESSED.md): 4.25 instead of 4.5 bits per weight.
+  nvfp4-sd4: the nvfp4 inventory with the base model's NVFP4 block scales drawn from a 16-entry table
+         per tensor (layout row-split-k128-sd4-v1, docs/NVFP4_COMPRESSED.md): 4.25 instead of 4.5 bits
+         per weight. The drafting stack (MTP layer, draft head) stays plain NVFP4: 33 MiB for about 1%
+         more accepted drafts.
 
 Quantization and fusion happen offline. The Java loader receives only final runtime
 objects and never reconstructs Hugging Face tensors or performs quantization.
@@ -944,6 +946,8 @@ def build_plans(store: SourceStore, selected: np.ndarray, profile: str = "compac
 
     def add_quant(plans: list[ObjectPlan], name: str, matrix: MatrixSource, format_name: str) -> None:
         mtp_profile = "nvfp4" if mtp_format == "nvfp4" and name.startswith("mtp/") and profile == "compact-q3" else profile
+        if profile == "nvfp4-sd4" and (name.startswith("mtp/") or name == "text/draft_head"):
+            mtp_profile = "nvfp4"
         add_quant_object(plans, name, matrix, format_name, mtp_profile)
 
     add_quant(plans, "text/token_embedding", source_matrix(store, "model.language_model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
