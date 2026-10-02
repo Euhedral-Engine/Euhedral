@@ -16,16 +16,27 @@ import sys
 import tempfile
 import unittest
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from test_q3_primitives import Gpu, NVRTC, SKIP_REASON
 
 ROOT = Path(__file__).resolve().parents[2]
 SENTINEL = 0xA5
-spec = importlib.util.spec_from_file_location("p2e2_converter", ROOT / "tools/convert_compact_edrl_to_p2e2.py")
-p2e2 = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = p2e2
-spec.loader.exec_module(p2e2)
+UNAVAILABLE = None
+if NVRTC is None:
+    UNAVAILABLE = f"CUDA probes unavailable: {SKIP_REASON}"
+elif np is None:
+    UNAVAILABLE = "NumPy unavailable"
+p2e2 = None
+if np is not None:
+    # The reference encoder (tools/convert_compact_edrl_to_p2e2.py) needs NumPy.
+    spec = importlib.util.spec_from_file_location("p2e2_converter", ROOT / "tools/convert_compact_edrl_to_p2e2.py")
+    p2e2 = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = p2e2
+    spec.loader.exec_module(p2e2)
 
 HOST_SOURCE = r'''#include <stdint.h>
 #include <cuda.h>
@@ -87,7 +98,7 @@ def adversarial(rng, rows, k):
     return codes
 
 
-@unittest.skipIf(NVRTC is None, f"CUDA probes unavailable: {SKIP_REASON}")
+@unittest.skipIf(UNAVAILABLE is not None, UNAVAILABLE or "")
 class P2e2KernelTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -184,7 +195,7 @@ class P2e2KernelTest(unittest.TestCase):
         self.assertEqual(expected[5 * row:7 * row], bytes([SENTINEL]) * 2 * row)
 
 
-@unittest.skipIf(NVRTC is None, f"CUDA probes unavailable: {SKIP_REASON}")
+@unittest.skipIf(UNAVAILABLE is not None, UNAVAILABLE or "")
 class P2e2HostTest(unittest.TestCase):
     """Host entry points: geometry checks, the route decision and the expansion destination."""
 
