@@ -1,6 +1,8 @@
 #include "cuda_kernel_loader.h"
 #include <cuda_runtime_api.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -117,4 +119,127 @@ int euhedral_cuda_nvfp4_gate_up_swiglu_bf16(const void* input, const void* weigh
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &width_arg, &outputs_arg};
     return finish(euhedral_launch_kernel(kernel, (unsigned int)grid, 1, 1, 128, 1, 1, 0,
             euhedral_cuda_submission_stream(), params, NULL));
+}
+
+/* Native Blackwell NVFP4 (native/src/nvfp4_native, docs/NVFP4_NATIVE.md): the BF16 activations are
+ * quantized to NVFP4 into caller scratch, then multiplied with block-scaled FP4 tensor-core MMA
+ * (OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X). The module is compiled for this device's sm_12xa target and
+ * exists only there; EUHEDRAL_NVFP4_NATIVE=0 selects the BF16-expansion kernels above instead. */
+#define NATIVE_SHARED_BYTES 67584u  /* nvfp4n::Pipeline<1 or 2>::kSharedBytes */
+#ifdef _WIN32
+static INIT_ONCE native_once = INIT_ONCE_STATIC_INIT;
+#else
+static pthread_once_t native_once = PTHREAD_ONCE_INIT;
+#endif
+static CUmodule native_module;
+static CUfunction native_quantize, native_linear, native_gate_up;
+static int native_status = EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
+/* Activation terms: 2 (the default) adds a quantized residual, about 1% error per linear, at the
+ * relaxed-numerics floor of the drift harness; 1 (EUHEDRAL_NVFP4_NATIVE=1) quantizes once, about 10%,
+ * doubling teacher-forced KL, for about 45% more prefill throughput. docs/NVFP4_NATIVE.md. */
+static unsigned int native_terms = 2u;
+
+static void initialize_native(void) {
+    const char* selected = getenv("EUHEDRAL_NVFP4_NATIVE");
+    if (selected != NULL && strcmp(selected, "0") == 0) return;
+    native_terms = selected != NULL && strcmp(selected, "1") == 0 ? 1u : 2u;
+    const int two = native_terms == 2u;
+    int status = euhedral_cuda_load_native_kernel((const void*)&native_once, "nvfp4_native/kernels.cu",
+            two ? "euhedral_nvfp4n_linear_x2_128x128" : "euhedral_nvfp4n_linear_128x128", &native_module, &native_linear);
+    if (status == EUHEDRAL_CUDA_SUCCESS
+            && (cuModuleGetFunction(&native_quantize, native_module,
+                        two ? "euhedral_nvfp4n_quantize_rows_x2" : "euhedral_nvfp4n_quantize_rows") != CUDA_SUCCESS
+                    || cuModuleGetFunction(&native_gate_up, native_module,
+                               two ? "euhedral_nvfp4n_gate_up_swiglu_x2_128x64" : "euhedral_nvfp4n_gate_up_swiglu_128x64")
+                            != CUDA_SUCCESS))
+        status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    if (status == EUHEDRAL_CUDA_SUCCESS
+            && (cuFuncSetAttribute(native_linear, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)NATIVE_SHARED_BYTES)
+                            != CUDA_SUCCESS
+                    || cuFuncSetAttribute(native_gate_up, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                               (int)NATIVE_SHARED_BYTES) != CUDA_SUCCESS))
+        status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    native_status = status;
+}
+
+#ifdef _WIN32
+static BOOL CALLBACK initialize_native_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
+    (void)state; (void)parameter; (void)context;
+    initialize_native();
+    return TRUE;
+}
+#endif
+
+static int ensure_native(void) {
+    // The capability check and module load need this thread's device context.
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+#ifdef _WIN32
+    if (!InitOnceExecuteOnce(&native_once, initialize_native_once, NULL, NULL)) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+#else
+    if (pthread_once(&native_once, initialize_native) != 0) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+#endif
+    return native_status;
+}
+
+int euhedral_cuda_nvfp4_native_available(void) {
+    return ensure_native() == EUHEDRAL_CUDA_SUCCESS;
+}
+
+/* Scratch for `rows` activation rows of `in_features` values in the selected number of terms: codes, a
+ * 256-aligned scale plane and one FP32 global per row (nvfp4n::ActivationLayout). */
+uint64_t euhedral_cuda_nvfp4_activation_bytes(uint32_t rows, uint32_t in_features) {
+    uint64_t k = ((uint64_t)in_features + 127u) / 128u * 128u, planes = (uint64_t)rows * native_terms;
+    uint64_t scales = align256(planes * k / 2u);
+    return align256(scales + planes * k / 16u) + 4ull * rows;
+}
+
+static int launch_native(CUfunction kernel, uint64_t column_tile, const void* input, const void* weights, void* output,
+        void* scratch, uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
+        uint64_t scratch_byte_size);
+
+int euhedral_cuda_linear_nvfp4_native_bf16(const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
+        uint64_t scratch_byte_size) {
+    int status = ensure_native();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    return launch_native(native_linear, out_features, input, weights, output, scratch, rows, in_features, out_features,
+            weights_byte_size, scratch_byte_size);
+}
+
+int euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16(const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size) {
+    int status = ensure_native();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (outputs % 2u != 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    return launch_native(native_gate_up, outputs, input, weights, output, scratch, rows, width, outputs, weight_bytes,
+            scratch_byte_size);
+}
+
+/* `columns` B-tile rows to cover: out_features for a linear (128 per tile) and all gate + up rows for
+ * the paired region (64 outputs, 128 weight rows, per tile). */
+static int launch_native(CUfunction kernel, uint64_t columns, const void* input, const void* weights, void* output,
+        void* scratch, uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
+        uint64_t scratch_byte_size) {
+    int status;
+    // Activations are quantized, so exact numerics keep the BF16-expansion kernels (the reference twin).
+    if (in_features % 128u != 0 || euhedral_cuda_exact_numerics()) return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
+    status = prepare(input, weights, output, rows, in_features, out_features, weights_byte_size);
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (scratch == NULL || scratch_byte_size < euhedral_cuda_nvfp4_activation_bytes(rows, in_features))
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    uint64_t grid = ((uint64_t)rows + 127u) / 128u * ((columns + 127u) / 128u);
+    if (grid > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    CUstream stream = euhedral_cuda_submission_stream();
+    CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
+    CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output, scratch_ptr = (CUdeviceptr)(uintptr_t)scratch;
+    unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
+    void* quantize_params[] = {&input_ptr, &scratch_ptr, &rows_arg, &in_arg};
+    CUresult result = euhedral_launch_kernel(native_quantize, rows, 1, 1, 128, 1, 1, 0, stream, quantize_params, NULL);
+    if (result != CUDA_SUCCESS) return finish(result);
+    void* linear_params[] = {&scratch_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg};
+    return finish(euhedral_launch_kernel(kernel, (unsigned int)grid, 1, 1, 256, 1, 1, NATIVE_SHARED_BYTES,
+            stream, linear_params, NULL));
 }

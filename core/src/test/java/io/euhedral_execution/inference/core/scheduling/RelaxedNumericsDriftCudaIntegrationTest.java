@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
+import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
@@ -60,7 +61,8 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         int[] tokens = forcedTokens(QwenTokenizer.load(tokenizerDirectory), prefixLength + steps);
         List<Metrics> metrics = new ArrayList<>();
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                QwenModel model = QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu);
+                QwenModel model =
+                        QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu, WeightResidency.EXECUTED);
                 var lattice = new PullingLattice()) {
             var plan = new QwenExecutionPlan(model.weights());
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
