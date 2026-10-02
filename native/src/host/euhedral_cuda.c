@@ -1,3 +1,8 @@
+#ifndef _WIN32
+// posix_memalign and madvise(MADV_HUGEPAGE) under -std=c11.
+#define _GNU_SOURCE
+#endif
+
 #include "euhedral_cuda.h"
 
 #include <cuda.h>
@@ -9,6 +14,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+#endif
 
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 13010
 #error "Euhedral CUDA ABI requires CUDA toolkit 13.1 or newer"
@@ -60,6 +72,48 @@ void* euhedral_cuda_host_malloc(uint64_t byte_size) {
 int euhedral_cuda_host_free(void* address) {
     if (address == NULL) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t status = cudaFreeHost(address);
+    return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
+/// Host memory that copy engines read for staged weights: 2 MiB-aligned, backed by transparent huge
+/// pages where the platform offers them, and pinned with cudaHostRegister. Translated DMA under an
+/// IOMMU runs at about 25 GB/s over 4 KiB pages and about 44 GB/s over 2 MiB pages.
+#define EUHEDRAL_HOST_WEIGHT_ALIGNMENT ((size_t)2 << 20)
+
+void* euhedral_cuda_host_weights_malloc(uint64_t byte_size) {
+    if (byte_size == 0 || byte_size > SIZE_MAX - EUHEDRAL_HOST_WEIGHT_ALIGNMENT) return NULL;
+    size_t size = ((size_t)byte_size + EUHEDRAL_HOST_WEIGHT_ALIGNMENT - 1) & ~(EUHEDRAL_HOST_WEIGHT_ALIGNMENT - 1);
+#ifdef _WIN32
+    void* address = _aligned_malloc(size, EUHEDRAL_HOST_WEIGHT_ALIGNMENT);
+    if (address == NULL) return NULL;
+#else
+    void* address = NULL;
+    if (posix_memalign(&address, EUHEDRAL_HOST_WEIGHT_ALIGNMENT, size) != 0) return NULL;
+    (void)madvise(address, size, MADV_HUGEPAGE);
+    // Fault the pages in after the advice, so they are huge pages before pinning. Under memory pressure
+    // a fault falls back to 4 KiB pages; MADV_COLLAPSE then reclaims and compacts synchronously.
+    memset(address, 0, size);
+    for (int attempt = 0; attempt < 3 && madvise(address, size, MADV_COLLAPSE) != 0; attempt++) {}
+#endif
+    if (cudaHostRegister(address, size, cudaHostRegisterDefault) != cudaSuccess) {
+#ifdef _WIN32
+        _aligned_free(address);
+#else
+        free(address);
+#endif
+        return NULL;
+    }
+    return address;
+}
+
+int euhedral_cuda_host_weights_free(void* address) {
+    if (address == NULL) return EUHEDRAL_CUDA_SUCCESS;
+    cudaError_t status = cudaHostUnregister(address);
+#ifdef _WIN32
+    _aligned_free(address);
+#else
+    free(address);
+#endif
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 

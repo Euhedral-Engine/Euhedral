@@ -37,7 +37,7 @@ final class QwenCompactWeightLoader {
     static QwenWeights load(
             Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, Map<String, TensorDescriptor> descriptors)
             throws IOException {
-        return load(artifactPath, artifact, gpuMemory, descriptors, WeightResidency.ALL);
+        return load(artifactPath, artifact, gpuMemory, descriptors, WeightResidency.ALL, Set.of());
     }
 
     static QwenWeights load(
@@ -45,21 +45,44 @@ final class QwenCompactWeightLoader {
             QwenArtifact artifact,
             GpuMemory gpuMemory,
             Map<String, TensorDescriptor> descriptors,
-            WeightResidency residency)
+            WeightResidency residency,
+            Set<String> hostBacked)
             throws IOException {
         QwenConfig config = artifact.config();
         validateConfig(config);
         validateInventory(config, descriptors);
 
         Map<String, TensorHandle> handles = new LinkedHashMap<>();
+        long hostArena = 0;
         try {
+            // Host-backed objects share one pinned arena, allocated before any payload is read: huge
+            // pages are far likelier to be available then than between reads.
+            long hostBytes = 0;
             for (TensorDescriptor descriptor : descriptors.values()) {
-                if (residency.uploads(descriptor.name()))
-                    handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
+                if (residency.uploads(descriptor.name()) && hostBacked.contains(descriptor.name()))
+                    hostBytes += hostSlot(descriptor.byteSize());
+            }
+            if (hostBytes > 0) hostArena = gpuMemory.allocateHostWeights(hostBytes);
+            long hostOffset = 0;
+            for (TensorDescriptor descriptor : descriptors.values()) {
+                if (!residency.uploads(descriptor.name())) continue;
+                if (hostBacked.contains(descriptor.name())) {
+                    handles.put(
+                            descriptor.name(),
+                            TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset));
+                    hostOffset += hostSlot(descriptor.byteSize());
+                } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
             return assemble(config, handles);
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);
+            if (hostArena != 0) {
+                try {
+                    gpuMemory.freeHostWeights(hostArena);
+                } catch (Throwable cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
             return propagate(failure);
         }
     }
@@ -520,8 +543,14 @@ final class QwenCompactWeightLoader {
         }
     }
 
+    /// Host-backed objects start on 4 KiB boundaries within the arena.
+    private static long hostSlot(long byteSize) {
+        return (byteSize + 4095) & ~4095L;
+    }
+
     private static void freeAll(Iterable<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
         for (TensorHandle handle : handles) {
+            if (handle.hostBacked()) continue;
             try {
                 gpuMemory.free(handle.deviceAddress());
             } catch (Throwable cleanupFailure) {

@@ -321,6 +321,12 @@ public abstract class ExecutionGpu implements GpuMemory {
         linearQ3Bf16(inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize);
     }
 
+    /// Queues a copy of `byteSize` bytes from pinned host weights at `source` to device memory on the
+    /// selected stream.
+    public void copyHostWeightsToDevice(long destination, long source, long byteSize) {
+        throw new UnsupportedOperationException("host-backed weights are not implemented by this GPU");
+    }
+
     /// NVFP4 linear (Nvfp4Layout): `outFeatures` weight rows of `inFeatures` values on BF16 rows.
     public void linearNvfp4Bf16(
             long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {

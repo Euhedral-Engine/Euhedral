@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
+import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
@@ -45,7 +46,10 @@ public final class QwenExecutionPlan {
         SWIGLU,
         ATTENTION_QK_NORM_ROPE,
         ATTENTION_KV_APPEND,
-        ATTENTION_CAUSAL
+        ATTENTION_CAUSAL,
+        /// Copies a host-backed weight into its staging slot. Its weight's `hostAddress` is the source
+        /// and its `deviceAddress` the slot.
+        WEIGHT_TRANSFER
     }
 
     public enum Buffer {
@@ -258,6 +262,7 @@ public final class QwenExecutionPlan {
     private final QwenExecutionPlan smallPrefill;
     private final QwenExecutionPlan decode;
     private final QwenExecutionPlan regionPrefill;
+    private final WeightStaging staging;
     private final QwenExecutionPlan streamedPrefill;
 
     /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
@@ -329,7 +334,13 @@ public final class QwenExecutionPlan {
     /// retained region architecture by row count and geometry; decode runs the small topology.
     /// Staged plans for partial weights (embedding-only, layer zero) remain reference-only.
     public QwenExecutionPlan(QwenWeights weights) {
-        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), null, false);
+        this(weights, (WeightStaging) null);
+    }
+
+    /// Builds the production plan for weights that may be host-backed: every executed view stages
+    /// them through `staging`, which must be present when any weight is host-backed.
+    public QwenExecutionPlan(QwenWeights weights, WeightStaging staging) {
+        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), null, false, staging);
     }
 
     /// Unfused reference topology for every execution kind. This is a correctness oracle for tests
@@ -342,6 +353,11 @@ public final class QwenExecutionPlan {
                 new PlanData(data.instructions(), data.projectionWidths(), data.bufferSpecs(), data.firstLayer()),
                 null,
                 false);
+    }
+
+    /// The staging ring of this plan family, or null when no weight is host-backed.
+    public WeightStaging staging() {
+        return this.staging;
     }
 
     /// Owning plan whose views belong to one family; runners admit any view of their owner.
@@ -410,7 +426,13 @@ public final class QwenExecutionPlan {
     }
 
     private QwenExecutionPlan(QwenWeights weights, PlanData data, QwenExecutionPlan owner, boolean reuseStorage) {
+        this(weights, data, owner, reuseStorage, null);
+    }
+
+    private QwenExecutionPlan(
+            QwenWeights weights, PlanData data, QwenExecutionPlan owner, boolean reuseStorage, WeightStaging staging) {
         this.owner = owner == null ? this : owner;
+        this.staging = owner == null ? staging : owner.staging;
         this.weights = weights;
         this.instructions = List.copyOf(data.instructions());
         this.projectionWidths = List.copyOf(data.projectionWidths());
@@ -464,7 +486,124 @@ public final class QwenExecutionPlan {
         boolean regions = view == PrefillView.REGIONS || view == PrefillView.STREAMED;
         boolean hasFusedFfn = selected.instructions().stream()
                 .anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU || i.kind() == Kind.FFN_STREAMED);
-        return new QwenExecutionPlan(weights, selected, owner, regions && hasFusedFfn);
+        return new QwenExecutionPlan(weights, staged(selected, owner.staging), owner, regions && hasFusedFfn);
+    }
+
+    /// Whether this view copies host-backed weights into the staging ring.
+    public boolean stagesWeights() {
+        return this.instructions.stream().anyMatch(i -> i.kind() == Kind.WEIGHT_TRANSFER);
+    }
+
+    /// Rewrites a view so that each use of a host-backed weight reads a staging slot. Use `u` takes slot
+    /// `u mod slots`; its transfer follows the use that last read the slot (use `u - slots`), or starts
+    /// the quantum, and precedes the consumer. Transfers are leaves apart from those two edges, so each
+    /// copy starts as soon as its slot is free.
+    static PlanData staged(PlanData data, WeightStaging staging) {
+        List<Instruction> source = data.instructions();
+        boolean hostBacked = source.stream().flatMap(i -> i.weights.stream()).anyMatch(TensorHandle::hostBacked);
+        if (!hostBacked) return data;
+        if (staging == null) throw new IllegalArgumentException("host-backed weights need a staging ring");
+        int slots = staging.slots();
+        for (Instruction instruction : source) {
+            long uses = instruction.weights.stream()
+                    .filter(TensorHandle::hostBacked)
+                    .count();
+            if (uses > slots) throw new IllegalArgumentException("an instruction stages more weights than slots");
+            for (TensorHandle weight : instruction.weights) {
+                if (weight.hostBacked() && weight.byteSize() > staging.slotBytes())
+                    throw new IllegalArgumentException("host-backed weight exceeds a staging slot: " + weight.name());
+            }
+        }
+        // Each use's weight, in order, and the transfers still to emit once a slot frees.
+        List<TensorHandle> useWeights = new ArrayList<>();
+        List<Integer> useLayers = new ArrayList<>();
+        for (Instruction instruction : source) {
+            for (TensorHandle weight : instruction.weights) {
+                if (weight.hostBacked()) {
+                    useWeights.add(weight);
+                    useLayers.add(instruction.layerIndex());
+                }
+            }
+        }
+        List<Instruction> result = new ArrayList<>();
+        int[] remapped = new int[source.size()];
+        int[] transferIds = new int[useWeights.size()];
+        java.util.function.IntConsumer emitTransfer = use -> {
+            TensorHandle weight = useWeights.get(use);
+            TensorHandle transfer = new TensorHandle(
+                    weight.name(),
+                    weight.shape(),
+                    weight.dataType(),
+                    weight.format(),
+                    weight.layout(),
+                    staging.slotAddress(use % slots),
+                    weight.byteSize(),
+                    weight.hostAddress());
+            List<Integer> dependencies = use < slots ? List.of() : List.of(consumerOf(use - slots, source, remapped));
+            transferIds[use] = result.size();
+            result.add(new Instruction(
+                    result.size(),
+                    Kind.WEIGHT_TRANSFER,
+                    dependencies,
+                    List.of(transfer),
+                    List.of(),
+                    List.of(),
+                    0,
+                    0,
+                    -1,
+                    useLayers.get(use)));
+        };
+        for (int use = 0; use < Math.min(slots, useWeights.size()); use++) emitTransfer.accept(use);
+        int use = 0;
+        for (Instruction instruction : source) {
+            List<Integer> dependencies = new ArrayList<>(remapDependencies(instruction.dependencies(), remapped));
+            List<TensorHandle> weights = new ArrayList<>();
+            int first = use;
+            for (TensorHandle weight : instruction.weights) {
+                if (!weight.hostBacked()) {
+                    weights.add(weight);
+                    continue;
+                }
+                dependencies.add(transferIds[use]);
+                weights.add(new TensorHandle(
+                        weight.name(),
+                        weight.shape(),
+                        weight.dataType(),
+                        weight.format(),
+                        weight.layout(),
+                        staging.slotAddress(use % slots),
+                        weight.byteSize()));
+                use++;
+            }
+            remapped[instruction.id()] = result.size();
+            result.add(new Instruction(
+                    result.size(),
+                    instruction.kind(),
+                    dependencies.stream().distinct().sorted().toList(),
+                    weights,
+                    instruction.inputBuffers(),
+                    instruction.outputBuffers(),
+                    instruction.inputWidth(),
+                    instruction.outputWidth(),
+                    instruction.outputBufferIndex(),
+                    instruction.layerIndex()));
+            for (int staged = first; staged < use; staged++) {
+                if (staged + slots < useWeights.size()) emitTransfer.accept(staged + slots);
+            }
+        }
+        return new PlanData(
+                List.copyOf(result), data.projectionWidths(), data.bufferSpecs(), data.firstLayer(), data.fullModel());
+    }
+
+    /// The remapped id of the instruction that reads use `use`; it is always already emitted.
+    private static int consumerOf(int use, List<Instruction> source, int[] remapped) {
+        int seen = 0;
+        for (Instruction instruction : source) {
+            for (TensorHandle weight : instruction.weights) {
+                if (weight.hostBacked() && seen++ == use) return remapped[instruction.id()];
+            }
+        }
+        throw new IllegalStateException("no consumer for staged use " + use);
     }
 
     /// Rewrites the reference layer DAG into the retained prefill regions:
@@ -1557,7 +1696,7 @@ public final class QwenExecutionPlan {
                 || shape[0] != rows
                 || shape[1] != width
                 || width % 64 != 0
-                || handle.deviceAddress() == 0
+                || (handle.deviceAddress() == 0 && !handle.hostBacked())
                 || handle.dataType() != TensorDataType.BF16
                 || !(handle.format() == format || handle.format() == WeightFormat.NVFP4)
                 || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
@@ -1577,6 +1716,7 @@ public final class QwenExecutionPlan {
                 handle.format(),
                 handle.layout(),
                 handle.deviceAddress(),
-                handle.byteSize());
+                handle.byteSize(),
+                handle.hostAddress());
     }
 }

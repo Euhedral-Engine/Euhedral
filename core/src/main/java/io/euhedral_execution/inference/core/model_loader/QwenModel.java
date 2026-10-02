@@ -7,16 +7,22 @@ import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.Objects;
+import java.util.Set;
 
 /// Owns the device allocations made by model loading, including non-compact artifacts.
 /// The GPU is borrowed and must outlive this model. Close only after all model executions stop.
 public final class QwenModel implements AutoCloseable {
+    /// Staging slots when a load does not choose: enough for copies to queue ahead of their consumers.
+    public static final int DEFAULT_STAGING_SLOTS = 4;
+
     private final Allocations allocations;
     private final QwenWeights weights;
+    private final WeightStaging staging;
 
-    private QwenModel(Allocations allocations, QwenWeights weights) {
+    private QwenModel(Allocations allocations, QwenWeights weights, WeightStaging staging) {
         this.allocations = allocations;
         this.weights = Objects.requireNonNull(weights);
+        this.staging = staging;
     }
 
     public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu) throws IOException {
@@ -25,7 +31,28 @@ public final class QwenModel implements AutoCloseable {
 
     public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu, WeightResidency residency)
             throws IOException {
-        return load(gpu, memory -> QwenWeightLoader.load(path, artifact, memory, residency));
+        return load(path, artifact, gpu, residency, Set.of(), DEFAULT_STAGING_SLOTS);
+    }
+
+    /// Loads the objects named in `hostBacked` into pinned host memory, and allocates a device staging
+    /// ring of `stagingSlots` slots, each holding the largest of them. The model owns both.
+    public static QwenModel load(
+            Path path,
+            QwenArtifact artifact,
+            GpuMemory gpu,
+            WeightResidency residency,
+            Set<String> hostBacked,
+            int stagingSlots)
+            throws IOException {
+        return load(
+                gpu,
+                memory -> QwenWeightLoader.load(path, artifact, memory, residency, hostBacked),
+                hostBacked.isEmpty() ? 0 : stagingSlots);
+    }
+
+    /// The device staging ring for host-backed weights, or null when every weight is resident.
+    public WeightStaging staging() {
+        return this.staging;
     }
 
     public static QwenModel loadFirstLayer(Path path, QwenArtifact artifact, GpuMemory gpu) throws IOException {
@@ -42,9 +69,23 @@ public final class QwenModel implements AutoCloseable {
     }
 
     static QwenModel load(GpuMemory memory, Loader loader) throws IOException {
+        return load(memory, loader, 0);
+    }
+
+    private static QwenModel load(GpuMemory memory, Loader loader, int stagingSlots) throws IOException {
         var allocations = new Allocations(Objects.requireNonNull(memory));
         try {
-            return new QwenModel(allocations, loader.load(allocations));
+            QwenWeights weights = loader.load(allocations);
+            long largest = 0;
+            for (var handle : weights.runtimeObjects().values())
+                if (handle.hostBacked()) largest = Math.max(largest, handle.byteSize());
+            WeightStaging staging = null;
+            if (largest > 0) {
+                long slotBytes = WeightStaging.slotBytesFor(largest);
+                staging = new WeightStaging(
+                        allocations.allocate(Math.multiplyExact(slotBytes, stagingSlots)), slotBytes, stagingSlots);
+            }
+            return new QwenModel(allocations, weights, staging);
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 allocations.close();
@@ -79,6 +120,7 @@ public final class QwenModel implements AutoCloseable {
     private static final class Allocations implements GpuMemory, AutoCloseable {
         private final GpuMemory gpu;
         private final LinkedHashSet<Long> live = new LinkedHashSet<>();
+        private final LinkedHashSet<Long> hostLive = new LinkedHashSet<>();
 
         private Allocations(GpuMemory gpu) {
             this.gpu = gpu;
@@ -93,6 +135,17 @@ public final class QwenModel implements AutoCloseable {
         public void free(long address) {
             this.gpu.free(address);
             this.live.remove(address);
+        }
+
+        public long allocateHostWeights(long bytes) {
+            long address = this.gpu.allocateHostWeights(bytes);
+            this.hostLive.add(address);
+            return address;
+        }
+
+        public void freeHostWeights(long address) {
+            this.gpu.freeHostWeights(address);
+            this.hostLive.remove(address);
         }
 
         public void copyHostToDevice(long address, MemorySegment source, long bytes) {
@@ -112,6 +165,14 @@ public final class QwenModel implements AutoCloseable {
             for (long address : this.live.reversed().stream().toList()) {
                 try {
                     free(address);
+                } catch (RuntimeException | Error cleanup) {
+                    if (failure == null) failure = cleanup;
+                    else if (failure != cleanup) failure.addSuppressed(cleanup);
+                }
+            }
+            for (long address : this.hostLive.reversed().stream().toList()) {
+                try {
+                    freeHostWeights(address);
                 } catch (RuntimeException | Error cleanup) {
                     if (failure == null) failure = cleanup;
                     else if (failure != cleanup) failure.addSuppressed(cleanup);

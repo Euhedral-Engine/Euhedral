@@ -36,6 +36,8 @@ public final class LanePool implements AutoCloseable {
     public static final int MAX_LANES = 64;
 
     private final GpuStream[] lanes;
+    /// Lanes that stages choose among; a transfer lane, when present, follows them.
+    private final int computeLanes;
     private final Placement placement;
     private final AtomicInteger nextWorker = new AtomicInteger();
     private final AtomicInteger nextHome = new AtomicInteger();
@@ -47,12 +49,26 @@ public final class LanePool implements AutoCloseable {
         this(lanes, placement, null);
     }
 
+    /// A pool whose last lane is reserved for host-to-device transfers: only transfer stages use it, so
+    /// copies queue behind copies and never behind compute.
+    public static LanePool withTransferLane(GpuStream[] compute, GpuStream transfer, Placement placement) {
+        GpuStream[] lanes = java.util.Arrays.copyOf(compute, compute.length + 1);
+        lanes[compute.length] = Objects.requireNonNull(transfer, "transfer");
+        return new LanePool(lanes, placement, null, compute.length);
+    }
+
     /// Test placement: stage `s` always runs on lane `fixed.applyAsInt(s)`.
     LanePool(GpuStream[] lanes, Placement placement, java.util.function.IntUnaryOperator fixed) {
+        this(lanes, placement, fixed, Objects.requireNonNull(lanes, "lanes").length);
+    }
+
+    private LanePool(
+            GpuStream[] lanes, Placement placement, java.util.function.IntUnaryOperator fixed, int computeLanes) {
         Objects.requireNonNull(lanes, "lanes");
-        if (lanes.length == 0 || lanes.length > MAX_LANES) {
+        if (lanes.length == 0 || lanes.length > MAX_LANES || computeLanes < 1 || computeLanes > lanes.length) {
             throw new IllegalArgumentException("a lane pool needs 1 to " + MAX_LANES + " lanes");
         }
+        this.computeLanes = computeLanes;
         this.lanes = lanes.clone();
         for (GpuStream lane : this.lanes) Objects.requireNonNull(lane, "lane");
         this.placement = Objects.requireNonNull(placement, "placement");
@@ -68,6 +84,11 @@ public final class LanePool implements AutoCloseable {
         return this.lanes.length;
     }
 
+    /// The lane reserved for transfer stages, or -1.
+    public int transferLane() {
+        return this.computeLanes < this.lanes.length ? this.computeLanes : -1;
+    }
+
     public Placement placement() {
         return this.placement;
     }
@@ -78,26 +99,27 @@ public final class LanePool implements AutoCloseable {
 
     /// The home lane for a newly built graph: its quantum's preparation and retirement boundary.
     int nextHome() {
-        return Math.floorMod(this.nextHome.getAndIncrement(), this.lanes.length);
+        return Math.floorMod(this.nextHome.getAndIncrement(), this.computeLanes);
     }
 
     /// The lane for `stage`, given the lane it may continue (-1 for none): its chain predecessor's
     /// under CHAIN, an unclaimed predecessor's (or the graph's home lane for a root) under FORK, its
     /// path predecessor's (or the home lane for a root) under PATH.
     int choose(int stage, int continued) {
-        if (this.lanes.length == 1) return 0;
+        if (this.computeLanes == 1) return 0;
         if (this.fixed != null) return this.fixed.applyAsInt(stage);
+        if (continued >= this.computeLanes) continued = -1;
         return switch (this.placement) {
-            case RANDOM -> ThreadLocalRandom.current().nextInt(this.lanes.length);
+            case RANDOM -> ThreadLocalRandom.current().nextInt(this.computeLanes);
             case WORKER -> worker();
             case CHAIN, FORK, PATH ->
-                continued >= 0 ? continued : ThreadLocalRandom.current().nextInt(this.lanes.length);
+                continued >= 0 ? continued : ThreadLocalRandom.current().nextInt(this.computeLanes);
         };
     }
 
     private int worker() {
         int[] slot = this.workerLane.get();
-        if (slot[0] < 0) slot[0] = Math.floorMod(this.nextWorker.getAndIncrement(), this.lanes.length);
+        if (slot[0] < 0) slot[0] = Math.floorMod(this.nextWorker.getAndIncrement(), this.computeLanes);
         return slot[0];
     }
 

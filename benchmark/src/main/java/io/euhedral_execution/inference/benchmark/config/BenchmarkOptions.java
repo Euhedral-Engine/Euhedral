@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
+import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.io.IOException;
@@ -53,7 +54,9 @@ public record BenchmarkOptions(
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
         @JsonProperty("q3DispatchMode") Q3DispatchMode q3DispatchMode,
         @JsonProperty("q3SmallRowThreshold") Integer q3SmallRowThreshold,
-        @JsonProperty("weightResidency") WeightResidency weightResidency) {
+        @JsonProperty("weightResidency") WeightResidency weightResidency,
+        @JsonProperty("hostWeightMiB") Long hostWeightMiB,
+        @JsonProperty("stagingSlots") Integer stagingSlots) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -82,6 +85,10 @@ public record BenchmarkOptions(
                 q3SmallRowThreshold == null ? Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD : q3SmallRowThreshold;
         if (q3SmallRowThreshold < 0) throw new IllegalArgumentException("Q3 threshold must not be negative");
         weightResidency = weightResidency == null ? WeightResidency.ALL : weightResidency;
+        hostWeightMiB = hostWeightMiB == null ? 0L : hostWeightMiB;
+        if (hostWeightMiB < 0) throw new IllegalArgumentException("hostWeightMiB must not be negative");
+        stagingSlots = stagingSlots == null ? QwenModel.DEFAULT_STAGING_SLOTS : stagingSlots;
+        if (stagingSlots < 2) throw new IllegalArgumentException("stagingSlots must be at least 2");
 
         if (cpus.isEmpty()) throw new IllegalArgumentException("cpus must not be blank");
         for (int id : excludeCpus) if (id < 0) throw new IllegalArgumentException("excludeCpus must not be negative");
@@ -139,6 +146,8 @@ public record BenchmarkOptions(
                 gpuMemory,
                 gpuHeadroomMiB,
                 shutdownTimeoutSeconds,
+                null,
+                null,
                 null,
                 null,
                 null);
@@ -210,7 +219,9 @@ public record BenchmarkOptions(
                 options.shutdownTimeoutSeconds(),
                 options.q3DispatchMode(),
                 options.q3SmallRowThreshold(),
-                options.weightResidency());
+                options.weightResidency(),
+                options.hostWeightMiB(),
+                options.stagingSlots());
     }
 
     public boolean json() {
@@ -227,7 +238,8 @@ public record BenchmarkOptions(
         for (int chunk : this.prefillChunks)
             tunings.add(base.withPrefillChunkTokens(chunk)
                     .withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold)
-                    .withWeightResidency(this.weightResidency));
+                    .withWeightResidency(this.weightResidency)
+                    .withHostWeights(this.hostWeightMiB * 1024L * 1024L, this.stagingSlots));
         return tunings;
     }
 

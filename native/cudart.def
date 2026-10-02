@@ -10,6 +10,8 @@ EXPORTS
     cudaGetDevice
     cudaMalloc
     cudaHostAlloc
+    cudaHostRegister
+    cudaHostUnregister
     cudaMemGetInfo
     cudaMemcpy
     cudaMemcpy2D

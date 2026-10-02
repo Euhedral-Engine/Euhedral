@@ -211,10 +211,12 @@ public final class StageGraph implements AutoCloseable {
             StageFrame stage = ready.poll();
             StageFrame next = null;
             for (StageFrame successor : stage.submittedSuccessors) {
+                // A transfer never continues a compute chain, and no chain continues a transfer's lane.
+                if (successor.transfers()) continue;
                 if (next == null || height[successor.stage()] > height[next.stage()]) next = successor;
             }
             height[stage.stage()] = next == null ? 1 : height[next.stage()] + 1;
-            if (next != null) next.pathPredecessor = stage;
+            if (next != null && !stage.transfers()) next.pathPredecessor = stage;
             for (StageFrame predecessor : stage.submittedPredecessors) {
                 if (--pending[predecessor.stage()] == 0) ready.add(predecessor);
             }
@@ -340,10 +342,12 @@ public final class StageGraph implements AutoCloseable {
                 this.pool.lane(lane).mark(this.tails[lane]);
                 home.await(this.tails[lane]);
             }
+            this.quantum.lanesJoined(home);
             home.notifyRetired(terminal);
         } catch (RuntimeException | Error failure) {
             this.quantum.fail(failure);
             recover(failure);
+            this.quantum.lanesJoined(null);
             this.source.publish(terminal);
         }
     }

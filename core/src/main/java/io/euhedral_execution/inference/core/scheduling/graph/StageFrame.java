@@ -70,6 +70,12 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     /// Submits this stage's device work. The quantum's stream is selected on the calling thread.
     protected abstract void submit();
 
+    /// Whether this stage only copies host memory to the device. Such a stage runs on the pool's
+    /// transfer lane when it has one, and never carries a compute chain.
+    protected boolean transfers() {
+        return false;
+    }
+
     /// Runs once per quantum on the retiring worker for a stage that attempted submission, after the
     /// quantum's device work has retired. `committed` is true only when the whole quantum succeeded:
     /// publish externally visible state then, and release temporary resources either way.
@@ -96,7 +102,9 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         if (owner.stopRequested()) return;
         this.attempted = true;
         LanePool pool = owner.pool();
-        int lane = owner.spread() ? pool.choose(this.stage, continuedLane(pool, owner)) : owner.home();
+        int lane = transfers() && pool.transferLane() >= 0
+                ? pool.transferLane()
+                : owner.spread() ? pool.choose(this.stage, continuedLane(pool, owner)) : owner.home();
         this.lane = lane;
         GpuStream stream = pool.lane(lane);
         try {

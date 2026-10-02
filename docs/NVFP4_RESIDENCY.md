@@ -142,6 +142,45 @@ tiles are compute-bound.
 Greedy generation answers "The capital of France is" with " Paris."
 (`QwenNvfp4GenerationCudaIntegrationTest`).
 
+## Host-backed weights
+
+`hostWeightBytes` (benchmark `hostWeightMiB`) keeps layer projections in pinned host memory and stages
+them into a device ring of `stagingSlots` slots on every use.
+
+- **Selection:** whole families are taken smallest tensor first (GDN query_key, GDN output, attention
+  output, ...). Within the last family the layers are spread evenly. The ring then holds the
+  smallest possible slot.
+- **Host memory:** one arena, allocated before any payload is read, 2 MiB-aligned, with
+  `MADV_HUGEPAGE` and `MADV_COLLAPSE`, and pinned with `cudaHostRegister`.
+- **Execution:** each plan view gets a `WEIGHT_TRANSFER` stage per use, run on a lane reserved for
+  copies. A transfer depends only on the consumer that last read its slot. The consumer depends on
+  the transfer and reads the slot. Ordering uses the graph's existing cross-lane markers, with no
+  host synchronization.
+- **Concurrency:** a quantum that stages weights holds the ring from admission until its last stage
+  submitted. The next one's preparation awaits a marker recorded after the holder's lanes joined.
+
+Greedy tokens are identical to the resident run (`QwenNvfp4GenerationCudaIntegrationTest`).
+
+NVFP4, executed objects, 4 slots (warmup 1, 2 iterations; resident: 48.1 / 45.4 / 1052):
+
+| Host-backed | Staged per token | Ring | Decode @64 | Decode @8K | Prefill 512 |
+|---|---|---|---|---|---|
+| 512 MiB (GDN query_key) | 0.54 GB | 47 MB | 45.4 tok/s | 42.5 tok/s | 1048 tok/s |
+| 1 GiB | 1.08 GB | 71 MB | 35.0 tok/s | 34.5 tok/s | 1048 tok/s |
+| 2 GiB | 2.15 GB | 83 MB | 19.2 tok/s | 19.3 tok/s | 1046 tok/s |
+
+**Up to the GPU's own token time the copies hide.** 0.54 GB is 12.4 ms of copying under a 20.8 ms
+token, and costs 6%. Beyond that, decode runs at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against
+43.7 GB/s for bare copies. Prefill is unaffected.
+
+**Measured and not kept:**
+- **One allocation per tensor:** compaction under the loader's page-cache churn failed for a third
+  of them, which fell back to 4 KiB pages. Copies then split between 26 and 43 GB/s, about 30 GB/s
+  overall, and 2 GiB decoded at 15.0 tok/s.
+- **Deeper rings:** 8 and 16 slots gave 14.5 and 14.2 tok/s against 15.0 for 4 slots (per-tensor
+  allocation).
+- **The staging DAG without its copies** costs 2% (47.2 against 48.1 tok/s).
+
 ## What was built
 
 - `tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4`: the NVFP4 artifact, quantized
@@ -151,3 +190,5 @@ Greedy generation answers "The capital of France is" with " Paris."
 - Execution: `native/src/nvfp4` (decode GEMV, tile-engine producer for prefill, paired gate_up and
   SwiGLU), `euhedral_cuda_linear_nvfp4_bf16` and `euhedral_cuda_nvfp4_gate_up_swiglu_bf16`, plan and
   frame dispatch for NVFP4 weights, and `WeightResidency`.
+- Host-backed weights: `HostWeightSelection`, `WeightStaging`, `WeightTransferFrame`, the transfer
+  lane in `LanePool`, and `euhedral_cuda_host_weights_malloc`.

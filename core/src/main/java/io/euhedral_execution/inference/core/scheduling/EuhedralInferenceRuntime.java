@@ -43,6 +43,11 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     private final Object laneLock = new Object();
     private final int laneCount;
     private final LanePool.Placement placement;
+    /// Held by the quantum that stages weights, from its admission until its last stage submitted.
+    private final java.util.concurrent.Semaphore stagingHold = new java.util.concurrent.Semaphore(1);
+    /// Recorded on the releasing quantum's home lane once its lanes joined; the next staging quantum's
+    /// preparation awaits it, so its first copies follow every earlier read of the ring.
+    private long stagingIdle;
 
     /// Lanes in the shared pool: `EUHEDRAL_LANES`, by default one per available processor (at most 64).
     static int laneCount() {
@@ -70,11 +75,17 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             synchronized (this.closeLock) {
                 if (this.lanes != null) return this.lanes;
             }
-            GpuStream[] streams = new GpuStream[this.laneCount];
+            boolean transfers = this.plan.staging() != null;
+            int compute = transfers ? Math.min(this.laneCount, LanePool.MAX_LANES - 1) : this.laneCount;
+            GpuStream[] streams = new GpuStream[compute + (transfers ? 1 : 0)];
             LanePool pool;
             try {
                 for (int lane = 0; lane < streams.length; lane++) streams[lane] = this.gpu.openStream();
-                pool = new LanePool(streams, this.placement);
+                if (transfers) {
+                    pool = LanePool.withTransferLane(
+                            java.util.Arrays.copyOf(streams, compute), streams[compute], this.placement);
+                    this.stagingIdle = streams[compute].openMarker();
+                } else pool = new LanePool(streams, this.placement);
             } catch (RuntimeException | Error failure) {
                 for (GpuStream stream : streams) {
                     if (stream == null) continue;
@@ -185,8 +196,15 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             throw failure;
         }
         boolean started = false;
+        if (view.stagesWeights()) {
+            // Blocks only this admitting thread, until the previous staging quantum has submitted its
+            // last stage; its device work is ordered by `stagingIdle`, not waited for here.
+            this.stagingHold.acquireUninterruptibly();
+            context.holdStaging(this::releaseStaging);
+        }
         try {
             GpuStream stream = graph.stream();
+            if (view.stagesWeights()) stream.await(this.stagingIdle);
             try {
                 stream.submit(() -> context.begin(this.gpu, stream, terminalConsumer, pooled.storage()), false);
             } catch (RuntimeException | Error failure) {
@@ -204,11 +222,22 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             return context.completion().copy();
         } finally {
             if (!started) {
+                context.lanesJoined(null);
                 pool.recycle(pooled);
                 graph.source().terminated();
                 // Outcome callbacks never run with the graph's stream selected.
                 context.publishOutcome();
             }
+        }
+    }
+
+    /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when its
+    /// lanes were proven idle instead.
+    private void releaseStaging(GpuStream home) {
+        try {
+            if (home != null) home.mark(this.stagingIdle);
+        } finally {
+            this.stagingHold.release();
         }
     }
 
@@ -257,6 +286,14 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             lanes = this.lanes;
         }
         if (lanes != null) {
+            if (this.stagingIdle != 0) {
+                try {
+                    lanes.lane(lanes.transferLane()).closeMarker(this.stagingIdle);
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
+            }
             try {
                 lanes.close();
             } catch (RuntimeException closeFailure) {

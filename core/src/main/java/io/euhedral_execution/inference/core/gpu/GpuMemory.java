@@ -16,4 +16,14 @@ public interface GpuMemory {
     }
 
     void free(long address);
+
+    /// Pins `byteSize` bytes of host memory that the device's copy engines read directly, for weights
+    /// staged to the device on use. Returns its host address.
+    default long allocateHostWeights(long byteSize) {
+        throw new UnsupportedOperationException("host-backed weights are not implemented by this GPU memory provider");
+    }
+
+    default void freeHostWeights(long address) {
+        throw new UnsupportedOperationException("host-backed weights are not implemented by this GPU memory provider");
+    }
 }

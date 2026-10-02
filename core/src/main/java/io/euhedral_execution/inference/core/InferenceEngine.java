@@ -8,6 +8,7 @@ import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model_loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
@@ -105,9 +106,8 @@ public final class InferenceEngine implements AutoCloseable {
             QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
             QwenArtifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath(), tuning);
-            model = bootstrap.loadModel(
-                    config.artifactPath(), artifact, gpu, config.tuning().weightResidency());
-            QwenExecutionPlan plan = new QwenExecutionPlan(model.weights());
+            model = bootstrap.loadModel(config.artifactPath(), artifact, gpu, tuning);
+            QwenExecutionPlan plan = new QwenExecutionPlan(model.weights(), model.staging());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
@@ -398,11 +398,17 @@ public final class InferenceEngine implements AutoCloseable {
             return QwenModel.load(path, artifact, gpu);
         }
 
-        QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu, WeightResidency residency)
+        QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu, InferenceTuning tuning)
                 throws IOException {
-            return residency == WeightResidency.ALL
-                    ? loadModel(path, artifact, gpu)
-                    : QwenModel.load(path, artifact, gpu, residency);
+            if (tuning.weightResidency() == WeightResidency.ALL && tuning.hostWeightBytes() == 0)
+                return loadModel(path, artifact, gpu);
+            return QwenModel.load(
+                    path,
+                    artifact,
+                    gpu,
+                    tuning.weightResidency(),
+                    HostWeightSelection.select(artifact, tuning.hostWeightBytes()),
+                    tuning.stagingSlots());
         }
 
         ControlPlaneLattice createLattice(InferenceConfig config) {

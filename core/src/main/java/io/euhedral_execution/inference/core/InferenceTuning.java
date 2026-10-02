@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
+import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.util.BitSet;
@@ -13,13 +14,18 @@ import java.util.Objects;
 /// [WorkerProcessorSelection] to derive them from topology. The set is copied on input and output.
 /// `prefillChunkTokens` bounds the prompt tokens submitted per prefill quantum and therefore the
 /// per-quantum GPU workspace. It does not change the token sequence. `weightResidency` selects which
-/// artifact objects are placed on the GPU.
+/// artifact objects are placed on the GPU. `hostWeightBytes` keeps at least that many bytes of layer
+/// projections in pinned host memory, staged to the device through `stagingSlots` slots on each use
+/// (see [io.euhedral_execution.inference.core.model_loader.HostWeightSelection]); it trades transfer
+/// time for device memory and does not change results.
 public record InferenceTuning(
         BitSet workerProcessorIds,
         int prefillChunkTokens,
         Q3DispatchMode q3DispatchMode,
         int q3SmallRowThreshold,
-        WeightResidency weightResidency) {
+        WeightResidency weightResidency,
+        long hostWeightBytes,
+        int stagingSlots) {
     public static final int DEFAULT_PREFILL_CHUNK_TOKENS = QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS;
 
     public InferenceTuning {
@@ -30,6 +36,24 @@ public record InferenceTuning(
         Objects.requireNonNull(q3DispatchMode, "q3DispatchMode");
         if (q3SmallRowThreshold < 0) throw new IllegalArgumentException("Q3 threshold must not be negative");
         Objects.requireNonNull(weightResidency, "weightResidency");
+        if (hostWeightBytes < 0) throw new IllegalArgumentException("hostWeightBytes must not be negative");
+        if (stagingSlots < 2) throw new IllegalArgumentException("stagingSlots must be at least 2");
+    }
+
+    public InferenceTuning(
+            BitSet workerProcessorIds,
+            int prefillChunkTokens,
+            Q3DispatchMode q3DispatchMode,
+            int q3SmallRowThreshold,
+            WeightResidency weightResidency) {
+        this(
+                workerProcessorIds,
+                prefillChunkTokens,
+                q3DispatchMode,
+                q3SmallRowThreshold,
+                weightResidency,
+                0L,
+                QwenModel.DEFAULT_STAGING_SLOTS);
     }
 
     public InferenceTuning(
@@ -53,17 +77,35 @@ public record InferenceTuning(
 
     public InferenceTuning withWorkerProcessorIds(BitSet ids) {
         return new InferenceTuning(
-                ids, this.prefillChunkTokens, this.q3DispatchMode, this.q3SmallRowThreshold, this.weightResidency);
+                ids,
+                this.prefillChunkTokens,
+                this.q3DispatchMode,
+                this.q3SmallRowThreshold,
+                this.weightResidency,
+                this.hostWeightBytes,
+                this.stagingSlots);
     }
 
     public InferenceTuning withPrefillChunkTokens(int tokens) {
         return new InferenceTuning(
-                this.workerProcessorIds, tokens, this.q3DispatchMode, this.q3SmallRowThreshold, this.weightResidency);
+                this.workerProcessorIds,
+                tokens,
+                this.q3DispatchMode,
+                this.q3SmallRowThreshold,
+                this.weightResidency,
+                this.hostWeightBytes,
+                this.stagingSlots);
     }
 
     public InferenceTuning withQ3Dispatch(Q3DispatchMode mode, int smallRowThreshold) {
         return new InferenceTuning(
-                this.workerProcessorIds, this.prefillChunkTokens, mode, smallRowThreshold, this.weightResidency);
+                this.workerProcessorIds,
+                this.prefillChunkTokens,
+                mode,
+                smallRowThreshold,
+                this.weightResidency,
+                this.hostWeightBytes,
+                this.stagingSlots);
     }
 
     public InferenceTuning withWeightResidency(WeightResidency residency) {
@@ -72,7 +114,20 @@ public record InferenceTuning(
                 this.prefillChunkTokens,
                 this.q3DispatchMode,
                 this.q3SmallRowThreshold,
-                residency);
+                residency,
+                this.hostWeightBytes,
+                this.stagingSlots);
+    }
+
+    public InferenceTuning withHostWeights(long bytes, int slots) {
+        return new InferenceTuning(
+                this.workerProcessorIds,
+                this.prefillChunkTokens,
+                this.q3DispatchMode,
+                this.q3SmallRowThreshold,
+                this.weightResidency,
+                bytes,
+                slots);
     }
 
     @Override

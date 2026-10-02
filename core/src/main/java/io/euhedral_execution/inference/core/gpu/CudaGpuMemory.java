@@ -45,6 +45,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle free;
     private final MethodHandle hostMalloc;
     private final MethodHandle hostFree;
+    private final MethodHandle hostWeightsMalloc;
+    private final MethodHandle hostWeightsFree;
+    private final java.util.concurrent.ConcurrentHashMap<Long, Long> hostWeights =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final MethodHandle deviceMemoryInfo;
     private final MethodHandle copyHostToDevice;
     private final MethodHandle copyUploadToDevice;
@@ -140,6 +144,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.free = bind(linker, symbols, "euhedral_cuda_free", FREE);
             this.hostMalloc = bind(linker, symbols, "euhedral_cuda_host_malloc", MALLOC);
             this.hostFree = bind(linker, symbols, "euhedral_cuda_host_free", FREE);
+            this.hostWeightsMalloc = bind(linker, symbols, "euhedral_cuda_host_weights_malloc", MALLOC);
+            this.hostWeightsFree = bind(linker, symbols, "euhedral_cuda_host_weights_free", FREE);
             this.deviceMemoryInfo = bind(linker, symbols, "euhedral_cuda_device_memory_info", DEVICE_MEMORY_INFO);
             this.copyHostToDevice = bind(linker, symbols, "euhedral_cuda_copy_host_to_device", COPY);
             this.copyUploadToDevice = bind(linker, symbols, "euhedral_cuda_copy_upload_to_device", COPY);
@@ -695,6 +701,55 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (cacheable) pinnedUploadCount.decrementAndGet();
         freePinned(allocation);
+    }
+
+    @Override
+    public long allocateHostWeights(long byteSize) {
+        ensureOpen();
+        if (byteSize <= 0) throw new IllegalArgumentException("byteSize must be positive");
+        MemorySegment address;
+        try {
+            address = (MemorySegment) hostWeightsMalloc.invokeExact(byteSize);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA host weight allocation failed", failure);
+        }
+        if (address.address() == 0) throw new GpuMemoryException("CUDA host weight allocation returned null");
+        this.hostWeights.put(address.address(), byteSize);
+        return address.address();
+    }
+
+    @Override
+    public void freeHostWeights(long address) {
+        ensureOpen();
+        if (this.hostWeights.remove(address) == null)
+            throw new IllegalArgumentException("not a host weight allocation: " + address);
+        try {
+            int status = (int) hostWeightsFree.invokeExact(MemorySegment.ofAddress(address));
+            if (status != 0) throw new GpuMemoryException("CUDA host weight free", status);
+        } catch (GpuMemoryException failure) {
+            throw failure;
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA host weight free invocation failed", failure);
+        }
+    }
+
+    /// Bytes of pinned host memory currently held for host-backed weights.
+    public long hostWeightBytes() {
+        return this.hostWeights.values().stream().mapToLong(Long::longValue).sum();
+    }
+
+    @Override
+    public void copyHostWeightsToDevice(long destination, long source, long byteSize) {
+        ensureOpen();
+        requireDeviceAddress(destination);
+        if (source == 0 || byteSize <= 0) throw new IllegalArgumentException("invalid host weight copy");
+        int status = invokeCopy(
+                copyUploadToDevice,
+                MemorySegment.ofAddress(destination),
+                MemorySegment.ofAddress(source),
+                byteSize,
+                "host weight copy");
+        if (status != 0) throw new GpuMemoryException("host weight copy", status);
     }
 
     @Override

@@ -144,6 +144,23 @@ final class StageGraphFixtures {
         }
     }
 
+    /// A transfer stage that records one named copy on its lane.
+    static final class TransferStage extends StageFrame {
+        TransferStage(StageGraph graph, int stage) {
+            super(graph, stage);
+        }
+
+        @Override
+        protected boolean transfers() {
+            return true;
+        }
+
+        @Override
+        protected void submit() {
+            ((RecordingStream) laneStream()).kernel("t" + stage());
+        }
+    }
+
     /// A stage that launches one named kernel on its quantum's stream.
     static final class TestStage extends StageFrame {
         final List<Boolean> retirements = Collections.synchronizedList(new ArrayList<>());

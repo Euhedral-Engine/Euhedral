@@ -26,6 +26,7 @@ public abstract class QwenStageFrame extends StageFrame {
     public static QwenStageFrame create(StageGraph graph, QwenExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
         return switch (instruction.kind()) {
             case EMBEDDING -> new EmbeddingFrame(graph, instruction, gpu);
+            case WEIGHT_TRANSFER -> new WeightTransferFrame(graph, instruction, gpu);
             case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNormFrame(graph, instruction, gpu);
             case Q3_LINEAR, Q3_FFN_DOWN, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new LinearFrame(graph, instruction, gpu);
             case GDN_CONTROL,

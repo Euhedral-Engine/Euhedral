@@ -31,24 +31,7 @@ public final class TensorLoader {
         boolean allocated = false;
         try (Arena hostArena = Arena.ofConfined()) {
             MemorySegment payload = TensorDataReader.read(artifactPath, descriptor, hostArena);
-            if (descriptor.format() == WeightFormat.NVFP4 && descriptor.layout() == WeightLayout.ROW_SPLIT_K128_V1) {
-                try {
-                    Nvfp4Layout.validate(
-                            payload, descriptor.shape()[0], descriptor.shape()[1]);
-                } catch (IllegalArgumentException exception) {
-                    throw new QwenWeightLoadException(
-                            "invalid NVFP4 tensor '" + descriptor.name() + "': " + exception.getMessage());
-                }
-            }
-            if (descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1) {
-                try {
-                    P2e2Layout.validate(
-                            payload, descriptor.shape()[0], descriptor.shape()[1]);
-                } catch (IllegalArgumentException exception) {
-                    throw new QwenWeightLoadException(
-                            "invalid P2E2 tensor '" + descriptor.name() + "': " + exception.getMessage());
-                }
-            }
+            validate(descriptor, payload);
             deviceAddress = gpuMemory.allocate(descriptor.byteSize());
             allocated = true;
             gpuMemory.copyHostToDevice(deviceAddress, payload, descriptor.byteSize());
@@ -69,6 +52,50 @@ public final class TensorLoader {
                 }
             }
             return propagate(failure);
+        }
+    }
+
+    /// Copies the payload into pinned host memory at `hostAddress`, which holds at least its byte size;
+    /// execution stages it to the device before each use.
+    public static TensorHandle loadToHost(Path artifactPath, TensorDescriptor descriptor, long hostAddress)
+            throws IOException {
+        Objects.requireNonNull(artifactPath, "artifactPath");
+        Objects.requireNonNull(descriptor, "descriptor");
+        if (hostAddress == 0) throw new IllegalArgumentException("hostAddress must be set");
+        try (Arena hostArena = Arena.ofConfined()) {
+            MemorySegment payload = TensorDataReader.read(artifactPath, descriptor, hostArena);
+            validate(descriptor, payload);
+            MemorySegment.ofAddress(hostAddress)
+                    .reinterpret(descriptor.byteSize())
+                    .copyFrom(payload.asSlice(0, descriptor.byteSize()));
+            return new TensorHandle(
+                    descriptor.name(),
+                    descriptor.shape(),
+                    descriptor.dataType(),
+                    descriptor.format(),
+                    descriptor.layout(),
+                    0L,
+                    descriptor.byteSize(),
+                    hostAddress);
+        }
+    }
+
+    private static void validate(TensorDescriptor descriptor, MemorySegment payload) throws QwenWeightLoadException {
+        if (descriptor.format() == WeightFormat.NVFP4 && descriptor.layout() == WeightLayout.ROW_SPLIT_K128_V1) {
+            try {
+                Nvfp4Layout.validate(payload, descriptor.shape()[0], descriptor.shape()[1]);
+            } catch (IllegalArgumentException exception) {
+                throw new QwenWeightLoadException(
+                        "invalid NVFP4 tensor '" + descriptor.name() + "': " + exception.getMessage());
+            }
+        }
+        if (descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1) {
+            try {
+                P2e2Layout.validate(payload, descriptor.shape()[0], descriptor.shape()[1]);
+            } catch (IllegalArgumentException exception) {
+                throw new QwenWeightLoadException(
+                        "invalid P2E2 tensor '" + descriptor.name() + "': " + exception.getMessage());
+            }
         }
     }
 

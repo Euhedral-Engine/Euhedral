@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core.scheduling.graph;
 
+import io.euhedral_execution.inference.core.gpu.GpuStream;
+
 /// The quantum bound to a [StageGraph] while it runs.
 ///
 /// It supplies stop and failure state and owns the quantum's terminal work. The graph never inspects
@@ -15,6 +17,10 @@ public interface StageQuantum {
     default boolean overlapLaunches() {
         return false;
     }
+
+    /// Every lane the quantum used has joined `home`, and no stage of it can submit again; null when the
+    /// lanes were proven idle instead. Runs once, before the retirement boundary is armed.
+    default void lanesJoined(GpuStream home) {}
 
     /// Runs on an ordinary worker after the quantum's device-completion boundary and every stage's
     /// retirement hook. It releases quantum-owned storage and publishes externally visible state.
