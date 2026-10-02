@@ -25,7 +25,8 @@ public record InferenceTuning(
         int q3SmallRowThreshold,
         WeightResidency weightResidency,
         long hostWeightBytes,
-        int stagingSlots) {
+        int stagingSlots,
+        int speculativeDepth) {
     public static final int DEFAULT_PREFILL_CHUNK_TOKENS = QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS;
 
     public InferenceTuning {
@@ -38,6 +39,8 @@ public record InferenceTuning(
         Objects.requireNonNull(weightResidency, "weightResidency");
         if (hostWeightBytes < 0) throw new IllegalArgumentException("hostWeightBytes must not be negative");
         if (stagingSlots < 2) throw new IllegalArgumentException("stagingSlots must be at least 2");
+        if (speculativeDepth < 0 || speculativeDepth > 7)
+            throw new IllegalArgumentException("speculativeDepth must be 0 to 7");
     }
 
     public InferenceTuning(
@@ -53,7 +56,8 @@ public record InferenceTuning(
                 q3SmallRowThreshold,
                 weightResidency,
                 0L,
-                QwenModel.DEFAULT_STAGING_SLOTS);
+                QwenModel.DEFAULT_STAGING_SLOTS,
+                0);
     }
 
     public InferenceTuning(
@@ -83,7 +87,8 @@ public record InferenceTuning(
                 this.q3SmallRowThreshold,
                 this.weightResidency,
                 this.hostWeightBytes,
-                this.stagingSlots);
+                this.stagingSlots,
+                this.speculativeDepth);
     }
 
     public InferenceTuning withPrefillChunkTokens(int tokens) {
@@ -94,7 +99,8 @@ public record InferenceTuning(
                 this.q3SmallRowThreshold,
                 this.weightResidency,
                 this.hostWeightBytes,
-                this.stagingSlots);
+                this.stagingSlots,
+                this.speculativeDepth);
     }
 
     public InferenceTuning withQ3Dispatch(Q3DispatchMode mode, int smallRowThreshold) {
@@ -105,7 +111,8 @@ public record InferenceTuning(
                 smallRowThreshold,
                 this.weightResidency,
                 this.hostWeightBytes,
-                this.stagingSlots);
+                this.stagingSlots,
+                this.speculativeDepth);
     }
 
     public InferenceTuning withWeightResidency(WeightResidency residency) {
@@ -116,7 +123,8 @@ public record InferenceTuning(
                 this.q3SmallRowThreshold,
                 residency,
                 this.hostWeightBytes,
-                this.stagingSlots);
+                this.stagingSlots,
+                this.speculativeDepth);
     }
 
     public InferenceTuning withHostWeights(long bytes, int slots) {
@@ -127,7 +135,21 @@ public record InferenceTuning(
                 this.q3SmallRowThreshold,
                 this.weightResidency,
                 bytes,
-                slots);
+                slots,
+                this.speculativeDepth);
+    }
+
+    /// MTP speculative decoding with `depth` drafts per verification for greedy generation (0: off).
+    public InferenceTuning withSpeculativeDepth(int depth) {
+        return new InferenceTuning(
+                this.workerProcessorIds,
+                this.prefillChunkTokens,
+                this.q3DispatchMode,
+                this.q3SmallRowThreshold,
+                this.weightResidency,
+                this.hostWeightBytes,
+                this.stagingSlots,
+                depth);
     }
 
     @Override

@@ -110,7 +110,32 @@ public record BenchmarkResult(
             Integer generatedTokens,
             Integer decodeSampledTokens,
             Integer finalCommitQuanta,
-            Boolean eosObserved) {}
+            Boolean eosObserved,
+            Speculative speculative) {
+        public Work(
+                Integer promptTokens,
+                Integer prefillQuanta,
+                Integer prefillTokens,
+                Integer generatedTokens,
+                Integer decodeSampledTokens,
+                Integer finalCommitQuanta,
+                Boolean eosObserved) {
+            this(
+                    promptTokens,
+                    prefillQuanta,
+                    prefillTokens,
+                    generatedTokens,
+                    decodeSampledTokens,
+                    finalCommitQuanta,
+                    eosObserved,
+                    null);
+        }
+    }
+
+    /// Speculative decoding: verifications, `acceptedDrafts[a]` = verifications that accepted a drafts,
+    /// output tokens they committed, and the time spent verifying versus drafting between them (ns).
+    public record Speculative(
+            int verifications, long[] acceptedDrafts, int committedTokens, long verifyNanos, long draftNanos) {}
 
     /// Nanosecond durations. Null means the boundary was not reached.
     public record Timings(

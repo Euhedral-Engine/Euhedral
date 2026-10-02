@@ -202,6 +202,8 @@ public final class InferenceEngine implements AutoCloseable {
                 Objects.requireNonNull(config, "config"),
                 this.tuning.prefillChunkTokens(),
                 this::releaseSession);
+        if (this.tuning.speculativeDepth() > 0 && this.plan.drafts())
+            session.enableSpeculativeDecoding(this.tuning.speculativeDepth());
         this.sessions.add(session);
         return session;
     }
@@ -402,11 +404,16 @@ public final class InferenceEngine implements AutoCloseable {
                 throws IOException {
             if (tuning.weightResidency() == WeightResidency.ALL && tuning.hostWeightBytes() == 0)
                 return loadModel(path, artifact, gpu);
+            // Speculative decoding needs the MTP layer and draft head that EXECUTED leaves out.
+            WeightResidency residency =
+                    tuning.speculativeDepth() > 0 && tuning.weightResidency() == WeightResidency.EXECUTED
+                            ? WeightResidency.SPECULATIVE
+                            : tuning.weightResidency();
             return QwenModel.load(
                     path,
                     artifact,
                     gpu,
-                    tuning.weightResidency(),
+                    residency,
                     HostWeightSelection.select(artifact, tuning.hostWeightBytes()),
                     tuning.stagingSlots());
         }

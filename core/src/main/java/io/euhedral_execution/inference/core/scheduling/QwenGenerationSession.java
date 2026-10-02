@@ -45,6 +45,9 @@ public final class QwenGenerationSession implements AutoCloseable {
     private IncrementalDecoder decoder;
     private boolean decoderFinished;
     private boolean promptPrefilled;
+    /// MTP draft depth for greedy unconstrained generation from a fresh sequence; 0 disables it.
+    private int speculativeDepth;
+    private QwenSpeculativeDecoder speculative;
 
     /// Creates a session with a new persistent sequence owned by this instance.
     /// The plan, runtime, GPU, and tokenizer are borrowed and must remain usable until the session is closed.
@@ -95,6 +98,15 @@ public final class QwenGenerationSession implements AutoCloseable {
         this.sampler = new QwenLogitsSampler(config, plan.weights().config().vocabSize());
         this.hostLogits = new QwenHostLogits(gpu, plan.weights().config().vocabSize());
         this.decoder = tokenizer.newIncrementalDecoder();
+    }
+
+    /// Generates greedy, unconstrained calls from a fresh sequence with MTP speculative decoding of
+    /// `depth` drafts per verification: the same tokens and state as one-row greedy decode, in fewer
+    /// sequential steps (docs/MTP_CONTRACT.md). Requires a plan with a loaded MTP layer and draft head.
+    public void enableSpeculativeDecoding(int depth) {
+        if (depth < 0 || depth > 7) throw new IllegalArgumentException("depth must be 0 to 7");
+        if (depth > 0 && !this.plan.drafts()) throw new IllegalStateException("the model has no MTP draft view");
+        this.speculativeDepth = depth;
     }
 
     /// Prefills a prompt at the current sequence position and returns the IDs sampled by this call.
@@ -226,6 +238,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         // The sequence completes only once no quantum holds its lease, and a quantum releases the lease
         // after its retirement boundary, so no copy into the host row can still be queued.
         this.hostLogits.close();
+        if (this.speculative != null) this.speculative.close();
         if (this.closeListener != null) {
             this.closeListener.accept(this);
             this.closeListener = null;
@@ -243,6 +256,14 @@ public final class QwenGenerationSession implements AutoCloseable {
         if (isStopRequested()) return List.of();
         // A greedy, unconstrained call selects each token on the device and reads back only its ID.
         this.hostLogits.selectOnDevice(this.sampler.greedy() && constraint == null);
+        if (this.speculativeDepth > 0
+                && this.sampler.greedy()
+                && constraint == null
+                && !this.promptPrefilled
+                && this.sequence.currentTokenPosition() == 0
+                && maxNewTokens > 0) {
+            return generateSpeculative(promptTokenIds, maxNewTokens, output, timing);
+        }
 
         OptionalInt nextToken = OptionalInt.empty();
         for (int offset = 0; offset < promptTokenIds.length; offset += this.prefillChunkTokens) {
@@ -307,6 +328,34 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
         if (endedNormally && !isStopRequested()) finishDecoder(output);
         return List.copyOf(callTokenIds);
+    }
+
+    private List<Integer> generateSpeculative(
+            int[] promptTokenIds, int maxNewTokens, Consumer<String> output, GenerationTimingListener timing)
+            throws InterruptedException, ExecutionException {
+        if (this.speculative == null)
+            this.speculative = new QwenSpeculativeDecoder(
+                    this.runtime,
+                    this.plan,
+                    this.gpu,
+                    this.sequence,
+                    this.tokenizer::isGenerationEosToken,
+                    this.speculativeDepth,
+                    this.prefillChunkTokens);
+        List<Integer> tokens = this.speculative.generate(
+                promptTokenIds,
+                maxNewTokens,
+                token -> {
+                    synchronized (this.generatedTokenIds) {
+                        this.generatedTokenIds.add(token);
+                    }
+                    // As in ordinary decode, a generation terminator is returned but never decoded into text.
+                    if (!this.tokenizer.isGenerationEosToken(token)) emit(output, this.decoder.append(token));
+                },
+                timing);
+        this.promptPrefilled = true;
+        if (!isStopRequested()) finishDecoder(output);
+        return tokens;
     }
 
     private OptionalInt executeAndSelect(
