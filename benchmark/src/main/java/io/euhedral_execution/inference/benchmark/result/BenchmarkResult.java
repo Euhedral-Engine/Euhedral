@@ -128,5 +128,15 @@ public record BenchmarkResult(
             Double prefillTokensPerSecond, Double decodeTokensPerSecond, Double endToEndOutputTokensPerSecond) {}
 
     /// Device-wide free/total bytes before and after the iteration, observed outside timing.
-    public record GpuMemory(Long beforeFreeBytes, Long afterFreeBytes, Long totalBytes) {}
+    /// Device free/total around the iteration, and the engine's own live allocations: before, the peak
+    /// during the iteration (sequence state, workspaces and scratch included), after, and the graphs'
+    /// retained workspace after.
+    public record GpuMemory(
+            Long beforeFreeBytes,
+            Long afterFreeBytes,
+            Long totalBytes,
+            Long allocatedBeforeBytes,
+            Long peakAllocatedBytes,
+            Long allocatedAfterBytes,
+            Long retainedWorkspaceBytes) {}
 }
