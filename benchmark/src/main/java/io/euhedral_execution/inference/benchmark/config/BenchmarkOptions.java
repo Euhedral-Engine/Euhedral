@@ -57,7 +57,8 @@ public record BenchmarkOptions(
         @JsonProperty("weightResidency") WeightResidency weightResidency,
         @JsonProperty("hostWeightMiB") Long hostWeightMiB,
         @JsonProperty("stagingSlots") Integer stagingSlots,
-        @JsonProperty("speculativeDepth") Integer speculativeDepth) {
+        @JsonProperty("speculativeDepth") Integer speculativeDepth,
+        @JsonProperty("promptCorpus") String promptCorpus) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -93,6 +94,9 @@ public record BenchmarkOptions(
         speculativeDepth = speculativeDepth == null ? 0 : speculativeDepth;
         if (speculativeDepth < 0 || speculativeDepth > 7)
             throw new IllegalArgumentException("speculativeDepth must be 0 to 7");
+        promptCorpus = promptCorpus == null ? "words" : promptCorpus.strip();
+        if (!promptCorpus.equals("words") && !promptCorpus.equals("chat"))
+            throw new IllegalArgumentException("promptCorpus must be \"words\" or \"chat\"");
 
         if (cpus.isEmpty()) throw new IllegalArgumentException("cpus must not be blank");
         for (int id : excludeCpus) if (id < 0) throw new IllegalArgumentException("excludeCpus must not be negative");
@@ -150,6 +154,7 @@ public record BenchmarkOptions(
                 gpuMemory,
                 gpuHeadroomMiB,
                 shutdownTimeoutSeconds,
+                null,
                 null,
                 null,
                 null,
@@ -227,7 +232,8 @@ public record BenchmarkOptions(
                 options.weightResidency(),
                 options.hostWeightMiB(),
                 options.stagingSlots(),
-                options.speculativeDepth());
+                options.speculativeDepth(),
+                options.promptCorpus());
     }
 
     public boolean json() {

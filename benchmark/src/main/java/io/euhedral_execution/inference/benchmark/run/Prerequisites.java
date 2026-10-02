@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.benchmark.run;
 
 import io.euhedral_execution.inference.benchmark.config.BenchmarkOptions;
 import io.euhedral_execution.inference.benchmark.config.Scenario;
+import io.euhedral_execution.inference.benchmark.prompt.ChatPromptCorpus;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.ResultStore;
 import io.euhedral_execution.inference.core.ProcessorTopology;
@@ -23,7 +24,7 @@ public final class Prerequisites {
     private Prerequisites() {}
 
     public record Prepared(
-            WorkerProcessorSelection workers, Map<Scenario, PromptMaterial> prompts, int maxPositionEmbeddings) {}
+            WorkerProcessorSelection workers, Map<Scenario, List<PromptMaterial>> prompts, int maxPositionEmbeddings) {}
 
     public static Prepared check(BenchmarkOptions options, ProcessorTopology topology) throws IOException {
         requireFile(options.artifact(), "artifact");
@@ -36,18 +37,23 @@ public final class Prerequisites {
 
         int context = QwenArtifactReader.read(options.artifact()).config().maxPositionEmbeddings();
         QwenTokenizer tokenizer = QwenTokenizer.load(options.tokenizer());
-        Map<Integer, PromptMaterial> byTarget = new HashMap<>();
-        Map<Scenario, PromptMaterial> prompts = new LinkedHashMap<>();
+        // One prompt per scenario (words), or one per corpus task (chat): iteration i runs prompt i mod size.
+        Map<Integer, List<PromptMaterial>> byTarget = new HashMap<>();
+        Map<Scenario, List<PromptMaterial>> prompts = new LinkedHashMap<>();
+        java.util.function.ToIntFunction<String> count = text -> tokenizer.encodeWithModelSpecialTokens(text).length;
         for (Scenario scenario : options.scenarios()) {
-            PromptMaterial prompt = byTarget.computeIfAbsent(
+            List<PromptMaterial> scenarioPrompts = byTarget.computeIfAbsent(
                     scenario.targetPromptTokens(),
-                    target -> PromptMaterial.build(
-                            target, options.promptSeed(), text -> tokenizer.encodeWithModelSpecialTokens(text).length));
-            long required = (long) prompt.actualTokens() + scenario.requestedNewTokens();
-            if (required > context)
-                throw new IllegalArgumentException(
-                        scenario.name() + " needs " + required + " positions; model context is " + context);
-            prompts.put(scenario, prompt);
+                    target -> options.promptCorpus().equals("chat")
+                            ? ChatPromptCorpus.build(target, count)
+                            : List.of(PromptMaterial.build(target, options.promptSeed(), count)));
+            for (PromptMaterial prompt : scenarioPrompts) {
+                long required = (long) prompt.actualTokens() + scenario.requestedNewTokens();
+                if (required > context)
+                    throw new IllegalArgumentException(
+                            scenario.name() + " needs " + required + " positions; model context is " + context);
+            }
+            prompts.put(scenario, scenarioPrompts);
         }
         return new Prepared(workers, prompts, context);
     }

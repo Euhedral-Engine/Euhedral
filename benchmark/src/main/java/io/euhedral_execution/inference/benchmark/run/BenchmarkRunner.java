@@ -53,7 +53,7 @@ public final class BenchmarkRunner {
     public static void run(
             BenchmarkOptions options,
             InferenceTuning baseTuning,
-            Map<Scenario, PromptMaterial> prompts,
+            Map<Scenario, List<PromptMaterial>> prompts,
             TargetFactory factory,
             Context context,
             Consumer<BenchmarkResult> sink)
@@ -64,13 +64,31 @@ public final class BenchmarkRunner {
                 JsonNode engine = BenchmarkResult.JSON.readTree(
                         target.snapshot(options.generation().toConfig()).toJson());
                 for (Scenario scenario : options.scenarios()) {
-                    PromptMaterial prompt = prompts.get(scenario);
-                    if (prompt == null) throw new IllegalStateException("no prompt prepared for " + scenario.name());
+                    List<PromptMaterial> scenarioPrompts = prompts.get(scenario);
+                    if (scenarioPrompts == null || scenarioPrompts.isEmpty())
+                        throw new IllegalStateException("no prompt prepared for " + scenario.name());
                     for (int index = 0; index < options.warmup(); index++)
-                        sink.accept(iteration(options, tuning, scenario, prompt, target, engine, context, true, index));
+                        sink.accept(iteration(
+                                options,
+                                tuning,
+                                scenario,
+                                scenarioPrompts.get(index % scenarioPrompts.size()),
+                                target,
+                                engine,
+                                context,
+                                true,
+                                index));
                     for (int index = 0; index < options.iterations(); index++)
-                        sink.accept(
-                                iteration(options, tuning, scenario, prompt, target, engine, context, false, index));
+                        sink.accept(iteration(
+                                options,
+                                tuning,
+                                scenario,
+                                scenarioPrompts.get(index % scenarioPrompts.size()),
+                                target,
+                                engine,
+                                context,
+                                false,
+                                index));
                 }
             }
         }

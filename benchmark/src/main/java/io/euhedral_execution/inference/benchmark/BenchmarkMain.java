@@ -111,9 +111,9 @@ public final class BenchmarkMain {
                 + ", measured " + options.iterations() + " per scenario; generation " + options.generation()
                 + "; fork " + (forkId == null ? "unspecified" : forkId));
         prepared.prompts()
-                .forEach((scenario, prompt) -> System.out.println("scenario " + scenario.name() + ": prompt "
-                        + prompt.actualTokens() + "/" + prompt.targetTokens() + " tokens, sha256 "
-                        + prompt.sha256()));
+                .forEach((scenario, prompts) -> prompts.forEach(prompt -> System.out.println("scenario "
+                        + scenario.name() + ": " + prompt.generator() + " prompt " + prompt.actualTokens() + "/"
+                        + prompt.targetTokens() + " tokens, sha256 " + prompt.sha256())));
         System.out.println("output: " + options.output().toAbsolutePath());
         if (validateOnly) {
             System.out.println("validation passed; no model was loaded");
