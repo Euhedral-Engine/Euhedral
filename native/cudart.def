@@ -12,6 +12,8 @@ EXPORTS
     cudaHostAlloc
     cudaMemGetInfo
     cudaMemcpy
+    cudaMemcpy2D
+    cudaMemcpy2DAsync
     cudaMemcpyAsync
     cudaMemset
     cudaMemsetAsync

@@ -1,5 +1,6 @@
 #include "cuda_kernel_loader.h"
 #include "q3_prefill_policy.h"
+#include "q3_p2e2_geometry.h"
 #include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -23,6 +24,7 @@ static CUfunction function;
 static CUfunction decode1, decode2, decode4, decode_wide, decode_contiguous, prefill, prefill64, prefill64_wmma, prefill64_k32_cb, prefill_s104;
 static CUfunction prefill_exact, prefill64_exact, prefill64_k32_cb_exact, prefill_s104_exact;
 static CUfunction prefill_engine, prefill_engine64;
+static CUfunction p2e2_decode, p2e2_expand;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 /* Alias of euhedral_cuda_select_exact_numerics, kept for existing callers. */
 int euhedral_cuda_q3_decode_select_exact(int exact) {
@@ -51,12 +53,15 @@ static void initialize(void) {
     prefill64_k32_cb_exact = optional_kernel("euhedral_q3_prefill_64_k32_cb_exact");
     prefill_engine = optional_kernel("euhedral_q3_prefill_128x64");
     prefill_engine64 = optional_kernel("euhedral_q3_prefill_64x64");
+    p2e2_decode = optional_kernel("euhedral_q3_p2e2_decode");
+    p2e2_expand = optional_kernel("euhedral_q3_p2e2_expand");
     // The decode kernels begin with euhedral_pdl_begin() (see cuda_kernel_loader.h).
     euhedral_cuda_pdl_register(decode1);
     euhedral_cuda_pdl_register(decode2);
     euhedral_cuda_pdl_register(decode4);
     euhedral_cuda_pdl_register(decode_wide);
     euhedral_cuda_pdl_register(decode_contiguous);
+    euhedral_cuda_pdl_register(p2e2_decode);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -169,4 +174,63 @@ int euhedral_cuda_linear_q3_prefill_bf16(const void* input, const void* weights,
 int euhedral_cuda_linear_q3_prefill_64_bf16(const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
     return linear_q3(input, weights, output, rows, in_features, out_features, weights_byte_size, 3);
+}
+
+static int ensure_initialized(void) {
+#ifdef _WIN32
+    if (!InitOnceExecuteOnce(&once, initialize_once, NULL, NULL)) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+#else
+    if (pthread_once(&once, initialize) != 0) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+#endif
+    return init_status;
+}
+
+static int finish_launch(CUresult status) {
+    if (status != CUDA_SUCCESS) return (int)status;
+    if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
+    cudaError_t sync = cudaDeviceSynchronize();
+    return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
+}
+
+int euhedral_cuda_linear_q3_p2e2_decode_bf16(const void* input, const void* weights, void* output,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
+    if (input == NULL || weights == NULL || output == NULL || rows == 0 || out_features == 0)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    int geometry = euhedral_q3_p2e2_geometry(out_features, in_features, weights_byte_size);
+    if (geometry != EUHEDRAL_CUDA_SUCCESS) return geometry;
+    int context_status = euhedral_cuda_bind_thread_context();
+    if (context_status != EUHEDRAL_CUDA_SUCCESS) return context_status;
+    int status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    // The fused route reproduces euhedral_q3_decode_contiguous only; every other route expands.
+    if (p2e2_decode == NULL || euhedral_cuda_exact_numerics() || rows != 1u
+            || ((uintptr_t)input & 15u) != 0u || ((uintptr_t)weights & 15u) != 0u
+            || !euhedral_q3_decode_contiguous_shape(rows, in_features, out_features))
+        return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
+    CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
+    CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
+    unsigned int in_arg = in_features, out_arg = out_features;
+    void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
+    return finish_launch(euhedral_launch_kernel(p2e2_decode, out_features / 16u, 1, 1, 128, 1, 1, 0,
+            euhedral_cuda_submission_stream(), params, NULL));
+}
+
+int euhedral_cuda_q3_p2e2_expand(const void* weights, uint64_t weights_byte_size, uint32_t rows,
+        uint32_t in_features, uint32_t first_row, uint32_t row_count, void* destination, uint64_t destination_byte_size) {
+    if (weights == NULL || destination == NULL || row_count == 0 || first_row >= rows || row_count > rows - first_row)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    int geometry = euhedral_q3_p2e2_geometry(rows, in_features, weights_byte_size);
+    if (geometry != EUHEDRAL_CUDA_SUCCESS) return geometry;
+    if (destination_byte_size < euhedral_q3_row_split_size(row_count, in_features)) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    if (((uintptr_t)weights & 15u) != 0u || ((uintptr_t)destination & 15u) != 0u) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    int context_status = euhedral_cuda_bind_thread_context();
+    if (context_status != EUHEDRAL_CUDA_SUCCESS) return context_status;
+    int status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    if (p2e2_expand == NULL) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    CUdeviceptr weights_ptr = (CUdeviceptr)(uintptr_t)weights, destination_ptr = (CUdeviceptr)(uintptr_t)destination;
+    unsigned int rows_arg = rows, in_arg = in_features, first_arg = first_row, count_arg = row_count;
+    void* params[] = {&weights_ptr, &destination_ptr, &rows_arg, &in_arg, &first_arg, &count_arg};
+    return finish_launch(euhedral_launch_kernel(p2e2_expand, (row_count + 3u) / 4u, 1, 1, 128, 1, 1, 0,
+            euhedral_cuda_submission_stream(), params, NULL));
 }

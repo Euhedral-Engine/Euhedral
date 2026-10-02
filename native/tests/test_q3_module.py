@@ -19,7 +19,8 @@ HEADERS = (
     'primitives/staging.cuh', 'primitives/mma.cuh', 'primitives/mma_leaf.cuh',
     'primitives/accumulation.cuh', 'primitives/writeback.cuh',
     'strategies/scalar.cuh', 'strategies/decode.cuh',
-    'strategies/prefill.cuh', 'strategies/k32_prefill.cuh',
+    'strategies/prefill.cuh', 'strategies/k32_prefill.cuh', 'strategies/decode_contiguous.cuh',
+    'p2e2.cuh',
 )
 
 HOST_DISPATCH_SOURCE = r'''#include <stdint.h>

@@ -172,6 +172,27 @@ int euhedral_cuda_copy_device_to_device(
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 
+int euhedral_cuda_copy_device_to_device_2d(
+        void* destination_address,
+        uint64_t destination_pitch,
+        const void* source_address,
+        uint64_t source_pitch,
+        uint64_t row_bytes,
+        uint64_t rows) {
+    if (row_bytes == 0 || rows == 0) return EUHEDRAL_CUDA_SUCCESS;
+    if (destination_address == NULL || source_address == NULL || destination_pitch < row_bytes || source_pitch < row_bytes)
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    if (destination_pitch > SIZE_MAX || source_pitch > SIZE_MAX || row_bytes > SIZE_MAX || rows > SIZE_MAX)
+        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    cudaStream_t stream = euhedral_cuda_submission_stream();
+    cudaError_t status = stream == NULL
+            ? cudaMemcpy2D(destination_address, (size_t)destination_pitch, source_address, (size_t)source_pitch,
+                    (size_t)row_bytes, (size_t)rows, cudaMemcpyDeviceToDevice)
+            : cudaMemcpy2DAsync(destination_address, (size_t)destination_pitch, source_address, (size_t)source_pitch,
+                    (size_t)row_bytes, (size_t)rows, cudaMemcpyDeviceToDevice, stream);
+    return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
 uint64_t euhedral_cuda_stream_create(void) {
     cudaStream_t stream = NULL;
     if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return 0;
