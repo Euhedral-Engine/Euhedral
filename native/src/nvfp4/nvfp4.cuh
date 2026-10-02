@@ -1,0 +1,162 @@
+#pragma once
+#include "gemm/balanced.cuh"
+#include "common/pdl.cuh"
+
+// NVFP4 weights (WeightFormat.NVFP4, row-split-k128-v1; Nvfp4Layout.java,
+// tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4). Rows of K values, K padded to
+// 128: E2M1 codes two per byte with the even K in the low nibble, then a 256-aligned plane of one
+// E4M3 scale per 16 values, then a 256-aligned FP32 global scale. A weight is
+// e2m1(code) * e4m3(scale) * global.
+namespace nvfp4 {
+static constexpr unsigned int kBlock = 16u;
+
+static __host__ __device__ __forceinline__ unsigned long long align256(unsigned long long v) { return (v + 255ull) & ~255ull; }
+
+struct Layout {
+    const unsigned char* codes;
+    const unsigned char* scales;
+    float global;
+    unsigned int row_bytes, row_scales;
+    __device__ __forceinline__ Layout(const unsigned char* w, unsigned int in_features, unsigned int rows) {
+        const unsigned long long k = (in_features + 127u) / 128u * 128u;
+        row_bytes = (unsigned int)(k / 2u);
+        row_scales = (unsigned int)(k / kBlock);
+        const unsigned long long scale_offset = align256((unsigned long long)rows * row_bytes);
+        const unsigned long long global_offset = align256(scale_offset + (unsigned long long)rows * row_scales);
+        codes = w;
+        scales = w + scale_offset;
+        global = *reinterpret_cast<const float*>(w + global_offset);
+    }
+};
+
+// E4M3 (no sign, never NaN in a valid tensor) is FP16 with the exponent bias of 7: shifting its bits
+// into an FP16 and multiplying by 2^8 is exact, subnormals included.
+static __device__ __forceinline__ float e4m3_to_float(unsigned int bits) {
+    return __half2float(__ushort_as_half((unsigned short)((bits & 0x7fu) << 7))) * 256.0f;
+}
+
+static __device__ __forceinline__ float e2m1_value(unsigned int code) {
+    const unsigned int magnitude = code & 7u;
+    const float value = magnitude < 4u ? 0.5f * (float)magnitude : magnitude == 4u ? 2.0f : magnitude == 5u ? 3.0f : magnitude == 6u ? 4.0f : 6.0f;
+    return (code & 8u) ? -value : value;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Single-row decode: each lane owns 32 contiguous K values of a 1024-value slice (16 code bytes, one
+// 16-byte load, and two block scales), each warp owns kRows rows and reuses its 32 activations for
+// all of them. Code values come from a 16-entry shared table, one entry per bank. Each 16-value
+// block forms an FP32 dot product scaled once by its block scale; the global scale is applied last.
+// Requirements (checked by host dispatch): one row, in_features a multiple of 1024, out_features a
+// multiple of 4 * kRows, 16-byte aligned input and weights.
+static constexpr int kDecodeRows = 4;
+
+static __device__ __forceinline__ void decode(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int in_features, unsigned int out_features) {
+    __shared__ float table[16];
+    if (threadIdx.x < 16u) table[threadIdx.x] = e2m1_value(threadIdx.x);
+    __syncthreads();
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kDecodeRows;
+    const Layout w(weights, in_features, out_features);
+    const unsigned int slices = in_features / 1024u;
+    float sums[kDecodeRows] = {};
+    euhedral_pdl_begin();
+    for (unsigned int slice = 0; slice < slices; slice++) {
+        uint4 codes[kDecodeRows];
+        unsigned int scale_pair[kDecodeRows];
+        #pragma unroll
+        for (int r = 0; r < kDecodeRows; r++) {
+            const unsigned long long row = first_row + r;
+            codes[r] = reinterpret_cast<const uint4*>(w.codes + row * w.row_bytes)[slice * 32u + lane];
+            scale_pair[r] = reinterpret_cast<const unsigned short*>(w.scales + row * w.row_scales)[slice * 32u + lane];
+        }
+        float x[32];
+        const uint4* activation = reinterpret_cast<const uint4*>(input + slice * 1024u + 32u * lane);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint4 v = activation[i];
+            const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
+                x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < kDecodeRows; r++) {
+            const unsigned int words[4] = {codes[r].x, codes[r].y, codes[r].z, codes[r].w};
+            float block[2] = {0.0f, 0.0f};
+            #pragma unroll
+            for (int j = 0; j < 32; j++) {
+                const float value = table[(words[j >> 3] >> ((j & 7) * 4)) & 15u];
+                block[j >> 4] = fmaf(x[j], value, block[j >> 4]);
+            }
+            sums[r] = fmaf(block[0], e4m3_to_float(scale_pair[r] & 0xffu), sums[r]);
+            sums[r] = fmaf(block[1], e4m3_to_float(scale_pair[r] >> 8), sums[r]);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < kDecodeRows; r++) {
+        #pragma unroll
+        for (int distance = 16; distance; distance >>= 1) sums[r] += __shfl_xor_sync(0xffffffffu, sums[r], distance);
+    }
+    float mine = sums[0];
+    #pragma unroll
+    for (int r = 1; r < kDecodeRows; r++) mine = lane == (unsigned int)r ? sums[r] : mine;
+    if (lane < (unsigned int)kDecodeRows) q3::write_bf16(output, 0, first_row + lane, out_features, mine * w.global);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// B operand of the balanced tile engine (gemm/balanced.cuh): one 16-column x K32 tile per warp and
+// generation, staged as BF16(e2m1 * scale * global). Lanes 8c..8c+7 own column c of each 4-column
+// pass; sublanes 0-3 hold the K32 block's four code words, sublane 4 its two block scales.
+struct B {
+    using Layout = nvfp4::Layout;
+    struct Compact { unsigned int words[4]; float global; };
+    static __device__ __forceinline__ Layout layout(const unsigned char* w, unsigned int width, unsigned int outputs,
+            unsigned long long) { return Layout(w, width, outputs); }
+    static __device__ __forceinline__ void prefetch(Compact& next, const Layout& w, unsigned int outputs,
+            unsigned int first_col, unsigned int base, unsigned int lane) {
+        const unsigned int sublane = lane & 7u;
+        #pragma unroll
+        for (unsigned int j = 0; j < 4; ++j) {
+            const unsigned int col = first_col + (lane >> 3) + 4u * j;
+            unsigned int word = 0;
+            if (col < outputs) {
+                if (sublane < 4u)
+                    word = reinterpret_cast<const unsigned int*>(w.codes + (unsigned long long)col * w.row_bytes)[base / 8u + sublane];
+                else if (sublane == 4u)
+                    word = reinterpret_cast<const unsigned short*>(w.scales + (unsigned long long)col * w.row_scales)[base / 32u];
+            }
+            next.words[j] = word;
+        }
+        next.global = w.global;
+    }
+    template<int P>
+    static __device__ __forceinline__ void stage(__nv_bfloat16* hi, __nv_bfloat16*, const Compact& next, unsigned int lane) {
+        const unsigned int sublane = lane & 7u;
+        #pragma unroll
+        for (unsigned int j = 0; j < 4; ++j) {
+            const unsigned int col = (lane >> 3) + 4u * j;
+            const unsigned int scale_pair = __shfl_sync(0xffffffffu, next.words[j], 4, 8);
+            #pragma unroll
+            for (unsigned int h = 0; h < 2; ++h) {
+                const float scale = e4m3_to_float(h ? scale_pair >> 8 : scale_pair & 0xffu) * next.global;
+                const unsigned int word = __shfl_sync(0xffffffffu, next.words[j], h * 2u + (sublane >> 2), 8);
+                const unsigned int pair = (word >> ((sublane & 3u) * 8u)) & 0xffu;
+                const unsigned int i = k32_probe::b_index(col, h * 16u + sublane * 2u);
+                hi[i] = __float2bfloat16_rn(e2m1_value(pair & 15u) * scale);
+                hi[i + 1] = __float2bfloat16_rn(e2m1_value(pair >> 4) * scale);
+            }
+        }
+    }
+    template<int P>
+    static __device__ __forceinline__ void produce(__nv_bfloat16* hi, __nv_bfloat16* lo, const Layout& w,
+            unsigned int outputs, unsigned int col, unsigned int base, unsigned int lane) {
+        Compact now;
+        prefetch(now, w, outputs, col, base, lane);
+        stage<P>(hi, lo, now, lane);
+    }
+};
+}  // namespace nvfp4
