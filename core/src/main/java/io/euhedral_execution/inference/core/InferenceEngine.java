@@ -402,13 +402,12 @@ public final class InferenceEngine implements AutoCloseable {
 
         QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu, InferenceTuning tuning)
                 throws IOException {
-            if (tuning.weightResidency() == WeightResidency.ALL && tuning.hostWeightBytes() == 0)
+            boolean speculative = tuning.speculativeDepth() > 0;
+            if (!speculative && tuning.weightResidency() == WeightResidency.ALL && tuning.hostWeightBytes() == 0)
                 return loadModel(path, artifact, gpu);
-            // Speculative decoding needs the MTP layer and draft head that EXECUTED leaves out.
-            WeightResidency residency =
-                    tuning.speculativeDepth() > 0 && tuning.weightResidency() == WeightResidency.EXECUTED
-                            ? WeightResidency.SPECULATIVE
-                            : tuning.weightResidency();
+            // Speculative decoding needs the MTP layer prepared for execution and the draft head; only the
+            // SPECULATIVE residency loads them so (it leaves out the vision tower).
+            WeightResidency residency = speculative ? WeightResidency.SPECULATIVE : tuning.weightResidency();
             return QwenModel.load(
                     path,
                     artifact,

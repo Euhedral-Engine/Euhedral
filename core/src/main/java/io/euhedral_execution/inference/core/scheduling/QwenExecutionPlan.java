@@ -597,7 +597,13 @@ public final class QwenExecutionPlan {
             this.mtpDraft = null;
             return;
         }
-        this.mtpDraft = weights.mtp() != null && weights.runtimeObjects().containsKey(DRAFT_HEAD)
+        // Drafting needs the MTP attention split like a base layer's, which only a speculative load does.
+        this.mtpDraft = weights.mtp() != null
+                        && weights.mtp().layer().mixer()
+                                instanceof
+                                io.euhedral_execution.inference.core.model_loader.layer_weights
+                                        .QwenCompactAttentionWeights
+                        && weights.runtimeObjects().containsKey(DRAFT_HEAD)
                 ? new QwenExecutionPlan(weights, staged(mtpDraft(weights), this.staging), this, false)
                 : null;
         QwenConfig config = weights.config();
