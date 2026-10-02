@@ -358,4 +358,150 @@ static __device__ __forceinline__ void linear(
     }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Skinny linear for decode-like row counts (M <= 16 * kMF): weight streaming, not MMA, is the cost.
+// CTA: 4 warps over 64 output columns (one warp per 16 columns, two n8 fragments) and all M rows
+// (kMF m16 fragments); K tile 256 values (128 code bytes per row); S::kStages-deep cp.async pipeline
+// so each SM keeps several weight tiles in flight. gridDim.y splits K: with one split the CTA writes
+// BF16; otherwise it adds its scaled FP32 partials into `partials` (rows x cols, zeroed) and
+// skinny_finish converts them.
+static constexpr int kSkinnyBK = 256, kSkinnyRowBytes = kSkinnyBK / 2, kSkinnyStride = kSkinnyRowBytes + 16;
+static constexpr int kSkinnyScaleBytes = kSkinnyBK / 16, kSkinnyCols = 64, kSkinnyThreads = 128;
+static constexpr int kSharedLimit = 101376;                   // sm_120 per-block opt-in
+template <int kTerms, int kMF> struct Skinny {
+    static constexpr int kRows = 16 * kMF;
+    static constexpr int kStageBytes = (kTerms * kRows + kSkinnyCols) * (kSkinnyStride + kSkinnyScaleBytes);
+    static constexpr int kStages = kSharedLimit / kStageBytes >= 4 ? 4 : kSharedLimit / kStageBytes;
+    static constexpr int kSharedBytes = kStages * kStageBytes;
+};
+
+template <int kTerms, int kMF>
+static __device__ __forceinline__ void skinny_load(unsigned char* stage, const Matrix& a, const Matrix& b,
+        unsigned int rows, unsigned int n0, unsigned int cols, unsigned int tile) {
+    constexpr int R = Skinny<kTerms, kMF>::kRows;
+    unsigned char* a_codes = stage;
+    unsigned char* b_codes = stage + kTerms * R * kSkinnyStride;
+    unsigned char* a_scales = b_codes + kSkinnyCols * kSkinnyStride;
+    unsigned char* b_scales = a_scales + kTerms * R * kSkinnyScaleBytes;
+    const unsigned int byte0 = tile * kSkinnyRowBytes, scale0 = tile * kSkinnyScaleBytes;
+    // B: 64 rows x 8 chunks of 16 bytes = 512 chunks, 4 per thread; scales 64 x 16 bytes, one chunk each.
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned int chunk = threadIdx.x + i * kSkinnyThreads, r = chunk >> 3, c = (chunk & 7u) * 16u;
+        const bool v = n0 + r < cols;
+        cp_async(b_codes + r * kSkinnyStride + c, b.codes + (unsigned long long)(v ? n0 + r : 0) * b.row_bytes + byte0 + c, 16, v);
+    }
+    if (threadIdx.x < kSkinnyCols) {
+        const unsigned int r = threadIdx.x;
+        const bool v = n0 + r < cols;
+        cp_async(b_scales + r * kSkinnyScaleBytes, b.scales + (unsigned long long)(v ? n0 + r : 0) * b.row_scales + scale0, 16, v);
+    }
+    // A: kTerms * R rows x 8 chunks; scales kTerms * R chunks.
+    for (unsigned int chunk = threadIdx.x; chunk < (unsigned int)(kTerms * R * 8); chunk += kSkinnyThreads) {
+        const unsigned int pr = chunk >> 3, c = (chunk & 7u) * 16u, term = pr / R, r = pr % R;
+        const bool v = r < rows;
+        cp_async(a_codes + pr * kSkinnyStride + c, a.codes + ((unsigned long long)term * rows + (v ? r : 0)) * a.row_bytes + byte0 + c, 16, v);
+    }
+    for (unsigned int pr = threadIdx.x; pr < (unsigned int)(kTerms * R); pr += kSkinnyThreads) {
+        const unsigned int term = pr / R, r = pr % R;
+        const bool v = r < rows;
+        cp_async(a_scales + pr * kSkinnyScaleBytes, a.scales + ((unsigned long long)term * rows + (v ? r : 0)) * a.row_scales + scale0, 16, v);
+    }
+}
+
+template <int kTerms, int kMF>
+static __device__ __forceinline__ void skinny_linear(
+        const unsigned char* activations, const unsigned char* weight_tensor, __nv_bfloat16* output, float* partials,
+        unsigned int rows, unsigned int k, unsigned int cols) {
+    using S = Skinny<kTerms, kMF>;
+    constexpr int R = S::kRows;
+    extern __shared__ __align__(128) unsigned char shared[];
+    const ActivationLayout act(rows, k, kTerms);
+    const Matrix a{activations, activations + act.scale_offset, k / 2u, k / 16u};
+    float weight_global;
+    const Matrix b = weights(weight_tensor, k, cols, &weight_global);
+    const float* row_globals = reinterpret_cast<const float*>(activations + act.global_offset);
+    const unsigned int n0 = blockIdx.x * kSkinnyCols;
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3u;
+    const unsigned int k_tiles = k / kSkinnyBK, splits = gridDim.y;
+    const unsigned int first = (unsigned int)((unsigned long long)k_tiles * blockIdx.y / splits);
+    const unsigned int last = (unsigned int)((unsigned long long)k_tiles * (blockIdx.y + 1) / splits);
+    float acc[kMF][2][4] = {};
+    euhedral_pdl_begin();
+#pragma unroll
+    for (int s = 0; s < S::kStages - 1; ++s) {
+        if (first + s < last) skinny_load<kTerms, kMF>(shared + s * S::kStageBytes, a, b, rows, n0, cols, first + s);
+        asm volatile("cp.async.commit_group;");
+    }
+    for (unsigned int tile = first; tile < last; ++tile) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(S::kStages - 2));
+        __syncthreads();
+        const unsigned int next = tile + S::kStages - 1;
+        if (next < last) skinny_load<kTerms, kMF>(shared + ((next - first) % S::kStages) * S::kStageBytes, a, b, rows, n0, cols, next);
+        asm volatile("cp.async.commit_group;");
+        const unsigned char* stage = shared + ((tile - first) % S::kStages) * S::kStageBytes;
+        const unsigned char* b_codes = stage + kTerms * R * kSkinnyStride;
+        const unsigned char* a_scales = b_codes + kSkinnyCols * kSkinnyStride;
+        const unsigned char* b_scales = a_scales + kTerms * R * kSkinnyScaleBytes;
+        const unsigned int mat = lane >> 3, r8 = lane & 7u, wn = warp * 16u;
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {   // K steps 2 pair, 2 pair + 1 share scale registers
+            // B scales for steps 2 pair (selector 0, lanes t = 0) and 2 pair + 1 (selector 1, lanes t = 1).
+            unsigned int sb[2];
+#pragma unroll
+            for (int nf = 0; nf < 2; ++nf)
+                sb[nf] = *reinterpret_cast<const unsigned int*>(b_scales + (wn + nf * 8u + g) * kSkinnyScaleBytes + 8u * pair + 4u * (t & 1u));
+            unsigned int sa[kTerms][kMF];
+#pragma unroll
+            for (int term = 0; term < kTerms; ++term)
+#pragma unroll
+                for (int mf = 0; mf < kMF; ++mf)
+                    sa[term][mf] = *reinterpret_cast<const unsigned int*>(
+                            a_scales + (term * R + mf * 16u + g + 8u * (t & 1u)) * kSkinnyScaleBytes + 8u * pair + 4u * (t >> 1));
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const unsigned int step = 2u * pair + half;
+                unsigned int bf[4];
+                ldmatrix_x4(bf, b_codes + (wn + r8 + 8u * (mat >> 1)) * kSkinnyStride + 32u * step + 16u * (mat & 1u));
+#pragma unroll
+                for (int term = 0; term < kTerms; ++term)
+#pragma unroll
+                    for (int mf = 0; mf < kMF; ++mf) {
+                        unsigned int af[4];
+                        ldmatrix_x4(af, stage + (term * R + mf * 16u + r8 + 8u * (mat & 1u)) * kSkinnyStride + 32u * step + 16u * (mat >> 1));
+#pragma unroll
+                        for (int nf = 0; nf < 2; ++nf) {
+                            if (half == 0) mma<0, 0>(acc[mf][nf], af, bf[nf * 2], bf[nf * 2 + 1], sa[term][mf], sb[nf]);
+                            else mma<1, 1>(acc[mf][nf], af, bf[nf * 2], bf[nf * 2 + 1], sa[term][mf], sb[nf]);
+                        }
+                    }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;");
+#pragma unroll
+    for (int mf = 0; mf < kMF; ++mf)
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned int row = mf * 16u + g + 8u * half;
+            if (row >= rows) continue;
+            const float scale = row_globals[row] * weight_global;
+#pragma unroll
+            for (int nf = 0; nf < 2; ++nf) {
+                const unsigned int col = n0 + warp * 16u + nf * 8u + 2u * t;
+                if (col >= cols) continue;
+                const float x = acc[mf][nf][2 * half] * scale, y = acc[mf][nf][2 * half + 1] * scale;
+                if (splits == 1) {
+                    __nv_bfloat16* out = output + (unsigned long long)row * cols + col;
+                    if (col + 1u < cols) *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(x, y);
+                    else *out = __float2bfloat16_rn(x);
+                } else {
+                    float* p = partials + (unsigned long long)row * cols + col;
+                    atomicAdd(p, x);
+                    if (col + 1u < cols) atomicAdd(p + 1, y);
+                }
+            }
+        }
+}
+
 }  // namespace nvfp4n

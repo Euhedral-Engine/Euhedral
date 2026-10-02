@@ -22,3 +22,22 @@ EUHEDRAL_NVFP4N_LINEAR(euhedral_nvfp4n_gate_up_swiglu_128x64, 1, true)
 EUHEDRAL_NVFP4N_LINEAR(euhedral_nvfp4n_linear_x2_128x128, 2, false)
 EUHEDRAL_NVFP4N_LINEAR(euhedral_nvfp4n_gate_up_swiglu_x2_128x64, 2, true)
 
+// Skinny (decode-like) linear: gridDim.x = ceil(cols / 64), gridDim.y = K splits.
+#define EUHEDRAL_NVFP4N_SKINNY(name, terms, mf)                                                             \
+    extern "C" __global__ void __launch_bounds__(nvfp4n::kSkinnyThreads) name(                              \
+            const unsigned char* activations, const unsigned char* weights, __nv_bfloat16* output,          \
+            float* partials, unsigned int rows, unsigned int k, unsigned int cols) {                       \
+        nvfp4n::skinny_linear<terms, mf>(activations, weights, output, partials, rows, k, cols);            \
+    }
+EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_16, 1, 1)
+EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_32, 1, 2)
+EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_64, 1, 4)
+EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_x2_16, 2, 1)
+EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_x2_32, 2, 2)
+EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_x2_64, 2, 4)
+
+// FP32 partials (rows x cols) to BF16.
+extern "C" __global__ void euhedral_nvfp4n_skinny_finish(const float* partials, __nv_bfloat16* output, unsigned int count) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) output[i] = __float2bfloat16_rn(partials[i]);
+}

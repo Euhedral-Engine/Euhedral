@@ -126,13 +126,35 @@ int euhedral_cuda_nvfp4_gate_up_swiglu_bf16(const void* input, const void* weigh
  * (OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X). The module is compiled for this device's sm_12xa target and
  * exists only there; EUHEDRAL_NVFP4_NATIVE=0 selects the BF16-expansion kernels above instead. */
 #define NATIVE_SHARED_BYTES 67584u  /* nvfp4n::Pipeline<1 or 2>::kSharedBytes */
+#define SKINNY_MAX_ROWS 64u
+#define SKINNY_COLUMNS 64u
+#define SKINNY_TARGET_CTAS 140u  /* two per SM */
+
+/* nvfp4n::Skinny<terms, rows / 16>::kSharedBytes: stages of (A rows + 64 weight rows) x 160 bytes. */
+static uint32_t skinny_shared_bytes(uint32_t terms, uint32_t rows) {
+    uint32_t stage = (terms * rows + SKINNY_COLUMNS) * 160u, stages = 101376u / stage;
+    return (stages > 4u ? 4u : stages) * stage;
+}
+
+/* K splits for the skinny kernel: enough CTAs to keep every SM streaming weights. */
+static uint32_t skinny_splits(uint32_t in_features, uint32_t out_features) {
+    uint32_t tiles = (out_features + SKINNY_COLUMNS - 1u) / SKINNY_COLUMNS, k_tiles = in_features / 256u;
+    uint32_t splits = (SKINNY_TARGET_CTAS + tiles - 1u) / tiles, limit = k_tiles / 2u;
+    if (splits > limit) splits = limit;
+    return splits == 0u ? 1u : splits;
+}
+
+static int skinny_route(uint32_t rows, uint32_t in_features) {
+    return rows <= SKINNY_MAX_ROWS && in_features % 256u == 0;
+}
 #ifdef _WIN32
 static INIT_ONCE native_once = INIT_ONCE_STATIC_INIT;
 #else
 static pthread_once_t native_once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule native_module;
-static CUfunction native_quantize, native_linear, native_gate_up;
+static CUfunction native_quantize, native_linear, native_gate_up, native_finish;
+static CUfunction native_skinny[3];  /* up to 16, 32 and 64 rows */
 static int native_status = EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
 /* Activation terms: 2 (the default) adds a quantized residual, about 1% error per linear, at the
  * relaxed-numerics floor of the drift harness; 1 (EUHEDRAL_NVFP4_NATIVE=1) quantizes once, about 10%,
@@ -152,6 +174,18 @@ static void initialize_native(void) {
                     || cuModuleGetFunction(&native_gate_up, native_module,
                                two ? "euhedral_nvfp4n_gate_up_swiglu_x2_128x64" : "euhedral_nvfp4n_gate_up_swiglu_128x64")
                             != CUDA_SUCCESS))
+        status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    static const char* skinny_names[2][3] = {
+            {"euhedral_nvfp4n_skinny_16", "euhedral_nvfp4n_skinny_32", "euhedral_nvfp4n_skinny_64"},
+            {"euhedral_nvfp4n_skinny_x2_16", "euhedral_nvfp4n_skinny_x2_32", "euhedral_nvfp4n_skinny_x2_64"}};
+    for (int i = 0; i < 3 && status == EUHEDRAL_CUDA_SUCCESS; ++i) {
+        if (cuModuleGetFunction(&native_skinny[i], native_module, skinny_names[two][i]) != CUDA_SUCCESS
+                || cuFuncSetAttribute(native_skinny[i], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           (int)skinny_shared_bytes(native_terms, 16u << i)) != CUDA_SUCCESS)
+            status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    }
+    if (status == EUHEDRAL_CUDA_SUCCESS
+            && cuModuleGetFunction(&native_finish, native_module, "euhedral_nvfp4n_skinny_finish") != CUDA_SUCCESS)
         status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     if (status == EUHEDRAL_CUDA_SUCCESS
             && (cuFuncSetAttribute(native_linear, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)NATIVE_SHARED_BYTES)
@@ -188,12 +222,20 @@ int euhedral_cuda_nvfp4_native_available(void) {
     return ensure_native() == EUHEDRAL_CUDA_SUCCESS;
 }
 
-/* Scratch for `rows` activation rows of `in_features` values in the selected number of terms: codes, a
+/* Activations of `rows` rows of `in_features` values in the selected number of terms: codes, a
  * 256-aligned scale plane and one FP32 global per row (nvfp4n::ActivationLayout). */
-uint64_t euhedral_cuda_nvfp4_activation_bytes(uint32_t rows, uint32_t in_features) {
+static uint64_t activation_bytes(uint32_t rows, uint32_t in_features) {
     uint64_t k = ((uint64_t)in_features + 127u) / 128u * 128u, planes = (uint64_t)rows * native_terms;
     uint64_t scales = align256(planes * k / 2u);
     return align256(scales + planes * k / 16u) + 4ull * rows;
+}
+
+/* Scratch for one native linear: the activations, then (split-K skinny shapes) FP32 partials. */
+uint64_t euhedral_cuda_nvfp4_native_scratch_bytes(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    uint64_t bytes = activation_bytes(rows, in_features);
+    if (skinny_route(rows, in_features) && skinny_splits(in_features, out_features) > 1u)
+        bytes = align256(bytes) + 4ull * rows * out_features;
+    return bytes;
 }
 
 static int launch_native(CUfunction kernel, uint64_t column_tile, const void* input, const void* weights, void* output,
@@ -228,7 +270,9 @@ static int launch_native(CUfunction kernel, uint64_t columns, const void* input,
     if (in_features % 128u != 0 || euhedral_cuda_exact_numerics()) return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
     status = prepare(input, weights, output, rows, in_features, out_features, weights_byte_size);
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    if (scratch == NULL || scratch_byte_size < euhedral_cuda_nvfp4_activation_bytes(rows, in_features))
+    const int skinny = kernel == native_linear && skinny_route(rows, in_features);
+    if (scratch == NULL || scratch_byte_size < (skinny ? euhedral_cuda_nvfp4_native_scratch_bytes(rows, in_features, out_features)
+                                                       : activation_bytes(rows, in_features)))
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     uint64_t grid = ((uint64_t)rows + 127u) / 128u * ((columns + 127u) / 128u);
     if (grid > 2147483647u) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
@@ -239,6 +283,22 @@ static int launch_native(CUfunction kernel, uint64_t columns, const void* input,
     void* quantize_params[] = {&input_ptr, &scratch_ptr, &rows_arg, &in_arg};
     CUresult result = euhedral_launch_kernel(native_quantize, rows, 1, 1, 128, 1, 1, 0, stream, quantize_params, NULL);
     if (result != CUDA_SUCCESS) return finish(result);
+    if (skinny) {
+        /* Decode-like rows: weight streaming dominates, so 64-column CTAs, split over K when the
+         * columns alone cannot occupy the GPU, partials summed in FP32 and converted once. */
+        const uint32_t index = rows <= 16u ? 0u : rows <= 32u ? 1u : 2u, splits = skinny_splits(in_features, out_features);
+        CUdeviceptr partials = splits > 1u ? scratch_ptr + align256(activation_bytes(rows, in_features)) : 0;
+        if (splits > 1u && cudaMemsetAsync((void*)(uintptr_t)partials, 0, 4ull * rows * out_features, stream) != cudaSuccess)
+            return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+        void* skinny_params[] = {&scratch_ptr, &weights_ptr, &output_ptr, &partials, &rows_arg, &in_arg, &out_arg};
+        result = euhedral_launch_kernel(native_skinny[index], (out_features + SKINNY_COLUMNS - 1u) / SKINNY_COLUMNS, splits, 1,
+                128, 1, 1, skinny_shared_bytes(native_terms, 16u << index), stream, skinny_params, NULL);
+        if (result != CUDA_SUCCESS || splits == 1u) return finish(result);
+        unsigned int count = rows * out_features;
+        void* finish_params[] = {&partials, &output_ptr, &count};
+        return finish(euhedral_launch_kernel(native_finish, (count + 255u) / 256u, 1, 1, 256, 1, 1, 0, stream,
+                finish_params, NULL));
+    }
     void* linear_params[] = {&scratch_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg};
     return finish(euhedral_launch_kernel(kernel, (unsigned int)grid, 1, 1, 256, 1, 1, NATIVE_SHARED_BYTES,
             stream, linear_params, NULL));
