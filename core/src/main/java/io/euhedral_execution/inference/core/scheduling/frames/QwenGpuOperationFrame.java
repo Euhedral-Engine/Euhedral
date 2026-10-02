@@ -15,6 +15,8 @@ import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 public final class QwenGpuOperationFrame extends QwenStageFrame {
 
     private AttentionKvState pendingAppendState;
+    /// The GDN state a verification checkpointed in this frame; its commit sets the replay.
+    private QwenGdnSequenceState pendingSpeculativeState;
 
     QwenGpuOperationFrame(StageGraph graph, QwenExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
         super(graph, instruction, gpu);
@@ -152,6 +154,32 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
         QwenConfig config = context.plan().weights().config();
         int queryKeyWidth = 2 * config.linearNumKeyHeads() * config.linearKeyHeadDim();
         int valueWidth = config.linearNumValueHeads() * config.linearValueHeadDim();
+        QwenGdnSequenceState state = sequenceState(context, instruction);
+        // A previous verification committed only part of its rows: rebuild this layer's state first.
+        if (state.pendingReplayRows() > 0) replay(context, instruction, state);
+        if (context.kind() == QwenExecutionContext.ExecutionKind.VERIFY) {
+            int rows = context.inputTokenCount();
+            var speculative = state.speculative(
+                    rows,
+                    queryKeyWidth,
+                    2 * valueWidth,
+                    config.linearNumValueHeads(),
+                    instruction.outputWidth(),
+                    valueWidth);
+            gpu().copyDeviceToDevice(
+                            speculative.convolutionCheckpoint(),
+                            state.convolutionStateAddress(),
+                            state.convolutionBytes());
+            gpu().copyDeviceToDevice(
+                            speculative.queryKeyRows(),
+                            input(context, instruction, 0),
+                            (long) rows * queryKeyWidth * Short.BYTES);
+            gpu().copyDeviceToDevice(
+                            speculative.valueZRows(),
+                            input(context, instruction, 1),
+                            (long) rows * 2 * valueWidth * Short.BYTES);
+            this.pendingSpeculativeState = state;
+        }
         gpu().gdnConvolutionBf16(
                         input(context, instruction, 0),
                         input(context, instruction, 1),
@@ -168,6 +196,15 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
     private void runRecurrence(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         QwenConfig config = context.plan().weights().config();
         float outputScale = (float) (1.0 / Math.sqrt(config.linearKeyHeadDim()));
+        if (context.kind() == QwenExecutionContext.ExecutionKind.VERIFY) {
+            QwenGdnSequenceState state = sequenceState(context, instruction);
+            var speculative = state.speculative();
+            long rowBytes = (long) context.inputTokenCount() * config.linearNumValueHeads() * Float.BYTES;
+            gpu().copyDeviceToDevice(
+                            speculative.recurrentCheckpoint(), state.recurrentStateAddress(), state.recurrentBytes());
+            gpu().copyDeviceToDevice(speculative.alphaRows(), input(context, instruction, 1), rowBytes);
+            gpu().copyDeviceToDevice(speculative.betaRows(), input(context, instruction, 2), rowBytes);
+        }
         gpu().gdnRecurrenceBf16(
                         input(context, instruction, 0),
                         input(context, instruction, 1),
@@ -180,6 +217,53 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         config.linearKeyHeadDim(),
                         config.linearValueHeadDim(),
                         outputScale);
+    }
+
+    /// ReplaySSM: restores this layer's state from the checkpoint taken before the last verification and
+    /// re-runs its committed rows through the same convolution and recurrence kernels, row-exact, so the
+    /// state is bit for bit what one-row decode of those rows leaves.
+    private void replay(
+            QwenExecutionContext context, QwenExecutionPlan.Instruction instruction, QwenGdnSequenceState state) {
+        QwenConfig config = context.plan().weights().config();
+        int rows = state.pendingReplayRows();
+        var speculative = state.speculative();
+        int queryKeyWidth = 2 * config.linearNumKeyHeads() * config.linearKeyHeadDim();
+        int valueWidth = config.linearNumValueHeads() * config.linearValueHeadDim();
+        gpu().selectRowExact(true);
+        try {
+            gpu().copyDeviceToDevice(
+                            state.convolutionStateAddress(),
+                            speculative.convolutionCheckpoint(),
+                            state.convolutionBytes());
+            gpu().gdnConvolutionBf16(
+                            speculative.queryKeyRows(),
+                            speculative.valueZRows(),
+                            instruction.weightAddress(0),
+                            state.convolutionStateAddress(),
+                            speculative.replayConvolved(),
+                            rows,
+                            queryKeyWidth,
+                            valueWidth,
+                            instruction.outputWidth(),
+                            config.linearConvKernelDim());
+            gpu().copyDeviceToDevice(
+                            state.recurrentStateAddress(), speculative.recurrentCheckpoint(), state.recurrentBytes());
+            gpu().gdnRecurrenceBf16(
+                            speculative.replayConvolved(),
+                            speculative.alphaRows(),
+                            speculative.betaRows(),
+                            state.recurrentStateAddress(),
+                            speculative.replayOutput(),
+                            rows,
+                            config.linearNumKeyHeads(),
+                            config.linearNumValueHeads(),
+                            config.linearKeyHeadDim(),
+                            config.linearValueHeadDim(),
+                            (float) (1.0 / Math.sqrt(config.linearKeyHeadDim())));
+        } finally {
+            gpu().selectRowExact(context.kind() == QwenExecutionContext.ExecutionKind.VERIFY);
+        }
+        state.setPendingReplayRows(0);
     }
 
     private void runGatedRmsNorm(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
@@ -233,14 +317,22 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
         state.appendSubmitted(context.inputTokenCount());
     }
 
-    /// Publishes the appended rows once the quantum's device work has retired.
+    /// Publishes the appended rows once the quantum's device work has retired; a verification whose
+    /// GDN state ran past its committed rows leaves a replay for the next quantum.
     @Override
     protected void commit() {
-        if (this.pendingAppendState != null) this.pendingAppendState.commitSubmitted();
+        if (this.pendingAppendState != null)
+            this.pendingAppendState.commitSubmitted(context().committedRowCount());
+        QwenGdnSequenceState speculative = this.pendingSpeculativeState;
+        if (speculative != null) {
+            int committed = context().committedRowCount();
+            speculative.setPendingReplayRows(committed < context().inputTokenCount() ? committed : 0);
+        }
     }
 
     @Override
     protected void releaseTemporary(QwenExecutionContext context) {
+        this.pendingSpeculativeState = null;
         AttentionKvState state = this.pendingAppendState;
         this.pendingAppendState = null;
         // A committed frontier is unaffected; an uncommitted one never becomes visible.

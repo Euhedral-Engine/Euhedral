@@ -86,6 +86,124 @@ class SpeculativeVerifyCudaIntegrationTest {
         }
     }
 
+    /// Partial acceptance: a verification commits only its first k rows. KV publishes those rows and the
+    /// GDN state is replayed from the checkpoint by the next quantum, so after a further partial
+    /// verification and a one-row decode, everything equals sequential decode of the committed tokens.
+    @Test
+    @Timeout(value = 1800, unit = TimeUnit.SECONDS)
+    void partiallyCommittedVerificationsLeaveSequentialState() throws Throwable {
+        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
+        Path artifact = Path.of(System.getProperty(
+                "euhedral.speculative.artifact", System.getProperty("euhedral.qwen.nvfp4-artifact", "")));
+        assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
+        Path tokenizerDirectory =
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+        int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
+        int[] text = QwenTokenizer.load(tokenizerDirectory)
+                .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
+        int[] prompt = java.util.Arrays.copyOf(text, prefix);
+        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
+                QwenModel model =
+                        QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu, WeightResidency.EXECUTED);
+                var lattice = new PullingLattice()) {
+            var plan = new QwenExecutionPlan(model.weights());
+            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            try {
+                for (int first = 1; first <= 3; first++) {
+                    var sequential = new QwenSequenceState(10 + first);
+                    var verified = new QwenSequenceState(20 + first);
+                    try {
+                        prefill(runtime, plan, sequential, prompt, gpu);
+                        prefill(runtime, plan, verified, prompt, gpu);
+                        int cursor = prefix;
+                        // Verification 1 commits `first` rows, verification 2 commits 2, then one decode.
+                        for (int committed : new int[] {first, 2}) {
+                            int[] rows = java.util.Arrays.copyOfRange(text, cursor, cursor + 4);
+                            List<short[]> verifiedRows = verify(runtime, plan, verified, rows, committed, gpu);
+                            for (int row = 0; row < committed; row++) {
+                                List<short[]> decoded = run(
+                                        runtime,
+                                        plan,
+                                        sequential,
+                                        QwenExecutionContext.ExecutionKind.DECODE,
+                                        new int[] {rows[row]},
+                                        QwenLogitsRequirement.ALL_TOKENS,
+                                        gpu);
+                                assertArrayEquals(decoded.getFirst(), verifiedRows.get(row), "committed row " + row);
+                            }
+                            cursor += committed;
+                            assertEquals(sequential.currentTokenPosition(), verified.currentTokenPosition());
+                        }
+                        int[] next = {text[cursor]};
+                        assertArrayEquals(
+                                run(
+                                                runtime,
+                                                plan,
+                                                sequential,
+                                                QwenExecutionContext.ExecutionKind.DECODE,
+                                                next,
+                                                QwenLogitsRequirement.ALL_TOKENS,
+                                                gpu)
+                                        .getFirst(),
+                                run(
+                                                runtime,
+                                                plan,
+                                                verified,
+                                                QwenExecutionContext.ExecutionKind.DECODE,
+                                                next,
+                                                QwenLogitsRequirement.ALL_TOKENS,
+                                                gpu)
+                                        .getFirst(),
+                                "decode after replay, first commit " + first);
+                        assertStatesEqual(gpu, model.weights().config().layerTypes(), sequential, verified);
+                    } finally {
+                        sequential.complete();
+                        verified.complete();
+                    }
+                }
+            } finally {
+                runtime.close();
+            }
+        }
+    }
+
+    /// A VERIFY quantum that commits only its first `committed` rows; returns all its logits rows.
+    static List<short[]> verify(
+            EuhedralInferenceRuntime runtime,
+            QwenExecutionPlan plan,
+            QwenSequenceState sequence,
+            int[] rows,
+            int committed,
+            CudaGpuMemory gpu)
+            throws Exception {
+        AtomicReference<List<short[]>> captured = new AtomicReference<>(List.of());
+        var context = new QwenExecutionContext(
+                        plan,
+                        sequence,
+                        QwenExecutionContext.ExecutionKind.VERIFY,
+                        sequence.currentTokenPosition(),
+                        rows,
+                        QwenLogitsRequirement.ALL_TOKENS)
+                .withCommittedRows(committed);
+        var outcome = runtime.submit(context, done -> {
+                    try (Arena arena = Arena.ofConfined();
+                            QwenDeviceLogits output = done.logitsOutput().orElseThrow()) {
+                        List<short[]> out = new ArrayList<>();
+                        int vocabulary = output.vocabularySize();
+                        for (int row = 0; row < output.tokenCount(); row++)
+                            out.add(shorts(
+                                    gpu,
+                                    arena,
+                                    output.deviceAddress() + (long) row * vocabulary * Short.BYTES,
+                                    vocabulary));
+                        captured.set(out);
+                    }
+                })
+                .get(600, TimeUnit.SECONDS);
+        if (outcome.status() != QwenExecutionContext.Status.SUCCESS) throw new AssertionError(outcome.failure());
+        return captured.get();
+    }
+
     static Path repositoryRoot() {
         Path root = Path.of(System.getProperty("user.dir")).toAbsolutePath();
         while (!Files.isDirectory(root.resolve("docs"))) root = root.getParent();

@@ -8,13 +8,129 @@ public final class QwenGdnSequenceState implements AutoCloseable {
     private final ExecutionGpu gpu;
     private long convolutionStateAddress;
     private long recurrentStateAddress;
+    private final long convolutionBytes;
+    private final long recurrentBytes;
     private boolean closing;
     private boolean closed;
 
-    private QwenGdnSequenceState(ExecutionGpu gpu, long convolutionStateAddress, long recurrentStateAddress) {
+    /// Speculative verification (docs/MTP_CONTRACT.md §5, ReplaySSM): the state before the latest
+    /// verification, its recorded inputs, and replay scratch. Allocated at the first verification.
+    private Speculative speculative;
+    /// Verified rows the next quantum must replay from the checkpoint before touching this state.
+    private int pendingReplayRows;
+
+    /// Device buffers for `capacity` verified rows.
+    public record Speculative(
+            int capacity,
+            long recurrentCheckpoint,
+            long convolutionCheckpoint,
+            long queryKeyRows,
+            long valueZRows,
+            long alphaRows,
+            long betaRows,
+            long replayConvolved,
+            long replayOutput) {}
+
+    private QwenGdnSequenceState(
+            ExecutionGpu gpu,
+            long convolutionStateAddress,
+            long recurrentStateAddress,
+            long convolutionBytes,
+            long recurrentBytes) {
         this.gpu = gpu;
         this.convolutionStateAddress = convolutionStateAddress;
         this.recurrentStateAddress = recurrentStateAddress;
+        this.convolutionBytes = convolutionBytes;
+        this.recurrentBytes = recurrentBytes;
+    }
+
+    public long convolutionBytes() {
+        return this.convolutionBytes;
+    }
+
+    public long recurrentBytes() {
+        return this.recurrentBytes;
+    }
+
+    /// The speculative buffers, allocated (or grown) for `rows` verified rows of the given widths
+    /// (BF16 query/key and value/z rows, FP32 alpha/beta per value head, BF16 convolved and output rows).
+    public Speculative speculative(
+            int rows, int queryKeyWidth, int valueZWidth, int heads, int convolvedWidth, int outputWidth) {
+        ensureOpen();
+        if (this.speculative != null && this.speculative.capacity() >= rows) return this.speculative;
+        if (this.speculative != null) {
+            if (this.pendingReplayRows > 0)
+                throw new IllegalStateException("cannot grow speculative state with a pending replay");
+            releaseSpeculative();
+        }
+        int capacity = Math.max(rows, 8);
+        long[] addresses = new long[8];
+        long[] sizes = {
+            this.recurrentBytes,
+            this.convolutionBytes,
+            (long) capacity * queryKeyWidth * Short.BYTES,
+            (long) capacity * valueZWidth * Short.BYTES,
+            (long) capacity * heads * Float.BYTES,
+            (long) capacity * heads * Float.BYTES,
+            (long) capacity * convolvedWidth * Short.BYTES,
+            (long) capacity * outputWidth * Short.BYTES
+        };
+        try {
+            for (int i = 0; i < sizes.length; i++) addresses[i] = allocateRequired(this.gpu, sizes[i]);
+        } catch (Throwable failure) {
+            for (long address : addresses) freeAfterFailure(this.gpu, address, failure);
+            throw failure;
+        }
+        this.speculative = new Speculative(
+                capacity,
+                addresses[0],
+                addresses[1],
+                addresses[2],
+                addresses[3],
+                addresses[4],
+                addresses[5],
+                addresses[6],
+                addresses[7]);
+        return this.speculative;
+    }
+
+    public Speculative speculative() {
+        return this.speculative;
+    }
+
+    public int pendingReplayRows() {
+        return this.pendingReplayRows;
+    }
+
+    /// After a verification committed `rows` of its rows: replay them from the checkpoint before the
+    /// state is next used, or nothing when every row was committed (0).
+    public void setPendingReplayRows(int rows) {
+        if (rows < 0 || (rows > 0 && this.speculative == null)) throw new IllegalArgumentException("invalid replay");
+        this.pendingReplayRows = rows;
+    }
+
+    private void releaseSpeculative() {
+        Speculative s = this.speculative;
+        this.speculative = null;
+        Throwable failure = null;
+        for (long address : new long[] {
+            s.recurrentCheckpoint(),
+            s.convolutionCheckpoint(),
+            s.queryKeyRows(),
+            s.valueZRows(),
+            s.alphaRows(),
+            s.betaRows(),
+            s.replayConvolved(),
+            s.replayOutput()
+        }) {
+            try {
+                this.gpu.free(address);
+            } catch (Throwable cleanupFailure) {
+                if (failure == null) failure = cleanupFailure;
+                else failure.addSuppressed(cleanupFailure);
+            }
+        }
+        if (failure != null) throw propagate(failure);
     }
 
     /// Allocates zero-initialized GDN state for the supplied layer geometry.
@@ -50,7 +166,8 @@ public final class QwenGdnSequenceState implements AutoCloseable {
             recurrentAddress = allocateRequired(gpu, recurrentBytes);
             gpu.zeroDeviceMemory(convolutionAddress, convolutionBytes);
             gpu.zeroDeviceMemory(recurrentAddress, recurrentBytes);
-            return new QwenGdnSequenceState(gpu, convolutionAddress, recurrentAddress);
+            return new QwenGdnSequenceState(
+                    gpu, convolutionAddress, recurrentAddress, convolutionBytes, recurrentBytes);
         } catch (Throwable failure) {
             freeAfterFailure(gpu, recurrentAddress, failure);
             freeAfterFailure(gpu, convolutionAddress, failure);
@@ -73,6 +190,13 @@ public final class QwenGdnSequenceState implements AutoCloseable {
         if (this.closed) return;
         this.closing = true;
         Throwable failure = null;
+        if (this.speculative != null) {
+            try {
+                releaseSpeculative();
+            } catch (Throwable cleanupFailure) {
+                failure = cleanupFailure;
+            }
+        }
         failure = free(this.convolutionStateAddress, failure, true);
         failure = free(this.recurrentStateAddress, failure, false);
         if (failure != null) throw propagate(failure);

@@ -109,6 +109,17 @@ public final class AttentionKvState implements AutoCloseable {
         releaseRetired();
     }
 
+    /// Publishes only the first `rows` submitted rows (a speculative verification's accepted prefix);
+    /// the rest stay beyond the committed frontier, where the next append overwrites them.
+    public void commitSubmitted(int rows) {
+        ensureOpen();
+        if (rows < 0 || (long) this.length + rows > this.submittedLength)
+            throw new IllegalArgumentException("committed rows exceed the submitted frontier");
+        this.length += rows;
+        this.submittedLength = this.length;
+        releaseRetired();
+    }
+
     /// Drops a submitted frontier that must not become visible, such as a failed quantum's. Called
     /// after the quantum's device work retired, so it also releases what the reservation retired.
     public void discardSubmitted() {
