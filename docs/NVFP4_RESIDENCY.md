@@ -123,10 +123,31 @@ of compute for a 512-token chunk, so overlapped transfers could hide it.
 
 Prefill-only staging is not useful alone: decode is the binding regime.
 
+## Fully resident NVFP4
+
+With `weightResidency: EXECUTED` the vision tower, MTP layer and draft head stay in the artifact, and
+the NVFP4 base model runs from the GPU. Measured 2026-10-01, one session per artifact, warmup 1,
+2 measured iterations, serving stopped:
+
+| Artifact | Decode, 64-token prompt | Decode, 8K prompt | Prefill 512 | TTFT at 8K | Engine allocation | Device free |
+|---|---|---|---|---|---|---|
+| Compact Q3 | 59.3 tok/s | 54.1 tok/s | 1154 tok/s | 7.66 s | 12.09 GiB | 2.23 GiB |
+| NVFP4, executed objects | 48.1 tok/s (-19%) | 45.4 tok/s (-16%) | 1052 tok/s (-9%) | 8.34 s | 14.05 GiB | 0.62 GiB |
+
+**NVFP4 is slower than compact Q3, by about its extra bytes.** Decode reads about 25% more weight
+bytes per token. 59.3 / 1.25 = 47.4 tok/s predicts the measured 48.1, so the NVFP4 GEMV streams at
+Q3's efficiency, and no kernel work can close the gap at batch 1. Prefill loses less because its
+tiles are compute-bound.
+
+Greedy generation answers "The capital of France is" with " Paris."
+(`QwenNvfp4GenerationCudaIntegrationTest`).
+
 ## What was built
 
 - `tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4`: the NVFP4 artifact, quantized
   on the GPU by default.
 - Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory, and
   `QwenNvfp4CudaLoadIntegrationTest`.
-- No NVFP4 execution path was written; the budget above rules out the staged configuration first.
+- Execution: `native/src/nvfp4` (decode GEMV, tile-engine producer for prefill, paired gate_up and
+  SwiGLU), `euhedral_cuda_linear_nvfp4_bf16` and `euhedral_cuda_nvfp4_gate_up_swiglu_bf16`, plan and
+  frame dispatch for NVFP4 weights, and `WeightResidency`.

@@ -38,6 +38,7 @@ public final class LinearFrame extends QwenStageFrame {
                             instruction.inputWidth(),
                             instruction.outputWidth(),
                             instruction.weightByteSize());
+            if (logits) context.logitsProduced(output);
             return;
         }
         switch (instruction.kind()) {
