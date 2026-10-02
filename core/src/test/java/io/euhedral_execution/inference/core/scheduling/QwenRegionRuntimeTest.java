@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
@@ -27,7 +28,8 @@ class QwenRegionRuntimeTest {
         var sequences = new ArrayList<QwenSequenceState>();
         try {
             var completions = new ArrayList<CompletableFuture<QwenExecutionContext.Outcome>>();
-            for (var kind : QwenExecutionContext.ExecutionKind.values()) {
+            for (var kind :
+                    List.of(QwenExecutionContext.ExecutionKind.PREFILL, QwenExecutionContext.ExecutionKind.DECODE)) {
                 var sequence = new QwenSequenceState(sequences.size() + 1);
                 sequences.add(sequence);
                 completions.add(runtime.submit(new QwenExecutionContext(
@@ -73,7 +75,8 @@ class QwenRegionRuntimeTest {
         var gpu = new RegionGpu(weights.config().vocabSize());
         var runtime = runtime(view, gpu);
         try {
-            for (var kind : QwenExecutionContext.ExecutionKind.values()) {
+            for (var kind :
+                    List.of(QwenExecutionContext.ExecutionKind.PREFILL, QwenExecutionContext.ExecutionKind.DECODE)) {
                 for (int rows : new int[] {1, 64}) {
                     if (kind == QwenExecutionContext.ExecutionKind.DECODE && rows != 1) continue;
                     var sequence = new QwenSequenceState(700 + kind.ordinal() * 100 + rows);

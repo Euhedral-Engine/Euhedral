@@ -24,6 +24,11 @@ public final class QwenHostLogits implements AutoCloseable {
     private ExecutionGpu.ReadbackBuffer row;
     private ExecutionGpu.ReadbackBuffer selection;
     private long deviceSelection;
+    private ExecutionGpu.ReadbackBuffer rowSelections;
+    private long deviceRowSelections;
+    private int rowSelectionCapacity;
+    private int queuedRows;
+    private int readyRows;
     private boolean selectOnDevice;
     private boolean queued;
     private boolean queuedSelection;
@@ -75,13 +80,60 @@ public final class QwenHostLogits implements AutoCloseable {
         this.queuedSelection = false;
     }
 
+    /// Queues a greedy device selection for each of `rows` BF16 logits rows at `logitsAddress` and the
+    /// copy of their 8-byte results: a verifier reads back only token IDs, never vocabulary rows.
+    void queueRowSelections(long logitsAddress, int rows) {
+        if (this.closed) throw new IllegalStateException("host logits are closed");
+        if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
+        if (!this.selectOnDevice) throw new IllegalStateException("row selections need device selection");
+        this.ready = false;
+        this.selectionReady = false;
+        this.readyRows = 0;
+        if (rows > this.rowSelectionCapacity) {
+            // Grown between sessions' first verifications; the previous quantum retired before this one.
+            if (this.rowSelections != null) this.rowSelections.close();
+            if (this.deviceRowSelections != 0) this.gpu.free(this.deviceRowSelections);
+            this.rowSelections = null;
+            this.deviceRowSelections = 0;
+            this.deviceRowSelections = this.gpu.allocate((long) rows * Long.BYTES);
+            this.rowSelections = this.gpu.allocateReadbackBuffer((long) rows * Long.BYTES);
+            this.rowSelectionCapacity = rows;
+        }
+        for (int row = 0; row < rows; row++) {
+            long rowAddress = Math.addExact(logitsAddress, Math.multiplyExact((long) row, this.rowBytes));
+            if (!this.gpu.argmaxBf16(
+                    rowAddress, this.vocabularySize, this.deviceRowSelections + (long) row * Long.BYTES))
+                throw new IllegalStateException("device greedy selection is unavailable");
+        }
+        this.gpu.copyDeviceToReadback(this.rowSelections, this.deviceRowSelections, (long) rows * Long.BYTES);
+        this.queued = false;
+        this.queuedSelection = false;
+        this.queuedRows = rows;
+    }
+
     /// Publishes a queued row or selection once its quantum retired; only a successful quantum's
     /// result becomes readable.
     void retired(boolean succeeded) {
         this.ready = succeeded && this.queued;
         this.selectionReady = succeeded && this.queuedSelection;
+        this.readyRows = succeeded ? this.queuedRows : 0;
         this.queued = false;
         this.queuedSelection = false;
+        this.queuedRows = 0;
+    }
+
+    /// The device's greedy token for each row of the latest retired verification (lowest token ID among
+    /// equal maxima). Readable from the verification's own retirement onward.
+    public int[] selectedTokens() {
+        int rows = this.queuedRows > 0 ? this.queuedRows : this.readyRows;
+        if (rows == 0 || this.closed) throw new IllegalStateException("no verified row selections are available");
+        int[] tokens = new int[rows];
+        for (int row = 0; row < rows; row++) {
+            long key = this.rowSelections.segment().get(ValueLayout.JAVA_LONG, (long) row * Long.BYTES);
+            if (key == 0) throw new IllegalArgumentException("logit row " + row + " has no selectable token");
+            tokens[row] = (int) (0xFFFF_FFFFL - (key & 0xFFFF_FFFFL));
+        }
+        return tokens;
     }
 
     /// Whether the latest retired sampling quantum selected its token on the device.
@@ -112,14 +164,23 @@ public final class QwenHostLogits implements AutoCloseable {
         if (this.closed) return;
         this.ready = false;
         this.selectionReady = false;
-        if (this.row != null || this.selection != null || this.deviceSelection != 0) {
+        this.readyRows = 0;
+        if (this.row != null
+                || this.selection != null
+                || this.deviceSelection != 0
+                || this.rowSelections != null
+                || this.deviceRowSelections != 0) {
             if (!this.gpu.completionProven()) return;
             if (this.row != null) this.row.close();
             if (this.selection != null) this.selection.close();
             if (this.deviceSelection != 0) this.gpu.free(this.deviceSelection);
+            if (this.rowSelections != null) this.rowSelections.close();
+            if (this.deviceRowSelections != 0) this.gpu.free(this.deviceRowSelections);
             this.row = null;
             this.selection = null;
             this.deviceSelection = 0;
+            this.rowSelections = null;
+            this.deviceRowSelections = 0;
         }
         this.closed = true;
     }

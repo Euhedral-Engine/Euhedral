@@ -42,6 +42,7 @@ subprojects {
             exclude("**/QwenP2e2CudaIntegrationTest.class")
             exclude("**/QwenNvfp4CudaLoadIntegrationTest.class")
             exclude("**/QwenNvfp4GenerationCudaIntegrationTest.class")
+            exclude("**/SpeculativeVerifyCudaIntegrationTest.class")
             useJUnitPlatform()
         }
         val testSourceSet = the<SourceSetContainer>()["test"]
@@ -70,6 +71,7 @@ subprojects {
             include("**/QwenP2e2CudaIntegrationTest.class")
             include("**/QwenNvfp4CudaLoadIntegrationTest.class")
             include("**/QwenNvfp4GenerationCudaIntegrationTest.class")
+            include("**/SpeculativeVerifyCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -99,6 +101,9 @@ subprojects {
             // report, and `exact` to run the oracle on both sequences.
             for (name in listOf("steps", "prefix", "report", "candidate"))
                 providers.gradleProperty("euhedral.numerics.drift.$name").orNull?.let { systemProperty("euhedral.numerics.drift.$name", it) }
+            // Speculative decoding tests: artifact (defaults to the NVFP4 artifact), prompt length, rows.
+            for (name in listOf("artifact", "prefix", "rows"))
+                providers.gradleProperty("euhedral.speculative.$name").orNull?.let { systemProperty("euhedral.speculative.$name", it) }
             jvmArgs("--enable-native-access=ALL-UNNAMED")
             // Each class loads the model and may start the process-wide Euhedral lattice singleton.
             forkEvery = 1

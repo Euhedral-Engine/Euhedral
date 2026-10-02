@@ -141,6 +141,17 @@ public final class AttentionKvState implements AutoCloseable {
         return this.decodeScratch;
     }
 
+    /// Device pages, K plane first then V plane in each (tests compare committed rows).
+    List<Long> pageAddresses() {
+        ensureOpen();
+        return List.copyOf(this.pages);
+    }
+
+    /// Bytes of one plane (K or V) of one page: PAGE_TOKENS token rows of all KV heads.
+    long planePageBytes() {
+        return this.planePageBytes;
+    }
+
     public int capacity() {
         ensureOpen();
         return this.capacity;

@@ -107,6 +107,75 @@ static __device__ __forceinline__ void decode(
     if (lane < (unsigned int)kDecodeRows) q3::write_bf16(output, 0, first_row + lane, out_features, mine * w.global);
 }
 
+// Multi-row decode for speculative verification: M activation rows against each weight row. Every
+// token row repeats decode()'s exact FMA sequence (same blocks, same order, same warp reduction), so
+// row t's output is bit for bit what decode() gives for that row alone; the weights stream once.
+template <int M>
+static __device__ __forceinline__ void decode_rows(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int in_features, unsigned int out_features) {
+    __shared__ float table[16];
+    if (threadIdx.x < 16u) table[threadIdx.x] = e2m1_value(threadIdx.x);
+    __syncthreads();
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kDecodeRows;
+    const Layout w(weights, in_features, out_features);
+    const unsigned int slices = in_features / 1024u;
+    float sums[M][kDecodeRows] = {};
+    euhedral_pdl_begin();
+    for (unsigned int slice = 0; slice < slices; slice++) {
+        uint4 codes[kDecodeRows];
+        unsigned int scale_pair[kDecodeRows];
+        #pragma unroll
+        for (int r = 0; r < kDecodeRows; r++) {
+            const unsigned long long row = first_row + r;
+            codes[r] = reinterpret_cast<const uint4*>(w.codes + row * w.row_bytes)[slice * 32u + lane];
+            scale_pair[r] = reinterpret_cast<const unsigned short*>(w.scales + row * w.row_scales)[slice * 32u + lane];
+        }
+        #pragma unroll
+        for (int t = 0; t < M; t++) {
+            float x[32];
+            const uint4* activation = reinterpret_cast<const uint4*>(
+                    input + (unsigned long long)t * in_features + slice * 1024u + 32u * lane);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = activation[i];
+                const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
+                    x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < kDecodeRows; r++) {
+                const unsigned int words[4] = {codes[r].x, codes[r].y, codes[r].z, codes[r].w};
+                float block[2] = {0.0f, 0.0f};
+                #pragma unroll
+                for (int j = 0; j < 32; j++) {
+                    const float value = table[(words[j >> 3] >> ((j & 7) * 4)) & 15u];
+                    block[j >> 4] = fmaf(x[j], value, block[j >> 4]);
+                }
+                sums[t][r] = fmaf(block[0], e4m3_to_float(scale_pair[r] & 0xffu), sums[t][r]);
+                sums[t][r] = fmaf(block[1], e4m3_to_float(scale_pair[r] >> 8), sums[t][r]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < M; t++) {
+        #pragma unroll
+        for (int r = 0; r < kDecodeRows; r++) {
+            #pragma unroll
+            for (int distance = 16; distance; distance >>= 1) sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], distance);
+        }
+        float mine = sums[t][0];
+        #pragma unroll
+        for (int r = 1; r < kDecodeRows; r++) mine = lane == (unsigned int)r ? sums[t][r] : mine;
+        if (lane < (unsigned int)kDecodeRows)
+            q3::write_bf16(output + (unsigned long long)t * out_features, 0, first_row + lane, out_features, mine * w.global);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // B operand of the balanced tile engine (gemm/balanced.cuh): one 16-column x K32 tile per warp and
 // generation, staged as BF16(e2m1 * scale * global). Lanes 8c..8c+7 own column c of each 4-column

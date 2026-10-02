@@ -58,7 +58,18 @@ public abstract class QwenStageFrame extends StageFrame {
 
     @Override
     protected final void submit() {
-        perform(context(), this.instruction);
+        QwenExecutionContext context = context();
+        if (context.kind() != QwenExecutionContext.ExecutionKind.VERIFY) {
+            perform(context, this.instruction);
+            return;
+        }
+        // Verification rows must be bit for bit one-row decode; the selection is per submitting thread.
+        this.gpu.selectRowExact(true);
+        try {
+            perform(context, this.instruction);
+        } finally {
+            this.gpu.selectRowExact(false);
+        }
     }
 
     @Override

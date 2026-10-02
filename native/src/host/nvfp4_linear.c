@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -19,6 +20,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction decode, prefill128, prefill64, gate_up128, gate_up64;
+static CUfunction decode_rows[9];  /* [M] for 2..8 token rows */
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static CUfunction optional_kernel(const char* name) {
@@ -34,6 +36,12 @@ static void initialize(void) {
     gate_up128 = optional_kernel("euhedral_nvfp4_gate_up_swiglu_128x32");
     gate_up64 = optional_kernel("euhedral_nvfp4_gate_up_swiglu_64x32");
     euhedral_cuda_pdl_register(decode);
+    for (int m = 2; m <= 8; ++m) {
+        char name[40];
+        snprintf(name, sizeof(name), "euhedral_nvfp4_decode_rows%d", m);
+        decode_rows[m] = optional_kernel(name);
+        euhedral_cuda_pdl_register(decode_rows[m]);
+    }
 }
 
 #ifdef _WIN32
@@ -88,6 +96,21 @@ int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void
     CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
     CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
     unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
+    /* Row-exact (speculative verification): rows computed bit for bit as one-row decode, the weights
+     * streamed once for up to 8 rows. */
+    if (rows > 1u && euhedral_cuda_row_exact()) {
+        if (rows <= 8u && in_features % 1024u == 0 && out_features % 16u == 0 && decode_rows[rows] != NULL) {
+            void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
+            return finish(euhedral_launch_kernel(decode_rows[rows], out_features / 16u, 1, 1, 128, 1, 1, 0,
+                    euhedral_cuda_submission_stream(), params, NULL));
+        }
+        for (uint32_t row = 0; row < rows; ++row) {
+            status = euhedral_cuda_linear_nvfp4_bf16((const char*)input + (uint64_t)row * in_features * 2u, weights,
+                    (char*)output + (uint64_t)row * out_features * 2u, 1u, in_features, out_features, weights_byte_size);
+            if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        }
+        return EUHEDRAL_CUDA_SUCCESS;
+    }
     if (rows == 1u && in_features % 1024u == 0 && out_features % 16u == 0) {
         void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
         return finish(euhedral_launch_kernel(decode, out_features / 16u, 1, 1, 128, 1, 1, 0,

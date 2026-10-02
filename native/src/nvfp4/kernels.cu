@@ -9,6 +9,21 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_nvfp4_decode(
     nvfp4::decode(input, weights, output, in_features, out_features);
 }
 
+// 2..8 token rows, each bit for bit as euhedral_nvfp4_decode on that row (speculative verification).
+#define EUHEDRAL_NVFP4_DECODE_ROWS(M)                                                                       \
+    extern "C" __global__ __launch_bounds__(128) void euhedral_nvfp4_decode_rows##M(                         \
+            const unsigned short* input, const unsigned char* weights, unsigned short* output,             \
+            unsigned int in_features, unsigned int out_features) {                                          \
+        nvfp4::decode_rows<M>(input, weights, output, in_features, out_features);                           \
+    }
+EUHEDRAL_NVFP4_DECODE_ROWS(2)
+EUHEDRAL_NVFP4_DECODE_ROWS(3)
+EUHEDRAL_NVFP4_DECODE_ROWS(4)
+EUHEDRAL_NVFP4_DECODE_ROWS(5)
+EUHEDRAL_NVFP4_DECODE_ROWS(6)
+EUHEDRAL_NVFP4_DECODE_ROWS(7)
+EUHEDRAL_NVFP4_DECODE_ROWS(8)
+
 // Any rows on the balanced tile engine: 128 or 64 rows x 64 outputs per CTA.
 extern "C" __global__ __launch_bounds__(128) void euhedral_nvfp4_prefill_128x64(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,

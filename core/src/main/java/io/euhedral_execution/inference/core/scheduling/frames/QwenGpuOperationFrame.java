@@ -264,7 +264,9 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         // readable here but not committed until the quantum retires.
                         state.submittedLength(),
                         context.startPosition(),
-                        context.inputTokenCount() == 1 ? state.decodeScratchAddress(config.numAttentionHeads()) : 0);
+                        context.inputTokenCount() == 1 || context.kind() == QwenExecutionContext.ExecutionKind.VERIFY
+                                ? state.decodeScratchAddress(config.numAttentionHeads())
+                                : 0);
     }
 
     private void runResidualAdd(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {

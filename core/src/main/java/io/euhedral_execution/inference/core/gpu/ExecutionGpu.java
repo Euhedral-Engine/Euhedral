@@ -450,6 +450,10 @@ public abstract class ExecutionGpu implements GpuMemory {
     /// 64-bit key to `resultAddress`, whose low word is `0xFFFFFFFF` minus the host argmax's token ID
     /// (0 when no logit is selectable). False, with nothing queued, when this GPU cannot select on the
     /// device.
+    /// Row-exact execution for launches from the calling thread: a multi-row operation computes every row
+    /// bit for bit as a one-row operation at that row's position would (speculative verification).
+    public void selectRowExact(boolean enabled) {}
+
     public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
         return false;
     }

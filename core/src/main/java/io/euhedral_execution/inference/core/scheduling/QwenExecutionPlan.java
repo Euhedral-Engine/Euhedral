@@ -373,7 +373,8 @@ public final class QwenExecutionPlan {
         if (family.regionPrefill == null) return family;
         // Decode runs its own instance of the small topology: rounded residual add + RMSNorm and the
         // joint GDN A/B projection + control are single region launches, as in short prefill quanta.
-        if (kind == QwenExecutionContext.ExecutionKind.DECODE) return family.decode;
+        if (kind == QwenExecutionContext.ExecutionKind.DECODE || kind == QwenExecutionContext.ExecutionKind.VERIFY)
+            return family.decode;
         if (rows < REGION_MIN_ROWS) return family.smallPrefill;
         if (streamedFfnRows(rows) && family.streamedPrefill != null) return family.streamedPrefill;
         return family.regionPrefill;
