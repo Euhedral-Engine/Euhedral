@@ -46,7 +46,9 @@ public final class ChatPromptCorpus {
 
     static List<PromptMaterial> build(int targetTokens, ToIntFunction<String> tokenCount, String document) {
         if (targetTokens <= 0) throw new IllegalArgumentException("targetTokens must be positive");
-        String[] paragraphs = document.split("\n\n");
+        // A Windows checkout may hold the document with CRLF line endings; prompts are built from its LF
+        // form so they, and their hashes, are the same on every platform.
+        String[] paragraphs = document.replace("\r\n", "\n").split("\n\n");
         List<PromptMaterial> prompts = new ArrayList<>();
         for (int task = 0; task < size(); task++) {
             String standalone = chat(null, STANDALONE_TASKS.get(task));
