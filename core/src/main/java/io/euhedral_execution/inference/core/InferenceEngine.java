@@ -9,6 +9,7 @@ import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
+import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
@@ -104,7 +105,8 @@ public final class InferenceEngine implements AutoCloseable {
             QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
             QwenArtifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath(), tuning);
-            model = bootstrap.loadModel(config.artifactPath(), artifact, gpu);
+            model = bootstrap.loadModel(
+                    config.artifactPath(), artifact, gpu, config.tuning().weightResidency());
             QwenExecutionPlan plan = new QwenExecutionPlan(model.weights());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
@@ -394,6 +396,13 @@ public final class InferenceEngine implements AutoCloseable {
 
         QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu) throws IOException {
             return QwenModel.load(path, artifact, gpu);
+        }
+
+        QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu, WeightResidency residency)
+                throws IOException {
+            return residency == WeightResidency.ALL
+                    ? loadModel(path, artifact, gpu)
+                    : QwenModel.load(path, artifact, gpu, residency);
         }
 
         ControlPlaneLattice createLattice(InferenceConfig config) {

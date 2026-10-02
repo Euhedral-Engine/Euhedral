@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
+import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.util.BitSet;
 import java.util.Objects;
@@ -11,9 +12,14 @@ import java.util.Objects;
 /// validates them against [ProcessorTopology] before loading any model resource. Use
 /// [WorkerProcessorSelection] to derive them from topology. The set is copied on input and output.
 /// `prefillChunkTokens` bounds the prompt tokens submitted per prefill quantum and therefore the
-/// per-quantum GPU workspace. It does not change the token sequence.
+/// per-quantum GPU workspace. It does not change the token sequence. `weightResidency` selects which
+/// artifact objects are placed on the GPU.
 public record InferenceTuning(
-        BitSet workerProcessorIds, int prefillChunkTokens, Q3DispatchMode q3DispatchMode, int q3SmallRowThreshold) {
+        BitSet workerProcessorIds,
+        int prefillChunkTokens,
+        Q3DispatchMode q3DispatchMode,
+        int q3SmallRowThreshold,
+        WeightResidency weightResidency) {
     public static final int DEFAULT_PREFILL_CHUNK_TOKENS = QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS;
 
     public InferenceTuning {
@@ -23,6 +29,12 @@ public record InferenceTuning(
         if (prefillChunkTokens <= 0) throw new IllegalArgumentException("prefillChunkTokens must be positive");
         Objects.requireNonNull(q3DispatchMode, "q3DispatchMode");
         if (q3SmallRowThreshold < 0) throw new IllegalArgumentException("Q3 threshold must not be negative");
+        Objects.requireNonNull(weightResidency, "weightResidency");
+    }
+
+    public InferenceTuning(
+            BitSet workerProcessorIds, int prefillChunkTokens, Q3DispatchMode q3DispatchMode, int q3SmallRowThreshold) {
+        this(workerProcessorIds, prefillChunkTokens, q3DispatchMode, q3SmallRowThreshold, WeightResidency.ALL);
     }
 
     public InferenceTuning(BitSet workerProcessorIds, int prefillChunkTokens) {
@@ -40,15 +52,27 @@ public record InferenceTuning(
     }
 
     public InferenceTuning withWorkerProcessorIds(BitSet ids) {
-        return new InferenceTuning(ids, this.prefillChunkTokens, this.q3DispatchMode, this.q3SmallRowThreshold);
+        return new InferenceTuning(
+                ids, this.prefillChunkTokens, this.q3DispatchMode, this.q3SmallRowThreshold, this.weightResidency);
     }
 
     public InferenceTuning withPrefillChunkTokens(int tokens) {
-        return new InferenceTuning(this.workerProcessorIds, tokens, this.q3DispatchMode, this.q3SmallRowThreshold);
+        return new InferenceTuning(
+                this.workerProcessorIds, tokens, this.q3DispatchMode, this.q3SmallRowThreshold, this.weightResidency);
     }
 
     public InferenceTuning withQ3Dispatch(Q3DispatchMode mode, int smallRowThreshold) {
-        return new InferenceTuning(this.workerProcessorIds, this.prefillChunkTokens, mode, smallRowThreshold);
+        return new InferenceTuning(
+                this.workerProcessorIds, this.prefillChunkTokens, mode, smallRowThreshold, this.weightResidency);
+    }
+
+    public InferenceTuning withWeightResidency(WeightResidency residency) {
+        return new InferenceTuning(
+                this.workerProcessorIds,
+                this.prefillChunkTokens,
+                this.q3DispatchMode,
+                this.q3SmallRowThreshold,
+                residency);
     }
 
     @Override

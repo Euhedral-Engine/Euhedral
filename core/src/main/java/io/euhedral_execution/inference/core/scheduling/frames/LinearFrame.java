@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.scheduling.frames;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionContext;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
@@ -23,6 +24,22 @@ public final class LinearFrame extends QwenStageFrame {
         long output = context.plan().hasFirstLayer()
                 ? context.workspace().address(instruction.outputBuffers().getFirst())
                 : context.workspace().projectionAddress(instruction.outputBufferIndex());
+        if (instruction.weights().size() == 1
+                && instruction.weightFormat() == WeightFormat.NVFP4
+                && (instruction.kind() == QwenExecutionPlan.Kind.Q3_FFN_DOWN
+                        || instruction.kind() == QwenExecutionPlan.Kind.Q3_LINEAR
+                        || instruction.kind() == QwenExecutionPlan.Kind.Q4_LINEAR
+                        || instruction.kind() == QwenExecutionPlan.Kind.Q5_LINEAR)) {
+            gpu().linearNvfp4Bf16(
+                            input,
+                            instruction.weightAddress(),
+                            output,
+                            rows,
+                            instruction.inputWidth(),
+                            instruction.outputWidth(),
+                            instruction.weightByteSize());
+            return;
+        }
         switch (instruction.kind()) {
             case Q3_FFN_DOWN -> {
                 if (instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.FFN_PARTIALS))

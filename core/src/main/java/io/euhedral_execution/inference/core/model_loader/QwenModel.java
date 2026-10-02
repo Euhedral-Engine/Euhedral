@@ -20,7 +20,12 @@ public final class QwenModel implements AutoCloseable {
     }
 
     public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu) throws IOException {
-        return load(gpu, memory -> QwenWeightLoader.load(path, artifact, memory));
+        return load(path, artifact, gpu, WeightResidency.ALL);
+    }
+
+    public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu, WeightResidency residency)
+            throws IOException {
+        return load(gpu, memory -> QwenWeightLoader.load(path, artifact, memory, residency));
     }
 
     public static QwenModel loadFirstLayer(Path path, QwenArtifact artifact, GpuMemory gpu) throws IOException {

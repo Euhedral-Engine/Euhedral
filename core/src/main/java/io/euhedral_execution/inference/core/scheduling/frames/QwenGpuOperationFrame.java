@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.scheduling.frames;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.scheduling.AttentionKvState;
 import io.euhedral_execution.inference.core.scheduling.AttentionSequenceStates;
 import io.euhedral_execution.inference.core.scheduling.GdnSequenceStates;
@@ -37,16 +38,27 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                                 instruction.weightByteSize(1),
                                 instruction.weightLayout(0),
                                 instruction.weightLayout(1));
-            case Q3_GATE_UP_SWIGLU ->
-                gpu().q3GateUpSwiGluBf16(
-                                input(context, instruction, 0),
-                                instruction.weightAddress(),
-                                output(context, instruction, 0),
-                                context.inputTokenCount(),
-                                instruction.inputWidth(),
-                                instruction.outputWidth(),
-                                instruction.weightByteSize(),
-                                instruction.weightLayout());
+            case Q3_GATE_UP_SWIGLU -> {
+                if (instruction.weightFormat() == WeightFormat.NVFP4)
+                    gpu().nvfp4GateUpSwiGluBf16(
+                                    input(context, instruction, 0),
+                                    instruction.weightAddress(),
+                                    output(context, instruction, 0),
+                                    context.inputTokenCount(),
+                                    instruction.inputWidth(),
+                                    instruction.outputWidth(),
+                                    instruction.weightByteSize());
+                else
+                    gpu().q3GateUpSwiGluBf16(
+                                    input(context, instruction, 0),
+                                    instruction.weightAddress(),
+                                    output(context, instruction, 0),
+                                    context.inputTokenCount(),
+                                    instruction.inputWidth(),
+                                    instruction.outputWidth(),
+                                    instruction.weightByteSize(),
+                                    instruction.weightLayout());
+            }
             case RESIDUAL_RMS_NORM ->
                 gpu().residualRmsNormBf16(
                                 input(context, instruction, 0),
@@ -88,6 +100,28 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
     private void runGdnProjections(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         QwenConfig config = context.plan().weights().config();
         int valueZWidth = 2 * config.linearNumValueHeads() * config.linearValueHeadDim();
+        if (instruction.weightFormat(0) == WeightFormat.NVFP4 || instruction.weightFormat(1) == WeightFormat.NVFP4) {
+            if (instruction.weightFormat(0) != WeightFormat.NVFP4 || instruction.weightFormat(1) != WeightFormat.NVFP4)
+                throw new IllegalStateException("GDN projections mix NVFP4 and grouped formats");
+            int rows = context.inputTokenCount();
+            gpu().linearNvfp4Bf16(
+                            input(context, instruction, 0),
+                            instruction.weightAddress(0),
+                            output(context, instruction, 0),
+                            rows,
+                            instruction.inputWidth(),
+                            instruction.outputWidth(),
+                            instruction.weightByteSize(0));
+            gpu().linearNvfp4Bf16(
+                            input(context, instruction, 0),
+                            instruction.weightAddress(1),
+                            output(context, instruction, 1),
+                            rows,
+                            instruction.inputWidth(),
+                            valueZWidth,
+                            instruction.weightByteSize(1));
+            return;
+        }
         gpu().gdnProjectionsBf16(
                         input(context, instruction, 0),
                         instruction.weightAddress(0),
