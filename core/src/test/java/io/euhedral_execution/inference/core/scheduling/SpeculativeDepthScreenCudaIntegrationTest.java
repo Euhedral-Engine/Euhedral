@@ -25,6 +25,8 @@ import org.junit.jupiter.api.Timeout;
 /// verify and draft times and their acceptance without end-to-end benchmark forks.
 class SpeculativeDepthScreenCudaIntegrationTest {
 
+    private static final double GIB = 1L << 30;
+
     private static final List<String> TASKS = List.of(
             "Summarize the document above in detail, section by section.",
             "Write a Java implementation of the main mechanism the document above describes, with comments"
@@ -54,14 +56,18 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                 .split("\n\n");
         List<int[]> prompts = new ArrayList<>();
         for (String task : TASKS) {
-            int count = 1;
-            while (count < paragraphs.length && chat(tokenizer, paragraphs, count + 1, task).length <= contextTokens)
-                count++;
-            prompts.add(chat(tokenizer, paragraphs, count, task));
+            // The most paragraphs that fit: binary search, since tokenizing a long prefix is slow.
+            int low = 1, high = paragraphs.length;
+            while (low < high) {
+                int middle = (low + high + 1) >>> 1;
+                if (chat(tokenizer, paragraphs, middle, task).length <= contextTokens) low = middle;
+                else high = middle - 1;
+            }
+            prompts.add(chat(tokenizer, paragraphs, low, task));
         }
         var data = QwenArtifactReader.read(artifact);
         long hostBytes = Long.getLong("euhedral.speculative.host-mib", 0L) << 20;
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
+        try (CudaGpuMemory gpu = printFree(new CudaGpuMemory(library));
                 QwenModel model = QwenModel.load(
                         artifact,
                         data,
@@ -71,6 +77,13 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                         QwenModel.DEFAULT_STAGING_SLOTS);
                 var lattice = new PullingLattice()) {
             var plan = new QwenExecutionPlan(model.weights(), model.staging());
+            long[] minFree = {gpu.deviceMemoryInfo().freeBytes()};
+            System.out.printf(
+                    Locale.ROOT,
+                    "memory after load: allocated %.3f GiB, device free %.3f GiB%n",
+                    gpu.allocatedBytes() / GIB,
+                    minFree[0] / GIB);
+            gpu.resetPeakAllocatedBytes();
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             List<String> modes = nativeToo ? List.of("exact", "native") : List.of("exact");
             // [mode][depth] accumulated statistics over rounds and prompts.
@@ -92,7 +105,13 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                                         tokenizer::isGenerationEosToken,
                                         depths[d],
                                         512)) {
-                                    decoder.generate(prompt, budget, token -> {});
+                                    int[] emitted = {0};
+                                    decoder.generate(prompt, budget, token -> {
+                                        if (emitted[0]++ % 16 == 0)
+                                            minFree[0] = Math.min(
+                                                    minFree[0],
+                                                    gpu.deviceMemoryInfo().freeBytes());
+                                    });
                                     if (round == 0) continue;
                                     var s = decoder.statistics();
                                     long[] t = totals[m][d];
@@ -114,6 +133,12 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                 gpu.selectNvfp4NativeDecode(false);
                 runtime.close();
             }
+            System.out.printf(
+                    Locale.ROOT,
+                    "memory during runs: peak allocated %.3f GiB, min device free %.3f GiB (prompts %s tokens)%n",
+                    gpu.peakAllocatedBytes() / GIB,
+                    minFree[0] / GIB,
+                    prompts.stream().map(p -> Integer.toString(p.length)).toList());
             System.out.printf(
                     Locale.ROOT,
                     "screen %s, %d-token prompts, %d tokens, %d rounds%n",
@@ -144,6 +169,14 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                 }
             }
         }
+    }
+
+    private static CudaGpuMemory printFree(CudaGpuMemory gpu) {
+        System.out.printf(
+                Locale.ROOT,
+                "memory before load: device free %.3f GiB%n",
+                gpu.deviceMemoryInfo().freeBytes() / GIB);
+        return gpu;
     }
 
     private static int[] chat(QwenTokenizer tokenizer, String[] paragraphs, int count, String task) {
