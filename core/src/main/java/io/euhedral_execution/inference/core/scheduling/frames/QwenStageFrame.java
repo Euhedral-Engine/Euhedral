@@ -42,7 +42,8 @@ public abstract class QwenStageFrame extends StageFrame {
                     SWIGLU,
                     ATTENTION_QK_NORM_ROPE,
                     ATTENTION_KV_APPEND,
-                    ATTENTION_CAUSAL -> new QwenGpuOperationFrame(graph, instruction, gpu);
+                    ATTENTION_CAUSAL,
+                    MTP_STEM -> new QwenGpuOperationFrame(graph, instruction, gpu);
         };
     }
 

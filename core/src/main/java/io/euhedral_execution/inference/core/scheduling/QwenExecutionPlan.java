@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompa
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompactDenseFfnWeights;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompactGatedDeltaNetWeights;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenLayerWeights;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenMtpWeights;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDataType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
@@ -47,6 +48,8 @@ public final class QwenExecutionPlan {
         ATTENTION_QK_NORM_ROPE,
         ATTENTION_KV_APPEND,
         ATTENTION_CAUSAL,
+        /// MTP stem (docs/MTP_CONTRACT.md §2): packs [RMSNorm₁₊w(embedding); RMSNorm₁₊w(seed hidden)] per row.
+        MTP_STEM,
         /// Copies a host-backed weight into its staging slot. Its weight's `hostAddress` is the source
         /// and its `deviceAddress` the slot.
         WEIGHT_TRANSFER
@@ -78,7 +81,10 @@ public final class QwenExecutionPlan {
         FFN_PARTIALS,
         FINAL_NORMALIZED,
         LOGITS,
-        SLICE_PROJECTION
+        SLICE_PROJECTION,
+        /// MTP stem scratch: one normalized half, then the packed [embedding; hidden] rows.
+        MTP_NORMED,
+        MTP_PACKED
     }
 
     public enum ElementType {
@@ -263,6 +269,8 @@ public final class QwenExecutionPlan {
     private final QwenExecutionPlan decode;
     private final QwenExecutionPlan regionPrefill;
     private final WeightStaging staging;
+    /// The MTP draft view; null without loaded MTP weights and draft head.
+    private final QwenExecutionPlan mtpDraft;
     private final QwenExecutionPlan streamedPrefill;
 
     /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
@@ -373,11 +381,130 @@ public final class QwenExecutionPlan {
         if (family.regionPrefill == null) return family;
         // Decode runs its own instance of the small topology: rounded residual add + RMSNorm and the
         // joint GDN A/B projection + control are single region launches, as in short prefill quanta.
+        if (kind == QwenExecutionContext.ExecutionKind.DRAFT) {
+            if (family.mtpDraft == null)
+                throw new IllegalStateException("the model has no loaded MTP layer and draft head");
+            return family.mtpDraft;
+        }
         if (kind == QwenExecutionContext.ExecutionKind.DECODE || kind == QwenExecutionContext.ExecutionKind.VERIFY)
             return family.decode;
         if (rows < REGION_MIN_ROWS) return family.smallPrefill;
         if (streamedFfnRows(rows) && family.streamedPrefill != null) return family.streamedPrefill;
         return family.regionPrefill;
+    }
+
+    static final String DRAFT_HEAD = "text/draft_head";
+
+    /// Whether this plan's family can draft with MTP.
+    public boolean drafts() {
+        return this.owner.mtpDraft != null;
+    }
+
+    /// Rows of the draft head: the draft view's logits width.
+    public int draftVocabularySize() {
+        TensorHandle head = this.weights.runtimeObjects().get(DRAFT_HEAD);
+        if (head == null) throw new IllegalStateException("the model has no draft head");
+        return Math.toIntExact(head.shape()[0]);
+    }
+
+    /// The MTP draft view (docs/MTP_CONTRACT.md §2): embedding of each row's token, the MTP stem with the
+    /// context's seed hidden rows, the input projection, then the MTP layer, built by [#fullModel] as a
+    /// one-layer model with `mtp/final_norm` and the draft head, at the layer index after the base
+    /// layers (its own attention cache).
+    private static PlanData mtpDraft(QwenWeights weights) {
+        QwenConfig c = weights.config();
+        QwenMtpWeights mtp = weights.mtp();
+        TensorHandle head = weights.runtimeObjects().get(DRAFT_HEAD);
+        int hidden = c.hiddenSize();
+        int mtpLayer = c.numHiddenLayers();
+        QwenConfig one = new QwenConfig(
+                Math.toIntExact(head.shape()[0]),
+                hidden,
+                1,
+                c.numAttentionHeads(),
+                c.numKeyValueHeads(),
+                c.attentionHeadDim(),
+                c.intermediateSize(),
+                c.linearNumKeyHeads(),
+                c.linearNumValueHeads(),
+                c.linearKeyHeadDim(),
+                c.linearValueHeadDim(),
+                c.linearConvKernelDim(),
+                c.rmsNormEpsilon(),
+                c.ropeTheta(),
+                c.partialRotaryFactor(),
+                c.maxPositionEmbeddings(),
+                c.hiddenActivation(),
+                new QwenLayerType[] {QwenLayerType.FULL_ATTENTION},
+                c.numExperts(),
+                c.numExpertsPerToken(),
+                c.moeIntermediateSize(),
+                c.sharedExpertIntermediateSize(),
+                c.tieWordEmbeddings(),
+                c.attentionOutputGate(),
+                0);
+        QwenWeights single = new QwenWeights(
+                one, weights.tokenEmbedding(), new QwenLayerWeights[] {mtp.layer()}, mtp.finalNorm(), head, null);
+        PlanData layer = fullModel(single, validateEmbedding(weights.tokenEmbedding(), c.vocabSize(), hidden));
+        TensorHandle projection = validateQuantized(mtp.projection(), hidden, 2 * hidden, WeightFormat.Q3_G64_FP16);
+        TensorHandle embeddingNorm = validateNorm(mtp.embeddingNorm(), hidden);
+        TensorHandle hiddenNorm = validateNorm(mtp.hiddenNorm(), hidden);
+        List<Instruction> source = layer.instructions();
+        Instruction embedding = source.getFirst();
+        if (embedding.kind() != Kind.EMBEDDING)
+            throw new IllegalStateException("one-layer plan must start with the embedding");
+        List<Instruction> nodes = new ArrayList<>();
+        nodes.add(new Instruction(
+                0,
+                Kind.EMBEDDING,
+                List.of(),
+                embedding.weights,
+                List.of(),
+                List.of(Buffer.HIDDEN_STATE),
+                0,
+                hidden,
+                -1,
+                -1));
+        nodes.add(new Instruction(
+                1,
+                Kind.MTP_STEM,
+                List.of(0),
+                List.of(embeddingNorm, hiddenNorm),
+                List.of(Buffer.HIDDEN_STATE),
+                List.of(Buffer.MTP_PACKED),
+                hidden,
+                2 * hidden,
+                -1,
+                mtpLayer));
+        nodes.add(new Instruction(
+                2,
+                Kind.Q3_LINEAR,
+                List.of(1),
+                List.of(projection),
+                List.of(Buffer.MTP_PACKED),
+                List.of(Buffer.HIDDEN_STATE),
+                2 * hidden,
+                hidden,
+                -1,
+                mtpLayer));
+        for (int index = 1; index < source.size(); index++) {
+            Instruction next = source.get(index);
+            nodes.add(new Instruction(
+                    index + 2,
+                    next.kind(),
+                    next.dependencies().stream().map(id -> id + 2).toList(),
+                    next.weights,
+                    next.inputBuffers(),
+                    next.outputBuffers(),
+                    next.inputWidth(),
+                    next.outputWidth(),
+                    next.outputBufferIndex(),
+                    next.layerIndex() == 0 ? mtpLayer : next.layerIndex()));
+        }
+        List<BufferSpec> buffers = new ArrayList<>(layer.bufferSpecs());
+        buffers.add(new BufferSpec(Buffer.MTP_NORMED, hidden, ElementType.BF16));
+        buffers.add(new BufferSpec(Buffer.MTP_PACKED, 2 * hidden, ElementType.BF16));
+        return new PlanData(List.copyOf(nodes), layer.projectionWidths(), List.copyOf(buffers), true, false);
     }
 
     /// Builds an embedding-only plan for callers that intentionally validate only token lookup.
@@ -467,8 +594,12 @@ public final class QwenExecutionPlan {
             this.decode = null;
             this.regionPrefill = null;
             this.streamedPrefill = null;
+            this.mtpDraft = null;
             return;
         }
+        this.mtpDraft = weights.mtp() != null && weights.runtimeObjects().containsKey(DRAFT_HEAD)
+                ? new QwenExecutionPlan(weights, staged(mtpDraft(weights), this.staging), this, false)
+                : null;
         QwenConfig config = weights.config();
         this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
         this.decode = prefillPlan(weights, data, PrefillView.DECODE, this);

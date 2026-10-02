@@ -84,6 +84,7 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                                 instruction.inputWidth(),
                                 instruction.outputWidth());
             case GDN_PROJECTIONS -> runGdnProjections(context, instruction);
+            case MTP_STEM -> runMtpStem(context, instruction);
             case GDN_CONTROL -> runControl(context, instruction);
             case GDN_CONVOLUTION -> runConvolution(context, instruction);
             case GDN_RECURRENCE -> runRecurrence(context, instruction);
@@ -264,6 +265,24 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
             gpu().selectRowExact(context.kind() == QwenExecutionContext.ExecutionKind.VERIFY);
         }
         state.setPendingReplayRows(0);
+    }
+
+    /// MTP stem (docs/MTP_CONTRACT.md §2): row r of the packed output is
+    /// [RMSNorm₁₊w(embedding r, embedding_norm); RMSNorm₁₊w(seed r, hidden_norm)], the seed rows coming from
+    /// the context (base hidden rows for catch-up, the previous MTP hidden for a recursive row).
+    private void runMtpStem(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
+        int rows = context.inputTokenCount();
+        int hidden = instruction.inputWidth();
+        long rowBytes = (long) hidden * Short.BYTES;
+        long packed = output(context, instruction, 0);
+        long normed = context.workspace().address(QwenExecutionPlan.Buffer.MTP_NORMED);
+        float epsilon = (float) context.plan().weights().config().rmsNormEpsilon();
+        gpu().rmsNormUnitOffsetBf16(
+                        input(context, instruction, 0), instruction.weightAddress(0), normed, rows, hidden, epsilon);
+        gpu().copyRowsDeviceToDevice(packed, 2 * rowBytes, normed, rowBytes, rows);
+        gpu().rmsNormUnitOffsetBf16(
+                        context.draftSeedAddress(), instruction.weightAddress(1), normed, rows, hidden, epsilon);
+        gpu().copyRowsDeviceToDevice(packed + rowBytes, 2 * rowBytes, normed, rowBytes, rows);
     }
 
     private void runGatedRmsNorm(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
