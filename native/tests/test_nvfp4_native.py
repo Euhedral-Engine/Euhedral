@@ -125,6 +125,36 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                 expected = gate / (1.0 + np.exp(-gate)) * up
                 self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * np.abs(expected).max())
 
+    def test_skinny_linear_matches_float64_over_its_operands(self):
+        for terms in (1, 2):
+            for rows, k, cols, splits in ((2, 5120, 320, 1), (16, 2048, 200, 3), (29, 4096, 384, 2), (64, 2048, 128, 1)):
+                with self.subTest(terms=terms, rows=rows, k=k, cols=cols, splits=splits):
+                    weights, dense = tensor(self.rng, cols, k)
+                    x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                    fragments = 1 if rows <= 16 else 2 if rows <= 32 else 4
+                    stage = (terms * 16 * fragments + 64) * 160
+                    shared = min(4, 101376 // stage) * stage
+                    suffix = "" if terms == 1 else "_x2"
+                    with contextlib.ExitStack() as stack:
+                        dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
+                        size = layout(rows, k, terms)[2]
+                        da = self.gpu.zeros(size); stack.callback(self.gpu.free, da)
+                        dw = self.gpu.upload(weights); stack.callback(self.gpu.free, dw)
+                        dy = self.gpu.zeros(rows * cols * 2, fill=0xA5); stack.callback(self.gpu.free, dy)
+                        dp = self.gpu.zeros(rows * cols * 4); stack.callback(self.gpu.free, dp)
+                        self.gpu.launch("euhedral_nvfp4n_quantize_rows" + suffix, rows,
+                                        [C.c_uint64(dx), C.c_uint64(da), C.c_uint(rows), C.c_uint(k)], block=128)
+                        self.gpu.launch(f"euhedral_nvfp4n_skinny{suffix}_{16 * fragments}", ((cols + 63) // 64, splits),
+                                        [C.c_uint64(da), C.c_uint64(dw), C.c_uint64(dy), C.c_uint64(dp), C.c_uint(rows),
+                                         C.c_uint(k), C.c_uint(cols)], block=128, shared=shared)
+                        if splits > 1:
+                            self.gpu.launch("euhedral_nvfp4n_skinny_finish", (rows * cols + 255) // 256,
+                                            [C.c_uint64(dp), C.c_uint64(dy), C.c_uint(rows * cols)], block=256)
+                        activations = self.gpu.download(da, size)
+                        y = from_bf16_bytes(self.gpu.download(dy, rows * cols * 2), (rows, cols))
+                    expected = dequantize(activations, rows, k, terms) @ dense.astype(np.float64).T
+                    self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * np.abs(expected).max())
+
 
 if __name__ == "__main__":
     unittest.main()

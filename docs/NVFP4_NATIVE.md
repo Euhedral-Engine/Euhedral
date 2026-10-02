@@ -161,6 +161,77 @@ per-fork medians; "ahead" counts forks against the BF16-expansion arm.
   256–2048 tokens (6/6 forks each), and TTFT halves.
 - **Decode is unchanged:** one row per token still runs the GEMV, and Q3 decodes 18% faster.
 
+## Decode-like row counts
+
+One-row decode streams every weight once per token, so its floor is bytes over DRAM bandwidth. The
+NVFP4 GEMV already reaches it (gate_up: 100 MB in 0.128 ms, 780 GB/s). A tensor-core tile needs 16
+rows, so the question is what extra rows cost.
+
+**Skinny native kernel** (`skinny_linear`):
+- 4 warps over 64 output columns and all M ≤ 64 rows.
+- 256-value K tiles, up to 4 `cp.async` stages.
+- K is split when 64-column tiles alone cannot occupy 140 CTAs; FP32 partials are summed with
+  atomics and converted once.
+- It takes 2–64 rows. One row stays on the GEMV, which is as fast and keeps BF16 activations.
+
+**Operator times** (ms; real weights rotated over 4 layers; native includes quantization and split-K
+clear and finish):
+
+| Tensor (NVFP4 MB) | M | Q3 small-row route | NVFP4 GEMV / BF16 tile | Native 128×128, 1 term | Native skinny, 1 term | Native skinny, 2 terms |
+|---|---|---|---|---|---|---|
+| gate_up (100.3) | 1 | 0.095 | 0.128 | 0.165 | 0.128 | 0.129 |
+| | 2 | 0.356 | 0.516 | 0.171 | 0.129 | 0.130 |
+| | 4 | 0.531 | 0.518 | 0.166 | 0.129 | 0.130 |
+| | 8 | 1.062 | 0.517 | 0.166 | 0.129 | 0.131 |
+| | 16 | 0.403 | 0.523 | 0.174 | 0.131 | 0.132 |
+| | 64 | 0.630 | 0.559 | 0.188 | 0.139 | 0.178 |
+| down (50.1) | 1 | 0.046 | 0.068 | 0.117 | 0.071 | 0.077 |
+| | 4 | 0.379 | 0.661 | 0.118 | 0.076 | 0.076 |
+| | 16 | 0.328 | 0.663 | 0.120 | 0.072 | 0.082 |
+| GDN output (17.7) | 1 | 0.013 | 0.024 | 0.035 | 0.028 | 0.031 |
+| | 4 | 0.122 | 0.233 | 0.035 | 0.029 | 0.029 |
+| | 16 | 0.114 | 0.233 | 0.041 | 0.028 | 0.030 |
+| LM head (715.2) | 1 | 0.642 | 0.897 | 1.154 | 0.888 | 0.890 |
+| | 4 | 3.625 | 3.306 | 1.159 | 0.893 | 0.895 |
+| | 16 | 2.609 | 3.342 | 1.171 | 0.903 | 0.904 |
+
+**Native NVFP4 is flat in M up to about 32 rows, at the weight-streaming floor.** Q3's small-row
+route and the BF16-expansion tile cost 3–8× one row as soon as M ≥ 2.
+
+**Whole-model estimate per decode step.**
+- Linears weighted by layer count: 48 GDN layers (query_key, value_z, output), 16 attention layers
+  (query_key, gate_value, output), 64 × (gate_up, down), and the LM head.
+- Step time = the measured NVFP4 one-row step (19.52 ms at 51.24 tok/s) + linear(M) − linear(1).
+- Linears are 94% of that step (18.3 ms).
+- Attention and GDN growth with M is not included.
+
+| M | Current NVFP4 route | Native, 1 term | Native, 2 terms |
+|---|---|---|---|
+| 1 | 19.5 ms (GEMV) | 19.5 ms (GEMV) | 19.5 ms (GEMV) |
+| 2 | 121.4 ms | 20.9 ms (1.87× rows/s) | 21.6 ms (1.81×) |
+| 4 | 120.1 ms | 21.1 ms (3.70×) | 21.8 ms (3.58×) |
+| 8 | 121.1 ms | 20.8 ms (7.49×) | 21.8 ms (7.15×) |
+| 16 | 120.7 ms | 22.1 ms (14.2×) | 21.8 ms (14.3×) |
+| 32 | 121.9 ms | 21.8 ms (28.6×) | 23.7 ms (26.4×) |
+| 64 | 125.4 ms | 23.6 ms (52.8×) | 31.3 ms (40.0×) |
+
+**End to end, against the previous commit** (128×128 tile from 64 rows, BF16-expansion tile below):
+paired gate, 6 forks, default two terms.
+
+| Scenario | Before | After | Forks ahead |
+|---|---|---|---|
+| prefill 8 (tok/s) | 67.7 | 278.2 (+311%) | 6/6 |
+| prefill 16 | 135.4 | 557.4 (+312%) | 6/6 |
+| prefill 32 | 265.3 | 1003.1 (+278%) | 6/6 |
+| prefill 64 | 1177.8 | 1492.5 (+27%) | 6/6 |
+| TTFT, 16-token prompt (ms) | 119.4 | 29.1 | 6/6 |
+| TTFT, 64-token prompt (ms) | 55.7 | 44.8 | 6/6 |
+| decode @16 / @64 (tok/s) | 51.27 / 51.28 | 51.24 / 51.28 | flat |
+
+**At M = 1 native loses 9%** (20.0 against 18.3 ms of linears), so one-row decode keeps the GEMV.
+**From M = 2 native wins outright.** An MTP verification of 1 + 3 drafts, or a batch of 4, would
+cost about 21 ms per step against 19.5 ms for one token.
+
 ## Numerics
 
 **Operator level** (Gaussian activations, real-shape converter-quantized weights):

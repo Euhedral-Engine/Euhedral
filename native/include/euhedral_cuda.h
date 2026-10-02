@@ -138,7 +138,10 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_gate_up_swiglu_bf16(
  * in_features is not a multiple of 128. Activations are quantized (two NVFP4 terms by default, one with
  * EUHEDRAL_NVFP4_NATIVE=1), so results differ from euhedral_cuda_linear_nvfp4_bf16. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_available(void);
-EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_nvfp4_activation_bytes(uint32_t rows, uint32_t in_features);
+/* Scratch for one native linear or gate/up region: quantized activations, plus FP32 split-K partials for
+ * decode-like row counts (2 to 64 rows run the skinny weight-streaming kernel). */
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_nvfp4_native_scratch_bytes(
+        uint32_t rows, uint32_t in_features, uint32_t out_features);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_nvfp4_native_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,

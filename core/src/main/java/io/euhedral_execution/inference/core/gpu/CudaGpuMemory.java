@@ -188,10 +188,14 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.nvfp4NativeAvailable = symbols.find("euhedral_cuda_nvfp4_native_available")
                     .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
                     .orElse(null);
-            this.nvfp4ActivationBytes = symbols.find("euhedral_cuda_nvfp4_activation_bytes")
+            this.nvfp4ActivationBytes = symbols.find("euhedral_cuda_nvfp4_native_scratch_bytes")
                     .map(symbol -> linker.downcallHandle(
                             symbol,
-                            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT)))
                     .orElse(null);
             this.linearNvfp4NativeBf16 = symbols.find("euhedral_cuda_linear_nvfp4_native_bf16")
                     .map(symbol -> linker.downcallHandle(
@@ -1415,8 +1419,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         });
     }
 
-    /// Rows from which an NVFP4 linear runs on native FP4 tensor cores (docs/NVFP4_NATIVE.md).
-    static final int NVFP4_NATIVE_MIN_ROWS = 64;
+    /// Rows from which an NVFP4 linear runs on native FP4 tensor cores: one row stays on the GEMV, which
+    /// streams weights as fast and keeps BF16 activations (docs/NVFP4_NATIVE.md).
+    static final int NVFP4_NATIVE_MIN_ROWS = 2;
+    /// The paired gate/up region exists only in region views, from 64 rows.
+    static final int NVFP4_NATIVE_REGION_MIN_ROWS = 64;
 
     /// Whether the native Blackwell NVFP4 kernels are loaded: an sm_12x device, and not disabled with
     /// EUHEDRAL_NVFP4_NATIVE=0.
@@ -1456,7 +1463,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void nvfp4GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
-        if (rows >= NVFP4_NATIVE_MIN_ROWS && width % 128 == 0 && nvfp4NativeAvailable()) {
+        if (rows >= NVFP4_NATIVE_REGION_MIN_ROWS && width % 128 == 0 && nvfp4NativeAvailable()) {
             if (invokeNativeNvfp4(
                     "native NVFP4 gate/up SwiGLU region",
                     this.nvfp4NativeGateUpSwiGluBf16,
@@ -1497,7 +1504,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         requireAddresses(input, weights, output);
         long activationBytes;
         try {
-            activationBytes = (long) this.nvfp4ActivationBytes.invokeExact(rows, width);
+            activationBytes = (long) this.nvfp4ActivationBytes.invokeExact(rows, width, outputs);
         } catch (Throwable failure) {
             throw new GpuMemoryException("NVFP4 activation size invocation failed", failure);
         }
