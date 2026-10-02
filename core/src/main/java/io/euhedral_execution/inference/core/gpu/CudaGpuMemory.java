@@ -76,6 +76,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// The size of every live device allocation, by address; [#allocate] is the only native allocator.
     private final ConcurrentHashMap<Long, Long> allocationSizes = new ConcurrentHashMap<>();
     private final AtomicLong allocatedBytes = new AtomicLong();
+    /// High-water mark of [#allocatedBytes] since construction or the last [#resetPeakAllocatedBytes].
+    private final AtomicLong peakAllocatedBytes = new AtomicLong();
     private final MethodHandle rmsNormBf16;
     private final MethodHandle rmsNormUnitOffsetBf16;
     private final MethodHandle linearQ3Bf16;
@@ -636,7 +638,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             long value = address.address();
             if (value == 0) throw new GpuMemoryException("CUDA allocation returned a null address");
             allocationSizes.put(value, byteSize);
-            allocatedBytes.addAndGet(byteSize);
+            long live = allocatedBytes.addAndGet(byteSize);
+            peakAllocatedBytes.accumulateAndGet(live, Math::max);
             return value;
         } catch (GpuMemoryException exception) {
             throw exception;
@@ -1939,6 +1942,17 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// it stays readable after close.
     public long allocatedBytes() {
         return allocatedBytes.get();
+    }
+
+    /// The largest [#allocatedBytes] seen since construction or the last [#resetPeakAllocatedBytes]:
+    /// transient allocations included. Stays readable after close.
+    public long peakAllocatedBytes() {
+        return peakAllocatedBytes.get();
+    }
+
+    /// Restarts the high-water mark at the current [#allocatedBytes].
+    public void resetPeakAllocatedBytes() {
+        peakAllocatedBytes.set(allocatedBytes.get());
     }
 
     /// Returns the current CUDA device's free and total memory, in bytes.

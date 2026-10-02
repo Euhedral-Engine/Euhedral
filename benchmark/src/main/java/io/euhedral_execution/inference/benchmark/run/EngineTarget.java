@@ -61,7 +61,18 @@ public final class EngineTarget implements BenchmarkRunner.Target {
     @Override
     public long[] memory() {
         var info = this.engine.deviceMemoryInfo();
-        return new long[] {info.freeBytes(), info.totalBytes()};
+        return new long[] {
+            info.freeBytes(),
+            info.totalBytes(),
+            this.engine.allocatedDeviceBytes(),
+            this.engine.peakAllocatedDeviceBytes(),
+            this.engine.retainedWorkspaceBytes()
+        };
+    }
+
+    @Override
+    public void resetPeakMemory() {
+        this.engine.resetPeakAllocatedDeviceBytes();
     }
 
     @Override

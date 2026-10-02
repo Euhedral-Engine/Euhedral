@@ -33,7 +33,11 @@ public final class BenchmarkRunner {
         boolean isEos(int tokenId);
 
         /// Returns `{freeBytes, totalBytes}` for the device.
+        /// {free, total, allocated, peak allocated, retained workspace} device bytes.
         long[] memory();
+
+        /// Restarts the peak of the allocated bytes [#memory] reports.
+        default void resetPeakMemory() {}
 
         @Override
         void close();
@@ -83,6 +87,7 @@ public final class BenchmarkRunner {
             boolean warmup,
             int index)
             throws InterruptedException {
+        if (options.gpuMemory()) target.resetPeakMemory();
         long[] before = options.gpuMemory() ? target.memory() : null;
         var timing = new IterationTiming(
                 Math.ceilDiv(prompt.actualTokens(), tuning.prefillChunkTokens()), scenario.requestedNewTokens());
@@ -130,6 +135,19 @@ public final class BenchmarkRunner {
                 outcome.timings(),
                 outcome.throughput(),
                 engine,
-                before == null ? null : new BenchmarkResult.GpuMemory(before[0], after[0], before[1]));
+                before == null
+                        ? null
+                        : new BenchmarkResult.GpuMemory(
+                                before[0],
+                                after[0],
+                                before[1],
+                                at(before, 2),
+                                at(after, 3),
+                                at(after, 2),
+                                at(after, 4)));
+    }
+
+    private static Long at(long[] values, int index) {
+        return values.length > index ? values[index] : null;
     }
 }

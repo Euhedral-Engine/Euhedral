@@ -255,6 +255,19 @@ public final class InferenceEngine implements AutoCloseable {
         return this.bootstrap.allocatedBytes(this.gpu);
     }
 
+    /// The largest [#allocatedDeviceBytes] since the engine loaded or the last
+    /// [#resetPeakAllocatedDeviceBytes], transient allocations included.
+    public synchronized long peakAllocatedDeviceBytes() {
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        return this.bootstrap.peakAllocatedBytes(this.gpu);
+    }
+
+    /// Restarts [#peakAllocatedDeviceBytes] at the current [#allocatedDeviceBytes].
+    public synchronized void resetPeakAllocatedDeviceBytes() {
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        this.bootstrap.resetPeakAllocatedBytes(this.gpu);
+    }
+
     /// The part of [#allocatedDeviceBytes] that execution graphs retain between quanta, so that a quantum
     /// finds its workspace already allocated. It is bounded by the graphs' largest quanta, not by
     /// sessions or tokens, and is released when the engine closes.
@@ -418,6 +431,14 @@ public final class InferenceEngine implements AutoCloseable {
 
         long allocatedBytes(ExecutionGpu gpu) {
             return ((CudaGpuMemory) gpu).allocatedBytes();
+        }
+
+        long peakAllocatedBytes(ExecutionGpu gpu) {
+            return ((CudaGpuMemory) gpu).peakAllocatedBytes();
+        }
+
+        void resetPeakAllocatedBytes(ExecutionGpu gpu) {
+            ((CudaGpuMemory) gpu).resetPeakAllocatedBytes();
         }
     }
 }
