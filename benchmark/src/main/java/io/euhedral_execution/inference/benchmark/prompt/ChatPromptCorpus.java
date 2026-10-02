@@ -13,11 +13,14 @@ import java.util.function.ToIntFunction;
 /// prompts make the model repeat itself).
 ///
 /// A scenario gets one prompt per task. When the target leaves room, a prompt quotes the longest
-/// paragraph-aligned prefix of a frozen document (a snapshot of docs/FRAME_MODEL.md) that keeps it
-/// within the target, and its task refers to that document; otherwise it carries a standalone task.
+/// paragraph-aligned prefix of a frozen document that keeps it within the target, and its task refers to
+/// that document; otherwise it carries a standalone task. The document is a snapshot of docs/FRAME_MODEL.md
+/// followed by other repository documents and Java sources (about 60K tokens), so 16K and 32K prompts are
+/// real long contexts. v2 only appended to v1's document: prompts that fit in its first ~10K tokens are
+/// byte-identical to v1's.
 /// `actualTokens` is at most the target. Every task asks for long-form output.
 public final class ChatPromptCorpus {
-    public static final String GENERATOR = "euhedral-chat-v1";
+    public static final String GENERATOR = "euhedral-chat-v2";
     /// The least document a prompt quotes; shorter targets use standalone tasks.
     static final int MIN_DOCUMENT_TOKENS = 64;
 
