@@ -2,6 +2,7 @@
 #include "strategies/decode.cuh"
 #include "strategies/decode_wide.cuh"
 #include "strategies/decode_contiguous.cuh"
+#include "p2e2.cuh"
 #include "strategies/prefill.cuh"
 #include "strategies/k32_prefill.cuh"
 #include "common/pdl.cuh"
@@ -51,6 +52,22 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q3_decode_contiguous(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
     q3::contiguous_decode(input, weights, output, in_features, out_features, scale_offset);
+}
+
+// P2E2 tensors (p2e2.cuh, docs/COMPRESSED_Q3.md). Optional symbols.
+// Single-row decode from the compressed layout, bitwise identical to euhedral_q3_decode_contiguous on
+// the row-split tensor it encodes. 128 threads, 16 rows per CTA; same shape requirements.
+extern "C" __global__ __launch_bounds__(128, 5) void euhedral_q3_p2e2_decode(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int in_features, unsigned int out_features) {
+    q3::p2e2::p2e2_decode(input, weights, output, in_features, out_features);
+}
+// Expands rows [first_row, first_row + row_count) of a P2E2 tensor of `rows` rows into the row-split
+// tensor of row_count rows they encode, byte for byte. One warp per row.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_p2e2_expand(
+        const unsigned char* weights, unsigned char* out, unsigned int rows, unsigned int in_features,
+        unsigned int first_row, unsigned int row_count) {
+    q3::p2e2::p2e2_expand(weights, out, rows, in_features, first_row, row_count);
 }
 
 // Single-row decode with warp-local wide streaming (strategies/decode_wide.cuh): every lane loads

@@ -17,6 +17,8 @@ void* euhedral_cuda_submission_stream(void);
 #define EUHEDRAL_CUDA_SIZE_OVERFLOW (-2)
 #define EUHEDRAL_CUDA_FORMAT_MISMATCH (-3)
 #define EUHEDRAL_CUDA_KERNEL_UNAVAILABLE (-4)
+/* The requested specialized route does not apply (numerics, shape or alignment); use another. */
+#define EUHEDRAL_CUDA_ROUTE_UNAVAILABLE (-5)
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +57,16 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_device_to_device(
         void* destination_address,
         const void* source_address,
         uint64_t byte_size);
+
+/// Copies `rows` rows of `row_bytes` between pitched device regions; queued like
+/// euhedral_cuda_copy_device_to_device.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_device_to_device_2d(
+        void* destination_address,
+        uint64_t destination_pitch,
+        const void* source_address,
+        uint64_t source_pitch,
+        uint64_t row_bytes,
+        uint64_t rows);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_embed_q3(
         const int32_t* device_token_ids,
@@ -105,6 +117,27 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_bf16(
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_64_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
+
+/* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/COMPRESSED_Q3.md): the same Q3G64_F16S values in
+ * a smaller, entropy-coded layout. The decode route runs one row with relaxed numerics on the shapes
+ * of euhedral_cuda_linear_q3_decode_bf16's contiguous kernel, bitwise identical to it, and returns
+ * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE otherwise. Every other route expands the tensor into the row-split
+ * layout (`destination` holds at least that many bytes) and runs the row-split entry points. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_p2e2_decode_bf16(
+        const void* input, const void* weights, void* output,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
+/* Expands rows [first_row, first_row + row_count) into a row-split tensor of row_count rows. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_p2e2_expand(
+        const void* weights, uint64_t weights_byte_size, uint32_t rows, uint32_t in_features,
+        uint32_t first_row, uint32_t row_count, void* destination, uint64_t destination_byte_size);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_embed_q3_p2e2(
+        const int32_t* device_token_ids,
+        const void* device_embedding_weights,
+        void* device_hidden_state,
+        uint32_t token_count,
+        uint32_t vocabulary_size,
+        uint32_t hidden_size,
+        uint64_t embedding_byte_size);
 
 /* Split-K FFN down for the measured prefill shapes: K splits accumulate into `partials`
  * (splits x rows x outputs FP32, splits = 4) and a reduction writes BF16 `output`. Other shapes, or
