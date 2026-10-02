@@ -118,6 +118,17 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_64_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
 
+/* NVFP4 weights (Nvfp4Layout): `in_features` x `out_features` (weight rows) linear on BF16 rows, one
+ * row on the decode kernel and other row counts on the balanced tile engine; and the paired gate/up
+ * projection with SwiGLU, `outputs` weight rows (gate first) giving outputs / 2 values per row. FP32
+ * accumulation; the tile kernels round each weight to BF16. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_nvfp4_bf16(
+        const void* input, const void* weights, void* output,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_gate_up_swiglu_bf16(
+        const void* input, const void* weights, void* output,
+        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);
+
 /* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/COMPRESSED_Q3.md): the same Q3G64_F16S values in
  * a smaller, entropy-coded layout. The decode route runs one row with relaxed numerics on the shapes
  * of euhedral_cuda_linear_q3_decode_bf16's contiguous kernel, bitwise identical to it, and returns

@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
         .root = b.path("src/host"),
         .files = &.{
             "euhedral_cuda.c", "q3_embedding.c", "cuda_kernel_loader.c",
-            "rms_norm_bf16.c", "q3_linear_bf16.c", "qwen_layer_ops.c",
+            "rms_norm_bf16.c", "q3_linear_bf16.c", "qwen_layer_ops.c", "nvfp4_linear.c",
         },
         .flags = &.{"-std=c11", "-fvisibility=hidden"},
     });
