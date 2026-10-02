@@ -34,6 +34,13 @@ public final class QwenWeightLoader {
     private QwenWeightLoader() {}
 
     public static QwenWeights load(Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory) throws IOException {
+        return load(artifactPath, artifact, gpuMemory, WeightResidency.ALL);
+    }
+
+    /// Loads with the given residency; [WeightResidency#EXECUTED] applies to compact artifacts.
+    public static QwenWeights load(
+            Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, WeightResidency residency)
+            throws IOException {
         Objects.requireNonNull(artifactPath, "artifactPath");
         Objects.requireNonNull(artifact, "artifact");
         Objects.requireNonNull(gpuMemory, "gpuMemory");
@@ -43,7 +50,7 @@ public final class QwenWeightLoader {
         TensorDescriptor[] descriptors = requireDescriptors(artifact);
         Map<String, TensorDescriptor> descriptorsByName = indexDescriptors(descriptors);
         if (isCompactArtifact(artifact)) {
-            return QwenCompactWeightLoader.load(artifactPath, artifact, gpuMemory, descriptorsByName);
+            return QwenCompactWeightLoader.load(artifactPath, artifact, gpuMemory, descriptorsByName, residency);
         }
         String modelPrefix = modelPrefix(descriptorsByName.keySet());
         Set<String> requiredNames = requiredNames(config, modelPrefix);

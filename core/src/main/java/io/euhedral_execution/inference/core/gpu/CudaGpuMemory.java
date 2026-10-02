@@ -110,6 +110,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle q3P2e2Expand;
     private final MethodHandle embedQ3P2e2;
     private final MethodHandle copyDeviceToDevice2d;
+    private final MethodHandle linearNvfp4Bf16;
+    private final MethodHandle nvfp4GateUpSwiGluBf16;
     /// The stream whose launches the current thread is submitting, or null for synchronous calls.
     private final ThreadLocal<CudaStream> submitting = new ThreadLocal<>();
     /// One device region, reused by every P2E2 route that expands its tensor for a row-split kernel.
@@ -164,6 +166,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                                     ValueLayout.JAVA_INT,
                                     ValueLayout.ADDRESS,
                                     ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.linearNvfp4Bf16 = symbols.find("euhedral_cuda_linear_nvfp4_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
+                    .orElse(null);
+            this.nvfp4GateUpSwiGluBf16 = symbols.find("euhedral_cuda_nvfp4_gate_up_swiglu_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
                     .orElse(null);
             this.copyDeviceToDevice2d = symbols.find("euhedral_cuda_copy_device_to_device_2d")
                     .map(symbol -> linker.downcallHandle(
@@ -1306,6 +1314,59 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
             q3GateUpSwiGluBf16(input, scratch, output, rows, width, outputs, expanded);
         });
+    }
+
+    @Override
+    public void linearNvfp4Bf16(
+            long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
+        invokeNvfp4(
+                "NVFP4 linear", linearNvfp4Bf16, input, weights, output, rows, inFeatures, outFeatures, weightBytes);
+    }
+
+    @Override
+    public void nvfp4GateUpSwiGluBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        invokeNvfp4(
+                "NVFP4 gate/up SwiGLU region",
+                nvfp4GateUpSwiGluBf16,
+                input,
+                weights,
+                output,
+                rows,
+                width,
+                outputs,
+                weightBytes);
+    }
+
+    private void invokeNvfp4(
+            String operation,
+            MethodHandle kernel,
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes) {
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
+            throw new IllegalArgumentException(operation + " dimensions and payload size must be positive");
+        if (kernel == null) throw new UnsupportedOperationException("native " + operation + " unavailable");
+        int status;
+        try {
+            status = (int) kernel.invokeExact(
+                    MemorySegment.ofAddress(input),
+                    MemorySegment.ofAddress(weights),
+                    MemorySegment.ofAddress(output),
+                    rows,
+                    width,
+                    outputs,
+                    weightBytes);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException(operation + " invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException(q3Operation(operation, status), status);
     }
 
     @Override

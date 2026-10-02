@@ -37,6 +37,16 @@ final class QwenCompactWeightLoader {
     static QwenWeights load(
             Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, Map<String, TensorDescriptor> descriptors)
             throws IOException {
+        return load(artifactPath, artifact, gpuMemory, descriptors, WeightResidency.ALL);
+    }
+
+    static QwenWeights load(
+            Path artifactPath,
+            QwenArtifact artifact,
+            GpuMemory gpuMemory,
+            Map<String, TensorDescriptor> descriptors,
+            WeightResidency residency)
+            throws IOException {
         QwenConfig config = artifact.config();
         validateConfig(config);
         validateInventory(config, descriptors);
@@ -44,7 +54,8 @@ final class QwenCompactWeightLoader {
         Map<String, TensorHandle> handles = new LinkedHashMap<>();
         try {
             for (TensorDescriptor descriptor : descriptors.values()) {
-                handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
+                if (residency.uploads(descriptor.name()))
+                    handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
             return assemble(config, handles);
         } catch (Throwable failure) {
@@ -129,7 +140,8 @@ final class QwenCompactWeightLoader {
             layers[index] = new QwenLayerWeights(index, inputNorm, postNorm, mixer, ffn);
         }
 
-        QwenMtpWeights mtp = config.mtpLayerCount() == 0 ? null : buildMtp(handles);
+        QwenMtpWeights mtp =
+                config.mtpLayerCount() == 0 || !handles.containsKey("mtp/input_projection") ? null : buildMtp(handles);
         return new QwenWeights(config, tokenEmbedding, layers, finalNorm, lmHead, mtp, handles);
     }
 

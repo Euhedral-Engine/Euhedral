@@ -183,6 +183,14 @@ public final class QwenExecutionPlan {
             return this.weights.get(weightIndex).byteSize();
         }
 
+        public WeightFormat weightFormat() {
+            return weightFormat(0);
+        }
+
+        public WeightFormat weightFormat(int weightIndex) {
+            return this.weights.get(weightIndex).format();
+        }
+
         public WeightLayout weightLayout() {
             return weightLayout(0);
         }
@@ -360,8 +368,7 @@ public final class QwenExecutionPlan {
         Objects.requireNonNull(weights, "weights");
         int hiddenSize = weights.config().hiddenSize();
         int vocabularySize = weights.config().vocabSize();
-        TensorHandle embedding =
-                validateQuantized(weights.tokenEmbedding(), vocabularySize, hiddenSize, WeightFormat.Q3_G64_FP16);
+        TensorHandle embedding = validateEmbedding(weights.tokenEmbedding(), vocabularySize, hiddenSize);
         return new QwenExecutionPlan(weights, embeddingOnly(embedding, hiddenSize));
     }
 
@@ -527,6 +534,7 @@ public final class QwenExecutionPlan {
             }
             if (streamed
                     && first.kind() == Kind.Q3_LINEAR
+                    && first.weight().format() == WeightFormat.Q3_G64_FP16
                     && next != null
                     && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
                     && next.kind() == Kind.SWIGLU
@@ -747,8 +755,7 @@ public final class QwenExecutionPlan {
         if (hiddenSize <= 0 || vocabularySize <= 0) {
             throw new IllegalArgumentException("invalid model dimensions");
         }
-        TensorHandle embedding =
-                validateQuantized(weights.tokenEmbedding(), vocabularySize, hiddenSize, WeightFormat.Q3_G64_FP16);
+        TensorHandle embedding = validateEmbedding(weights.tokenEmbedding(), vocabularySize, hiddenSize);
         QwenLayerWeights[] layers = weights.layers();
         if (layers == null || layers.length == 0) {
             return embeddingOnly(embedding, hiddenSize);
@@ -1423,8 +1430,7 @@ public final class QwenExecutionPlan {
                 || (normWeight != null && projections.isEmpty())) {
             throw new IllegalArgumentException("invalid operator slice");
         }
-        TensorHandle embedding =
-                validateQuantized(weights.tokenEmbedding(), vocabularySize, hiddenSize, WeightFormat.Q3_G64_FP16);
+        TensorHandle embedding = validateEmbedding(weights.tokenEmbedding(), vocabularySize, hiddenSize);
         List<Instruction> nodes = new ArrayList<>();
         nodes.add(node(
                 0,
@@ -1532,6 +1538,17 @@ public final class QwenExecutionPlan {
         return copyHandle(handle);
     }
 
+    /// Projections may be NVFP4 wherever a row-split format is registered; the token embedding, a
+    /// gather, has Q3 kernels only.
+    private static final WeightFormat EMBEDDING_FORMAT = WeightFormat.Q3_G64_FP16;
+
+    private static TensorHandle validateEmbedding(TensorHandle handle, long rows, int width) {
+        if (handle.format() != EMBEDDING_FORMAT) {
+            throw new IllegalArgumentException("unsupported token embedding format: " + handle.format());
+        }
+        return validateQuantized(handle, rows, width, EMBEDDING_FORMAT);
+    }
+
     private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat format) {
         Objects.requireNonNull(handle, "weight");
         long[] shape = handle.shape();
@@ -1542,7 +1559,7 @@ public final class QwenExecutionPlan {
                 || width % 64 != 0
                 || handle.deviceAddress() == 0
                 || handle.dataType() != TensorDataType.BF16
-                || handle.format() != format
+                || !(handle.format() == format || (handle.format() == WeightFormat.NVFP4 && format != EMBEDDING_FORMAT))
                 || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
                         || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1 && format == WeightFormat.Q3_G64_FP16))
                 || !CompactTensorLayout.acceptsByteSize(

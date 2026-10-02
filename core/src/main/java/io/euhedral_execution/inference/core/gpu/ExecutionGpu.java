@@ -321,6 +321,19 @@ public abstract class ExecutionGpu implements GpuMemory {
         linearQ3Bf16(inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize);
     }
 
+    /// NVFP4 linear (Nvfp4Layout): `outFeatures` weight rows of `inFeatures` values on BF16 rows.
+    public void linearNvfp4Bf16(
+            long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
+        throw new UnsupportedOperationException("NVFP4 linear is not implemented by this GPU");
+    }
+
+    /// NVFP4 gate/up projection with SwiGLU: `outputs` weight rows, gate rows first, giving outputs / 2
+    /// values per row.
+    public void nvfp4GateUpSwiGluBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        throw new UnsupportedOperationException("NVFP4 gate/up SwiGLU region is not implemented by this GPU");
+    }
+
     /// Computes the Q4 query/key and Q5 value/gate projections of one GDN layer. The default runs
     /// the two linear routes; a native implementation may fuse them where that is faster, with
     /// bitwise identical outputs.

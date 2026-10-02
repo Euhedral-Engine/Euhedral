@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
+import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -51,7 +52,8 @@ public record BenchmarkOptions(
         @JsonProperty("gpuHeadroomMiB") Long gpuHeadroomMiB,
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
         @JsonProperty("q3DispatchMode") Q3DispatchMode q3DispatchMode,
-        @JsonProperty("q3SmallRowThreshold") Integer q3SmallRowThreshold) {
+        @JsonProperty("q3SmallRowThreshold") Integer q3SmallRowThreshold,
+        @JsonProperty("weightResidency") WeightResidency weightResidency) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -79,6 +81,7 @@ public record BenchmarkOptions(
         q3SmallRowThreshold =
                 q3SmallRowThreshold == null ? Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD : q3SmallRowThreshold;
         if (q3SmallRowThreshold < 0) throw new IllegalArgumentException("Q3 threshold must not be negative");
+        weightResidency = weightResidency == null ? WeightResidency.ALL : weightResidency;
 
         if (cpus.isEmpty()) throw new IllegalArgumentException("cpus must not be blank");
         for (int id : excludeCpus) if (id < 0) throw new IllegalArgumentException("excludeCpus must not be negative");
@@ -136,6 +139,7 @@ public record BenchmarkOptions(
                 gpuMemory,
                 gpuHeadroomMiB,
                 shutdownTimeoutSeconds,
+                null,
                 null,
                 null);
     }
@@ -205,7 +209,8 @@ public record BenchmarkOptions(
                 options.gpuHeadroomMiB(),
                 options.shutdownTimeoutSeconds(),
                 options.q3DispatchMode(),
-                options.q3SmallRowThreshold());
+                options.q3SmallRowThreshold(),
+                options.weightResidency());
     }
 
     public boolean json() {
@@ -220,8 +225,9 @@ public record BenchmarkOptions(
     public List<InferenceTuning> sweep(InferenceTuning base) {
         List<InferenceTuning> tunings = new ArrayList<>();
         for (int chunk : this.prefillChunks)
-            tunings.add(
-                    base.withPrefillChunkTokens(chunk).withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold));
+            tunings.add(base.withPrefillChunkTokens(chunk)
+                    .withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold)
+                    .withWeightResidency(this.weightResidency));
         return tunings;
     }
 
