@@ -1039,7 +1039,10 @@ int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
         uint32_t cache_length, uint64_t start, void* scratch) {
-    if (rows > 1 && euhedral_cuda_row_exact() && query_key && gate && keys && values && output && scratch
+    // The row twins also serve small non-row-exact quanta that bring decode scratch (speculative drafting):
+    // a 32-row prefill tile over a long cache is one CTA per head, about 9.5 ms over 32K keys for 2-4 rows
+    // against 0.45-0.75 ms for the twins.
+    if (rows > 1 && (euhedral_cuda_row_exact() || rows <= 8u) && query_key && gate && keys && values && output && scratch
             && query_heads && key_heads && query_heads % key_heads == 0 && head_dim == 256 && rows <= 64u
             && start <= cache_length && rows <= cache_length - start && start + rows <= UINT32_MAX
             && !euhedral_cuda_exact_numerics()) {

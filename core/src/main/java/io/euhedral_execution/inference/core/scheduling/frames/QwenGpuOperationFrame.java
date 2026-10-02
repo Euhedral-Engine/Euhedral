@@ -375,11 +375,20 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         // readable here but not committed until the quantum retires.
                         state.submittedLength(),
                         context.startPosition(),
-                        context.inputTokenCount() == 1 || context.kind() == QwenExecutionContext.ExecutionKind.VERIFY
+                        context.inputTokenCount() == 1
+                                        || context.kind() == QwenExecutionContext.ExecutionKind.VERIFY
+                                        || draftRowTwins(context)
                                 ? ((AttentionSequenceStates)
                                                 context.sequenceState().kvCacheState())
                                         .decodeScratch(config.numAttentionHeads(), context.inputTokenCount())
                                 : 0);
+    }
+
+    /// Small draft quanta (MTP catch-up, at most 8 rows) bring decode scratch, so their attention runs on
+    /// the decode row twins: far more parallel over a long cache than a 32-row prefill tile (at 32K keys
+    /// about 0.45-0.75 ms against 9.5 ms for 2-4 rows), and drafts only propose tokens.
+    private static boolean draftRowTwins(QwenExecutionContext context) {
+        return context.kind() == QwenExecutionContext.ExecutionKind.DRAFT && context.inputTokenCount() <= 8;
     }
 
     private void runResidualAdd(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
