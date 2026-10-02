@@ -48,6 +48,45 @@ class MetricsTest {
         assertEquals(new BenchmarkResult.Throughput(5e9 / 800, 2e9 / 350, 3e9 / 1_800), outcome.throughput());
     }
 
+    /// Speculative decoding: two verification steps commit 3 and 2 tokens after the first, then the last
+    /// token's commit-only quantum. The decode window starts at the first token, because the MTP
+    /// catch-up that drafts the first verification runs after it.
+    @Test
+    void speculativeStepsCountTheirCommittedTokensAndDrafting() {
+        var timing = new IterationTiming(1, 1);
+        timing.entered = true;
+        timing.entryNanos = 1_000;
+        timing.promptEncoded(1_100, 5);
+        timing.prefillQuantum(1_200, 2_000, 5);
+        timing.firstTokenSelected(2_100, 1);
+        timing.speculativeStep(2_200, 2_400, 3, 2);
+        timing.speculativeStep(2_500, 2_700, 2, 1);
+        timing.decodeQuantum(2_750, 2_800, 2_800, false, -1);
+        timing.returned = true;
+        timing.returnNanos = 2_900;
+        var outcome = Metrics.evaluate(
+                new Scenario(Scenario.Kind.PROMPT_TO_N, 5, 6),
+                timing,
+                List.of(1, 2, 3, 4, 5, 6),
+                id -> id == EOS,
+                null);
+        assertEquals(BenchmarkResult.SUCCESS, outcome.status());
+        var speculative = outcome.work().speculative();
+        assertEquals(2, speculative.verifications());
+        assertEquals(
+                List.of(0L, 1L, 1L, 0L),
+                java.util.Arrays.stream(speculative.acceptedDrafts()).boxed().toList());
+        assertEquals(5, speculative.committedTokens());
+        assertEquals(400, speculative.verifyNanos());
+        assertEquals(200, speculative.draftNanos());
+        assertEquals(5, outcome.work().decodeSampledTokens());
+        assertEquals(1, outcome.work().finalCommitQuanta());
+        assertEquals(
+                new BenchmarkResult.Timings(100L, 800L, 100L, 1_100L, 600L, 400L, 50L, 1_700L, 1_900L),
+                outcome.timings());
+        assertEquals(new BenchmarkResult.Throughput(5e9 / 800, 5e9 / 600, 6e9 / 1_900), outcome.throughput());
+    }
+
     @Test
     void prefillOnlyHasNoFirstTokenDecodeOrOutputRate() {
         var timing = new IterationTiming(1, 1);

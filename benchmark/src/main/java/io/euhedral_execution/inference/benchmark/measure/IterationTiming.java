@@ -25,6 +25,11 @@ public final class IterationTiming implements GenerationTimingListener {
     long[] decodeExecuted;
     long[] decodeSelected;
     boolean[] decodeSampled;
+    int stepCount;
+    long[] stepStart = new long[16];
+    long[] stepExecuted = new long[16];
+    int[] stepOutputs = new int[16];
+    int[] stepAccepted = new int[16];
 
     public IterationTiming(int expectedPrefillQuanta, int expectedDecodeQuanta) {
         int prefill = Math.max(1, expectedPrefillQuanta);
@@ -84,6 +89,21 @@ public final class IterationTiming implements GenerationTimingListener {
     public void firstTokenSelected(long nanos, int tokenId) {
         this.firstSelected = true;
         this.firstSelectedNanos = nanos;
+    }
+
+    @Override
+    public void speculativeStep(long startNanos, long executedNanos, int outputs, int acceptedDrafts) {
+        if (this.stepCount == this.stepStart.length) {
+            int size = this.stepCount * 2;
+            this.stepStart = Arrays.copyOf(this.stepStart, size);
+            this.stepExecuted = Arrays.copyOf(this.stepExecuted, size);
+            this.stepOutputs = Arrays.copyOf(this.stepOutputs, size);
+            this.stepAccepted = Arrays.copyOf(this.stepAccepted, size);
+        }
+        this.stepStart[this.stepCount] = startNanos;
+        this.stepExecuted[this.stepCount] = executedNanos;
+        this.stepOutputs[this.stepCount] = outputs;
+        this.stepAccepted[this.stepCount++] = acceptedDrafts;
     }
 
     @Override

@@ -56,7 +56,8 @@ public record BenchmarkOptions(
         @JsonProperty("q3SmallRowThreshold") Integer q3SmallRowThreshold,
         @JsonProperty("weightResidency") WeightResidency weightResidency,
         @JsonProperty("hostWeightMiB") Long hostWeightMiB,
-        @JsonProperty("stagingSlots") Integer stagingSlots) {
+        @JsonProperty("stagingSlots") Integer stagingSlots,
+        @JsonProperty("speculativeDepth") Integer speculativeDepth) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -89,6 +90,9 @@ public record BenchmarkOptions(
         if (hostWeightMiB < 0) throw new IllegalArgumentException("hostWeightMiB must not be negative");
         stagingSlots = stagingSlots == null ? QwenModel.DEFAULT_STAGING_SLOTS : stagingSlots;
         if (stagingSlots < 2) throw new IllegalArgumentException("stagingSlots must be at least 2");
+        speculativeDepth = speculativeDepth == null ? 0 : speculativeDepth;
+        if (speculativeDepth < 0 || speculativeDepth > 7)
+            throw new IllegalArgumentException("speculativeDepth must be 0 to 7");
 
         if (cpus.isEmpty()) throw new IllegalArgumentException("cpus must not be blank");
         for (int id : excludeCpus) if (id < 0) throw new IllegalArgumentException("excludeCpus must not be negative");
@@ -146,6 +150,7 @@ public record BenchmarkOptions(
                 gpuMemory,
                 gpuHeadroomMiB,
                 shutdownTimeoutSeconds,
+                null,
                 null,
                 null,
                 null,
@@ -221,7 +226,8 @@ public record BenchmarkOptions(
                 options.q3SmallRowThreshold(),
                 options.weightResidency(),
                 options.hostWeightMiB(),
-                options.stagingSlots());
+                options.stagingSlots(),
+                options.speculativeDepth());
     }
 
     public boolean json() {
@@ -239,7 +245,8 @@ public record BenchmarkOptions(
             tunings.add(base.withPrefillChunkTokens(chunk)
                     .withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold)
                     .withWeightResidency(this.weightResidency)
-                    .withHostWeights(this.hostWeightMiB * 1024L * 1024L, this.stagingSlots));
+                    .withHostWeights(this.hostWeightMiB * 1024L * 1024L, this.stagingSlots)
+                    .withSpeculativeDepth(this.speculativeDepth));
         return tunings;
     }
 

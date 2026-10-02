@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.benchmark.run.GpuCapacity;
 import io.euhedral_execution.inference.benchmark.run.Prerequisites;
 import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.ProcessorTopology;
+import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
@@ -122,7 +123,9 @@ public final class BenchmarkMain {
                 options.cudaLibrary(),
                 options.artifact(),
                 options.gpuHeadroomMiB(),
-                options.weightResidency(),
+                options.speculativeDepth() > 0 && options.weightResidency() == WeightResidency.EXECUTED
+                        ? WeightResidency.SPECULATIVE
+                        : options.weightResidency(),
                 options.hostWeightMiB() * 1024L * 1024L,
                 options.stagingSlots());
         if (capacity != null) {

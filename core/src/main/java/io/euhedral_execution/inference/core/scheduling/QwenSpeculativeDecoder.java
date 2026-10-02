@@ -65,6 +65,9 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         }
     }
 
+    /// Largest MTP catch-up quantum (prompt chunks are split).
+    static final int CATCH_UP_ROWS = 128;
+
     private final EuhedralInferenceRuntime runtime;
     private final QwenExecutionPlan plan;
     private final QwenSequenceState sequence;
@@ -122,6 +125,13 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
     /// reporting each token as it is committed.
     public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken)
             throws InterruptedException, ExecutionException {
+        return generate(prompt, maxNewTokens, onToken, null);
+    }
+
+    /// As [#generate(int[], int, IntConsumer)], reporting prefill chunks, the first token, every
+    /// verification step and a final commit-only quantum to `timing` (when not null).
+    public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing)
+            throws InterruptedException, ExecutionException {
         if (prompt.length == 0 || maxNewTokens <= 0) throw new IllegalArgumentException("empty generation");
         this.statistics = new Statistics(this.depth);
         List<Integer> output = new ArrayList<>();
@@ -141,11 +151,14 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                             last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
                             last ? this.baseLogits : null)
                     .seedingDraft());
-            this.statistics.prefillNanos += System.nanoTime() - started;
+            long executed = System.nanoTime();
+            this.statistics.prefillNanos += executed - started;
+            if (timing != null) timing.prefillQuantum(started, executed, end - offset);
             int[] next = new int[end - offset];
             System.arraycopy(prompt, offset + 1, next, 0, end - offset - 1);
             if (last) {
                 first = this.baseLogits.selectedToken();
+                if (timing != null) timing.firstTokenSelected(System.nanoTime(), first);
                 next[next.length - 1] = first;
             } else next[next.length - 1] = prompt[end];
             int[] chunkDrafts = catchUp(offset, next, last);
@@ -156,7 +169,7 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         this.statistics.outputTokens++;
         if (this.endOfGeneration.test(first)) return output;
         if (maxNewTokens == 1) {
-            feedFinal(first);
+            feedFinal(first, timing);
             return output;
         }
         int current = first;
@@ -177,10 +190,13 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                             this.baseLogits)
                     .withAcceptance(acceptance)
                     .seedingDraft());
-            this.statistics.verifyNanos += System.nanoTime() - started;
+            long executed = System.nanoTime();
+            this.statistics.verifyNanos += executed - started;
             this.statistics.verifications++;
             this.statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
             int[] committed = acceptance.outputs();
+            if (timing != null)
+                timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts());
             for (int token : committed) {
                 output.add(token);
                 onToken.accept(token);
@@ -189,7 +205,7 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
             current = committed[committed.length - 1];
             if (this.endOfGeneration.test(current)) return output;
             if (output.size() >= maxNewTokens) {
-                feedFinal(current);
+                feedFinal(current, timing);
                 return output;
             }
             // Discard the previous step's recursive draft rows, then catch the MTP cache up.
@@ -205,15 +221,21 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         AttentionSequenceStates states = states();
         long seeds = states.draftSeedRows(tokens.length, this.hidden);
         long started = System.nanoTime();
-        execute(new QwenExecutionContext(
-                        this.plan,
-                        this.sequence,
-                        QwenExecutionContext.ExecutionKind.DRAFT,
-                        position,
-                        tokens,
-                        draft ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
-                        draft ? this.draftLogits : null)
-                .withDraftSeed(seeds, tokens.length));
+        // Pieces of at most CATCH_UP_ROWS rows: the draft view's workspace is retained at the largest
+        // quantum it ran, and MTP cache appends are contiguous, so the pieces equal one catch-up.
+        for (int first = 0; first < tokens.length; first += CATCH_UP_ROWS) {
+            int count = Math.min(CATCH_UP_ROWS, tokens.length - first);
+            boolean last = first + count == tokens.length;
+            execute(new QwenExecutionContext(
+                            this.plan,
+                            this.sequence,
+                            QwenExecutionContext.ExecutionKind.DRAFT,
+                            position + first,
+                            Arrays.copyOfRange(tokens, first, first + count),
+                            draft && last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                            draft && last ? this.draftLogits : null)
+                    .withDraftSeed(seeds + (long) first * this.hidden * Short.BYTES, count));
+        }
         this.statistics.catchUpNanos += System.nanoTime() - started;
         if (!draft) return null;
         int[] drafts = new int[this.depth];
@@ -237,7 +259,8 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
 
     /// Ordinary decode feeds the last allowed token without sampling; so does the decoder, so both leave
     /// the same state.
-    private void feedFinal(int token) throws InterruptedException, ExecutionException {
+    private void feedFinal(int token, GenerationTimingListener timing) throws InterruptedException, ExecutionException {
+        long started = System.nanoTime();
         execute(new QwenExecutionContext(
                 this.plan,
                 this.sequence,
@@ -245,6 +268,8 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                 this.sequence.currentTokenPosition(),
                 new int[] {token},
                 QwenLogitsRequirement.NONE));
+        long executed = System.nanoTime();
+        if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
     }
 
     private AttentionSequenceStates states() {
