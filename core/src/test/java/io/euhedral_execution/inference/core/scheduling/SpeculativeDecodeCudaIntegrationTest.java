@@ -59,6 +59,8 @@ class SpeculativeDecodeCudaIntegrationTest {
                         HostWeightSelection.select(artifactData, hostBytes),
                         QwenModel.DEFAULT_STAGING_SLOTS);
                 var lattice = new PullingLattice()) {
+            // The native-numerics mode: its oracle is greedy decode with the same native numerics.
+            if (Boolean.getBoolean("euhedral.speculative.native")) gpu.selectNvfp4NativeDecode(true);
             var plan = new QwenExecutionPlan(model.weights(), model.staging());
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             try {
