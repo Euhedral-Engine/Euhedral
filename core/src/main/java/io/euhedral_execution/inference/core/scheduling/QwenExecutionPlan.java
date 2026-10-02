@@ -1559,7 +1559,7 @@ public final class QwenExecutionPlan {
                 || width % 64 != 0
                 || handle.deviceAddress() == 0
                 || handle.dataType() != TensorDataType.BF16
-                || !(handle.format() == format || (handle.format() == WeightFormat.NVFP4 && format != EMBEDDING_FORMAT))
+                || !(handle.format() == format || handle.format() == WeightFormat.NVFP4)
                 || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
                         || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1 && format == WeightFormat.Q3_G64_FP16))
                 || !CompactTensorLayout.acceptsByteSize(

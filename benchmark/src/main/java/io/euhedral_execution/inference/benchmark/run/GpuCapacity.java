@@ -1,6 +1,8 @@
 package io.euhedral_execution.inference.benchmark.run;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.model_loader.WeightResidency;
+import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,7 +14,16 @@ public final class GpuCapacity {
 
     /// Returns null when free device memory covers the artifact plus headroom, otherwise the reason.
     public static String check(Path cudaLibrary, Path artifact, long headroomMiB) throws IOException {
-        long required = Files.size(artifact) + headroomMiB * 1024L * 1024L;
+        return check(cudaLibrary, artifact, headroomMiB, WeightResidency.ALL);
+    }
+
+    /// As [#check(Path, Path, long)], counting only the objects `residency` uploads.
+    public static String check(Path cudaLibrary, Path artifact, long headroomMiB, WeightResidency residency)
+            throws IOException {
+        long weights = residency == WeightResidency.ALL
+                ? Files.size(artifact)
+                : residency.residentBytes(QwenArtifactReader.read(artifact));
+        long required = weights + headroomMiB * 1024L * 1024L;
         try (var gpu = new CudaGpuMemory(cudaLibrary)) {
             var info = gpu.deviceMemoryInfo();
             return evaluate(info.freeBytes(), info.totalBytes(), required);

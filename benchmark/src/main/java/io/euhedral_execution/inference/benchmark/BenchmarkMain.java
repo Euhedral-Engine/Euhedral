@@ -118,7 +118,8 @@ public final class BenchmarkMain {
             System.out.println("validation passed; no model was loaded");
             return 0;
         }
-        String capacity = GpuCapacity.check(options.cudaLibrary(), options.artifact(), options.gpuHeadroomMiB());
+        String capacity = GpuCapacity.check(
+                options.cudaLibrary(), options.artifact(), options.gpuHeadroomMiB(), options.weightResidency());
         if (capacity != null) {
             System.err.println("not run: " + capacity);
             return 3;
