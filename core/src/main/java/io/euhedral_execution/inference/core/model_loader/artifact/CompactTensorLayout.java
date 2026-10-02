@@ -83,6 +83,9 @@ public final class CompactTensorLayout {
         if (shape.length != 2 || shape[0] <= 0 || shape[1] <= 0) {
             throw new IllegalArgumentException("row-split layout requires a positive rank-2 shape");
         }
+        if (format == WeightFormat.NVFP4) {
+            return Nvfp4Layout.byteSize(shape[0], shape[1]);
+        }
         int bits;
         int groupSize;
         switch (format) {
