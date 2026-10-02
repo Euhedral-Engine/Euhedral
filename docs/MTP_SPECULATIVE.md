@@ -158,7 +158,13 @@ Notes:
 Nsight Systems, 1024-token chat prompt. Times are per quantum, as exclusive kernel time: each kernel
 is charged from the later of its start and the previous kernel's end.
 
-**NVFP4: one exact M=4 verification against one decode token (resident weights):**
+**NVFP4: one exact M=4 verification against one decode token.** The two columns come from different
+traces:
+- **decode:** ordinary NVFP4 decode, all weights resident;
+- **verification:** NVFP4 + MTP3 with 640 MiB of base weights host-backed.
+
+Kernel times are comparable, since host-backed linears run the same kernels on staged copies. Span
+is not: the verification span includes waiting for the host-backed weight stream.
 
 | Category | Decode (M=1) | Verify (M=4) | Ratio |
 |---|---|---|---|
@@ -167,10 +173,14 @@ is charged from the later of its start and the previous kernel's end.
 | Norms (row-exact) | 0.23 | 0.87 | 3.7× |
 | GDN (recurrence, convolution, control) | 1.31 | 1.03 | (lane overlap; not comparable) |
 | GPU busy | 20.41 | 26.74 | 1.31× |
-| Span (first kernel to last) | 21.14 | 29.62 | 1.40× |
+| Span (first kernel to last) | 21.14 | 29.62 | (mixed residency; see below) |
 
 - The verification span exceeds its busy time by 2.9 ms. That gap is the 630 MiB host-backed weight
   stream: 15.4 ms of H2D at about 43 GB/s, overlapping compute.
+- **Like-for-like cross-check.** The NVFP4 + MTP3 trace's own one-row decode quantum (the final commit
+  at the budget, a single sample, same 640 MiB host-backed setup) has busy 19.53 ms and span 22.38 ms.
+  The verification is 1.37× its busy time and 1.32× its span. The gated decode rates agree: an M=4
+  verification costs 1.24-1.31× a host-backed decode step (§4).
 - Native mode: M=4 skinny OMMA linears take 19.98 ms against 18.89 ms at M=1 (1.06×).
   Activation quantization (0.72 ms) and split-K finish (0.18 ms) come on top. Its M=1 linears are
   slower than the GEMV (19.75 against 18.21 ms), which is why native ordinary decode loses 10%.
