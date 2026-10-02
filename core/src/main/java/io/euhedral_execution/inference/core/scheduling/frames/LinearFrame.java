@@ -34,7 +34,8 @@ public final class LinearFrame extends QwenStageFrame {
                                     rows,
                                     instruction.inputWidth(),
                                     instruction.outputWidth(),
-                                    instruction.weightByteSize());
+                                    instruction.weightByteSize(),
+                                    instruction.weightLayout());
                 else
                     gpu().q3FfnDownBf16(
                                     input,
@@ -43,7 +44,8 @@ public final class LinearFrame extends QwenStageFrame {
                                     rows,
                                     instruction.inputWidth(),
                                     instruction.outputWidth(),
-                                    instruction.weightByteSize());
+                                    instruction.weightByteSize(),
+                                    instruction.weightLayout());
             }
             case Q3_LINEAR ->
                 gpu().linearQ3Bf16(
@@ -53,7 +55,8 @@ public final class LinearFrame extends QwenStageFrame {
                                 rows,
                                 instruction.inputWidth(),
                                 instruction.outputWidth(),
-                                instruction.weightByteSize());
+                                instruction.weightByteSize(),
+                                instruction.weightLayout());
             case Q4_LINEAR ->
                 gpu().linearQ4Bf16(
                                 input,

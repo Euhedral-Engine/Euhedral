@@ -12,6 +12,21 @@ public final class CompactTensorLayout {
 
     private CompactTensorLayout() {}
 
+    /// Whether `byteSize` is a valid payload size: exactly [#expectedByteSize] for the fixed-size
+    /// layouts, and within [P2e2Layout]'s bounds for P2E2, whose size depends on the codes.
+    public static boolean acceptsByteSize(
+            long[] shape, TensorDataType dataType, WeightFormat format, WeightLayout layout, long byteSize) {
+        if (layout == WeightLayout.ROW_SPLIT_P2E2_V1) {
+            if (!P2e2Layout.supports(shape, dataType, format)) {
+                throw new IllegalArgumentException(
+                        "P2E2 layout requires Q3 BF16 metadata and a rank-2 shape whose K is a multiple of "
+                                + P2e2Layout.SLICE);
+            }
+            return P2e2Layout.acceptsByteSize(shape[0], shape[1], byteSize);
+        }
+        return expectedByteSize(shape, dataType, format, layout) == byteSize;
+    }
+
     public static long expectedByteSize(
             long[] shape, TensorDataType dataType, WeightFormat format, WeightLayout layout) {
         if (shape == null || dataType == null || format == null || layout == null) {
@@ -25,6 +40,7 @@ public final class CompactTensorLayout {
                 }
                 yield rowSplitSize(shape, format);
             }
+            case ROW_SPLIT_P2E2_V1 -> throw new IllegalArgumentException("P2E2 tensor sizes depend on their codes");
         };
     }
 

@@ -35,7 +35,8 @@ public final class EmbeddingFrame extends QwenStageFrame {
                         context.workspace().hiddenStateAddress(),
                         ids.length,
                         context.plan().weights().config().vocabSize(),
-                        instruction.outputWidth());
+                        instruction.outputWidth(),
+                        instruction.weightLayout());
     }
 
     @Override

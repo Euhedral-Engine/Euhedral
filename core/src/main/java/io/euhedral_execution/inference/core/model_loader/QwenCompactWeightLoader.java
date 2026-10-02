@@ -274,7 +274,9 @@ final class QwenCompactWeightLoader {
                 || descriptor.format() == WeightFormat.Q5_G64_FP16
                 || descriptor.format() == WeightFormat.Q6_G64_FP16
                 || descriptor.format() == WeightFormat.W8_G32_FP16;
-        if (quantized && descriptor.layout() != WeightLayout.ROW_SPLIT_K128_V1) {
+        boolean p2e2 = descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
+                && descriptor.format() == WeightFormat.Q3_G64_FP16;
+        if (quantized && descriptor.layout() != WeightLayout.ROW_SPLIT_K128_V1 && !p2e2) {
             throw new QwenWeightLoadException("quantized runtime object has unsupported layout: " + name);
         }
         if (!quantized && descriptor.layout() != WeightLayout.CONTIGUOUS_LE_V1) {
@@ -285,7 +287,8 @@ final class QwenCompactWeightLoader {
                 && (!java.util.Arrays.equals(expected.shape(), descriptor.shape())
                         || expected.dataType() != descriptor.dataType()
                         || expected.format() != descriptor.format()
-                        || expected.layout() != descriptor.layout())) {
+                        || !(expected.layout() == descriptor.layout()
+                                || (p2e2 && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)))) {
             throw new QwenWeightLoadException(
                     "compact runtime metadata conflicts with the registered layout for '" + name + "'");
         }

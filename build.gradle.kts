@@ -39,6 +39,7 @@ subprojects {
             exclude("**/StreamOrderedEngineCudaIntegrationTest.class")
             exclude("**/ChatCompletionsCudaIntegrationTest.class")
             exclude("**/RelaxedNumericsDriftCudaIntegrationTest.class")
+            exclude("**/QwenP2e2CudaIntegrationTest.class")
             useJUnitPlatform()
         }
         val testSourceSet = the<SourceSetContainer>()["test"]
@@ -64,6 +65,7 @@ subprojects {
             include("**/StreamOrderedEngineCudaIntegrationTest.class")
             include("**/ChatCompletionsCudaIntegrationTest.class")
             include("**/RelaxedNumericsDriftCudaIntegrationTest.class")
+            include("**/QwenP2e2CudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -71,6 +73,12 @@ subprojects {
                     "euhedral.qwen.artifact",
                     providers.gradleProperty("euhedral.qwen.artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl")
+                            .get())
+            // Optional P2E2 transcode of the compact artifact (tools/convert_compact_edrl_to_p2e2.py).
+            systemProperty(
+                    "euhedral.qwen.p2e2-artifact",
+                    providers.gradleProperty("euhedral.qwen.p2e2-artifact")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3_p2e2.edrl")
                             .get())
             systemProperty(
                     "euhedral.qwen.reference-artifact",

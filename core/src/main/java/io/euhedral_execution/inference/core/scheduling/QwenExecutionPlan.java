@@ -183,6 +183,14 @@ public final class QwenExecutionPlan {
             return this.weights.get(weightIndex).byteSize();
         }
 
+        public WeightLayout weightLayout() {
+            return weightLayout(0);
+        }
+
+        public WeightLayout weightLayout(int weightIndex) {
+            return this.weights.get(weightIndex).layout();
+        }
+
         public String weightName(int weightIndex) {
             return this.weights.get(weightIndex).name();
         }
@@ -1535,10 +1543,10 @@ public final class QwenExecutionPlan {
                 || handle.deviceAddress() == 0
                 || handle.dataType() != TensorDataType.BF16
                 || handle.format() != format
-                || handle.layout() != WeightLayout.ROW_SPLIT_K128_V1
-                || handle.byteSize()
-                        != CompactTensorLayout.expectedByteSize(
-                                shape, handle.dataType(), handle.format(), handle.layout())) {
+                || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
+                        || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1 && format == WeightFormat.Q3_G64_FP16))
+                || !CompactTensorLayout.acceptsByteSize(
+                        shape, handle.dataType(), handle.format(), handle.layout(), handle.byteSize())) {
             throw new IllegalArgumentException("unsupported quantized weight layout or dimensions: " + handle.name());
         }
         return copyHandle(handle);
