@@ -165,6 +165,38 @@ public final class QwenExecutionContext implements StageQuantum {
     /// Called by the stage that produced this quantum's logits rows at `address`, with the quantum's
     /// stream selected. A host-sampling quantum queues the copy of its final row here, ahead of its
     /// retirement boundary.
+    /// The acceptance rule of a VERIFY quantum; null commits every row (tests may force a count).
+    private SpeculativeAcceptance acceptance;
+    private int forcedCommittedRows;
+
+    /// Binds the acceptance of a VERIFY quantum before submission.
+    public QwenExecutionContext withAcceptance(SpeculativeAcceptance acceptance) {
+        if (this.kind != ExecutionKind.VERIFY) throw new IllegalStateException("only verification resolves acceptance");
+        this.acceptance = Objects.requireNonNull(acceptance, "acceptance");
+        return this;
+    }
+
+    /// Commits only the first `rows` verified rows regardless of the selections (state tests).
+    QwenExecutionContext withCommittedRows(int rows) {
+        if (this.kind != ExecutionKind.VERIFY || rows <= 0 || rows > this.tokenIds.length)
+            throw new IllegalArgumentException("invalid committed row count");
+        this.forcedCommittedRows = rows;
+        return this;
+    }
+
+    public SpeculativeAcceptance acceptance() {
+        return this.acceptance;
+    }
+
+    /// Rows whose state this quantum commits: all rows, or a verification's accepted prefix. Resolved on
+    /// first use after the device work retired, from the verified rows' greedy selections.
+    public int committedRowCount() {
+        if (this.forcedCommittedRows > 0) return this.forcedCommittedRows;
+        if (this.acceptance == null) return this.tokenIds.length;
+        if (!this.acceptance.resolved()) this.acceptance.resolve(this.hostLogits.selectedTokens());
+        return this.acceptance.committedRows();
+    }
+
     public void logitsProduced(long address) {
         if (this.hostLogits == null) return;
         if (this.kind == ExecutionKind.VERIFY) this.hostLogits.queueRowSelections(address, logitsRowCount());
@@ -417,7 +449,7 @@ public final class QwenExecutionContext implements StageQuantum {
                 completed = new Outcome(Status.CANCELLED, null);
             } else {
                 boolean cancelled = this.sequence.releaseExecutionAndCheckCancellation(
-                        this.lease, this.startPosition + this.tokenIds.length);
+                        this.lease, this.startPosition + committedRowCount());
                 completed = new Outcome(cancelled ? Status.CANCELLED : Status.SUCCESS, null);
             }
         } catch (Throwable cleanupFailure) {
