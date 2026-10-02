@@ -512,6 +512,9 @@ _TABLES: dict[str, Any] = {}
 
 
 def default_device() -> str:
+    # Ask NVML, not the CUDA runtime: initializing CUDA here, in the parent, would make every forked
+    # --jobs worker fail with "Cannot re-initialize CUDA in forked subprocess".
+    os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     try:
         import torch
     except ImportError:
