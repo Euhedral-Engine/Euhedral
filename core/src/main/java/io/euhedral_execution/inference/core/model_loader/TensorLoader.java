@@ -81,9 +81,9 @@ public final class TensorLoader {
     }
 
     private static void validate(TensorDescriptor descriptor, MemorySegment payload) throws QwenWeightLoadException {
-        if (descriptor.format() == WeightFormat.NVFP4 && descriptor.layout() == WeightLayout.ROW_SPLIT_K128_V1) {
+        if (descriptor.format() == WeightFormat.NVFP4 && Nvfp4Layout.supports(descriptor.layout())) {
             try {
-                Nvfp4Layout.validate(payload, descriptor.shape()[0], descriptor.shape()[1]);
+                Nvfp4Layout.validate(payload, descriptor.shape()[0], descriptor.shape()[1], descriptor.layout());
             } catch (IllegalArgumentException exception) {
                 throw new QwenWeightLoadException(
                         "invalid NVFP4 tensor '" + descriptor.name() + "': " + exception.getMessage());

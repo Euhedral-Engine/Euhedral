@@ -16,7 +16,7 @@ except ImportError:
     np = None
 
 from test_q3_primitives import Gpu, NVRTC, CUDA, SKIP_REASON
-from test_nvfp4 import bf16, to_bf16_bytes, from_bf16_bytes, tensor, converter
+from test_nvfp4 import bf16, to_bf16_bytes, from_bf16_bytes, tensor, sd4_tensor, converter
 
 E2M1 = None if np is None else np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float64)
 SHARED = 67584
@@ -72,7 +72,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.gpu.close()
 
-    def run_native(self, x, weights, rows, k, cols, terms, paired=False):
+    def run_native(self, x, weights, rows, k, cols, terms, paired=False, variant=""):
         suffix = "" if terms == 1 else "_x2"
         out_cols = cols // 2 if paired else cols
         with contextlib.ExitStack() as stack:
@@ -84,6 +84,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
             self.gpu.launch("euhedral_nvfp4n_quantize_rows" + suffix, rows,
                             [C.c_uint64(dx), C.c_uint64(da), C.c_uint(rows), C.c_uint(k)], block=128)
             kernel = f"euhedral_nvfp4n_gate_up_swiglu{suffix}_128x64" if paired else f"euhedral_nvfp4n_linear{suffix}_128x128"
+            kernel += variant
             grid = (rows + 127) // 128 * ((cols + 127) // 128)
             self.gpu.launch(kernel, grid, [C.c_uint64(da), C.c_uint64(dw), C.c_uint64(dy), C.c_uint(rows), C.c_uint(k),
                                            C.c_uint(cols)], block=256, shared=SHARED)
@@ -157,20 +158,21 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                     self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * np.abs(expected).max())
 
 
-    def skinny(self, x, weights, k, cols, splits):
-        """One skinny linear (one term, up to 16 rows) as the host runs it; BF16 output bytes."""
+    def skinny(self, x, weights, k, cols, splits, terms=1, variant=""):
+        """One skinny linear (up to 16 rows) as the host runs it; BF16 output bytes."""
         rows = x.shape[0]
-        shared = min(4, 101376 // ((16 + 64) * 160)) * (16 + 64) * 160
+        suffix = "" if terms == 1 else "_x2"
+        shared = min(4, 101376 // ((16 * terms + 64) * 160)) * (16 * terms + 64) * 160
         with contextlib.ExitStack() as stack:
             dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
-            size = layout(rows, k, 1)[2]
+            size = layout(rows, k, terms)[2]
             da = self.gpu.zeros(size); stack.callback(self.gpu.free, da)
             dw = self.gpu.upload(weights); stack.callback(self.gpu.free, dw)
             dy = self.gpu.zeros(rows * cols * 2, fill=0xA5); stack.callback(self.gpu.free, dy)
             dp = self.gpu.zeros(splits * rows * cols * 4, fill=0x7F); stack.callback(self.gpu.free, dp)
-            self.gpu.launch("euhedral_nvfp4n_quantize_rows", rows,
+            self.gpu.launch("euhedral_nvfp4n_quantize_rows" + suffix, rows,
                             [C.c_uint64(dx), C.c_uint64(da), C.c_uint(rows), C.c_uint(k)], block=128)
-            self.gpu.launch("euhedral_nvfp4n_skinny_16", ((cols + 63) // 64, splits),
+            self.gpu.launch(f"euhedral_nvfp4n_skinny{suffix}_16{variant}", ((cols + 63) // 64, splits),
                             [C.c_uint64(da), C.c_uint64(dw), C.c_uint64(dy), C.c_uint64(dp), C.c_uint(rows),
                              C.c_uint(k), C.c_uint(cols)], block=128, shared=shared)
             if splits > 1:
@@ -191,6 +193,23 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                 for row in range(4):
                     alone = self.skinny(x[row:row + 1], weights, k, cols, splits)
                     self.assertEqual(together[row * cols * 2:(row + 1) * cols * 2], alone, f"row {row}")
+
+    def test_sd4_kernels_are_bitwise_the_plain_kernels_on_the_expanded_tensor(self):
+        for terms in (1, 2):
+            for rows, k, cols in ((3, 5120, 256), (130, 2048, 384)):
+                sd4, plain = sd4_tensor(self.rng, cols, k)
+                x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                for paired in (False, True):
+                    with self.subTest(terms=terms, rows=rows, k=k, paired=paired):
+                        self.assertEqual(self.run_native(x, sd4, rows, k, cols, terms, paired, "_sd4")[1].tobytes(),
+                                         self.run_native(x, plain, rows, k, cols, terms, paired)[1].tobytes())
+            k, cols = 5120, 320
+            sd4, plain = sd4_tensor(self.rng, cols, k)
+            x = bf16(self.rng.standard_normal((5, k)).astype(np.float32))
+            for splits in (1, 3):
+                with self.subTest(terms=terms, kernel="skinny", splits=splits):
+                    self.assertEqual(self.skinny(x, sd4, k, cols, splits, terms, "_sd4"),
+                                     self.skinny(x, plain, k, cols, splits, terms))
 
 
 if __name__ == "__main__":

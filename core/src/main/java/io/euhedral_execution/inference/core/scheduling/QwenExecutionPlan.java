@@ -1838,7 +1838,9 @@ public final class QwenExecutionPlan {
                 || handle.dataType() != TensorDataType.BF16
                 || !(handle.format() == format || handle.format() == WeightFormat.NVFP4)
                 || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
-                        || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1 && format == WeightFormat.Q3_G64_FP16))
+                        || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1 && format == WeightFormat.Q3_G64_FP16)
+                        || (handle.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1
+                                && handle.format() == WeightFormat.NVFP4))
                 || !CompactTensorLayout.acceptsByteSize(
                         shape, handle.dataType(), handle.format(), handle.layout(), handle.byteSize())) {
             throw new IllegalArgumentException("unsupported quantized weight layout or dimensions: " + handle.name());

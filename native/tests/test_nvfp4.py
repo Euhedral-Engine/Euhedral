@@ -58,6 +58,28 @@ def tensor(rng, rows, k):
     return bytes(out), converter.dequantize_nvfp4_rows(packed, scales, global_scale)
 
 
+def sd4_tensor(rng, rows, k):
+    """(SD4 tensor bytes, the same weights as a plain NVFP4 tensor's bytes). Rows span a wide range of
+    magnitudes, so the table's 16 entries are all in use."""
+    weights = (rng.standard_normal((rows, k)) * np.exp(rng.uniform(-4.0, 0.0, (rows, 1)))).astype(np.float32)
+    global_scale = converter.nvfp4_global_scale(float(np.abs(weights).max()))
+    table = converter.sd4_table(converter.sd4_costs(weights, global_scale))
+    packed, indices = converter.quantize_nvfp4_sd4_rows(weights, global_scale, table)
+    assert len(np.unique(np.concatenate([indices & 15, indices >> 4]))) == 16, "every table entry in use"
+    index_offset, table_offset, size = converter.nvfp4_sd4_offsets((rows, k))
+    sd4 = bytearray(size)
+    sd4[:packed.nbytes] = packed.tobytes()
+    sd4[index_offset:index_offset + indices.nbytes] = indices.tobytes()
+    sd4[table_offset:table_offset + 20] = table.tobytes() + np.float32(global_scale).astype("<f4").tobytes()
+    scales = converter.expand_nvfp4_sd4(indices, table)
+    scale_offset, global_offset, plain_size = converter.nvfp4_offsets((rows, k))
+    plain = bytearray(plain_size)
+    plain[:packed.nbytes] = packed.tobytes()
+    plain[scale_offset:scale_offset + scales.nbytes] = scales.tobytes()
+    plain[global_offset:global_offset + 4] = np.float32(global_scale).astype("<f4").tobytes()
+    return bytes(sd4), bytes(plain)
+
+
 @unittest.skipIf(UNAVAILABLE is not None, UNAVAILABLE or "")
 class Nvfp4KernelTest(unittest.TestCase):
     @classmethod
@@ -127,6 +149,35 @@ class Nvfp4KernelTest(unittest.TestCase):
                 grid = (rows + tile - 1) // tile * (n // 2 // 32)
                 actual = self.run_kernel(name, grid, x, weights, n // 2, [C.c_uint(rows), C.c_uint(k), C.c_uint(n)], rows)
                 self.assert_close(actual, expected, np.abs(expected).max())
+
+    def assert_bitwise(self, actual, expected):
+        self.assertTrue(np.array_equal(actual.view(np.uint32), expected.view(np.uint32)),
+                        f"{np.count_nonzero(actual.view(np.uint32) != expected.view(np.uint32))} outputs differ")
+
+    def test_sd4_kernels_are_bitwise_the_plain_kernels_on_the_expanded_tensor(self):
+        for k, n in ((1024, 64), (5120, 128), (17408, 64)):
+            sd4, plain = sd4_tensor(self.rng, n, k)
+            shape = [C.c_uint(k), C.c_uint(n)]
+            for rows in range(1, 9):
+                with self.subTest(kernel="decode", k=k, rows=rows):
+                    x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                    name = "euhedral_nvfp4_decode" if rows == 1 else f"euhedral_nvfp4_decode_rows{rows}"
+                    self.assert_bitwise(self.run_kernel(name + "_sd4", n // 16, x, sd4, n, shape, rows),
+                                        self.run_kernel(name, n // 16, x, plain, n, shape, rows))
+            for rows in (3, 130):
+                x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                for name, tile in (("euhedral_nvfp4_prefill_128x64", 128), ("euhedral_nvfp4_prefill_64x64", 64)):
+                    with self.subTest(kernel=name, k=k, rows=rows):
+                        grid = (rows + tile - 1) // tile * ((n + 63) // 64)
+                        args = [C.c_uint(rows), C.c_uint(k), C.c_uint(n)]
+                        self.assert_bitwise(self.run_kernel(name + "_sd4", grid, x, sd4, n, args, rows),
+                                            self.run_kernel(name, grid, x, plain, n, args, rows))
+                for name, tile in (("euhedral_nvfp4_gate_up_swiglu_128x32", 128), ("euhedral_nvfp4_gate_up_swiglu_64x32", 64)):
+                    with self.subTest(kernel=name, k=k, rows=rows):
+                        grid = (rows + tile - 1) // tile * (n // 2 // 32)
+                        args = [C.c_uint(rows), C.c_uint(k), C.c_uint(n)]
+                        self.assert_bitwise(self.run_kernel(name + "_sd4", grid, x, sd4, n // 2, args, rows),
+                                            self.run_kernel(name, grid, x, plain, n // 2, args, rows))
 
 
 if __name__ == "__main__":
