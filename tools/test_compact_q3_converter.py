@@ -183,6 +183,84 @@ class Nvfp4QuantizationTest(unittest.TestCase):
         self.assertEqual(size, global_offset + 4)
         self.assertEqual(converter.payload_size((3, 1024), "NVFP4"), size)
 
+    def test_nvfp4_sd4_geometry(self):
+        index_offset, table_offset, size = converter.nvfp4_sd4_offsets((3, 1024))
+        self.assertEqual(index_offset, 3 * 512)
+        self.assertEqual(table_offset, 3 * 512 + 256)
+        self.assertEqual(size, table_offset + 16 + 4)
+
+    def test_sd4_table_minimizes_the_total_cost(self):
+        rng = np.random.default_rng(12)
+        code = np.arange(converter.E4M3_CODES)
+        weights = np.zeros(converter.E4M3_CODES)
+        clients = rng.choice(np.arange(30, 100), 12, replace=False)
+        weights[clients] = rng.uniform(0.1, 10.0, 12)
+        costs = weights[:, None] * (code[None, :] - code[:, None]).astype(np.float64) ** 2
+        saved = converter.SD4_TABLE
+        try:
+            converter.SD4_TABLE = 3
+            table = converter.sd4_table(costs)
+        finally:
+            converter.SD4_TABLE = saved
+        def total(entries):
+            return costs[:, list(entries)].min(axis=1).sum()
+        import itertools
+        best = min(total(c) for c in itertools.combinations(range(25, 105), 3))
+        self.assertAlmostEqual(total(table), best)
+        # Sixteen entries cover twelve clients exactly.
+        self.assertEqual(total(converter.sd4_table(costs)), 0.0)
+        self.assertTrue(set(clients) <= set(converter.sd4_table(costs).tolist()))
+
+    def test_sd4_reaches_the_largest_scales(self):
+        rng = np.random.default_rng(13)
+        values = (rng.standard_t(2.0, (64, 1024)) * 0.01).astype(np.float32)
+        values[7, 300] = 3.0  # one outlier block four octaves above the rest
+        global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
+        table = converter.sd4_table(converter.sd4_costs(values, global_scale))
+        packed, indices = converter.quantize_nvfp4_sd4_rows(values, global_scale, table)
+        chosen = converter.expand_nvfp4_sd4(indices, table).reshape(-1).astype(np.int64)
+        nearest = converter.nearest_scale_codes(values.reshape(-1, 16), global_scale)
+        self.assertTrue((chosen >= nearest - converter.SD4_BELOW).all())
+        self.assertGreaterEqual(int(table.max()), int(nearest.max()) - converter.SD4_BELOW)
+        restored = converter.dequantize_nvfp4_rows(packed, converter.expand_nvfp4_sd4(indices, table), global_scale)
+        self.assertLess(abs(restored[7, 300] - 3.0), 0.5)
+
+    def test_sd4_error_is_below_plain_nvfp4(self):
+        rng = np.random.default_rng(9)
+        values = (rng.standard_normal((64, 1024)) * rng.uniform(0.5, 2.0, (64, 1))).astype(np.float32)
+        global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
+        plain = converter.dequantize_nvfp4_rows(*converter.quantize_nvfp4_rows(values, global_scale), global_scale)
+        table = converter.sd4_table(converter.sd4_costs(values, global_scale))
+        packed, indices = converter.quantize_nvfp4_sd4_rows(values, global_scale, table)
+        compressed = converter.dequantize_nvfp4_rows(packed, converter.expand_nvfp4_sd4(indices, table), global_scale)
+        self.assertLess(np.sum((compressed - values) ** 2), np.sum((plain - values) ** 2))
+
+    def test_sd4_matrix_writes_codes_indices_table_and_global(self):
+        rng = np.random.default_rng(10)
+        values = rng.standard_normal((5, 256)).astype(np.float32)
+        matrix = converter.MatrixSource((5, 256), lambda begin, end: values[begin:end])
+        index_offset, table_offset, size = converter.nvfp4_sd4_offsets((5, 256))
+        output = io.BytesIO(bytes(size + 8))
+        converter.quantize_nvfp4_sd4_matrix(output, 8, matrix)
+        data = np.frombuffer(output.getvalue()[8:], dtype=np.uint8)
+        global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
+        table = converter.sd4_table(converter.sd4_costs(values, global_scale))
+        packed, indices = converter.quantize_nvfp4_sd4_rows(values, global_scale, table)
+        np.testing.assert_array_equal(data[:5 * 128], packed.reshape(-1))
+        np.testing.assert_array_equal(data[index_offset:index_offset + 5 * 8], indices.reshape(-1))
+        np.testing.assert_array_equal(data[table_offset:table_offset + 16], table)
+        self.assertEqual(data[table_offset + 16:table_offset + 20].view("<f4")[0], global_scale)
+
+    def test_sd4_zero_tensor(self):
+        matrix = converter.MatrixSource((2, 128), lambda begin, end: np.zeros((end - begin, 128), np.float32))
+        output = io.BytesIO(bytes(converter.nvfp4_sd4_offsets((2, 128))[2]))
+        converter.quantize_nvfp4_sd4_matrix(output, 0, matrix)
+        index_offset, table_offset, _ = converter.nvfp4_sd4_offsets((2, 128))
+        data = output.getvalue()
+        self.assertFalse(any(data[:table_offset]))
+        self.assertEqual(struct.unpack("<f", data[table_offset + 16:table_offset + 20])[0], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -213,6 +291,20 @@ class CudaQuantizationMatchesCpuTest(unittest.TestCase):
         global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
         cpu = converter.quantize_nvfp4_rows(values, global_scale)
         gpu = converter.quantize_nvfp4_rows_torch(values, global_scale)
+        np.testing.assert_array_equal(cpu[0], gpu[0])
+        np.testing.assert_array_equal(cpu[1], gpu[1])
+
+    def test_nvfp4_sd4_rows_are_byte_identical(self):
+        rng = np.random.default_rng(11)
+        values = (rng.standard_normal((64, 1024)) * rng.uniform(0.001, 3.0, (64, 1))).astype(np.float32)
+        values[3, :16] = 0
+        global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
+        costs = converter.sd4_costs(values, global_scale)
+        np.testing.assert_allclose(costs, converter.sd4_costs_torch(values, global_scale), rtol=1e-12)
+        table = converter.sd4_table(costs)
+        np.testing.assert_array_equal(table, converter.sd4_table(converter.sd4_costs_torch(values, global_scale)))
+        cpu = converter.quantize_nvfp4_sd4_rows(values, global_scale, table)
+        gpu = converter.quantize_nvfp4_sd4_rows_torch(values, global_scale, table)
         np.testing.assert_array_equal(cpu[0], gpu[0])
         np.testing.assert_array_equal(cpu[1], gpu[1])
 

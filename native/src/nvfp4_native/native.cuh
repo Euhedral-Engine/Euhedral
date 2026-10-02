@@ -15,10 +15,13 @@
 // Operands are NVFP4 matrices with K padded to 128: rows of K/2 code bytes (even K in the low nibble)
 // and rows of K/16 E4M3 scales, plus FP32 global scales (one per weight tensor; one per activation row).
 // A weight tensor (Nvfp4Layout) is consumed in place; activations are quantized by quantize_rows.
+// kSd4 weights (row-split-k128-sd4-v1, nvfp4/nvfp4.cuh) stage their 4-bit scale indices instead, and
+// each B scale register is looked up in the tensor's table just before its MMA.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 #include "common/pdl.cuh"
+#include "nvfp4/scale_table.cuh"
 
 namespace nvfp4n {
 
@@ -28,19 +31,34 @@ struct Matrix {
     const unsigned char* codes;
     const unsigned char* scales;
     unsigned int row_bytes, row_scales;
+    nvfp4::ScaleTable table;  // SD4 weights only
 };
 
 // Weight tensor in the artifact's layout.
+template <bool kSd4>
 static __device__ __forceinline__ Matrix weights(const unsigned char* w, unsigned int k, unsigned int rows, float* global) {
     const unsigned long long padded = (k + 127u) / 128u * 128u;
     Matrix m;
     m.row_bytes = (unsigned int)(padded / 2u);
-    m.row_scales = (unsigned int)(padded / 16u);
+    m.row_scales = (unsigned int)(padded / (kSd4 ? 32u : 16u));
     const unsigned long long scale_offset = align256((unsigned long long)rows * m.row_bytes);
     m.codes = w;
     m.scales = w + scale_offset;
-    *global = *reinterpret_cast<const float*>(w + align256(scale_offset + (unsigned long long)rows * m.row_scales));
+    const unsigned char* end = w + align256(scale_offset + (unsigned long long)rows * m.row_scales);
+    if (kSd4) {
+        m.table.codes = *reinterpret_cast<const uint4*>(end);
+        end += 16;
+    }
+    *global = *reinterpret_cast<const float*>(end);
     return m;
+}
+
+// Four B scale codes from the staged scales of one row: E4M3 bytes, or (kSd4) two bytes of indices.
+template <bool kSd4>
+static __device__ __forceinline__ unsigned int b_scale_quad(const unsigned char* row_scales, unsigned int quad,
+                                                            const Matrix& b) {
+    if (kSd4) return b.table.lookup(*reinterpret_cast<const unsigned short*>(row_scales + 2u * quad));
+    return *reinterpret_cast<const unsigned int*>(row_scales + 4u * quad);
 }
 
 // Activation buffer: `terms` planes of `rows` rows (term t at rows t * rows..), codes then scales, then
@@ -167,8 +185,10 @@ static __device__ __forceinline__ void cp_async(void* dst, const void* src, int 
     const int size = valid ? bytes : 0;
     if (bytes == 16)
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_address(dst)), "l"(src), "r"(size));
-    else
+    else if (bytes == 8)
         asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(smem_address(dst)), "l"(src), "r"(size));
+    else
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(smem_address(dst)), "l"(src), "r"(size));
 }
 
 static __device__ __forceinline__ void ldmatrix_x4(unsigned int (&r)[4], const void* p) {
@@ -201,7 +221,7 @@ static __device__ __forceinline__ unsigned int b_row(unsigned int r, unsigned in
 }
 
 // Issues the cp.async copies of K tile `tile` into `stage`. Rows past the matrix are zero-filled.
-template <int kTerms, bool kPaired>
+template <int kTerms, bool kPaired, bool kSd4>
 static __device__ __forceinline__ void load_stage(
         unsigned char* stage, const Matrix& a, const Matrix& b, unsigned int m0, unsigned int n0,
         unsigned int rows, unsigned int cols, unsigned int tile) {
@@ -232,13 +252,15 @@ static __device__ __forceinline__ void load_stage(
     } else {
         bool v;
         const unsigned int br = b_row<kPaired>(r, n0, cols, &v);
-        cp_async(b_scales + r * kScaleBytes, b.scales + (unsigned long long)(v ? br : 0) * b.row_scales + scale0, 8, v);
+        constexpr int bytes = kSd4 ? kScaleBytes / 2 : kScaleBytes;
+        cp_async(b_scales + r * kScaleBytes, b.scales + (unsigned long long)(v ? br : 0) * b.row_scales + (kSd4 ? tile * bytes : scale0),
+                 bytes, v);
     }
 }
 
 // kPaired: `cols` weight rows are gate rows then up rows; output[M][cols / 2] = SwiGLU(gate, up), with
 // gate and up rounded to BF16 first, as the BF16 regions do.
-template <int kTerms, bool kPaired>
+template <int kTerms, bool kPaired, bool kSd4 = false>
 static __device__ __forceinline__ void linear(
         const unsigned char* activations, const unsigned char* weight_tensor, __nv_bfloat16* output,
         unsigned int rows, unsigned int k, unsigned int cols) {
@@ -247,7 +269,7 @@ static __device__ __forceinline__ void linear(
     const ActivationLayout act(rows, k, kTerms);
     const Matrix a{activations, activations + act.scale_offset, k / 2u, k / 16u};
     float weight_global;
-    const Matrix b = weights(weight_tensor, k, cols, &weight_global);
+    const Matrix b = weights<kSd4>(weight_tensor, k, cols, &weight_global);
     const float* row_globals = reinterpret_cast<const float*>(activations + act.global_offset);
 
     const unsigned int tile_cols = kPaired ? kBN / 2 : kBN;
@@ -263,14 +285,14 @@ static __device__ __forceinline__ void linear(
     euhedral_pdl_begin();
 #pragma unroll
     for (int s = 0; s < P::kStages - 1; ++s) {
-        if ((unsigned int)s < k_tiles) load_stage<kTerms, kPaired>(shared + s * P::kStageBytes, a, b, m0, n0, rows, cols, s);
+        if ((unsigned int)s < k_tiles) load_stage<kTerms, kPaired, kSd4>(shared + s * P::kStageBytes, a, b, m0, n0, rows, cols, s);
         asm volatile("cp.async.commit_group;");
     }
     for (unsigned int tile = 0; tile < k_tiles; ++tile) {
         asm volatile("cp.async.wait_group %0;" ::"n"(P::kStages - 2));
         __syncthreads();
         const unsigned int next = tile + P::kStages - 1;
-        if (next < k_tiles) load_stage<kTerms, kPaired>(shared + (next % P::kStages) * P::kStageBytes, a, b, m0, n0, rows, cols, next);
+        if (next < k_tiles) load_stage<kTerms, kPaired, kSd4>(shared + (next % P::kStages) * P::kStageBytes, a, b, m0, n0, rows, cols, next);
         asm volatile("cp.async.commit_group;");
 
         const unsigned char* stage = shared + (tile % P::kStages) * P::kStageBytes;
@@ -288,7 +310,7 @@ static __device__ __forceinline__ void linear(
                         a_scales + term * kScaleTile + (wm + mf * 16u + g + 8u * (t & 1u)) * kScaleBytes + 4u * (t >> 1));
 #pragma unroll
         for (int nf = 0; nf < 4; ++nf)
-            sb[nf] = *reinterpret_cast<const unsigned int*>(b_scales + (wn + nf * 8u + g) * kScaleBytes + 4u * (t & 1u));
+            sb[nf] = b_scale_quad<kSd4>(b_scales + (wn + nf * 8u + g) * kScaleBytes, t & 1u, b);
 #pragma unroll
         for (int step = 0; step < 2; ++step) {
             const unsigned int mat = lane >> 3, r8 = lane & 7u;
@@ -376,7 +398,7 @@ template <int kTerms, int kMF> struct Skinny {
     static constexpr int kSharedBytes = kStages * kStageBytes;
 };
 
-template <int kTerms, int kMF>
+template <int kTerms, int kMF, bool kSd4>
 static __device__ __forceinline__ void skinny_load(unsigned char* stage, const Matrix& a, const Matrix& b,
         unsigned int rows, unsigned int n0, unsigned int cols, unsigned int tile) {
     constexpr int R = Skinny<kTerms, kMF>::kRows;
@@ -395,7 +417,9 @@ static __device__ __forceinline__ void skinny_load(unsigned char* stage, const M
     if (threadIdx.x < kSkinnyCols) {
         const unsigned int r = threadIdx.x;
         const bool v = n0 + r < cols;
-        cp_async(b_scales + r * kSkinnyScaleBytes, b.scales + (unsigned long long)(v ? n0 + r : 0) * b.row_scales + scale0, 16, v);
+        constexpr int bytes = kSd4 ? kSkinnyScaleBytes / 2 : kSkinnyScaleBytes;
+        cp_async(b_scales + r * kSkinnyScaleBytes,
+                 b.scales + (unsigned long long)(v ? n0 + r : 0) * b.row_scales + (kSd4 ? tile * bytes : scale0), bytes, v);
     }
     // A: kTerms * R rows x 8 chunks; scales kTerms * R chunks.
     for (unsigned int chunk = threadIdx.x; chunk < (unsigned int)(kTerms * R * 8); chunk += kSkinnyThreads) {
@@ -410,7 +434,7 @@ static __device__ __forceinline__ void skinny_load(unsigned char* stage, const M
     }
 }
 
-template <int kTerms, int kMF>
+template <int kTerms, int kMF, bool kSd4 = false>
 static __device__ __forceinline__ void skinny_linear(
         const unsigned char* activations, const unsigned char* weight_tensor, __nv_bfloat16* output, float* partials,
         unsigned int rows, unsigned int k, unsigned int cols) {
@@ -420,7 +444,7 @@ static __device__ __forceinline__ void skinny_linear(
     const ActivationLayout act(rows, k, kTerms);
     const Matrix a{activations, activations + act.scale_offset, k / 2u, k / 16u};
     float weight_global;
-    const Matrix b = weights(weight_tensor, k, cols, &weight_global);
+    const Matrix b = weights<kSd4>(weight_tensor, k, cols, &weight_global);
     const float* row_globals = reinterpret_cast<const float*>(activations + act.global_offset);
     const unsigned int n0 = blockIdx.x * kSkinnyCols;
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3u;
@@ -431,14 +455,14 @@ static __device__ __forceinline__ void skinny_linear(
     euhedral_pdl_begin();
 #pragma unroll
     for (int s = 0; s < S::kStages - 1; ++s) {
-        if (first + s < last) skinny_load<kTerms, kMF>(shared + s * S::kStageBytes, a, b, rows, n0, cols, first + s);
+        if (first + s < last) skinny_load<kTerms, kMF, kSd4>(shared + s * S::kStageBytes, a, b, rows, n0, cols, first + s);
         asm volatile("cp.async.commit_group;");
     }
     for (unsigned int tile = first; tile < last; ++tile) {
         asm volatile("cp.async.wait_group %0;" ::"n"(S::kStages - 2));
         __syncthreads();
         const unsigned int next = tile + S::kStages - 1;
-        if (next < last) skinny_load<kTerms, kMF>(shared + ((next - first) % S::kStages) * S::kStageBytes, a, b, rows, n0, cols, next);
+        if (next < last) skinny_load<kTerms, kMF, kSd4>(shared + ((next - first) % S::kStages) * S::kStageBytes, a, b, rows, n0, cols, next);
         asm volatile("cp.async.commit_group;");
         const unsigned char* stage = shared + ((tile - first) % S::kStages) * S::kStageBytes;
         const unsigned char* b_codes = stage + kTerms * R * kSkinnyStride;
@@ -451,7 +475,7 @@ static __device__ __forceinline__ void skinny_linear(
             unsigned int sb[2];
 #pragma unroll
             for (int nf = 0; nf < 2; ++nf)
-                sb[nf] = *reinterpret_cast<const unsigned int*>(b_scales + (wn + nf * 8u + g) * kSkinnyScaleBytes + 8u * pair + 4u * (t & 1u));
+                sb[nf] = b_scale_quad<kSd4>(b_scales + (wn + nf * 8u + g) * kSkinnyScaleBytes, 2u * pair + (t & 1u), b);
             unsigned int sa[kTerms][kMF];
 #pragma unroll
             for (int term = 0; term < kTerms; ++term)

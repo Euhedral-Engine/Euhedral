@@ -1,33 +1,59 @@
 #pragma once
 #include "gemm/balanced.cuh"
 #include "common/pdl.cuh"
+#include "nvfp4/scale_table.cuh"
 
 // NVFP4 weights (WeightFormat.NVFP4, row-split-k128-v1; Nvfp4Layout.java,
 // tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4). Rows of K values, K padded to
 // 128: E2M1 codes two per byte with the even K in the low nibble, then a 256-aligned plane of one
 // E4M3 scale per 16 values, then a 256-aligned FP32 global scale. A weight is
 // e2m1(code) * e4m3(scale) * global.
+//
+// SD4 (row-split-k128-sd4-v1, --profile nvfp4-sd4, docs/NVFP4_COMPRESSED.md) stores each block scale
+// as a 4-bit index into the tensor's table of 16 E4M3 codes: the scale plane holds K/32 bytes per row,
+// two indices per byte with the even block in the low nibble, and the table (16 bytes) precedes the
+// global scale at the 256-aligned end of the plane. Kernels look the codes up and then run exactly
+// as on the plain layout, so an SD4 tensor computes what its expansion to plain NVFP4 computes.
 namespace nvfp4 {
 static constexpr unsigned int kBlock = 16u;
 
 static __host__ __device__ __forceinline__ unsigned long long align256(unsigned long long v) { return (v + 255ull) & ~255ull; }
 
-struct Layout {
+template <bool kSd4>
+struct LayoutT {
     const unsigned char* codes;
     const unsigned char* scales;
     float global;
     unsigned int row_bytes, row_scales;
-    __device__ __forceinline__ Layout(const unsigned char* w, unsigned int in_features, unsigned int rows) {
+    ScaleTable table;
+    __device__ __forceinline__ LayoutT(const unsigned char* w, unsigned int in_features, unsigned int rows) {
         const unsigned long long k = (in_features + 127u) / 128u * 128u;
         row_bytes = (unsigned int)(k / 2u);
-        row_scales = (unsigned int)(k / kBlock);
+        row_scales = (unsigned int)(k / (kSd4 ? 2u * kBlock : kBlock));
         const unsigned long long scale_offset = align256((unsigned long long)rows * row_bytes);
         const unsigned long long global_offset = align256(scale_offset + (unsigned long long)rows * row_scales);
         codes = w;
         scales = w + scale_offset;
-        global = *reinterpret_cast<const float*>(w + global_offset);
+        if (kSd4) {
+            table.codes = *reinterpret_cast<const uint4*>(w + global_offset);
+            global = *reinterpret_cast<const float*>(w + global_offset + 16u);
+        } else {
+            global = *reinterpret_cast<const float*>(w + global_offset);
+        }
+    }
+    // Scale-plane bits of blocks 2 pair and 2 pair + 1 of `row`, the first in the low bits: two E4M3
+    // codes, or (SD4) two table indices.
+    __device__ __forceinline__ unsigned int scale_bits(unsigned long long row, unsigned int pair) const {
+        if (kSd4) return scales[row * row_scales + pair];
+        return reinterpret_cast<const unsigned short*>(scales + row * row_scales)[pair];
+    }
+    // E4M3 codes of blocks 2 pair and 2 pair + 1 of `row`, the first in the low byte.
+    __device__ __forceinline__ unsigned int scale_pair(unsigned long long row, unsigned int pair) const {
+        if (kSd4) return table.lookup(scale_bits(row, pair)) & 0xffffu;
+        return scale_bits(row, pair);
     }
 };
+using Layout = LayoutT<false>;
 
 // E4M3 (no sign, never NaN in a valid tensor) is FP16 with the exponent bias of 7: shifting its bits
 // into an FP16 and multiplying by 2^8 is exact, subnormals included.
@@ -35,10 +61,21 @@ static __device__ __forceinline__ float e4m3_to_float(unsigned int bits) {
     return __half2float(__ushort_as_half((unsigned short)((bits & 0x7fu) << 7))) * 256.0f;
 }
 
+// Block `half` (0 or 1) of a lane's scale bits (LayoutT::scale_bits) as a float: E4M3 decoded in
+// registers, or (SD4) an index into the block's shared table of decoded scales.
+template <bool kSd4>
+static __device__ __forceinline__ float scale(const float* table, unsigned int bits, unsigned int half);
+
 static __device__ __forceinline__ float e2m1_value(unsigned int code) {
     const unsigned int magnitude = code & 7u;
     const float value = magnitude < 4u ? 0.5f * (float)magnitude : magnitude == 4u ? 2.0f : magnitude == 5u ? 3.0f : magnitude == 6u ? 4.0f : 6.0f;
     return (code & 8u) ? -value : value;
+}
+
+template <bool kSd4>
+static __device__ __forceinline__ float scale(const float* table, unsigned int bits, unsigned int half) {
+    if (kSd4) return table[(bits >> (4u * half)) & 15u];
+    return e4m3_to_float(half ? bits >> 8 : bits & 0xffu);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -50,15 +87,19 @@ static __device__ __forceinline__ float e2m1_value(unsigned int code) {
 // multiple of 4 * kRows, 16-byte aligned input and weights.
 static constexpr int kDecodeRows = 4;
 
+template <bool kSd4 = false>
 static __device__ __forceinline__ void decode(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int in_features, unsigned int out_features) {
     __shared__ float table[16];
+    __shared__ float scale_table[16];  // SD4: the decoded scale table
     if (threadIdx.x < 16u) table[threadIdx.x] = e2m1_value(threadIdx.x);
+    if (kSd4 && threadIdx.x < 16u)
+        scale_table[threadIdx.x] = e4m3_to_float(LayoutT<true>(weights, in_features, out_features).table.lookup(threadIdx.x));
     __syncthreads();
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kDecodeRows;
-    const Layout w(weights, in_features, out_features);
+    const LayoutT<kSd4> w(weights, in_features, out_features);
     const unsigned int slices = in_features / 1024u;
     float sums[kDecodeRows] = {};
     euhedral_pdl_begin();
@@ -69,7 +110,7 @@ static __device__ __forceinline__ void decode(
         for (int r = 0; r < kDecodeRows; r++) {
             const unsigned long long row = first_row + r;
             codes[r] = reinterpret_cast<const uint4*>(w.codes + row * w.row_bytes)[slice * 32u + lane];
-            scale_pair[r] = reinterpret_cast<const unsigned short*>(w.scales + row * w.row_scales)[slice * 32u + lane];
+            scale_pair[r] = w.scale_bits(row, slice * 32u + lane);
         }
         float x[32];
         const uint4* activation = reinterpret_cast<const uint4*>(input + slice * 1024u + 32u * lane);
@@ -92,8 +133,8 @@ static __device__ __forceinline__ void decode(
                 const float value = table[(words[j >> 3] >> ((j & 7) * 4)) & 15u];
                 block[j >> 4] = fmaf(x[j], value, block[j >> 4]);
             }
-            sums[r] = fmaf(block[0], e4m3_to_float(scale_pair[r] & 0xffu), sums[r]);
-            sums[r] = fmaf(block[1], e4m3_to_float(scale_pair[r] >> 8), sums[r]);
+            sums[r] = fmaf(block[0], scale<kSd4>(scale_table, scale_pair[r], 0), sums[r]);
+            sums[r] = fmaf(block[1], scale<kSd4>(scale_table, scale_pair[r], 1), sums[r]);
         }
     }
     #pragma unroll
@@ -110,16 +151,19 @@ static __device__ __forceinline__ void decode(
 // Multi-row decode for speculative verification: M activation rows against each weight row. Every
 // token row repeats decode()'s exact FMA sequence (same blocks, same order, same warp reduction), so
 // row t's output is bit for bit what decode() gives for that row alone; the weights stream once.
-template <int M>
+template <int M, bool kSd4 = false>
 static __device__ __forceinline__ void decode_rows(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int in_features, unsigned int out_features) {
     __shared__ float table[16];
+    __shared__ float scale_table[16];  // SD4: the decoded scale table
     if (threadIdx.x < 16u) table[threadIdx.x] = e2m1_value(threadIdx.x);
+    if (kSd4 && threadIdx.x < 16u)
+        scale_table[threadIdx.x] = e4m3_to_float(LayoutT<true>(weights, in_features, out_features).table.lookup(threadIdx.x));
     __syncthreads();
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kDecodeRows;
-    const Layout w(weights, in_features, out_features);
+    const LayoutT<kSd4> w(weights, in_features, out_features);
     const unsigned int slices = in_features / 1024u;
     float sums[M][kDecodeRows] = {};
     euhedral_pdl_begin();
@@ -130,7 +174,7 @@ static __device__ __forceinline__ void decode_rows(
         for (int r = 0; r < kDecodeRows; r++) {
             const unsigned long long row = first_row + r;
             codes[r] = reinterpret_cast<const uint4*>(w.codes + row * w.row_bytes)[slice * 32u + lane];
-            scale_pair[r] = reinterpret_cast<const unsigned short*>(w.scales + row * w.row_scales)[slice * 32u + lane];
+            scale_pair[r] = w.scale_bits(row, slice * 32u + lane);
         }
         #pragma unroll
         for (int t = 0; t < M; t++) {
@@ -156,8 +200,8 @@ static __device__ __forceinline__ void decode_rows(
                     const float value = table[(words[j >> 3] >> ((j & 7) * 4)) & 15u];
                     block[j >> 4] = fmaf(x[j], value, block[j >> 4]);
                 }
-                sums[t][r] = fmaf(block[0], e4m3_to_float(scale_pair[r] & 0xffu), sums[t][r]);
-                sums[t][r] = fmaf(block[1], e4m3_to_float(scale_pair[r] >> 8), sums[t][r]);
+                sums[t][r] = fmaf(block[0], scale<kSd4>(scale_table, scale_pair[r], 0), sums[t][r]);
+                sums[t][r] = fmaf(block[1], scale<kSd4>(scale_table, scale_pair[r], 1), sums[t][r]);
             }
         }
     }
@@ -180,8 +224,9 @@ static __device__ __forceinline__ void decode_rows(
 // B operand of the balanced tile engine (gemm/balanced.cuh): one 16-column x K32 tile per warp and
 // generation, staged as BF16(e2m1 * scale * global). Lanes 8c..8c+7 own column c of each 4-column
 // pass; sublanes 0-3 hold the K32 block's four code words, sublane 4 its two block scales.
-struct B {
-    using Layout = nvfp4::Layout;
+template <bool kSd4>
+struct BT {
+    using Layout = nvfp4::LayoutT<kSd4>;
     struct Compact { unsigned int words[4]; float global; };
     static __device__ __forceinline__ Layout layout(const unsigned char* w, unsigned int width, unsigned int outputs,
             unsigned long long) { return Layout(w, width, outputs); }
@@ -196,7 +241,7 @@ struct B {
                 if (sublane < 4u)
                     word = reinterpret_cast<const unsigned int*>(w.codes + (unsigned long long)col * w.row_bytes)[base / 8u + sublane];
                 else if (sublane == 4u)
-                    word = reinterpret_cast<const unsigned short*>(w.scales + (unsigned long long)col * w.row_scales)[base / 32u];
+                    word = w.scale_pair(col, base / 32u);
             }
             next.words[j] = word;
         }
@@ -228,4 +273,5 @@ struct B {
         stage<P>(hi, lo, now, lane);
     }
 };
+using B = BT<false>;
 }  // namespace nvfp4

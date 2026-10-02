@@ -58,4 +58,46 @@ class Nvfp4LayoutTest {
             assertThrows(IllegalArgumentException.class, () -> Nvfp4Layout.validate(tensor, 3, 1024));
         }
     }
+
+    private static final WeightLayout SD4 = WeightLayout.ROW_SPLIT_K128_SD4_V1;
+
+    @Test
+    void sd4GeometryFollowsTheConverter() {
+        // nvfp4_sd4_offsets((3, 1024)) == (1536, 1792, 1812): K/32 index bytes per row, then the table
+        // and the global scale.
+        assertEquals(32, Nvfp4Layout.rowScaleBytes(1024, SD4));
+        assertEquals(1536, Nvfp4Layout.scaleOffset(3, 1024));
+        assertEquals(1792, Nvfp4Layout.trailerOffset(3, 1024, SD4));
+        assertEquals(1812, Nvfp4Layout.byteSize(3, 1024, SD4));
+        assertEquals(
+                1812,
+                CompactTensorLayout.expectedByteSize(
+                        new long[] {3, 1024}, TensorDataType.BF16, WeightFormat.NVFP4, SD4));
+        // At the model's shapes the index plane is half the scale plane: 1/18 of the plain tensor.
+        long plain = Nvfp4Layout.byteSize(34816, 5120), compressed = Nvfp4Layout.byteSize(34816, 5120, SD4);
+        assertEquals(34816L * 5120 / 32, plain - compressed + 16, 256);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> CompactTensorLayout.expectedByteSize(
+                        new long[] {3, 1024}, TensorDataType.BF16, WeightFormat.Q3_G64_FP16, SD4));
+    }
+
+    @Test
+    void sd4ValidationChecksTheTableAndTheGlobalScale() {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment tensor = arena.allocate(Nvfp4Layout.byteSize(4, 1024, SD4));
+            long trailer = Nvfp4Layout.trailerOffset(4, 1024, SD4);
+            tensor.set(GLOBAL, trailer + Nvfp4Layout.TABLE, 1.5e-4f);
+            assertDoesNotThrow(() -> Nvfp4Layout.validate(tensor, 4, 1024, SD4));
+            // Index bytes are any value: every nibble selects a table entry.
+            tensor.set(ValueLayout.JAVA_BYTE, Nvfp4Layout.scaleOffset(4, 1024) + 5, (byte) 0xff);
+            assertDoesNotThrow(() -> Nvfp4Layout.validate(tensor, 4, 1024, SD4));
+            tensor.set(ValueLayout.JAVA_BYTE, trailer + 15, (byte) 0x7f);
+            assertThrows(IllegalArgumentException.class, () -> Nvfp4Layout.validate(tensor, 4, 1024, SD4));
+            tensor.set(ValueLayout.JAVA_BYTE, trailer + 15, (byte) 0x7e);
+            tensor.set(GLOBAL, trailer + Nvfp4Layout.TABLE, Float.NaN);
+            assertThrows(IllegalArgumentException.class, () -> Nvfp4Layout.validate(tensor, 4, 1024, SD4));
+            assertThrows(IllegalArgumentException.class, () -> Nvfp4Layout.validate(tensor, 4, 1024));
+        }
+    }
 }
