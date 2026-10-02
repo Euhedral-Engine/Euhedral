@@ -127,5 +127,61 @@ class CompactConverterTest(unittest.TestCase):
                 self.assertNotEqual(payload[high_offset:high_offset + high_bytes], b"\x00" * high_bytes)
 
 
+class Nvfp4QuantizationTest(unittest.TestCase):
+    def test_tables_cover_the_formats(self):
+        self.assertEqual(list(converter.E2M1_VALUES), [0, 0.5, 1, 1.5, 2, 3, 4, 6])
+        self.assertEqual(len(converter.E4M3_VALUES), 127)
+        self.assertEqual(converter.E4M3_VALUES[1], 2.0**-9)
+        self.assertEqual(converter.E4M3_VALUES[8], 2.0**-6)
+        self.assertEqual(converter.E4M3_VALUES[-1], 448.0)
+        self.assertTrue((np.diff(converter.E4M3_VALUES) > 0).all())
+
+    def test_rounding_is_nearest_with_ties_to_even_and_saturates(self):
+        values = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.26, 5.1, 7.0, 100.0, 0.0], dtype=np.float32)
+        codes = converter.round_to_table(values, converter.E2M1_VALUES)
+        self.assertEqual(list(converter.E2M1_VALUES[codes]), [0, 1, 1, 2, 2, 4, 4, 0.5, 6, 6, 6, 0])
+        scale = converter.round_to_table(np.array([1000.0, 448.0, 2.0**-10], dtype=np.float32), converter.E4M3_VALUES)
+        self.assertEqual(list(converter.E4M3_VALUES[scale]), [448.0, 448.0, 0.0])
+
+    def test_representable_blocks_round_trip_exactly(self):
+        rng = np.random.default_rng(4)
+        global_scale = np.float32(2.0**-12)
+        codes = rng.integers(0, 8, size=(3, 64))
+        signs = np.where(rng.integers(0, 2, size=(3, 64)) == 1, -1.0, 1.0)
+        block = converter.E4M3_VALUES[rng.integers(8, 120, size=(3, 4))]
+        values = (converter.E2M1_VALUES[codes] * signs).reshape(3, 4, 16)
+        values[..., 0] = 6.0  # each block's maximum sets its scale to block / 6 * 6
+        values = (values * block[..., None] * global_scale).reshape(3, 64).astype(np.float32)
+        packed, scales = converter.quantize_nvfp4_rows(values, global_scale)
+        np.testing.assert_array_equal(converter.dequantize_nvfp4_rows(packed, scales, global_scale), values)
+
+    def test_low_nibble_holds_the_even_column(self):
+        values = np.zeros((1, 16), dtype=np.float32)
+        values[0, 0], values[0, 1] = 6.0, -0.5
+        packed, scales = converter.quantize_nvfp4_rows(values, converter.nvfp4_global_scale(6.0))
+        self.assertEqual(packed[0, 0], 0x7 | (0x9 << 4))
+        self.assertEqual(converter.E4M3_VALUES[scales[0, 0]], 448.0)
+
+    def test_quantization_error_is_bounded_by_half_a_step(self):
+        rng = np.random.default_rng(5)
+        values = rng.standard_normal((8, 256)).astype(np.float32)
+        global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
+        packed, scales = converter.quantize_nvfp4_rows(values, global_scale)
+        restored = converter.dequantize_nvfp4_rows(packed, scales, global_scale)
+        step = np.repeat(converter.E4M3_VALUES[scales] * global_scale, 16, axis=1)
+        self.assertTrue((np.abs(restored - values) <= step + 1e-6).all())
+
+    def test_zero_tensor_has_zero_codes_and_scales(self):
+        packed, scales = converter.quantize_nvfp4_rows(np.zeros((2, 32), np.float32), np.float32(0))
+        self.assertFalse(packed.any())
+        self.assertFalse(scales.any())
+
+    def test_row_split_nvfp4_geometry(self):
+        scale_offset, global_offset, size = converter.nvfp4_offsets((3, 1024))
+        self.assertEqual(scale_offset, 3 * 512)
+        self.assertEqual(global_offset, 3 * 512 + 256)
+        self.assertEqual(size, global_offset + 4)
+        self.assertEqual(converter.payload_size((3, 1024), "NVFP4"), size)
+
 if __name__ == "__main__":
     unittest.main()
