@@ -201,7 +201,12 @@ final class QwenCompactWeightLoader {
     /// global scale, so the MTP layer executes as an ordinary attention layer (docs/MTP_CONTRACT.md §1).
     private static void splitMtpAttention(Map<String, TensorHandle> handles, GpuMemory gpu) {
         TensorHandle packed = handles.get(MTP_ATTENTION);
-        if (packed == null || packed.format() != WeightFormat.NVFP4 || packed.hostBacked()) return;
+        if (packed == null || packed.hostBacked()) return;
+        if (packed.format() == WeightFormat.W8_G32_FP16) {
+            requantizeW8MtpAttention(handles, packed, gpu);
+            return;
+        }
+        if (packed.format() != WeightFormat.NVFP4) return;
         long rows = packed.shape()[0], k = packed.shape()[1];
         long half = rows / 2;
         handles.put("mtp/layer/attention/query_key", nvfp4Rows(packed, 0, half, "mtp/layer/attention/query_key", gpu));
@@ -209,6 +214,74 @@ final class QwenCompactWeightLoader {
                 "mtp/layer/attention/gate_value", nvfp4Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
         handles.remove(MTP_ATTENTION);
         gpu.free(packed.deviceAddress());
+    }
+
+    /// The compact Q3 artifact stores the MTP attention pack as W8G32 (int8 codes [rows][K], then FP16
+    /// scales [rows][K/32] at a 256-aligned offset), for which no linear kernel exists. Each half is
+    /// dequantized and re-quantized to NVFP4 (Nvfp4WeightQuantizer). This affects drafts only: verification
+    /// by the base model decides every output token.
+    private static void requantizeW8MtpAttention(
+            Map<String, TensorHandle> handles, TensorHandle packed, GpuMemory gpu) {
+        int rows = Math.toIntExact(packed.shape()[0]), k = Math.toIntExact(packed.shape()[1]);
+        int padded = (k + 127) / 128 * 128, groups = padded / 32;
+        long scales = align256((long) rows * padded);
+        float[] values = new float[rows * k];
+        try (var arena = java.lang.foreign.Arena.ofConfined()) {
+            var host = arena.allocate(packed.byteSize(), 16);
+            gpu.copyDeviceToHost(host, packed.deviceAddress(), packed.byteSize());
+            for (int row = 0; row < rows; row++) {
+                for (int col = 0; col < k; col++) {
+                    byte code = host.get(java.lang.foreign.ValueLayout.JAVA_BYTE, (long) row * padded + col);
+                    short half = host.get(
+                            java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED,
+                            scales + ((long) row * groups + col / 32) * 2);
+                    values[row * k + col] = code * Float.float16ToFloat(half);
+                }
+            }
+        }
+        int half = rows / 2;
+        handles.put(
+                "mtp/layer/attention/query_key",
+                uploadNvfp4(
+                        java.util.Arrays.copyOfRange(values, 0, half * k),
+                        half,
+                        k,
+                        "mtp/layer/attention/query_key",
+                        packed,
+                        gpu));
+        handles.put(
+                "mtp/layer/attention/gate_value",
+                uploadNvfp4(
+                        java.util.Arrays.copyOfRange(values, half * k, rows * k),
+                        half,
+                        k,
+                        "mtp/layer/attention/gate_value",
+                        packed,
+                        gpu));
+        handles.remove(MTP_ATTENTION);
+        gpu.free(packed.deviceAddress());
+    }
+
+    private static TensorHandle uploadNvfp4(
+            float[] values, int rows, int k, String name, TensorHandle source, GpuMemory gpu) {
+        byte[] payload = Nvfp4WeightQuantizer.quantize(values, rows, k);
+        long address = gpu.allocate(payload.length);
+        try (var arena = java.lang.foreign.Arena.ofConfined()) {
+            var host = arena.allocate(payload.length, 16);
+            host.copyFrom(java.lang.foreign.MemorySegment.ofArray(payload));
+            gpu.copyHostToDevice(address, host, payload.length);
+        } catch (RuntimeException | Error failure) {
+            gpu.free(address);
+            throw failure;
+        }
+        return new TensorHandle(
+                name,
+                new long[] {rows, k},
+                source.dataType(),
+                WeightFormat.NVFP4,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                address,
+                payload.length);
     }
 
     private static TensorHandle nvfp4Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
