@@ -141,7 +141,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                         da = self.gpu.zeros(size); stack.callback(self.gpu.free, da)
                         dw = self.gpu.upload(weights); stack.callback(self.gpu.free, dw)
                         dy = self.gpu.zeros(rows * cols * 2, fill=0xA5); stack.callback(self.gpu.free, dy)
-                        dp = self.gpu.zeros(rows * cols * 4); stack.callback(self.gpu.free, dp)
+                        dp = self.gpu.zeros(splits * rows * cols * 4); stack.callback(self.gpu.free, dp)
                         self.gpu.launch("euhedral_nvfp4n_quantize_rows" + suffix, rows,
                                         [C.c_uint64(dx), C.c_uint64(da), C.c_uint(rows), C.c_uint(k)], block=128)
                         self.gpu.launch(f"euhedral_nvfp4n_skinny{suffix}_{16 * fragments}", ((cols + 63) // 64, splits),
@@ -149,11 +149,48 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                                          C.c_uint(k), C.c_uint(cols)], block=128, shared=shared)
                         if splits > 1:
                             self.gpu.launch("euhedral_nvfp4n_skinny_finish", (rows * cols + 255) // 256,
-                                            [C.c_uint64(dp), C.c_uint64(dy), C.c_uint(rows * cols)], block=256)
+                                            [C.c_uint64(dp), C.c_uint64(dy), C.c_uint(rows * cols), C.c_uint(splits)],
+                                            block=256)
                         activations = self.gpu.download(da, size)
                         y = from_bf16_bytes(self.gpu.download(dy, rows * cols * 2), (rows, cols))
                     expected = dequantize(activations, rows, k, terms) @ dense.astype(np.float64).T
                     self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * np.abs(expected).max())
+
+
+    def skinny(self, x, weights, k, cols, splits):
+        """One skinny linear (one term, up to 16 rows) as the host runs it; BF16 output bytes."""
+        rows = x.shape[0]
+        shared = min(4, 101376 // ((16 + 64) * 160)) * (16 + 64) * 160
+        with contextlib.ExitStack() as stack:
+            dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
+            size = layout(rows, k, 1)[2]
+            da = self.gpu.zeros(size); stack.callback(self.gpu.free, da)
+            dw = self.gpu.upload(weights); stack.callback(self.gpu.free, dw)
+            dy = self.gpu.zeros(rows * cols * 2, fill=0xA5); stack.callback(self.gpu.free, dy)
+            dp = self.gpu.zeros(splits * rows * cols * 4, fill=0x7F); stack.callback(self.gpu.free, dp)
+            self.gpu.launch("euhedral_nvfp4n_quantize_rows", rows,
+                            [C.c_uint64(dx), C.c_uint64(da), C.c_uint(rows), C.c_uint(k)], block=128)
+            self.gpu.launch("euhedral_nvfp4n_skinny_16", ((cols + 63) // 64, splits),
+                            [C.c_uint64(da), C.c_uint64(dw), C.c_uint64(dy), C.c_uint64(dp), C.c_uint(rows),
+                             C.c_uint(k), C.c_uint(cols)], block=128, shared=shared)
+            if splits > 1:
+                self.gpu.launch("euhedral_nvfp4n_skinny_finish", (rows * cols + 255) // 256,
+                                [C.c_uint64(dp), C.c_uint64(dy), C.c_uint(rows * cols), C.c_uint(splits)], block=256)
+            return self.gpu.download(dy, rows * cols * 2)
+
+    def test_skinny_rows_are_deterministic_and_independent_of_the_other_rows(self):
+        """Native-numerics speculative verification relies on this: a row's output is bit for bit the
+        same whether it runs alone (decode) or with up to 15 other rows (verification), and run to run."""
+        k, cols = 5120, 192
+        weights, _ = tensor(self.rng, cols, k)
+        x = bf16(self.rng.standard_normal((4, k)).astype(np.float32))
+        for splits in (1, 2, 3, 7):
+            with self.subTest(splits=splits):
+                together = self.skinny(x, weights, k, cols, splits)
+                self.assertEqual(together, self.skinny(x, weights, k, cols, splits), "run to run")
+                for row in range(4):
+                    alone = self.skinny(x[row:row + 1], weights, k, cols, splits)
+                    self.assertEqual(together[row * cols * 2:(row + 1) * cols * 2], alone, f"row {row}")
 
 
 if __name__ == "__main__":
