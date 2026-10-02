@@ -48,8 +48,9 @@ class SpeculativeDepthScreenCudaIntegrationTest {
         int rounds = Integer.getInteger("euhedral.speculative.rounds", 2);
         QwenTokenizer tokenizer = QwenTokenizer.load(
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
-        String[] paragraphs = Files.readString(
-                        SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md"))
+        String[] paragraphs = Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                        .resolve("benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/"
+                                + "chat-corpus-v1-document.md"))
                 .split("\n\n");
         List<int[]> prompts = new ArrayList<>();
         for (String task : TASKS) {
