@@ -45,6 +45,7 @@ subprojects {
             exclude("**/SpeculativeVerifyCudaIntegrationTest.class")
             exclude("**/SpeculativeDecodeCudaIntegrationTest.class")
             exclude("**/SpeculativeDepthScreenCudaIntegrationTest.class")
+            exclude("**/TeacherForcedQualityCudaIntegrationTest.class")
             useJUnitPlatform()
         }
         val testSourceSet = the<SourceSetContainer>()["test"]
@@ -76,6 +77,7 @@ subprojects {
             include("**/SpeculativeVerifyCudaIntegrationTest.class")
             include("**/SpeculativeDecodeCudaIntegrationTest.class")
             include("**/SpeculativeDepthScreenCudaIntegrationTest.class")
+            include("**/TeacherForcedQualityCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -105,6 +107,9 @@ subprojects {
             // report, and `exact` to run the oracle on both sequences.
             for (name in listOf("steps", "prefix", "report", "candidate"))
                 providers.gradleProperty("euhedral.numerics.drift.$name").orNull?.let { systemProperty("euhedral.numerics.drift.$name", it) }
+            // Teacher-forced quality measurement (TeacherForcedQualityCudaIntegrationTest).
+            for (name in listOf("report", "artifact", "prefix", "steps", "host-mib"))
+                providers.gradleProperty("euhedral.quality.$name").orNull?.let { systemProperty("euhedral.quality.$name", it) }
             // Speculative decoding tests: artifact (defaults to the NVFP4 artifact), prompt length, rows.
             for (name in listOf("artifact", "prefix", "rows", "tokens", "host-mib", "native", "screen", "depths", "rounds"))
                 providers.gradleProperty("euhedral.speculative.$name").orNull?.let { systemProperty("euhedral.speculative.$name", it) }
