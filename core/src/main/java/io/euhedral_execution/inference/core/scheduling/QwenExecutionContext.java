@@ -30,7 +30,10 @@ public final class QwenExecutionContext implements StageQuantum {
         DECODE,
         /// Speculative verification: decode's topology over several rows, each computed bit for bit as
         /// one-row decode at its position (row-exact execution), with logits for every row.
-        VERIFY
+        VERIFY,
+        /// MTP drafting (docs/MTP_CONTRACT.md §2): rows of the MTP layer at MTP positions, writing only
+        /// the MTP layer's cache. The base sequence position does not move.
+        DRAFT
     }
 
     public enum Status {
@@ -65,6 +68,13 @@ public final class QwenExecutionContext implements StageQuantum {
     private ExecutionGpu gpu;
     private Consumer<? super QwenExecutionContext> terminalConsumer;
     private Outcome pendingOutcome;
+    /// DRAFT: the device rows of base (or MTP) hidden state that seed this quantum's MTP rows, and how
+    /// many of its rows the MTP cache commits (catch-up rows commit, recursive draft rows do not).
+    private long draftSeedAddress;
+    private int draftCommittedRows;
+    /// Base quanta of a speculative session also keep every row's post-final-norm hidden for drafting.
+    private boolean seedsDraft;
+    private long leasePosition;
 
     public QwenExecutionContext(
             QwenExecutionPlan plan,
@@ -102,7 +112,10 @@ public final class QwenExecutionContext implements StageQuantum {
         if (hostLogits != null) {
             if (logitsRequirement == QwenLogitsRequirement.NONE)
                 throw new IllegalArgumentException("host logits require a logits row");
-            if (hostLogits.vocabularySize() != this.plan.weights().config().vocabSize())
+            int vocabulary = kind == ExecutionKind.DRAFT
+                    ? this.plan.draftVocabularySize()
+                    : this.plan.weights().config().vocabSize();
+            if (hostLogits.vocabularySize() != vocabulary)
                 throw new IllegalArgumentException("host logits do not match the model vocabulary");
         }
         this.hostLogits = hostLogits;
@@ -165,6 +178,32 @@ public final class QwenExecutionContext implements StageQuantum {
     /// Called by the stage that produced this quantum's logits rows at `address`, with the quantum's
     /// stream selected. A host-sampling quantum queues the copy of its final row here, ahead of its
     /// retirement boundary.
+    /// A DRAFT quantum whose MTP rows are seeded by the BF16 hidden rows at `seedAddress`, committing its
+    /// first `committedRows` MTP cache rows.
+    public QwenExecutionContext withDraftSeed(long seedAddress, int committedRows) {
+        if (this.kind != ExecutionKind.DRAFT) throw new IllegalStateException("only drafting takes a seed");
+        if (seedAddress == 0 || committedRows < 0 || committedRows > this.tokenIds.length)
+            throw new IllegalArgumentException("invalid draft seed");
+        this.draftSeedAddress = seedAddress;
+        this.draftCommittedRows = committedRows;
+        return this;
+    }
+
+    public long draftSeedAddress() {
+        return this.draftSeedAddress;
+    }
+
+    /// Keeps every row's post-final-norm hidden in the sequence's draft seed rows.
+    public QwenExecutionContext seedingDraft() {
+        if (this.kind == ExecutionKind.DRAFT) throw new IllegalStateException("drafting does not seed itself");
+        this.seedsDraft = true;
+        return this;
+    }
+
+    public boolean seedsDraft() {
+        return this.seedsDraft;
+    }
+
     /// The acceptance rule of a VERIFY quantum; null commits every row (tests may force a count).
     private SpeculativeAcceptance acceptance;
     private int forcedCommittedRows;
@@ -191,6 +230,7 @@ public final class QwenExecutionContext implements StageQuantum {
     /// Rows whose state this quantum commits: all rows, or a verification's accepted prefix. Resolved on
     /// first use after the device work retired, from the verified rows' greedy selections.
     public int committedRowCount() {
+        if (this.kind == ExecutionKind.DRAFT) return this.draftCommittedRows;
         if (this.forcedCommittedRows > 0) return this.forcedCommittedRows;
         if (this.acceptance == null) return this.tokenIds.length;
         if (!this.acceptance.resolved()) this.acceptance.resolve(this.hostLogits.selectedTokens());
@@ -307,7 +347,10 @@ public final class QwenExecutionContext implements StageQuantum {
             }
             beforeClaim.run();
             try {
-                this.lease = this.sequence.claimExecution(this.startPosition);
+                // Drafting runs at MTP positions and leaves the base position where it is.
+                this.leasePosition =
+                        this.kind == ExecutionKind.DRAFT ? this.sequence.currentTokenPosition() : this.startPosition;
+                this.lease = this.sequence.claimExecution(this.leasePosition);
             } catch (IllegalStateException claimFailure) {
                 if (this.sequence.terminalState() == QwenSequenceState.TerminalState.CANCELLED) {
                     this.pendingOutcome = new Outcome(Status.CANCELLED, null);
@@ -354,7 +397,10 @@ public final class QwenExecutionContext implements StageQuantum {
                             config.linearValueHeadDim(),
                             config.linearConvKernelDim());
                     createdKv = AttentionSequenceStates.allocate(
-                            gpu, config.layerTypes(), config.numKeyValueHeads() * config.attentionHeadDim());
+                            gpu,
+                            config.layerTypes(),
+                            config.numKeyValueHeads() * config.attentionHeadDim(),
+                            this.plan.weights().mtp() != null);
                 } else {
                     createdRecurrent = QwenGdnSequenceState.allocate(
                             gpu,
@@ -449,7 +495,10 @@ public final class QwenExecutionContext implements StageQuantum {
                 completed = new Outcome(Status.CANCELLED, null);
             } else {
                 boolean cancelled = this.sequence.releaseExecutionAndCheckCancellation(
-                        this.lease, this.startPosition + committedRowCount());
+                        this.lease,
+                        this.kind == ExecutionKind.DRAFT
+                                ? this.leasePosition
+                                : this.startPosition + committedRowCount());
                 completed = new Outcome(cancelled ? Status.CANCELLED : Status.SUCCESS, null);
             }
         } catch (Throwable cleanupFailure) {

@@ -1242,6 +1242,15 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (status != 0) throw new GpuMemoryException(q3Operation("P2E2 expansion", status), status);
     }
 
+    @Override
+    public void copyRowsDeviceToDevice(
+            long destination, long destinationPitch, long source, long sourcePitch, int rows) {
+        ensureOpen();
+        if (copyDeviceToDevice2d == null) throw new UnsupportedOperationException("native pitched copy unavailable");
+        requireAddresses(destination, source);
+        copyRows(destination, destinationPitch, source, sourcePitch, rows);
+    }
+
     private void copyRows(long destination, long destinationPitch, long source, long sourcePitch, int rows) {
         int status;
         try {

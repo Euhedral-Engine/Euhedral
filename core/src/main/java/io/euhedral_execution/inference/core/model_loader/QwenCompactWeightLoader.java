@@ -73,6 +73,7 @@ final class QwenCompactWeightLoader {
                     hostOffset += hostSlot(descriptor.byteSize());
                 } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
+            splitMtpAttention(handles, gpuMemory);
             return assemble(config, handles);
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);
@@ -192,8 +193,71 @@ final class QwenCompactWeightLoader {
                 take(handles, prefix + "/gdn/output"));
     }
 
+    private static final String MTP_ATTENTION = "mtp/layer/attention/query_key_gate_value";
+
+    /// The MTP layer packs its attention projection as the base layers' query/key rows (q, k) followed by
+    /// their gate/value rows (gate, v) (tools/convert_qwen_safetensors_to_compact_edrl.py). An NVFP4
+    /// pack is split here into those two tensors, each with its rows' codes and scales and the shared
+    /// global scale, so the MTP layer executes as an ordinary attention layer (docs/MTP_CONTRACT.md §1).
+    private static void splitMtpAttention(Map<String, TensorHandle> handles, GpuMemory gpu) {
+        TensorHandle packed = handles.get(MTP_ATTENTION);
+        if (packed == null || packed.format() != WeightFormat.NVFP4 || packed.hostBacked()) return;
+        long rows = packed.shape()[0], k = packed.shape()[1];
+        long half = rows / 2;
+        handles.put("mtp/layer/attention/query_key", nvfp4Rows(packed, 0, half, "mtp/layer/attention/query_key", gpu));
+        handles.put(
+                "mtp/layer/attention/gate_value", nvfp4Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
+        handles.remove(MTP_ATTENTION);
+        gpu.free(packed.deviceAddress());
+    }
+
+    private static TensorHandle nvfp4Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
+        long k = source.shape()[1];
+        long padded = (k + 127) / 128 * 128, rowBytes = padded / 2, rowScales = padded / 16;
+        long sourceScales = align256(source.shape()[0] * rowBytes);
+        long sourceGlobal = align256(sourceScales + source.shape()[0] * rowScales);
+        long scales = align256(rows * rowBytes), global = align256(scales + rows * rowScales);
+        long bytes = global + Float.BYTES;
+        long address = gpu.allocate(bytes);
+        try {
+            long base = source.deviceAddress();
+            gpu.copyDeviceToDevice(address, base + first * rowBytes, rows * rowBytes);
+            gpu.copyDeviceToDevice(address + scales, base + sourceScales + first * rowScales, rows * rowScales);
+            gpu.copyDeviceToDevice(address + global, base + sourceGlobal, Float.BYTES);
+        } catch (RuntimeException | Error failure) {
+            gpu.free(address);
+            throw failure;
+        }
+        return new TensorHandle(
+                name, new long[] {rows, k}, source.dataType(), WeightFormat.NVFP4, source.layout(), address, bytes);
+    }
+
+    private static long align256(long value) {
+        return (value + 255) & ~255L;
+    }
+
     private static QwenMtpWeights buildMtp(Map<String, TensorHandle> handles) throws QwenWeightLoadException {
         String prefix = "mtp/layer";
+        if (handles.containsKey("mtp/layer/attention/query_key")) {
+            QwenLayerWeights layer = new QwenLayerWeights(
+                    0,
+                    take(handles, prefix + "/input_norm"),
+                    take(handles, prefix + "/post_attention_norm"),
+                    new QwenCompactAttentionWeights(
+                            take(handles, prefix + "/attention/query_key"),
+                            take(handles, prefix + "/attention/gate_value"),
+                            take(handles, prefix + "/attention/query_norm"),
+                            take(handles, prefix + "/attention/key_norm"),
+                            take(handles, prefix + "/attention/output")),
+                    new QwenCompactDenseFfnWeights(
+                            take(handles, prefix + "/mlp/gate_up"), take(handles, prefix + "/mlp/down")));
+            return new QwenMtpWeights(
+                    take(handles, "mtp/embedding_norm"),
+                    take(handles, "mtp/hidden_norm"),
+                    take(handles, "mtp/input_projection"),
+                    layer,
+                    take(handles, "mtp/final_norm"));
+        }
         QwenLayerWeights layer = new QwenLayerWeights(
                 0,
                 take(handles, prefix + "/input_norm"),

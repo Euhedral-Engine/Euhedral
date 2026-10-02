@@ -16,6 +16,18 @@ public final class RmsNormFrame extends QwenStageFrame {
     protected void perform(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         boolean finalNorm = instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.FINAL_NORMALIZED);
         int rows = finalNorm ? context.logitsRowCount() : context.inputTokenCount();
+        if (finalNorm && context.seedsDraft()) {
+            // Speculative drafting reads every row's post-final-norm hidden (docs/MTP_CONTRACT.md §2).
+            var states = (io.euhedral_execution.inference.core.scheduling.AttentionSequenceStates)
+                    context.sequenceState().kvCacheState();
+            int all = context.inputTokenCount();
+            normalize(
+                    instruction,
+                    context.workspace().address(instruction.inputBuffers().getFirst()),
+                    states.draftSeedRows(all, instruction.outputWidth()),
+                    all,
+                    (float) context.plan().weights().config().rmsNormEpsilon());
+        }
         if (rows == 0) return;
         long input = context.plan().hasFirstLayer()
                 ? context.workspace().address(instruction.inputBuffers().getFirst())
@@ -27,6 +39,20 @@ public final class RmsNormFrame extends QwenStageFrame {
                 ? context.workspace().address(instruction.outputBuffers().getFirst())
                 : context.workspace().normalizedStateAddress();
         float epsilon = (float) context.plan().weights().config().rmsNormEpsilon();
+        normalize(instruction, input, output, rows, epsilon);
+        if (finalNorm && context.kind() == QwenExecutionContext.ExecutionKind.DRAFT) {
+            // The last MTP row's post-mtp.norm hidden seeds the next recursive draft row.
+            var states = (io.euhedral_execution.inference.core.scheduling.AttentionSequenceStates)
+                    context.sequenceState().kvCacheState();
+            gpu().copyDeviceToDevice(
+                            states.draftRecursionHidden(instruction.outputWidth()),
+                            output + (long) (rows - 1) * instruction.outputWidth() * Short.BYTES,
+                            (long) instruction.outputWidth() * Short.BYTES);
+        }
+    }
+
+    private void normalize(
+            QwenExecutionPlan.Instruction instruction, long input, long output, int rows, float epsilon) {
         if (instruction.kind() == QwenExecutionPlan.Kind.RMS_NORM_UNIT_OFFSET) {
             gpu().rmsNormUnitOffsetBf16(
                             input, instruction.weightAddress(), output, rows, instruction.outputWidth(), epsilon);

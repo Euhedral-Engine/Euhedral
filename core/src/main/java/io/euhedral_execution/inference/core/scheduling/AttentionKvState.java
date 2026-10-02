@@ -128,6 +128,16 @@ public final class AttentionKvState implements AutoCloseable {
         releaseRetired();
     }
 
+    /// Drops committed rows from `length` on (speculative MTP draft rows), between quanta. The rows stay
+    /// in their pages until the next append overwrites them; no reader sees past the frontier.
+    public void truncate(int length) {
+        ensureOpen();
+        if (this.submittedLength != this.length) throw new IllegalStateException("an append is in flight");
+        if (length < 0 || length > this.length) throw new IllegalArgumentException("can only truncate committed rows");
+        this.length = length;
+        this.submittedLength = length;
+    }
+
     /// Device pointer to the K page-address table, not to BF16 payloads.
     public long keyCacheAddress() {
         ensureOpen();

@@ -9,12 +9,19 @@ public enum WeightResidency {
     ALL,
     /// Only the objects text generation executes: the vision tower, the MTP layer and the draft head
     /// stay in the artifact until a route uses them.
-    EXECUTED;
+    EXECUTED,
+    /// The executed objects plus the MTP layer and draft head, for speculative decoding: everything but
+    /// the vision tower.
+    SPECULATIVE;
 
     /// Whether a compact runtime object is uploaded under this residency.
     public boolean uploads(String name) {
-        return this == ALL
-                || !(name.startsWith("vision/") || name.startsWith("mtp/") || name.startsWith("text/draft_head"));
+        return switch (this) {
+            case ALL -> true;
+            case EXECUTED ->
+                !(name.startsWith("vision/") || name.startsWith("mtp/") || name.startsWith("text/draft_head"));
+            case SPECULATIVE -> !name.startsWith("vision/");
+        };
     }
 
     /// Device bytes the artifact's uploaded objects occupy under this residency.
