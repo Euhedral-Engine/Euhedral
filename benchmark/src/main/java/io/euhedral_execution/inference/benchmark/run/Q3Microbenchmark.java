@@ -72,20 +72,46 @@ public final class Q3Microbenchmark {
                             eviction = gpu.allocate(128L * 1024 * 1024);
                             gpu.copyHostToDevice(x, hostInput, hostInput.byteSize());
                             gpu.linearQ3Bf16(
-                                    x, weight.deviceAddress(), y, rows, k, n, weight.byteSize(), Q3DispatchMode.SCALAR);
+                                    x,
+                                    weight.deviceAddress(),
+                                    y,
+                                    rows,
+                                    k,
+                                    n,
+                                    weight.byteSize(),
+                                    Q3DispatchMode.SCALAR,
+                                    weight.layout());
                             var reference = arena.allocate((long) rows * n * Short.BYTES);
                             gpu.copyDeviceToHost(reference, y, reference.byteSize());
                             var actual = arena.allocate(reference.byteSize());
                             for (var mode :
                                     List.of(Q3DispatchMode.SCALAR, Q3DispatchMode.DECODE, Q3DispatchMode.PREFILL)) {
                                 for (int warmup = 0; warmup < options.warmup(); warmup++)
-                                    gpu.linearQ3Bf16(x, weight.deviceAddress(), y, rows, k, n, weight.byteSize(), mode);
+                                    gpu.linearQ3Bf16(
+                                            x,
+                                            weight.deviceAddress(),
+                                            y,
+                                            rows,
+                                            k,
+                                            n,
+                                            weight.byteSize(),
+                                            mode,
+                                            weight.layout());
                                 long[] samples = new long[options.iterations()];
                                 for (int iteration = 0; iteration < samples.length; iteration++) {
                                     // Larger than this target GPU's L2; excluded from the timed boundary.
                                     gpu.zeroDeviceMemory(eviction, 128L * 1024 * 1024);
                                     long started = System.nanoTime();
-                                    gpu.linearQ3Bf16(x, weight.deviceAddress(), y, rows, k, n, weight.byteSize(), mode);
+                                    gpu.linearQ3Bf16(
+                                            x,
+                                            weight.deviceAddress(),
+                                            y,
+                                            rows,
+                                            k,
+                                            n,
+                                            weight.byteSize(),
+                                            mode,
+                                            weight.layout());
                                     samples[iteration] = System.nanoTime() - started;
                                 }
                                 gpu.copyDeviceToHost(actual, y, actual.byteSize());

@@ -130,8 +130,7 @@ public final class QwenArtifactReader {
                     : new TensorDescriptor(name, shape, dataType, format, dataOffset, byteSize);
             if (header.version() == QwenArtifactHeader.COMPACT_VERSION) {
                 try {
-                    long expected = CompactTensorLayout.expectedByteSize(shape, dataType, format, layout);
-                    if (expected != byteSize) {
+                    if (!CompactTensorLayout.acceptsByteSize(shape, dataType, format, layout, byteSize)) {
                         throw new QwenArtifactFormatException(
                                 "compact tensor byte size does not match metadata: " + name);
                     }

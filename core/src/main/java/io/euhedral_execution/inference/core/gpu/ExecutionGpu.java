@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.gpu;
 
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -257,6 +258,33 @@ public abstract class ExecutionGpu implements GpuMemory {
 
     public abstract void synchronize();
 
+    /// [#embedQ3] for an embedding table in either Q3 layout. Backends without P2E2 support accept
+    /// only [WeightLayout#ROW_SPLIT_K128_V1].
+    public void embedQ3(
+            long tokenIdsAddress,
+            long embeddingAddress,
+            long embeddingByteSize,
+            long hiddenStateAddress,
+            int tokenCount,
+            int vocabularySize,
+            int hiddenSize,
+            WeightLayout layout) {
+        requireRowSplit(layout, "Q3 embedding");
+        embedQ3(
+                tokenIdsAddress,
+                embeddingAddress,
+                embeddingByteSize,
+                hiddenStateAddress,
+                tokenCount,
+                vocabularySize,
+                hiddenSize);
+    }
+
+    protected static void requireRowSplit(WeightLayout layout, String operation) {
+        if (layout != WeightLayout.ROW_SPLIT_K128_V1)
+            throw new UnsupportedOperationException(operation + " does not support " + layout + " on this GPU");
+    }
+
     public void rmsNormBf16(
             long inputAddress, long weightAddress, long outputAddress, int rows, int width, float epsilon) {
         throw new UnsupportedOperationException("BF16 RMS norm is not implemented by this GPU");
@@ -277,6 +305,20 @@ public abstract class ExecutionGpu implements GpuMemory {
             int outFeatures,
             long weightsByteSize) {
         throw new UnsupportedOperationException("Q3 linear is not implemented by this GPU");
+    }
+
+    /// [#linearQ3Bf16] for weights in either Q3 layout; the results are the same values.
+    public void linearQ3Bf16(
+            long inputAddress,
+            long weightsAddress,
+            long outputAddress,
+            int rows,
+            int inFeatures,
+            int outFeatures,
+            long weightsByteSize,
+            WeightLayout layout) {
+        requireRowSplit(layout, "Q3 linear");
+        linearQ3Bf16(inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize);
     }
 
     /// Computes the Q4 query/key and Q5 value/gate projections of one GDN layer. The default runs
@@ -424,6 +466,78 @@ public abstract class ExecutionGpu implements GpuMemory {
     public void q3GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
         throw new UnsupportedOperationException("Q3 gate/up SwiGLU region is not implemented");
+    }
+
+    /// Layout-aware forms of the Q3 FFN regions; backends without P2E2 support accept only
+    /// [WeightLayout#ROW_SPLIT_K128_V1].
+    public void q3FfnStreamedBf16(
+            long input,
+            long gateWeights,
+            long downWeights,
+            long output,
+            long slots,
+            long accumulators,
+            int rows,
+            int hidden,
+            int intermediate,
+            long gateBytes,
+            long downBytes,
+            WeightLayout gateLayout,
+            WeightLayout downLayout) {
+        requireRowSplit(gateLayout, "streamed FFN region");
+        requireRowSplit(downLayout, "streamed FFN region");
+        q3FfnStreamedBf16(
+                input,
+                gateWeights,
+                downWeights,
+                output,
+                slots,
+                accumulators,
+                rows,
+                hidden,
+                intermediate,
+                gateBytes,
+                downBytes);
+    }
+
+    public void q3FfnDownBf16(
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        requireRowSplit(layout, "Q3 FFN down");
+        q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
+    }
+
+    public void q3FfnDownSplitBf16(
+            long input,
+            long weights,
+            long output,
+            long partials,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        requireRowSplit(layout, "Q3 split-K FFN down");
+        q3FfnDownSplitBf16(input, weights, output, partials, rows, width, outputs, weightBytes);
+    }
+
+    public void q3GateUpSwiGluBf16(
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        requireRowSplit(layout, "Q3 gate/up SwiGLU region");
+        q3GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes);
     }
 
     /// Writes the rounded residual and normalizes that BF16 representation in one region.

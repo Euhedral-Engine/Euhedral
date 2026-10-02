@@ -34,7 +34,9 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                                 instruction.inputWidth(),
                                 context.plan().weights().config().intermediateSize(),
                                 instruction.weightByteSize(0),
-                                instruction.weightByteSize(1));
+                                instruction.weightByteSize(1),
+                                instruction.weightLayout(0),
+                                instruction.weightLayout(1));
             case Q3_GATE_UP_SWIGLU ->
                 gpu().q3GateUpSwiGluBf16(
                                 input(context, instruction, 0),
@@ -43,7 +45,8 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                                 context.inputTokenCount(),
                                 instruction.inputWidth(),
                                 instruction.outputWidth(),
-                                instruction.weightByteSize());
+                                instruction.weightByteSize(),
+                                instruction.weightLayout());
             case RESIDUAL_RMS_NORM ->
                 gpu().residualRmsNormBf16(
                                 input(context, instruction, 0),

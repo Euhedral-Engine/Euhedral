@@ -1,6 +1,8 @@
 package io.euhedral_execution.inference.core.gpu;
 
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
+import io.euhedral_execution.inference.core.model_loader.artifact.P2e2Layout;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -18,6 +20,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,6 +35,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private static final int MAX_CACHED_EVENTS = 256;
     /// EUHEDRAL_CUDA_KERNEL_UNAVAILABLE: an optional kernel did not load.
     private static final int KERNEL_UNAVAILABLE = -4;
+    /// EUHEDRAL_CUDA_ROUTE_UNAVAILABLE: a specialized route does not apply; another one must run.
+    private static final int ROUTE_UNAVAILABLE = -5;
+    /// Expansion scratch above which a P2E2 linear is computed in output-row chunks. The largest
+    /// region that expands, the streamed FFN's gate/up plus down (109 MB), fits.
+    private static final long Q3_SCRATCH_LIMIT = 128L << 20;
     private final Arena arena;
     private final MethodHandle malloc;
     private final MethodHandle free;
@@ -95,6 +104,18 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
     private final MethodHandle attentionCausalNvfp4;
+    private final MethodHandle linearQ3P2e2DecodeBf16;
+    private final MethodHandle q3P2e2Expand;
+    private final MethodHandle embedQ3P2e2;
+    private final MethodHandle copyDeviceToDevice2d;
+    /// The stream whose launches the current thread is submitting, or null for synchronous calls.
+    private final ThreadLocal<CudaStream> submitting = new ThreadLocal<>();
+    /// One device region, reused by every P2E2 route that expands its tensor for a row-split kernel.
+    /// Each use waits for the previous one through `q3ScratchEvent`, recorded on the stream that used it.
+    private final ReentrantLock q3ScratchLock = new ReentrantLock();
+    private long q3ScratchAddress;
+    private long q3ScratchBytes;
+    private long q3ScratchEvent;
     private volatile boolean closed;
 
     public CudaGpuMemory(Path libraryPath) {
@@ -122,6 +143,38 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.copyDeviceToReadback = bind(linker, symbols, "euhedral_cuda_copy_device_to_readback", COPY);
             this.copyDeviceToDevice = bind(linker, symbols, "euhedral_cuda_copy_device_to_device", COPY);
             this.embedQ3 = bind(linker, symbols, "euhedral_cuda_embed_q3", EMBED_Q3);
+            this.embedQ3P2e2 = symbols.find("euhedral_cuda_embed_q3_p2e2")
+                    .map(symbol -> linker.downcallHandle(symbol, EMBED_Q3))
+                    .orElse(null);
+            this.linearQ3P2e2DecodeBf16 = symbols.find("euhedral_cuda_linear_q3_p2e2_decode_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
+                    .orElse(null);
+            this.q3P2e2Expand = symbols.find("euhedral_cuda_q3_p2e2_expand")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.copyDeviceToDevice2d = symbols.find("euhedral_cuda_copy_device_to_device_2d")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
+                    .orElse(null);
             this.synchronize = bind(linker, symbols, "euhedral_cuda_synchronize", SYNCHRONIZE);
             this.streamCreate =
                     bind(linker, symbols, "euhedral_cuda_stream_create", FunctionDescriptor.of(ValueLayout.JAVA_LONG));
@@ -401,9 +454,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         public void submit(Runnable launches, boolean overlapPredecessor) {
             ensureOpen();
             select(overlapPredecessor);
+            CudaStream previous = submitting.get();
+            submitting.set(this);
             try {
                 launches.run();
             } finally {
+                submitting.set(previous);
                 clear(overlapPredecessor);
             }
         }
@@ -885,6 +941,368 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             String operation = status == CUDA_FORMAT_MISMATCH ? "Q3 linear format/layout mismatch" : "Q3 linear";
             throw new GpuMemoryException(operation, status);
         }
+    }
+
+    @Override
+    public void linearQ3Bf16(
+            long inputAddress,
+            long weightsAddress,
+            long outputAddress,
+            int rows,
+            int inFeatures,
+            int outFeatures,
+            long weightsByteSize,
+            WeightLayout layout) {
+        linearQ3Bf16(
+                inputAddress,
+                weightsAddress,
+                outputAddress,
+                rows,
+                inFeatures,
+                outFeatures,
+                weightsByteSize,
+                this.q3DispatchMode,
+                layout);
+    }
+
+    /// [#linearQ3Bf16(long, long, long, int, int, int, long, Q3DispatchMode)] for either Q3 layout. A
+    /// P2E2 tensor runs one row on its own decode kernel, bitwise identical to the row-split contiguous
+    /// kernel, where that kernel would run; every other route expands it into the shared scratch and
+    /// runs the row-split route on the expansion, so the outputs are the same bits in every case.
+    public void linearQ3Bf16(
+            long inputAddress,
+            long weightsAddress,
+            long outputAddress,
+            int rows,
+            int inFeatures,
+            int outFeatures,
+            long weightsByteSize,
+            Q3DispatchMode mode,
+            WeightLayout layout) {
+        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
+            requireRowSplit(layout, "Q3 linear");
+            linearQ3Bf16(
+                    inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize, mode);
+            return;
+        }
+        ensureOpen();
+        requireAddresses(inputAddress, weightsAddress, outputAddress);
+        if (rows <= 0 || inFeatures <= 0 || outFeatures <= 0 || weightsByteSize <= 0) {
+            throw new IllegalArgumentException("Q3 linear dimensions and payload size must be positive");
+        }
+        Q3DispatchMode selected = Objects.requireNonNull(mode, "mode").select(rows, this.q3SmallRowThreshold);
+        if (selected == Q3DispatchMode.DECODE && rows == 1 && linearQ3P2e2DecodeBf16 != null) {
+            int status;
+            try {
+                status = (int) linearQ3P2e2DecodeBf16.invokeExact(
+                        MemorySegment.ofAddress(inputAddress),
+                        MemorySegment.ofAddress(weightsAddress),
+                        MemorySegment.ofAddress(outputAddress),
+                        rows,
+                        inFeatures,
+                        outFeatures,
+                        weightsByteSize);
+            } catch (Throwable throwable) {
+                throw new GpuMemoryException("P2E2 Q3 decode invocation failed", throwable);
+            }
+            if (status == 0) return;
+            if (status != ROUTE_UNAVAILABLE)
+                throw new GpuMemoryException(q3Operation("P2E2 Q3 decode", status), status);
+        }
+        long expanded = P2e2Layout.expandedByteSize(outFeatures, inFeatures);
+        if (expanded <= Q3_SCRATCH_LIMIT) {
+            withQ3Scratch(expanded, scratch -> {
+                expandQ3(weightsAddress, weightsByteSize, outFeatures, inFeatures, 0, outFeatures, scratch, expanded);
+                linearQ3Bf16(inputAddress, scratch, outputAddress, rows, inFeatures, outFeatures, expanded, selected);
+            });
+            return;
+        }
+        // Output-row chunks, each written to the scratch and copied into place. Every Q3 linear kernel
+        // computes an output column from its own weight row alone, and the chunk widths avoid the
+        // shapes that select a shape-specific kernel, so the outputs equal those of the whole tensor.
+        if (copyDeviceToDevice2d == null) throw new UnsupportedOperationException("native pitched copy unavailable");
+        int chunk = linearChunkRows(rows, inFeatures);
+        for (int first = 0; first < outFeatures; first += chunk) {
+            int firstRow = first;
+            int count = Math.min(chunk, outFeatures - first);
+            long weights = P2e2Layout.expandedByteSize(count, inFeatures);
+            long outputOffset = alignUp(weights, 256);
+            withQ3Scratch(outputOffset + (long) rows * count * Short.BYTES, scratch -> {
+                expandQ3(weightsAddress, weightsByteSize, outFeatures, inFeatures, firstRow, count, scratch, weights);
+                linearQ3Bf16(inputAddress, scratch, scratch + outputOffset, rows, inFeatures, count, weights, selected);
+                copyRows(
+                        outputAddress + (long) firstRow * Short.BYTES,
+                        (long) outFeatures * Short.BYTES,
+                        scratch + outputOffset,
+                        (long) count * Short.BYTES,
+                        rows);
+            });
+        }
+    }
+
+    /// Output rows per chunk of a P2E2 linear too large to expand at once: a multiple of 1024 that
+    /// fits the scratch limit together with its output and is no FFN or mixer output width.
+    private static int linearChunkRows(int rows, int inFeatures) {
+        long perRow = P2e2Layout.expandedByteSize(1024, inFeatures) + 1024L * rows * Short.BYTES;
+        long chunk = Math.max(1, Q3_SCRATCH_LIMIT / perRow) * 1024;
+        if (chunk == 5120 || chunk == 34816) chunk -= 1024;
+        return (int) Math.max(1024, Math.min(chunk, Integer.MAX_VALUE / 2));
+    }
+
+    private static long alignUp(long value, long alignment) {
+        return (value + alignment - 1) / alignment * alignment;
+    }
+
+    private static String q3Operation(String operation, int status) {
+        return status == CUDA_FORMAT_MISMATCH ? operation + " format/layout mismatch" : operation;
+    }
+
+    /// Runs `use` with the shared scratch of at least `bytes`, ordered after its previous use on any
+    /// stream; growing it first drains the device.
+    private void withQ3Scratch(long bytes, LongConsumer use) {
+        q3ScratchLock.lock();
+        try {
+            ensureOpen();
+            CudaStream stream = submitting.get();
+            if (bytes > q3ScratchBytes) {
+                synchronize();
+                if (q3ScratchAddress != 0) free(q3ScratchAddress);
+                q3ScratchAddress = 0;
+                q3ScratchBytes = 0;
+                long size = alignUp(bytes, 1L << 20);
+                q3ScratchAddress = allocate(size);
+                q3ScratchBytes = size;
+                LOG.info("P2E2 expansion scratch: {} MiB", size >> 20);
+            } else if (stream == null) {
+                synchronize();
+            } else if (q3ScratchEvent != 0) {
+                stream.await(q3ScratchEvent);
+            }
+            use.accept(q3ScratchAddress);
+            if (stream != null) {
+                if (q3ScratchEvent == 0) {
+                    try {
+                        q3ScratchEvent = (long) eventCreate.invokeExact();
+                    } catch (Throwable failure) {
+                        throw new GpuMemoryException("CUDA event creation invocation failed", failure);
+                    }
+                    if (q3ScratchEvent == 0) throw new GpuMemoryException("CUDA event creation returned null");
+                }
+                stream.mark(q3ScratchEvent);
+            }
+        } finally {
+            q3ScratchLock.unlock();
+        }
+    }
+
+    private void expandQ3(
+            long weights,
+            long weightsByteSize,
+            int rows,
+            int inFeatures,
+            int firstRow,
+            int rowCount,
+            long destination,
+            long destinationBytes) {
+        if (q3P2e2Expand == null) throw new UnsupportedOperationException("native P2E2 expansion unavailable");
+        int status;
+        try {
+            status = (int) q3P2e2Expand.invokeExact(
+                    MemorySegment.ofAddress(weights),
+                    weightsByteSize,
+                    rows,
+                    inFeatures,
+                    firstRow,
+                    rowCount,
+                    MemorySegment.ofAddress(destination),
+                    destinationBytes);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("P2E2 expansion invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException(q3Operation("P2E2 expansion", status), status);
+    }
+
+    private void copyRows(long destination, long destinationPitch, long source, long sourcePitch, int rows) {
+        int status;
+        try {
+            status = (int) copyDeviceToDevice2d.invokeExact(
+                    MemorySegment.ofAddress(destination),
+                    destinationPitch,
+                    MemorySegment.ofAddress(source),
+                    sourcePitch,
+                    sourcePitch,
+                    (long) rows);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("pitched device copy invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException("pitched device copy", status);
+    }
+
+    @Override
+    public void embedQ3(
+            long tokenIdsAddress,
+            long embeddingAddress,
+            long embeddingByteSize,
+            long hiddenStateAddress,
+            int tokenCount,
+            int vocabularySize,
+            int hiddenSize,
+            WeightLayout layout) {
+        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
+            super.embedQ3(
+                    tokenIdsAddress,
+                    embeddingAddress,
+                    embeddingByteSize,
+                    hiddenStateAddress,
+                    tokenCount,
+                    vocabularySize,
+                    hiddenSize,
+                    layout);
+            return;
+        }
+        ensureOpen();
+        requireAddresses(tokenIdsAddress, embeddingAddress, hiddenStateAddress);
+        if (embeddingByteSize <= 0 || tokenCount <= 0 || vocabularySize <= 0 || hiddenSize <= 0) {
+            throw new IllegalArgumentException("Q3 embedding sizes must be positive");
+        }
+        if (embedQ3P2e2 == null) throw new UnsupportedOperationException("native P2E2 embedding unavailable");
+        int status;
+        try {
+            status = (int) embedQ3P2e2.invokeExact(
+                    MemorySegment.ofAddress(tokenIdsAddress),
+                    MemorySegment.ofAddress(embeddingAddress),
+                    MemorySegment.ofAddress(hiddenStateAddress),
+                    tokenCount,
+                    vocabularySize,
+                    hiddenSize,
+                    embeddingByteSize);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("P2E2 Q3 embedding invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException(q3Operation("P2E2 Q3 embedding", status), status);
+    }
+
+    @Override
+    public void q3FfnStreamedBf16(
+            long input,
+            long gateWeights,
+            long downWeights,
+            long output,
+            long slots,
+            long accumulators,
+            int rows,
+            int hidden,
+            int intermediate,
+            long gateBytes,
+            long downBytes,
+            WeightLayout gateLayout,
+            WeightLayout downLayout) {
+        boolean gateP2e2 = Objects.requireNonNull(gateLayout, "gateLayout") == WeightLayout.ROW_SPLIT_P2E2_V1;
+        boolean downP2e2 = Objects.requireNonNull(downLayout, "downLayout") == WeightLayout.ROW_SPLIT_P2E2_V1;
+        if (!gateP2e2 && !downP2e2) {
+            super.q3FfnStreamedBf16(
+                    input,
+                    gateWeights,
+                    downWeights,
+                    output,
+                    slots,
+                    accumulators,
+                    rows,
+                    hidden,
+                    intermediate,
+                    gateBytes,
+                    downBytes,
+                    gateLayout,
+                    downLayout);
+            return;
+        }
+        if (!gateP2e2) requireRowSplit(gateLayout, "streamed FFN region");
+        if (!downP2e2) requireRowSplit(downLayout, "streamed FFN region");
+        long gateExpanded = gateP2e2 ? P2e2Layout.expandedByteSize(2L * intermediate, hidden) : 0;
+        long downOffset = alignUp(gateExpanded, 256);
+        long downExpanded = downP2e2 ? P2e2Layout.expandedByteSize(hidden, intermediate) : 0;
+        withQ3Scratch(downOffset + downExpanded, scratch -> {
+            if (gateP2e2)
+                expandQ3(gateWeights, gateBytes, 2 * intermediate, hidden, 0, 2 * intermediate, scratch, gateExpanded);
+            if (downP2e2)
+                expandQ3(downWeights, downBytes, hidden, intermediate, 0, hidden, scratch + downOffset, downExpanded);
+            q3FfnStreamedBf16(
+                    input,
+                    gateP2e2 ? scratch : gateWeights,
+                    downP2e2 ? scratch + downOffset : downWeights,
+                    output,
+                    slots,
+                    accumulators,
+                    rows,
+                    hidden,
+                    intermediate,
+                    gateP2e2 ? gateExpanded : gateBytes,
+                    downP2e2 ? downExpanded : downBytes);
+        });
+    }
+
+    @Override
+    public void q3FfnDownBf16(
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
+            super.q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes, layout);
+            return;
+        }
+        long expanded = P2e2Layout.expandedByteSize(outputs, width);
+        withQ3Scratch(expanded, scratch -> {
+            expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
+            q3FfnDownBf16(input, scratch, output, rows, width, outputs, expanded);
+        });
+    }
+
+    @Override
+    public void q3FfnDownSplitBf16(
+            long input,
+            long weights,
+            long output,
+            long partials,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
+            super.q3FfnDownSplitBf16(input, weights, output, partials, rows, width, outputs, weightBytes, layout);
+            return;
+        }
+        long expanded = P2e2Layout.expandedByteSize(outputs, width);
+        withQ3Scratch(expanded, scratch -> {
+            expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
+            q3FfnDownSplitBf16(input, scratch, output, partials, rows, width, outputs, expanded);
+        });
+    }
+
+    @Override
+    public void q3GateUpSwiGluBf16(
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
+            super.q3GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes, layout);
+            return;
+        }
+        long expanded = P2e2Layout.expandedByteSize(outputs, width);
+        withQ3Scratch(expanded, scratch -> {
+            expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
+            q3GateUpSwiGluBf16(input, scratch, output, rows, width, outputs, expanded);
+        });
     }
 
     @Override
@@ -1554,6 +1972,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         // A retirement may be confirmed before its native host callback returns. Drain the device
         // before releasing the FFM upcall stub or unloading its library arena.
         synchronize();
+        if (q3ScratchAddress != 0) free(q3ScratchAddress);
+        q3ScratchAddress = 0;
+        q3ScratchBytes = 0;
+        if (q3ScratchEvent != 0) destroyEvent(q3ScratchEvent);
+        q3ScratchEvent = 0;
         for (Long event; (event = availableEvents.poll()) != null; ) destroyEvent(event);
         for (MemorySegment pinned; (pinned = pinnedUploads.poll()) != null; ) freePinned(pinned);
         closed = true;

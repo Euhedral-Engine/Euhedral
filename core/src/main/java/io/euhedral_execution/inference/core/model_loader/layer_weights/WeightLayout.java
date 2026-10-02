@@ -3,5 +3,9 @@ package io.euhedral_execution.inference.core.model_loader.layer_weights;
 /// Persistent byte layout independent of the source tensor data type.
 public enum WeightLayout {
     CONTIGUOUS_LE_V1,
-    ROW_SPLIT_K128_V1
+    ROW_SPLIT_K128_V1,
+    /// Q3G64_F16S values entropy coded as 2-bit primary symbols plus a payload stream
+    /// ([io.euhedral_execution.inference.core.model_loader.artifact.P2e2Layout]); smaller than
+    /// [#ROW_SPLIT_K128_V1] and lossless with respect to it.
+    ROW_SPLIT_P2E2_V1
 }

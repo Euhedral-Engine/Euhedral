@@ -384,11 +384,10 @@ final class QwenArtifactCodec {
             throw invalid("compact tensor layout is required");
         }
         try {
-            long expected = CompactTensorLayout.expectedByteSize(
-                    tensor.shape(), tensor.dataType(), tensor.format(), tensor.layout());
-            if (expected != tensor.byteSize()) {
+            if (!CompactTensorLayout.acceptsByteSize(
+                    tensor.shape(), tensor.dataType(), tensor.format(), tensor.layout(), tensor.byteSize())) {
                 throw invalid("compact tensor byte size does not match its shape, format, and layout: " + tensor.name()
-                        + " expected " + expected + " but was " + tensor.byteSize());
+                        + " was " + tensor.byteSize());
             }
         } catch (IllegalArgumentException exception) {
             throw invalid("unsupported compact tensor '" + tensor.name() + "': " + exception.getMessage());

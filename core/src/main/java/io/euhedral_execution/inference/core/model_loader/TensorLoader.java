@@ -1,16 +1,19 @@
 package io.euhedral_execution.inference.core.model_loader;
 
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.model_loader.artifact.P2e2Layout;
 import io.euhedral_execution.inference.core.model_loader.artifact.TensorDataReader;
 import io.euhedral_execution.inference.core.model_loader.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.Objects;
 
-/// Loads one unmodified tensor payload into GPU memory.
+/// Loads one unmodified tensor payload into GPU memory. P2E2 payloads are checked for internal
+/// consistency first, so that the kernels that decode them stay within the tensor.
 public final class TensorLoader {
 
     private TensorLoader() {}
@@ -25,6 +28,15 @@ public final class TensorLoader {
         boolean allocated = false;
         try (Arena hostArena = Arena.ofConfined()) {
             MemorySegment payload = TensorDataReader.read(artifactPath, descriptor, hostArena);
+            if (descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1) {
+                try {
+                    P2e2Layout.validate(
+                            payload, descriptor.shape()[0], descriptor.shape()[1]);
+                } catch (IllegalArgumentException exception) {
+                    throw new QwenWeightLoadException(
+                            "invalid P2E2 tensor '" + descriptor.name() + "': " + exception.getMessage());
+                }
+            }
             deviceAddress = gpuMemory.allocate(descriptor.byteSize());
             allocated = true;
             gpuMemory.copyHostToDevice(deviceAddress, payload, descriptor.byteSize());
