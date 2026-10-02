@@ -31,6 +31,11 @@ class SpeculativeAcceptanceTest {
         assertEquals(3, all.acceptedDrafts());
         assertArrayEquals(new int[] {6, 7, 8, 9}, all.outputs(), "the full step adds the verifier's token");
         assertEquals(4, all.committedRows());
+
+        // The rejected draft's base token: g at the first unmatched draft; none when all were accepted.
+        assertEquals(1, none.rejectedBaseToken());
+        assertEquals(3, two.rejectedBaseToken());
+        assertEquals(-1, all.rejectedBaseToken());
     }
 
     @Test

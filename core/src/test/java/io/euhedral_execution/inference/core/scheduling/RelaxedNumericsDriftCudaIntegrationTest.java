@@ -53,7 +53,11 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         int steps = Integer.getInteger("euhedral.numerics.drift.steps", 384);
         int prefixLength = Integer.getInteger("euhedral.numerics.drift.prefix", 256);
         // Calibration: "exact" runs the exact kernels on both sequences (determinism floor).
-        boolean candidate = "exact".equals(System.getProperty("euhedral.numerics.drift.candidate"));
+        // "native": sequence A runs ordinary decode, B native-numerics NVFP4 decode (the speculative native
+        // mode's numerics), both without exact numerics; run it on the NVFP4 artifact.
+        String mode = System.getProperty("euhedral.numerics.drift.candidate", "");
+        boolean candidate = "exact".equals(mode);
+        boolean nativeCandidate = "native".equals(mode);
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
         Path tokenizerDirectory =
@@ -70,20 +74,21 @@ class RelaxedNumericsDriftCudaIntegrationTest {
             var contiguous = new QwenSequenceState(2);
             try {
                 int[] prefix = java.util.Arrays.copyOf(tokens, prefixLength);
-                gpu.selectExactNumerics(true);
+                select(gpu, false, candidate, nativeCandidate);
                 run(runtime, gpu, plan, exact, QwenExecutionContext.ExecutionKind.PREFILL, prefix);
-                gpu.selectExactNumerics(candidate);
+                select(gpu, true, candidate, nativeCandidate);
                 run(runtime, gpu, plan, contiguous, QwenExecutionContext.ExecutionKind.PREFILL, prefix);
                 for (int step = 0; step < steps; step++) {
                     int[] token = {tokens[prefixLength + step]};
-                    gpu.selectExactNumerics(true);
+                    select(gpu, false, candidate, nativeCandidate);
                     Step a = run(runtime, gpu, plan, exact, QwenExecutionContext.ExecutionKind.DECODE, token);
-                    gpu.selectExactNumerics(candidate);
+                    select(gpu, true, candidate, nativeCandidate);
                     Step b = run(runtime, gpu, plan, contiguous, QwenExecutionContext.ExecutionKind.DECODE, token);
                     metrics.add(compare(prefixLength + step, a, b));
                 }
             } finally {
                 gpu.selectExactNumerics(false);
+                if (nativeCandidate) gpu.selectNvfp4NativeDecode(false);
                 exact.complete();
                 contiguous.complete();
                 runtime.close();
@@ -126,6 +131,15 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         // No progressive drift.
         assertTrue(late <= 1.5 * early + 1.0e-4, "hidden error grew from " + early + " to " + late);
         assertEquals(steps, metrics.size());
+    }
+
+    /// Numerics for sequence A (the oracle) or B. Exact mode: A exact, B relaxed (exact when calibrating with
+    /// `calibrate`). Native mode: A ordinary decode, B native-numerics NVFP4 decode.
+    private static void select(CudaGpuMemory gpu, boolean sequenceB, boolean calibrate, boolean nativeMode) {
+        if (nativeMode) {
+            gpu.selectExactNumerics(false);
+            gpu.selectNvfp4NativeDecode(sequenceB);
+        } else gpu.selectExactNumerics(!sequenceB || calibrate);
     }
 
     private static int[] forcedTokens(QwenTokenizer tokenizer, int count) throws Exception {

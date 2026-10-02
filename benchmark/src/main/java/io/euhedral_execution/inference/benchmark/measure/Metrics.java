@@ -66,9 +66,12 @@ public final class Metrics {
             long[] histogram = new long[8];
             int committed = 0;
             long verify = 0, draft = 0;
+            int inShortlist = 0, outsideShortlist = 0;
             for (int step = 0; step < timing.stepCount; step++) {
                 histogram[Math.min(7, timing.stepAccepted[step])]++;
                 committed += timing.stepOutputs[step];
+                if (timing.stepRejection[step] == 0) inShortlist++;
+                if (timing.stepRejection[step] == 1) outsideShortlist++;
                 verify += timing.stepExecuted[step] - timing.stepStart[step];
                 draft +=
                         timing.stepStart[step] - (step > 0 ? timing.stepExecuted[step - 1] : timing.firstSelectedNanos);
@@ -80,7 +83,9 @@ public final class Metrics {
                     java.util.Arrays.copyOf(histogram, Math.max(depth + 1, 4)),
                     committed,
                     verify,
-                    draft);
+                    draft,
+                    inShortlist,
+                    outsideShortlist);
             sampledDecode = committed;
             lastSampled = timing.stepCount - 1;
             // The window starts at the first token: the last prompt chunk's MTP catch-up, which drafts

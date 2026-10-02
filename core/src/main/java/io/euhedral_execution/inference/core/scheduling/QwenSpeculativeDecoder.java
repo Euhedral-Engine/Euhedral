@@ -36,6 +36,9 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         public long catchUpNanos;
         public long recursionNanos;
         public long prefillNanos;
+        /// Rejections whose base token was in the draft shortlist, and outside it.
+        public long rejectionsInShortlist;
+        public long rejectionsOutsideShortlist;
 
         Statistics(int depth) {
             this.acceptedDrafts = new long[depth + 1];
@@ -51,6 +54,8 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         public String toString() {
             return "verifications " + this.verifications + ", output tokens " + this.outputTokens + ", accepted drafts "
                     + Arrays.toString(this.acceptedDrafts)
+                    + ", shortlist rejections in/out " + this.rejectionsInShortlist + "/"
+                    + this.rejectionsOutsideShortlist
                     + String.format(
                             java.util.Locale.ROOT,
                             ", mean %.3f, verify %.2f ms, catch-up %.2f ms, recursion %.2f ms (per verification)",
@@ -78,6 +83,8 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
     private final QwenHostLogits baseLogits;
     private final QwenHostLogits draftLogits;
     private final int[] draftTokens;
+    /// Whether each vocabulary token is in the draft head's shortlist.
+    private final boolean[] inShortlist;
     private Statistics statistics;
 
     public QwenSpeculativeDecoder(
@@ -103,6 +110,9 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         this.baseLogits.selectOnDevice(true);
         this.draftLogits.selectOnDevice(true);
         this.draftTokens = draftTokenIds(gpu, plan);
+        this.inShortlist = new boolean[plan.weights().config().vocabSize()];
+        for (int token : this.draftTokens)
+            if (token >= 0 && token < this.inShortlist.length) this.inShortlist[token] = true;
     }
 
     /// The draft head's token for each of its rows (`text/draft_head_token_ids`).
@@ -195,8 +205,13 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
             this.statistics.verifications++;
             this.statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
             int[] committed = acceptance.outputs();
+            int rejected = acceptance.rejectedBaseToken();
+            int rejection =
+                    rejected < 0 ? -1 : rejected < this.inShortlist.length && this.inShortlist[rejected] ? 0 : 1;
+            if (rejection == 0) this.statistics.rejectionsInShortlist++;
+            if (rejection == 1) this.statistics.rejectionsOutsideShortlist++;
             if (timing != null)
-                timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts());
+                timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts(), rejection);
             for (int token : committed) {
                 output.add(token);
                 onToken.accept(token);
