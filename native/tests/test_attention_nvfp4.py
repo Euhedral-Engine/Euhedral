@@ -288,6 +288,67 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                     with self.subTest(route=label):
                         np.testing.assert_allclose(actual, expected, rtol=.02, atol=.0005)
 
+    def test_row_exact_decode_twins_equal_one_row_decode_bitwise(self):
+        """Speculative verification: every row of the multi-row decode twins (per-head kernel below 2048 keys,
+        GQA kernel from 2048, row-split merge) is bit for bit the one-row launch at that row's position,
+        across page boundaries, partial final pages and the 2048-key kernel switch."""
+        query_heads, heads = 24, 4
+        rng = np.random.default_rng(0x7417)
+        stride = query_heads * 64 * 258
+        for start in (40, 253, 1500, 2042, 3000):
+            tokens = start + 8
+            with contextlib.ExitStack() as scope:
+                keys, key_pages = self.paged(scope, tokens, heads)
+                values, value_pages = self.paged(scope, tokens, heads)
+                for page in key_pages + value_pages:
+                    raw = rng.integers(0, 256, (PAGE_TOKENS * heads, ROW_BYTES), dtype=np.uint8)
+                    raw[:, 128:] = rng.integers(0x28, 0x48, (PAGE_TOKENS * heads, 16), dtype=np.uint8)
+                    self.gpu.htod(page, C.create_string_buffer(raw.tobytes(), raw.nbytes), raw.nbytes)
+                for m in (2, 3, 4, 5, 8):
+                    with self.subTest(start=start, rows=m):
+                        width = (query_heads + heads) * 256
+                        qk, _ = bf16(rng.standard_normal((m, width)).astype(np.float32))
+                        gate, _ = bf16(rng.standard_normal((m, width)).astype(np.float32))
+                        dqk = self.owned(scope, self.gpu.upload(qk.tobytes()))
+                        dgate = self.owned(scope, self.gpu.upload(gate.tobytes()))
+                        scratch = self.owned(scope, self.gpu.zeros(m * stride * 4))
+                        together = self.owned(scope, self.gpu.zeros(m * query_heads * 256 * 2, 0xA5))
+                        first, last = start + 1, start + m
+                        if first < 2048:
+                            below = min(last, 2047)
+                            self.gpu.launch('euhedral_attention_decode_nvfp4_rows',
+                                            (query_heads * min(64, (below + 47) // 48), m),
+                                            [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(start),
+                                             P(scratch), P(stride), U(2048)], block=128)
+                        if last >= 2048:
+                            self.gpu.launch('euhedral_attention_decode_gqa_nvfp4_rows',
+                                            (heads * min(64, (last + 31) // 32), m),
+                                            [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(start),
+                                             P(scratch), P(stride), U(2048)], block=32)
+                        self.gpu.launch('euhedral_attention_merge_nvfp4_rows', (query_heads, m),
+                                        [P(dgate), P(together), P(scratch), U(query_heads), U(heads), P(start),
+                                         P(stride), U(2048)], block=128)
+                        rows = self.gpu.download(together, m * query_heads * 256 * 2)
+                        row_bytes = query_heads * 256 * 2
+                        for r in range(m):
+                            length = start + r + 1
+                            gqa = length >= 2048
+                            splits = min(64, (length + 31) // 32 if gqa else (length + 47) // 48)
+                            rqk = self.owned(scope, self.gpu.upload(qk[r].tobytes()))
+                            rgate = self.owned(scope, self.gpu.upload(gate[r].tobytes()))
+                            out = self.owned(scope, self.gpu.zeros(row_bytes, 0x5A))
+                            one = self.owned(scope, self.gpu.zeros(stride * 4))
+                            args = [P(rqk), P(rgate), P(keys), P(values), P(out), U(1), U(query_heads), U(heads),
+                                    U(256), U(length), P(start + r), P(one), U(splits)]
+                            if gqa:
+                                self.gpu.launch('euhedral_attention_decode_gqa_nvfp4', heads * splits, args, block=32)
+                            else:
+                                self.gpu.launch('euhedral_attention_decode_nvfp4', query_heads * splits, args, block=128)
+                            self.gpu.launch('euhedral_attention_merge_nvfp4', query_heads,
+                                            [P(rgate), P(out), P(one), U(query_heads), U(heads), U(splits)], block=128)
+                            self.assertEqual(rows[r * row_bytes:(r + 1) * row_bytes], self.gpu.download(out, row_bytes),
+                                             f"row {r} at length {length}")
+
     def test_split_append_and_prefill_preserve_cache_and_continuation(self):
         rows, heads, query_heads = 261, 1, 6
         width = (heads + query_heads) * 256

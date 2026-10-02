@@ -376,7 +376,9 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         state.submittedLength(),
                         context.startPosition(),
                         context.inputTokenCount() == 1 || context.kind() == QwenExecutionContext.ExecutionKind.VERIFY
-                                ? state.decodeScratchAddress(config.numAttentionHeads())
+                                ? ((AttentionSequenceStates)
+                                                context.sequenceState().kvCacheState())
+                                        .decodeScratch(config.numAttentionHeads(), context.inputTokenCount())
                                 : 0);
     }
 

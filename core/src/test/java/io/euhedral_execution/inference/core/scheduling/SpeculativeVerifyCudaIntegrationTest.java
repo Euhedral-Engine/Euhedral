@@ -44,10 +44,9 @@ class SpeculativeVerifyCudaIntegrationTest {
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         int[] forced = java.util.Arrays.copyOfRange(text, prefix, prefix + rows);
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                QwenModel model =
-                        QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu, WeightResidency.EXECUTED);
+                QwenModel model = load(artifact, gpu);
                 var lattice = new PullingLattice()) {
-            var plan = new QwenExecutionPlan(model.weights());
+            var plan = new QwenExecutionPlan(model.weights(), model.staging());
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             var sequential = new QwenSequenceState(1);
             var verified = new QwenSequenceState(2);
@@ -103,10 +102,9 @@ class SpeculativeVerifyCudaIntegrationTest {
                 .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                QwenModel model =
-                        QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu, WeightResidency.EXECUTED);
+                QwenModel model = load(artifact, gpu);
                 var lattice = new PullingLattice()) {
-            var plan = new QwenExecutionPlan(model.weights());
+            var plan = new QwenExecutionPlan(model.weights(), model.staging());
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             try {
                 for (int first = 1; first <= 3; first++) {
@@ -202,6 +200,20 @@ class SpeculativeVerifyCudaIntegrationTest {
                 .get(600, TimeUnit.SECONDS);
         if (outcome.status() != QwenExecutionContext.Status.SUCCESS) throw new AssertionError(outcome.failure());
         return captured.get();
+    }
+
+    /// Executed weights; `euhedral.speculative.host-mib` host-backs that many MiB of base weights (the
+    /// NVFP4 artifact needs it for two sequences).
+    static QwenModel load(Path artifact, CudaGpuMemory gpu) throws Exception {
+        var data = QwenArtifactReader.read(artifact);
+        long hostBytes = Long.getLong("euhedral.speculative.host-mib", 0L) << 20;
+        return QwenModel.load(
+                artifact,
+                data,
+                gpu,
+                WeightResidency.EXECUTED,
+                io.euhedral_execution.inference.core.model_loader.HostWeightSelection.select(data, hostBytes),
+                QwenModel.DEFAULT_STAGING_SLOTS);
     }
 
     static Path repositoryRoot() {
