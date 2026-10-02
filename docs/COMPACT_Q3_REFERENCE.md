@@ -44,3 +44,8 @@ The Java loader is intentionally opaque: it validates descriptor metadata,
 reads the exact payload range, allocates the exact byte count, uploads the
 bytes, and retains fused objects as fused `TensorHandle` instances. It does
 not quantize, dequantize, split, or repack at model-load time.
+
+The Q3 tensors may also use the smaller, lossless `row-split-p2e2-v1` layout (EDRL layout ordinal 2,
+`WeightLayout.ROW_SPLIT_P2E2_V1`), produced from a compact artifact by
+`tools/convert_compact_edrl_to_p2e2.py`. The loader checks each P2E2 tensor's internal consistency
+before uploading it. See [COMPRESSED_Q3.md](COMPRESSED_Q3.md).
