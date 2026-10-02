@@ -664,6 +664,8 @@ def add_direct(plans: list[ObjectPlan], name: str, shape: tuple[int, ...], store
 
 
 PROFILES = ("compact-q3", "nvfp4")
+# "profile" keeps the profile's formats for the MTP layer; "nvfp4" quantizes its projections to NVFP4.
+MTP_FORMATS = ("profile", "nvfp4")
 # Objects that keep their compact format in the NVFP4 profile: the embedding is a gather.
 NVFP4_KEEP = frozenset({"text/token_embedding"})
 
@@ -690,13 +692,19 @@ def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, Matr
     return head_part(store, q_name, False), head_part(store, q_name, True)
 
 
-def build_plans(store: SourceStore, selected: np.ndarray, profile: str = "compact-q3") -> list[ObjectPlan]:
+def build_plans(store: SourceStore, selected: np.ndarray, profile: str = "compact-q3",
+                mtp_format: str = "profile") -> list[ObjectPlan]:
+    """`mtp_format` "nvfp4" quantizes the MTP layer's projections to NVFP4 whatever the profile: the compact
+    Q3 MTP layer drafts with lower acceptance and slower multi-row catch-up (docs/MTP_VERIFIER.md)."""
     if profile not in PROFILES:
         fail(f"unknown profile {profile}")
+    if mtp_format not in MTP_FORMATS:
+        fail(f"unknown MTP format {mtp_format}")
     plans: list[ObjectPlan] = []
 
     def add_quant(plans: list[ObjectPlan], name: str, matrix: MatrixSource, format_name: str) -> None:
-        add_quant_object(plans, name, matrix, format_name, profile)
+        mtp_profile = "nvfp4" if mtp_format == "nvfp4" and name.startswith("mtp/") else profile
+        add_quant_object(plans, name, matrix, format_name, mtp_profile)
 
     add_quant(plans, "text/token_embedding", source_matrix(store, "model.language_model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
     for layer in range(64):
@@ -954,7 +962,8 @@ def write_objects(output_path: Path, output, plans: list["ObjectPlan"], jobs: in
 
 
 def convert(model: Path, output_path: Path, ranking_path: Path | None, reference: Path | None, force: bool,
-            profile: str = "compact-q3", draft_ids_from: Path | None = None, jobs: int = 1) -> None:
+            profile: str = "compact-q3", draft_ids_from: Path | None = None, jobs: int = 1,
+            mtp_format: str = "profile") -> None:
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     config = read_json(model / "config.json")
@@ -967,7 +976,7 @@ def convert(model: Path, output_path: Path, ranking_path: Path | None, reference
         fail("pass exactly one of --ranking and --draft-ids-from")
     selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)
     with SourceStore(model) as store:
-        plans = build_plans(store, selected, profile)
+        plans = build_plans(store, selected, profile, mtp_format)
         metadata = encode_metadata(config)
         table_size = len(encode_table(plans))
         data_base = HEADER_SIZE + len(metadata) + table_size
@@ -1025,6 +1034,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ranking", type=Path, help="token frequency ranking for the draft-head shortlist")
     parser.add_argument("--draft-ids-from", type=Path, help="reuse the draft-head shortlist of this compact artifact")
     parser.add_argument("--profile", choices=PROFILES, default="compact-q3")
+    parser.add_argument("--mtp-format", choices=MTP_FORMATS, default="profile",
+                        help="nvfp4: quantize the MTP layer's projections to NVFP4 (better drafts for compact Q3)")
     parser.add_argument("--device", default=default_device(),
                         help="cuda (default when PyTorch has a CUDA device) or cpu")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
@@ -1035,7 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
     global DEVICE
     DEVICE = args.device
     try:
-        convert(args.model, args.out, args.ranking, args.reference, args.force, args.profile, args.draft_ids_from, args.jobs)
+        convert(args.model, args.out, args.ranking, args.reference, args.force, args.profile, args.draft_ids_from, args.jobs,
+                args.mtp_format)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
