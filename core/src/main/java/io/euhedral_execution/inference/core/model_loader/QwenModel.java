@@ -148,6 +148,10 @@ public final class QwenModel implements AutoCloseable {
             this.hostLive.remove(address);
         }
 
+        public long hostWeightsDeviceAddress(long hostAddress) {
+            return this.gpu.hostWeightsDeviceAddress(hostAddress);
+        }
+
         public void copyHostToDevice(long address, MemorySegment source, long bytes) {
             this.gpu.copyHostToDevice(address, source, bytes);
         }

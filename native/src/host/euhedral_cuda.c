@@ -77,7 +77,8 @@ int euhedral_cuda_host_free(void* address) {
 
 /// Host memory that copy engines read for staged weights: 2 MiB-aligned, backed by transparent huge
 /// pages where the platform offers them, and pinned with cudaHostRegister. Translated DMA under an
-/// IOMMU runs at about 25 GB/s over 4 KiB pages and about 44 GB/s over 2 MiB pages.
+/// IOMMU runs at about 25 GB/s over 4 KiB pages and about 44 GB/s over 2 MiB pages. It is also mapped
+/// into the device's address space, so kernels can read small gathers (the token embedding) in place.
 #define EUHEDRAL_HOST_WEIGHT_ALIGNMENT ((size_t)2 << 20)
 
 void* euhedral_cuda_host_weights_malloc(uint64_t byte_size) {
@@ -95,7 +96,7 @@ void* euhedral_cuda_host_weights_malloc(uint64_t byte_size) {
     memset(address, 0, size);
     for (int attempt = 0; attempt < 3 && madvise(address, size, MADV_COLLAPSE) != 0; attempt++) {}
 #endif
-    if (cudaHostRegister(address, size, cudaHostRegisterDefault) != cudaSuccess) {
+    if (cudaHostRegister(address, size, cudaHostRegisterMapped) != cudaSuccess) {
 #ifdef _WIN32
         _aligned_free(address);
 #else
@@ -104,6 +105,15 @@ void* euhedral_cuda_host_weights_malloc(uint64_t byte_size) {
         return NULL;
     }
     return address;
+}
+
+int euhedral_cuda_host_weights_device_pointer(const void* host_address, uint64_t* device_address) {
+    if (host_address == NULL || device_address == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    void* device = NULL;
+    cudaError_t status = cudaHostGetDevicePointer(&device, (void*)host_address, 0);
+    if (status != cudaSuccess) return (int)status;
+    *device_address = (uint64_t)(uintptr_t)device;
+    return EUHEDRAL_CUDA_SUCCESS;
 }
 
 int euhedral_cuda_host_weights_free(void* address) {

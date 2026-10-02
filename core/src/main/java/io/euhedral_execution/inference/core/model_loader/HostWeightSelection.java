@@ -12,13 +12,18 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/// Chooses which layer projections live in pinned host memory when the device cannot hold them all.
+/// Chooses which weights live in pinned host memory when the device cannot hold them all.
 ///
-/// Every weight is read once per decode token, so each host-backed byte costs the same transfer time
+/// The token embedding goes first: it is a gather, so kernels read the rows they need in place over the
+/// bus (a few KiB per token) and it costs almost nothing. Then layer projections, which are staged:
+/// every one is read once per decode token, so each host-backed byte costs the same transfer time
 /// whichever tensor it belongs to. The choice therefore minimizes the staging ring instead: whole
 /// families are taken smallest tensor first, and within the last family the layers are spread evenly,
-/// so that transfers interleave with resident work. The embedding and LM head are never host-backed.
+/// so that transfers interleave with resident work. The LM head is never host-backed.
 public final class HostWeightSelection {
+
+    /// The token embedding, the one host-mapped object.
+    public static final String EMBEDDING = "text/token_embedding";
 
     /// Families in selection order, smallest tensor first.
     private static final List<String> FAMILIES = List.of(
@@ -35,20 +40,30 @@ public final class HostWeightSelection {
 
     private HostWeightSelection() {}
 
-    /// Names of the projections, together at least `bytes` (or every candidate when they hold
-    /// fewer), that are loaded into host memory. Empty for a non-positive request.
+    /// Names of the objects, the embedding and then projections, together at least `bytes` (or every
+    /// candidate when they hold fewer), that are loaded into host memory. Empty for a non-positive
+    /// request.
     public static Set<String> select(QwenArtifact artifact, long bytes) {
         Set<String> selected = new LinkedHashSet<>();
         if (bytes <= 0) return selected;
+        long remaining = bytes;
+        for (TensorDescriptor tensor : artifact.tensors()) {
+            if (tensor.name().equals(EMBEDDING)) {
+                selected.add(EMBEDDING);
+                remaining -= tensor.byteSize();
+            }
+        }
+        if (remaining <= 0) return selected;
         Map<String, List<TensorDescriptor>> families = new HashMap<>();
         for (TensorDescriptor tensor : artifact.tensors()) {
             Matcher matcher = LAYER_OBJECT.matcher(tensor.name());
-            if (!matcher.matches() || tensor.layout() != WeightLayout.ROW_SPLIT_K128_V1) continue;
+            if (!matcher.matches()
+                    || !(tensor.layout() == WeightLayout.ROW_SPLIT_K128_V1
+                            || tensor.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1)) continue;
             if (FAMILIES.contains(matcher.group(2)))
                 families.computeIfAbsent(matcher.group(2), ignored -> new ArrayList<>())
                         .add(tensor);
         }
-        long remaining = bytes;
         for (String family : FAMILIES) {
             List<TensorDescriptor> tensors = families.getOrDefault(family, List.of());
             if (tensors.isEmpty()) continue;

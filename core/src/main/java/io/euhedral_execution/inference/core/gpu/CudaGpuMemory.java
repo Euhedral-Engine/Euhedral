@@ -47,6 +47,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle hostFree;
     private final MethodHandle hostWeightsMalloc;
     private final MethodHandle hostWeightsFree;
+    private final MethodHandle hostWeightsDevicePointer;
     private final java.util.concurrent.ConcurrentHashMap<Long, Long> hostWeights =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final MethodHandle deviceMemoryInfo;
@@ -155,6 +156,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.hostFree = bind(linker, symbols, "euhedral_cuda_host_free", FREE);
             this.hostWeightsMalloc = bind(linker, symbols, "euhedral_cuda_host_weights_malloc", MALLOC);
             this.hostWeightsFree = bind(linker, symbols, "euhedral_cuda_host_weights_free", FREE);
+            this.hostWeightsDevicePointer =
+                    bind(linker, symbols, "euhedral_cuda_host_weights_device_pointer", DEVICE_MEMORY_INFO);
             this.deviceMemoryInfo = bind(linker, symbols, "euhedral_cuda_device_memory_info", DEVICE_MEMORY_INFO);
             this.copyHostToDevice = bind(linker, symbols, "euhedral_cuda_copy_host_to_device", COPY);
             this.copyUploadToDevice = bind(linker, symbols, "euhedral_cuda_copy_upload_to_device", COPY);
@@ -770,6 +773,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (address.address() == 0) throw new GpuMemoryException("CUDA host weight allocation returned null");
         this.hostWeights.put(address.address(), byteSize);
         return address.address();
+    }
+
+    @Override
+    public long hostWeightsDeviceAddress(long hostAddress) {
+        ensureOpen();
+        try (Arena queryArena = Arena.ofConfined()) {
+            MemorySegment device = queryArena.allocate(Long.BYTES, Long.BYTES);
+            int status;
+            try {
+                status = (int) hostWeightsDevicePointer.invokeExact(MemorySegment.ofAddress(hostAddress), device);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA host weight mapping invocation failed", failure);
+            }
+            if (status != 0) throw new GpuMemoryException("CUDA host weight mapping", status);
+            return device.get(ValueLayout.JAVA_LONG, 0);
+        }
     }
 
     @Override
