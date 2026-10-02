@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import mmap
+import multiprocessing
 import os
 from pathlib import Path
 import struct
@@ -394,13 +395,18 @@ def quantize_matrix(output, base_offset: int, matrix: MatrixSource, format_name:
             padded = np.zeros((end - begin, k_pad), dtype=np.float32)
             padded[:, :k] = values
             values = padded
-        grouped = values.reshape(end - begin, groups, group_size)
-        max_abs = np.max(np.abs(grouped), axis=2)
-        scales, reciprocal = _canonical_scales(max_abs, qmax)
-        codes = np.rint(grouped * reciprocal[..., None])
-        codes = np.clip(codes, qmin, qmax).astype(np.int8)
-        flat_codes = codes.reshape(-1, group_size)
-        base, high = pack_codes(flat_codes, bits)
+        if DEVICE != "cpu":
+            device_scales, flat_codes = quantize_group_codes_torch(values, group_size, qmin, qmax)
+            base, high = pack_codes_torch(flat_codes, bits)
+            scales = device_scales.cpu().numpy()
+        else:
+            grouped = values.reshape(end - begin, groups, group_size)
+            max_abs = np.max(np.abs(grouped), axis=2)
+            scales, reciprocal = _canonical_scales(max_abs, qmax)
+            codes = np.rint(grouped * reciprocal[..., None])
+            codes = np.clip(codes, qmin, qmax).astype(np.int8)
+            flat_codes = codes.reshape(-1, group_size)
+            base, high = pack_codes(flat_codes, bits)
         output.seek(base_offset + begin * base_row_bytes)
         output.write(base)
         if high_row_bytes:
@@ -473,7 +479,8 @@ def quantize_nvfp4_matrix(output, base_offset: int, matrix: MatrixSource) -> Non
     n, k = matrix.shape
     k_pad = align_up(k, 128)
     scale_offset, global_offset, _ = nvfp4_offsets(matrix.shape)
-    rows_per_chunk = max(1, 32 * 1024 * 1024 // max(k, 1))
+    # Small chunks: rounding allocates several index arrays per value, and many workers run at once.
+    rows_per_chunk = max(1, 8 * 1024 * 1024 // max(k, 1))
     amax = 0.0
     for begin in range(0, n, rows_per_chunk):
         values = matrix.read_rows(begin, min(n, begin + rows_per_chunk))
@@ -488,13 +495,106 @@ def quantize_nvfp4_matrix(output, base_offset: int, matrix: MatrixSource) -> Non
             padded = np.zeros((end - begin, k_pad), dtype=np.float32)
             padded[:, :k] = values
             values = padded
-        packed, scales = quantize_nvfp4_rows(values, global_scale)
+        quantize = quantize_nvfp4_rows_torch if DEVICE != "cpu" else quantize_nvfp4_rows
+        packed, scales = quantize(values, global_scale)
         output.seek(base_offset + begin * (k_pad // 2))
         output.write(packed.tobytes())
         output.seek(base_offset + scale_offset + begin * (k_pad // NVFP4_BLOCK))
         output.write(scales.tobytes())
     output.seek(base_offset + global_offset)
     output.write(np.float32(global_scale).astype("<f4").tobytes())
+
+
+# Optional CUDA path (--device cuda, needs PyTorch): the same float32/float64 operations in the same
+# order, IEEE division and round-half-to-even, so the output bytes equal the CPU path's.
+DEVICE = "cpu"
+_TABLES: dict[str, Any] = {}
+
+
+def _torch():
+    import torch  # imported lazily: the CPU path needs only NumPy
+    return torch
+
+
+def _table(name: str, values: np.ndarray):
+    if name not in _TABLES:
+        _TABLES[name] = _torch().from_numpy(values).to(DEVICE)
+    return _TABLES[name]
+
+
+def round_to_table_torch(values, table):
+    torch = _torch()
+    upper = torch.searchsorted(table, values.contiguous()).clamp(1, table.numel() - 1)
+    lower = upper - 1
+    below = values - table[lower]
+    above = table[upper] - values
+    pick_upper = (above < below) | ((above == below) & (upper % 2 == 0))
+    index = torch.where(pick_upper, upper, lower)
+    index = torch.where(values >= table[-1], torch.full_like(index, table.numel() - 1), index)
+    return torch.where(values <= table[0], torch.zeros_like(index), index).to(torch.uint8)
+
+
+def quantize_nvfp4_rows_torch(values: np.ndarray, global_scale: np.float32) -> tuple[np.ndarray, np.ndarray]:
+    torch = _torch()
+    rows, k = values.shape
+    blocks = torch.from_numpy(values).to(DEVICE).view(rows, k // NVFP4_BLOCK, NVFP4_BLOCK)
+    e4m3, e2m1 = _table("e4m3", E4M3_VALUES), _table("e2m1", E2M1_VALUES)
+    g = torch.tensor(global_scale, dtype=torch.float32, device=DEVICE)
+    if global_scale > 0:
+        block_scale = blocks.abs().amax(dim=2) / torch.tensor(E2M1_MAX, dtype=torch.float32, device=DEVICE) / g
+    else:
+        block_scale = torch.zeros(blocks.shape[:2], dtype=torch.float32, device=DEVICE)
+    scale_codes = round_to_table_torch(block_scale, e4m3)
+    decode = e4m3[scale_codes.long()] * g
+    scaled = torch.where(decode[..., None] > 0, blocks.abs() / decode[..., None], torch.zeros_like(blocks))
+    magnitude = round_to_table_torch(scaled, e2m1)
+    sign = ((blocks < 0) & (magnitude > 0)).to(torch.uint8) << 3
+    codes = (magnitude | sign).view(rows, k)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed.cpu().numpy(), scale_codes.cpu().numpy()
+
+
+def quantize_group_codes_torch(values: np.ndarray, group_size: int, qmin: int, qmax: int):
+    """Row-split scales and codes: (FP16 scales [rows, groups], int16 codes [rows * groups, group_size])."""
+    torch = _torch()
+    rows, k = values.shape
+    grouped = torch.from_numpy(values).to(DEVICE).view(rows, k // group_size, group_size)
+    max_abs = grouped.abs().amax(dim=2)
+    if not bool(torch.isfinite(max_abs).all()):
+        fail("quantization source contains NaN or infinity")
+    scales = (max_abs.double() / float(qmax)).float().half()
+    scales = torch.where((scales == 0) & (max_abs > 0), torch.full_like(scales, 2.0**-24), scales)
+    reciprocal = torch.where(scales > 0, (1.0 / scales.double()).float(), torch.zeros_like(max_abs))
+    codes = torch.round(grouped * reciprocal[..., None]).clamp(qmin, qmax).to(torch.int16)
+    return scales, codes.view(-1, group_size)
+
+
+def pack_codes_torch(codes, bits: int) -> tuple[bytes, bytes]:
+    torch = _torch()
+    rows, group_size = codes.shape
+    unsigned = codes & ((1 << bits) - 1)
+    if bits == 8:
+        return codes.to(torch.int8).view(torch.uint8).cpu().numpy().tobytes(), b""
+    if bits == 3:
+        base = torch.zeros((rows, group_size * 3 // 8), dtype=torch.int16, device=codes.device)
+        for index in range(group_size):
+            bit = index * 3
+            byte, shift = bit // 8, bit % 8
+            base[:, byte] |= (unsigned[:, index] << shift) & 0xFF
+            if shift > 5:
+                base[:, byte + 1] |= unsigned[:, index] >> (8 - shift)
+        return base.to(torch.uint8).cpu().numpy().tobytes(), b""
+    low = unsigned & 0x0F
+    base = (low[:, 0::2] | (low[:, 1::2] << 4)).to(torch.uint8).cpu().numpy().tobytes()
+    if bits == 4:
+        return base, b""
+    high_bits = bits - 4
+    high = torch.zeros((rows, group_size * high_bits // 8), dtype=torch.int16, device=codes.device)
+    upper = (unsigned >> 4) & ((1 << high_bits) - 1)
+    values_per_byte = 8 // high_bits
+    for index in range(group_size):
+        high[:, index // values_per_byte] |= (upper[:, index] << ((index % values_per_byte) * high_bits)) & 0xFF
+    return base, high.to(torch.uint8).cpu().numpy().tobytes()
 
 
 def write_direct(output, base_offset: int, store: SourceStore, action: tuple[str, Any]) -> None:
@@ -809,8 +909,44 @@ def draft_token_ids(artifact: Path) -> np.ndarray:
     fail(f"{artifact} has no text/draft_head_token_ids")
 
 
+# Objects are independent and their offsets fixed, so worker processes quantize them in parallel and
+# write their own regions; forked workers inherit the plans and the memory-mapped source.
+_PARALLEL_PLANS: list["ObjectPlan"] = []
+_PARALLEL_OUTPUT = ""
+
+
+def _write_object(index: int) -> int:
+    plan = _PARALLEL_PLANS[index]
+    with open(_PARALLEL_OUTPUT, "r+b") as output:
+        plan.writer(output, plan.offset)
+    return index
+
+
+def write_objects(output_path: Path, output, plans: list["ObjectPlan"], jobs: int) -> None:
+    global _PARALLEL_PLANS, _PARALLEL_OUTPUT
+    done = 0
+
+    def report(index: int) -> None:
+        nonlocal done
+        done += 1
+        if done == 1 or done == len(plans) or done % 32 == 0:
+            print(f"converted {done}/{len(plans)} {plans[index].name}", flush=True)
+
+    if jobs <= 1:
+        for index, plan in enumerate(plans):
+            plan.writer(output, plan.offset)
+            report(index)
+        return
+    output.flush()
+    _PARALLEL_PLANS, _PARALLEL_OUTPUT = plans, str(output_path)
+    order = sorted(range(len(plans)), key=lambda i: -plans[i].byte_size)
+    with multiprocessing.get_context("fork").Pool(jobs) as pool:
+        for index in pool.imap_unordered(_write_object, order):
+            report(index)
+
+
 def convert(model: Path, output_path: Path, ranking_path: Path | None, reference: Path | None, force: bool,
-            profile: str = "compact-q3", draft_ids_from: Path | None = None) -> None:
+            profile: str = "compact-q3", draft_ids_from: Path | None = None, jobs: int = 1) -> None:
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     config = read_json(model / "config.json")
@@ -843,10 +979,7 @@ def convert(model: Path, output_path: Path, ranking_path: Path | None, reference
                 output.write(header)
                 output.write(metadata)
                 output.write(table)
-                for index, plan in enumerate(plans, start=1):
-                    plan.writer(output, plan.offset)
-                    if index == 1 or index == len(plans) or index % 32 == 0:
-                        print(f"converted {index}/{len(plans)} {plan.name}", flush=True)
+                write_objects(temporary, output, plans, jobs)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, output_path)
@@ -884,11 +1017,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ranking", type=Path, help="token frequency ranking for the draft-head shortlist")
     parser.add_argument("--draft-ids-from", type=Path, help="reuse the draft-head shortlist of this compact artifact")
     parser.add_argument("--profile", choices=PROFILES, default="compact-q3")
+    parser.add_argument("--device", default="cpu", help="cpu, or cuda to quantize on the GPU with PyTorch")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                        help="objects quantized in parallel worker processes (default: one per CPU)")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
+    global DEVICE
+    DEVICE = args.device
     try:
-        convert(args.model, args.out, args.ranking, args.reference, args.force, args.profile, args.draft_ids_from)
+        convert(args.model, args.out, args.ranking, args.reference, args.force, args.profile, args.draft_ids_from, args.jobs)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

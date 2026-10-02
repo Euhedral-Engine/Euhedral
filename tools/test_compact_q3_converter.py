@@ -185,3 +185,48 @@ class Nvfp4QuantizationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _cuda_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(_cuda_available(), "PyTorch with CUDA unavailable")
+class CudaQuantizationMatchesCpuTest(unittest.TestCase):
+    def setUp(self):
+        converter.DEVICE = "cuda"
+        converter._TABLES.clear()
+
+    def tearDown(self):
+        converter.DEVICE = "cpu"
+        converter._TABLES.clear()
+
+    def test_nvfp4_rows_are_byte_identical(self):
+        rng = np.random.default_rng(6)
+        values = (rng.standard_normal((64, 1024)) * rng.uniform(0.001, 3.0, (64, 1))).astype(np.float32)
+        values[3, :16] = 0
+        values[5, :32] = np.repeat(np.float32(0.25), 32)
+        global_scale = converter.nvfp4_global_scale(float(np.abs(values).max()))
+        cpu = converter.quantize_nvfp4_rows(values, global_scale)
+        gpu = converter.quantize_nvfp4_rows_torch(values, global_scale)
+        np.testing.assert_array_equal(cpu[0], gpu[0])
+        np.testing.assert_array_equal(cpu[1], gpu[1])
+
+    def test_grouped_codes_and_packing_are_byte_identical(self):
+        rng = np.random.default_rng(7)
+        values = (rng.standard_normal((48, 256)) * rng.uniform(1e-6, 2.0, (48, 1))).astype(np.float32)
+        values[0, :64] = 0
+        for fmt in ("Q3G64_F16S", "Q4G64_F16S", "Q5G64_F16S", "W8G32_F16S"):
+            bits, group_size, qmin, qmax = converter.QUANT[fmt]
+            with self.subTest(fmt=fmt):
+                grouped = values.reshape(48, 256 // group_size, group_size)
+                scales, reciprocal = converter._canonical_scales(np.max(np.abs(grouped), axis=2), qmax)
+                codes = np.clip(np.rint(grouped * reciprocal[..., None]), qmin, qmax).astype(np.int8)
+                expected = converter.pack_codes(codes.reshape(-1, group_size), bits)
+                device_scales, device_codes = converter.quantize_group_codes_torch(values, group_size, qmin, qmax)
+                np.testing.assert_array_equal(device_scales.cpu().numpy(), scales)
+                self.assertEqual(converter.pack_codes_torch(device_codes, bits), expected)
