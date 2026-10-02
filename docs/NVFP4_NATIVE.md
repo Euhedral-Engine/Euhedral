@@ -91,11 +91,22 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
 | Linear | 32 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` per K tile (64 with two terms), `LDGSTS`, `LDSM.16.M88.4`; no weight conversion | 121 |
 | Quantizer | `F2FP.SATFINITE.E2M1.F32.PACK_AB_MERGE_C`, `F2FP.SATFINITE.E4M3.F32` | 42 |
 
-**Dispatch.**
-- `CudaGpuMemory.linearNvfp4Bf16` and `nvfp4GateUpSwiGluBf16` take the native route from
-  `NVFP4_NATIVE_MIN_ROWS` (64) rows. This covers every linear and the paired gate/up region in
-  prefill views.
-- Activations go into the shared, event-ordered scratch.
+**Dispatch** (`CudaGpuMemory`, `native/src/host/nvfp4_linear.c`):
+
+| Rows | NVFP4 linear (`linearNvfp4Bf16`) | Paired gate/up + SwiGLU (`nvfp4GateUpSwiGluBf16`) |
+|---|---|---|
+| 1 | the BF16-activation GEMV (`euhedral_nvfp4_decode`) when K is a multiple of 1024 and N of 16, as in every model shape; else the 64 × 64 BF16-expansion tile | not formed: decode and small views run gate/up as a linear |
+| 2–63 | native skinny kernel when K is a multiple of 256 (`skinny_linear`, see "Decode-like row counts"), else the 128 × 128 tile | not formed (small views run gate/up as a linear) |
+| 64 | native skinny kernel (same condition) | native paired tile |
+| 65 and more | native 128 × 128 tile | native paired tile |
+
+- **Thresholds:**
+  - `NVFP4_NATIVE_MIN_ROWS` = 2 for linears;
+  - `NVFP4_NATIVE_REGION_MIN_ROWS` = 64 for the paired region;
+  - the host's `SKINNY_MAX_ROWS` = 64.
+- Native linears need K to be a multiple of 128; otherwise the BF16-expansion kernels run.
+- Quantized activations, plus FP32 split-K partials for skinny shapes, go into the shared,
+  event-ordered scratch (`euhedral_cuda_nvfp4_native_scratch_bytes`).
 - `EUHEDRAL_NVFP4_NATIVE`:
   - `0`: the BF16-expansion kernels;
   - `1`: one term;
@@ -139,9 +150,14 @@ gate_up+SwiGLU, GDN recurrence 2.7%, attention 1.9% (Nsight Systems, prefill 512
 
 ## End to end
 
-Four-arm paired gate: 6 forks, each arm in a fresh JVM, start order rotated per fork, warmup 2,
+Four-arm paired gate at commit 28e7070, when native linears started at 64 rows and fewer rows used
+the BF16-expansion tile: 6 forks, each arm in a fresh JVM, start order rotated per fork, warmup 2,
 3 iterations. Default 512-row prefill chunk. NVFP4 arms load executed objects only. Medians of
 per-fork medians; "ahead" counts forks against the BF16-expansion arm.
+
+The skinny route (c632d47) later changed the 64-row and smaller rows: prefill 64 went from 1178 to
+1492 tok/s and TTFT for a 64-token prompt from 55.7 to 44.8 ms with two terms. See its gate under
+"Decode-like row counts". The other rows are unaffected, because they form quanta of more than 64 rows.
 
 | Scenario | Compact Q3 | NVFP4→BF16 | Native, 2 terms (default) | Native, 1 term |
 |---|---|---|---|---|
