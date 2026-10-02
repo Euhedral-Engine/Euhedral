@@ -32,17 +32,14 @@ static __device__ __forceinline__ void stage16(__half* kv, const unsigned char* 
     }
 }
 }  // namespace gqa_decode
-extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_nvfp4(
-        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
-        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
-        unsigned int headDim, unsigned int cacheLength, unsigned long long start,
-        float* partial, unsigned int splits) {
-    using namespace gqa_decode;
-    euhedral_pdl_begin();
+namespace gqa_decode {
+// One (KV head, split) block of the decode attention below; `block` is its index in the one-row grid.
+static __device__ __forceinline__ void decode_block(unsigned block,
+        const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        unsigned int queryHeads, unsigned int keyHeads, unsigned int cacheLength, float* partial, unsigned int splits) {
     const unsigned lane = threadIdx.x, g = lane >> 2, tig = lane & 3u;
     const unsigned group = queryHeads / keyHeads;
-    const unsigned kh = blockIdx.x / splits, split = blockIdx.x % splits;
+    const unsigned kh = block / splits, split = block % splits;
     const unsigned span = (cacheLength + splits - 1) / splits;
     const unsigned begin = split * span, end = min(cacheLength, begin + span);
     __shared__ __align__(16) __half kbuf[KT * STRIDE], vbuf[KT * STRIDE];
@@ -139,4 +136,34 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_n
         for (int j = 0; j < 16; j++) { destination[16 * j + g] = o[j][c]; destination[16 * j + g + 8] = o[j][2 + c]; }
         if (g == 0) { destination[256] = m[c]; destination[257] = l[c]; }
     }
+}
+}  // namespace gqa_decode
+
+extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_nvfp4(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
+        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
+        unsigned int headDim, unsigned int cacheLength, unsigned long long start,
+        float* partial, unsigned int splits) {
+    euhedral_pdl_begin();
+    gqa_decode::decode_block(blockIdx.x, queryKey, keyPages, valuePages, queryHeads, keyHeads, cacheLength, partial, splits);
+}
+
+// Row-exact multi-row twin for speculative verification: blockIdx.y is the verified row, which attends
+// the keys up to start + row exactly as the one-row launch above at that position would (same split
+// count and block partition); rows below `from` keys are left to the per-head decode twin. Each row
+// writes its own partials (rowStride floats apart). Grid: keyHeads * (largest split count) x rows.
+extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_nvfp4_rows(
+        const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        unsigned int queryHeads, unsigned int keyHeads, unsigned long long start, float* partial,
+        unsigned long long rowStride, unsigned int from) {
+    const unsigned row = blockIdx.y;
+    const unsigned length = (unsigned)start + row + 1u;
+    if (length < from) return;
+    unsigned splits = (length + 31u) / 32u;
+    if (splits > 64u) splits = 64u;
+    if (blockIdx.x >= keyHeads * splits) return;
+    euhedral_pdl_begin();
+    gqa_decode::decode_block(blockIdx.x, queryKey + (unsigned long long)row * (queryHeads + keyHeads) * 256u, keyPages,
+            valuePages, queryHeads, keyHeads, length, partial + row * rowStride, splits);
 }

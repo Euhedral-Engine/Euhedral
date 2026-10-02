@@ -198,12 +198,11 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp
     }
 }
 
-extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4(
-        const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial,
-        unsigned int queryHeads, unsigned int keyHeads, unsigned int splits) {
-    euhedral_pdl_begin();
+// The merge of one query head (block `head` of the one-row merge grid).
+static __device__ __forceinline__ void attention_merge_head(unsigned int head,
+        const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial, unsigned int splits) {
     if (threadIdx.x >= 32) return;
-    const unsigned int lane = threadIdx.x, head = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
     const float* source = partial + (unsigned long long)head * splits * 258;
     float maximum = -__int_as_float(0x7f800000);
     for (unsigned int s = 0; s < splits; s++) maximum = fmaxf(maximum, source[s * 258 + 256]);
@@ -225,19 +224,22 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4
     }
 }
 
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4(
+        const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial,
+        unsigned int queryHeads, unsigned int keyHeads, unsigned int splits) {
+    euhedral_pdl_begin();
+    attention_merge_head(blockIdx.x, gateValue, output, partial, splits);
+}
+
 // Relaxed decode attention: lane l owns the contiguous dimensions 8l .. 8l + 7, so each cached row costs
 // one 32-bit code load and one scale byte per lane for K and again for V (the exact kernel decodes
 // every element with its own byte loads). The query is re-laid out once through shared memory; only
 // the order of each dot product's FP32 sum differs from euhedral_attention_decode_nvfp4_exact.
-extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp4(
-        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
-        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
-        unsigned int headDim, unsigned int cacheLength, unsigned long long start,
-        float* partial, unsigned int splits) {
-    euhedral_pdl_begin();
+static __device__ __forceinline__ void attention_decode_block(unsigned int block,
+        const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        unsigned int queryHeads, unsigned int keyHeads, unsigned int cacheLength, float* partial, unsigned int splits) {
     const unsigned int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const unsigned int head = blockIdx.x / splits, split = blockIdx.x % splits;
+    const unsigned int head = block / splits, split = block % splits;
     const unsigned int kh = head / (queryHeads / keyHeads);
     const unsigned int span = (cacheLength + splits - 1) / splits;
     const unsigned int begin = split * span, end = min(cacheLength, begin + span);
@@ -290,9 +292,54 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp
 #pragma unroll
             for (int d = 0; d < 8; d++) combined[d] += staging[w][lane + d * 32] * scale;
         }
-        float* destination = partial + (unsigned long long)blockIdx.x * 258;
+        float* destination = partial + (unsigned long long)block * 258;
 #pragma unroll
         for (int d = 0; d < 8; d++) destination[lane + d * 32] = combined[d];
         if (lane == 0) { destination[256] = maxAll; destination[257] = sum; }
     }
+}
+
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp4(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
+        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
+        unsigned int headDim, unsigned int cacheLength, unsigned long long start,
+        float* partial, unsigned int splits) {
+    euhedral_pdl_begin();
+    attention_decode_block(blockIdx.x, queryKey, keyPages, valuePages, queryHeads, keyHeads, cacheLength, partial, splits);
+}
+
+// Row-exact multi-row twins for speculative verification. blockIdx.y is the verified row, which attends
+// the keys up to start + row with the split count and block partition of the one-row launch at that
+// position (host dispatch: 48-key splits, at most 64), so every row is bit for bit one-row decode. Rows
+// from `from` keys are left to the GQA twin. Each row has its own partials, rowStride floats apart.
+// Grid: queryHeads * (largest split count) x rows.
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp4_rows(
+        const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
+        unsigned int queryHeads, unsigned int keyHeads, unsigned long long start, float* partial,
+        unsigned long long rowStride, unsigned int from) {
+    const unsigned int row = blockIdx.y;
+    const unsigned int length = (unsigned int)start + row + 1u;
+    if (length >= from) return;
+    unsigned int splits = (length + 47u) / 48u;
+    if (splits > 64u) splits = 64u;
+    if (blockIdx.x >= queryHeads * splits) return;
+    euhedral_pdl_begin();
+    attention_decode_block(blockIdx.x, queryKey + (unsigned long long)row * (queryHeads + keyHeads) * 256u, keyPages,
+            valuePages, queryHeads, keyHeads, length, partial + row * rowStride, splits);
+}
+
+// Merge for the row twins: each row with its own split count (32-key splits from `from` keys, else 48).
+// Grid: queryHeads x rows.
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4_rows(
+        const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial, unsigned int queryHeads,
+        unsigned int keyHeads, unsigned long long start, unsigned long long rowStride, unsigned int from) {
+    const unsigned int row = blockIdx.y;
+    const unsigned int length = (unsigned int)start + row + 1u;
+    unsigned int splits = length >= from ? (length + 31u) / 32u : (length + 47u) / 48u;
+    if (splits > 64u) splits = 64u;
+    euhedral_pdl_begin();
+    const unsigned long long width = (unsigned long long)(queryHeads + keyHeads) * 256u;
+    attention_merge_head(blockIdx.x, gateValue + row * width, output + (unsigned long long)row * queryHeads * 256u,
+            partial + row * rowStride, splits);
 }

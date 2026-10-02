@@ -90,6 +90,8 @@ static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
 static CUfunction attention_prefill_nvfp4_exact, attention_decode_nvfp4_exact, attention_prefill_fa2, attention_decode_gqa;
+/* Row-exact multi-row twins of decode attention and its merge (speculative verification). */
+static CUfunction attention_decode_rows, attention_decode_gqa_rows, attention_merge_rows;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 // The grouped Q4+Q5 launch of the GDN input projections wins over two launches
@@ -204,6 +206,11 @@ static void initialize_modules(void) {
         get_function(attention_module, &attention_decode_nvfp4_exact, "euhedral_attention_decode_nvfp4_exact");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_merge_nvfp4, "euhedral_attention_merge_nvfp4");
     if (status != CUDA_SUCCESS) { init_status = (int)status; return; }
+    if (get_function(attention_module, &attention_decode_rows, "euhedral_attention_decode_nvfp4_rows") != CUDA_SUCCESS
+            || get_function(attention_module, &attention_merge_rows, "euhedral_attention_merge_nvfp4_rows") != CUDA_SUCCESS)
+        attention_decode_rows = attention_merge_rows = NULL;
+    if (get_function(attention_module, &attention_decode_gqa_rows, "euhedral_attention_decode_gqa_nvfp4_rows") != CUDA_SUCCESS)
+        attention_decode_gqa_rows = NULL;
     // Optional row-owned variant (256-dimension heads), bitwise equal to the per-head kernel.
     get_function(attention_module, &attention_qk_norm_rope_rows, "euhedral_attention_qk_norm_rope_rows_bf16");
     status = get_function(attention_module, &attention_kv_append, "euhedral_attention_kv_append_bf16");
@@ -265,6 +272,9 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(attention_decode_nvfp4_exact);
     euhedral_cuda_pdl_register(attention_decode_gqa);
     euhedral_cuda_pdl_register(attention_merge_nvfp4);
+    euhedral_cuda_pdl_register(attention_decode_rows);
+    euhedral_cuda_pdl_register(attention_decode_gqa_rows);
+    euhedral_cuda_pdl_register(attention_merge_rows);
 }
 
 #ifdef _WIN32
@@ -789,7 +799,13 @@ int euhedral_cuda_q3_ffn_down_split_bf16(
 int euhedral_cuda_residual_rms_norm_bf16(
         const void* residual, const void* delta, const void* weight,
         void* hidden, void* normalized, uint32_t rows, uint32_t width, float epsilon) {
-    if (rows > 1 && euhedral_cuda_row_exact() && residual && delta && hidden && normalized) {
+    // Row-exact: where one row runs the row-owned kernel (one CTA per row, blockIdx.x is the row), a
+    // rows-CTA launch of it computes every row exactly as one-row launches would.
+    const int row_exact = rows > 1 && euhedral_cuda_row_exact();
+    const int row_kernel = residual && delta && weight && hidden && normalized && width % 8u == 0u && width <= 8192u
+            && !euhedral_cuda_exact_numerics() && (((uintptr_t)residual | (uintptr_t)delta | (uintptr_t)weight
+                    | (uintptr_t)hidden | (uintptr_t)normalized) & 15u) == 0u;
+    if (row_exact && !row_kernel && residual && delta && hidden && normalized) {
         const uint64_t stride = (uint64_t)width * 2u;
         for (uint32_t row = 0; row < rows; ++row) {
             int status = euhedral_cuda_residual_rms_norm_bf16((const char*)residual + row * stride, (const char*)delta + row * stride,
@@ -808,10 +824,17 @@ int euhedral_cuda_residual_rms_norm_bf16(
     if (!residual_rms_norm) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     void* parameters[] = {&residual, &delta, &weight, &hidden, &normalized, &rows, &width, &epsilon};
     // Relaxed numerics: one row (decode) keeps its columns in registers, eight per thread.
-    if (rows == 1 && residual_rms_norm_row != NULL && !euhedral_cuda_exact_numerics() && width % 8u == 0u
-            && width <= 8192u && (((uintptr_t)residual | (uintptr_t)delta | (uintptr_t)weight
-                    | (uintptr_t)hidden | (uintptr_t)normalized) & 15u) == 0u)
-        return launch_and_synchronize(residual_rms_norm_row, 1, (width / 8u + 31u) / 32u * 32u, parameters);
+    if ((rows == 1 || row_exact) && residual_rms_norm_row != NULL && row_kernel)
+        return launch_and_synchronize(residual_rms_norm_row, rows, (width / 8u + 31u) / 32u * 32u, parameters);
+    if (row_exact) {
+        const uint64_t stride = (uint64_t)width * 2u;
+        for (uint32_t row = 0; row < rows; ++row) {
+            status = euhedral_cuda_residual_rms_norm_bf16((const char*)residual + row * stride, (const char*)delta + row * stride,
+                    weight, (char*)hidden + row * stride, (char*)normalized + row * stride, 1u, width, epsilon);
+            if (status != 0) return status;
+        }
+        return 0;
+    }
     return launch_and_synchronize(residual_rms_norm, rows, 128, parameters);
 }
 
@@ -941,7 +964,12 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
         uint64_t start_position,
         float epsilon,
         double rope_theta) {
-    if (rows > 1 && euhedral_cuda_row_exact() && device_query_key != NULL && device_output != NULL) {
+    // Row-exact: the one-row kernel already maps block -> (row, head) with position start + row, so a
+    // rows x heads launch of it computes every row exactly as one-row launches would. The in-place query
+    // path reads and writes only its own (row, head) block.
+    const int row_exact_heads = rows > 1 && euhedral_cuda_row_exact();
+    if (row_exact_heads && device_query_key != NULL && device_output != NULL
+            && ((uint64_t)rows * ((uint64_t)query_heads + key_value_heads) > UINT32_MAX)) {
         const uint64_t width = ((uint64_t)query_heads + key_value_heads) * head_dim * 2u;
         for (uint32_t row = 0; row < rows; ++row) {
             int status = euhedral_cuda_attention_qk_norm_rope_bf16((const char*)device_query_key + row * width, device_query_norm,
@@ -973,7 +1001,7 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
     void* parameters[] = {&query_key, &query_norm, &key_norm, &output, &rows_arg, &query_heads_arg,
             &key_value_heads_arg, &head_dim_arg, &rotary_dim_arg, &start_position, &epsilon, &rope_theta};
     // A single row (decode) keeps one CTA per head; from two rows one CTA per row shares the angles.
-    if (rows > 1 && attention_qk_norm_rope_rows != NULL)
+    if (rows > 1 && !row_exact_heads && attention_qk_norm_rope_rows != NULL)
         return launch_and_synchronize(attention_qk_norm_rope_rows, rows, 256, parameters);
     return launch_and_synchronize(attention_qk_norm_rope, (uint32_t)blocks, head_dim, parameters);
 }
@@ -1011,6 +1039,44 @@ int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
         uint32_t cache_length, uint64_t start, void* scratch) {
+    if (rows > 1 && euhedral_cuda_row_exact() && query_key && gate && keys && values && output && scratch
+            && query_heads && key_heads && query_heads % key_heads == 0 && head_dim == 256 && rows <= 64u
+            && start <= cache_length && rows <= cache_length - start && start + rows <= UINT32_MAX
+            && !euhedral_cuda_exact_numerics()) {
+        /* Row-exact twins: row j is one-row decode at position start + j, all rows in one launch each for
+         * decode and merge. Rows use the one-row kernel choice at their own length: the GQA kernel from
+         * 2048 keys when it is loaded and the group fits, else the per-head kernel. The scratch holds one
+         * one-row partial area (query_heads * 64 * 258 floats) per row. */
+        int status = euhedral_cuda_bind_thread_context();
+        if (status != 0) return status;
+        status = ensure_initialized();
+        if (status != 0) return status;
+        const uint32_t group = query_heads / key_heads;
+        const uint32_t from = attention_decode_gqa != NULL && group <= 8u ? 2048u : UINT32_MAX;
+        if (attention_decode_rows != NULL && attention_merge_rows != NULL
+                && (from == UINT32_MAX || attention_decode_gqa_rows != NULL)) {
+            const uint32_t first = (uint32_t)start + 1u, last = (uint32_t)start + rows;
+            unsigned long long row_stride = (unsigned long long)query_heads * 64u * 258u;
+            uint32_t qh = query_heads, kh = key_heads, from_arg = from;
+            unsigned long long start_arg = start;
+            if (first < from) {
+                uint32_t below = last < from ? last : from - 1u, splits = (below + 47u) / 48u;
+                if (splits > 64u) splits = 64u;
+                void* args[] = {&query_key, &keys, &values, &qh, &kh, &start_arg, &scratch, &row_stride, &from_arg};
+                status = launch_and_synchronize_2d(attention_decode_rows, query_heads * splits, rows, 128, args);
+                if (status != 0) return status;
+            }
+            if (last >= from) {
+                uint32_t splits = (last + 31u) / 32u;
+                if (splits > 64u) splits = 64u;
+                void* args[] = {&query_key, &keys, &values, &qh, &kh, &start_arg, &scratch, &row_stride, &from_arg};
+                status = launch_and_synchronize_2d(attention_decode_gqa_rows, key_heads * splits, rows, 32, args);
+                if (status != 0) return status;
+            }
+            void* merge_args[] = {&gate, &output, &scratch, &qh, &kh, &start_arg, &row_stride, &from_arg};
+            return launch_and_synchronize_2d(attention_merge_rows, query_heads, rows, 128, merge_args);
+        }
+    }
     if (rows > 1 && euhedral_cuda_row_exact() && query_key && gate && output) {
         /* Row-exact: row j is one-row decode at position start + j over the keys up to it. */
         const uint64_t width = ((uint64_t)query_heads + key_heads) * head_dim * 2u, out = (uint64_t)query_heads * head_dim * 2u;

@@ -15,6 +15,12 @@ public final class AttentionSequenceStates implements AutoCloseable {
     private long draftSeedRows;
     private int draftSeedCapacity;
     private long draftRecursionHidden;
+    /// Split-KV decode scratch shared by every attention layer of the sequence: a quantum's attention
+    /// layers run one after another (each needs the previous layer's output) and the sequence's quanta are
+    /// serialized by its lease, so one area serves them all.
+    private long decodeScratch;
+    private int decodeScratchHeads;
+    private int decodeScratchRows;
 
     private AttentionSequenceStates(ExecutionGpu gpu, AttentionKvState[] states) {
         this.gpu = gpu;
@@ -60,6 +66,26 @@ public final class AttentionSequenceStates implements AutoCloseable {
         return this.draftRecursionHidden;
     }
 
+    /// Split-KV scratch for `rows` decode rows: one one-row area (queryHeads x 64 splits x 258 floats) per
+    /// row, as one-row decode (one area) and the row-exact attention twins of a verification (one per
+    /// verified row) need. It grows when a verification first needs more rows.
+    public long decodeScratch(int queryHeads, int rows) {
+        if (this.closed) throw new IllegalStateException("attention sequence states are closed");
+        if (queryHeads <= 0 || rows <= 0) throw new IllegalArgumentException("queryHeads and rows must be positive");
+        if (this.decodeScratch != 0 && queryHeads != this.decodeScratchHeads)
+            throw new IllegalArgumentException("decode head geometry changed");
+        if (this.decodeScratch == 0 || rows > this.decodeScratchRows) {
+            if (this.decodeScratch != 0) this.gpu.free(this.decodeScratch);
+            this.decodeScratch = 0;
+            this.decodeScratchRows = 0;
+            this.decodeScratch =
+                    this.gpu.allocate(Math.multiplyExact((long) queryHeads * rows, 64L * 258 * Float.BYTES));
+            this.decodeScratchHeads = queryHeads;
+            this.decodeScratchRows = rows;
+        }
+        return this.decodeScratch;
+    }
+
     public AttentionKvState forLayer(int layerIndex) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
         if (layerIndex < 0 || layerIndex >= this.states.length || this.states[layerIndex] == null) {
@@ -72,16 +98,27 @@ public final class AttentionSequenceStates implements AutoCloseable {
     public void close() {
         if (this.closed) return;
         Throwable failure = null;
-        for (long address : new long[] {this.draftSeedRows, this.draftRecursionHidden}) {
-            if (address == 0) continue;
-            try {
-                this.gpu.free(address);
-            } catch (Throwable cleanupFailure) {
-                failure = cleanupFailure;
-            }
+        // Each buffer is forgotten only once freed, so a failed close can be retried.
+        try {
+            if (this.draftSeedRows != 0) this.gpu.free(this.draftSeedRows);
+            this.draftSeedRows = 0;
+        } catch (Throwable cleanupFailure) {
+            failure = cleanupFailure;
         }
-        this.draftSeedRows = 0;
-        this.draftRecursionHidden = 0;
+        try {
+            if (this.draftRecursionHidden != 0) this.gpu.free(this.draftRecursionHidden);
+            this.draftRecursionHidden = 0;
+        } catch (Throwable cleanupFailure) {
+            if (failure == null) failure = cleanupFailure;
+            else failure.addSuppressed(cleanupFailure);
+        }
+        try {
+            if (this.decodeScratch != 0) this.gpu.free(this.decodeScratch);
+            this.decodeScratch = 0;
+        } catch (Throwable cleanupFailure) {
+            if (failure == null) failure = cleanupFailure;
+            else failure.addSuppressed(cleanupFailure);
+        }
         for (int index = this.states.length - 1; index >= 0; index--) {
             AttentionKvState state = this.states[index];
             if (state == null) continue;
@@ -93,7 +130,7 @@ public final class AttentionSequenceStates implements AutoCloseable {
                 else failure.addSuppressed(cleanupFailure);
             }
         }
-        this.closed = true;
+        this.closed = this.draftSeedRows == 0 && this.draftRecursionHidden == 0 && this.decodeScratch == 0;
         for (AttentionKvState state : this.states) this.closed &= state == null;
         if (failure instanceof Error error) throw error;
         if (failure instanceof RuntimeException runtimeException) throw runtimeException;
