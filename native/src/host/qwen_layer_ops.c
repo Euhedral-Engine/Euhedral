@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -46,6 +47,7 @@ static CUfunction linear_quantized;
 static CUfunction q45_decode[2][3];
 static CUfunction q45_decode_wide[2];
 static CUfunction q45_decode_contiguous[2];
+static CUfunction q45_decode_contiguous_rows[2][9];  /* [format][M]: row-exact twins for 2..8 rows */
 static CUfunction q45_prefill[2];
 static CUfunction q45_prefill64[2];
 static CUfunction q45_grouped64;
@@ -130,6 +132,13 @@ static void initialize_modules(void) {
         get_function(q45_module, &q45_decode_wide[1], "euhedral_q5_decode_wide");
         get_function(q45_module, &q45_decode_contiguous[0], "euhedral_q4_decode_contiguous");
         get_function(q45_module, &q45_decode_contiguous[1], "euhedral_q5_decode_contiguous");
+        for (int format = 0; format < 2; format++)
+            for (int m = 2; m <= 8; m++) {
+                char name[48];
+                snprintf(name, sizeof(name), "euhedral_q%d_decode_contiguous_rows%d", 4 + format, m);
+                if (cuModuleGetFunction(&q45_decode_contiguous_rows[format][m], q45_module, name) != CUDA_SUCCESS)
+                    q45_decode_contiguous_rows[format][m] = NULL;
+            }
         // Optional: without it the GDN projection pair falls back to two launches.
         get_function(q45_module, &q45_grouped64, "euhedral_q45_prefill_64_grouped");
         get_function(q45_module, &q45_grouped64_exact, "euhedral_q45_prefill_64_grouped_exact");
@@ -235,6 +244,8 @@ static void initialize(void) {
         for (int tile = 0; tile < 3; tile++) euhedral_cuda_pdl_register(q45_decode[format][tile]);
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_wide[format]);
     for (int format = 0; format < 2; format++) euhedral_cuda_pdl_register(q45_decode_contiguous[format]);
+    for (int format = 0; format < 2; format++)
+        for (int m = 2; m <= 8; m++) euhedral_cuda_pdl_register(q45_decode_contiguous_rows[format][m]);
     euhedral_cuda_pdl_register(gdn_control);
     euhedral_cuda_pdl_register(argmax_bf16);
     euhedral_cuda_pdl_register(gdn_project_control);
@@ -346,6 +357,29 @@ int euhedral_cuda_linear_quantized_bf16(
     // grid-x limit rather than rejecting counts above it.
     const uint32_t scalar_grid = count > 2147483647u ? 2147483647u : (uint32_t)count;
     const char* mode = getenv("EUHEDRAL_Q45_DISPATCH");
+    // Row-exact verification (euhedral_cuda_row_exact): every row exactly as a one-row call. Where that
+    // call runs the contiguous decode kernel, its multi-row twin computes all rows in one launch, bit
+    // for bit; otherwise the rows run one at a time.
+    if (rows > 1 && euhedral_cuda_row_exact()) {
+        const int format = bits == 5;
+        const int decode_route = mode == NULL || strcmp(mode, "AUTO") == 0 || strcmp(mode, "DECODE") == 0;
+        if (decode_route && q45_status == EUHEDRAL_CUDA_SUCCESS && rows <= 8u
+                && q45_decode_contiguous[format] != NULL && q45_decode_contiguous_rows[format][rows] != NULL
+                && !euhedral_cuda_exact_numerics()
+                && (((uintptr_t)device_weights | (uintptr_t)device_input) & 15u) == 0u
+                && euhedral_q45_decode_contiguous_shape(1, in_features, out_features)) {
+            void* twin_parameters[] = {&input, &weights, &output, &rows_arg, &in_arg, &out_arg};
+            return launch_and_synchronize(q45_decode_contiguous_rows[format][rows], out_features / 8u, 128,
+                    twin_parameters);
+        }
+        for (uint32_t row = 0; row < rows; row++) {
+            status = euhedral_cuda_linear_quantized_bf16((const unsigned char*)device_input + (uint64_t)row * in_features * 2u,
+                    device_weights, (unsigned char*)device_output + (uint64_t)row * out_features * 2u, 1, in_features,
+                    out_features, weights_byte_size, bits);
+            if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        }
+        return EUHEDRAL_CUDA_SUCCESS;
+    }
     if (mode != NULL && strcmp(mode, "SCALAR") == 0)
         return launch_and_synchronize(linear_quantized, scalar_grid, 128, parameters);
     // DECODE, PREFILL and PREFILL64 force one optimized route; AUTO (the default)

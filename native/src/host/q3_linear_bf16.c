@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -25,6 +26,7 @@ static CUfunction decode1, decode2, decode4, decode_wide, decode_contiguous, pre
 static CUfunction prefill_exact, prefill64_exact, prefill64_k32_cb_exact, prefill_s104_exact;
 static CUfunction prefill_engine, prefill_engine64;
 static CUfunction p2e2_decode, p2e2_expand;
+static CUfunction decode_contiguous_rows[9];  /* [M]: row-exact twins for 2..8 rows */
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 /* Alias of euhedral_cuda_select_exact_numerics, kept for existing callers. */
 int euhedral_cuda_q3_decode_select_exact(int exact) {
@@ -55,6 +57,12 @@ static void initialize(void) {
     prefill_engine64 = optional_kernel("euhedral_q3_prefill_64x64");
     p2e2_decode = optional_kernel("euhedral_q3_p2e2_decode");
     p2e2_expand = optional_kernel("euhedral_q3_p2e2_expand");
+    for (int m = 2; m <= 8; m++) {
+        char name[48];
+        snprintf(name, sizeof(name), "euhedral_q3_decode_contiguous_rows%d", m);
+        decode_contiguous_rows[m] = optional_kernel(name);
+        euhedral_cuda_pdl_register(decode_contiguous_rows[m]);
+    }
     // The decode kernels begin with euhedral_pdl_begin() (see cuda_kernel_loader.h).
     euhedral_cuda_pdl_register(decode1);
     euhedral_cuda_pdl_register(decode2);
@@ -98,6 +106,34 @@ static int linear_q3(const void* input, const void* weights, void* output,
     if (pthread_once(&once, initialize) != 0) return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 #endif
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return init_status;
+    // Row-exact verification (euhedral_cuda_row_exact): every row exactly as a one-row decode call. Where
+    // that call runs the contiguous kernel, its multi-row twin computes all rows in one launch, bit for
+    // bit; otherwise the rows run one at a time.
+    if (rows > 1 && euhedral_cuda_row_exact()) {
+        int one_row_contiguous = decode_contiguous != NULL && !euhedral_cuda_exact_numerics()
+                && ((uintptr_t)input & 15u) == 0u && ((uintptr_t)weights & 3u) == 0u
+                && euhedral_q3_decode_contiguous_shape(1, in_features, out_features);
+        if (one_row_contiguous && rows <= 8u && decode_contiguous_rows[rows] != NULL) {
+            CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
+            CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
+            unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
+            unsigned long long scale_arg = scale_offset;
+            void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
+            CUresult status = euhedral_launch_kernel(decode_contiguous_rows[rows], out_features / 16u, 1, 1, 128, 1, 1, 0,
+                    euhedral_cuda_submission_stream(), params, NULL);
+            if (status != CUDA_SUCCESS) return (int)status;
+            if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
+            cudaError_t sync = cudaDeviceSynchronize();
+            return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
+        }
+        for (uint32_t row = 0; row < rows; row++) {
+            int status = linear_q3((const unsigned char*)input + (uint64_t)row * in_features * 2u, weights,
+                    (unsigned char*)output + (uint64_t)row * out_features * 2u, 1, in_features, out_features,
+                    weights_byte_size, 1);
+            if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+        }
+        return EUHEDRAL_CUDA_SUCCESS;
+    }
     // A matched older NVRTC source may lack the optional tile64 kernels. AUTO then
     // retains the 32-row route; explicit 64-row requests fail below.
     enum euhedral_q3_prefill_kernel prefill_kernel = EUHEDRAL_Q3_PREFILL_NONE;

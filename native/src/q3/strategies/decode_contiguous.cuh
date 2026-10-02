@@ -104,4 +104,70 @@ static __device__ __forceinline__ void contiguous_decode(
     if (lane < (unsigned int)kRows) write_bf16(output, 0, first_row + lane, out_features, mine);
 }
 
+// Multi-row twin for row-exact speculative verification: M activation rows against each weight row.
+// Every token row repeats contiguous_decode's exact FMA sequence (same half groups, same order, same
+// warp reduction), so row t's output is bit for bit what contiguous_decode gives for it alone; the
+// weights stream once. Same requirements as contiguous_decode, for each row.
+template<int M>
+static __device__ __forceinline__ void contiguous_decode_rows(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
+    constexpr int kRows = contiguous::kRows;
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kRows;
+    const Layout w(weights, in_features, scale_offset);
+    const unsigned int slices = in_features / 1024u, groups = in_features / 64u;
+    const unsigned long long row_words = (unsigned long long)groups * 6u;
+    const unsigned int* codes = reinterpret_cast<const unsigned int*>(w.codes);
+    float sums[M][kRows] = {};
+    euhedral_pdl_begin();
+    for (unsigned int slice = 0; slice < slices; slice++) {
+        unsigned int words[kRows][3];
+        float scales[kRows];
+        #pragma unroll
+        for (int r = 0; r < kRows; r++) {
+            const unsigned int* p = codes + (first_row + r) * row_words + slice * 96u + 3u * lane;
+            words[r][0] = p[0];
+            words[r][1] = p[1];
+            words[r][2] = p[2];
+            scales[r] = __half2float(__ushort_as_half(w.scales[(first_row + r) * (unsigned long long)groups
+                    + slice * 16u + (lane >> 1)]));
+        }
+        #pragma unroll
+        for (int t = 0; t < M; t++) {
+            float x[32];
+            const uint4* activation = reinterpret_cast<const uint4*>(
+                    input + (unsigned long long)t * in_features + slice * 1024u + 32u * lane);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = activation[i];
+                const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
+                    x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < kRows; r++) {
+                const float dot = contiguous::Dot<0>::run(x, words[r][0], words[r][1], words[r][2], 0.0f);
+                sums[t][r] = fmaf(dot, scales[r], sums[t][r]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < M; t++) {
+        #pragma unroll
+        for (int r = 0; r < kRows; r++) {
+            #pragma unroll
+            for (int distance = 16; distance; distance >>= 1) sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], distance);
+        }
+        float mine = sums[t][0];
+        #pragma unroll
+        for (int r = 1; r < kRows; r++) mine = lane == (unsigned int)r ? sums[t][r] : mine;
+        if (lane < (unsigned int)kRows)
+            write_bf16(output + (unsigned long long)t * out_features, 0, first_row + lane, out_features, mine);
+    }
+}
+
 }  // namespace q3

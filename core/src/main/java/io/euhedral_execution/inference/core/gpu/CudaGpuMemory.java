@@ -1883,6 +1883,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         ROW_EXACT.get()[0] = enabled;
     }
 
+    /// The native Q3, Q4 and Q5 linears run row-exact multi-row twins of their one-row contiguous kernels
+    /// (or one row at a time) when row-exact execution is selected.
+    @Override
+    public boolean rowExactQuantizedLinears() {
+        return this.rowExactSelect != null;
+    }
+
     public boolean selectExactNumerics(boolean exact) {
         ensureOpen();
         if (selectExactNumerics == null)
