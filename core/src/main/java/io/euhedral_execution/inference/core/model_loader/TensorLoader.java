@@ -31,7 +31,7 @@ public final class TensorLoader {
         boolean allocated = false;
         try (Arena hostArena = Arena.ofConfined()) {
             MemorySegment payload = TensorDataReader.read(artifactPath, descriptor, hostArena);
-            if (descriptor.format() == WeightFormat.NVFP4) {
+            if (descriptor.format() == WeightFormat.NVFP4 && descriptor.layout() == WeightLayout.ROW_SPLIT_K128_V1) {
                 try {
                     Nvfp4Layout.validate(
                             payload, descriptor.shape()[0], descriptor.shape()[1]);
