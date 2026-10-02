@@ -87,7 +87,7 @@ class SpeculativeDepthScreenCudaIntegrationTest {
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             List<String> modes = nativeToo ? List.of("exact", "native") : List.of("exact");
             // [mode][depth] accumulated statistics over rounds and prompts.
-            long[][][] totals = new long[modes.size()][depths.length][6];
+            long[][][] totals = new long[modes.size()][depths.length][7];
             long[][][] histograms = new long[modes.size()][depths.length][8];
             long sequenceId = 1000;
             try {
@@ -120,6 +120,8 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                                     t[2] += s.verifyNanos;
                                     t[3] += s.catchUpNanos;
                                     t[4] += s.recursionNanos;
+                                    t[5] += s.prefillNanos;
+                                    t[6] += s.promptCatchUpNanos;
                                     for (int a = 0; a < s.acceptedDrafts.length; a++)
                                         histograms[m][d][a] += s.acceptedDrafts[a];
                                 } finally {
@@ -152,11 +154,13 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                     double verifications = t[0];
                     double stepMs = (t[2] + t[3] + t[4]) / 1e6 / verifications;
                     double tokensPerStep = t[1] / verifications;
-                    // The prompt's last catch-up is part of the first step; catch-up after a step counts with it.
+                    // Steps only: the prompt's catch-up (the MTP layer over every prompt token) and its first
+                    // drafts belong to the time to first token.
                     System.out.printf(
                             Locale.ROOT,
                             "%-6s depth %d: verify %6.2f ms, catch-up %5.2f ms, recursion %5.2f ms, tokens/step %.3f,"
-                                    + " step %6.2f ms -> %6.1f tok/s | accepted %s%n",
+                                    + " step %6.2f ms -> %6.1f tok/s | accepted %s | prompt: prefill %.2f s,"
+                                    + " MTP catch-up %.2f s%n",
                             modes.get(m),
                             depths[d],
                             t[2] / 1e6 / verifications,
@@ -165,7 +169,9 @@ class SpeculativeDepthScreenCudaIntegrationTest {
                             tokensPerStep,
                             stepMs,
                             1000.0 * tokensPerStep / stepMs,
-                            Arrays.toString(Arrays.copyOf(histograms[m][d], depths[d] + 1)));
+                            Arrays.toString(Arrays.copyOf(histograms[m][d], depths[d] + 1)),
+                            t[5] / 1e9 / prompts.size() / rounds,
+                            t[6] / 1e9 / prompts.size() / rounds);
                 }
             }
         }
