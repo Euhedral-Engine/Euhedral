@@ -131,6 +131,23 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_nvfp4_bf16(
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_gate_up_swiglu_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);
+/* Native Blackwell NVFP4 linear (docs/NVFP4_NATIVE.md): quantizes the BF16 input rows to NVFP4 in
+ * `scratch` (euhedral_cuda_nvfp4_activation_bytes) and multiplies with block-scaled FP4 tensor-core MMA.
+ * Available only on sm_12x devices (euhedral_cuda_nvfp4_native_available); returns
+ * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE otherwise, when EUHEDRAL_NVFP4_NATIVE=0, under exact numerics, or when
+ * in_features is not a multiple of 128. Activations are quantized (two NVFP4 terms by default, one with
+ * EUHEDRAL_NVFP4_NATIVE=1), so results differ from euhedral_cuda_linear_nvfp4_bf16. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_available(void);
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_nvfp4_activation_bytes(uint32_t rows, uint32_t in_features);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_nvfp4_native_bf16(
+        const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
+        uint64_t scratch_byte_size);
+/* The paired gate/up region on native NVFP4: `outputs` weight rows (gate first), outputs / 2 SwiGLU
+ * values per row, gate and up rounded to BF16 before SwiGLU. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16(
+        const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
 
 /* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/COMPRESSED_Q3.md): the same Q3G64_F16S values in
  * a smaller, entropy-coded layout. The decode route runs one row with relaxed numerics on the shapes

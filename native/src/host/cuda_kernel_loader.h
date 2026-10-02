@@ -13,6 +13,16 @@ int euhedral_cuda_load_kernel(
         CUmodule* module,
         CUfunction* function);
 
+/* Loads `function_name` from a module compiled for this device's arch-specific target (sm_XYa), for
+ * kernels that use arch-specific instructions such as block-scaled FP4 MMA. Returns
+ * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE when the device is not an sm_12x GPU. */
+int euhedral_cuda_load_native_kernel(
+        const void* anchor,
+        const char* source_name,
+        const char* function_name,
+        CUmodule* module,
+        CUfunction* function);
+
 /* Programmatic dependent launch. Only kernels registered here call griddepcontrol.wait first,
  * so only they may be launched with the serialization attribute. Only threads that called euhedral_cuda_pdl_select(1)
  * launch with it; EUHEDRAL_PDL=0 disables it everywhere. */

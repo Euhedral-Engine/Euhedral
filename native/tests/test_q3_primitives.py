@@ -305,7 +305,7 @@ def _check(status, what):
 class Gpu:
     """Owns one primary-context retain and one module for the test class."""
 
-    def __init__(self, source, include_dir=None, cpp_std=14):
+    def __init__(self, source, include_dir=None, cpp_std=14, architecture="compute_90"):
         nv, cu = NVRTC, CUDA
         self.create = _bind(nv, "nvrtcCreateProgram", [C.POINTER(P), C.c_char_p, C.c_char_p, I, P, P])
         self.compile = _bind(nv, "nvrtcCompileProgram", [P, I, C.POINTER(C.c_char_p)])
@@ -313,6 +313,8 @@ class Gpu:
         self.get_log = _bind(nv, "nvrtcGetProgramLog", [P, P])
         self.ptx_size = _bind(nv, "nvrtcGetPTXSize", [P, C.POINTER(C.c_size_t)])
         self.get_ptx = _bind(nv, "nvrtcGetPTX", [P, P])
+        self.cubin_size = _bind(nv, "nvrtcGetCUBINSize", [P, C.POINTER(C.c_size_t)])
+        self.get_cubin = _bind(nv, "nvrtcGetCUBIN", [P, P])
         self.destroy = _bind(nv, "nvrtcDestroyProgram", [C.POINTER(P)])
         self.retain = _bind(cu, "cuDevicePrimaryCtxRetain", [C.POINTER(P), I])
         self.release = _bind(cu, "cuDevicePrimaryCtxRelease_v2", [I])
@@ -328,6 +330,8 @@ class Gpu:
         self.launch_kernel = _bind(cu, "cuLaunchKernel", [P, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_uint,
                                                           C.c_uint, C.c_uint, P, C.POINTER(P), P])
         self.sync = _bind(cu, "cuCtxSynchronize", [])
+        self.set_attribute = _bind(cu, "cuFuncSetAttribute", [P, I, I])
+        self.architecture = architecture
         count = I()
         if _bind(cu, "cuInit", [C.c_uint])(0) or _bind(cu, "cuDeviceGetCount", [C.POINTER(I)])(C.byref(count)) \
                 or count.value == 0:
@@ -346,7 +350,7 @@ class Gpu:
         program = P()
         _check(self.create(C.byref(program), source, b"q3_linear_bf16_probe.cu", 0, None, None), "nvrtcCreate")
         try:
-            options = [f"--std=c++{cpp_std}".encode(), b"--gpu-architecture=compute_90", b"-I" + str(INCLUDE).encode(),
+            options = [f"--std=c++{cpp_std}".encode(), f"--gpu-architecture={self.architecture}".encode(), b"-I" + str(INCLUDE).encode(),
                        b"-DCOMMA=,", b"-I" + str(include_dir or (ROOT / "native/src")).encode(),
                        b"-I" + str(INCLUDE / "cccl").encode()]
             status = self.compile(program, len(options), (C.c_char_p * len(options))(*options))
@@ -357,9 +361,11 @@ class Gpu:
                 self.get_log(program, log)
                 raise RuntimeError(log.value.decode())
             size = C.c_size_t()
-            _check(self.ptx_size(program, C.byref(size)), "nvrtcGetPTXSize")
+            # A real architecture (sm_XY[a]) yields a cubin, a virtual one PTX for the driver to JIT.
+            real = self.architecture.startswith("sm_")
+            _check((self.cubin_size if real else self.ptx_size)(program, C.byref(size)), "nvrtcGet code size")
             ptx = C.create_string_buffer(size.value)
-            _check(self.get_ptx(program, ptx), "nvrtcGetPTX")
+            _check((self.get_cubin if real else self.get_ptx)(program, ptx), "nvrtcGet code")
             return ptx
         finally:
             self.destroy(C.byref(program))
@@ -405,14 +411,16 @@ class Gpu:
         _check(self.dtoh(buffer, ptr, size), "cuMemcpyDtoH")
         return buffer.raw
 
-    def launch(self, name, grid, arguments, synchronize=True, block=None):
+    def launch(self, name, grid, arguments, synchronize=True, block=None, shared=0):
         function = P()
         _check(self.function(C.byref(function), self.module, name.encode()), name)
+        if shared > 48 * 1024:  # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            _check(self.set_attribute(function, 8, shared), name + " shared size")
         params = (P * len(arguments))(*[C.cast(C.pointer(value), P) for value in arguments])
         grid_x, grid_y = grid if isinstance(grid, tuple) else (grid, 1)
         if block is None:
             block = 128 if name != "probe_stripe_codes" and name != "probe_pair_codes" else 32
-        _check(self.launch_kernel(function, grid_x, grid_y, 1, block, 1, 1, 0, None, params, None), name)
+        _check(self.launch_kernel(function, grid_x, grid_y, 1, block, 1, 1, shared, None, params, None), name)
         if synchronize:
             _check(self.sync(), name)
 

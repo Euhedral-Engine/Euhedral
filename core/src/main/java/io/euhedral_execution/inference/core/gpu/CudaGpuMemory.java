@@ -116,6 +116,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle copyDeviceToDevice2d;
     private final MethodHandle linearNvfp4Bf16;
     private final MethodHandle nvfp4GateUpSwiGluBf16;
+    private final MethodHandle nvfp4NativeAvailable;
+    private final MethodHandle nvfp4ActivationBytes;
+    private final MethodHandle linearNvfp4NativeBf16;
+    private final MethodHandle nvfp4NativeGateUpSwiGluBf16;
+    /// Whether the native Blackwell NVFP4 module loaded (null until first asked).
+    private volatile Boolean nvfp4Native;
     /// The stream whose launches the current thread is submitting, or null for synchronous calls.
     private final ThreadLocal<CudaStream> submitting = new ThreadLocal<>();
     /// One device region, reused by every P2E2 route that expands its tensor for a row-split kernel.
@@ -178,6 +184,44 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     .orElse(null);
             this.nvfp4GateUpSwiGluBf16 = symbols.find("euhedral_cuda_nvfp4_gate_up_swiglu_bf16")
                     .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
+                    .orElse(null);
+            this.nvfp4NativeAvailable = symbols.find("euhedral_cuda_nvfp4_native_available")
+                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            this.nvfp4ActivationBytes = symbols.find("euhedral_cuda_nvfp4_activation_bytes")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            this.linearNvfp4NativeBf16 = symbols.find("euhedral_cuda_linear_nvfp4_native_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.nvfp4NativeGateUpSwiGluBf16 = symbols.find("euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
                     .orElse(null);
             this.copyDeviceToDevice2d = symbols.find("euhedral_cuda_copy_device_to_device_2d")
                     .map(symbol -> linker.downcallHandle(
@@ -1371,9 +1415,40 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         });
     }
 
+    /// Rows from which an NVFP4 linear runs on native FP4 tensor cores (docs/NVFP4_NATIVE.md).
+    static final int NVFP4_NATIVE_MIN_ROWS = 64;
+
+    /// Whether the native Blackwell NVFP4 kernels are loaded: an sm_12x device, and not disabled with
+    /// EUHEDRAL_NVFP4_NATIVE=0.
+    public boolean nvfp4NativeAvailable() {
+        Boolean available = this.nvfp4Native;
+        if (available == null) {
+            ensureOpen();
+            try {
+                available = this.nvfp4NativeAvailable != null && (int) this.nvfp4NativeAvailable.invokeExact() != 0;
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("native NVFP4 availability invocation failed", failure);
+            }
+            this.nvfp4Native = available;
+        }
+        return available;
+    }
+
     @Override
     public void linearNvfp4Bf16(
             long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
+        if (rows >= NVFP4_NATIVE_MIN_ROWS && inFeatures % 128 == 0 && nvfp4NativeAvailable()) {
+            if (invokeNativeNvfp4(
+                    "native NVFP4 linear",
+                    this.linearNvfp4NativeBf16,
+                    input,
+                    weights,
+                    output,
+                    rows,
+                    inFeatures,
+                    outFeatures,
+                    weightBytes)) return;
+        }
         invokeNvfp4(
                 "NVFP4 linear", linearNvfp4Bf16, input, weights, output, rows, inFeatures, outFeatures, weightBytes);
     }
@@ -1381,6 +1456,18 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void nvfp4GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        if (rows >= NVFP4_NATIVE_MIN_ROWS && width % 128 == 0 && nvfp4NativeAvailable()) {
+            if (invokeNativeNvfp4(
+                    "native NVFP4 gate/up SwiGLU region",
+                    this.nvfp4NativeGateUpSwiGluBf16,
+                    input,
+                    weights,
+                    output,
+                    rows,
+                    width,
+                    outputs,
+                    weightBytes)) return;
+        }
         invokeNvfp4(
                 "NVFP4 gate/up SwiGLU region",
                 nvfp4GateUpSwiGluBf16,
@@ -1391,6 +1478,51 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 width,
                 outputs,
                 weightBytes);
+    }
+
+    /// Quantizes the activations into the shared scratch, ordered between lanes by its event, and runs
+    /// `kernel` on native FP4 tensor cores. False when the route declined (exact numerics select the
+    /// BF16-expansion kernels).
+    private boolean invokeNativeNvfp4(
+            String operation,
+            MethodHandle kernel,
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes) {
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        long activationBytes;
+        try {
+            activationBytes = (long) this.nvfp4ActivationBytes.invokeExact(rows, width);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("NVFP4 activation size invocation failed", failure);
+        }
+        boolean[] ran = {false};
+        withQ3Scratch(activationBytes, scratch -> {
+            int status;
+            try {
+                status = (int) kernel.invokeExact(
+                        MemorySegment.ofAddress(input),
+                        MemorySegment.ofAddress(weights),
+                        MemorySegment.ofAddress(output),
+                        MemorySegment.ofAddress(scratch),
+                        rows,
+                        width,
+                        outputs,
+                        weightBytes,
+                        activationBytes);
+            } catch (Throwable throwable) {
+                throw new GpuMemoryException(operation + " invocation failed", throwable);
+            }
+            if (status == ROUTE_UNAVAILABLE) return;
+            if (status != 0) throw new GpuMemoryException(q3Operation(operation, status), status);
+            ran[0] = true;
+        });
+        return ran[0];
     }
 
     private void invokeNvfp4(
