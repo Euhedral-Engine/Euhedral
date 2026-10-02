@@ -178,11 +178,15 @@ final class QwenCompactWeightLoader {
                 take(handles, "mtp/final_norm"));
     }
 
-    private static void validateInventory(QwenConfig config, Map<String, TensorDescriptor> descriptors)
+    /// The text inventory is required. The vision tower is optional as a whole: the NVFP4 profile omits
+    /// it, the compact Q3 profile carries all of it.
+    static void validateInventory(QwenConfig config, Map<String, TensorDescriptor> descriptors)
             throws QwenWeightLoadException {
-        if (descriptors.size() != EXPECTED_OBJECT_COUNT) {
+        int textObjects = EXPECTED_OBJECT_COUNT - EXPECTED_VISION_OBJECT_COUNT;
+        if (descriptors.size() != EXPECTED_OBJECT_COUNT && descriptors.size() != textObjects) {
             throw new QwenWeightLoadException("compact Qwen artifact must contain " + EXPECTED_OBJECT_COUNT
-                    + " runtime objects, found " + descriptors.size());
+                    + " runtime objects, or " + textObjects + " without the vision tower, found "
+                    + descriptors.size());
         }
         Set<String> expected = new LinkedHashSet<>();
         expected.add("text/token_embedding");
@@ -245,6 +249,7 @@ final class QwenCompactWeightLoader {
                 throw new QwenWeightLoadException("compact artifact contains unknown runtime object '" + name + "'");
             }
         }
+        if (visionCount == 0) return;
         if (visionCount != EXPECTED_VISION_OBJECT_COUNT) {
             throw new QwenWeightLoadException("compact artifact must contain " + EXPECTED_VISION_OBJECT_COUNT
                     + " vision runtime objects, found " + visionCount);
@@ -273,7 +278,8 @@ final class QwenCompactWeightLoader {
                 || descriptor.format() == WeightFormat.Q4_G64_FP16
                 || descriptor.format() == WeightFormat.Q5_G64_FP16
                 || descriptor.format() == WeightFormat.Q6_G64_FP16
-                || descriptor.format() == WeightFormat.W8_G32_FP16;
+                || descriptor.format() == WeightFormat.W8_G32_FP16
+                || descriptor.format() == WeightFormat.NVFP4;
         boolean p2e2 = descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
                 && descriptor.format() == WeightFormat.Q3_G64_FP16;
         if (quantized && descriptor.layout() != WeightLayout.ROW_SPLIT_K128_V1 && !p2e2) {
@@ -286,7 +292,9 @@ final class QwenCompactWeightLoader {
         if (expected != null
                 && (!java.util.Arrays.equals(expected.shape(), descriptor.shape())
                         || expected.dataType() != descriptor.dataType()
-                        || expected.format() != descriptor.format()
+                        || !(expected.format() == descriptor.format()
+                                || (descriptor.format() == WeightFormat.NVFP4
+                                        && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1))
                         || !(expected.layout() == descriptor.layout()
                                 || (p2e2 && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)))) {
             throw new QwenWeightLoadException(
@@ -294,7 +302,7 @@ final class QwenCompactWeightLoader {
         }
     }
 
-    private static Expected expectedDescriptor(String name) {
+    static Expected expectedDescriptor(String name) {
         if (name.equals("vision/patch_embedding")) {
             return quantized(new long[] {1152, 1536}, TensorDataType.BF16, WeightFormat.Q6_G64_FP16);
         }
@@ -477,7 +485,7 @@ final class QwenCompactWeightLoader {
         return new Expected(shape, dataType, format, WeightLayout.CONTIGUOUS_LE_V1);
     }
 
-    private record Expected(long[] shape, TensorDataType dataType, WeightFormat format, WeightLayout layout) {}
+    record Expected(long[] shape, TensorDataType dataType, WeightFormat format, WeightLayout layout) {}
 
     private static TensorHandle take(Map<String, TensorHandle> handles, String name) throws QwenWeightLoadException {
         TensorHandle handle = handles.get(name);
