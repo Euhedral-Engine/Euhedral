@@ -32,8 +32,8 @@ class SpeculativeVerifyCudaIntegrationTest {
     @Timeout(value = 1800, unit = TimeUnit.SECONDS)
     void verificationRowsAndCommittedStateEqualSequentialDecode() throws Throwable {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(System.getProperty(
-                "euhedral.speculative.artifact", System.getProperty("euhedral.qwen.nvfp4-artifact", "")));
+        Path artifact = Path.of(
+                System.getProperty("euhedral.speculative.artifact", System.getProperty("euhedral.qwen.artifact", "")));
         assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
@@ -93,8 +93,8 @@ class SpeculativeVerifyCudaIntegrationTest {
     @Timeout(value = 1800, unit = TimeUnit.SECONDS)
     void partiallyCommittedVerificationsLeaveSequentialState() throws Throwable {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(System.getProperty(
-                "euhedral.speculative.artifact", System.getProperty("euhedral.qwen.nvfp4-artifact", "")));
+        Path artifact = Path.of(
+                System.getProperty("euhedral.speculative.artifact", System.getProperty("euhedral.qwen.artifact", "")));
         assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));

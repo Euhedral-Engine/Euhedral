@@ -73,7 +73,9 @@ final class QwenCompactWeightLoader {
                     hostOffset += hostSlot(descriptor.byteSize());
                 } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
-            splitMtpAttention(handles, gpuMemory);
+            // Only a speculative load prepares the MTP layer for execution; other residencies keep exactly
+            // the artifact's objects.
+            if (residency == WeightResidency.SPECULATIVE) splitMtpAttention(handles, gpuMemory);
             return assemble(config, handles);
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);

@@ -49,7 +49,7 @@ class SpeculativeDecodeCudaIntegrationTest {
                         + " singly linked list, with a short explanation.<|im_end|>\n<|im_start|>assistant\n"
                         + "<think>\n\n</think>\n\n"));
         var artifactData = QwenArtifactReader.read(artifact);
-        long hostBytes = Long.getLong("euhedral.speculative.host-mib", 512L) << 20;
+        long hostBytes = Long.getLong("euhedral.speculative.host-mib", 1024L) << 20;
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 QwenModel model = QwenModel.load(
                         artifact,

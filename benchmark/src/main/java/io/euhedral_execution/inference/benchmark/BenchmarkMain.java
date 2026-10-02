@@ -123,9 +123,7 @@ public final class BenchmarkMain {
                 options.cudaLibrary(),
                 options.artifact(),
                 options.gpuHeadroomMiB(),
-                options.speculativeDepth() > 0 && options.weightResidency() == WeightResidency.EXECUTED
-                        ? WeightResidency.SPECULATIVE
-                        : options.weightResidency(),
+                options.speculativeDepth() > 0 ? WeightResidency.SPECULATIVE : options.weightResidency(),
                 options.hostWeightMiB() * 1024L * 1024L,
                 options.stagingSlots());
         if (capacity != null) {
