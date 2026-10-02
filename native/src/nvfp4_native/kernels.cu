@@ -36,8 +36,12 @@ EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_x2_16, 2, 1)
 EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_x2_32, 2, 2)
 EUHEDRAL_NVFP4N_SKINNY(euhedral_nvfp4n_skinny_x2_64, 2, 4)
 
-// FP32 partials (rows x cols) to BF16.
-extern "C" __global__ void euhedral_nvfp4n_skinny_finish(const float* partials, __nv_bfloat16* output, unsigned int count) {
+// FP32 partials (splits x count) summed in split order, to BF16.
+extern "C" __global__ void euhedral_nvfp4n_skinny_finish(
+        const float* partials, __nv_bfloat16* output, unsigned int count, unsigned int splits) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) output[i] = __float2bfloat16_rn(partials[i]);
+    if (i >= count) return;
+    float sum = partials[i];
+    for (unsigned int split = 1; split < splits; ++split) sum += partials[(unsigned long long)split * count + i];
+    output[i] = __float2bfloat16_rn(sum);
 }

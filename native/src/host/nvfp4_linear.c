@@ -257,7 +257,7 @@ static uint64_t activation_bytes(uint32_t rows, uint32_t in_features) {
 uint64_t euhedral_cuda_nvfp4_native_scratch_bytes(uint32_t rows, uint32_t in_features, uint32_t out_features) {
     uint64_t bytes = activation_bytes(rows, in_features);
     if (skinny_route(rows, in_features) && skinny_splits(in_features, out_features) > 1u)
-        bytes = align256(bytes) + 4ull * rows * out_features;
+        bytes = align256(bytes) + 4ull * skinny_splits(in_features, out_features) * rows * out_features;
     return bytes;
 }
 
@@ -308,17 +308,16 @@ static int launch_native(CUfunction kernel, uint64_t columns, const void* input,
     if (result != CUDA_SUCCESS) return finish(result);
     if (skinny) {
         /* Decode-like rows: weight streaming dominates, so 64-column CTAs, split over K when the
-         * columns alone cannot occupy the GPU, partials summed in FP32 and converted once. */
+         * columns alone cannot occupy the GPU; each split stores FP32 partials, summed in split order
+         * and converted once, so results are deterministic. */
         const uint32_t index = rows <= 16u ? 0u : rows <= 32u ? 1u : 2u, splits = skinny_splits(in_features, out_features);
         CUdeviceptr partials = splits > 1u ? scratch_ptr + align256(activation_bytes(rows, in_features)) : 0;
-        if (splits > 1u && cudaMemsetAsync((void*)(uintptr_t)partials, 0, 4ull * rows * out_features, stream) != cudaSuccess)
-            return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
         void* skinny_params[] = {&scratch_ptr, &weights_ptr, &output_ptr, &partials, &rows_arg, &in_arg, &out_arg};
         result = euhedral_launch_kernel(native_skinny[index], (out_features + SKINNY_COLUMNS - 1u) / SKINNY_COLUMNS, splits, 1,
                 128, 1, 1, skinny_shared_bytes(native_terms, 16u << index), stream, skinny_params, NULL);
         if (result != CUDA_SUCCESS || splits == 1u) return finish(result);
-        unsigned int count = rows * out_features;
-        void* finish_params[] = {&partials, &output_ptr, &count};
+        unsigned int count = rows * out_features, splits_arg = splits;
+        void* finish_params[] = {&partials, &output_ptr, &count, &splits_arg};
         return finish(euhedral_launch_kernel(native_finish, (count + 255u) / 256u, 1, 1, 256, 1, 1, 0, stream,
                 finish_params, NULL));
     }

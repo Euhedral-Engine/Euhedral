@@ -363,8 +363,9 @@ static __device__ __forceinline__ void linear(
 // CTA: 4 warps over 64 output columns (one warp per 16 columns, two n8 fragments) and all M rows
 // (kMF m16 fragments); K tile 256 values (128 code bytes per row); S::kStages-deep cp.async pipeline
 // so each SM keeps several weight tiles in flight. gridDim.y splits K: with one split the CTA writes
-// BF16; otherwise it adds its scaled FP32 partials into `partials` (rows x cols, zeroed) and
-// skinny_finish converts them.
+// BF16; otherwise it stores its scaled FP32 partials in its own slice of `partials` (splits x rows x
+// cols) and skinny_finish sums the slices in split order, so the result is deterministic and a row's
+// output does not depend on the other rows (row-independent MMAs, per-row activation scales).
 static constexpr int kSkinnyBK = 256, kSkinnyRowBytes = kSkinnyBK / 2, kSkinnyStride = kSkinnyRowBytes + 16;
 static constexpr int kSkinnyScaleBytes = kSkinnyBK / 16, kSkinnyCols = 64, kSkinnyThreads = 128;
 static constexpr int kSharedLimit = 101376;                   // sm_120 per-block opt-in
@@ -496,9 +497,9 @@ static __device__ __forceinline__ void skinny_linear(
                     if (col + 1u < cols) *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(x, y);
                     else *out = __float2bfloat16_rn(x);
                 } else {
-                    float* p = partials + (unsigned long long)row * cols + col;
-                    atomicAdd(p, x);
-                    if (col + 1u < cols) atomicAdd(p + 1, y);
+                    float* p = partials + ((unsigned long long)blockIdx.y * rows + row) * cols + col;
+                    p[0] = x;
+                    if (col + 1u < cols) p[1] = y;
                 }
             }
         }
