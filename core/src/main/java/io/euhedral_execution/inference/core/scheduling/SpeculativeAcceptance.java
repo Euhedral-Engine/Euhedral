@@ -20,6 +20,7 @@ public final class SpeculativeAcceptance {
     private final int maxOutputs;
     private int[] outputs;
     private int accepted;
+    private int rejectedBaseToken = -1;
 
     /// `rows` are the verified input tokens; `maxOutputs` caps the outputs this step may commit.
     public SpeculativeAcceptance(int[] rows, IntPredicate endOfGeneration, int maxOutputs) {
@@ -46,6 +47,7 @@ public final class SpeculativeAcceptance {
             }
         }
         this.accepted = accepted;
+        this.rejectedBaseToken = accepted + 1 < this.rows.length ? selected[accepted] : -1;
         this.outputs = Arrays.copyOf(outputs, count);
     }
 
@@ -57,6 +59,13 @@ public final class SpeculativeAcceptance {
     public int acceptedDrafts() {
         requireResolved();
         return this.accepted;
+    }
+
+    /// The base model's token where a draft was rejected (the token the first unconfirmed draft should
+    /// have been), or -1 when every draft was accepted.
+    public int rejectedBaseToken() {
+        requireResolved();
+        return this.rejectedBaseToken;
     }
 
     /// The tokens this step commits to the output, in order.

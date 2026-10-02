@@ -166,8 +166,21 @@ public record BenchmarkResult(
 
     /// Speculative decoding: verifications, `acceptedDrafts[a]` = verifications that accepted a drafts,
     /// output tokens they committed, and the time spent verifying versus drafting between them (ns).
+    /// `rejectionsInShortlist` / `rejectionsOutsideShortlist`: rejected drafts whose base token was / was not
+    /// in the draft head's shortlist.
     public record Speculative(
-            int verifications, long[] acceptedDrafts, int committedTokens, long verifyNanos, long draftNanos) {}
+            int verifications,
+            long[] acceptedDrafts,
+            int committedTokens,
+            long verifyNanos,
+            long draftNanos,
+            int rejectionsInShortlist,
+            int rejectionsOutsideShortlist) {
+        public Speculative(
+                int verifications, long[] acceptedDrafts, int committedTokens, long verifyNanos, long draftNanos) {
+            this(verifications, acceptedDrafts, committedTokens, verifyNanos, draftNanos, 0, 0);
+        }
+    }
 
     /// Nanosecond durations. Null means the boundary was not reached.
     public record Timings(

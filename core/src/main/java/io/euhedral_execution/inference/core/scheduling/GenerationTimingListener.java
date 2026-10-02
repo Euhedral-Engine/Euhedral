@@ -35,4 +35,11 @@ public interface GenerationTimingListener {
     /// drafting) and resolved at `executedNanos`, committed `outputs` tokens, accepting `acceptedDrafts`
     /// drafts. It replaces decode quanta, except a final commit-only quantum at the token budget.
     default void speculativeStep(long startNanos, long executedNanos, int outputs, int acceptedDrafts) {}
+
+    /// As [#speculativeStep(long, long, int, int)], also classifying a rejection: `rejection` is -1 when
+    /// every draft was accepted, 0 when the base token the rejected draft should have been was in the
+    /// draft head's shortlist (the MTP chose another), and 1 when it was not (no draft could match it).
+    default void speculativeStep(long startNanos, long executedNanos, int outputs, int acceptedDrafts, int rejection) {
+        speculativeStep(startNanos, executedNanos, outputs, acceptedDrafts);
+    }
 }
