@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Create the deterministic compact Q3 EDRL inventory used by NInfer.
+"""Create the deterministic compact EDRL inventories of the Qwen checkpoint.
+
+Profiles:
+  compact-q3 (default): the mixed Q3/Q4/Q5/W8/Q6 inventory used by NInfer (1,118 objects).
+  nvfp4: every text and MTP projection (and the LM and draft heads) in NVFP4; the token embedding
+         stays Q3 (a gather, no matmul) and the vision tower is omitted (785 objects).
 
 Quantization and fusion happen offline. The Java loader receives only final runtime
 objects and never reconstructs Hugging Face tensors or performs quantization.
@@ -42,6 +47,7 @@ FORMAT_ORDINAL = {
     "Q5G64_F16S": 7,
     "Q6G64_F16S": 8,
     "W8G32_F16S": 9,
+    "NVFP4": 12,
 }
 LAYOUT_ORDINAL = {"contiguous-le-v1": 0, "row-split-k128-v1": 1}
 QUANT = {
@@ -114,7 +120,20 @@ def direct_size(shape: tuple[int, ...], format_name: str) -> int:
     return checked_product(shape, "shape") * (2 if format_name == "BF16" else 4)
 
 
+def nvfp4_offsets(shape: tuple[int, ...]) -> tuple[int, int, int]:
+    """Row-split NVFP4: (scale plane offset, global scale offset, byte size)."""
+    if len(shape) != 2:
+        fail("NVFP4 requires a rank-2 shape")
+    n, k = shape
+    groups = align_up(k, 128) // 64
+    scale_offset = align_up(n * groups * 32, 256)
+    global_offset = align_up(scale_offset + n * groups * 4, 256)
+    return scale_offset, global_offset, global_offset + 4
+
+
 def payload_size(shape: tuple[int, ...], format_name: str) -> int:
+    if format_name == "NVFP4":
+        return nvfp4_offsets(shape)[2]
     return row_split_size(shape, format_name) if format_name in QUANT else direct_size(shape, format_name)
 
 
@@ -391,6 +410,93 @@ def quantize_matrix(output, base_offset: int, matrix: MatrixSource, format_name:
         output.write(np.ascontiguousarray(scales.astype("<f2")).tobytes())
 
 
+# NVFP4: E2M1 values in blocks of 16 along K, one E4M3 scale per block, one FP32 scale per tensor.
+# A weight decodes to e2m1(code) * e4m3(block scale) * global scale; codes and scales round to
+# nearest, ties to even, as the CUDA cvt instructions do.
+E2M1_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
+E4M3_VALUES = np.array(
+    [(code & 7) / 8 * 2.0**-6 if code < 8 else (1 + (code & 7) / 8) * 2.0 ** ((code >> 3) - 7) for code in range(127)],
+    dtype=np.float32,
+)
+NVFP4_BLOCK = 16
+E2M1_MAX = 6.0
+E4M3_MAX = 448.0
+
+
+def round_to_table(values: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """Index of the nearest table entry to each non-negative value, ties to the even index;
+    values above the table saturate to its last entry."""
+    upper = np.searchsorted(table, values, side="left").clip(1, len(table) - 1)
+    lower = upper - 1
+    below = values - table[lower]
+    above = table[upper] - values
+    pick_upper = (above < below) | ((above == below) & (upper % 2 == 0))
+    index = np.where(pick_upper, upper, lower)
+    index = np.where(values >= table[-1], len(table) - 1, index)
+    return np.where(values <= table[0], 0, index).astype(np.uint8)
+
+
+def nvfp4_global_scale(amax: float) -> np.float32:
+    return np.float32(amax) / np.float32(E2M1_MAX * E4M3_MAX)
+
+
+def quantize_nvfp4_rows(values: np.ndarray, global_scale: np.float32) -> tuple[np.ndarray, np.ndarray]:
+    """values float32 [rows, K] (K a multiple of 16) -> (packed codes [rows, K/2], E4M3 scales [rows, K/16])."""
+    rows, k = values.shape
+    blocks = values.reshape(rows, k // NVFP4_BLOCK, NVFP4_BLOCK)
+    if global_scale > 0:
+        block_scale = (np.max(np.abs(blocks), axis=2) / np.float32(E2M1_MAX) / global_scale).astype(np.float32)
+    else:
+        block_scale = np.zeros(blocks.shape[:2], dtype=np.float32)
+    scale_codes = round_to_table(block_scale, E4M3_VALUES)
+    decode = (E4M3_VALUES[scale_codes] * global_scale).astype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scaled = np.where(decode[..., None] > 0, np.abs(blocks) / decode[..., None], 0).astype(np.float32)
+    magnitude = round_to_table(scaled, E2M1_VALUES)
+    sign = ((blocks < 0) & (magnitude > 0)).astype(np.uint8) << 3
+    codes = (magnitude | sign).reshape(rows, k)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
+    return packed, scale_codes.astype(np.uint8)
+
+
+def dequantize_nvfp4_rows(packed: np.ndarray, scales: np.ndarray, global_scale: np.float32) -> np.ndarray:
+    rows = packed.shape[0]
+    codes = np.empty((rows, packed.shape[1] * 2), dtype=np.uint8)
+    codes[:, 0::2] = packed & 15
+    codes[:, 1::2] = packed >> 4
+    values = E2M1_VALUES[codes & 7] * np.where(codes & 8, -1.0, 1.0).astype(np.float32)
+    block = np.repeat(E4M3_VALUES[scales] * global_scale, NVFP4_BLOCK, axis=1).astype(np.float32)
+    return (values * block).astype(np.float32)
+
+
+def quantize_nvfp4_matrix(output, base_offset: int, matrix: MatrixSource) -> None:
+    n, k = matrix.shape
+    k_pad = align_up(k, 128)
+    scale_offset, global_offset, _ = nvfp4_offsets(matrix.shape)
+    rows_per_chunk = max(1, 32 * 1024 * 1024 // max(k, 1))
+    amax = 0.0
+    for begin in range(0, n, rows_per_chunk):
+        values = matrix.read_rows(begin, min(n, begin + rows_per_chunk))
+        if not np.isfinite(values).all():
+            fail("quantization source contains NaN or infinity")
+        amax = max(amax, float(np.max(np.abs(values))))
+    global_scale = nvfp4_global_scale(amax)
+    for begin in range(0, n, rows_per_chunk):
+        end = min(n, begin + rows_per_chunk)
+        values = matrix.read_rows(begin, end)
+        if k_pad != k:
+            padded = np.zeros((end - begin, k_pad), dtype=np.float32)
+            padded[:, :k] = values
+            values = padded
+        packed, scales = quantize_nvfp4_rows(values, global_scale)
+        output.seek(base_offset + begin * (k_pad // 2))
+        output.write(packed.tobytes())
+        output.seek(base_offset + scale_offset + begin * (k_pad // NVFP4_BLOCK))
+        output.write(scales.tobytes())
+    output.seek(base_offset + global_offset)
+    output.write(np.float32(global_scale).astype("<f4").tobytes())
+
+
 def write_direct(output, base_offset: int, store: SourceStore, action: tuple[str, Any]) -> None:
     kind, value = action
     if kind == "raw":
@@ -449,7 +555,20 @@ def add_direct(plans: list[ObjectPlan], name: str, shape: tuple[int, ...], store
     plans.append(ObjectPlan(name, shape, source_dtype, format_name, "contiguous-le-v1", direct_size(shape, format_name), writer))
 
 
-def add_quant(plans: list[ObjectPlan], name: str, matrix: MatrixSource, format_name: str) -> None:
+PROFILES = ("compact-q3", "nvfp4")
+# Objects that keep their compact format in the NVFP4 profile: the embedding is a gather.
+NVFP4_KEEP = frozenset({"text/token_embedding"})
+
+
+def add_quant_object(plans: list[ObjectPlan], name: str, matrix: MatrixSource, format_name: str, profile: str = "compact-q3") -> None:
+    if profile == "nvfp4" and name not in NVFP4_KEEP:
+        format_name = "NVFP4"
+    if format_name == "NVFP4":
+        plans.append(ObjectPlan(
+            name, matrix.shape, "BF16", "NVFP4", "row-split-k128-v1", payload_size(matrix.shape, "NVFP4"),
+            lambda output, offset, source=matrix: quantize_nvfp4_matrix(output, offset, source),
+        ))
+        return
     if format_name not in QUANT:
         fail(f"unknown quantized format {format_name}")
     plans.append(ObjectPlan(
@@ -463,8 +582,14 @@ def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, Matr
     return head_part(store, q_name, False), head_part(store, q_name, True)
 
 
-def build_plans(store: SourceStore, selected: np.ndarray) -> list[ObjectPlan]:
+def build_plans(store: SourceStore, selected: np.ndarray, profile: str = "compact-q3") -> list[ObjectPlan]:
+    if profile not in PROFILES:
+        fail(f"unknown profile {profile}")
     plans: list[ObjectPlan] = []
+
+    def add_quant(plans: list[ObjectPlan], name: str, matrix: MatrixSource, format_name: str) -> None:
+        add_quant_object(plans, name, matrix, format_name, profile)
+
     add_quant(plans, "text/token_embedding", source_matrix(store, "model.language_model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
     for layer in range(64):
         source_prefix = f"model.language_model.layers.{layer}."
@@ -518,6 +643,10 @@ def build_plans(store: SourceStore, selected: np.ndarray) -> list[ObjectPlan]:
         source_matrix(store, mtp + "mlp.up_proj.weight", (INTERMEDIATE, HIDDEN))), "Q3G64_F16S")
     add_quant(plans, "mtp/layer/mlp/down", source_matrix(store, mtp + "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE)), "Q3G64_F16S")
     add_direct(plans, "mtp/final_norm", (HIDDEN,), store, "mtp.norm.weight", (HIDDEN,))
+    if profile == "nvfp4":
+        if len(plans) != 785:
+            fail(f"NVFP4 inventory produced {len(plans)} objects, expected 785")
+        return plans
 
     add_quant(plans, "vision/patch_embedding", source_matrix_reshape(
         store, "model.visual.patch_embed.proj.weight", (1152, 3, 2, 16, 16), (1152, 1536)), "Q6G64_F16S")
@@ -657,7 +786,31 @@ def compare_reference(path: Path, plans: list[ObjectPlan]) -> dict[str, Any]:
     }
 
 
-def convert(model: Path, output_path: Path, ranking_path: Path, reference: Path | None, force: bool) -> None:
+def draft_token_ids(artifact: Path) -> np.ndarray:
+    """The draft-head shortlist stored in an existing compact artifact (text/draft_head_token_ids)."""
+    with artifact.open("rb") as handle:
+        magic, version, _, _, table_offset, count, reserved, _ = struct.unpack(">iiqqqiiq", handle.read(HEADER_SIZE))
+        if magic != MAGIC or version != VERSION or reserved != 0:
+            fail(f"{artifact} is not a compact EDRL v2 artifact")
+        handle.seek(table_offset)
+        for _ in range(count):
+            name = handle.read(struct.unpack(">i", handle.read(4))[0]).decode("utf-8")
+            rank = struct.unpack(">i", handle.read(4))[0]
+            shape = struct.unpack(f">{rank}q", handle.read(8 * rank))
+            _, _, _, offset, size = struct.unpack(">iiiqq", handle.read(28))
+            if name == "text/draft_head_token_ids":
+                if shape != (DRAFT_ROWS,) or size != DRAFT_ROWS * 4:
+                    fail("draft token id object has an unexpected shape")
+                handle.seek(offset)
+                selected = np.frombuffer(handle.read(size), dtype="<i4").astype(np.int64)
+                if np.unique(selected).size != DRAFT_ROWS:
+                    fail("draft token ids are not unique")
+                return selected
+    fail(f"{artifact} has no text/draft_head_token_ids")
+
+
+def convert(model: Path, output_path: Path, ranking_path: Path | None, reference: Path | None, force: bool,
+            profile: str = "compact-q3", draft_ids_from: Path | None = None) -> None:
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     config = read_json(model / "config.json")
@@ -666,9 +819,11 @@ def convert(model: Path, output_path: Path, ranking_path: Path, reference: Path 
         fail("source is not the supported Qwen3_5ForConditionalGeneration checkpoint")
     if text.get("num_hidden_layers") != 64 or text.get("vocab_size") != VOCAB_SIZE:
         fail("source topology does not match the registered compact Q3 profile")
-    selected = shortlist(model, ranking_path)
+    if (ranking_path is None) == (draft_ids_from is None):
+        fail("pass exactly one of --ranking and --draft-ids-from")
+    selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)
     with SourceStore(model) as store:
-        plans = build_plans(store, selected)
+        plans = build_plans(store, selected, profile)
         metadata = encode_metadata(config)
         table_size = len(encode_table(plans))
         data_base = HEADER_SIZE + len(metadata) + table_size
@@ -704,7 +859,7 @@ def convert(model: Path, output_path: Path, ranking_path: Path, reference: Path 
         formats[plan.format_name] = formats.get(plan.format_name, 0) + 1
         layouts[plan.layout] = layouts.get(plan.layout, 0) + 1
     manifest: dict[str, Any] = {
-        "format": "edrl-v2-compact-q3",
+        "format": "edrl-v2-compact-q3" if profile == "compact-q3" else "edrl-v2-compact-nvfp4",
         "source_model": str(model),
         "object_count": len(plans),
         "payload_bytes": sum(plan.byte_size for plan in plans),
@@ -712,9 +867,9 @@ def convert(model: Path, output_path: Path, ranking_path: Path, reference: Path 
         "sha256": sha256(output_path),
         "format_counts": formats,
         "layout_counts": layouts,
-        "fused_object_count": 259,
+        "fused_object_count": 259 if profile == "compact-q3" else None,
     }
-    if reference is not None:
+    if reference is not None and profile == "compact-q3":
         manifest["reference_comparison"] = compare_reference(reference, plans)
     with Path(f"{output_path}.manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
@@ -726,12 +881,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--ranking", type=Path, required=True)
+    parser.add_argument("--ranking", type=Path, help="token frequency ranking for the draft-head shortlist")
+    parser.add_argument("--draft-ids-from", type=Path, help="reuse the draft-head shortlist of this compact artifact")
+    parser.add_argument("--profile", choices=PROFILES, default="compact-q3")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     try:
-        convert(args.model, args.out, args.ranking, args.reference, args.force)
+        convert(args.model, args.out, args.ranking, args.reference, args.force, args.profile, args.draft_ids_from)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
