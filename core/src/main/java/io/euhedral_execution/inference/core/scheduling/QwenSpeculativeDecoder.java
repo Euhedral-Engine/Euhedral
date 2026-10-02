@@ -33,7 +33,10 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         public long verifications;
         public long outputTokens;
         public long verifyNanos;
+        /// MTP catch-up after verification steps; the prompt's, over every prompt token, is in
+        /// `promptCatchUpNanos` (time to first token, like `prefillNanos`).
         public long catchUpNanos;
+        public long promptCatchUpNanos;
         public long recursionNanos;
         public long prefillNanos;
         /// Rejections whose base token was in the draft shortlist, and outside it.
@@ -171,7 +174,9 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                 if (timing != null) timing.firstTokenSelected(System.nanoTime(), first);
                 next[next.length - 1] = first;
             } else next[next.length - 1] = prompt[end];
+            long catchingUp = System.nanoTime();
             int[] chunkDrafts = catchUp(offset, next, last);
+            this.statistics.promptCatchUpNanos += System.nanoTime() - catchingUp;
             if (last) drafts = chunkDrafts;
         }
         output.add(first);
@@ -236,6 +241,7 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         AttentionSequenceStates states = states();
         long seeds = states.draftSeedRows(tokens.length, this.hidden);
         long started = System.nanoTime();
+        boolean prompt = this.statistics.outputTokens == 0;
         // Pieces of at most CATCH_UP_ROWS rows: the draft view's workspace is retained at the largest
         // quantum it ran, and MTP cache appends are contiguous, so the pieces equal one catch-up.
         for (int first = 0; first < tokens.length; first += CATCH_UP_ROWS) {
@@ -251,7 +257,7 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                             draft && last ? this.draftLogits : null)
                     .withDraftSeed(seeds + (long) first * this.hidden * Short.BYTES, count));
         }
-        this.statistics.catchUpNanos += System.nanoTime() - started;
+        if (!prompt) this.statistics.catchUpNanos += System.nanoTime() - started;
         if (!draft) return null;
         int[] drafts = new int[this.depth];
         drafts[0] = this.draftTokens[this.draftLogits.selectedToken()];
@@ -268,7 +274,7 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                     .withDraftSeed(states.draftRecursionHidden(this.hidden), 1));
             drafts[i] = this.draftTokens[this.draftLogits.selectedToken()];
         }
-        this.statistics.recursionNanos += System.nanoTime() - started;
+        if (!prompt) this.statistics.recursionNanos += System.nanoTime() - started;
         return drafts;
     }
 
