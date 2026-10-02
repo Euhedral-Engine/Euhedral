@@ -185,6 +185,38 @@ class StageGraphTest {
     }
 
     @Test
+    void transferStagesRunOnlyOnTheTransferLaneAndNeverCarryTheComputeChain() {
+        RecordingStream home = this.stream, side = new RecordingStream(), copy = new RecordingStream();
+        side.base = 100;
+        copy.base = 200;
+        // 1 and 3 are transfers feeding 2 and 4; 0 -> 2 -> 4 is the compute chain.
+        StageTopology topology = StageTopology.submitted(new int[][] {{}, {}, {0, 1}, {2}, {2, 3}});
+        LanePool pool = LanePool.withTransferLane(new RecordingStream[] {home, side}, copy, LanePool.Placement.PATH);
+        assertEquals(2, pool.transferLane());
+        for (int stage = 0; stage < 64; stage++) assertTrue(pool.choose(stage, 2) < 2, "compute never takes it");
+        StageGraph graph = new StageGraph(
+                topology,
+                (owner, stage) -> stage == 1 || stage == 3
+                        ? new StageGraphFixtures.TransferStage(owner, stage)
+                        : new StageGraphFixtures.TestStage(owner, stage),
+                pool,
+                true,
+                this.source,
+                this.recycler);
+        TestQuantum quantum = start(graph);
+        drain(this.source);
+        // Each copy awaits its predecessors' markers (the preparation, then k2), and the lane joins home.
+        assertEquals(List.of("await:1", "t1", "mark:3", "await:4", "t3", "mark:5", "mark:201"), copy.kernels);
+        assertEquals(
+                List.of("k0", "k2", "k4"),
+                home.kernels.stream().filter(k -> k.startsWith("k")).toList());
+        home.retireNext(false);
+        drain(this.source);
+        assertEquals("SUCCESS", quantum.outcome.join());
+        graph.close();
+    }
+
+    @Test
     void submissionEdgeReleasesTheSuccessorBeforeTheProducersDeviceWorkRetires() {
         StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
         TestQuantum quantum = start(graph);

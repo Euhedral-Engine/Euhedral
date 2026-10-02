@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
+import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
@@ -23,6 +24,74 @@ class QwenFullModelExecutionPlanTest {
     private static final int INTERMEDIATE = 17408;
     private static final int VOCABULARY = 248320;
     private static long nextAddress = 10_000;
+    private static java.util.function.Predicate<String> hostBacked = name -> false;
+
+    @Test
+    void stagesEveryHostBackedUseThroughTheRingInEveryView() {
+        java.util.function.Predicate<String> selected =
+                name -> name.endsWith("/gdn/output") || name.endsWith("/mlp/down") || name.endsWith("/gdn/query_key");
+        QwenWeights weights = fullModelWeights(selected);
+        long largest = (long) HIDDEN * INTERMEDIATE;
+        WeightStaging staging = new WeightStaging(1L << 40, WeightStaging.slotBytesFor(largest), 3);
+        QwenExecutionPlan plan = new QwenExecutionPlan(weights, staging);
+        var decode = QwenExecutionContext.ExecutionKind.DECODE;
+        var prefill = QwenExecutionContext.ExecutionKind.PREFILL;
+        for (QwenExecutionPlan view : java.util.List.of(
+                plan.forExecution(decode, 1),
+                plan.forExecution(prefill, 3),
+                plan.forExecution(prefill, 512),
+                plan.forExecution(prefill, 1024))) {
+            assertTrue(view.stagesWeights());
+            java.util.List<QwenExecutionPlan.Instruction> transfers = new java.util.ArrayList<>();
+            java.util.List<QwenExecutionPlan.Instruction> consumers = new java.util.ArrayList<>();
+            java.util.List<Long> slots = new java.util.ArrayList<>();
+            for (QwenExecutionPlan.Instruction instruction : view.instructions()) {
+                if (instruction.kind() == QwenExecutionPlan.Kind.WEIGHT_TRANSFER) {
+                    assertTrue(instruction.weight().hostBacked());
+                    transfers.add(instruction);
+                    continue;
+                }
+                for (TensorHandle weight : instruction.weights()) {
+                    assertTrue(!weight.hostBacked(), weight.name());
+                    if (selected.test(weight.name())) {
+                        consumers.add(instruction);
+                        slots.add(weight.deviceAddress());
+                    }
+                }
+            }
+            // 48 GDN output and query_key projections and 64 FFN downs, each staged once per quantum.
+            assertEquals(48 + 48 + 64, consumers.size());
+            transfers.sort(java.util.Comparator.comparingInt(
+                    t -> (int) ((t.weight().deviceAddress() - (1L << 40)) / staging.slotBytes())));
+            for (int use = 0; use < consumers.size(); use++) {
+                long slot = staging.slotAddress(use % 3);
+                assertEquals(slot, slots.get(use));
+                QwenExecutionPlan.Instruction consumer = consumers.get(use);
+                int u = use;
+                QwenExecutionPlan.Instruction transfer = view.instructions().stream()
+                        .filter(t -> t.kind() == QwenExecutionPlan.Kind.WEIGHT_TRANSFER
+                                && consumer.dependencies().contains(t.id())
+                                && t.weight().deviceAddress() == slot)
+                        .findFirst()
+                        .orElseThrow(() -> new AssertionError("use " + u + " has no transfer into its slot"));
+                assertTrue(transfer.id() < consumer.id());
+                if (use < 3) assertEquals(java.util.List.of(), transfer.dependencies());
+                else assertEquals(java.util.List.of(consumers.get(use - 3).id()), transfer.dependencies());
+            }
+            assertEquals(
+                    consumers.size(),
+                    view.instructions().stream()
+                            .filter(i -> i.kind() == QwenExecutionPlan.Kind.WEIGHT_TRANSFER)
+                            .count());
+        }
+    }
+
+    @Test
+    void hostBackedWeightsNeedAStagingRing() {
+        QwenWeights weights = fullModelWeights(name -> name.endsWith("/mlp/down"));
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> new QwenExecutionPlan(weights));
+    }
 
     @Test
     void buildsOneWeightBoundGraphForAllDeclaredLayersAndFinalLogits() {
@@ -90,6 +159,19 @@ class QwenFullModelExecutionPlanTest {
     }
 
     private static QwenWeights fullModelWeights() {
+        return fullModelWeights(name -> false);
+    }
+
+    private static QwenWeights fullModelWeights(java.util.function.Predicate<String> host) {
+        hostBacked = host;
+        try {
+            return buildFullModelWeights();
+        } finally {
+            hostBacked = name -> false;
+        }
+    }
+
+    private static QwenWeights buildFullModelWeights() {
         QwenLayerType[] layerTypes = new QwenLayerType[64];
         QwenLayerWeights[] layers = new QwenLayerWeights[layerTypes.length];
         for (int layerIndex = 0; layerIndex < layerTypes.length; layerIndex++) {
@@ -183,14 +265,12 @@ class QwenFullModelExecutionPlanTest {
 
     private static TensorHandle quantized(String name, int rows, int columns, WeightFormat format) {
         long[] shape = {rows, columns};
+        long bytes = CompactTensorLayout.expectedByteSize(
+                shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1);
+        if (hostBacked.test(name))
+            return new TensorHandle(
+                    name, shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1, 0L, bytes, nextAddress++);
         return new TensorHandle(
-                name,
-                shape,
-                TensorDataType.BF16,
-                format,
-                WeightLayout.ROW_SPLIT_K128_V1,
-                nextAddress++,
-                CompactTensorLayout.expectedByteSize(
-                        shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1));
+                name, shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1, nextAddress++, bytes);
     }
 }

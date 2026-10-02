@@ -53,6 +53,8 @@ public final class QwenExecutionContext implements StageQuantum {
     private final int[] tokenIds;
     private final AtomicBoolean submitted = new AtomicBoolean();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    /// Releases the staging ring this quantum holds; null when it holds none.
+    private final AtomicReference<java.util.function.Consumer<GpuStream>> stagingRelease = new AtomicReference<>();
     private final CompletableFuture<Outcome> outcome = new CompletableFuture<>();
     private QwenSequenceState.ExecutionLease lease;
     private QwenExecutionWorkspace workspace;
@@ -187,6 +189,18 @@ public final class QwenExecutionContext implements StageQuantum {
     @Override
     public boolean stopRequested() {
         return hasFailureOrCancellation();
+    }
+
+    /// Binds the staging ring hold this quantum releases once its lanes joined.
+    void holdStaging(java.util.function.Consumer<GpuStream> release) {
+        if (!this.stagingRelease.compareAndSet(null, java.util.Objects.requireNonNull(release, "release")))
+            throw new IllegalStateException("quantum already holds the staging ring");
+    }
+
+    @Override
+    public void lanesJoined(GpuStream home) {
+        var release = this.stagingRelease.getAndSet(null);
+        if (release != null) release.accept(home);
     }
 
     @Override
