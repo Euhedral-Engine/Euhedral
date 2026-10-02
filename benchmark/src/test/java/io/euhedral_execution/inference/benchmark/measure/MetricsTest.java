@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import io.euhedral_execution.inference.benchmark.config.Scenario;
+import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.BenchmarkResult;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -39,7 +40,11 @@ class MetricsTest {
                 null);
         assertEquals(BenchmarkResult.SUCCESS, outcome.status());
         assertNull(outcome.reason());
-        assertEquals(new BenchmarkResult.Work(5, 3, 5, 3, 2, 1, false), outcome.work());
+        assertEquals(
+                new BenchmarkResult.Work(
+                        5, 3, 5, 3, 2, 1, false, null, BenchmarkResult.Work.outputSha256(List.of(1, 2, 3))),
+                outcome.work());
+        assertEquals(PromptMaterial.sha256("1,2,3"), outcome.work().outputSha256());
         assertEquals(
                 new BenchmarkResult.Timings(100L, 800L, 100L, 1_100L, 350L, 300L, 100L, 1_550L, 1_800L),
                 outcome.timings());

@@ -97,7 +97,8 @@ public final class Metrics {
                 sampledDecode,
                 commitOnly >= 0 ? 1 : 0,
                 eos,
-                speculative);
+                speculative,
+                Work.outputSha256(tokens));
 
         Long prefill = timing.prefillCount == 0
                 ? null

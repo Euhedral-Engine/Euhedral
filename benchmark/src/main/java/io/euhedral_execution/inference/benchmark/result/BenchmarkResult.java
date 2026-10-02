@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.List;
 import java.util.Objects;
 
 /// One benchmark row, schema `euhedral-inference.benchmark-result` version 1.
@@ -111,7 +112,29 @@ public record BenchmarkResult(
             Integer decodeSampledTokens,
             Integer finalCommitQuanta,
             Boolean eosObserved,
-            Speculative speculative) {
+            Speculative speculative,
+            String outputSha256) {
+        public Work(
+                Integer promptTokens,
+                Integer prefillQuanta,
+                Integer prefillTokens,
+                Integer generatedTokens,
+                Integer decodeSampledTokens,
+                Integer finalCommitQuanta,
+                Boolean eosObserved,
+                Speculative speculative) {
+            this(
+                    promptTokens,
+                    prefillQuanta,
+                    prefillTokens,
+                    generatedTokens,
+                    decodeSampledTokens,
+                    finalCommitQuanta,
+                    eosObserved,
+                    speculative,
+                    null);
+        }
+
         public Work(
                 Integer promptTokens,
                 Integer prefillQuanta,
@@ -128,7 +151,16 @@ public record BenchmarkResult(
                     decodeSampledTokens,
                     finalCommitQuanta,
                     eosObserved,
+                    null,
                     null);
+        }
+
+        /// SHA-256 of the returned token IDs (decimal, comma-separated): equal across arms that must
+        /// generate the same tokens, such as greedy decode with and without speculative decoding.
+        public static String outputSha256(List<Integer> tokens) {
+            StringBuilder text = new StringBuilder();
+            for (int token : tokens) text.append(text.isEmpty() ? "" : ",").append(token);
+            return io.euhedral_execution.inference.benchmark.prompt.PromptMaterial.sha256(text.toString());
         }
     }
 

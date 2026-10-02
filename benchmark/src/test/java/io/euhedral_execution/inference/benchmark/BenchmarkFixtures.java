@@ -130,10 +130,12 @@ public final class BenchmarkFixtures {
                 Clock.fixed(Instant.parse("2026-09-25T12:00:00Z"), ZoneOffset.UTC));
     }
 
-    public static Map<Scenario, PromptMaterial> prompts(List<Scenario> scenarios) {
-        Map<Scenario, PromptMaterial> prompts = new LinkedHashMap<>();
+    public static Map<Scenario, List<PromptMaterial>> prompts(List<Scenario> scenarios) {
+        Map<Scenario, List<PromptMaterial>> prompts = new LinkedHashMap<>();
         for (Scenario scenario : scenarios)
-            prompts.put(scenario, PromptMaterial.build(scenario.targetPromptTokens(), 1L, BenchmarkFixtures::words));
+            prompts.put(
+                    scenario,
+                    List.of(PromptMaterial.build(scenario.targetPromptTokens(), 1L, BenchmarkFixtures::words)));
         return prompts;
     }
 
