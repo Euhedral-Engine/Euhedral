@@ -4,10 +4,15 @@ The question was whether NVFP4 weights can run near compact-Q3 speed with real V
 MTP retained, by keeping NVFP4 as the execution representation and streaming part of the weights
 from pinned host RAM ahead of use.
 
-**Conclusion: not on this platform.** Single-sequence decode reads every weight every token. The
-measured host-to-device bandwidth (25 GB/s) cannot stream the offload that useful headroom needs
-anywhere near Q3's token time. Prefill could hide it. Measured on 2026-10-01 on an RTX 5070 Ti
-(16 GB) with an i9-14900K.
+**Conclusion:** Single-sequence decode reads every weight every token, and the platform's
+host-to-device rate cannot stream the useful offload (at least 1.8 GiB) within Q3's 16 ms token. It
+takes 44 ms even at the 44 GB/s that huge-page pinned memory reaches; 4 KiB-page pinned memory under
+the IOMMU stalls at 25 GB/s.
+
+**Staged NVFP4 can match non-MTP Q3 only with MTP accepting about 2.75 or more tokens per
+verification step**, and Q3 would gain from MTP too. Prefill can hide the transfers.
+
+Measured on 2026-10-01 on an RTX 5070 Ti (16 GB) with an i9-14900K.
 
 ## Memory budget
 
@@ -32,27 +37,62 @@ more once staging buffers are counted.
 non-uniform FP4 grid already equalizes code use. The block scales carry 3.63 of their 8. Only the
 scales compress usefully, saving 0.75 GiB.
 
+## Platform
+
+**Link: PCIe Gen 5 x16, about 63 GB/s theoretical per direction.** Under transfer load sysfs
+reports 32 GT/s x16 for both the GPU (`01:00.0`) and its root port (`00:01.0`), and `nvidia-smi`
+reports gen 5 current and max, x16. The link drops to 2.5 GT/s when idle.
+
+**The GPU hangs off the CPU's own PCIe root port.** `nvidia-smi topo -m` shows CPU affinity 0-31 on
+NUMA node 0, and the PCI tree shows no switch and no chipset path. The CPU-attached NVMe has its own
+root port (`00:06.0`), so it does not split the GPU's lanes.
+
+**IOMMU: Intel VT-d in translated mode.** `dmar0` is active, all 24 groups are `DMA-FQ`, and the
+kernel command line has no `iommu=pt`.
+
+**Host DRAM: about 52-55 GB/s read.** A STREAM-style test with 16-32 threads gives copy 47 GB/s,
+triad 49-53 GB/s and read 52-55 GB/s.
+
+All copies below use genuinely pinned memory (`cudaHostAlloc`, or `cudaHostRegister`), as raw
+`cudaMemcpyAsync` timed with events, 1 GiB transfers:
+
+| Pinned host memory | H2D | D2H |
+|---|---|---|
+| `cudaHostAlloc` (4 KiB pages; also write-combined and portable variants) | 25.0-25.4 GB/s | 22.5 GB/s |
+| `malloc` + `cudaHostRegister`, 4 KiB pages | 24.8 GB/s | 21.7 GB/s |
+| `malloc` + `cudaHostRegister`, 2 MiB transparent huge pages | **43.9-44.1 GB/s** | **56.4 GB/s** |
+
+Two copy streams over huge-page buffers give the same 43.7 GB/s.
+
+**What limits the 4 KiB-page copies is IOMMU translation.** Translated DMA over 4 KiB pages
+throttles the copy engine at about 25 GB/s. Huge pages let the IOMMU map 2 MiB at a time, and D2H
+then reaches the link's practical rate.
+
+H2D stays at 44 GB/s. That is GPU-initiated reads of host memory, which run below D2H's posted
+writes, plus any translation cost left. Booting with `iommu=pt` would separate the two.
+
+**Staging buffers must be huge-page-backed pinned memory**, registered with `cudaHostRegister`.
+`cudaHostAlloc` alone caps at 25 GB/s here.
+
 ## Bandwidth budget
 
-**Host-to-device: 25 GB/s.** Pinned `cudaMemcpyAsync` from default, write-combined and portable
-memory, in 4-256 MiB transfers, with 1, 2 or 4 copy streams, alone or beside a memory-bound kernel,
-all reach the same rate. The link trains at Gen 5 x16 under load, so the ceiling is on the host side.
-Device-to-host: 22 GB/s.
+**Host-to-device: 44 GB/s** with huge-page pinned memory (25 GB/s with 4 KiB pages). Transfer times
+below use 44 GB/s.
 
 Streaming cost of each family per decode token, from host RAM, in compressed bytes (4.26 bits per
 weight):
 
-| Family | Bytes per layer | PCIe time per layer | Whole family |
+| Family | Bytes per layer | PCIe time per layer (44 GB/s) | Whole family |
 |---|---|---|---|
-| FFN gate_up (x64) | 94.9 MB | 3.80 ms | 5.66 GiB |
-| FFN down (x64) | 47.4 MB | 1.90 ms | 2.83 GiB |
-| GDN value_z (x48) | 33.5 MB | 1.34 ms | 1.50 GiB |
-| GDN query_key (x48) | 11.2 MB | 0.45 ms | 0.50 GiB |
-| GDN output (x48) | 16.7 MB | 0.67 ms | 0.75 GiB |
-| attention query_key (x16) | 19.5 MB | 0.78 ms | 0.29 GiB |
-| attention gate_value (x16) | 19.5 MB | 0.78 ms | 0.29 GiB |
-| attention output (x16) | 16.7 MB | 0.67 ms | 0.25 GiB |
-| LM head (x1) | 676.8 MB | 27.07 ms | 0.63 GiB |
+| FFN gate_up (x64) | 94.9 MB | 2.16 ms | 5.66 GiB |
+| FFN down (x64) | 47.4 MB | 1.08 ms | 2.83 GiB |
+| GDN value_z (x48) | 33.5 MB | 0.76 ms | 1.50 GiB |
+| GDN query_key (x48) | 11.2 MB | 0.25 ms | 0.50 GiB |
+| GDN output (x48) | 16.7 MB | 0.38 ms | 0.75 GiB |
+| attention query_key (x16) | 19.5 MB | 0.44 ms | 0.29 GiB |
+| attention gate_value (x16) | 19.5 MB | 0.44 ms | 0.29 GiB |
+| attention output (x16) | 16.7 MB | 0.38 ms | 0.25 GiB |
+| LM head (x1) | 676.8 MB | 15.38 ms | 0.63 GiB |
 
 Compact-Q3 decode takes 16.0 ms per token (62.7 tok/s at 64 + 128), about 0.25 ms per layer for
 every family together.
@@ -67,17 +107,18 @@ token do. With perfect overlap a token takes max(GPU time, PCIe time).
 10.7 GiB. At the same DRAM efficiency that is about 17.6 ms per token, 10% slower than Q3, before
 any offload.
 
-**Offload hides only up to the GPU time.** 0.4 GiB per token stays under 17.6 ms, which frees
-nothing useful. The minimum useful offload, 1.8 GiB, is 77 ms per token: 4.8x Q3's token time.
+**Offload hides only up to the GPU time.** At 44 GB/s, 0.72 GiB per token stays under 17.6 ms
+(0.4 GiB at 25 GB/s). The minimum useful offload, 1.8 GiB, is 44 ms per token: 2.7x Q3's token time.
 Matching Q3 would need 120 GB/s, nearly twice PCIe 5.0 x16's theoretical rate.
 
 **MTP does not change the ratio.** It divides streamed bytes and GPU work by the same number of
-tokens accepted per verification step. Against non-MTP Q3, offloaded NVFP4 would need about 4.8
-accepted tokens per step to break even.
+tokens accepted per verification step. Against non-MTP Q3 (16 ms per token), offloaded NVFP4 would
+need about 2.75 accepted tokens per step to break even (4.8 at 25 GB/s). Euhedral has no MTP decode
+yet, so acceptance has not been measured.
 
 ## Prefill
 
-A chunk reuses its weights across all its tokens. 1.8 GiB is 77 ms per chunk, against about 417 ms
+A chunk reuses its weights across all its tokens. 1.8 GiB is 44 ms per chunk, against about 417 ms
 of compute for a 512-token chunk, so overlapped transfers could hide it.
 
 Prefill-only staging is not useful alone: decode is the binding regime.
