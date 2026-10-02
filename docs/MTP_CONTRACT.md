@@ -159,7 +159,7 @@ The full-acceptance case is a = 3 with 4 tokens committed.
   **bitwise**.
 - This holds only if the verifier's rows are bitwise identical to single-row decode. See §6.
 
-## 6. Open: the verifier must be numerically identical to single-row decode
+## 6. The verifier is numerically identical to single-row decode
 
 The oracle is ordinary greedy decode, which runs every row through the decode kernels:
 - the NVFP4 M = 1 GEMV with **BF16 activations**;
@@ -167,14 +167,28 @@ The oracle is ordinary greedy decode, which runs every row through the decode ke
 - the decode GDN path.
 
 Committed tokens and state equal ordinary decode exactly only if the verifier computes each of its
-rows with arithmetic identical to that single-row path.
-- **Native NVFP4 OMMA cannot do that.** It requires FP4 activations (`kind::mxf4nvf4` only accepts
-  E2M1 × E2M1; docs/NVFP4_NATIVE.md), so its row-0 logits differ from ordinary decode's.
-- Two-term activations keep the difference at the drift floor, but near-ties will flip tokens.
-- The existing multi-row attention and GDN kernels (prefill paths) also differ from the decode
-  kernels in accumulation order.
-- The skinny kernel's split-K atomics are not even run-to-run deterministic.
+rows with arithmetic identical to that single-row path. Native NVFP4 OMMA cannot do that against the
+GEMV: it needs FP4 activations (`kind::mxf4nvf4` only accepts E2M1 × E2M1). The multi-row prefill
+attention and GDN kernels also accumulate in a different order from the decode kernels.
 
-**This is a conflict between two campaign requirements**: exact equality with ordinary greedy decode,
-and verifier linears on native OMMA. It needs a decision before Phase 2. The options are in the
-campaign log.
+**Decision (2026-10-01): exact first, native as a second mode.**
+
+- **Default mode: row-exact verification.** A VERIFY quantum selects row-exact execution
+  (`euhedral_cuda_row_exact_select`). Every operator whose kernel depends on the row count then runs
+  each row through its one-row path:
+  - attention, q/k norm and RoPE, residual norms and the GDN recurrence, row by row;
+  - NVFP4, Q3, Q4 and Q5 linears through multi-row twins of the one-row GEMV kernels
+    (`nvfp4::decode_rows<M>`, `q3::contiguous_decode_rows<M>`, `q45::contiguous_decode_rows<B, M>`,
+    for M = 2 to 8). Each repeats the one-row FMA sequence for every token row while streaming the
+    weights once, so every row is bitwise identical to one-row decode.
+- **Second mode: native numerics** (`ExecutionGpu.selectNvfp4NativeDecode`,
+  `EUHEDRAL_NVFP4_NATIVE_DECODE=1`). Every NVFP4 linear, one row included, runs on the native skinny
+  OMMA kernel.
+  - Each row's MMA, and its activation global scale, are independent of the other rows.
+  - The split-K reduction stores per-split partials and sums them in split order, so it is
+    deterministic.
+  - So an M-row native verification equals native single-row decode, and the oracle in this mode is
+    greedy decode with the same native numerics.
+
+Both modes are tested bitwise, on tokens and on GDN and KV state, by
+`SpeculativeDecodeCudaIntegrationTest`. Results are in docs/MTP_SPECULATIVE.md.
