@@ -21,6 +21,9 @@ euhedral:
     # worker-cpus: 2,3            (processor IDs or inclusive ranges, e.g. 2-5,8)
     # model-id: qwen3.8-27b       (the name clients send as "model")
     # prefill-chunk-tokens: 512  (optional; prompt tokens per prefill quantum, default 512)
+    # host-weight-mib: 1280      (optional; weights kept in pinned host memory for longer contexts, default 0)
+    # staging-slots: 4           (optional; device slots staging host-backed projections, default 4)
+    # speculative-depth: 3       (optional; MTP drafts per verification for greedy requests, default 0: off)
     shutdown-timeout: 10s
   api:
     default-max-tokens: 4096
