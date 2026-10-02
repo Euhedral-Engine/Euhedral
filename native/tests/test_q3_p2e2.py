@@ -58,6 +58,7 @@ void* euhedral_cuda_submission_stream(void) { return NULL; }
 void euhedral_cuda_pdl_register(CUfunction function) { (void)function; }
 int euhedral_cuda_exact_numerics(void) { return exact; }
 int euhedral_cuda_select_exact_numerics(int value) { int previous = exact; exact = value; return previous; }
+int euhedral_cuda_row_exact(void) { return 0; }
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int gx, unsigned int gy, unsigned int gz,
         unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared, CUstream stream,
         void** parameters, void** extra) {
@@ -133,6 +134,32 @@ class P2e2KernelTest(unittest.TestCase):
             self.gpu.launch("euhedral_q3_p2e2_decode", rows // 16,
                             [C.c_uint64(dx), C.c_uint64(dc), C.c_uint64(y1), C.c_uint(k), C.c_uint(rows)])
             return self.gpu.download(y0, rows * 2), self.gpu.download(y1, rows * 2)
+
+    def test_contiguous_rows_twins_are_bitwise_one_row_decode(self):
+        """Row-exact speculative verification: each row of euhedral_q3_decode_contiguous_rowsM is bit for
+        bit the one-row contiguous kernel's output for that row."""
+        rows, k = 48, 5120
+        source, scale_offset = row_split(realistic(self.rng, rows, k), self.rng)
+        with contextlib.ExitStack() as stack:
+            dw = self.owned(stack, self.gpu, self.gpu.upload(source))
+            for m in range(2, 9):
+                with self.subTest(m=m):
+                    x = (self.rng.standard_normal((m, k)).astype(np.float32) * 3.0)
+                    xb = (x.view(np.uint32) >> 16).astype(np.uint16)
+                    dx = self.owned(stack, self.gpu, self.gpu.upload(xb.tobytes()))
+                    dy = self.owned(stack, self.gpu, self.gpu.zeros(m * rows * 2, fill=SENTINEL))
+                    self.gpu.launch(f"euhedral_q3_decode_contiguous_rows{m}", rows // 16,
+                                    [C.c_uint64(dx), C.c_uint64(dw), C.c_uint64(dy), C.c_uint(m), C.c_uint(k),
+                                     C.c_uint(rows), C.c_uint64(scale_offset)])
+                    together = self.gpu.download(dy, m * rows * 2)
+                    for t in range(m):
+                        dxt = self.owned(stack, self.gpu, self.gpu.upload(xb[t].tobytes()))
+                        dyt = self.owned(stack, self.gpu, self.gpu.zeros(rows * 2, fill=SENTINEL))
+                        self.gpu.launch("euhedral_q3_decode_contiguous", rows // 16,
+                                        [C.c_uint64(dxt), C.c_uint64(dw), C.c_uint64(dyt), C.c_uint(1), C.c_uint(k),
+                                         C.c_uint(rows), C.c_uint64(scale_offset)])
+                        self.assertEqual(together[t * rows * 2:(t + 1) * rows * 2], self.gpu.download(dyt, rows * 2),
+                                         f"row {t}")
 
     def test_decode_matches_contiguous_bitwise(self):
         for rows, k in ((16, 1024), (48, 3072), (32, 5120)):

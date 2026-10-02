@@ -41,6 +41,7 @@ void* euhedral_cuda_submission_stream(void) { return NULL; }
 void euhedral_cuda_pdl_register(CUfunction function) { (void)function; }
 int euhedral_cuda_exact_numerics(void) { return 0; }
 int euhedral_cuda_select_exact_numerics(int exact) { (void)exact; return 0; }
+int euhedral_cuda_row_exact(void) { return 0; }
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int gx, unsigned int gy, unsigned int gz,
         unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared, CUstream stream,
         void** parameters, void** extra) {

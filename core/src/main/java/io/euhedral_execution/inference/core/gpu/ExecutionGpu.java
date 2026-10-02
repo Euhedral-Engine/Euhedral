@@ -461,6 +461,12 @@ public abstract class ExecutionGpu implements GpuMemory {
     /// bit for bit as a one-row operation at that row's position would (speculative verification).
     public void selectRowExact(boolean enabled) {}
 
+    /// Whether Q3, Q4 and Q5 linears honour [#selectRowExact] themselves, so a row-exact quantum can
+    /// launch them once over all its rows instead of once per row.
+    public boolean rowExactQuantizedLinears() {
+        return false;
+    }
+
     /// Native-numerics NVFP4 decode: every NVFP4 linear, one row included, runs on native FP4 tensor cores
     /// (FP4 activations), even inside row-exact quanta. Native rows are computed independently of each
     /// other and deterministically, so a verification's rows equal single-row decode in this mode too

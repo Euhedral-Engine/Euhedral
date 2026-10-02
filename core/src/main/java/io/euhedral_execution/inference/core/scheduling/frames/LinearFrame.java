@@ -41,7 +41,12 @@ public final class LinearFrame extends QwenStageFrame {
             if (logits) context.logitsProduced(output);
             return;
         }
-        if (context.kind() == QwenExecutionContext.ExecutionKind.VERIFY && rows > 1) {
+        boolean quantized = instruction.kind() == QwenExecutionPlan.Kind.Q3_LINEAR
+                || instruction.kind() == QwenExecutionPlan.Kind.Q4_LINEAR
+                || instruction.kind() == QwenExecutionPlan.Kind.Q5_LINEAR;
+        if (context.kind() == QwenExecutionContext.ExecutionKind.VERIFY
+                && rows > 1
+                && !(quantized && gpu().rowExactQuantizedLinears())) {
             // Row-exact verification: each row takes exactly the route and kernel one-row decode does.
             int outputBytes = instruction.kind() == QwenExecutionPlan.Kind.BF16_LINEAR ? Float.BYTES : Short.BYTES;
             for (int row = 0; row < rows; row++) {
