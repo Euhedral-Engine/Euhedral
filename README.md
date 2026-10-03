@@ -15,10 +15,10 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 
 | Artifact | Quantization | Representation | File size | Compression |
 |---|---|---|---|---|
-| `q3` | Q3 | uncompressed | @Q3_SIZE@ | |
-| `q3-compressed` | Q3 | compressed | @Q3C_SIZE@ | lossless: the same values as `q3`, bit for bit |
-| `nvfp4` | NVFP4 | uncompressed | @NV_SIZE@ | |
-| `nvfp4-compressed` | NVFP4 | compressed | @NVC_SIZE@ | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
+| `q3` | Q3 | uncompressed | 11.72 GiB (12.58 GB) | |
+| `q3-compressed` | Q3 | compressed | 10.16 GiB (10.91 GB) | lossless: the same values as `q3`, bit for bit |
+| `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
+| `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
 The engine reads what an artifact is from the file and picks the fastest validated execution for it: kernels by row count,
 FP8 and FP4 tensor-core prefill, the attention implementation, the speculative-decoding depth and which weights stay in
@@ -26,30 +26,97 @@ host memory. All of that is automatic.
 
 ## Performance
 
-RTX 5070 Ti (16 GB, 70 SMs), Ryzen/Intel desktop with the GPU also driving the display, Linux, driver 615.71. Greedy decoding
-of chat prompts with MTP speculative decoding; `tok/s` is output tokens per second after the first token. One run per cell.
+RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display, Linux, one run per row after one warmup. Greedy
+decoding with MTP speculative decoding (two drafted tokens for Q3, three for NVFP4); decode `tok/s` is output tokens per second
+after the first token. Prefill and time to first token (TTFT) include the whole prompt.
 
-@PERFORMANCE_TABLE@
+| Artifact | Context (prompt tokens) | Prefill tok/s | TTFT | Decode tok/s (MTP) |
+|---|---|---|---|---|
+| `q3` | 4K (3,964) | 1,974 | 2.10 s | 116.9 |
+| | 16K (15,930) | 1,801 | 9.14 s | 118.7 |
+| | 32K (31,906) | 1,636 | 19.9 s | 110.1 |
+| | 64K (59,111) | 1,401 | 43.7 s | 98.0 |
+| `q3-compressed` | 4K | 1,838 | 2.25 s | 63.3 |
+| | 16K | 1,689 | 9.72 s | 65.0 |
+| | 32K | 1,543 | 21.1 s | 61.6 |
+| | 64K | 1,333 | 46.1 s | 57.3 |
+| | 128K (128,000) | 989 | 134 s | 46.3 |
+| `nvfp4` | 4K | 2,380 | 1.78 s | 63.8 |
+| | 16K | 2,133 | 7.77 s | 54.5 |
+| | 32K | 1,900 | 17.2 s | 56.1 |
+| | 64K | 1,591 | 38.7 s | 60.3 |
+| `nvfp4-compressed` | 4K | 2,420 | 1.73 s | 97.6 |
+| | 16K | 2,158 | 7.66 s | 91.4 |
+| | 32K | 1,932 | 16.9 s | 82.3 |
+| | 64K | 1,613 | 38.5 s | 61.9 |
 
-Memory is the artifact's resident device bytes (weights, KV cache and sequence state for that context), and the pinned host
-memory the engine uses for weights that do not fit beside the KV cache. The longest context shown for each artifact is the
-longest this card holds with desktop use; see [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md).
+The 4K, 16K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
+and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are
+chat prompts.
+
+| Artifact | File | Device memory in use at 32K / 64K | Host-backed weights at 32K / 64K | Longest context run |
+|---|---|---|---|---|
+| `q3` | 11.72 GiB | 12.8 / 13.3 GiB | none | 64K |
+| `q3-compressed` | 10.16 GiB | 11.3 / 11.8 GiB (14.0 GiB at 128K) | none | 128K |
+| `nvfp4` | 14.52 GiB | 13.9 / 13.9 GiB | 1.22 / 1.77 GiB | 64K |
+| `nvfp4-compressed` | 13.77 GiB | 13.9 / 13.9 GiB | 0.46 / 1.03 GiB | 64K |
+
+Device memory is what the engine allocated at its peak during the run: the resident weights, the KV cache of the context, the
+sequence state, and the workspaces. The CUDA context and kernel modules come on top. An uncompressed NVFP4 model is larger than
+the card's memory budget at these contexts, so the engine holds part of it in pinned host memory and streams it in for every token.
+
+Residency is described in [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md) and [docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md).
 
 ## Quality
 
 Error is measured four separate ways because they answer different questions. All use the 1279 teacher-forced tokens
 that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint run in llama.cpp on the CPU as the reference.
 
-@QUALITY_TABLES@
+**Model and quantization error** — the artifact against the BF16 checkpoint (reference: BF16 in llama.cpp on the CPU):
+
+| Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
+|---|---|---|---|---|---|
+| BF16 reference | 2.128 | 8.39 | | | |
+| `q3`, `q3-compressed` | 2.403 | 11.05 | +0.275 ± 0.025 | 0.400 | 70.5% |
+| `nvfp4` | 2.178 | 8.83 | +0.051 ± 0.011 | 0.163 | 86.4% |
+| `nvfp4-compressed` | 2.183 | 8.87 | +0.056 ± 0.011 | 0.161 | 86.9% |
+
+**Compression-induced error** — the compressed artifact against its uncompressed one:
+
+| Pair | Result |
+|---|---|
+| `q3-compressed` against `q3` | lossless: the 1279 logit vectors are bitwise equal, as is every drift measurement below |
+| `nvfp4-compressed` against `nvfp4` | NLL +0.005 ± 0.011, KL 0.062, top-1 agreement 87.0% |
+
+**Relaxed-execution drift** — the production kernels against the exact scalar kernels on the same weights, 1024 teacher-forced
+decode steps after a 512-token prefill:
+
+| Artifact | Hidden-state relative error | Mean KL | Top-1 agreement |
+|---|---|---|---|
+| `q3`, `q3-compressed` | 7.6% | 4.7e-3 | 97.9% |
+| `nvfp4` | 7.0% | 3.9e-3 | 97.3% |
+| `nvfp4-compressed` | 7.4% | 3.4e-3 | 97.8% |
+
+The error settles within about 150 positions and does not grow after that.
+
+**Exact speculative verifier** — verification of drafts is row-exact: the logits and the KV and GDN state after a
+verification are bit for bit those of one-row decoding, and speculative generation produces exactly the tokens of ordinary
+greedy decoding. This holds for all four artifacts (`SpeculativeVerifyCudaIntegrationTest`,
+`SpeculativeDecodeCudaIntegrationTest`).
 
 How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest decode, fits everywhere:** `q3`. Choose `q3-compressed` when you need the extra ~1.5 GB of VRAM; the outputs are identical.
-- **Highest fidelity:** `nvfp4`. It needs roughly 2 GB of weights in host memory at 32K context on a 16 GB card, which costs speed.
-- **NVFP4 on a small card:** `nvfp4-compressed` brings that host memory down; its quality cost is in the table above.
-- Larger cards keep more weights on the device and run faster; the engine measures free memory at start and decides.
+- **Fastest, and the one that fits everywhere:** `q3`: 117 tok/s at 4K and 98 tok/s at 64K, with no host-backed weights. Its
+  error against BF16 is the largest of the four (perplexity 11.05 against 8.39 on the quality text).
+- **More room instead of speed:** `q3-compressed` returns exactly the `q3` outputs from a file 1.56 GiB smaller, which is what lets it
+  hold a 128K context on this card. Verification and prefill rebuild each tensor on the fly, so decode runs at about half
+  of `q3`'s speed.
+- **Highest fidelity:** the NVFP4 artifacts (perplexity 8.83 and 8.87). On a 16 GB card `nvfp4` keeps 1.2 to 1.8 GiB of weights in host memory at 32K to 64K of
+  context and streams them in for every token; `nvfp4-compressed` needs less than half of that, which makes it faster than `nvfp4` up to 32K
+  of context at a quality cost within the noise of the measurement (table above).
+- A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.
 
 ## Quick start
 
