@@ -12,10 +12,7 @@ not results. Nothing here has been gated in the model yet.
 
 ### 1. Long-context decode and verify attention at DRAM speed
 
-**Status (2026-10-03): done.** The cause was not bytes in flight but one latency-bound warp per
-scheduler; a three-warp CTA with the same arithmetic (bitwise identical) took 16K one-row attention from 156 to 38 µs
-per layer, decode in the model +11.4% at 16K and +21.3% at 32K, and MTP2 decode +19% at 16K and +38% at 32K. Fusing the verifier rows, merging inside the decode kernel and sharing the query rotation were bounded with skip toggles and are not worth building (3%, 0.2%, 2.5%). See
-[../ATTENTION_DECODE.md](../ATTENTION_DECODE.md).
+**Status (2026-10-03): done.** See [../ATTENTION_DECODE.md](../ATTENTION_DECODE.md) for the kernel, its performance and the rejected variants.
 
 **Evidence**
 - At 16K, decode attention takes 2.83 ms per token (Q3, one row; docs/MTP_VERIFIER.md "Final
@@ -46,10 +43,7 @@ cold KV pages, bitwise against the current kernel's per-row results.
 
 ### 2. Get prefill off the half-rate BF16 tensor path
 
-**Status (2026-10-03): done with the MXFP8 option.** Q3, Q4 and Q5 prefill linears, the FFN gate/up and down and the GDN
-input projections run on block-scaled E4M3 MMA with two exact activation terms: 1.4-1.7x per operator, time to first
-token -26% at 4K, -25% at 16K, -23% at 32K, decode unchanged, drift against the exact oracle unchanged. INT8 was
-screened and rejected. See [../PREFILL_MX.md](../PREFILL_MX.md).
+**Status (2026-10-03): done with the MXFP8 option.** See [../PREFILL_MX.md](../PREFILL_MX.md) for the kernels, their performance and the rejected variants.
 
 **Evidence** ([tensor-cores.md](tensor-cores.md))
 - Q3/Q4/Q5 prefill uses BF16 HMMA with FP32 accumulate: a 102 TFLOPS ceiling, 57 achieved in the FFN

@@ -1,14 +1,17 @@
 #pragma once
 #include "nvfp4_kv.cuh"
 #include "nvfp4_attention.cuh"
+#include "nvfp4_pipe.cuh"
 // FlashAttention-2 style NVFP4 prefill (relaxed). A CTA owns 16 query rows of one KV head's group of
-// G query heads, one warp per query head (blockDim = 32 G, G <= 8). Each 32-key tile of the cache is
-// expanded once into padded shared FP16 rows that the G warps share; the rotated queries (A fragments)
+// G query heads, one compute warp per query head and two producer warps (blockDim = 32 (G + 2), G <= 6). Each
+// 32-key tile of the cache is expanded once into padded shared FP16 rows that the G warps share; the rotated queries (A fragments)
 // and the 16 x 256 FP32 output stay in registers, scores and probabilities never leave registers, and
 // the online softmax uses quad shuffles. mma.sync m16n8k16 FP16 with FP32 accumulation; only the
 // accumulation order differs from euhedral_attention_prefill32_nvfp4 (and its _exact twin).
 namespace fa2 {
 constexpr int D = 256, KT = 32, STRIDE = D + 8;   // padded FP16 row stride (528 bytes)
+constexpr int kProducerWarps = 2;
+constexpr unsigned kSharedBytes = 2 * 2 * KT * STRIDE * 2;  // [slot][K, V] FP16 tiles: 67584 bytes
 static __device__ __forceinline__ void mma16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
@@ -50,20 +53,35 @@ static __device__ __forceinline__ void stage(__half* kv, const unsigned char* co
 }
 }  // namespace fa2
 
+// The rewrite: query-head warps compute, two more warps (the producers) expand the K and V tiles ahead of them into a
+// double buffer, handed over by mbarriers, so the tile expansion no longer stalls the MMAs and the per-tile CTA
+// barriers are gone. Every value is computed by the same operations in the same order as in the single-role kernel
+// (reference_prefill_fa2.cuh), so the output is bit for bit identical. Query-head groups up to 6 (8 warps); the
+// double buffer is dynamic shared memory (fa2::kSharedBytes).
 extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_fa2_nvfp4(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
         const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         __nv_bfloat16* output, unsigned rows, unsigned queryHeads, unsigned keyHeads,
         unsigned headDim, unsigned cacheLength, unsigned long long start) {
     using namespace fa2;
+    using namespace nvfp4pipe;
+    extern __shared__ __align__(16) __half kv[];  // [slot][K, V][KT][STRIDE]
+    __shared__ __align__(16) unsigned pairs[256];
+    __shared__ unsigned long long mbarriers[4];   // full[0..1], empty[0..1]
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, tig = lane & 3u;
     const unsigned group = queryHeads / keyHeads;
     const unsigned kh = blockIdx.x % keyHeads, first = (blockIdx.x / keyHeads) * 16;
     const unsigned head = kh * group + warp, width = (queryHeads + keyHeads) * D;
-    __shared__ __align__(16) __half kv[2 * KT * STRIDE];
-    __half* kbuf = kv;
-    __half* vbuf = kv + KT * STRIDE;
-    // Rotated queries: two warps at a time through qstage, then into A fragments (16 rows x 256 dims).
+    const bool producer = warp >= group;
+    for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) pairs[i] = e2m1_pair_bits(i);
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < 2; s++) {
+            mbarrier_init(&mbarriers[s], kProducerWarps * 32);
+            mbarrier_init(&mbarriers[2 + s], group * 32);
+        }
+    }
+    // Rotated queries: two warps at a time through qstage (the first slot's buffers), then into A fragments (16 rows x 256
+    // dims). The producers only take part in the barriers.
     unsigned qa[16][4];
     for (unsigned pass = 0; pass < (group + 1) / 2; pass++) {
         if (warp / 2 == pass) {
@@ -80,15 +98,88 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
         }
         __syncthreads();
     }
+    __syncthreads();  // mbarriers and the table are visible to every warp, the query staging is free
+    const unsigned last = min(cacheLength, (unsigned)(start + min(first + 16, rows)));
+    const unsigned tiles = (last + KT - 1) / KT;
+    if (producer) {
+        const unsigned pt = threadIdx.x - group * 32;  // 0 .. 32 kProducerWarps - 1
+        constexpr unsigned kThreads = kProducerWarps * 32, kPerThread = KT * nvfp4kv::kGroups / kThreads;
+        uint2 codes[2][kPerThread];
+        unsigned scales[2][kPerThread];
+        auto load = [&](unsigned base) {
+#pragma unroll
+            for (unsigned i = 0; i < kPerThread; i++) {
+                const unsigned group_index = pt + kThreads * i, token = base + group_index / nvfp4kv::kGroups;
+                const unsigned slot = group_index % nvfp4kv::kGroups;
+                const bool valid = token < last;
+                const unsigned char* row = nvfp4kv::cache_row(keyPages, valid ? token : base, kh, keyHeads);
+                const unsigned char* value = nvfp4kv::cache_row(valuePages, valid ? token : base, kh, keyHeads);
+                const uint2 kc = *reinterpret_cast<const uint2*>(row + slot * 8), vc = *reinterpret_cast<const uint2*>(value + slot * 8);
+                codes[0][i] = valid ? kc : make_uint2(0, 0);
+                codes[1][i] = valid ? vc : make_uint2(0, 0);
+                scales[0][i] = valid ? row[nvfp4kv::kCodeBytes + slot] : 0u;
+                scales[1][i] = valid ? value[nvfp4kv::kCodeBytes + slot] : 0u;
+            }
+        };
+        if (tiles > 0) load(0);
+        for (unsigned tile = 0; tile < tiles; tile++) {
+            const unsigned base = tile * KT, slot = tile & 1u;
+            uint2 next_codes[2][kPerThread];
+            unsigned next_scales[2][kPerThread];
+            if (tile + 1 < tiles) {
+                // Fetch the next tile while this one is expanded.
+#pragma unroll
+                for (unsigned i = 0; i < kPerThread; i++) {
+                    const unsigned group_index = pt + kThreads * i, token = base + KT + group_index / nvfp4kv::kGroups;
+                    const unsigned slot_index = group_index % nvfp4kv::kGroups;
+                    const bool valid = token < last;
+                    const unsigned char* row = nvfp4kv::cache_row(keyPages, valid ? token : base, kh, keyHeads);
+                    const unsigned char* value = nvfp4kv::cache_row(valuePages, valid ? token : base, kh, keyHeads);
+                    const uint2 kc = *reinterpret_cast<const uint2*>(row + slot_index * 8), vc = *reinterpret_cast<const uint2*>(value + slot_index * 8);
+                    next_codes[0][i] = valid ? kc : make_uint2(0, 0);
+                    next_codes[1][i] = valid ? vc : make_uint2(0, 0);
+                    next_scales[0][i] = valid ? row[nvfp4kv::kCodeBytes + slot_index] : 0u;
+                    next_scales[1][i] = valid ? value[nvfp4kv::kCodeBytes + slot_index] : 0u;
+                }
+            }
+            if (tile >= 2) mbarrier_wait(&mbarriers[2 + slot], ((tile >> 1) - 1) & 1u);
+#pragma unroll
+            for (unsigned plane = 0; plane < 2; plane++) {
+                __half* destination_plane = kv + (slot * 2 + plane) * KT * STRIDE;
+#pragma unroll
+                for (unsigned i = 0; i < kPerThread; i++) {
+                    const unsigned group_index = pt + kThreads * i, token = group_index / nvfp4kv::kGroups, slot_index = group_index % nvfp4kv::kGroups;
+                    const unsigned scale = scale_pair(scales[plane][i]);
+                    const unsigned words[2] = {codes[plane][i].x, codes[plane][i].y};
+                    unsigned out[8];
+#pragma unroll
+                    for (int h = 0; h < 2; h++)
+#pragma unroll
+                        for (int b = 0; b < 4; b++) out[h * 4 + b] = half2_multiply(pairs[(words[h] >> (8 * b)) & 0xFFu], scale);
+                    uint4* destination = reinterpret_cast<uint4*>(destination_plane + token * STRIDE + slot_index * 16);
+                    destination[0] = make_uint4(out[0], out[1], out[2], out[3]);
+                    destination[1] = make_uint4(out[4], out[5], out[6], out[7]);
+                }
+            }
+            mbarrier_arrive(&mbarriers[slot]);
+            if (tile + 1 < tiles) {
+#pragma unroll
+                for (unsigned plane = 0; plane < 2; plane++)
+#pragma unroll
+                    for (unsigned i = 0; i < kPerThread; i++) { codes[plane][i] = next_codes[plane][i]; scales[plane][i] = next_scales[plane][i]; }
+            }
+        }
+        return;
+    }
     float o[32][4];
     for (int j = 0; j < 32; j++) { o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f; }
     float m0 = -__int_as_float(0x7f800000), m1 = m0, l0 = 0.0f, l1 = 0.0f;
     const unsigned row0 = first + g, row1 = first + g + 8;
-    const unsigned last = min(cacheLength, (unsigned)(start + min(first + 16, rows)));
-    for (unsigned base = 0; base < last; base += KT) {
-        stage(kbuf, keyPages, base, last, kh, keyHeads);
-        stage(vbuf, valuePages, base, last, kh, keyHeads);
-        __syncthreads();
+    for (unsigned tile = 0; tile < tiles; tile++) {
+        const unsigned base = tile * KT, slot = tile & 1u;
+        const __half* kbuf = kv + (slot * 2) * KT * STRIDE;
+        const __half* vbuf = kv + (slot * 2 + 1) * KT * STRIDE;
+        mbarrier_wait(&mbarriers[slot], (tile >> 1) & 1u);
         // S = Q K^T: 16 rows x 32 keys (4 n-tiles of 8 keys).
         float s[4][4];
         for (int n = 0; n < 4; n++) { s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f; }
@@ -139,11 +230,14 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
                 mma16816(o[2 * jp + 1], pa[k], b[2], b[3]);
             }
         }
-        __syncthreads();
+        if (tile + 2 < tiles) mbarrier_arrive(&mbarriers[2 + slot]);
     }
-    // Normalize, rotate back and gate: rows through shared memory, two warps at a time.
+    // Normalize, rotate back and gate: rows through shared memory, two warps at a time (named barrier 1: the query-head
+    // warps only; the producers are done).
+    const unsigned compute_threads = group * 32;
+    asm volatile("bar.sync 1, %0;" ::"r"(compute_threads) : "memory");
     const float inv0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, inv1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
-    float* rowsbuf = reinterpret_cast<float*>(kv);  // 16 x 256 FP32 = 16 KB per warp; kv holds two
+    float* rowsbuf = reinterpret_cast<float*>(kv);  // 16 x 256 FP32 = 16 KB per warp; two warps at a time
     for (unsigned pass = 0; pass < (group + 1) / 2; pass++) {
         if (warp / 2 == pass) {
             float* buf = rowsbuf + (warp & 1u) * 16 * D;
@@ -167,6 +261,6 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
                 }
             }
         }
-        __syncthreads();
+        asm volatile("bar.sync 1, %0;" ::"r"(compute_threads) : "memory");
     }
 }

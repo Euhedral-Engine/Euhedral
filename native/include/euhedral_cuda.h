@@ -167,6 +167,9 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_mx_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
         uint64_t scratch_byte_size);
+/* Names, for the calling thread, the number of weight rows of the whole tensor a linear's output-row chunk belongs to
+ * (0 clears it), so the split-K choice, and with it the summation order, is that of the whole tensor. */
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_q3_mx_select_split_rows(uint32_t weight_rows);
 /* Q4 and Q5 tensors (bits = 4 or 5) on the same route. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q45_mx_bf16(
         int bits, const void* input, const void* weights, void* output, void* scratch,

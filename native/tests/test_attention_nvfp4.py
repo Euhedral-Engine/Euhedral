@@ -16,6 +16,7 @@ from test_q3_primitives import Gpu, NVRTC, CUDA
 
 P, U = C.c_uint64, C.c_uint
 PAGE_TOKENS = 256
+FA2_SHARED = 2 * 2 * 32 * 264 * 2  # fa2::kSharedBytes
 ROW_BYTES = 144
 if np is not None:
     MAGNITUDES = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], dtype=np.float64)
@@ -71,7 +72,7 @@ def unpack_rows(data):
 class Nvfp4AttentionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.gpu = Gpu(b'#include "attention/kernels.cu"\n#include "attention/reference_decode_gqa.cuh"\n' + br'''
+        cls.gpu = Gpu(b'#include "attention/kernels.cu"\n#include "attention/reference_decode_gqa.cuh"\n#include "attention/reference_prefill_fa2.cuh"\n' + br'''
 extern "C" __global__ void probe_nvfp4_encode(const float* input, unsigned char* output, unsigned int count) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = nvfp4kv::e2m1_encode(input[i]);
@@ -260,7 +261,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                     np.testing.assert_allclose(observed[-1][1], observed[-2][1], rtol=1e-2, atol=1e-4)
                     # The FlashAttention-2 leaf: 16 query rows x one KV head's query-head group per CTA.
                     self.gpu.launch('euhedral_attention_prefill_fa2_nvfp4', ((rows + 15) // 16) * heads, args,
-                                    block=32 * (query_heads // heads))
+                                    block=32 * (query_heads // heads + 2), shared=FA2_SHARED)
                     capture('prefill_fa2')
                     np.testing.assert_allclose(observed[-1][1], observed[-3][1], rtol=1e-2, atol=1e-4)
                 else:
@@ -398,6 +399,36 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                         results.append((self.gpu.download(scratch, used), self.gpu.download(out, rows * query_heads * 512)))
                     self.assertEqual(results[0][0], results[1][0], f"partials, rows {rows}")
                     self.assertEqual(results[0][1], results[1][1], f"merged output, rows {rows}")
+
+    def test_fa2_prefill_warp_specialized_equals_single_role_reference_bitwise(self):
+        """The producer/consumer FlashAttention-2 prefill kernel equals, bit for bit, the single-role kernel it replaced
+        (reference_prefill_fa2.cuh): chunk starts inside the cache, partial row tiles, partial last key tiles, page
+        edges, query-head groups of 1, 3 and 6, every finite cache scale."""
+        rng = np.random.default_rng(0x7e5a)
+        for rows, start, heads, query_heads in [(16, 0, 4, 24), (17, 40, 4, 24), (33, 250, 2, 12), (64, 1000, 4, 24),
+                                                (130, 31, 1, 6), (20, 511, 2, 6), (5, 3, 1, 1), (96, 2000, 4, 24)]:
+            with self.subTest(rows=rows, start=start, heads=heads, query_heads=query_heads), contextlib.ExitStack() as scope:
+                length = start + rows
+                width = (heads + query_heads) * 256
+                qbits, _ = bf16(rng.normal(0, .3, (rows, width)))
+                gbits, _ = bf16(rng.normal(0, .2, (rows, width)))
+                kt, kp = self.paged(scope, length + 8, heads)
+                vt, vp = self.paged(scope, length + 8, heads)
+                for page in kp + vp:
+                    raw = rng.integers(0, 256, (PAGE_TOKENS * heads, ROW_BYTES), dtype=np.uint8)
+                    raw[:, 128:] = rng.integers(0, 0x7f, (PAGE_TOKENS * heads, 16))
+                    self.gpu.htod(page, C.create_string_buffer(raw.tobytes(), raw.nbytes), raw.nbytes)
+                qp = self.owned(scope, self.gpu.upload(qbits.tobytes()))
+                gp = self.owned(scope, self.gpu.upload(gbits.tobytes()))
+                outputs = []
+                for name, block, shared in [('euhedral_attention_prefill_fa2_nvfp4_reference', 32 * (query_heads // heads), 0),
+                                            ('euhedral_attention_prefill_fa2_nvfp4', 32 * (query_heads // heads + 2), FA2_SHARED)]:
+                    out = self.owned(scope, self.gpu.zeros(rows * query_heads * 512, 0x5A))
+                    self.gpu.launch(name, ((rows + 15) // 16) * heads,
+                                    [P(qp), P(gp), P(kt), P(vt), P(out), U(rows), U(query_heads), U(heads), U(256),
+                                     U(length), P(start)], block=block, shared=shared)
+                    outputs.append(self.gpu.download(out, rows * query_heads * 512))
+                self.assertEqual(outputs[0], outputs[1])
 
     def test_split_append_and_prefill_preserve_cache_and_continuation(self):
         rows, heads, query_heads = 261, 1, 6

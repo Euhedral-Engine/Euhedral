@@ -12,7 +12,7 @@
 
 /* Q3 prefill on block-scaled FP8 tensor cores (native/src/q3_mx, docs/PREFILL_MX.md): the BF16 activations are
  * split into two E4M3 terms with a power-of-two block scale (exact for BF16), the Q3 codes are exact E4M3, and the
- * MMA accumulates in FP32 at the full FP8 rate, twice the BF16 rate on GeForce Blackwell. Needs an sm_12x device;
+ * MMA accumulates in FP32 at the full FP8 rate of GeForce Blackwell. Needs an sm_12x device;
  * EUHEDRAL_Q3_MX=0 disables it, exact numerics decline it. */
 #ifdef _WIN32
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -79,11 +79,22 @@ int euhedral_cuda_q3_mx_available(void) {
 /* Split-K factor of a linear: one CTA per 128 x 128 output tile fills the SMs in whole waves, so a skinny grid (few
  * rows, few outputs) leaves SMs idle in its last wave. Splitting K by s multiplies the CTAs and divides each one's
  * work; the cost model is waves / s plus a few percent per split for the FP32 partials, and a split is only taken when
- * it is clearly better. Splits divide the 64-code groups; the paired gate/up region never splits. */
+ * it is clearly better. Splits divide the 64-code groups; the paired gate/up region never splits.
+ * A P2E2 tensor too large to expand at once runs in output-row chunks whose results must equal the whole tensor's, so the
+ * summation order may not depend on the chunk width: the caller names the whole tensor's rows for the calling thread
+ * (euhedral_cuda_q3_mx_select_split_rows) and the split is chosen from those. */
+#ifdef _WIN32
+static __declspec(thread) uint32_t split_rows_override;
+#else
+static _Thread_local uint32_t split_rows_override;
+#endif
+void euhedral_cuda_q3_mx_select_split_rows(uint32_t weight_rows) { split_rows_override = weight_rows; }
+
 static uint32_t choose_splits(uint32_t rows, uint32_t width, uint32_t weight_rows, int paired) {
-    const uint64_t tiles = (((uint64_t)rows + 127u) / 128u) * (weight_rows / 128u), groups = width / 64u;
     uint32_t best = 1u;
+    if (split_rows_override != 0u) weight_rows = split_rows_override;
     if (paired) return best;
+    const uint64_t tiles = (((uint64_t)rows + 127u) / 128u) * (weight_rows / 128u), groups = width / 64u;
     double best_cost = (double)((tiles + sm_count - 1u) / sm_count);
     const double single = best_cost;
     for (uint32_t s = 2u; s <= 4u; s *= 2u) {

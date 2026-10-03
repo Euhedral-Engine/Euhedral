@@ -89,6 +89,8 @@ static CUfunction attention_qk_norm_rope_rows;
 static CUfunction attention_kv_append;
 static CUfunction attention_causal;
 static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
+/* fa2::kSharedBytes of native/src/attention/nvfp4_prefill_fa2.cuh: the K and V tiles, double buffered. */
+#define FA2_SHARED_BYTES 67584u
 static CUfunction attention_prefill_nvfp4_exact, attention_decode_nvfp4_exact, attention_prefill_fa2, attention_decode_gqa;
 /* Row-exact multi-row twins of decode attention and its merge (speculative verification). */
 static CUfunction attention_decode_rows, attention_decode_gqa_rows, attention_merge_rows;
@@ -199,6 +201,9 @@ static void initialize_modules(void) {
         get_function(attention_module, &attention_prefill_nvfp4_exact, "euhedral_attention_prefill32_nvfp4_exact");
     if (status == CUDA_SUCCESS)
         get_function(attention_module, &attention_prefill_fa2, "euhedral_attention_prefill_fa2_nvfp4");
+    if (attention_prefill_fa2 != NULL
+            && cuFuncSetAttribute(attention_prefill_fa2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)FA2_SHARED_BYTES) != CUDA_SUCCESS)
+        attention_prefill_fa2 = NULL;
     if (status == CUDA_SUCCESS)
         get_function(attention_module, &attention_decode_gqa, "euhedral_attention_decode_gqa_nvfp4");
     if (status == CUDA_SUCCESS) status = get_function(attention_module, &attention_decode_nvfp4, "euhedral_attention_decode_nvfp4");
@@ -296,6 +301,16 @@ static int ensure_initialized(void) {
 
 static int launch_and_synchronize(CUfunction function, uint32_t grid_x, uint32_t block_x, void** parameters) {
     CUresult status = euhedral_launch_kernel(function, grid_x, 1, 1, block_x, 1, 1, 0,
+            euhedral_cuda_submission_stream(), parameters, NULL);
+    if (status != CUDA_SUCCESS) return (int)status;
+    if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
+    cudaError_t sync = cudaDeviceSynchronize();
+    return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
+}
+
+static int launch_and_synchronize_shared(CUfunction function, uint32_t grid_x, uint32_t block_x, uint32_t shared_bytes,
+        void** parameters) {
+    CUresult status = euhedral_launch_kernel(function, grid_x, 1, 1, block_x, 1, 1, shared_bytes,
             euhedral_cuda_submission_stream(), parameters, NULL);
     if (status != CUDA_SUCCESS) return (int)status;
     if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
@@ -1110,11 +1125,11 @@ int euhedral_cuda_attention_causal_nvfp4(
         // CTA) wherever its grid carries enough work: 512 rows after 3584 keys 3733 -> 1481 us, 128 rows
         // after 3968 keys 1252 -> 774 us; on small grids (64-256 rows, short context) the 32-row tile wins.
         uint32_t group = query_heads / key_heads;
-        if (!exact && attention_prefill_fa2 != NULL && group >= 1u && group <= 8u
+        if (!exact && attention_prefill_fa2 != NULL && group >= 1u && group <= 6u
                 && (rows >= 512u || (rows >= 128u && (uint64_t)cache_length >= 2048u))) {
             uint64_t fa2_grid = ((uint64_t)rows + 15u) / 16u * key_heads;
             if (fa2_grid <= UINT32_MAX)
-                return launch_and_synchronize(attention_prefill_fa2, (uint32_t)fa2_grid, 32u * group, args);
+                return launch_and_synchronize_shared(attention_prefill_fa2, (uint32_t)fa2_grid, 32u * (group + 2u), FA2_SHARED_BYTES, args);
         }
         CUfunction prefill = attention_prefill_nvfp4_exact != NULL && exact
                 ? attention_prefill_nvfp4_exact : attention_prefill_nvfp4;
@@ -1136,10 +1151,9 @@ int euhedral_cuda_attention_causal_nvfp4(
     CUfunction decode = attention_decode_nvfp4_exact != NULL && exact
             ? attention_decode_nvfp4_exact : attention_decode_nvfp4;
     uint32_t decode_grid = query_heads * splits, decode_block = 128;
-    // Relaxed numerics from 2048 keys: one tensor-core warp per (KV head, 32-key split, at most 64) serves
-    // the KV head's whole query-head group. With the merge: 2048 keys 52.0 -> 41.7 us, 4096 keys 77 -> 54 us,
-    // 16K keys 212 -> 120 us per layer; the three-warp CTA (96 threads) then took 16K to 38 us and 64K to 116 us. At 1024 keys it won as an operator (35.6 -> 33.6 us) but measured
-    // -0.6% in decode, so shorter contexts keep the per-query-head kernel.
+    // Relaxed numerics from 2048 keys: one three-warp tensor-core CTA (96 threads) per (KV head, 32-key split, at most 64)
+    // serves the KV head's whole query-head group (docs/ATTENTION_DECODE.md). Shorter contexts keep the per-query-head
+    // kernel, which measured faster in decode at 1024 keys.
     uint32_t group = query_heads / key_heads;
     if (!exact && attention_decode_gqa != NULL && length >= 2048u && group <= 8u) {
         splits = (uint32_t)(((uint64_t)length + 31) / 32);
