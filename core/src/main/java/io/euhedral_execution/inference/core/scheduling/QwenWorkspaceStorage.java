@@ -57,6 +57,11 @@ public final class QwenWorkspaceStorage implements AutoCloseable {
         return address;
     }
 
+    void fingerprint(CaptureFingerprint fingerprint) {
+        for (int slot = 0; slot < this.addresses.length; slot++)
+            fingerprint.add(this.addresses[slot]).add(this.capacities[slot]);
+    }
+
     /// Device bytes this storage currently holds.
     public long retainedBytes() {
         long total = 0;

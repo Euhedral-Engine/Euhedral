@@ -64,6 +64,21 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle streamSelect;
     private final MethodHandle streamClear;
     private final MethodHandle pdlSelect;
+    private final MethodHandle submissionRecord;
+    private final MethodHandle submissionCheck;
+    private final MethodHandle submissionFinish;
+    private final MethodHandle submissionMarkUnrecordable;
+    private final MethodHandle submissionCheckBegin;
+    private final MethodHandle submissionCheckEnd;
+    private final MethodHandle graphCaptureBegin;
+    private final MethodHandle graphCaptureEnd;
+    private final MethodHandle graphLaunch;
+    private final MethodHandle graphDestroy;
+    /// The calling thread's submission mode while a stage runs: recording, checking, or neither.
+    private static final ThreadLocal<int[]> SUBMISSION = ThreadLocal.withInitial(() -> new int[1]);
+
+    private static final int RECORDING = 1;
+    private static final int CHECKING = 2;
     private final MethodHandle rowExactSelect;
     /// Mirrors the native thread-local row-exact selection; the native NVFP4 route is never row-exact.
     private static final ThreadLocal<boolean[]> ROW_EXACT = ThreadLocal.withInitial(() -> new boolean[1]);
@@ -300,6 +315,43 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.pdlSelect =
                     bind(linker, symbols, "euhedral_cuda_pdl_select", FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
             this.streamClear = bind(linker, symbols, "euhedral_cuda_stream_clear", FunctionDescriptor.ofVoid());
+            this.submissionRecord = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_submission_record",
+                    FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
+            this.submissionCheck = bind(linker, symbols, "euhedral_cuda_submission_check", FunctionDescriptor.ofVoid());
+            this.submissionFinish = bind(
+                    linker, symbols, "euhedral_cuda_submission_finish", FunctionDescriptor.of(ValueLayout.JAVA_LONG));
+            this.submissionMarkUnrecordable =
+                    bind(linker, symbols, "euhedral_cuda_submission_mark_unrecordable", FunctionDescriptor.ofVoid());
+            this.submissionCheckBegin = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_submission_check_begin",
+                    FunctionDescriptor.of(ValueLayout.JAVA_LONG));
+            this.submissionCheckEnd = bind(
+                    linker, symbols, "euhedral_cuda_submission_check_end", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+            this.graphCaptureBegin = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_graph_capture_begin",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+            this.graphCaptureEnd = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_graph_capture_end",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+            this.graphLaunch = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_graph_launch",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
+            this.graphDestroy = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_graph_destroy",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
             this.eventCreate = bind(
                     linker,
                     symbols,
@@ -527,6 +579,140 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
 
         @Override
+        public boolean capturesGraphs() {
+            return true;
+        }
+
+        @Override
+        public long submitRecording(
+                Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
+            ensureOpen();
+            if (!(shadow instanceof CudaStream capture))
+                throw new IllegalArgumentException("shadow is not a CUDA stream");
+            select(overlapPredecessor);
+            CudaStream previous = submitting.get();
+            submitting.set(this);
+            int[] mode = SUBMISSION.get();
+            try {
+                submissionRecord.invokeExact(capture.handle, shadowOverlap ? 1 : 0);
+            } catch (Throwable failure) {
+                submitting.set(previous);
+                clear(overlapPredecessor);
+                throw new GpuMemoryException("CUDA submission recording invocation failed", failure);
+            }
+            mode[0] = RECORDING;
+            long hash;
+            try {
+                launches.run();
+            } finally {
+                mode[0] = 0;
+                hash = finishSubmission();
+                submitting.set(previous);
+                clear(overlapPredecessor);
+            }
+            return hash;
+        }
+
+        @Override
+        public long beginChecking() {
+            ensureOpen();
+            long sink;
+            try {
+                sink = (long) submissionCheckBegin.invokeExact();
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA submission check invocation failed", failure);
+            }
+            if (sink == 0) throw new GpuMemoryException("CUDA submission check could not start capturing its sink");
+            return sink;
+        }
+
+        @Override
+        public long submitChecking(Runnable launches, long sink) {
+            ensureOpen();
+            int status;
+            try {
+                status = (int) streamSelect.invokeExact(sink);
+                if (status == 0) submissionCheck.invokeExact();
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA submission check invocation failed", failure);
+            }
+            if (status != 0) throw new GpuMemoryException("CUDA submission check stream selection", status);
+            CudaStream previous = submitting.get();
+            submitting.set(this);
+            int[] mode = SUBMISSION.get();
+            mode[0] = CHECKING;
+            long hash;
+            try {
+                launches.run();
+            } finally {
+                mode[0] = 0;
+                hash = finishSubmission();
+                submitting.set(previous);
+                clear(false);
+            }
+            return hash;
+        }
+
+        @Override
+        public boolean endChecking() {
+            try {
+                return (int) submissionCheckEnd.invokeExact() == 0;
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA submission check invocation failed", failure);
+            }
+        }
+
+        @Override
+        public void beginCapture() {
+            ensureOpen();
+            int status;
+            try {
+                status = (int) graphCaptureBegin.invokeExact(this.handle);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA graph capture invocation failed", failure);
+            }
+            if (status != 0) throw new GpuMemoryException("CUDA graph capture", status);
+        }
+
+        @Override
+        public long endCapture() {
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment exec = arena.allocate(ValueLayout.JAVA_LONG);
+                int status = (int) graphCaptureEnd.invokeExact(this.handle, exec);
+                if (status != 0) {
+                    LOG.debug("CUDA graph capture ended with status {}", status);
+                    return 0;
+                }
+                return exec.get(ValueLayout.JAVA_LONG, 0);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA graph capture invocation failed", failure);
+            }
+        }
+
+        @Override
+        public void launchGraph(long graph) {
+            ensureOpen();
+            int status;
+            try {
+                status = (int) graphLaunch.invokeExact(graph, this.handle);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA graph launch invocation failed", failure);
+            }
+            if (status != 0) throw new GpuMemoryException("CUDA graph launch", status);
+        }
+
+        @Override
+        public void destroyGraph(long graph) {
+            int status;
+            try {
+                status = (int) graphDestroy.invokeExact(graph);
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA graph destruction invocation failed", failure);
+            }
+            if (status != 0) LOG.warn("CUDA graph destruction failed with status {}", status);
+        }
+
+        @Override
         public long notifyRetired(RetirementListener listener) {
             ensureOpen();
             Objects.requireNonNull(listener, "listener");
@@ -695,6 +881,29 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private static final long PINNED_CACHE_BYTES = 64 * 1024;
 
     private static final int PINNED_CACHE_ENTRIES = 32;
+
+    private long finishSubmission() {
+        try {
+            return (long) submissionFinish.invokeExact();
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA submission finish invocation failed", failure);
+        }
+    }
+
+    /// The shared P2E2 scratch orders its uses across streams with a device-wide event and may drain the
+    /// device, neither of which a captured quantum can repeat: it ends the thread's recording, and a
+    /// checked (replayed) quantum must not reach it.
+    private void requireRepeatableScratch() {
+        int mode = SUBMISSION.get()[0];
+        if (mode == CHECKING) throw new IllegalStateException("a replayed quantum reached the shared P2E2 scratch");
+        if (mode == RECORDING) {
+            try {
+                submissionMarkUnrecordable.invokeExact();
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("CUDA submission invocation failed", failure);
+            }
+        }
+    }
 
     @Override
     public UploadBuffer allocateUploadBuffer(long byteSize) {
@@ -1236,6 +1445,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// Runs `use` with the shared scratch of at least `bytes`, ordered after its previous use on any
     /// stream; growing it first drains the device.
     private void withQ3Scratch(long bytes, LongConsumer use) {
+        requireRepeatableScratch();
         q3ScratchLock.lock();
         try {
             ensureOpen();
@@ -1995,6 +2205,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public boolean rowExactQuantizedLinears() {
         return true;
+    }
+
+    @Override
+    public boolean exactNumerics() {
+        return this.exactNumerics;
     }
 
     /// Selects exact numerics process-wide: every quantized linear runs its scalar reference and every

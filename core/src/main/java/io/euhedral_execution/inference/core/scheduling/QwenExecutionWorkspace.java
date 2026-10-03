@@ -220,6 +220,10 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         return ((long) this.tokenCount * Integer.BYTES + Long.BYTES - 1) / Long.BYTES * Long.BYTES;
     }
 
+    void fingerprint(CaptureFingerprint fingerprint) {
+        this.storage.fingerprint(fingerprint);
+    }
+
     /// The input record's device address: its token IDs.
     public long tokenIdsAddress() {
         if (this.closed || this.inputAddress == 0) throw new IllegalStateException("input record is unavailable");

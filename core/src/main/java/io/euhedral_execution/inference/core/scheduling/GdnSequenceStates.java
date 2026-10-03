@@ -39,6 +39,10 @@ public final class GdnSequenceStates implements AutoCloseable {
         }
     }
 
+    void fingerprint(CaptureFingerprint fingerprint) {
+        for (QwenGdnSequenceState state : this.states) if (state != null) state.fingerprint(fingerprint);
+    }
+
     public QwenGdnSequenceState forLayer(int layerIndex) {
         if (this.closed) throw new IllegalStateException("GDN sequence states are closed");
         if (layerIndex < 0 || layerIndex >= this.states.length || this.states[layerIndex] == null) {

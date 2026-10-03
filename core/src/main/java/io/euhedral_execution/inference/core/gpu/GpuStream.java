@@ -43,6 +43,57 @@ public interface GpuStream extends AutoCloseable {
     /// Releases a marker from [#openMarker()] once no recorded or awaited use remains outstanding.
     default void closeMarker(long marker) {}
 
+    /// Whether this stream records and replays captured quanta (CUDA graphs): the methods below.
+    default boolean capturesGraphs() {
+        return false;
+    }
+
+    /// As [#submit], also submitting every launch, copy and memset to `shadow`, a stream under capture
+    /// (with programmatic dependent launch where `shadowOverlap` allows it). Returns the hash of the
+    /// submissions, never 0, or 0 when the shadow submission failed; the stream's own work is unaffected.
+    default long submitRecording(
+            Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Starts checking on the calling thread and returns its sink: a stream under capture that receives
+    /// whatever bypasses the submission hooks, so that it never runs.
+    default long beginChecking() {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Runs `launches` on the calling thread with `sink` selected, submitting nothing: returns the hash
+    /// that [#submitRecording] would have returned for the same submissions.
+    default long submitChecking(Runnable launches, long sink) {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Ends checking on the calling thread. Returns whether the sink captured nothing.
+    default boolean endChecking() {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Starts capturing this stream's submissions into a graph instead of running them.
+    default void beginCapture() {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Ends this stream's capture and instantiates the graph. Returns its handle, or 0 when the capture
+    /// failed; the capture has ended either way.
+    default long endCapture() {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Submits one run of an instantiated graph.
+    default void launchGraph(long graph) {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
+    /// Releases an instantiated graph none of whose runs is outstanding.
+    default void destroyGraph(long graph) {
+        throw new UnsupportedOperationException("graph capture is not supported");
+    }
+
     /// Blocks until all submitted work has finished. Only recovery and teardown use it.
     void synchronize();
 

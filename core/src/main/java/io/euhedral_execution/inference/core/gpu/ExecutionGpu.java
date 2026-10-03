@@ -27,6 +27,11 @@ public abstract class ExecutionGpu implements GpuMemory {
         }
     }
 
+    /// Whether exact numerics (the scalar oracles) are selected.
+    public boolean exactNumerics() {
+        return false;
+    }
+
     public UploadBuffer allocateUploadBuffer(long bytes) {
         Arena arena = Arena.ofShared();
         try {

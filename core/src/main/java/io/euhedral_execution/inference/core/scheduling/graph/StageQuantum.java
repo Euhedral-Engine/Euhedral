@@ -18,6 +18,13 @@ public interface StageQuantum {
         return false;
     }
 
+    /// Identifies what this quantum submits apart from values it reads from device memory: two quanta with
+    /// equal keys submit the same launches, copies and memsets, so one's captured graph can run the other.
+    /// Null for a quantum that is never captured.
+    default Object captureKey() {
+        return null;
+    }
+
     /// Every lane the quantum used has joined `home`, and no stage of it can submit again; null when the
     /// lanes were proven idle instead. Runs once, before the retirement boundary is armed.
     default void lanesJoined(GpuStream home) {}

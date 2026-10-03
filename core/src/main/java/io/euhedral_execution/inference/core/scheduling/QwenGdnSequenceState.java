@@ -98,6 +98,18 @@ public final class QwenGdnSequenceState implements AutoCloseable {
         return this.speculative;
     }
 
+    void fingerprint(CaptureFingerprint fingerprint) {
+        fingerprint
+                .add(this.convolutionStateAddress)
+                .add(this.recurrentStateAddress)
+                .add(this.pendingReplayRows);
+        Speculative buffers = this.speculative;
+        if (buffers == null) return;
+        fingerprint.add(buffers.capacity()).add(buffers.recurrentCheckpoint()).add(buffers.convolutionCheckpoint());
+        fingerprint.add(buffers.queryKeyRows()).add(buffers.valueZRows()).add(buffers.alphaRows());
+        fingerprint.add(buffers.betaRows()).add(buffers.replayConvolved()).add(buffers.replayOutput());
+    }
+
     public int pendingReplayRows() {
         return this.pendingReplayRows;
     }

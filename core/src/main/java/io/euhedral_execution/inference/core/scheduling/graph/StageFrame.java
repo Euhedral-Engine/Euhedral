@@ -41,6 +41,8 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     StageFrame pathPredecessor;
     /// Recorded on this stage's lane after it submits when it has successors (multi-lane pools only).
     long marker;
+    /// The marker's mirror on the lane's shadow while the graph records a captured quantum.
+    long shadowMarker;
     /// The lane this stage submitted to in the current quantum. Successors read it after their final
     /// arrival, which orders it after this stage's submission.
     int lane;
@@ -101,21 +103,27 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         GpuStream stream = pool.lane(lane);
         try {
             boolean awaited = false;
+            boolean recording = owner.recording();
             if (pool.size() > 1) {
                 if (this.submittedPredecessors.length == 0 && lane != owner.home()) {
                     stream.await(owner.prepared());
+                    if (recording) owner.shadowAwait(lane, owner.shadowPrepared());
                     awaited = true;
                 }
                 for (StageFrame predecessor : this.submittedPredecessors) {
                     if (predecessor.lane == lane) continue;
                     stream.await(predecessor.marker);
+                    if (recording) owner.shadowAwait(lane, predecessor.shadowMarker);
                     awaited = true;
                 }
                 owner.used(lane);
             }
             // A launch that waits on another lane does not overlap its stream predecessor.
-            stream.submit(this, owner.overlapLaunches() && !awaited);
-            if (this.marker != 0) stream.mark(this.marker);
+            owner.submit(this, stream, lane, owner.overlapLaunches() && !awaited);
+            if (this.marker != 0) {
+                stream.mark(this.marker);
+                if (recording) owner.shadowMark(lane, this.shadowMarker);
+            }
         } catch (Throwable failure) {
             // doFinally drops this frame's live count and publishes no successor.
             owner.fail(failure);
