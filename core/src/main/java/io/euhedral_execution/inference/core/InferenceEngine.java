@@ -266,6 +266,15 @@ public final class InferenceEngine implements AutoCloseable {
         return this.bootstrap.memoryInfo(this.gpu);
     }
 
+    /// Bytes of model weights this engine keeps in pinned host memory instead of on the device.
+    public synchronized long hostBackedWeightBytes() {
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        long bytes = 0;
+        for (var handle : this.model.weights().runtimeObjects().values())
+            if (handle.hostBacked()) bytes += handle.byteSize();
+        return bytes;
+    }
+
     /// Device bytes this engine owns: model weights, open sessions' persistent state, and the reusable
     /// workspace storage of its execution graphs. Other processes and CUDA's own context and kernel
     /// modules are excluded.

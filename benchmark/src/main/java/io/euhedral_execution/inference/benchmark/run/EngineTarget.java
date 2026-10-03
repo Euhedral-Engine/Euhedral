@@ -30,8 +30,11 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             Duration shutdown) {
         return () -> {
             try {
-                return new EngineTarget(InferenceEngine.load(
-                        new InferenceConfig(artifact, tokenizer, cudaLibrary, workerCpus, maxContextTokens, shutdown)));
+                var engine = InferenceEngine.load(
+                        new InferenceConfig(artifact, tokenizer, cudaLibrary, workerCpus, maxContextTokens, shutdown));
+                System.out.println("loaded: " + engine.allocatedDeviceBytes() + " device bytes, "
+                        + engine.hostBackedWeightBytes() + " host-backed weight bytes");
+                return new EngineTarget(engine);
             } catch (InferenceEngine.StartupFailure failure) {
                 try {
                     failure.close();
