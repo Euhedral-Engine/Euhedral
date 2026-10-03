@@ -1078,8 +1078,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     /// [#linearQ3Bf16(long, long, long, int, int, int, long)] for either Q3 layout. A
-    /// P2E2 tensor runs one row on its own decode kernel, bitwise identical to the row-split contiguous
-    /// kernel, where that kernel would run; every other route expands it into the shared scratch and
+    /// P2E2 tensor runs up to eight rows on its own decode kernels, bitwise identical to the row-split contiguous
+    /// kernels, where those kernels would run; every other route expands it into the shared scratch and
     /// runs the row-split route on the expansion, so the outputs are the same bits in every case.
     @Override
     public void linearQ3Bf16(
@@ -1101,7 +1101,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || inFeatures <= 0 || outFeatures <= 0 || weightsByteSize <= 0) {
             throw new IllegalArgumentException("Q3 linear dimensions and payload size must be positive");
         }
-        if (rows == 1) {
+        if (rows <= Q3_DECODE_MAX_ROWS) {
             int status;
             try {
                 status = (int) linearQ3P2e2DecodeBf16.invokeExact(
@@ -1634,6 +1634,15 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || width <= 0 || width % 128 != 0 || outputs <= 0 || outputs % 32 != 0 || weightBytes <= 0)
             throw new IllegalArgumentException("invalid Q3 gate/up region dimensions");
         if (Objects.requireNonNull(layout, "layout") == WeightLayout.ROW_SPLIT_P2E2_V1) {
+            if (rows <= Q3_DECODE_MAX_ROWS && !this.exactNumerics) {
+                // The decode kernels read the compressed tensor in place; no FP8 region applies to so few rows.
+                composeGateUp(
+                        output,
+                        rows,
+                        outputs,
+                        gateUp -> linearQ3Bf16(input, weights, gateUp, rows, width, outputs, weightBytes, layout));
+                return;
+            }
             long expanded = P2e2Layout.expandedByteSize(outputs, width);
             long fused = q3MxReserveBytes(rows, width, outputs);
             long reserve = fused > 0 ? fused : (long) rows * outputs * Short.BYTES;

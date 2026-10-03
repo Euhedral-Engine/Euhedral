@@ -174,6 +174,34 @@ class P2e2KernelTest(unittest.TestCase):
                     self.assertNotIn(b"\xa5\xa5", expected[:2])
                     self.assertEqual(actual, expected)
 
+    def test_rows_kernels_are_bitwise_one_row_decode(self):
+        """Rows 2 to 4 of the fused kernels equal the contiguous one-row kernel on the row-split tensor, on
+        every decode path (dense BIG lanes, overflowing slices, empty rows)."""
+        rows, k = 64, 3072
+        for name, codes in (("realistic", realistic(self.rng, rows, k)), ("adversarial", adversarial(self.rng, rows, k))):
+            source, scale_offset = row_split(codes, self.rng)
+            tensor = p2e2.encode(source, rows, k)
+            with contextlib.ExitStack() as stack:
+                dw = self.owned(stack, self.gpu, self.gpu.upload(source))
+                dc = self.owned(stack, self.gpu, self.gpu.upload(tensor))
+                for m in range(2, 5):
+                    with self.subTest(codes=name, m=m):
+                        x = (self.rng.standard_normal((m, k)).astype(np.float32) * 3.0)
+                        xb = (x.view(np.uint32) >> 16).astype(np.uint16)
+                        dx = self.owned(stack, self.gpu, self.gpu.upload(xb.tobytes()))
+                        dy = self.owned(stack, self.gpu, self.gpu.zeros(m * rows * 2, fill=SENTINEL))
+                        self.gpu.launch(f"euhedral_q3_p2e2_decode_rows{m}", rows // 16,
+                                        [C.c_uint64(dx), C.c_uint64(dc), C.c_uint64(dy), C.c_uint(k), C.c_uint(rows)])
+                        together = self.gpu.download(dy, m * rows * 2)
+                        for t in range(m):
+                            dxt = self.owned(stack, self.gpu, self.gpu.upload(xb[t].tobytes()))
+                            dyt = self.owned(stack, self.gpu, self.gpu.zeros(rows * 2, fill=SENTINEL))
+                            self.gpu.launch("euhedral_q3_decode_contiguous", rows // 16,
+                                            [C.c_uint64(dxt), C.c_uint64(dw), C.c_uint64(dyt), C.c_uint(1), C.c_uint(k),
+                                             C.c_uint(rows), C.c_uint64(scale_offset)])
+                            self.assertEqual(together[t * rows * 2:(t + 1) * rows * 2], self.gpu.download(dyt, rows * 2),
+                                             f"row {t}")
+
     def test_expand_reproduces_the_row_split_tensor(self):
         for rows, k, name in ((5, 1024, "realistic"), (37, 2048, "adversarial"), (8, 6144, "realistic")):
             with self.subTest(rows=rows, k=k, codes=name):
@@ -262,18 +290,41 @@ class P2e2HostTest(unittest.TestCase):
     def setUp(self):
         self.host.p2e2_test_set_exact(0)
 
+    def test_up_to_eight_rows_are_bitwise_the_contiguous_rows_kernels(self):
+        rows, k = 32, 2048
+        source, scale_offset = row_split(adversarial(self.rng, rows, k), self.rng)
+        tensor = p2e2.encode(source, rows, k)
+        with contextlib.ExitStack() as stack:
+            dw = self.gpu.upload(source); stack.callback(self.gpu.free, dw)
+            dc = self.gpu.upload(tensor); stack.callback(self.gpu.free, dc)
+            for m in range(1, 9):
+                with self.subTest(m=m):
+                    x = (self.rng.standard_normal((m, k)).astype(np.float32) * 3.0)
+                    xb = (x.view(np.uint32) >> 16).astype(np.uint16).tobytes()
+                    dx = self.gpu.upload(xb); stack.callback(self.gpu.free, dx)
+                    y0 = self.gpu.zeros(m * rows * 2, fill=SENTINEL); stack.callback(self.gpu.free, y0)
+                    y1 = self.gpu.zeros(m * rows * 2, fill=SENTINEL); stack.callback(self.gpu.free, y1)
+                    name = "euhedral_q3_decode_contiguous" + ("" if m == 1 else f"_rows{m}")
+                    self.gpu.launch(name, rows // 16,
+                                    [C.c_uint64(dx), C.c_uint64(dw), C.c_uint64(y0), C.c_uint(m), C.c_uint(k),
+                                     C.c_uint(rows), C.c_uint64(scale_offset)])
+                    self.assertEqual(self.decode(dx, dc, y1, m, k, rows, len(tensor)), 0)
+                    self.gpu.sync()
+                    self.assertEqual(self.gpu.download(y1, m * rows * 2), self.gpu.download(y0, m * rows * 2))
+
     def test_routes_and_geometry(self):
         rows, k = 32, 2048
         codes = realistic(self.rng, rows, k)
         source, _ = row_split(codes, self.rng)
         tensor = p2e2.encode(source, rows, k)
         with contextlib.ExitStack() as stack:
-            dx = self.gpu.upload(bytes(2 * k)); stack.callback(self.gpu.free, dx)
+            dx = self.gpu.upload(bytes(2 * k * 9)); stack.callback(self.gpu.free, dx)
             dc = self.gpu.upload(tensor); stack.callback(self.gpu.free, dc)
-            y = self.gpu.zeros(rows * 2); stack.callback(self.gpu.free, y)
+            y = self.gpu.zeros(rows * 2 * 9); stack.callback(self.gpu.free, y)
             out = self.gpu.zeros(len(source)); stack.callback(self.gpu.free, out)
             self.assertEqual(self.decode(dx, dc, y, 1, k, rows, len(tensor)), 0)
-            self.assertEqual(self.decode(dx, dc, y, 2, k, rows, len(tensor)), -5)
+            self.assertEqual(self.decode(dx, dc, y, 8, k, rows, len(tensor)), 0)
+            self.assertEqual(self.decode(dx, dc, y, 9, k, rows, len(tensor)), -5)
             payload = p2e2.p2e2_offsets(rows, k)[2]
             full = payload + 4 * (rows * k // 16 + p2e2.PAYLOAD_PAD_WORDS)
             self.assertEqual(self.decode(dx, dc, y, 1, k, rows, len(tensor) - 2), -3)
