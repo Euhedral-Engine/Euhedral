@@ -207,7 +207,8 @@ compatible host driver. Hosts without the toolkit can pass the device nodes and 
 
 `mise run deploy` pulls `origin/main`, builds an image from exactly that commit, switches the `euhedral-inference-serve`
 container on localhost port 18080 after checking Docker health, `/health`, `/v1/models` and a one-token completion, and
-restores the previous container if the candidate fails. Its defaults are in `scripts/deploy-main.py`.
+restores the previous container if the candidate fails. It serves the `nvfp4-compressed` artifact by default; the artifact, model ID and
+port are overridable through `EUHEDRAL_DEPLOY_*` variables (`scripts/deploy-main.py`).
 
 ## Configuration
 
