@@ -126,6 +126,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle nvfp4NativeGateUpSwiGluBf16;
     private final MethodHandle q3MxAvailable;
     private final MethodHandle q3MxScratchBytes;
+    private final MethodHandle q3MxSelectSplitRows;
     private final MethodHandle linearQ3MxBf16;
     private final MethodHandle linearQ45MxBf16;
     private final MethodHandle q3MxGateUpSwiGluBf16;
@@ -244,6 +245,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     .orElse(null);
             this.q3MxAvailable = symbols.find("euhedral_cuda_q3_mx_available")
                     .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            this.q3MxSelectSplitRows = symbols.find("euhedral_cuda_q3_mx_select_split_rows")
+                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
                     .orElse(null);
             this.q3MxScratchBytes = symbols.find("euhedral_cuda_q3_mx_scratch_bytes")
                     .map(symbol -> linker.downcallHandle(
@@ -1240,34 +1244,58 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         // shapes that select a shape-specific kernel, so the outputs equal those of the whole tensor.
         if (copyDeviceToDevice2d == null) throw new UnsupportedOperationException("native pitched copy unavailable");
         int chunk = linearChunkRows(rows, inFeatures);
-        for (int first = 0; first < outFeatures; first += chunk) {
-            int firstRow = first;
-            int count = Math.min(chunk, outFeatures - first);
-            long weights = P2e2Layout.expandedByteSize(count, inFeatures);
-            long outputOffset = alignUp(weights, 256);
-            long activationOffset = alignUp(outputOffset + (long) rows * count * Short.BYTES, 256);
-            long activations = q3MxReserveBytes(rows, inFeatures, count);
-            withQ3Scratch(activationOffset + activations, scratch -> {
-                expandQ3(weightsAddress, weightsByteSize, outFeatures, inFeatures, firstRow, count, scratch, weights);
-                withQ3MxReserved(
-                        scratch + activationOffset,
-                        activations,
-                        () -> linearQ3Bf16(
-                                inputAddress,
-                                scratch,
-                                scratch + outputOffset,
-                                rows,
-                                inFeatures,
-                                count,
-                                weights,
-                                selected));
-                copyRows(
-                        outputAddress + (long) firstRow * Short.BYTES,
-                        (long) outFeatures * Short.BYTES,
-                        scratch + outputOffset,
-                        (long) count * Short.BYTES,
-                        rows);
-            });
+        // The FP8 route's split-K choice, hence its summation order, follows the whole tensor, not the chunk.
+        selectQ3MxSplitRows(outFeatures);
+        try {
+            for (int first = 0; first < outFeatures; first += chunk) {
+                int firstRow = first;
+                int count = Math.min(chunk, outFeatures - first);
+                long weights = P2e2Layout.expandedByteSize(count, inFeatures);
+                long outputOffset = alignUp(weights, 256);
+                long activationOffset = alignUp(outputOffset + (long) rows * count * Short.BYTES, 256);
+                long activations = q3MxReserveBytes(rows, inFeatures, count);
+                withQ3Scratch(activationOffset + activations, scratch -> {
+                    expandQ3(
+                            weightsAddress,
+                            weightsByteSize,
+                            outFeatures,
+                            inFeatures,
+                            firstRow,
+                            count,
+                            scratch,
+                            weights);
+                    withQ3MxReserved(
+                            scratch + activationOffset,
+                            activations,
+                            () -> linearQ3Bf16(
+                                    inputAddress,
+                                    scratch,
+                                    scratch + outputOffset,
+                                    rows,
+                                    inFeatures,
+                                    count,
+                                    weights,
+                                    selected));
+                    copyRows(
+                            outputAddress + (long) firstRow * Short.BYTES,
+                            (long) outFeatures * Short.BYTES,
+                            scratch + outputOffset,
+                            (long) count * Short.BYTES,
+                            rows);
+                });
+            }
+        } finally {
+            selectQ3MxSplitRows(0);
+        }
+    }
+
+    /// Names the weight rows of the whole tensor for the FP8 route's split choice on this thread (0 clears it).
+    private void selectQ3MxSplitRows(int weightRows) {
+        if (this.q3MxSelectSplitRows == null) return;
+        try {
+            this.q3MxSelectSplitRows.invokeExact(weightRows);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("Q3 FP8 split selection invocation failed", failure);
         }
     }
 
@@ -1286,6 +1314,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     private static String q3Operation(String operation, int status) {
         return status == CUDA_FORMAT_MISMATCH ? operation + " format/layout mismatch" : operation;
+    }
+
+    /// Frees the shared scratch (P2E2 expansion, quantized activations of the FP8 and native FP4 routes) after draining
+    /// the
+    /// device; the next route that needs it allocates it again. For callers that account for every allocation.
+    public void releaseQ3Scratch() {
+        q3ScratchLock.lock();
+        try {
+            ensureOpen();
+            synchronize();
+            if (q3ScratchAddress != 0) free(q3ScratchAddress);
+            q3ScratchAddress = 0;
+            q3ScratchBytes = 0;
+        } finally {
+            q3ScratchLock.unlock();
+        }
     }
 
     /// Runs `use` with the shared scratch of at least `bytes`, ordered after its previous use on any
@@ -1563,9 +1607,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// The paired gate/up region exists only in region views, from 64 rows.
     static final int NVFP4_NATIVE_REGION_MIN_ROWS = 64;
 
-    /// Rows from which a Q3 prefill linear runs on the block-scaled FP8 route (docs/PREFILL_MX.md): below one 128-row
-    /// tile the BF16 tile kernels waste less.
-    static final int Q3_MX_MIN_ROWS = Integer.getInteger("euhedral.q3mx.minRows", 128);
+    /// Rows from which a Q3, Q4 or Q5 prefill linear runs on the block-scaled FP8 route (docs/PREFILL_MX.md); smaller
+    /// quanta (speculative verification and drafting) have dedicated GEMV kernels.
+    static final int Q3_MX_MIN_ROWS = Integer.getInteger("euhedral.q3mx.minRows", 16);
 
     /// Enables or disables the FP8 prefill route for later launches (it is on by default where available). The BF16
     /// tile routes it replaces stay selectable, for comparisons between them.
@@ -1582,6 +1626,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             try {
                 available = this.q3MxAvailable != null
                         && this.q3MxScratchBytes != null
+                        && this.q3MxSelectSplitRows != null
                         && this.linearQ3MxBf16 != null
                         && this.linearQ45MxBf16 != null
                         && this.q3MxGateUpSwiGluBf16 != null

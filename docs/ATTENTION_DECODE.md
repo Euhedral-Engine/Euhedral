@@ -1,133 +1,61 @@
 # Long-context decode and verify attention
 
-Item 1 of docs/nvidia/opportunities.md: at 16K, one-row decode attention took 2.83 ms per token (Q3,
-16 full-attention layers) while the NVFP4 KV it reads (288 MiB) needs 0.35 ms at the measured 855 GB/s.
-This log covers the investigation, what was kept and what was not, and the measurements.
+The GQA decode attention kernel serves one query-head group (6 heads) per KV head over an NVFP4 cache (D256, 144-byte rows:
+128 code bytes and 16 E4M3 scales; 256-token pages). It runs from 2048 keys for single-row decode and for the verifier's row twin.
+Sources: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin), `nvfp4_attention.cuh` (merge), `nvfp4_pipe.cuh` (shared
+pipeline helpers). Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running.
 
-Setup: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running. Head geometry of the
-model: 24 query heads, 4 KV heads (group 6), D256, 144-byte rows (128 code bytes + 16 E4M3 scales), 256-token
-pages. Kernels: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin) and `nvfp4_attention.cuh`
-(merge).
+## Design
 
-## Why the kernel was slow
+One CTA per (KV head, key split): 4 KV heads times at most 64 splits of 32 or more keys, so 256 CTAs. The CTA is three warps with
+the arithmetic order of a single-warp loop (the single-warp kernels are kept as test controls in `reference_decode_gqa.cuh`):
 
-The GQA decode kernel is one single-warp CTA per (KV head, 32-key split), at most 4 x 64 = 256 CTAs: 3.7 warps
-per SM, one per scheduler at most. The doc item blamed bytes in flight. A skip-toggle ladder on a copy of the
-kernel (16K keys, cold KV, decode kernel only; each phase removed in turn) says otherwise:
+- **scores warp:** the K tile arrives by a two-stage cp.async ring; A fragments of the QK product are built straight from the raw
+  144-byte rows through a lookup (no FP16 staging); the QK mma chain; scores to shared memory;
+- **values warp:** the V tile is prefetched into registers and expanded to padded FP16 rows in shared memory;
+- **consumer warp:** online softmax, P as hi and lo FP16 parts, the PV mma chain, the partial write.
 
-| Variant | Time |
-|---|---|
-| production | 140 µs |
-| + cp.async ring (K and V rows prefetched two tiles ahead), same arithmetic | 131 µs |
-| + lookup-table dequantization (below) | 96 µs |
-| + full-tile path with all loads hoisted | 83 µs |
-| no loads at all (compute only) | 66 µs |
-| loads only (no expand, QK, softmax or PV) | 28 µs |
+Tiles of 16 keys hand off in order through shared-memory mbarriers. The CTA uses 24.3 KiB of shared memory and 158 registers, so
+4 CTAs per SM are resident and the 256 CTAs of a long context run in one wave. Named barriers would cap the SM at one resident CTA
+(nine ids against sixteen per SM), which is why mbarriers carry the hand-offs.
 
-- The cp.async ring alone barely helped: memory was not the limiter. The phases added up almost exactly
-  (loads 28 + expand 24 + QK 11 + softmax 9 + PV 12 = 83): a lone warp per scheduler runs them one after another
-  with about 0.1 instructions per cycle (1435 instructions per 16-key tile in 5-6 µs).
-- The loads-only floor of 28 µs is 650 GB/s on 18 MiB, so DRAM was never the 8x gap; issue latency was.
-- Smaller key splits (128, 256) gave only 78 and 76 µs: each CTA re-rotates the query heads (Hadamard) and the
-  merge grows. Rejected.
-- More resident CTAs mattered more than depth: a 4-stage ring (31 KiB of shared memory) fell to 3 CTAs per
-  SM and was slower than 2 stages. Named barriers (9 ids used) cap an SM at 1 resident CTA; a first
-  warp-specialized version ran 2.4x slower than its single-warp twin for that reason alone.
+**Exact-product lookup.** A 256-entry table maps a byte of two E2M1 codes to an FP16 pair; one FP16 multiply by the group scale
+(a hardware `cvt.rn.f16x2.e4m3x2` of the scale byte) follows. Every product (at most five significant bits, 2^-10 to 2688) is exact in
+FP16, so the result equals the FP32 product rounded to FP16 for every legal cache scale.
 
-## What was kept: three warps per CTA, bit-identical
+**Merge.** One warp per query head. Lanes gather the split statistics (the maximum is order-free) and the per-split rows are loaded
+eight at a time; every sum still adds the splits in order.
 
-Each (KV head, split) CTA now has three warps with the same arithmetic order as before:
-- **scores:** K tile by cp.async (two stages), A fragments built directly from the raw 144-byte rows (no FP16
-  staging), the QK mma chain, scores to shared memory;
-- **values:** V tile by register prefetch, expanded to padded FP16 rows in shared memory;
-- **consumer:** online softmax, P hi/lo, PV mma chain, partial write.
+**Equality.** Partials and merged outputs are bit for bit those of the single-warp kernels and the one-lane merge, for one row and for
+the row twin (`test_gqa_decode_warp_specialized_equals_single_warp_reference_bitwise`: lengths 1 to 16385, empty splits, partial last
+tiles, page edges, every finite E4M3 scale byte).
 
-Tiles hand off in order through shared-memory mbarriers. 24.3 KiB of shared memory per CTA keeps 4 CTAs per
-SM resident, so all 256 CTAs of a long context are in one wave.
+## Performance
 
-**Exact-product lookup.** Dequantization was software: E2M1 decode, FP32 multiply by the scale, convert to
-FP16. A 256-entry table maps a byte (two E2M1 codes) to an FP16 pair and one `hmul2` applies the group scale,
-which is a hardware `cvt.rn.f16x2.e4m3x2` of the scale byte. Every product (at most five significant bits,
-2^-10 to 2688) is exact in FP16, so this equals the old result bit for bit for every legal cache scale.
+Decode plus merge, per layer, cold KV (several layer-sized caches rotated past L2); the 3-row column is the verifier's row twin.
 
-**Merge.** One warp per query head summed the 64 splits with a dependent load chain: 17 µs per layer at 16K.
-Lanes now gather the split statistics (max is order-free), and the rows are loaded eight at a time; every sum
-still adds in split order. 7 µs, bit-identical.
+| Keys | 1 row | 3 rows |
+|---|---|---|
+| 4K | 21 us | 37 us |
+| 16K | 38 us | 84 us |
+| 32K | 67 us | 151 us |
+| 64K | 116 us | 308 us |
 
-**Proof.** `test_gqa_decode_warp_specialized_equals_single_warp_reference_bitwise`
-(native/tests/test_attention_nvfp4.py) compares partials and merged outputs with the previous kernels, kept
-as test-only controls in `native/src/attention/reference_decode_gqa.cuh`. It covers lengths 1 to 16385 (empty
-splits, partial last tiles, page edges), one row and the row twin, realistic scales and every finite E4M3 scale
-byte. Two deliberate mutations (a softmax scale, a LUT sign bit) both fail it.
+At 64K the one-row decode kernel streams the 72 MiB cache at 107 us, 82% of the 855 GB/s DRAM rate. Of the 38 us at 16K, the decode
+kernel takes 31 us and the merge 7 us.
 
-## Operator bench
+In the model (Q3 compact artifact), decode runs at 61.7 tok/s at a 4K context, 60.5 at 16K and 59.0 at 32K. MTP2 decode (3-row verify,
+NVMTP artifact, chat corpus) runs at 111 tok/s at 16K and 101 at 32K.
 
-`synthetic/attention_decode.py` in the performance skill: cold KV (several layer-sized caches rotated past
-L2), production against candidates, partials compared bitwise first. Decode + merge, per layer:
+## Rejected
 
-| Keys | Rows | Before | After | Speedup |
-|---|---|---|---|---|
-| 4K | 1 | 54 µs | 21 µs | 2.6x |
-| 4K | 3 | 100 µs | 37 µs | 2.7x |
-| 16K | 1 | 156 µs | 38 µs | 4.1x |
-| 16K | 3 | 332 µs | 84 µs | 3.9x |
-| 32K | 1 | 290 µs | 67 µs | 4.3x |
-| 32K | 3 | 639 µs | 151 µs | 4.2x |
-| 64K | 1 | 568 µs | 116 µs | 4.9x |
-| 64K | 3 | 1606 µs | 308 µs | 5.2x |
-
-At 64K one row reaches about 82% of the 855 GB/s DRAM rate (decode kernel 107 µs for 72 MiB).
-
-## In-model gate
-
-Control: `main` at `ef33b25`; plain decode, Q3 compact artifact, 128 generated tokens, warmup 2 and 3
-iterations (4K-16K: 5 paired forks, stopped before the sixth because the result was clear; 32K: one fork,
-warmup 1, 2 iterations).
-
-| Scenario | Control tok/s | Candidate tok/s | Change | Forks ahead |
-|---|---|---|---|---|
-| decode 64 | 62.99 | 63.01 | +0.0% | 3/5 |
-| decode 1K | 61.63 | 61.86 | +0.4% | 5/5 |
-| decode 4K | 59.68 | 61.78 | +3.5% | 5/5 |
-| decode 16K | 54.33 | 60.52 | **+11.4%** | 5/5 |
-| decode 32K | 48.55 | 58.90 | **+21.3%** | 1/1 |
-
-TTFT is unchanged (-0.0% at every length). At 64 and 1K the GQA kernel is not used (it starts at 2048 keys); the
-0.4% at 1K is the faster merge shared with the per-head kernel.
-
-Validation: the bitwise test above, the whole native suite (116 tests), `spotlessCheck test nativeVerify
-nativePackage :api:bootJar`, and the in-model `SpeculativeVerifyCudaIntegrationTest` and
-`SpeculativeDecodeCudaIntegrationTest` (row-exact verification equals one-row decode, outputs equal greedy).
-
-## Verify (MTP) gate
-
-Q3 + NVMTP artifact, MTP2 (verify = 3 rows), chat corpus, 256 generated tokens, warmup 1 and 4 iterations (one per
-prompt), one paired fork each. Control `ef33b25` (before the change), candidate `main` with it.
-
-| Context | Control tok/s | Candidate tok/s | Change |
-|---|---|---|---|
-| 16K | 93.47 | 111.26 | **+19.0%** |
-| 32K | 73.22 | 101.29 | **+38.3%** |
-
-TTFT unchanged. Every output hash equals the control's (the row-exact verifier still equals greedy decode). The
-verify rows share the kernel, so the per-row speedup carries over: at 32K the 3-row twin went from 639 to 151 us
-per layer, about 7.8 ms per verification.
-
-## Follow-ups, bounded and not built
-
-Each was bounded first with a skip toggle on a copy of the kernel (operator bench, cold KV, relaxed numerics,
-results discarded), because the doc's estimates predate the three-warp kernel.
-
-| Idea | Toggle | 16K, 3 rows | 64K, 3 rows | Verdict |
-|---|---|---|---|---|
-| Fused verifier rows: expand each KV tile once for all rows | rows 1 and 2 skip all V expansion, all V loads and all K copies | 86 -> 83 us (-3%) | 335 -> 272 us (-19%) | Not built |
-| Shared query rotation (rotate once per KV head, not per split) | skip the Hadamard entirely | 86 -> 84 us (-2.5%) | 335 -> 333 us (-0.7%) | Not built |
-| Merge inside the decode kernel (last CTA merges) | none needed: the merge is 7 us of 38 us at 16K; fusing removes the launch gap, not the work | at most 3 us per layer, about 0.2% of a token | | Not built |
-
-**Why fusing rows buys so little.** The bound above is generous: it removes all of the V work and all of the memory
-traffic of two of the three rows, and still saves only 3% at 16K. The rows are limited by per-row compute
-that sharing cannot remove (the QK and PV mma chains and the softmax; the mma tiles are already 6 of 8
-columns full). A real fused kernel also hits the SM budget: three rows need three n-tiles of 64 accumulator
-registers each, one consumer warp per tile plus the producers is 7 warps at about 160 registers, which leaves
-under two CTAs per SM, so 256 CTAs run in two waves. The 4-CTA occupancy of the current kernel (24 KiB of
-shared memory, 158 registers) is what made it fast.
+- **A deeper cp.async ring, or finer key splits.** The loads alone take 28 us of the 16K one-row kernel; the time is the phases of one
+  warp running one after another at about 0.1 instructions per cycle. A cp.async ring on the single-warp kernel left it at 131 us;
+  128 and 256 splits ran at 78 and 76 us because every CTA repeats the query rotation and the merge grows. A 4-stage ring takes 31 KiB
+  of shared memory, drops the SM to 3 resident CTAs and runs slower than 2 stages.
+- **Named barriers for the hand-offs.** Nine ids cap the SM at one resident CTA.
+- **Fused verifier rows** (expanding each K and V tile once for all rows). Removing all V expansion and all K and V traffic for rows 1 and
+  2 of the 3-row twin saves 3% at 16K and 19% at 64K, an upper bound; a fused kernel also needs three accumulator sets of 64 registers,
+  one consumer warp per 8 query columns and the producers, about 7 warps at 160 registers, which leaves fewer than two CTAs per SM.
+- **Shared query rotation** (rotate once per KV head, not per split). Skipping the Hadamard entirely saves 2.5% at 16K and 0.7% at 64K.
+- **Merge inside the decode kernel** (the last CTA merges). The merge is 7 us of 38 us at 16K and fusing removes the launch gap, not the work.
