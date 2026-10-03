@@ -198,20 +198,50 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_decode_nvfp
     }
 }
 
-// The merge of one query head (block `head` of the one-row merge grid).
+// The merge of one query head (block `head` of the one-row merge grid). Lane l owns dimensions l + 32 d. The split
+// statistics are gathered across the lanes first (lane s holds splits s and s + 32; at most 64) and the per-split
+// rows are loaded eight at a time, instead of one dependent load chain per split. The maximum does not depend on
+// order and every sum still adds the splits in order, so the result is bit for bit the sequential merge.
 static __device__ __forceinline__ void attention_merge_head(unsigned int head,
         const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial, unsigned int splits) {
     if (threadIdx.x >= 32) return;
     const unsigned int lane = threadIdx.x;
     const float* source = partial + (unsigned long long)head * splits * 258;
+    float splitMax[2], splitSum[2];
     float maximum = -__int_as_float(0x7f800000);
-    for (unsigned int s = 0; s < splits; s++) maximum = fmaxf(maximum, source[s * 258 + 256]);
-    float sum = 0, values[8] = {};
-    for (unsigned int s = 0; s < splits; s++) {
-        const float scale = source[s * 258 + 257] > 0 ? expf(source[s * 258 + 256] - maximum) : 0;
-        sum += source[s * 258 + 257] * scale;
 #pragma unroll
-        for (int d = 0; d < 8; d++) values[d] += source[s * 258 + lane + d * 32] * scale;
+    for (int i = 0; i < 2; i++) {
+        const unsigned int s = lane + 32u * i;
+        splitMax[i] = s < splits ? source[s * 258 + 256] : -__int_as_float(0x7f800000);
+        splitSum[i] = s < splits ? source[s * 258 + 257] : 0.0f;
+        maximum = fmaxf(maximum, splitMax[i]);
+    }
+#pragma unroll
+    for (int mask = 16; mask; mask >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, mask));
+    float splitScale[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) splitScale[i] = splitSum[i] > 0 ? expf(splitMax[i] - maximum) : 0;
+    float sum = 0, values[8] = {};
+    for (unsigned int first = 0; first < splits; first += 8) {
+        float rows[8][8], sums[8], scales[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const unsigned int s = first + u;
+            sums[u] = __shfl_sync(0xffffffffu, (s >> 5) ? splitSum[1] : splitSum[0], s & 31u);
+            scales[u] = __shfl_sync(0xffffffffu, (s >> 5) ? splitScale[1] : splitScale[0], s & 31u);
+            if (s < splits) {
+#pragma unroll
+                for (int d = 0; d < 8; d++) rows[u][d] = source[s * 258 + lane + d * 32];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            if (first + u < splits) {
+                sum += sums[u] * scales[u];
+#pragma unroll
+                for (int d = 0; d < 8; d++) values[d] += rows[u][d] * scales[u];
+            }
+        }
     }
 #pragma unroll
     for (int d = 0; d < 8; d++) values[d] /= sum;

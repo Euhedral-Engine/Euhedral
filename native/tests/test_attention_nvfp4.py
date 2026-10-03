@@ -71,7 +71,7 @@ def unpack_rows(data):
 class Nvfp4AttentionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.gpu = Gpu(b'#include "attention/kernels.cu"\n' + br'''
+        cls.gpu = Gpu(b'#include "attention/kernels.cu"\n#include "attention/reference_decode_gqa.cuh"\n' + br'''
 extern "C" __global__ void probe_nvfp4_encode(const float* input, unsigned char* output, unsigned int count) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = nvfp4kv::e2m1_encode(input[i]);
@@ -268,7 +268,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                         scratch = self.owned(scope, self.gpu.zeros(query_heads * splits * 258 * 4, 0xA5))
                         for name, grid, block in [('euhedral_attention_decode_nvfp4', query_heads * splits, 128),
                                                   ('euhedral_attention_decode_nvfp4_exact', query_heads * splits, 128),
-                                                  ('euhedral_attention_decode_gqa_nvfp4', heads * splits, 32)]:
+                                                  ('euhedral_attention_decode_gqa_nvfp4', heads * splits, 96)]:
                             self.gpu.launch(name, grid, args + [P(scratch), U(splits)], block=block)
                             self.gpu.launch('euhedral_attention_merge_nvfp4', query_heads,
                                             [P(gp), P(output), P(scratch), U(query_heads), U(heads), U(splits)])
@@ -324,7 +324,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                             self.gpu.launch('euhedral_attention_decode_gqa_nvfp4_rows',
                                             (heads * min(64, (last + 31) // 32), m),
                                             [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(start),
-                                             P(scratch), P(stride), U(2048)], block=32)
+                                             P(scratch), P(stride), U(2048)], block=96)
                         self.gpu.launch('euhedral_attention_merge_nvfp4_rows', (query_heads, m),
                                         [P(dgate), P(together), P(scratch), U(query_heads), U(heads), P(start),
                                          P(stride), U(2048)], block=128)
@@ -341,13 +341,63 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                             args = [P(rqk), P(rgate), P(keys), P(values), P(out), U(1), U(query_heads), U(heads),
                                     U(256), U(length), P(start + r), P(one), U(splits)]
                             if gqa:
-                                self.gpu.launch('euhedral_attention_decode_gqa_nvfp4', heads * splits, args, block=32)
+                                self.gpu.launch('euhedral_attention_decode_gqa_nvfp4', heads * splits, args, block=96)
                             else:
                                 self.gpu.launch('euhedral_attention_decode_nvfp4', query_heads * splits, args, block=128)
                             self.gpu.launch('euhedral_attention_merge_nvfp4', query_heads,
                                             [P(rgate), P(out), P(one), U(query_heads), U(heads), U(splits)], block=128)
                             self.assertEqual(rows[r * row_bytes:(r + 1) * row_bytes], self.gpu.download(out, row_bytes),
                                              f"row {r} at length {length}")
+
+    def test_gqa_decode_warp_specialized_equals_single_warp_reference_bitwise(self):
+        """The three-warp GQA decode kernels and the batched merge equal, bit for bit, the single-warp kernels and the
+        one-lane merge they replaced (reference_decode_gqa.cuh): partials and merged output, one row and the row twin,
+        across tile, page and split-boundary edges (empty splits, partial last tiles), with every finite cache scale."""
+        query_heads, heads = 24, 4
+        rng = np.random.default_rng(0x6b17)
+        stride = query_heads * 64 * 258
+        for length, realistic in [(1, True), (17, True), (33, True), (100, False), (255, True), (256, True), (257, False),
+                                  (700, True), (2048, True), (2049, False), (4097, True), (9000, False), (16385, True)]:
+            with self.subTest(length=length, realistic=realistic), contextlib.ExitStack() as scope:
+                keys, key_pages = self.paged(scope, length + 8, heads)
+                values, value_pages = self.paged(scope, length + 8, heads)
+                for page in key_pages + value_pages:
+                    raw = rng.integers(0, 256, (PAGE_TOKENS * heads, ROW_BYTES), dtype=np.uint8)
+                    # Realistic scales, or every finite E4M3 byte (0..0x7e, including the subnormals and zero).
+                    raw[:, 128:] = (rng.integers(0x28, 0x48, (PAGE_TOKENS * heads, 16)) if realistic
+                                    else rng.integers(0, 0x7f, (PAGE_TOKENS * heads, 16)))
+                    self.gpu.htod(page, C.create_string_buffer(raw.tobytes(), raw.nbytes), raw.nbytes)
+                width = (query_heads + heads) * 256
+                for rows in (1, 3):
+                    start = length - 1
+                    qk, _ = bf16(rng.standard_normal((rows, width)).astype(np.float32))
+                    gate, _ = bf16(rng.standard_normal((rows, width)).astype(np.float32))
+                    dqk = self.owned(scope, self.gpu.upload(qk.tobytes()))
+                    dgate = self.owned(scope, self.gpu.upload(gate.tobytes()))
+                    results = []
+                    for suffix, decode_block, kernel_suffix in [('_reference', 32, '_reference'), ('', 96, '')]:
+                        scratch = self.owned(scope, self.gpu.zeros(rows * stride * 4, 0x11))
+                        out = self.owned(scope, self.gpu.zeros(rows * query_heads * 512, 0x22))
+                        if rows == 1:
+                            splits = min(64, (length + 31) // 32)
+                            args = [P(dqk), P(dgate), P(keys), P(values), P(out), U(1), U(query_heads), U(heads),
+                                    U(256), U(length), P(start), P(scratch), U(splits)]
+                            self.gpu.launch('euhedral_attention_decode_gqa_nvfp4' + suffix, heads * splits, args, block=decode_block)
+                            self.gpu.launch('euhedral_attention_merge_nvfp4' + kernel_suffix, query_heads,
+                                            [P(dgate), P(out), P(scratch), U(query_heads), U(heads), U(splits)])
+                            used = query_heads * splits * 258 * 4
+                        else:
+                            first = max(0, length - rows)
+                            splits = min(64, (length + 31) // 32)
+                            self.gpu.launch('euhedral_attention_decode_gqa_nvfp4_rows' + suffix, (heads * splits, rows),
+                                            [P(dqk), P(keys), P(values), U(query_heads), U(heads), P(first), P(scratch),
+                                             P(stride), U(0)], block=decode_block)
+                            self.gpu.launch('euhedral_attention_merge_nvfp4_rows' + kernel_suffix, (query_heads, rows),
+                                            [P(dgate), P(out), P(scratch), U(query_heads), U(heads), P(first), P(stride), U(0)])
+                            used = rows * stride * 4
+                        results.append((self.gpu.download(scratch, used), self.gpu.download(out, rows * query_heads * 512)))
+                    self.assertEqual(results[0][0], results[1][0], f"partials, rows {rows}")
+                    self.assertEqual(results[0][1], results[1][1], f"merged output, rows {rows}")
 
     def test_split_append_and_prefill_preserve_cache_and_continuation(self):
         rows, heads, query_heads = 261, 1, 6
