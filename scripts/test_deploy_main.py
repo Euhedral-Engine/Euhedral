@@ -67,7 +67,7 @@ class DeploymentTests(unittest.TestCase):
     def test_cleanup_only_after_new_service_is_ready(self):
         def ready(port):
             self.events.append(("ready", port))
-            return "qwen3.8-27b-q3"
+            return "qwen3.8-27b-nvfp4-compressed"
 
         revision = self.deploy(ready)
         self.assertEqual("e39805f194a0d2904f7dcb16ef68d9db666d3123", revision)
@@ -85,7 +85,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(any(e[:3] == ("docker", "inspect", "--format") and "State.Health.Status" in str(e) for e in events[index(lambda e: e[:2] == ("docker", "rm")):]))
         run = next(e for e in events if e[:2] == ("docker", "run"))
         self.assertNotIn("euhedral.qwen.prefillRegions", str(run))
-        self.assertIn("EUHEDRAL_INFERENCE_MODEL_ID=qwen3.8-27b-q3", run)
+        self.assertIn("EUHEDRAL_INFERENCE_MODEL_ID=qwen3.8-27b-nvfp4-compressed", run)
 
     def test_failure_restores_old_service_without_deleting_its_image(self):
         def not_ready(port):
@@ -112,7 +112,7 @@ class DeploymentTests(unittest.TestCase):
                 return "healthy"
             return self.command(*args)
 
-        with patch.object(MODULE, "build_context", return_value=nullcontext(self.root)), patch.object(MODULE, "command", side_effect=checked_command), patch.object(MODULE, "verify_ready", return_value="qwen3.8-27b-q3"):
+        with patch.object(MODULE, "build_context", return_value=nullcontext(self.root)), patch.object(MODULE, "command", side_effect=checked_command), patch.object(MODULE, "verify_ready", return_value="qwen3.8-27b-nvfp4-compressed"):
             with self.assertRaisesRegex(RuntimeError, "became unhealthy before cleanup"):
                 MODULE.deploy(self.root, self.model, self.tokenizer, self.driver, self.ptx, 18080)
         self.assertTrue(any(e[:2] == ("docker", "start") for e in self.events))
@@ -128,7 +128,7 @@ class DeploymentTests(unittest.TestCase):
             if url.endswith("/health"):
                 return {"status": "up", "engine": "ready"}
             if url.endswith("/v1/models"):
-                return {"data": [{"id": "qwen3.8-27b-q3"}]}
+                return {"data": [{"id": "qwen3.8-27b-nvfp4-compressed"}]}
             return {"choices": [{"message": {"content": ""}}], "usage": {"completion_tokens": 0}}
 
         with patch.object(MODULE, "command", return_value="healthy"), patch.object(MODULE, "get_json", side_effect=response), patch.object(MODULE.time, "monotonic", side_effect=[0, 1, 301]), patch.object(MODULE.time, "sleep"):

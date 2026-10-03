@@ -21,7 +21,7 @@ from contextlib import contextmanager
 SERVICE = "euhedral-inference-serve"
 IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
-MODEL_ID = os.environ.get("EUHEDRAL_DEPLOY_MODEL_ID", "qwen3.8-27b-q3")
+MODEL_ID = os.environ.get("EUHEDRAL_DEPLOY_MODEL_ID", "qwen3.8-27b-nvfp4-compressed")
 
 
 def command(*args):
@@ -208,7 +208,7 @@ def deploy(repository, model, tokenizer, driver, ptx, port):
 
 if __name__ == "__main__":
     root = Path(__file__).resolve().parents[1]
-    model_path = Path(os.environ.get("EUHEDRAL_DEPLOY_MODEL", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl"))
+    model_path = Path(os.environ.get("EUHEDRAL_DEPLOY_MODEL", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl"))
     tokenizer_path = Path(os.environ.get("EUHEDRAL_DEPLOY_TOKENIZER", "/mnt/shared/qwen38-quant/source/qwen"))
     driver_path = Path(os.environ.get("EUHEDRAL_DEPLOY_DRIVER", "/usr/lib/x86_64-linux-gnu/libcuda.so.1"))
     ptx_path = Path(os.environ.get("EUHEDRAL_DEPLOY_PTX", "/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1"))
