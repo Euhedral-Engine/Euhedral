@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     library.root_module.addCSourceFiles(.{
         .root = b.path("src/host"),
         .files = &.{
-            "euhedral_cuda.c", "q3_embedding.c", "cuda_kernel_loader.c",
+            "euhedral_cuda.c", "q3_embedding.c", "cuda_kernel_loader.c", "submission.c",
             "rms_norm_bf16.c", "q3_linear_bf16.c", "q45_linear.c", "qwen_layer_ops.c", "nvfp4_linear.c", "q3_mx.c", "reference.c",
         },
         .flags = &.{"-std=c11", "-fvisibility=hidden"},

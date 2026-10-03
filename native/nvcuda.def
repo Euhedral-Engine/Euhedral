@@ -4,6 +4,7 @@ EXPORTS
     cuCtxGetCurrent_v2
     cuCtxGetDevice
     cuDeviceGetAttribute
+    cuFuncGetParamInfo
     cuFuncSetAttribute
     cuGetErrorString
     cuInit

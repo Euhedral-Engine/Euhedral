@@ -4,6 +4,7 @@
 #endif
 
 #include "euhedral_cuda.h"
+#include "submission.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -159,6 +160,8 @@ int euhedral_cuda_copy_host_to_device(
     }
 
     cudaStream_t stream = euhedral_cuda_submission_stream();
+    // A synchronous copy cannot be repeated by a captured graph: its host memory may be released on return.
+    if (euhedral_submission_unrepeatable()) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t status = stream == NULL
             ? cudaMemcpy(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice)
             : cudaMemcpyAsync(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice, stream);
@@ -179,7 +182,7 @@ int euhedral_cuda_copy_upload_to_device(
     // synchronization; with no stream selected it completes before returning, like every operation.
     cudaError_t status = stream == NULL
             ? cudaMemcpy(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice)
-            : cudaMemcpyAsync(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice, stream);
+            : euhedral_submit_copy(device_address, host_address, (size_t)byte_size, cudaMemcpyHostToDevice, stream);
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 
@@ -198,6 +201,7 @@ int euhedral_cuda_copy_device_to_host(
     }
 
     cudaStream_t stream = euhedral_cuda_submission_stream();
+    if (euhedral_submission_unrepeatable()) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t status = stream == NULL
             ? cudaMemcpy(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost)
             : cudaMemcpyAsync(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost, stream);
@@ -216,7 +220,7 @@ int euhedral_cuda_copy_device_to_readback(
     // synchronization here; with no stream selected the copy completes before returning.
     cudaError_t status = stream == NULL
             ? cudaMemcpy(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost)
-            : cudaMemcpyAsync(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost, stream);
+            : euhedral_submit_copy(host_address, device_address, (size_t)byte_size, cudaMemcpyDeviceToHost, stream);
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 
@@ -230,7 +234,8 @@ int euhedral_cuda_copy_device_to_device(
     cudaStream_t stream = euhedral_cuda_submission_stream();
     cudaError_t status = stream == NULL
             ? cudaMemcpy(destination_address, source_address, (size_t)byte_size, cudaMemcpyDeviceToDevice)
-            : cudaMemcpyAsync(destination_address, source_address, (size_t)byte_size, cudaMemcpyDeviceToDevice, stream);
+            : euhedral_submit_copy(destination_address, source_address, (size_t)byte_size, cudaMemcpyDeviceToDevice,
+                    stream);
     // With a submission stream selected the copy is queued on it; the caller keeps both allocations
     // until that stream's work has retired.
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
@@ -252,8 +257,8 @@ int euhedral_cuda_copy_device_to_device_2d(
     cudaError_t status = stream == NULL
             ? cudaMemcpy2D(destination_address, (size_t)destination_pitch, source_address, (size_t)source_pitch,
                     (size_t)row_bytes, (size_t)rows, cudaMemcpyDeviceToDevice)
-            : cudaMemcpy2DAsync(destination_address, (size_t)destination_pitch, source_address, (size_t)source_pitch,
-                    (size_t)row_bytes, (size_t)rows, cudaMemcpyDeviceToDevice, stream);
+            : euhedral_submit_copy_2d(destination_address, (size_t)destination_pitch, source_address,
+                    (size_t)source_pitch, (size_t)row_bytes, (size_t)rows, cudaMemcpyDeviceToDevice, stream);
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
 }
 

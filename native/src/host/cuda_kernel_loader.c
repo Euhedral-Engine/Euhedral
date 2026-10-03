@@ -244,6 +244,7 @@ int euhedral_cuda_load_native_kernel(const void* anchor, const char* source_name
     return load_kernel(anchor, source_name, function_name, module, function, architecture);
 }
 
+#include "submission.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -308,20 +309,10 @@ static int pdl_registered(CUfunction function) {
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
         unsigned int block_x, unsigned int block_y, unsigned int block_z, unsigned int shared_bytes,
         CUstream stream, void** parameters, void** extra) {
-    if (stream == NULL || extra != NULL || !pdl_selected || !pdl_registered(function))
+    if (extra != NULL)
         return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
                 parameters, extra);
-    CUlaunchAttribute attribute;
-    memset(&attribute, 0, sizeof(attribute));
-    attribute.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-    attribute.value.programmaticStreamSerializationAllowed = 1;
-    CUlaunchConfig config;
-    memset(&config, 0, sizeof(config));
-    config.gridDimX = grid_x; config.gridDimY = grid_y; config.gridDimZ = grid_z;
-    config.blockDimX = block_x; config.blockDimY = block_y; config.blockDimZ = block_z;
-    config.sharedMemBytes = shared_bytes;
-    config.hStream = stream;
-    config.attrs = &attribute;
-    config.numAttrs = 1;
-    return cuLaunchKernelEx(&config, function, parameters, NULL);
+    const int overlappable = stream != NULL && pdl_registered(function);
+    return euhedral_submit_kernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
+            parameters, overlappable && pdl_selected, overlappable);
 }
