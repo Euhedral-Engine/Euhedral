@@ -28,7 +28,7 @@ import org.junit.jupiter.api.Test;
 class QwenCompactCudaResidencyIntegrationTest {
 
     private static final long EXPECTED_OBJECT_COUNT = 771;
-    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl");
+    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl");
 
     @Test
     void reportsCudaDeviceMemory() throws Exception {

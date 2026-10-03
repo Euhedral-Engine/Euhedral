@@ -73,8 +73,8 @@ Reference encoder and decoder: `tools/euhedral_artifacts/q3_p2e2.py`. Device cod
 
 ```bash
 python3 tools/convert_checkpoint.py --model /mnt/shared/qwen38-quant/source/qwen --quantization q3 --compressed \
-    --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl \
-    --out /mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3_compressed.edrl
+    --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl \
+    --out /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3_compressed.edrl
 ```
 
 The converter builds the `q3` artifact beside the output, transcodes every Q3 tensor whose K is a multiple of 1024 (all 195 Q3

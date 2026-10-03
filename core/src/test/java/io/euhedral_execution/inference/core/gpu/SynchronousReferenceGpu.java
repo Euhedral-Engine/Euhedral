@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.gpu;
 
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 
@@ -125,6 +126,74 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
             long weightsByteSize) {
         this.delegate.linearQ3Bf16(
                 inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize);
+    }
+
+    @Override
+    public void linearQ3Bf16(
+            long inputAddress,
+            long weightsAddress,
+            long outputAddress,
+            int rows,
+            int inFeatures,
+            int outFeatures,
+            long weightsByteSize,
+            WeightLayout layout) {
+        this.delegate.linearQ3Bf16(
+                inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize, layout);
+    }
+
+    @Override
+    public void embedQ3(
+            long tokenIdsAddress,
+            long embeddingAddress,
+            long embeddingByteSize,
+            long hiddenStateAddress,
+            int tokenCount,
+            int vocabularySize,
+            int hiddenSize,
+            WeightLayout layout) {
+        this.delegate.embedQ3(
+                tokenIdsAddress,
+                embeddingAddress,
+                embeddingByteSize,
+                hiddenStateAddress,
+                tokenCount,
+                vocabularySize,
+                hiddenSize,
+                layout);
+    }
+
+    @Override
+    public void q3GateUpSwiGluBf16(
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        this.delegate.q3GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes, layout);
+    }
+
+    @Override
+    public long allocateHostWeights(long byteSize) {
+        return this.delegate.allocateHostWeights(byteSize);
+    }
+
+    @Override
+    public void freeHostWeights(long address) {
+        this.delegate.freeHostWeights(address);
+    }
+
+    @Override
+    public long hostWeightsDeviceAddress(long hostAddress) {
+        return this.delegate.hostWeightsDeviceAddress(hostAddress);
+    }
+
+    @Override
+    public void copyHostWeightsToDevice(long destination, long source, long byteSize) {
+        this.delegate.copyHostWeightsToDevice(destination, source, byteSize);
     }
 
     @Override

@@ -9,7 +9,7 @@
 // normalized Sylvester H256 rotation. Queries are rotated by the same orthogonal transform, so
 // q.k is preserved; attention outputs are rotated back with the same (self-inverse) transform.
 //
-// The loader compiles for compute_90, so the E2M1 conversions are exact software routines
+// The loader compiles this module for the plain sm_XY target (no E2M1 conversion instructions), so the conversions are exact software routines
 // rather than the sm_100+ cvt instructions. Rounding is round-to-nearest-even with saturation,
 // identical to cvt.rn.satfinite.e2m1x2.f32.
 

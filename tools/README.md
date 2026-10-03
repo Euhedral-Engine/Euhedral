@@ -1,6 +1,6 @@
 # Artifact converter
 
-`convert_checkpoint.py` converts a Qwen3.5-27B Hugging Face checkpoint directory (BF16 safetensors,
+`convert_checkpoint.py` converts a Qwen3.8-27B Hugging Face checkpoint directory (BF16 safetensors,
 `config.json`, `tokenizer_config.json`) to one of the four artifacts the engine ships. Two choices select
 the artifact: the quantization and the representation.
 
@@ -27,19 +27,19 @@ RANKING=/path/to/token-ranking.i64
 
 # q3
 python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 \
-    --ranking $RANKING --out $OUT/qwen3_5_27b_q3.edrl
+    --ranking $RANKING --out $OUT/qwen3_8_27b_q3.edrl
 
 # q3-compressed
 python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 --compressed \
-    --draft-ids-from $OUT/qwen3_5_27b_q3.edrl --out $OUT/qwen3_5_27b_q3_compressed.edrl
+    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $OUT/qwen3_8_27b_q3_compressed.edrl
 
 # nvfp4
 python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 \
-    --draft-ids-from $OUT/qwen3_5_27b_q3.edrl --out $OUT/qwen3_5_27b_nvfp4.edrl
+    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $OUT/qwen3_8_27b_nvfp4.edrl
 
 # nvfp4-compressed
 python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --compressed \
-    --draft-ids-from $OUT/qwen3_5_27b_q3.edrl --out $OUT/qwen3_5_27b_nvfp4_compressed.edrl
+    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $OUT/qwen3_8_27b_nvfp4_compressed.edrl
 ```
 
 `--jobs N` sets the number of parallel worker processes (default 4 on cuda, one per CPU on cpu), and

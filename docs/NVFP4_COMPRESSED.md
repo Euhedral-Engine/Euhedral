@@ -88,8 +88,8 @@ table entry.
 
 ```bash
 python3 tools/convert_checkpoint.py --model /mnt/shared/qwen38-quant/source/qwen --quantization nvfp4 --compressed \
-    --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl \
-    --out /mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_nvfp4_compressed.edrl
+    --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl \
+    --out /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl
 ```
 
 See `tools/README.md`. It runs on the GPU and takes about 14 minutes. SD4's error pass costs about 60 times plain NVFP4's rounding.
