@@ -71,7 +71,11 @@ class StageGraphCaptureTest {
 
         @Override
         public long submitRecording(
-                Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
+                Runnable launches,
+                boolean overlapPredecessor,
+                GpuStream shadow,
+                boolean shadowOverlap,
+                SharedOrdering shared) {
             long[] sum = {17};
             this.hash.set(sum);
             this.shadow.set((CapturingStream) shadow);
@@ -123,9 +127,13 @@ class StageGraphCaptureTest {
             return this.failCapture ? 0 : 1000 + StageGraphCaptureTest.this.graphs.incrementAndGet();
         }
 
+        volatile boolean refuseLaunch;
+
         @Override
-        public void launchGraph(long graph) {
+        public boolean launchGraph(long graph, boolean ordered) {
+            if (this.refuseLaunch) return false;
             this.kernels.add("graph:" + graph);
+            return true;
         }
 
         @Override
@@ -216,6 +224,23 @@ class StageGraphCaptureTest {
         assertEquals(List.of(1001L), home.destroyed, "the diverged capture was released");
         assertEquals(
                 List.of("k0", "k1", "k2"), home.kernels.subList(launches, launches + 3), "and its key starts over");
+    }
+
+    @Test
+    void aRefusedLaunchRunsTheQuantumStageByStageAndDiscardsTheCapture() {
+        CapturingStream home = new CapturingStream();
+        StageGraph graph = graph(LINEAR, LanePool.single(home));
+        run(graph, home, keyed("draft"));
+        run(graph, home, keyed("draft"));
+        home.refuseLaunch = true;
+        int launches = home.kernels.size();
+        TestQuantum refused = keyed("draft");
+        assertEquals("SUCCESS", run(graph, home, refused));
+        assertEquals(List.of("k0", "k1", "k2"), home.kernels.subList(launches, launches + 3));
+        assertEquals(List.of("commit:0", "commit:1", "commit:2", "retire", "outcome"), refused.events);
+        home.refuseLaunch = false;
+        run(graph, home, keyed("draft"));
+        assertEquals(List.of(1001L), home.destroyed, "the refused capture was released before the next quantum");
     }
 
     @Test

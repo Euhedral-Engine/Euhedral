@@ -300,7 +300,7 @@ public final class QwenExecutionContext implements StageQuantum {
     public Object captureKey() {
         if (this.kind == ExecutionKind.PREFILL || this.tokenIds.length > MAX_CAPTURED_ROWS) return null;
         if (this.workspace == null || this.gpu == null || this.gpu.exactNumerics()) return null;
-        if (!this.plan.hasFirstLayer() || this.plan.stagesWeights()) return null;
+        if (!this.plan.hasFirstLayer()) return null;
         if (!(this.sequence.kvCacheState() instanceof AttentionSequenceStates attention)
                 || !(this.sequence.recurrentState() instanceof GdnSequenceStates recurrent)) return null;
         if (!attention.reserves(this.startPosition, this.tokenIds.length, this.kind == ExecutionKind.DRAFT))
