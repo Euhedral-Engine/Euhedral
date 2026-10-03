@@ -31,7 +31,7 @@ It compiles to SASS **`OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`**.
 
 | Item | Contract |
 |---|---|
-| Target | `sm_120a` or `sm_120f`. Plain `sm_120` is rejected by ptxas. `compute_90` PTX only "compiles" because NVRTC skips ptxas for virtual targets. |
+| Target | `sm_120a` or `sm_120f`. The `cvt` forms for E2M1 are rejected by ptxas for plain `sm_120`, which is why the other modules use exact software conversions. |
 | A and B | E2M1 only. Packed eight per 32-bit register, element j in nibble j, even K in the low nibble. |
 | Accumulator | FP32 only (`.f16` is rejected). |
 | Scales | UE4M3, one per 16 K values (`scale_vec::4X`): four per row or column per 64-K MMA. Decoded as E4M3 with the sign bit ignored, subnormals included; `0x7f`/`0xff` are NaN. |

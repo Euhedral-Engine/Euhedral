@@ -1,4 +1,4 @@
-"""The object inventory of the Qwen3.5-27B checkpoint and the writers that fill each object."""
+"""The object inventory of the Qwen3.8-27B checkpoint and the writers that fill each object."""
 
 from __future__ import annotations
 

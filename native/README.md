@@ -15,7 +15,7 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 | File | Entry points |
 | --- | --- |
 | `euhedral_cuda.c` | Memory allocation (device, pinned host, huge-page host weights), memory queries, streams, markers and completion events, copies. |
-| `cuda_kernel_loader.c`, `.h` | Compiles an installed CUDA module root once per process with NVRTC and loads it. Ordinary modules compile for `compute_90` and the driver JITs that PTX for the active device; the Blackwell-only modules (`q3_mx`, `nvfp4_native`) compile for `sm_<major><minor>a` and exist only on compute capability 12.x. Also holds the thread-local selections: exact numerics, row-exact execution and programmatic dependent launch. |
+| `cuda_kernel_loader.c`, `.h` | Compiles an installed CUDA module root once per process with NVRTC and loads it, on a dedicated thread with a large stack (NVRTC overflows a worker thread's). Ordinary modules compile to the device's own cubin (`sm_<major><minor>`); the modules that use arch-specific instructions (`q3_mx`, `nvfp4_native`) compile for `sm_<major><minor>a`. No PTX is left for the driver to JIT. Also holds the thread-local selections: exact numerics, row-exact execution and programmatic dependent launch. |
 | `q3_embedding.c` | Q3 row-split and P2E2 embedding gather to BF16 hidden states (rows may be read in place from mapped host memory). |
 | `rms_norm_bf16.c` | Standalone BF16 RMSNorm. |
 | `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |

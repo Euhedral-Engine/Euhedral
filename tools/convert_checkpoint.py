@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a Qwen3.5-27B Hugging Face checkpoint to an Euhedral inference artifact.
+"""Convert a Qwen3.8-27B Hugging Face checkpoint to an Euhedral inference artifact.
 
 Two choices select one of the four artifacts the engine ships:
 

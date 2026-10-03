@@ -7,6 +7,6 @@
     nvfp4        NVFP4 and NVFP4-SD4 quantization
     q3_p2e2      the lossless Q3 -> P2E2 transcode
     recipes      what each of the four artifacts stores, per object
-    inventory    the object inventory of the Qwen3.5-27B checkpoint
+    inventory    the object inventory of the Qwen3.8-27B checkpoint
     pipeline     checkpoint directory -> artifact file
 """

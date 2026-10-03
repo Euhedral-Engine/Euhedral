@@ -60,7 +60,7 @@ def check_checkpoint(config: dict[str, Any]) -> None:
     if config.get("architectures") != ["Qwen3_5ForConditionalGeneration"] or not isinstance(text, dict):
         fail("source is not the supported Qwen3_5ForConditionalGeneration checkpoint")
     if text.get("num_hidden_layers") != 64 or text.get("vocab_size") != VOCAB_SIZE:
-        fail("source topology does not match the supported Qwen3.5-27B checkpoint")
+        fail("source topology does not match the supported Qwen3.8-27B checkpoint")
 
 
 def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recipe: Recipe, selected: np.ndarray,

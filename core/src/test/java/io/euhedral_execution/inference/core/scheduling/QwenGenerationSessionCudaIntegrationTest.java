@@ -38,7 +38,7 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 @Execution(ExecutionMode.SAME_THREAD)
 class QwenGenerationSessionCudaIntegrationTest {
 
-    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl");
+    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl");
     private static final Path DEFAULT_TOKENIZER = Path.of("/mnt/shared/qwen38-quant/source/qwen");
     private static final AtomicLong LATTICE_ID = new AtomicLong();
 
@@ -149,7 +149,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                         // The runtime's graphs keep their workspace storage for later quanta.
                         assertTrue(runtime.retainedWorkspaceBytes() > 0);
                         assertEquals(
-                                allocatedAfterWeights + runtime.retainedWorkspaceBytes(),
+                                allocatedAfterWeights + runtime.retainedWorkspaceBytes() + gpu.retainedScratchBytes(),
                                 gpu.allocatedBytes(),
                                 "session close did not release its persistent KV/GDN state and sampled logits");
                     } finally {
@@ -166,6 +166,7 @@ class QwenGenerationSessionCudaIntegrationTest {
                         else failure.addSuppressed(cleanupFailure);
                     }
                 }
+                gpu.releaseQ3Scratch(); // the shared scratch of the quantized-activation routes outlives the model
                 long allocatedAfterWeightsRelease = gpu.allocatedBytes();
                 if (allocatedAfterWeightsRelease != allocatedBeforeWeights) {
                     IllegalStateException cleanupFailure =

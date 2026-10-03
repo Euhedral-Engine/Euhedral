@@ -80,19 +80,19 @@ subprojects {
             systemProperty(
                     "euhedral.qwen.artifact",
                     providers.gradleProperty("euhedral.qwen.artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl")
                             .get())
             // Optional NVFP4 artifact (tools/convert_checkpoint.py --quantization nvfp4).
             systemProperty(
                     "euhedral.qwen.nvfp4-artifact",
                     providers.gradleProperty("euhedral.qwen.nvfp4-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_nvfp4.edrl")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl")
                             .get())
             // Optional compressed Q3 artifact (tools/convert_checkpoint.py --quantization q3 --compressed).
             systemProperty(
                     "euhedral.qwen.q3-compressed-artifact",
                     providers.gradleProperty("euhedral.qwen.q3-compressed-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3_compressed.edrl")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3_compressed.edrl")
                             .get())
             // Teacher-forced relaxed-numerics drift: decode length, prefill prefix, an optional per-step CSV
             // report, and `exact` to run the oracle on both sequences.
