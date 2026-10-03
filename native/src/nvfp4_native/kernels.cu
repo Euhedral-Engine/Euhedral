@@ -7,14 +7,19 @@ extern "C" __global__ void __launch_bounds__(nvfp4n::kQuantizeThreads) euhedral_
     nvfp4n::quantize_rows<2>(input, output, rows, k);
 }
 
+// Tile linear: gridDim.x = tiles_m * tiles_n (M fastest), 288 threads (eight consumer warps and a producer warp),
+// nvfp4n::Pipeline<2>::kSharedBytes of dynamic shared memory; the three tensor maps describe the activation code
+// planes, the weight codes and the weight scales (docs/NVFP4_NATIVE.md).
 #define EUHEDRAL_NVFP4N_LINEAR(name, terms, paired, sd4)                                                    \
-    extern "C" __global__ void __launch_bounds__(nvfp4n::kThreads) name(                                    \
+    extern "C" __global__ void __launch_bounds__(nvfp4n::kThreads, 1) name(                                 \
+            const __grid_constant__ nvfp4n::TensorMap tm_a, const __grid_constant__ nvfp4n::TensorMap tm_b, \
+            const __grid_constant__ nvfp4n::TensorMap tm_bs,                                                \
             const unsigned char* activations, const unsigned char* weights, __nv_bfloat16* output,          \
             unsigned int rows, unsigned int k, unsigned int cols) {                                        \
-        nvfp4n::linear<terms, paired, sd4>(activations, weights, output, rows, k, cols);                    \
+        nvfp4n::linear<terms, paired, sd4>(&tm_a, &tm_b, &tm_bs, activations, weights, output, rows, k, cols); \
     }
-// Linear: `cols` output features. Paired gate/up: `cols` weight rows (gate, then up), cols / 2 SwiGLU outputs.
-// The _sd4 kernels take row-split-k128-sd4-v1 weights.
+// Linear: `cols` output features (128 per tile). Paired gate/up: `cols` weight rows (gate, then up), cols / 2
+// SwiGLU outputs (64 per tile). The _sd4 kernels take row-split-k128-sd4-v1 weights.
 EUHEDRAL_NVFP4N_LINEAR(euhedral_nvfp4n_linear_128x128, 2, false, false)
 EUHEDRAL_NVFP4N_LINEAR(euhedral_nvfp4n_gate_up_swiglu_128x64, 2, true, false)
 EUHEDRAL_NVFP4N_LINEAR(euhedral_nvfp4n_linear_128x128_sd4, 2, false, true)

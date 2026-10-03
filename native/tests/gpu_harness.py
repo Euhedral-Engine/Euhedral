@@ -69,6 +69,9 @@ class Gpu:
                                                           C.c_uint, C.c_uint, P, C.POINTER(P), P])
         self.sync = _bind(cu, "cuCtxSynchronize", [])
         self.set_attribute = _bind(cu, "cuFuncSetAttribute", [P, I, I])
+        self.encode_tiled = _bind(cu, "cuTensorMapEncodeTiled", [P, I, C.c_uint, C.c_uint64, C.POINTER(C.c_uint64),
+                                                                 C.POINTER(C.c_uint64), C.POINTER(C.c_uint),
+                                                                 C.POINTER(C.c_uint), I, I, I, I])
         self.architecture = architecture
         count = I()
         if _bind(cu, "cuInit", [C.c_uint])(0) or _bind(cu, "cuDeviceGetCount", [C.POINTER(I)])(C.byref(count)) \
@@ -148,6 +151,17 @@ class Gpu:
         buffer = C.create_string_buffer(size)
         _check(self.dtoh(buffer, ptr, size), "cuMemcpyDtoH")
         return buffer.raw
+
+    def tensor_map(self, address, dims, strides, box, swizzle=0):
+        """A tiled TMA descriptor over bytes (128 bytes, passed by value as a kernel argument). `dims` and `box`
+        are innermost first, `strides` are the byte strides of every dimension but the innermost; swizzle 0 is
+        none, 2 is 64 bytes."""
+        rank = len(dims)
+        descriptor = (C.c_ubyte * 128)()
+        _check(self.encode_tiled(C.cast(descriptor, P), 0, rank, address, (C.c_uint64 * rank)(*dims),
+                                 (C.c_uint64 * (rank - 1))(*strides), (C.c_uint * rank)(*box),
+                                 (C.c_uint * rank)(*([1] * rank)), 0, swizzle, 2, 0), "cuTensorMapEncodeTiled")
+        return descriptor
 
     def launch(self, name, grid, arguments, synchronize=True, block=None, shared=0):
         function = P()

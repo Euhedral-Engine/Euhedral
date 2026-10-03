@@ -13,3 +13,4 @@ EXPORTS
     cuModuleGetFunction
     cuModuleLoadData
     cuModuleUnload
+    cuTensorMapEncodeTiled
