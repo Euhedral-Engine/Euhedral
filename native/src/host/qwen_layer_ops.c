@@ -1073,7 +1073,7 @@ int euhedral_cuda_attention_causal_nvfp4(
                 uint32_t splits = (last + 31u) / 32u;
                 if (splits > 64u) splits = 64u;
                 void* args[] = {&query_key, &keys, &values, &qh, &kh, &start_arg, &scratch, &row_stride, &from_arg};
-                status = launch_and_synchronize_2d(attention_decode_gqa_rows, key_heads * splits, rows, 32, args);
+                status = launch_and_synchronize_2d(attention_decode_gqa_rows, key_heads * splits, rows, 96, args);
                 if (status != 0) return status;
             }
             void* merge_args[] = {&gate, &output, &scratch, &qh, &kh, &start_arg, &row_stride, &from_arg};
@@ -1138,7 +1138,7 @@ int euhedral_cuda_attention_causal_nvfp4(
     uint32_t decode_grid = query_heads * splits, decode_block = 128;
     // Relaxed numerics from 2048 keys: one tensor-core warp per (KV head, 32-key split, at most 64) serves
     // the KV head's whole query-head group. With the merge: 2048 keys 52.0 -> 41.7 us, 4096 keys 77 -> 54 us,
-    // 16K keys 212 -> 120 us per layer. At 1024 keys it won as an operator (35.6 -> 33.6 us) but measured
+    // 16K keys 212 -> 120 us per layer; the three-warp CTA (96 threads) then took 16K to 38 us and 64K to 116 us. At 1024 keys it won as an operator (35.6 -> 33.6 us) but measured
     // -0.6% in decode, so shorter contexts keep the per-query-head kernel.
     uint32_t group = query_heads / key_heads;
     if (!exact && attention_decode_gqa != NULL && length >= 2048u && group <= 8u) {
@@ -1146,7 +1146,7 @@ int euhedral_cuda_attention_causal_nvfp4(
         if (splits > 64) splits = 64;
         decode = attention_decode_gqa;
         decode_grid = key_heads * splits;
-        decode_block = 32;
+        decode_block = 96;
     }
     status = (int)euhedral_launch_kernel(decode, decode_grid, 1, 1,
             decode_block, 1, 1, 0, stream, args, NULL);

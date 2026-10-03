@@ -12,6 +12,11 @@ not results. Nothing here has been gated in the model yet.
 
 ### 1. Long-context decode and verify attention at DRAM speed
 
+**Status (2026-10-03): decode done, verify partly.** The cause was not bytes in flight but one latency-bound warp per
+scheduler; a three-warp CTA with the same arithmetic (bitwise identical) took 16K one-row attention from 156 to 38 µs
+per layer, and decode in the model +11.4% at 16K and +21.3% at 32K. Fusing the verifier rows is still open. See
+[../ATTENTION_DECODE.md](../ATTENTION_DECODE.md).
+
 **Evidence**
 - At 16K, decode attention takes 2.83 ms per token (Q3, one row; docs/MTP_VERIFIER.md "Final
   profile at 16K"). It reads 288 MiB of NVFP4 KV (18 KiB per token across 16 layers). At the
