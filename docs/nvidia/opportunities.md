@@ -12,9 +12,9 @@ not results. Nothing here has been gated in the model yet.
 
 ### 1. Long-context decode and verify attention at DRAM speed
 
-**Status (2026-10-03): decode done, verify partly.** The cause was not bytes in flight but one latency-bound warp per
+**Status (2026-10-03): done.** The cause was not bytes in flight but one latency-bound warp per
 scheduler; a three-warp CTA with the same arithmetic (bitwise identical) took 16K one-row attention from 156 to 38 µs
-per layer, and decode in the model +11.4% at 16K and +21.3% at 32K. Fusing the verifier rows is still open. See
+per layer, decode in the model +11.4% at 16K and +21.3% at 32K, and MTP2 decode +19% at 16K and +38% at 32K. Fusing the verifier rows, merging inside the decode kernel and sharing the query rotation were bounded with skip toggles and are not worth building (3%, 0.2%, 2.5%). See
 [../ATTENTION_DECODE.md](../ATTENTION_DECODE.md).
 
 **Evidence**
