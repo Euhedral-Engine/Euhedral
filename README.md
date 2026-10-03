@@ -36,11 +36,11 @@ after the first token. Prefill and time to first token (TTFT) include the whole 
 | | 16K (15,930) | 1,801 | 9.14 s | 118.7 |
 | | 32K (31,906) | 1,636 | 19.9 s | 110.1 |
 | | 64K (59,111) | 1,401 | 43.7 s | 98.0 |
-| `q3-compressed` | 4K | 1,838 | 2.25 s | 63.3 |
-| | 16K | 1,689 | 9.72 s | 65.0 |
-| | 32K | 1,543 | 21.1 s | 61.6 |
-| | 64K | 1,333 | 46.1 s | 57.3 |
-| | 128K (128,000) | 989 | 134 s | 46.3 |
+| `q3-compressed` | 4K | 1,837 | 2.28 s | 95.0 |
+| | 16K | 1,693 | 9.63 s | 97.0 |
+| | 32K | 1,543 | 21.1 s | 91.1 |
+| | 64K | 1,332 | 45.7 s | 82.0 |
+| | 128K (128,000) | 987 | 135 s | 60.7 |
 | `nvfp4` | 4K | 2,380 | 1.78 s | 63.8 |
 | | 16K | 2,133 | 7.77 s | 54.5 |
 | | 32K | 1,900 | 17.2 s | 56.1 |
@@ -111,8 +111,8 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 - **Fastest, and the one that fits everywhere:** `q3`: 117 tok/s at 4K and 98 tok/s at 64K, with no host-backed weights. Its
   error against BF16 is the largest of the four (perplexity 11.05 against 8.39 on the quality text).
 - **More room instead of speed:** `q3-compressed` returns exactly the `q3` outputs from a file 1.56 GiB smaller, which is what lets it
-  hold a 128K context on this card. Verification and prefill rebuild each tensor on the fly, so decode runs at about half
-  of `q3`'s speed.
+  hold a 128K context on this card. Its kernels decode the compressed weights as they read them, which costs about a fifth of `q3`'s
+  decode speed (95 tok/s at 4K).
 - **Highest fidelity:** the NVFP4 artifacts (perplexity 8.83 and 8.87). On a 16 GB card `nvfp4` keeps 1.2 to 1.8 GiB of weights in host memory at 32K to 64K of
   context and streams them in for every token; `nvfp4-compressed` needs less than half of that, which makes it faster than `nvfp4` up to 32K
   of context at a quality cost within the noise of the measurement (table above).
