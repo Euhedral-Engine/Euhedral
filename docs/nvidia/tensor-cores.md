@@ -154,8 +154,8 @@ Consequences:
 |---|---|---|
 | BF16 HMMA, FP32 accumulate (Q3/Q4/Q5 today) | 102 | Achieved 57 TFLOPS in the FFN at 512 rows (docs/FRAME_MODEL.md) |
 | FP16 HMMA, FP16 accumulate inside each 64-K Q3 group, then promotion to FP32 with the group scale | 204 | The scale is applied per group anyway; overflow and drift need the drift test |
-| MXFP8 (`mxf8f6f4` E4M3, unit UE8M0) with FP8 activations | 408 | FP32 accumulate at full rate; activation quantization changes numerics |
-| Two-term FP8 activations (hi + lo) through MXFP8 | 204 effective | About 7–8 significant bits, near BF16 |
+| MXFP8 (`mxf8f6f4` E4M3, unit UE8M0) with FP8 activations | 408 (built, docs/PREFILL_MX.md) | FP32 accumulate at full rate; activation quantization changes numerics |
+| Two-term FP8 activations (hi + lo) through MXFP8 | 204 effective | Exact for BF16 activations. **Built:** 118 TFLOPS achieved on the FFN, against 69 for the BF16 route. The scale-A register contract is in docs/PREFILL_MX.md |
 | INT8 IMMA with two-term int8 activations (int16 split into hi/lo bytes) | 204 effective | Exact, order-independent integer accumulation per Q3 group; Q3 codes are already small integers |
 | NVFP4 native, 1–2 activation terms (today) | 815 | Achieves 225–290 TFLOPS, about 30% (docs/NVFP4_NATIVE.md) |
 
