@@ -42,30 +42,15 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     private LanePool lanes;
     private final Object laneLock = new Object();
     private final int laneCount;
-    private final LanePool.Placement placement;
     /// Held by the quantum that stages weights, from its admission until its last stage submitted.
     private final java.util.concurrent.Semaphore stagingHold = new java.util.concurrent.Semaphore(1);
     /// Recorded on the releasing quantum's home lane once its lanes joined; the next staging quantum's
     /// preparation awaits it, so its first copies follow every earlier read of the ring.
     private long stagingIdle;
 
-    /// Lanes in the shared pool: `EUHEDRAL_LANES`, by default one per available processor (at most 64).
+    /// Lanes in the shared pool: one per available processor, at most [LanePool#MAX_LANES].
     static int laneCount() {
-        String configured = System.getenv("EUHEDRAL_LANES");
-        int count = configured == null || configured.isBlank()
-                ? Runtime.getRuntime().availableProcessors()
-                : Integer.parseInt(configured.strip());
-        if (count < 1) throw new IllegalArgumentException("EUHEDRAL_LANES must be positive");
-        return Math.min(count, LanePool.MAX_LANES);
-    }
-
-    /// Stage placement over the lanes: `EUHEDRAL_LANE_PLACEMENT` (RANDOM, WORKER, CHAIN, FORK or PATH; PATH
-    /// by default).
-    static LanePool.Placement lanePlacement() {
-        String configured = System.getenv("EUHEDRAL_LANE_PLACEMENT");
-        return configured == null || configured.isBlank()
-                ? LanePool.Placement.PATH
-                : LanePool.Placement.valueOf(configured.strip().toUpperCase(java.util.Locale.ROOT));
+        return Math.min(Runtime.getRuntime().availableProcessors(), LanePool.MAX_LANES);
     }
 
     /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime closed
@@ -82,10 +67,9 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             try {
                 for (int lane = 0; lane < streams.length; lane++) streams[lane] = this.gpu.openStream();
                 if (transfers) {
-                    pool = LanePool.withTransferLane(
-                            java.util.Arrays.copyOf(streams, compute), streams[compute], this.placement);
+                    pool = LanePool.withTransferLane(java.util.Arrays.copyOf(streams, compute), streams[compute]);
                     this.stagingIdle = streams[compute].openMarker();
-                } else pool = new LanePool(streams, this.placement);
+                } else pool = new LanePool(streams);
             } catch (RuntimeException | Error failure) {
                 for (GpuStream stream : streams) {
                     if (stream == null) continue;
@@ -108,25 +92,19 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
     }
 
-    /// A runtime whose lane pool takes its size and placement from the environment.
+    /// A runtime whose lane pool has one lane per available processor.
     public EuhedralInferenceRuntime(LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu) {
-        this(lattice, plan, gpu, laneCount(), lanePlacement());
+        this(lattice, plan, gpu, laneCount());
     }
 
-    /// A runtime whose graphs share `laneCount` device lanes, placing stages by `placement`.
-    public EuhedralInferenceRuntime(
-            LatticeTerminal lattice,
-            QwenExecutionPlan plan,
-            ExecutionGpu gpu,
-            int laneCount,
-            LanePool.Placement placement) {
+    /// A runtime whose graphs share `laneCount` device lanes.
+    public EuhedralInferenceRuntime(LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu, int laneCount) {
         this.lattice = Objects.requireNonNull(lattice, "lattice");
         this.plan = Objects.requireNonNull(plan, "plan").executionOwner();
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
             throw new IllegalArgumentException("laneCount must be 1 to " + LanePool.MAX_LANES);
         this.laneCount = laneCount;
-        this.placement = Objects.requireNonNull(placement, "placement");
     }
 
     /// Executes quanta and waits for all of their outcomes.

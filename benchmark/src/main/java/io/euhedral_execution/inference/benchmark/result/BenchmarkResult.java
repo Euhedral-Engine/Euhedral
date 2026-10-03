@@ -10,7 +10,7 @@ import java.util.Objects;
 /// One benchmark row, schema `euhedral-inference.benchmark-result` version 1.
 ///
 /// Rows are self-describing: `implementation` and `provenance` say what produced them, `runId` and
-/// `fork` identify the JVM, and `engine` holds the engine's `InferenceRunSnapshot` (tuning, model,
+/// `fork` identify the JVM, and `engine` holds the engine's `InferenceRunSnapshot` (configuration, model,
 /// runtime identity, and generation settings) for measured rows. Timings are integer nanoseconds and
 /// throughputs are tokens per second; either is null when the work it describes did not complete.
 /// See `docs/BENCHMARKING.md` for every metric's boundaries and denominator.

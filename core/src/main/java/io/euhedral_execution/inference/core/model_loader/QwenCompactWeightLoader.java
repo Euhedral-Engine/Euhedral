@@ -38,7 +38,7 @@ final class QwenCompactWeightLoader {
     static QwenWeights load(
             Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, Map<String, TensorDescriptor> descriptors)
             throws IOException {
-        return load(artifactPath, artifact, gpuMemory, descriptors, WeightResidency.ALL, Set.of());
+        return load(artifactPath, artifact, gpuMemory, descriptors, false, Set.of());
     }
 
     static QwenWeights load(
@@ -46,7 +46,7 @@ final class QwenCompactWeightLoader {
             QwenArtifact artifact,
             GpuMemory gpuMemory,
             Map<String, TensorDescriptor> descriptors,
-            WeightResidency residency,
+            boolean speculative,
             Set<String> hostBacked)
             throws IOException {
         QwenConfig config = artifact.config();
@@ -60,13 +60,13 @@ final class QwenCompactWeightLoader {
             // pages are far likelier to be available then than between reads.
             long hostBytes = 0;
             for (TensorDescriptor descriptor : descriptors.values()) {
-                if (residency.uploads(descriptor.name()) && hostBacked.contains(descriptor.name()))
+                if (uploads(descriptor.name(), speculative) && hostBacked.contains(descriptor.name()))
                     hostBytes += hostSlot(descriptor.byteSize());
             }
             if (hostBytes > 0) hostArena = gpuMemory.allocateHostWeights(hostBytes);
             long hostOffset = 0;
             for (TensorDescriptor descriptor : descriptors.values()) {
-                if (!residency.uploads(descriptor.name())) continue;
+                if (!uploads(descriptor.name(), speculative)) continue;
                 if (hostBacked.contains(descriptor.name())) {
                     TensorHandle host = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
                     // The embedding is a gather: kernels read its rows in place instead of staging it.
@@ -76,9 +76,8 @@ final class QwenCompactWeightLoader {
                     hostOffset += hostSlot(descriptor.byteSize());
                 } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
-            // Only a speculative load prepares the MTP layer for execution; other residencies keep exactly
-            // the artifact's objects.
-            if (residency == WeightResidency.SPECULATIVE) splitMtpAttention(handles, gpuMemory);
+            // Only a speculative load prepares the MTP layer for execution.
+            if (speculative) splitMtpAttention(handles, gpuMemory);
             return assemble(config, handles);
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);
@@ -91,6 +90,13 @@ final class QwenCompactWeightLoader {
             }
             return propagate(failure);
         }
+    }
+
+    /// Whether a load places the named object on the device: never the vision tower, and the MTP layer
+    /// and draft head only for speculative decoding.
+    static boolean uploads(String name, boolean speculative) {
+        if (name.startsWith("vision/")) return false;
+        return speculative || !(name.startsWith("mtp/") || name.startsWith("text/draft_head"));
     }
 
     static QwenWeights loadFirstLayer(

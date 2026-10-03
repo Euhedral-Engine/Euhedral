@@ -467,14 +467,6 @@ public abstract class ExecutionGpu implements GpuMemory {
         return false;
     }
 
-    /// Native-numerics NVFP4 decode: every NVFP4 linear, one row included, runs on native FP4 tensor cores
-    /// (FP4 activations), even inside row-exact quanta. Native rows are computed independently of each
-    /// other and deterministically, so a verification's rows equal single-row decode in this mode too
-    /// (docs/MTP_CONTRACT.md §6). Off by default: one-row decode keeps the BF16-activation GEMV.
-    public void selectNvfp4NativeDecode(boolean enabled) {
-        if (enabled) throw new UnsupportedOperationException("no native NVFP4 decode on this device");
-    }
-
     public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
         return false;
     }

@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -211,9 +210,8 @@ class SpeculativeVerifyCudaIntegrationTest {
                 artifact,
                 data,
                 gpu,
-                WeightResidency.EXECUTED,
-                io.euhedral_execution.inference.core.model_loader.HostWeightSelection.select(data, hostBytes),
-                QwenModel.DEFAULT_STAGING_SLOTS);
+                false,
+                io.euhedral_execution.inference.core.model_loader.HostWeightSelection.select(data, hostBytes));
     }
 
     static Path repositoryRoot() {

@@ -12,9 +12,6 @@ import java.util.Set;
 /// Owns the device allocations made by model loading, including non-compact artifacts.
 /// The GPU is borrowed and must outlive this model. Close only after all model executions stop.
 public final class QwenModel implements AutoCloseable {
-    /// Staging slots when a load does not choose: enough for copies to queue ahead of their consumers.
-    public static final int DEFAULT_STAGING_SLOTS = 4;
-
     private final Allocations allocations;
     private final QwenWeights weights;
     private final WeightStaging staging;
@@ -25,29 +22,21 @@ public final class QwenModel implements AutoCloseable {
         this.staging = staging;
     }
 
+    /// Loads every object the artifact's text generation executes onto the device.
     public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu) throws IOException {
-        return load(path, artifact, gpu, WeightResidency.ALL);
-    }
-
-    public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu, WeightResidency residency)
-            throws IOException {
-        return load(path, artifact, gpu, residency, Set.of(), DEFAULT_STAGING_SLOTS);
+        return load(path, artifact, gpu, false, Set.of());
     }
 
     /// Loads the objects named in `hostBacked` into pinned host memory, and allocates a device staging
-    /// ring of `stagingSlots` slots, each holding the largest of them. The model owns both.
+    /// ring of [ResidencyPlanner#STAGING_SLOTS] slots, each holding the largest of them. `speculative` also
+    /// loads the MTP layer and draft head. The model owns both.
     public static QwenModel load(
-            Path path,
-            QwenArtifact artifact,
-            GpuMemory gpu,
-            WeightResidency residency,
-            Set<String> hostBacked,
-            int stagingSlots)
+            Path path, QwenArtifact artifact, GpuMemory gpu, boolean speculative, Set<String> hostBacked)
             throws IOException {
         return load(
                 gpu,
-                memory -> QwenWeightLoader.load(path, artifact, memory, residency, hostBacked),
-                hostBacked.isEmpty() ? 0 : stagingSlots);
+                memory -> QwenWeightLoader.load(path, artifact, memory, speculative, hostBacked),
+                hostBacked.isEmpty() ? 0 : ResidencyPlanner.STAGING_SLOTS);
     }
 
     /// The device staging ring for host-backed weights, or null when every weight is resident.

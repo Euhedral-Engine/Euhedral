@@ -34,24 +34,13 @@ public final class QwenWeightLoader {
     private QwenWeightLoader() {}
 
     public static QwenWeights load(Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory) throws IOException {
-        return load(artifactPath, artifact, gpuMemory, WeightResidency.ALL, Set.of());
+        return load(artifactPath, artifact, gpuMemory, false, Set.of());
     }
 
-    /// Loads with the given residency; [WeightResidency#EXECUTED] applies to compact artifacts.
+    /// Loads a compact artifact's objects, keeping those named in `hostBacked` in pinned host memory;
+    /// `speculative` also uploads the MTP layer and draft head.
     public static QwenWeights load(
-            Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, WeightResidency residency)
-            throws IOException {
-        return load(artifactPath, artifact, gpuMemory, residency, Set.of());
-    }
-
-    /// As [#load(Path, QwenArtifact, GpuMemory, WeightResidency)], loading the compact objects named in
-    /// `hostBacked` into pinned host memory.
-    public static QwenWeights load(
-            Path artifactPath,
-            QwenArtifact artifact,
-            GpuMemory gpuMemory,
-            WeightResidency residency,
-            Set<String> hostBacked)
+            Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, boolean speculative, Set<String> hostBacked)
             throws IOException {
         Objects.requireNonNull(artifactPath, "artifactPath");
         Objects.requireNonNull(artifact, "artifact");
@@ -63,7 +52,7 @@ public final class QwenWeightLoader {
         Map<String, TensorDescriptor> descriptorsByName = indexDescriptors(descriptors);
         if (isCompactArtifact(artifact)) {
             return QwenCompactWeightLoader.load(
-                    artifactPath, artifact, gpuMemory, descriptorsByName, residency, hostBacked);
+                    artifactPath, artifact, gpuMemory, descriptorsByName, speculative, hostBacked);
         }
         String modelPrefix = modelPrefix(descriptorsByName.keySet());
         Set<String> requiredNames = requiredNames(config, modelPrefix);

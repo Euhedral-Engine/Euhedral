@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.euhedral_execution.hardware_utils.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
 import io.euhedral_execution.inference.core.model_loader.EngineModelFixture;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
@@ -280,20 +281,22 @@ class InferenceEngineTest {
                 }
 
                 @Override
-                ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
+                ExecutionGpu openGpu(Path path) {
                     if (selected == 1) throw new IllegalStateException("gpu");
-                    return super.openGpu(path, tuning);
+                    return super.openGpu(path);
                 }
 
                 @Override
-                QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu) throws java.io.IOException {
+                QwenModel loadModel(
+                        Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
+                        throws java.io.IOException {
                     if (selected == 2) throw new IllegalStateException("model");
                     if (selected == 3)
                         return EngineModelFixture.load(
                                 gpu,
                                 new io.euhedral_execution.inference.core.model_loader.QwenWeights(
                                         null, null, null, null, null, null));
-                    return super.loadModel(path, artifact, gpu);
+                    return super.loadModel(path, artifact, profile, gpu, maxContext);
                 }
 
                 @Override
@@ -409,16 +412,6 @@ class InferenceEngineTest {
         }
     }
 
-    InferenceConfig config(InferenceTuning tuning) throws Exception {
-        var legacy = config();
-        return new InferenceConfig(
-                legacy.artifactPath(),
-                legacy.tokenizerDirectory(),
-                legacy.cudaLibraryPath(),
-                tuning,
-                legacy.shutdownTimeout());
-    }
-
     private static List<Integer> prefillChunkLengths(EngineExecutionFixture.SamplingGpu gpu, int decodeQuanta) {
         var inputs = gpu.embeddingInputs;
         return inputs.subList(0, inputs.size() - decodeQuanta).stream()
@@ -427,29 +420,13 @@ class InferenceEngineTest {
     }
 
     @Test
-    void programmaticTuningReachesTheSessionPrefillLoop() throws Exception {
+    void prefillRunsInChunksOf512Tokens() throws Exception {
         var bootstrap = new FakeBootstrap();
-        var tuning = InferenceTuning.defaults(config().workerCpus()).withPrefillChunkTokens(2);
-        try (var engine = InferenceEngine.load(config(tuning), bootstrap);
-                var session = engine.createSession(GenerationConfig.greedy(1L))) {
-            assertEquals(tuning, engine.tuning());
-            int promptTokens = engine.tokenizer().encodeWithModelSpecialTokens("!!!!!").length;
-            assertEquals(5, promptTokens);
-            assertEquals(List.of(1), session.generate("!!!!!", 1, ignored -> {}));
-            assertEquals(List.of(2, 2, 1), prefillChunkLengths(bootstrap.gpu, 1));
-            assertEquals(6, session.currentTokenPosition());
-        }
-    }
-
-    @Test
-    void legacyConfigurationKeepsTheDefault512TokenPrefillChunks() throws Exception {
-        var bootstrap = new FakeBootstrap();
-        var legacy = config();
+        var config = config();
         String prompt = "!".repeat(1100);
-        try (var engine = InferenceEngine.load(legacy, bootstrap);
+        try (var engine = InferenceEngine.load(config, bootstrap);
                 var session = engine.createSession(GenerationConfig.greedy(1L))) {
-            assertEquals(InferenceTuning.defaults(legacy.workerCpus()), engine.tuning());
-            assertEquals(legacy.workerCpus(), engine.tuning().workerProcessorIds());
+            assertEquals(config, engine.config());
             assertEquals(1100, engine.tokenizer().encodeWithModelSpecialTokens(prompt).length);
             session.generate(prompt, 1, ignored -> {});
             assertEquals(List.of(512, 512, 76), prefillChunkLengths(bootstrap.gpu, 1));
@@ -483,13 +460,16 @@ class InferenceEngineTest {
     }
 
     @Test
-    void snapshotRecordsTheEngineTuningIdentityAndSuppliedGeneration() throws Exception {
-        var tuning = InferenceTuning.defaults(config().workerCpus()).withPrefillChunkTokens(64);
+    void snapshotRecordsTheEngineConfigurationIdentityAndSuppliedGeneration() throws Exception {
+        var config = config();
         var generation = new GenerationConfig(0.5f, 3, 0.9f, 7L, false);
-        try (var engine = InferenceEngine.load(config(tuning), new FakeBootstrap())) {
+        try (var engine = InferenceEngine.load(config, new FakeBootstrap())) {
             var snapshot = engine.snapshot(generation);
-            int cpu = tuning.workerProcessorIds().nextSetBit(0);
-            assertEquals(new InferenceRunSnapshot.Tuning(List.of(cpu), 64), snapshot.tuning());
+            int cpu = config.workerCpus().nextSetBit(0);
+            assertEquals(
+                    new InferenceRunSnapshot.Configuration(
+                            List.of(cpu), InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS, null, 0),
+                    snapshot.configuration());
             assertEquals(List.of(SystemInfo.getCpuInfo(cpu).core()), snapshot.workerCoreIds());
             assertEquals(generation, snapshot.generation());
             assertNull(engine.snapshot().generation());
@@ -505,7 +485,7 @@ class InferenceEngineTest {
             assertEquals(directory.resolve("lib.so").toString(), runtime.nativeLibraryPath());
             assertTrue(runtime.euhedralCoreArtifact().startsWith("euhedral-core"), runtime.euhedralCoreArtifact());
             assertEquals(snapshot.toJson(), engine.snapshot(generation).toJson());
-            assertTrue(snapshot.toJson().contains("\"prefillChunkTokens\":64"), snapshot.toJson());
+            assertTrue(snapshot.toJson().contains("\"maxContextTokens\":32768"), snapshot.toJson());
         }
     }
 
@@ -555,17 +535,14 @@ class InferenceEngineTest {
     void timingBoundariesFollowPrefillSelectionOutputAndCommitOrder() throws Exception {
         var bootstrap = new FakeBootstrap();
         bootstrap.gpu.selectTokens(1, 2, 3);
-        var tuning = InferenceTuning.defaults(config().workerCpus()).withPrefillChunkTokens(2);
-        try (var engine = InferenceEngine.load(config(tuning), bootstrap);
+        try (var engine = InferenceEngine.load(config(), bootstrap);
                 var session = engine.createSession(GenerationConfig.greedy(1L))) {
             var timing = new RecordingTiming();
             assertEquals(List.of(1, 2, 3), session.generate("!!!!!", 3, timing::output, null, timing));
             assertEquals(
                     List.of(
                             "encoded:5",
-                            "prefill:2",
-                            "prefill:2",
-                            "prefill:1",
+                            "prefill:5",
                             "first:1",
                             "output:A",
                             "decode:2",
@@ -634,12 +611,13 @@ class InferenceEngineTest {
         }
 
         @Override
-        ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
+        ExecutionGpu openGpu(Path path) {
             return gpu;
         }
 
         @Override
-        QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu) throws java.io.IOException {
+        QwenModel loadModel(Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
+                throws java.io.IOException {
             modelLoads++;
             return EngineModelFixture.load(gpu, EngineExecutionFixture.weights());
         }

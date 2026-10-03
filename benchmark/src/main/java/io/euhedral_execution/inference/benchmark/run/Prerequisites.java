@@ -35,7 +35,8 @@ public final class Prerequisites {
         WorkerProcessorSelection workers =
                 resolveWorkers(options.cpus(), options.excludeCpus(), options.excludeCores(), topology);
 
-        int context = QwenArtifactReader.read(options.artifact()).config().maxPositionEmbeddings();
+        int modelContext = QwenArtifactReader.read(options.artifact()).config().maxPositionEmbeddings();
+        int context = Math.min(modelContext, options.maxContextTokens());
         QwenTokenizer tokenizer = QwenTokenizer.load(options.tokenizer());
         // One prompt per scenario (words), or one per corpus task (chat): iteration i runs prompt i mod size.
         Map<Integer, List<PromptMaterial>> byTarget = new HashMap<>();
@@ -51,11 +52,12 @@ public final class Prerequisites {
                 long required = (long) prompt.actualTokens() + scenario.requestedNewTokens();
                 if (required > context)
                     throw new IllegalArgumentException(
-                            scenario.name() + " needs " + required + " positions; model context is " + context);
+                            scenario.name() + " needs " + required + " positions; context is " + context + " (model "
+                                    + modelContext + ", maxContextTokens " + options.maxContextTokens() + ")");
             }
             prompts.put(scenario, scenarioPrompts);
         }
-        return new Prepared(workers, prompts, context);
+        return new Prepared(workers, prompts, modelContext);
     }
 
     /// `all`, `one-per-core`, `performance`, `performance-one-per-core`, or explicit processor IDs

@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model_loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -52,15 +51,8 @@ class SpeculativeDecodeCudaIntegrationTest {
         long hostBytes = Long.getLong("euhedral.speculative.host-mib", 1024L) << 20;
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 QwenModel model = QwenModel.load(
-                        artifact,
-                        artifactData,
-                        gpu,
-                        WeightResidency.SPECULATIVE,
-                        HostWeightSelection.select(artifactData, hostBytes),
-                        QwenModel.DEFAULT_STAGING_SLOTS);
+                        artifact, artifactData, gpu, true, HostWeightSelection.select(artifactData, hostBytes));
                 var lattice = new PullingLattice()) {
-            // The native-numerics mode: its oracle is greedy decode with the same native numerics.
-            if (Boolean.getBoolean("euhedral.speculative.native")) gpu.selectNvfp4NativeDecode(true);
             var plan = new QwenExecutionPlan(model.weights(), model.staging());
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
             try {

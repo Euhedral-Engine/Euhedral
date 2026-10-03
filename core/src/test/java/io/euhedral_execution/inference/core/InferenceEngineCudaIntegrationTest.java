@@ -70,8 +70,8 @@ class InferenceEngineCudaIntegrationTest {
         private CudaGpuMemory gpu;
 
         @Override
-        ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
-            ExecutionGpu opened = super.openGpu(path, tuning);
+        ExecutionGpu openGpu(Path path) {
+            ExecutionGpu opened = super.openGpu(path);
             this.gpu = (CudaGpuMemory) opened;
             return opened;
         }

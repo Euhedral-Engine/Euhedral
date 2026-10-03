@@ -5,27 +5,34 @@ import java.time.Duration;
 import java.util.BitSet;
 import java.util.Objects;
 
-/// Explicit runtime inputs. [InferenceTuning] is the single owner of the worker processor IDs;
-/// [#workerCpus()] reads them from it. CPU IDs are logical processor IDs accepted by Euhedral, not
-/// a worker count, and are defensively copied.
+/// Explicit runtime inputs. `workerCpus` are logical processor IDs accepted by Euhedral, not a worker
+/// count; the engine validates them against [ProcessorTopology] before loading any model resource, and
+/// the set is defensively copied. `maxContextTokens` is the longest sequence (prompt plus generation)
+/// the engine keeps device memory for: weights that do not fit beside that much KV cache stay in pinned
+/// host memory, chosen automatically.
 public record InferenceConfig(
         Path artifactPath,
         Path tokenizerDirectory,
         Path cudaLibraryPath,
-        InferenceTuning tuning,
+        BitSet workerCpus,
+        int maxContextTokens,
         Duration shutdownTimeout) {
+    public static final int DEFAULT_MAX_CONTEXT_TOKENS = 32768;
+
     public InferenceConfig {
         Objects.requireNonNull(artifactPath, "artifactPath");
         Objects.requireNonNull(tokenizerDirectory, "tokenizerDirectory");
         Objects.requireNonNull(cudaLibraryPath, "cudaLibraryPath");
-        Objects.requireNonNull(tuning, "tuning");
+        workerCpus = (BitSet) Objects.requireNonNull(workerCpus, "workerCpus").clone();
+        if (workerCpus.isEmpty()) throw new IllegalArgumentException("workerCpus must not be empty");
+        if (maxContextTokens <= 0) throw new IllegalArgumentException("maxContextTokens must be positive");
         Objects.requireNonNull(shutdownTimeout, "shutdownTimeout");
         if (shutdownTimeout.isNegative() || shutdownTimeout.isZero())
             throw new IllegalArgumentException("shutdownTimeout must be positive");
         shutdownTimeout.toNanos();
     }
 
-    /// Uses default tuning for the given worker CPUs.
+    /// The default context capacity.
     public InferenceConfig(
             Path artifactPath,
             Path tokenizerDirectory,
@@ -36,12 +43,13 @@ public record InferenceConfig(
                 artifactPath,
                 tokenizerDirectory,
                 cudaLibraryPath,
-                InferenceTuning.defaults(Objects.requireNonNull(workerCpus, "workerCpus")),
+                workerCpus,
+                DEFAULT_MAX_CONTEXT_TOKENS,
                 shutdownTimeout);
     }
 
-    /// Returns a copy of the tuning's worker processor IDs.
+    @Override
     public BitSet workerCpus() {
-        return this.tuning.workerProcessorIds();
+        return (BitSet) this.workerCpus.clone();
     }
 }

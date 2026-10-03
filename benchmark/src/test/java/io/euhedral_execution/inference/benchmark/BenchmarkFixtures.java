@@ -7,8 +7,8 @@ import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.BenchmarkResult;
 import io.euhedral_execution.inference.benchmark.run.BenchmarkRunner;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
-import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
@@ -23,6 +23,8 @@ public final class BenchmarkFixtures {
     private BenchmarkFixtures() {}
 
     public static final int EOS = 7;
+    /// The prefill chunk the real session uses.
+    public static final int CHUNK = QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS;
 
     public static java.util.BitSet bits(int... ids) {
         var set = new java.util.BitSet();
@@ -34,10 +36,10 @@ public final class BenchmarkFixtures {
         return text.split(" ").length;
     }
 
-    public static InferenceRunSnapshot snapshot(InferenceTuning tuning, GenerationConfig generation) {
+    public static InferenceRunSnapshot snapshot(GenerationConfig generation) {
         return new InferenceRunSnapshot(
                 InferenceRunSnapshot.SCHEMA_VERSION,
-                InferenceRunSnapshot.Tuning.of(tuning),
+                new InferenceRunSnapshot.Configuration(List.of(0), 32768, "fake.edrl", 0),
                 List.of(0),
                 new InferenceRunSnapshot.Model(
                         "/fake.edrl",
@@ -49,9 +51,9 @@ public final class BenchmarkFixtures {
                         "25", "vendor", "vm", "Linux", "amd64", null, "euhedral-core-0.0.7.jar", "/lib.so", null));
     }
 
-    /// Simulates the session contract: fresh session per call, hook events per prefill chunk and decode quantum.
+    /// Simulates the session contract: fresh session per call, hook events per 512-token prefill chunk and decode
+    /// quantum.
     public static final class FakeTarget implements BenchmarkRunner.Target {
-        public final InferenceTuning tuning;
         public final List<IterationTiming> timings = new ArrayList<>();
         public int sessions;
         public boolean closed;
@@ -59,13 +61,9 @@ public final class BenchmarkFixtures {
         public int eosAfter = Integer.MAX_VALUE;
         long clock;
 
-        public FakeTarget(InferenceTuning tuning) {
-            this.tuning = tuning;
-        }
-
         @Override
         public InferenceRunSnapshot snapshot(GenerationConfig generation) {
-            return BenchmarkFixtures.snapshot(this.tuning, generation);
+            return BenchmarkFixtures.snapshot(generation);
         }
 
         @Override
@@ -77,10 +75,9 @@ public final class BenchmarkFixtures {
             timing.markEntry(tick());
             int promptTokens = words(prompt);
             timing.promptEncoded(tick(), promptTokens);
-            for (int offset = 0; offset < promptTokens; offset += this.tuning.prefillChunkTokens()) {
+            for (int offset = 0; offset < promptTokens; offset += CHUNK) {
                 if (call == this.failOnCall) throw new IllegalStateException("injected quantum failure");
-                timing.prefillQuantum(
-                        tick(), tick(), Math.min(this.tuning.prefillChunkTokens(), promptTokens - offset));
+                timing.prefillQuantum(tick(), tick(), Math.min(CHUNK, promptTokens - offset));
             }
             List<Integer> tokens = new ArrayList<>();
             if (maxNewTokens > 0) {
@@ -139,7 +136,7 @@ public final class BenchmarkFixtures {
         return prompts;
     }
 
-    public static BenchmarkOptions options(List<Integer> chunks, List<Scenario> scenarios, int warmup, int iterations) {
+    public static BenchmarkOptions options(List<Scenario> scenarios, int warmup, int iterations) {
         return new BenchmarkOptions(
                 Path.of("/a"),
                 Path.of("/t"),
@@ -147,7 +144,7 @@ public final class BenchmarkFixtures {
                 null,
                 null,
                 null,
-                chunks,
+                null,
                 scenarios,
                 warmup,
                 iterations,

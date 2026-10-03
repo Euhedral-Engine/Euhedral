@@ -4,10 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
-import io.euhedral_execution.inference.core.InferenceTuning;
-import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
-import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -15,7 +12,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -24,11 +20,10 @@ import java.util.Objects;
 /// rejected. Relative paths resolve against the working directory.
 ///
 /// - `cpus`: `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges such as `2-5,8`.
-/// - `prefillChunks`: one engine load per value; each runs every scenario.
+/// - `maxContextTokens`: the longest sequence (prompt plus generation) the engine keeps device memory for.
 /// - `output`: a `.json` path writes one document; any other path writes JSONL. Null selects a
 ///   timestamped JSONL file under `benchmark-results/`.
 /// - `gpuMemory`: record device free/total memory before and after each iteration, outside timing.
-/// - `gpuHeadroomMiB`: free device memory required beyond the artifact size before loading.
 @JsonIgnoreProperties(ignoreUnknown = false)
 public record BenchmarkOptions(
         @JsonProperty(value = "artifact", required = true) Path artifact,
@@ -37,10 +32,10 @@ public record BenchmarkOptions(
         @JsonProperty(value = "cudaLibrary", required = true)
         Path cudaLibrary,
 
+        @JsonProperty("maxContextTokens") Integer maxContextTokens,
         @JsonProperty("cpus") String cpus,
         @JsonProperty("excludeCpus") List<Integer> excludeCpus,
         @JsonProperty("excludeCores") List<Integer> excludeCores,
-        @JsonProperty("prefillChunks") List<Integer> prefillChunks,
         @JsonProperty("scenarios") List<Scenario> scenarios,
         @JsonProperty("warmup") Integer warmup,
         @JsonProperty("iterations") Integer iterations,
@@ -50,14 +45,7 @@ public record BenchmarkOptions(
         @JsonProperty("overwrite") Boolean overwrite,
         @JsonProperty("append") Boolean append,
         @JsonProperty("gpuMemory") Boolean gpuMemory,
-        @JsonProperty("gpuHeadroomMiB") Long gpuHeadroomMiB,
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
-        @JsonProperty("q3DispatchMode") Q3DispatchMode q3DispatchMode,
-        @JsonProperty("q3SmallRowThreshold") Integer q3SmallRowThreshold,
-        @JsonProperty("weightResidency") WeightResidency weightResidency,
-        @JsonProperty("hostWeightMiB") Long hostWeightMiB,
-        @JsonProperty("stagingSlots") Integer stagingSlots,
-        @JsonProperty("speculativeDepth") Integer speculativeDepth,
         @JsonProperty("promptCorpus") String promptCorpus) {
 
     static final ObjectMapper JSON = new ObjectMapper();
@@ -66,12 +54,10 @@ public record BenchmarkOptions(
         Objects.requireNonNull(artifact, "artifact");
         Objects.requireNonNull(tokenizer, "tokenizer");
         Objects.requireNonNull(cudaLibrary, "cudaLibrary");
+        maxContextTokens = maxContextTokens == null ? InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS : maxContextTokens;
         cpus = cpus == null ? "all" : cpus.strip();
         excludeCpus = excludeCpus == null ? List.of() : List.copyOf(excludeCpus);
         excludeCores = excludeCores == null ? List.of() : List.copyOf(excludeCores);
-        prefillChunks = prefillChunks == null
-                ? List.of(InferenceTuning.DEFAULT_PREFILL_CHUNK_TOKENS)
-                : List.copyOf(prefillChunks);
         scenarios = scenarios == null ? Scenario.DEFAULT_SUITE : List.copyOf(scenarios);
         warmup = warmup == null ? 1 : warmup;
         iterations = iterations == null ? 3 : iterations;
@@ -80,20 +66,7 @@ public record BenchmarkOptions(
         overwrite = overwrite != null && overwrite;
         append = append != null && append;
         gpuMemory = gpuMemory != null && gpuMemory;
-        gpuHeadroomMiB = gpuHeadroomMiB == null ? 1024L : gpuHeadroomMiB;
         shutdownTimeoutSeconds = shutdownTimeoutSeconds == null ? 10L : shutdownTimeoutSeconds;
-        q3DispatchMode = q3DispatchMode == null ? Q3DispatchMode.AUTO : q3DispatchMode;
-        q3SmallRowThreshold =
-                q3SmallRowThreshold == null ? Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD : q3SmallRowThreshold;
-        if (q3SmallRowThreshold < 0) throw new IllegalArgumentException("Q3 threshold must not be negative");
-        weightResidency = weightResidency == null ? WeightResidency.ALL : weightResidency;
-        hostWeightMiB = hostWeightMiB == null ? 0L : hostWeightMiB;
-        if (hostWeightMiB < 0) throw new IllegalArgumentException("hostWeightMiB must not be negative");
-        stagingSlots = stagingSlots == null ? QwenModel.DEFAULT_STAGING_SLOTS : stagingSlots;
-        if (stagingSlots < 2) throw new IllegalArgumentException("stagingSlots must be at least 2");
-        speculativeDepth = speculativeDepth == null ? 0 : speculativeDepth;
-        if (speculativeDepth < 0 || speculativeDepth > 7)
-            throw new IllegalArgumentException("speculativeDepth must be 0 to 7");
         promptCorpus = promptCorpus == null ? "words" : promptCorpus.strip();
         if (!promptCorpus.equals("words") && !promptCorpus.equals("chat"))
             throw new IllegalArgumentException("promptCorpus must be \"words\" or \"chat\"");
@@ -101,66 +74,13 @@ public record BenchmarkOptions(
         if (cpus.isEmpty()) throw new IllegalArgumentException("cpus must not be blank");
         for (int id : excludeCpus) if (id < 0) throw new IllegalArgumentException("excludeCpus must not be negative");
         for (int id : excludeCores) if (id < 0) throw new IllegalArgumentException("excludeCores must not be negative");
-        if (prefillChunks.isEmpty()) throw new IllegalArgumentException("prefillChunks selects no values");
-        for (int chunk : prefillChunks)
-            if (chunk <= 0) throw new IllegalArgumentException("prefillChunks values must be positive");
-        if (prefillChunks.stream().distinct().count() != prefillChunks.size())
-            throw new IllegalArgumentException("prefillChunks contains duplicates");
+        if (maxContextTokens <= 0) throw new IllegalArgumentException("maxContextTokens must be positive");
         if (scenarios.isEmpty()) throw new IllegalArgumentException("no scenarios selected");
         if (warmup < 0) throw new IllegalArgumentException("warmup must not be negative");
         if (iterations <= 0) throw new IllegalArgumentException("iterations must be positive");
         if (overwrite && append) throw new IllegalArgumentException("choose either overwrite or append");
         if (append && isJson(output)) throw new IllegalArgumentException("append requires JSONL output");
-        if (gpuHeadroomMiB < 0) throw new IllegalArgumentException("gpuHeadroomMiB must not be negative");
         if (shutdownTimeoutSeconds <= 0) throw new IllegalArgumentException("shutdownTimeoutSeconds must be positive");
-    }
-
-    /// Compatibility constructor for callers that do not select experimental GPU execution.
-    public BenchmarkOptions(
-            Path artifact,
-            Path tokenizer,
-            Path cudaLibrary,
-            String cpus,
-            List<Integer> excludeCpus,
-            List<Integer> excludeCores,
-            List<Integer> prefillChunks,
-            List<Scenario> scenarios,
-            Integer warmup,
-            Integer iterations,
-            Generation generation,
-            Long promptSeed,
-            Path output,
-            Boolean overwrite,
-            Boolean append,
-            Boolean gpuMemory,
-            Long gpuHeadroomMiB,
-            Long shutdownTimeoutSeconds) {
-        this(
-                artifact,
-                tokenizer,
-                cudaLibrary,
-                cpus,
-                excludeCpus,
-                excludeCores,
-                prefillChunks,
-                scenarios,
-                warmup,
-                iterations,
-                generation,
-                promptSeed,
-                output,
-                overwrite,
-                append,
-                gpuMemory,
-                gpuHeadroomMiB,
-                shutdownTimeoutSeconds,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null);
     }
 
     /// Sampling settings. `greedy` (default) selects argmax, so temperature/topK/topP are rejected;
@@ -212,10 +132,10 @@ public record BenchmarkOptions(
                 options.artifact(),
                 options.tokenizer(),
                 options.cudaLibrary(),
+                options.maxContextTokens(),
                 options.cpus(),
                 options.excludeCpus(),
                 options.excludeCores(),
-                options.prefillChunks(),
                 options.scenarios(),
                 options.warmup(),
                 options.iterations(),
@@ -225,14 +145,7 @@ public record BenchmarkOptions(
                 options.overwrite(),
                 options.append(),
                 options.gpuMemory(),
-                options.gpuHeadroomMiB(),
                 options.shutdownTimeoutSeconds(),
-                options.q3DispatchMode(),
-                options.q3SmallRowThreshold(),
-                options.weightResidency(),
-                options.hostWeightMiB(),
-                options.stagingSlots(),
-                options.speculativeDepth(),
                 options.promptCorpus());
     }
 
@@ -242,18 +155,6 @@ public record BenchmarkOptions(
 
     public Duration shutdownTimeout() {
         return Duration.ofSeconds(this.shutdownTimeoutSeconds);
-    }
-
-    /// One engine load per prefill-chunk value; each runs every scenario.
-    public List<InferenceTuning> sweep(InferenceTuning base) {
-        List<InferenceTuning> tunings = new ArrayList<>();
-        for (int chunk : this.prefillChunks)
-            tunings.add(base.withPrefillChunkTokens(chunk)
-                    .withQ3Dispatch(this.q3DispatchMode, this.q3SmallRowThreshold)
-                    .withWeightResidency(this.weightResidency)
-                    .withHostWeights(this.hostWeightMiB * 1024L * 1024L, this.stagingSlots)
-                    .withSpeculativeDepth(this.speculativeDepth));
-        return tunings;
     }
 
     private static boolean isJson(Path output) {

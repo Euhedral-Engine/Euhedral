@@ -11,26 +11,30 @@ import java.util.function.Function;
 /// Short human summary: medians over measured successful rows. Warmup rows are excluded; ineligible
 /// and failed rows are only counted.
 public final class Summary {
+    private static final String LABEL = "implementation | artifact | scenario";
+
     private Summary() {}
 
     public static String format(List<BenchmarkResult> rows) {
         Map<String, List<BenchmarkResult>> groups = new LinkedHashMap<>();
         for (BenchmarkResult row : rows) {
             if (row.warmup()) continue;
-            String chunk = row.engine() == null
+            String artifact = row.engine() == null
                     ? "-"
-                    : row.engine().path("tuning").path("prefillChunkTokens").asText("-");
+                    : row.engine().path("configuration").path("artifact").asText("-");
             groups.computeIfAbsent(
-                            row.implementation() + " | chunk " + chunk + " | "
+                            row.implementation() + " | " + artifact + " | "
                                     + row.scenario().name(),
                             ignored -> new ArrayList<>())
                     .add(row);
         }
+        int width = groups.keySet().stream().mapToInt(String::length).max().orElse(0);
+        width = Math.max(width, LABEL.length());
         StringBuilder out = new StringBuilder();
         out.append(String.format(
                 Locale.ROOT,
-                "%-52s %4s %4s %4s %12s %10s %12s %10s%n",
-                "implementation | chunk | scenario",
+                "%-" + width + "s %4s %4s %4s %12s %10s %12s %10s%n",
+                LABEL,
                 "ok",
                 "inel",
                 "fail",
@@ -45,7 +49,7 @@ public final class Summary {
                     .toList();
             out.append(String.format(
                     Locale.ROOT,
-                    "%-52s %4d %4d %4d %12s %10s %12s %10s%n",
+                    "%-" + width + "s %4d %4d %4d %12s %10s %12s %10s%n",
                     entry.getKey(),
                     ok.size(),
                     count(group, BenchmarkResult.INELIGIBLE),

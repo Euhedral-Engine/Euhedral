@@ -26,7 +26,7 @@ class InferenceRunSnapshotTest {
         };
         return new InferenceRunSnapshot(
                 InferenceRunSnapshot.SCHEMA_VERSION,
-                InferenceRunSnapshot.Tuning.of(new InferenceTuning(ProcessorTopology.bits(9, 1, 8, 0), 256)),
+                new InferenceRunSnapshot.Configuration(List.of(0, 1, 8, 9), 32768, "q3-compressed", 2),
                 List.of(0, 1),
                 new InferenceRunSnapshot.Model(
                         "/models/model.edrl", 12859040768L, 2, InferenceRunSnapshot.Dimensions.of(config(layers))),
@@ -45,8 +45,8 @@ class InferenceRunSnapshotTest {
 
     @Test
     void serializesAStableJsonContract() {
-        String expected = "{\"schemaVersion\":2,"
-                + "\"tuning\":{\"workerProcessorIds\":[0,1,8,9],\"prefillChunkTokens\":256,\"q3DispatchMode\":\"AUTO\",\"q3SmallRowThreshold\":8},"
+        String expected = "{\"schemaVersion\":3,"
+                + "\"configuration\":{\"workerProcessorIds\":[0,1,8,9],\"maxContextTokens\":32768,\"artifact\":\"q3-compressed\",\"speculativeDepth\":2},"
                 + "\"workerCoreIds\":[0,1],"
                 + "\"model\":{\"artifactPath\":\"/models/model.edrl\",\"artifactBytes\":12859040768,"
                 + "\"artifactFormatVersion\":2,\"dimensions\":{\"vocabSize\":248320,\"hiddenSize\":5120,"
@@ -86,7 +86,7 @@ class InferenceRunSnapshotTest {
         var original = snapshot(null);
         var copy = new InferenceRunSnapshot(
                 original.schemaVersion(),
-                original.tuning(),
+                original.configuration(),
                 cores,
                 original.model(),
                 original.generation(),
@@ -97,6 +97,6 @@ class InferenceRunSnapshotTest {
                 UnsupportedOperationException.class, () -> copy.workerCoreIds().add(3));
         assertThrows(
                 UnsupportedOperationException.class,
-                () -> copy.tuning().workerProcessorIds().add(3));
+                () -> copy.configuration().workerProcessorIds().add(3));
     }
 }

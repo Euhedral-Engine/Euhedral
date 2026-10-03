@@ -147,13 +147,6 @@ public final class StageGraph implements AutoCloseable {
                 successor.submittedPredecessors[predecessorCounts[successor.stage()]++] = producer;
             }
         }
-        // A stage continues a linear chain when its only predecessor has no other successor.
-        for (StageFrame stage : this.stages) {
-            stage.chainPredecessor = stage.submittedPredecessors.length == 1
-                            && stage.submittedPredecessors[0].submittedSuccessors.length == 1
-                    ? stage.submittedPredecessors[0]
-                    : null;
-        }
         markPaths(this.stages);
         long preparedMarker = 0;
         try {
@@ -198,7 +191,7 @@ public final class StageGraph implements AutoCloseable {
 
     /// Whether stages are placed over the pool's lanes; otherwise they all run on the home lane.
     /// Links each stage to the successor that continues its longest submitted path to a sink (the first
-    /// listed on ties), so PATH placement keeps a graph's critical chain on one lane.
+    /// listed on ties), so lane placement keeps a graph's critical chain on one lane.
     private static void markPaths(StageFrame[] stages) {
         int[] height = new int[stages.length];
         int[] pending = new int[stages.length];

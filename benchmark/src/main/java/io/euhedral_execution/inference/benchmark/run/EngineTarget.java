@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.InferenceRunSnapshot;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.BitSet;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -21,11 +22,16 @@ public final class EngineTarget implements BenchmarkRunner.Target {
     }
 
     public static BenchmarkRunner.TargetFactory factory(
-            Path artifact, Path tokenizer, Path cudaLibrary, Duration shutdown) {
-        return tuning -> {
+            Path artifact,
+            Path tokenizer,
+            Path cudaLibrary,
+            BitSet workerCpus,
+            int maxContextTokens,
+            Duration shutdown) {
+        return () -> {
             try {
-                return new EngineTarget(
-                        InferenceEngine.load(new InferenceConfig(artifact, tokenizer, cudaLibrary, tuning, shutdown)));
+                return new EngineTarget(InferenceEngine.load(
+                        new InferenceConfig(artifact, tokenizer, cudaLibrary, workerCpus, maxContextTokens, shutdown)));
             } catch (InferenceEngine.StartupFailure failure) {
                 try {
                     failure.close();
