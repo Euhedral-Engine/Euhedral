@@ -99,12 +99,35 @@ Validation: the bitwise test above, the whole native suite (116 tests), `spotles
 nativePackage :api:bootJar`, and the in-model `SpeculativeVerifyCudaIntegrationTest` and
 `SpeculativeDecodeCudaIntegrationTest` (row-exact verification equals one-row decode, outputs equal greedy).
 
-## Not done
+## Verify (MTP) gate
 
-- **Fused verifier rows.** The row twin is about 4x faster per row, but each of the M rows still expands the
-  same KV tiles. A kernel that expands each K and V tile once for all rows (columns 6 M of the mma N dimension,
-  one consumer warp per 8 columns, falling back to the row twin when the rows' split spans differ, about 3% of
-  launches) would take 3 rows at 16K from 84 toward about 45 µs per layer. Not built; the MTP verify gate was not
-  run either (the verify rows share the kernel and are covered by the exactness tests above).
-- **Merge into the decode kernel** (last CTA merges): about 5 µs of the 38 µs at 16K.
-- **Query rotation** is repeated by all 64 splits of a KV head (about 13 µs of fixed cost per CTA at 16K).
+Q3 + NVMTP artifact, MTP2 (verify = 3 rows), chat corpus, 256 generated tokens, warmup 1 and 4 iterations (one per
+prompt), one paired fork each. Control `ef33b25` (before the change), candidate `main` with it.
+
+| Context | Control tok/s | Candidate tok/s | Change |
+|---|---|---|---|
+| 16K | 93.47 | 111.26 | **+19.0%** |
+| 32K | 73.22 | 101.29 | **+38.3%** |
+
+TTFT unchanged. Every output hash equals the control's (the row-exact verifier still equals greedy decode). The
+verify rows share the kernel, so the per-row speedup carries over: at 32K the 3-row twin went from 639 to 151 us
+per layer, about 7.8 ms per verification.
+
+## Follow-ups, bounded and not built
+
+Each was bounded first with a skip toggle on a copy of the kernel (operator bench, cold KV, relaxed numerics,
+results discarded), because the doc's estimates predate the three-warp kernel.
+
+| Idea | Toggle | 16K, 3 rows | 64K, 3 rows | Verdict |
+|---|---|---|---|---|
+| Fused verifier rows: expand each KV tile once for all rows | rows 1 and 2 skip all V expansion, all V loads and all K copies | 86 -> 83 us (-3%) | 335 -> 272 us (-19%) | Not built |
+| Shared query rotation (rotate once per KV head, not per split) | skip the Hadamard entirely | 86 -> 84 us (-2.5%) | 335 -> 333 us (-0.7%) | Not built |
+| Merge inside the decode kernel (last CTA merges) | none needed: the merge is 7 us of 38 us at 16K; fusing removes the launch gap, not the work | at most 3 us per layer, about 0.2% of a token | | Not built |
+
+**Why fusing rows buys so little.** The bound above is generous: it removes all of the V work and all of the memory
+traffic of two of the three rows, and still saves only 3% at 16K. The rows are limited by per-row compute
+that sharing cannot remove (the QK and PV mma chains and the softmax; the mma tiles are already 6 of 8
+columns full). A real fused kernel also hits the SM budget: three rows need three n-tiles of 64 accumulator
+registers each, one consumer warp per tile plus the producers is 7 warps at about 160 registers, which leaves
+under two CTAs per SM, so 256 CTAs run in two waves. The 4-CTA occupancy of the current kernel (24 KiB of
+shared memory, 158 registers) is what made it fast.
