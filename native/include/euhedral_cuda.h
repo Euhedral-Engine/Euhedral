@@ -162,7 +162,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16(
  * the BF16 kernels then run. The BF16 activations are represented exactly (down to 2^-9 of a 32-block's maximum),
  * so the results differ from the BF16 route only by its rounding of code * scale to BF16. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_available(void);
-EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_q3_mx_scratch_bytes(uint32_t rows, uint32_t width);
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_q3_mx_scratch_bytes(uint32_t rows, uint32_t width, uint32_t weight_rows);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_mx_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,

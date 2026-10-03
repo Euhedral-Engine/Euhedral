@@ -248,7 +248,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.q3MxScratchBytes = symbols.find("euhedral_cuda_q3_mx_scratch_bytes")
                     .map(symbol -> linker.downcallHandle(
                             symbol,
-                            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT)))
                     .orElse(null);
             FunctionDescriptor q3MxDescriptor = FunctionDescriptor.of(
                     ValueLayout.JAVA_INT,
@@ -1212,9 +1216,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         long expanded = P2e2Layout.expandedByteSize(outFeatures, inFeatures);
         if (expanded <= Q3_SCRATCH_LIMIT) {
-            withQ3Scratch(expanded, scratch -> {
+            long activations = q3MxReserveBytes(rows, inFeatures, outFeatures),
+                    activationOffset = alignUp(expanded, 256);
+            withQ3Scratch(activationOffset + activations, scratch -> {
                 expandQ3(weightsAddress, weightsByteSize, outFeatures, inFeatures, 0, outFeatures, scratch, expanded);
-                linearQ3Bf16(inputAddress, scratch, outputAddress, rows, inFeatures, outFeatures, expanded, selected);
+                withQ3MxReserved(
+                        scratch + activationOffset,
+                        activations,
+                        () -> linearQ3Bf16(
+                                inputAddress,
+                                scratch,
+                                outputAddress,
+                                rows,
+                                inFeatures,
+                                outFeatures,
+                                expanded,
+                                selected));
             });
             return;
         }
@@ -1228,9 +1245,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int count = Math.min(chunk, outFeatures - first);
             long weights = P2e2Layout.expandedByteSize(count, inFeatures);
             long outputOffset = alignUp(weights, 256);
-            withQ3Scratch(outputOffset + (long) rows * count * Short.BYTES, scratch -> {
+            long activationOffset = alignUp(outputOffset + (long) rows * count * Short.BYTES, 256);
+            long activations = q3MxReserveBytes(rows, inFeatures, count);
+            withQ3Scratch(activationOffset + activations, scratch -> {
                 expandQ3(weightsAddress, weightsByteSize, outFeatures, inFeatures, firstRow, count, scratch, weights);
-                linearQ3Bf16(inputAddress, scratch, scratch + outputOffset, rows, inFeatures, count, weights, selected);
+                withQ3MxReserved(
+                        scratch + activationOffset,
+                        activations,
+                        () -> linearQ3Bf16(
+                                inputAddress,
+                                scratch,
+                                scratch + outputOffset,
+                                rows,
+                                inFeatures,
+                                count,
+                                weights,
+                                selected));
                 copyRows(
                         outputAddress + (long) firstRow * Short.BYTES,
                         (long) outFeatures * Short.BYTES,
@@ -1466,9 +1496,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             return;
         }
         long expanded = P2e2Layout.expandedByteSize(outputs, width);
-        withQ3Scratch(expanded, scratch -> {
+        long activations = q3MxReserveBytes(rows, width, outputs), activationOffset = alignUp(expanded, 256);
+        withQ3Scratch(activationOffset + activations, scratch -> {
             expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
-            q3FfnDownBf16(input, scratch, output, rows, width, outputs, expanded);
+            withQ3MxReserved(
+                    scratch + activationOffset,
+                    activations,
+                    () -> q3FfnDownBf16(input, scratch, output, rows, width, outputs, expanded));
         });
     }
 
@@ -1488,9 +1522,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             return;
         }
         long expanded = P2e2Layout.expandedByteSize(outputs, width);
-        withQ3Scratch(expanded, scratch -> {
+        long activations = q3MxReserveBytes(rows, width, outputs), activationOffset = alignUp(expanded, 256);
+        withQ3Scratch(activationOffset + activations, scratch -> {
             expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
-            q3FfnDownSplitBf16(input, scratch, output, partials, rows, width, outputs, expanded);
+            withQ3MxReserved(
+                    scratch + activationOffset,
+                    activations,
+                    () -> q3FfnDownSplitBf16(input, scratch, output, partials, rows, width, outputs, expanded));
         });
     }
 
@@ -1509,9 +1547,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             return;
         }
         long expanded = P2e2Layout.expandedByteSize(outputs, width);
-        withQ3Scratch(expanded, scratch -> {
+        long activations = q3MxReserveBytes(rows, width, outputs), activationOffset = alignUp(expanded, 256);
+        withQ3Scratch(activationOffset + activations, scratch -> {
             expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
-            q3GateUpSwiGluBf16(input, scratch, output, rows, width, outputs, expanded);
+            withQ3MxReserved(
+                    scratch + activationOffset,
+                    activations,
+                    () -> q3GateUpSwiGluBf16(input, scratch, output, rows, width, outputs, expanded));
         });
     }
 
@@ -1579,55 +1621,128 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int width,
             int outputs,
             long weightBytes) {
-        // Inside a P2E2 expansion the shared scratch holds the expanded weights; this route needs it for activations.
-        if (!q3MxEnabled
-                || rows < Q3_MX_MIN_ROWS
-                || ROW_EXACT.get()[0]
-                || q3ScratchLock.isHeldByCurrentThread()
-                || !q3MxAvailable()) return false;
+        if (!q3MxEnabled || rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || !q3MxAvailable()) return false;
         if (width % 128 != 0 || outputs % 128 != 0) return false;
         ensureOpen();
         requireAddresses(input, weights, output);
-        long scratchBytes;
+        long scratchBytes = q3MxScratchBytes(rows, width, outputs);
+        // Inside a P2E2 expansion the shared scratch holds the expanded weights; the expansion reserved a region
+        // behind them for the activations (withExpandedWeights).
+        if (q3ScratchLock.isHeldByCurrentThread()) {
+            long[] reserved = q3MxReserved.get();
+            if (reserved == null || reserved[1] < scratchBytes) return false;
+            return runQ3Mx(
+                    operation,
+                    kernel,
+                    bits,
+                    input,
+                    weights,
+                    output,
+                    rows,
+                    width,
+                    outputs,
+                    weightBytes,
+                    reserved[0],
+                    scratchBytes);
+        }
+        boolean[] ran = {false};
+        withQ3Scratch(
+                scratchBytes,
+                scratch -> ran[0] = runQ3Mx(
+                        operation,
+                        kernel,
+                        bits,
+                        input,
+                        weights,
+                        output,
+                        rows,
+                        width,
+                        outputs,
+                        weightBytes,
+                        scratch,
+                        scratchBytes));
+        return ran[0];
+    }
+
+    private boolean runQ3Mx(
+            String operation,
+            MethodHandle kernel,
+            int bits,
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            long scratch,
+            long scratchBytes) {
+        int status;
         try {
-            scratchBytes = (long) this.q3MxScratchBytes.invokeExact(rows, width);
+            status = bits == 3
+                    ? (int) kernel.invokeExact(
+                            MemorySegment.ofAddress(input),
+                            MemorySegment.ofAddress(weights),
+                            MemorySegment.ofAddress(output),
+                            MemorySegment.ofAddress(scratch),
+                            rows,
+                            width,
+                            outputs,
+                            weightBytes,
+                            scratchBytes)
+                    : (int) this.linearQ45MxBf16.invokeExact(
+                            bits,
+                            MemorySegment.ofAddress(input),
+                            MemorySegment.ofAddress(weights),
+                            MemorySegment.ofAddress(output),
+                            MemorySegment.ofAddress(scratch),
+                            rows,
+                            width,
+                            outputs,
+                            weightBytes,
+                            scratchBytes);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException(operation + " invocation failed", throwable);
+        }
+        if (status == ROUTE_UNAVAILABLE) return false;
+        if (status != 0) throw new GpuMemoryException(q3Operation(operation, status), status);
+        return true;
+    }
+
+    /// Bytes of quantized-activation scratch the FP8 route needs for `rows` rows of `width` values.
+    private long q3MxScratchBytes(int rows, int width, int outputs) {
+        try {
+            return (long) this.q3MxScratchBytes.invokeExact(rows, width, outputs);
         } catch (Throwable failure) {
             throw new GpuMemoryException("Q3 FP8 scratch size invocation failed", failure);
         }
-        boolean[] ran = {false};
-        withQ3Scratch(scratchBytes, scratch -> {
-            int status;
-            try {
-                status = bits == 3
-                        ? (int) kernel.invokeExact(
-                                MemorySegment.ofAddress(input),
-                                MemorySegment.ofAddress(weights),
-                                MemorySegment.ofAddress(output),
-                                MemorySegment.ofAddress(scratch),
-                                rows,
-                                width,
-                                outputs,
-                                weightBytes,
-                                scratchBytes)
-                        : (int) this.linearQ45MxBf16.invokeExact(
-                                bits,
-                                MemorySegment.ofAddress(input),
-                                MemorySegment.ofAddress(weights),
-                                MemorySegment.ofAddress(output),
-                                MemorySegment.ofAddress(scratch),
-                                rows,
-                                width,
-                                outputs,
-                                weightBytes,
-                                scratchBytes);
-            } catch (Throwable throwable) {
-                throw new GpuMemoryException(operation + " invocation failed", throwable);
-            }
-            if (status == ROUTE_UNAVAILABLE) return;
-            if (status != 0) throw new GpuMemoryException(q3Operation(operation, status), status);
-            ran[0] = true;
-        });
-        return ran[0];
+    }
+
+    /// The activation region reserved behind P2E2-expanded weights for the calling thread: {address, bytes}.
+    private final ThreadLocal<long[]> q3MxReserved = new ThreadLocal<>();
+
+    /// Bytes to reserve behind expanded weights for an FP8 route over `rows` rows of `width` values, or zero
+    /// when that route will not run.
+    private long q3MxReserveBytes(int rows, int width, int outputs) {
+        if (!q3MxEnabled || rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || width % 128 != 0 || !q3MxAvailable())
+            return 0;
+        return q3MxScratchBytes(rows, width, outputs);
+    }
+
+    /// Runs `use` with the activation region [`address`, `address + bytes`) reserved for the FP8 route of the
+    /// launches it makes (the caller holds the shared scratch and has placed expanded weights before `address`).
+    private void withQ3MxReserved(long address, long bytes, Runnable use) {
+        if (bytes == 0) {
+            use.run();
+            return;
+        }
+        long[] previous = q3MxReserved.get();
+        q3MxReserved.set(new long[] {address, bytes});
+        try {
+            use.run();
+        } finally {
+            q3MxReserved.set(previous);
+        }
     }
 
     /// Whether the native Blackwell NVFP4 kernels are loaded: an sm_12x device, and not disabled with

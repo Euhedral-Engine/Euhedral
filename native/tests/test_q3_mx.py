@@ -121,8 +121,8 @@ class Q3MxTest(unittest.TestCase):
         dout = gpu.zeros(rows * width * 2, 0xAA)
         grid = ((rows + 127) // 128) * (n // 128)
         name = "euhedral_q3mx_gate_up_swiglu_128x64" if paired else "euhedral_q3mx_linear_128x128"
-        gpu.launch(name, grid, [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset)],
-                   block=256, shared=SHARED)
+        gpu.launch(name, grid, [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset), P(0)],
+                   block=384, shared=SHARED)
         got = (np.frombuffer(gpu.download(dout, rows * width * 2), np.uint16).astype(np.uint32) << 16).view(np.float32)
         got = got.reshape(rows, width).astype(np.float64)
         for p in (dhi, dlo, dsc, dw, dout):
@@ -159,7 +159,7 @@ class Q3MxTest(unittest.TestCase):
                     dout = gpu.zeros(rows * n * 2, 0xAA)
                     gpu.launch(f"euhedral_q{bits}mx_linear_128x128", ((rows + 127) // 128) * (n // 128),
                                [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(high_offset),
-                                C.c_uint64(scale_offset)], block=256, shared=SHARED)
+                                C.c_uint64(scale_offset), P(0)], block=384, shared=SHARED)
                     got = (np.frombuffer(gpu.download(dout, rows * n * 2), np.uint16).astype(np.uint32) << 16).view(np.float32)
                     got = got.reshape(rows, n).astype(np.float64)
                     for p in (dhi, dlo, dsc, dw, dout):
@@ -167,6 +167,29 @@ class Q3MxTest(unittest.TestCase):
                     w64 = (codes.reshape(n, k // 64, 64) * scales.astype(np.float64)[:, :, None]).reshape(n, k)
                     y = x.astype(np.float64) @ w64.T
                     self.assertLess(np.max(np.abs(got - y)) / np.abs(y).max(), 2.0 ** -8)
+
+    def test_split_k_linear_matches_float64(self):
+        gpu, rng = self.gpu, self.rng
+        for splits, rows, n, k in [(2, 200, 256, 512), (4, 128, 128, 1024), (2, 37, 384, 768)]:
+            with self.subTest(splits=splits, rows=rows, n=n, k=k):
+                codes = rng.integers(-4, 4, (n, k)).astype(np.int8)
+                scales = rng.uniform(0.002, 0.02, (n, k // 64)).astype(np.float16)
+                weights, scale_offset = pack_q3(codes, scales)
+                bits, x = bf16_values(rng, (rows, k))
+                hi, lo, sc = self.quantize(bits, rows, k)
+                dhi, dlo, dsc, dw = gpu.upload(hi.tobytes()), gpu.upload(lo.tobytes()), gpu.upload(sc.tobytes()), gpu.upload(weights)
+                dout, dpart = gpu.zeros(rows * n * 2, 0xAA), gpu.zeros(splits * rows * n * 4, 0xAA)
+                gpu.launch("euhedral_q3mx_linear_128x128", (((rows + 127) // 128) * (n // 128), splits),
+                           [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset), P(dpart)],
+                           block=384, shared=SHARED)
+                gpu.launch("euhedral_q3mx_reduce", (rows * n // 4 + 255) // 256, [P(dpart), P(dout), U(rows * n), U(splits)], block=256)
+                got = (np.frombuffer(gpu.download(dout, rows * n * 2), np.uint16).astype(np.uint32) << 16).view(np.float32)
+                got = got.reshape(rows, n).astype(np.float64)
+                for p in (dhi, dlo, dsc, dw, dout, dpart):
+                    gpu.free(p)
+                w64 = (codes.reshape(n, k // 64, 64) * scales.astype(np.float64)[:, :, None]).reshape(n, k)
+                y = x.astype(np.float64) @ w64.T
+                self.assertLess(np.max(np.abs(got - y)) / np.abs(y).max(), 2.0 ** -8)
 
     def test_gate_up_swiglu_matches_float64(self):
         for rows, n, k in [(128, 128, 128), (200, 256, 384), (65, 512, 256)]:
@@ -194,7 +217,7 @@ class Q3MxTest(unittest.TestCase):
         dhi, dlo, dsc, dw = gpu.upload(hi.tobytes()), gpu.upload(lo.tobytes()), gpu.upload(sc.tobytes()), gpu.upload(weights)
         dout = gpu.zeros(rows * n * 2, 0xAA)
         gpu.launch("euhedral_q3mx_linear_128x128", ((rows + 127) // 128) * (n // 128),
-                   [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset)], block=256, shared=SHARED)
+                   [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset), P(0)], block=384, shared=SHARED)
         got = (np.frombuffer(gpu.download(dout, rows * n * 2), np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(rows, n)
         weights64 = (codes.reshape(n, k // 64, 64) * scales.astype(np.float64)[:, :, None]).reshape(n, k)
         y = x.astype(np.float64) @ weights64.T
