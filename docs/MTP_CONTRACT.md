@@ -3,7 +3,7 @@
 This is the contract written before implementation. Sources:
 
 - **Checkpoint:** `/mnt/shared/qwen38-quant/source/qwen`: `config.json` and the safetensors index.
-- **This repository's converter:** `tools/convert_qwen_safetensors_to_compact_edrl.py`.
+- **This repository's converter:** `tools/convert_checkpoint.py` (`tools/euhedral_artifacts/inventory.py` lists the objects).
 - **llama.cpp at 67a17c17c** (`/mnt/shared/qwen38-quant/llama.cpp`): `src/models/qwen35.cpp`,
   `common/speculative.cpp`, `conversion/qwen.py` and `src/llama-memory-recurrent.cpp`. File:line
   references below are to this tree.
@@ -25,7 +25,7 @@ There are 15 tensors:
 There is no MTP embedding and no MTP LM head (`qwen35.cpp:113-115` falls back to the base token
 embedding and base `lm_head`).
 
-**Artifact objects** (both artifacts; NVFP4 in the NVFP4 profile):
+**Artifact objects** (all four artifacts; the table lists each object's shape):
 
 | Object | Shape | Source |
 |---|---|---|
@@ -42,10 +42,10 @@ embedding and base `lm_head`).
   (`[q_h | gate_h]` per head, confirmed by `qwen35.cpp:556-573` and ninfer `qwen3_5.py:496-510`)
   into contiguous q and gate, exactly as for base layers. The packed tensor is the base layers'
   `query_key` (7168 rows) followed by `gate_value` (7168 rows).
-- **Formats.**
-  - NVFP4 profile: every MTP projection is NVFP4.
-  - Compact Q3: `query_key_gate_value` is `W8G32_F16S`, which no Euhedral kernel executes; the
-    others are Q3.
+- **Formats.** Every MTP projection is plain NVFP4 (`row-split-k128-v1`) in all four artifacts, including the compressed ones.
+  Q3 drafts accept fewer tokens per verification than NVFP4 ones, so the `q3` artifact stores its MTP layer in NVFP4
+  ([MTP_VERIFIER.md](MTP_VERIFIER.md)). The draft head follows the artifact: Q3 in `q3` and `q3-compressed`, NVFP4 in `nvfp4` and
+  `nvfp4-compressed`.
 - **Norms.** Every MTP norm is the `(1 + w)` RMSNorm form (llama.cpp's converter bakes +1 into every
   `*norm.weight` except the GDN gated norm, `qwen.py:394-395`; ninfer
   `qwen3_5-model.md:116-124`). Euhedral already uses this form for base layer and q/k norms
@@ -90,16 +90,20 @@ for every depth.
 - **No zero-hidden row for the first prompt token** (ninfer). llama.cpp pairs x₀ with h = 0
   (`speculative.cpp:1430`); training pairs only real (h_p, x_{p+1}).
 - **Draft head.** The artifacts carry `text/draft_head`: the 131,072 most frequent `lm_head` rows,
-  chosen by the converter's ranking, plus `text/draft_head_token_ids`, the token for each row.
+  chosen by the converter's token ranking (`--ranking`, or copied from an existing artifact with `--draft-ids-from`), plus
+  `text/draft_head_token_ids`, the token for each row.
   - It is **this repository's construct, not the checkpoint's**; the checkpoint's MTP uses the full
     `lm_head`.
   - **Choice: draft with the shortlist** (argmax over 131,072 rows, then map through
-    `draft_head_token_ids`). It reads 360 MB instead of 682 MB per draft in NVFP4.
+    `draft_head_token_ids`). It reads 360 MiB instead of 682 MiB per draft in NVFP4.
   - A token outside the shortlist can never be drafted. It still appears in output whenever the
     verifier produces it, so this only costs acceptance.
   - The full head stays a measurable alternative.
 
-## 4. The speculative step (MTP3, greedy)
+## 4. The speculative step (greedy)
+
+The text below is written for depth 3; the artifact fixes the depth (2 for Q3 artifacts, 3 for NVFP4 artifacts, `ArtifactProfile`),
+and every count scales with it (a verifier of depth + 1 rows).
 
 State before a step:
 - base KV and GDN state committed through position P − 1;
@@ -168,27 +172,20 @@ The oracle is ordinary greedy decode, which runs every row through the decode ke
 
 Committed tokens and state equal ordinary decode exactly only if the verifier computes each of its
 rows with arithmetic identical to that single-row path. Native NVFP4 OMMA cannot do that against the
-GEMV: it needs FP4 activations (`kind::mxf4nvf4` only accepts E2M1 × E2M1). The multi-row prefill
+GEMV: it needs FP4 activations (`kind::mxf4nvf4` only accepts E2M1 × E2M1), and the MXFP8 route quantizes activations too. The multi-row prefill
 attention and GDN kernels also accumulate in a different order from the decode kernels.
 
-**Decision (2026-10-01): exact first, native as a second mode.**
+**Decision: row-exact verification.** A VERIFY quantum selects row-exact execution (`euhedral_cuda_row_exact_select`). Every
+operator whose kernel depends on the row count then runs each row through its one-row path:
+- attention, q/k norm and RoPE, residual norms and the GDN recurrence, row by row;
+- NVFP4, Q3, Q4 and Q5 linears through multi-row twins of the one-row GEMV kernels
+  (`nvfp4::decode_rows<M>`, `q3::contiguous_decode_rows<M>`, `q45::contiguous_decode_rows<B, M>`,
+  for M = 2 to 8). Each repeats the one-row FMA sequence for every token row while streaming the
+  weights once, so every row is bitwise identical to one-row decode.
 
-- **Default mode: row-exact verification.** A VERIFY quantum selects row-exact execution
-  (`euhedral_cuda_row_exact_select`). Every operator whose kernel depends on the row count then runs
-  each row through its one-row path:
-  - attention, q/k norm and RoPE, residual norms and the GDN recurrence, row by row;
-  - NVFP4, Q3, Q4 and Q5 linears through multi-row twins of the one-row GEMV kernels
-    (`nvfp4::decode_rows<M>`, `q3::contiguous_decode_rows<M>`, `q45::contiguous_decode_rows<B, M>`,
-    for M = 2 to 8). Each repeats the one-row FMA sequence for every token row while streaming the
-    weights once, so every row is bitwise identical to one-row decode.
-- **Second mode: native numerics** (`ExecutionGpu.selectNvfp4NativeDecode`,
-  `EUHEDRAL_NVFP4_NATIVE_DECODE=1`). Every NVFP4 linear, one row included, runs on the native skinny
-  OMMA kernel.
-  - Each row's MMA, and its activation global scale, are independent of the other rows.
-  - The split-K reduction stores per-split partials and sums them in split order, so it is
-    deterministic.
-  - So an M-row native verification equals native single-row decode, and the oracle in this mode is
-    greedy decode with the same native numerics.
+Row-exact execution declines the block-scaled MXFP8 route and the native FP4 route, whose activation quantization and tile
+accumulation differ from the GEMV. There is no second numerics mode for verification: a verifier on native FP4 kernels would
+change every generated text ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
 
-Both modes are tested bitwise, on tokens and on GDN and KV state, by
-`SpeculativeDecodeCudaIntegrationTest`. Results are in docs/MTP_SPECULATIVE.md.
+This is tested bitwise, on tokens and on GDN and KV state, by `SpeculativeVerifyCudaIntegrationTest` and
+`SpeculativeDecodeCudaIntegrationTest`. Results are in [MTP_SPECULATIVE.md](MTP_SPECULATIVE.md).

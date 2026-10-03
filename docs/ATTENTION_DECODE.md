@@ -1,14 +1,15 @@
 # Long-context decode and verify attention
 
 The GQA decode attention kernel serves one query-head group (6 heads) per KV head over an NVFP4 cache (D256, 144-byte rows:
-128 code bytes and 16 E4M3 scales; 256-token pages). It runs from 2048 keys for single-row decode and for the verifier's row twin.
-Sources: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin), `nvfp4_attention.cuh` (merge), `nvfp4_pipe.cuh` (shared
+128 code bytes and 16 E4M3 scales; 256-token pages). It runs from 2048 keys for single-row decode and for the verifier's row twin (below 2048 keys the per-head
+decode kernel runs; a group of more than 8 query heads also keeps the per-head kernel). Sources: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin), `nvfp4_attention.cuh` (merge), `nvfp4_pipe.cuh` (shared
 pipeline helpers). Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running.
 
 ## Design
 
 One CTA per (KV head, key split): 4 KV heads times at most 64 splits of 32 or more keys, so 256 CTAs. The CTA is three warps with
-the arithmetic order of a single-warp loop (the single-warp kernels are kept as test controls in `reference_decode_gqa.cuh`):
+the arithmetic order of a single-warp loop (the single-warp kernels are kept as test controls in `reference_decode_gqa.cuh`,
+and the exact-numerics oracle runs the `_exact` per-head twins instead of this kernel):
 
 - **scores warp:** the K tile arrives by a two-stage cp.async ring; A fragments of the QK product are built straight from the raw
   144-byte rows through a lookup (no FP16 staging); the QK mma chain; scores to shared memory;
@@ -44,8 +45,8 @@ Decode plus merge, per layer, cold KV (several layer-sized caches rotated past L
 At 64K the one-row decode kernel streams the 72 MiB cache at 107 us, 82% of the 855 GB/s DRAM rate. Of the 38 us at 16K, the decode
 kernel takes 31 us and the merge 7 us.
 
-In the model (Q3 compact artifact), decode runs at 61.7 tok/s at a 4K context, 60.5 at 16K and 59.0 at 32K. MTP2 decode (3-row verify,
-NVMTP artifact, chat corpus) runs at 111 tok/s at 16K and 101 at 32K.
+In the model (the `q3` artifact), decode runs at 61.7 tok/s at a 4K context, 60.5 at 16K and 59.0 at 32K. MTP2 decode (3-row
+verify, chat corpus) runs at 111 tok/s at 16K and 101 at 32K.
 
 ## Rejected
 

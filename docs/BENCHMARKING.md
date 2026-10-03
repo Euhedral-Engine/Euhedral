@@ -23,7 +23,7 @@ Change one variable at a time and keep the JSON for every run you compare.
    ```bash
    ./gradlew test
    ./gradlew :core:tokenizerReferenceTest -Peuhedral.qwen.tokenizer-dir=/mnt/shared/qwen38-quant/source/qwen
-   ./gradlew cudaIntegrationTest -Peuhedral.qwen.artifact=/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl
+   ./gradlew cudaIntegrationTest -Peuhedral.qwen.artifact=/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl
    ```
 
 3. **Check the GPU is free.** The engine refuses to load, and the run exits with code 3 without
@@ -228,7 +228,7 @@ below is illustrative; its values are not a measurement.
               "decodeQuantaSum": 0, "finalCommit": 0, "timeToLastToken": 0, "endToEnd": 0},
   "throughput": {"prefillTokensPerSecond": 0.0, "decodeTokensPerSecond": 0.0, "endToEndOutputTokensPerSecond": 0.0},
   "engine": {"schemaVersion": 3, "configuration": {"workerProcessorIds": [0, 1], "maxContextTokens": 32768,
-             "artifact": "qwen3_5_27b_compact_q3.edrl", "speculativeDepth": 2},
+             "artifact": "qwen3_5_27b_q3.edrl", "speculativeDepth": 2},
              "workerCoreIds": [0], "model": {}, "generation": {}, "runtime": {}},
   "gpuMemory": {"beforeFreeBytes": 0, "afterFreeBytes": 0, "totalBytes": 0}
 }
