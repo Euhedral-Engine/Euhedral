@@ -313,21 +313,14 @@ final class QwenExecutionFixtures {
 
         @Override
         public void q3GateUpSwiGluBf16(
-                long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {}
-
-        @Override
-        public void q3FfnStreamedBf16(
                 long input,
-                long gateWeights,
-                long downWeights,
+                long weights,
                 long output,
-                long slots,
-                long accumulators,
                 int rows,
-                int hidden,
-                int intermediate,
-                long gateBytes,
-                long downBytes) {}
+                int width,
+                int outputs,
+                long weightBytes,
+                io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout layout) {}
 
         @Override
         public void synchronize() {

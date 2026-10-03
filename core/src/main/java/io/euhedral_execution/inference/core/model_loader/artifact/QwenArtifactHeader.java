@@ -14,7 +14,7 @@ public record QwenArtifactHeader(
         long tensorDataOffset) {
 
     public static final int MAGIC = 0x5157454E;
-    public static final int VERSION = 1;
+    /// The only supported container version: tensor descriptors carry a persistent weight layout.
     public static final int COMPACT_VERSION = 2;
     public static final int BYTE_SIZE = 48;
 }

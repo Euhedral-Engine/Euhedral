@@ -18,10 +18,10 @@ FORMAT_ORDINAL = {
     "BF16": 0,
     "FP32": 2,
     "I32": 3,
-    "Q3G64_F16S": 5,
-    "Q4G64_F16S": 6,
-    "Q5G64_F16S": 7,
-    "NVFP4": 12,
+    "Q3G64_F16S": 4,
+    "Q4G64_F16S": 5,
+    "Q5G64_F16S": 6,
+    "NVFP4": 7,
 }
 LAYOUT_ORDINAL = {
     "contiguous-le-v1": 0,

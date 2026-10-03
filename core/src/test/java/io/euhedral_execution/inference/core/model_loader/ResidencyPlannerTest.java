@@ -74,7 +74,6 @@ class ResidencyPlannerTest {
         }
         tensors.add(tensor("mtp/input_projection", 50 * MIB));
         tensors.add(tensor("text/draft_head", 70 * MIB));
-        tensors.add(tensor("vision/patch_embed", 900 * MIB));
         return new QwenArtifact(null, config(2), tensors.toArray(TensorDescriptor[]::new));
     }
 

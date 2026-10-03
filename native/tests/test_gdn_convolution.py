@@ -5,7 +5,7 @@ import random
 import struct
 import unittest
 
-from test_q3_primitives import Gpu, NVRTC, SKIP_REASON
+from gpu_harness import Gpu, NVRTC, SKIP_REASON
 
 HERE = pathlib.Path(__file__).resolve().parent
 

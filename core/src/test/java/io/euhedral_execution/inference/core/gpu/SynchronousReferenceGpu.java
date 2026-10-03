@@ -128,33 +128,6 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
     }
 
     @Override
-    public void gdnProjectionsBf16(
-            long input,
-            long q4Weights,
-            long q5Weights,
-            long queryKeyOutput,
-            long valueZOutput,
-            int rows,
-            int hidden,
-            int queryKeyWidth,
-            int valueZWidth,
-            long q4Bytes,
-            long q5Bytes) {
-        this.delegate.gdnProjectionsBf16(
-                input,
-                q4Weights,
-                q5Weights,
-                queryKeyOutput,
-                valueZOutput,
-                rows,
-                hidden,
-                queryKeyWidth,
-                valueZWidth,
-                q4Bytes,
-                q5Bytes);
-    }
-
-    @Override
     public void linearQ4Bf16(
             long inputAddress,
             long weightsAddress,
@@ -274,41 +247,46 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
     }
 
     @Override
+    public void copyRowsDeviceToDevice(
+            long destination, long destinationPitch, long source, long sourcePitch, int rows) {
+        this.delegate.copyRowsDeviceToDevice(destination, destinationPitch, source, sourcePitch, rows);
+    }
+
+    @Override
+    public void linearNvfp4Bf16(
+            long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
+        this.delegate.linearNvfp4Bf16(input, weights, output, rows, inFeatures, outFeatures, weightBytes);
+    }
+
+    @Override
+    public void nvfp4GateUpSwiGluBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        this.delegate.nvfp4GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes);
+    }
+
+    @Override
+    public long retainedScratchBytes() {
+        return this.delegate.retainedScratchBytes();
+    }
+
+    @Override
+    public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
+        return this.delegate.argmaxBf16(logitsAddress, count, resultAddress);
+    }
+
+    @Override
+    public void selectRowExact(boolean enabled) {
+        this.delegate.selectRowExact(enabled);
+    }
+
+    @Override
+    public boolean rowExactQuantizedLinears() {
+        return this.delegate.rowExactQuantizedLinears();
+    }
+
+    @Override
     public void residualAddBf16(long residualAddress, long deltaAddress, long outputAddress, int rows, int width) {
         this.delegate.residualAddBf16(residualAddress, deltaAddress, outputAddress, rows, width);
-    }
-
-    @Override
-    public void q3FfnStreamedBf16(
-            long input,
-            long gateWeights,
-            long downWeights,
-            long output,
-            long slots,
-            long accumulators,
-            int rows,
-            int hidden,
-            int intermediate,
-            long gateBytes,
-            long downBytes) {
-        this.delegate.q3FfnStreamedBf16(
-                input,
-                gateWeights,
-                downWeights,
-                output,
-                slots,
-                accumulators,
-                rows,
-                hidden,
-                intermediate,
-                gateBytes,
-                downBytes);
-    }
-
-    @Override
-    public void q3FfnDownBf16(
-            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
-        this.delegate.q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
     }
 
     @Override

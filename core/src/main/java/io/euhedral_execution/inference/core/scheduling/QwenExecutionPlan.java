@@ -40,10 +40,7 @@ public final class QwenExecutionPlan {
         RESIDUAL_ADD,
         RESIDUAL_RMS_NORM,
         GDN_PROJECT_CONTROL,
-        GDN_PROJECTIONS,
         Q3_GATE_UP_SWIGLU,
-        Q3_FFN_DOWN,
-        FFN_STREAMED,
         SWIGLU,
         ATTENTION_QK_NORM_ROPE,
         ATTENTION_KV_APPEND,
@@ -76,9 +73,6 @@ public final class QwenExecutionPlan {
         GATE_UP,
         SWIGLU,
         FFN_DELTA,
-        FFN_STAGING,
-        FFN_ACCUMULATORS,
-        FFN_PARTIALS,
         FINAL_NORMALIZED,
         LOGITS,
         SLICE_PROJECTION,
@@ -229,32 +223,15 @@ public final class QwenExecutionPlan {
         }
     }
 
-    /// Prefill specializations derived from the full-model reference topology.
-    /// `SMALL` covers quanta below the 64-row region tile; `STREAMED` exists only at the
-    /// qualified streamed-FFN geometry.
+    /// Prefill specializations derived from the full-model reference topology. `SMALL` covers decode and
+    /// quanta below the 64-row region tile; `REGIONS` fuses the FFN gate/up projection with SwiGLU.
     private enum PrefillView {
         SMALL,
-        /// The small topology for decode, with the GDN Q4 and Q5 projections as separate leaf frames.
-        DECODE,
-        REGIONS,
-        STREAMED
+        REGIONS
     }
 
     /// Row threshold for the gate/up and down regions (one 64-row prefill tile).
     private static final int REGION_MIN_ROWS = 64;
-    /// Exact geometry at which the streamed FFN region is qualified; elsewhere gate/up + down is used.
-    /// 64-row quanta run full-width gate/up and split-K down instead (1253 vs 1400 us per layer).
-    private static boolean streamedFfnRows(int rows) {
-        return rows == 1024;
-    }
-
-    /// K splits of the FFN down's FP32 partials (euhedral_ffn_down_splits in qwen_ffn_policy.h).
-    private static final int FFN_DOWN_SPLITS = 4;
-
-    private static final int STREAMED_FFN_HIDDEN = 5120;
-    private static final int STREAMED_FFN_INTERMEDIATE = 17408;
-    /// Two bounded BF16 feature slots of 4096 features each.
-    private static final int STREAMED_FFN_STAGING_WIDTH = 2 * 4096;
 
     private final QwenWeights weights;
     private final List<Instruction> instructions;
@@ -271,17 +248,13 @@ public final class QwenExecutionPlan {
     private final WeightStaging staging;
     /// The MTP draft view; null without loaded MTP weights and draft head.
     private final QwenExecutionPlan mtpDraft;
-    private final QwenExecutionPlan streamedPrefill;
 
     /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
     static final List<Map.Entry<Buffer, Buffer>> REGION_STORAGE = List.of(
             Map.entry(Buffer.FINAL_HIDDEN_STATE, Buffer.HIDDEN_STATE),
             Map.entry(Buffer.POST_MIXER_NORMALIZED, Buffer.INPUT_NORMALIZED),
             Map.entry(Buffer.FFN_DELTA, Buffer.MIXER_DELTA),
-            Map.entry(Buffer.SWIGLU, Buffer.VALUE_Z_PROJECTED),
-            Map.entry(Buffer.FFN_STAGING, Buffer.VALUE_Z_PROJECTED),
-            Map.entry(Buffer.FFN_ACCUMULATORS, Buffer.QK_PROJECTED),
-            Map.entry(Buffer.FFN_PARTIALS, Buffer.QK_PROJECTED));
+            Map.entry(Buffer.SWIGLU, Buffer.VALUE_Z_PROJECTED));
 
     /// Adds the ordering edges that a single device stream used to provide implicitly. For every
     /// storage (aliased buffers count as one when `reuseStorage`), each reader is ordered after the
@@ -389,7 +362,6 @@ public final class QwenExecutionPlan {
         if (kind == QwenExecutionContext.ExecutionKind.DECODE || kind == QwenExecutionContext.ExecutionKind.VERIFY)
             return family.decode;
         if (rows < REGION_MIN_ROWS) return family.smallPrefill;
-        if (streamedFfnRows(rows) && family.streamedPrefill != null) return family.streamedPrefill;
         return family.regionPrefill;
     }
 
@@ -593,7 +565,6 @@ public final class QwenExecutionPlan {
             this.smallPrefill = null;
             this.decode = null;
             this.regionPrefill = null;
-            this.streamedPrefill = null;
             this.mtpDraft = null;
             return;
         }
@@ -606,14 +577,9 @@ public final class QwenExecutionPlan {
                         && weights.runtimeObjects().containsKey(DRAFT_HEAD)
                 ? new QwenExecutionPlan(weights, staged(mtpDraft(weights), this.staging), this, false)
                 : null;
-        QwenConfig config = weights.config();
         this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
-        this.decode = prefillPlan(weights, data, PrefillView.DECODE, this);
+        this.decode = prefillPlan(weights, data, PrefillView.SMALL, this);
         this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
-        this.streamedPrefill =
-                config.hiddenSize() == STREAMED_FFN_HIDDEN && config.intermediateSize() == STREAMED_FFN_INTERMEDIATE
-                        ? prefillPlan(weights, data, PrefillView.STREAMED, this)
-                        : null;
     }
 
     private static QwenExecutionPlan prefillPlan(
@@ -621,9 +587,8 @@ public final class QwenExecutionPlan {
         PlanData selected = prefillView(data, view);
         // The named lifetime pairs are qualified only for the region views with a fused FFN, not for
         // a shape that falls back to ordinary FFN.
-        boolean regions = view == PrefillView.REGIONS || view == PrefillView.STREAMED;
-        boolean hasFusedFfn = selected.instructions().stream()
-                .anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU || i.kind() == Kind.FFN_STREAMED);
+        boolean regions = view == PrefillView.REGIONS;
+        boolean hasFusedFfn = selected.instructions().stream().anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU);
         return new QwenExecutionPlan(weights, staged(selected, owner.staging), owner, regions && hasFusedFfn);
     }
 
@@ -745,12 +710,11 @@ public final class QwenExecutionPlan {
     }
 
     /// Rewrites the reference layer DAG into the retained prefill regions:
-    /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows, B gate/up+SwiGLU
-    /// (or C streamed FFN). The attention producers stay four leaf frames (Q projection, QK norm and
+    /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows, B gate/up+SwiGLU.
+    /// The attention producers stay four leaf frames (Q projection, QK norm and
     /// RoPE, KV projection, cache append), so the KV branch runs on its own lane beside the Q branch.
     private static PlanData prefillView(PlanData data, PrefillView view) {
-        boolean regions = view != PrefillView.SMALL && view != PrefillView.DECODE;
-        boolean streamed = view == PrefillView.STREAMED;
+        boolean regions = view == PrefillView.REGIONS;
         List<Instruction> source = earlyControlOrder(data.instructions());
         List<Instruction> result = new ArrayList<>();
         int[] remapped = new int[source.size()];
@@ -758,33 +722,6 @@ public final class QwenExecutionPlan {
         for (int index = 0; index < source.size(); index++) {
             Instruction first = source.get(index);
             Instruction next = index + 1 < source.size() ? source.get(index + 1) : null;
-            if (first.kind() == Kind.Q4_LINEAR
-                    && next != null
-                    && next.kind() == Kind.Q5_LINEAR
-                    && index + 2 < source.size()
-                    && source.get(index + 2).kind() == Kind.GDN_CONVOLUTION
-                    && view != PrefillView.DECODE) {
-                if (!next.dependencies().equals(first.dependencies())
-                        || !first.inputBuffers().equals(next.inputBuffers())
-                        || !first.outputBuffers().equals(List.of(Buffer.QK_PROJECTED))
-                        || !next.outputBuffers().equals(List.of(Buffer.VALUE_Z_PROJECTED)))
-                    throw new IllegalStateException("unexpected GDN projection topology");
-                remapped[first.id()] = result.size();
-                remapped[next.id()] = result.size();
-                result.add(new Instruction(
-                        result.size(),
-                        Kind.GDN_PROJECTIONS,
-                        remapDependencies(first.dependencies(), remapped),
-                        List.of(first.weight(), next.weight()),
-                        first.inputBuffers(),
-                        List.of(Buffer.QK_PROJECTED, Buffer.VALUE_Z_PROJECTED),
-                        first.inputWidth(),
-                        first.outputWidth(),
-                        -1,
-                        first.layerIndex()));
-                index++;
-                continue;
-            }
             if (first.kind() == Kind.RESIDUAL_ADD
                     && next != null
                     && next.kind() == Kind.RMS_NORM_UNIT_OFFSET
@@ -807,38 +744,6 @@ public final class QwenExecutionPlan {
                         -1,
                         first.layerIndex()));
                 index++;
-                continue;
-            }
-            if (streamed
-                    && first.kind() == Kind.Q3_LINEAR
-                    && first.weight().format() == WeightFormat.Q3_G64_FP16
-                    && next != null
-                    && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
-                    && next.kind() == Kind.SWIGLU
-                    && first.inputWidth() == STREAMED_FFN_HIDDEN
-                    && first.outputWidth() == 2 * STREAMED_FFN_INTERMEDIATE
-                    && index + 2 < source.size()) {
-                Instruction down = source.get(index + 2);
-                if (down.kind() != Kind.Q3_LINEAR
-                        || !down.dependencies().equals(List.of(next.id()))
-                        || !next.dependencies().equals(List.of(first.id()))
-                        || !down.outputBuffers().equals(List.of(Buffer.FFN_DELTA)))
-                    throw new IllegalStateException("unexpected streamed FFN topology");
-                remapped[first.id()] = result.size();
-                remapped[next.id()] = result.size();
-                remapped[down.id()] = result.size();
-                result.add(new Instruction(
-                        result.size(),
-                        Kind.FFN_STREAMED,
-                        remapDependencies(first.dependencies(), remapped),
-                        List.of(first.weight(), down.weight()),
-                        first.inputBuffers(),
-                        List.of(Buffer.FFN_DELTA, Buffer.FFN_STAGING, Buffer.FFN_ACCUMULATORS),
-                        first.inputWidth(),
-                        down.outputWidth(),
-                        -1,
-                        first.layerIndex()));
-                index += 2;
                 continue;
             }
             if (regions
@@ -900,20 +805,13 @@ public final class QwenExecutionPlan {
             }
             List<Integer> dependencies = remapDependencies(first.dependencies(), remapped);
             remapped[first.id()] = result.size();
-            boolean ffnDown = regions
-                    && first.kind() == Kind.Q3_LINEAR
-                    && first.inputBuffers().equals(List.of(Buffer.SWIGLU))
-                    && first.outputBuffers().equals(List.of(Buffer.FFN_DELTA));
-            boolean splitDown = ffnDown
-                    && first.inputWidth() == STREAMED_FFN_INTERMEDIATE
-                    && first.outputWidth() == STREAMED_FFN_HIDDEN;
             result.add(new Instruction(
                     result.size(),
-                    ffnDown ? Kind.Q3_FFN_DOWN : first.kind(),
+                    first.kind(),
                     dependencies,
                     first.weights(),
                     first.inputBuffers(),
-                    splitDown ? List.of(Buffer.FFN_DELTA, Buffer.FFN_PARTIALS) : first.outputBuffers(),
+                    first.outputBuffers(),
                     first.inputWidth(),
                     first.outputWidth(),
                     first.outputBufferIndex(),
@@ -926,13 +824,6 @@ public final class QwenExecutionPlan {
                 .filter(spec -> needsGateUp || spec.buffer() != Buffer.GATE_UP)
                 .filter(spec -> spec.buffer() != Buffer.A_PROJECTED && spec.buffer() != Buffer.B_PROJECTED)
                 .toList());
-        if (result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.FFN_PARTIALS))) {
-            buffers.add(spec(Buffer.FFN_PARTIALS, FFN_DOWN_SPLITS * STREAMED_FFN_HIDDEN, ElementType.FP32));
-        }
-        if (result.stream().anyMatch(i -> i.kind() == Kind.FFN_STREAMED)) {
-            buffers.add(spec(Buffer.FFN_STAGING, STREAMED_FFN_STAGING_WIDTH, ElementType.BF16));
-            buffers.add(spec(Buffer.FFN_ACCUMULATORS, STREAMED_FFN_HIDDEN, ElementType.FP32));
-        }
         return new PlanData(result, data.projectionWidths(), buffers, data.firstLayer());
     }
 
@@ -992,9 +883,7 @@ public final class QwenExecutionPlan {
     /// The views this plan owns besides its own topology; empty for a view or a reference plan.
     List<QwenExecutionPlan> executionVariants() {
         if (this.owner != this || this.regionPrefill == null) return List.of();
-        return this.streamedPrefill == null
-                ? List.of(this.decode, this.smallPrefill, this.regionPrefill)
-                : List.of(this.decode, this.smallPrefill, this.regionPrefill, this.streamedPrefill);
+        return List.of(this.decode, this.smallPrefill, this.regionPrefill);
     }
 
     boolean reusePrefillStorage() {

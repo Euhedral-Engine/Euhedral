@@ -1,5 +1,6 @@
 #pragma once
-#include "decode.cuh"
+#include "layout.cuh"
+#include "numeric.cuh"
 #include "common/pdl.cuh"
 
 namespace q45 {
@@ -12,8 +13,8 @@ namespace q45 {
 // and reuses its 32 activations for both. Each lane forms an FP32 dot product of its codes, scales
 // it once by the group scale and accumulates across slices; a warp shuffle reduces each row.
 //
-// Numerical contract: FP32 accumulation in a different order from cooperative/wide decode (the exact
-// kernels, selected by exact numerics); within one BF16 ulp of them.
+// Numerical contract: FP32 accumulation in a different order from the scalar reference
+// (reference/kernels.cu); within one BF16 ulp of it.
 //
 // Requirements (checked by host dispatch): one row, in_features a multiple of 1024, out_features a
 // multiple of 8, a 16-byte aligned input and weight base.

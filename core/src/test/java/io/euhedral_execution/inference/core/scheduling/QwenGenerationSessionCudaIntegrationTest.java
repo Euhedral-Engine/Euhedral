@@ -38,8 +38,7 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 @Execution(ExecutionMode.SAME_THREAD)
 class QwenGenerationSessionCudaIntegrationTest {
 
-    private static final Path DEFAULT_ARTIFACT =
-            Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl");
+    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl");
     private static final Path DEFAULT_TOKENIZER = Path.of("/mnt/shared/qwen38-quant/source/qwen");
     private static final AtomicLong LATTICE_ID = new AtomicLong();
 

@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDataType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -18,6 +19,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class QwenArtifactBinaryTest {
+
+    private static final byte[][] PAYLOAD = {{1, 2, 3, 4}, {5, 6, 7, 8}};
 
     @TempDir
     Path tempDirectory;
@@ -30,8 +33,8 @@ class QwenArtifactBinaryTest {
         Path firstPath = tempDirectory.resolve("first.edrl");
         Path secondPath = tempDirectory.resolve("second.edrl");
 
-        QwenArtifactWriter.write(firstPath, artifact, new byte[][] {{1, 2, 3, 4}, {}});
-        QwenArtifactWriter.write(secondPath, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(firstPath, artifact, PAYLOAD);
+        QwenCompactArtifactWriter.write(secondPath, artifact, PAYLOAD);
 
         QwenArtifact read = QwenArtifactReader.read(firstPath);
         assertEquals(artifact.header(), read.header());
@@ -49,7 +52,7 @@ class QwenArtifactBinaryTest {
     void rejectsInvalidMagic() throws Exception {
         QwenArtifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-magic.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(0, 0);
@@ -62,7 +65,7 @@ class QwenArtifactBinaryTest {
     void rejectsTruncatedArtifact() throws Exception {
         QwenArtifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("truncated.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         Files.write(path, java.util.Arrays.copyOf(bytes, bytes.length - 1));
@@ -76,7 +79,7 @@ class QwenArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         QwenArtifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-offset.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         int dataOffsetField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]);
@@ -90,7 +93,7 @@ class QwenArtifactBinaryTest {
     void rejectsTensorCountThatDoesNotMatchTable() throws Exception {
         QwenArtifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-count.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(32, 3);
@@ -100,23 +103,52 @@ class QwenArtifactBinaryTest {
     }
 
     @Test
-    void rejectsUnsupportedVersion() throws Exception {
+    void rejectsLegacyAndUnknownVersions() throws Exception {
         QwenArtifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-version.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
+        byte[] original = Files.readAllBytes(path);
 
-        byte[] bytes = Files.readAllBytes(path);
-        ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(4, QwenArtifactHeader.VERSION + 1);
-        Files.write(path, bytes);
+        for (int version : new int[] {1, QwenArtifactHeader.COMPACT_VERSION + 1}) {
+            byte[] bytes = original.clone();
+            ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(4, version);
+            Files.write(path, bytes);
 
-        assertThrows(QwenArtifactFormatException.class, () -> QwenArtifactReader.read(path));
+            QwenArtifactFormatException failure =
+                    assertThrows(QwenArtifactFormatException.class, () -> QwenArtifactReader.read(path));
+            assertEquals(
+                    "unsupported artifact version " + version + ": only compact version "
+                            + QwenArtifactHeader.COMPACT_VERSION + " artifacts are supported",
+                    failure.getMessage());
+        }
+    }
+
+    @Test
+    void writerRejectsNonCompactHeader() {
+        QwenArtifact compact = artifact(sampleConfig(), descriptors(sampleConfig()));
+        QwenArtifactHeader header = compact.header();
+        QwenArtifact legacy = new QwenArtifact(
+                new QwenArtifactHeader(
+                        header.magic(),
+                        1,
+                        header.metadataOffset(),
+                        header.metadataSize(),
+                        header.tensorTableOffset(),
+                        header.tensorCount(),
+                        header.tensorDataOffset()),
+                compact.config(),
+                compact.tensors());
+
+        assertThrows(
+                QwenArtifactFormatException.class,
+                () -> QwenCompactArtifactWriter.write(tempDirectory.resolve("legacy.edrl"), legacy, PAYLOAD));
     }
 
     @Test
     void rejectsNonZeroReservedHeaderField() throws Exception {
         QwenArtifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-reserved.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(36, 1);
@@ -131,11 +163,44 @@ class QwenArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         QwenArtifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-data-type.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
-        int dataTypeField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) - Long.BYTES;
+        int dataTypeField =
+                (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) - Integer.BYTES * 3;
         ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(dataTypeField, Integer.MAX_VALUE);
+        Files.write(path, bytes);
+
+        assertThrows(QwenArtifactFormatException.class, () -> QwenArtifactReader.read(path));
+    }
+
+    @Test
+    void rejectsInvalidTensorLayout() throws Exception {
+        QwenConfig config = sampleConfig();
+        TensorDescriptor[] tensors = descriptors(config);
+        QwenArtifact artifact = artifact(config, tensors);
+        Path path = tempDirectory.resolve("invalid-layout.edrl");
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
+
+        byte[] bytes = Files.readAllBytes(path);
+        int layoutField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) - Integer.BYTES;
+        ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putInt(layoutField, Integer.MAX_VALUE);
+        Files.write(path, bytes);
+
+        assertThrows(QwenArtifactFormatException.class, () -> QwenArtifactReader.read(path));
+    }
+
+    @Test
+    void rejectsTensorByteSizeThatDoesNotMatchItsShape() throws Exception {
+        QwenConfig config = sampleConfig();
+        TensorDescriptor[] tensors = descriptors(config);
+        QwenArtifact artifact = artifact(config, tensors);
+        Path path = tempDirectory.resolve("mismatched-byte-size.edrl");
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
+
+        byte[] bytes = Files.readAllBytes(path);
+        int byteSizeField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) + Long.BYTES;
+        ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).putLong(byteSizeField, 3);
         Files.write(path, bytes);
 
         assertThrows(QwenArtifactFormatException.class, () -> QwenArtifactReader.read(path));
@@ -145,7 +210,7 @@ class QwenArtifactBinaryTest {
     void rejectsInvalidTensorNameLength() throws Exception {
         QwenArtifact artifact = artifact(sampleConfig(), descriptors(sampleConfig()));
         Path path = tempDirectory.resolve("invalid-name-length.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         ByteBuffer.wrap(bytes)
@@ -162,7 +227,7 @@ class QwenArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         QwenArtifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-byte-size.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         int byteSizeField = (int) tensorsTableOffset(artifact) + tensorDataOffsetWithinEntry(tensors[0]) + Long.BYTES;
@@ -178,7 +243,7 @@ class QwenArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         QwenArtifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-utf8.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         int activationOffset = (int) artifact.header().metadataOffset()
@@ -198,7 +263,7 @@ class QwenArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         QwenArtifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("invalid-boolean.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         int booleanOffset = (int) artifact.header().metadataOffset()
@@ -222,22 +287,15 @@ class QwenArtifactBinaryTest {
         QwenArtifact validArtifact = artifact(config, descriptors(config));
         long dataOffset = validArtifact.header().tensorDataOffset();
         TensorDescriptor[] tensors = {
-            new TensorDescriptor(
-                    "model.embed_tokens.weight",
-                    new long[] {32_000, 4_096},
-                    TensorDataType.BF16,
-                    WeightFormat.BF16,
-                    dataOffset,
-                    4),
-            new TensorDescriptor(
-                    "model.norm.weight", new long[] {4_096}, TensorDataType.FP32, WeightFormat.FP32, dataOffset, 4)
+            descriptor("text/test_a", new long[] {1}, TensorDataType.FP32, WeightFormat.FP32, dataOffset),
+            descriptor("text/test_b", new long[] {2}, TensorDataType.BF16, WeightFormat.BF16, dataOffset)
         };
         QwenArtifact artifact = new QwenArtifact(validArtifact.header(), config, tensors);
         Path path = tempDirectory.resolve("overlapping-data.edrl");
 
         assertThrows(
                 QwenArtifactFormatException.class,
-                () -> QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {5, 6, 7, 8}}));
+                () -> QwenCompactArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {5, 6, 7, 8}}));
     }
 
     @Test
@@ -246,7 +304,7 @@ class QwenArtifactBinaryTest {
         TensorDescriptor[] tensors = descriptors(config);
         QwenArtifact artifact = artifact(config, tensors);
         Path path = tempDirectory.resolve("overlapping-data-on-read.edrl");
-        QwenArtifactWriter.write(path, artifact, new byte[][] {{1, 2, 3, 4}, {}});
+        QwenCompactArtifactWriter.write(path, artifact, PAYLOAD);
 
         byte[] bytes = Files.readAllBytes(path);
         int secondDataOffsetField = (int) artifact.header().tensorTableOffset()
@@ -268,7 +326,7 @@ class QwenArtifactBinaryTest {
         Path path = tempDirectory.resolve("oversized-metadata.edrl");
         ByteBuffer header = ByteBuffer.allocate(QwenArtifactHeader.BYTE_SIZE).order(ByteOrder.BIG_ENDIAN);
         header.putInt(QwenArtifactHeader.MAGIC);
-        header.putInt(QwenArtifactHeader.VERSION);
+        header.putInt(QwenArtifactHeader.COMPACT_VERSION);
         header.putLong(QwenArtifactHeader.BYTE_SIZE);
         header.putLong(metadataSize);
         header.putLong(tableOffset);
@@ -317,43 +375,33 @@ class QwenArtifactBinaryTest {
                 0);
     }
 
+    private static TensorDescriptor descriptor(
+            String name, long[] shape, TensorDataType dataType, WeightFormat format, long dataOffset) {
+        return new TensorDescriptor(name, shape, dataType, format, WeightLayout.CONTIGUOUS_LE_V1, dataOffset, 4);
+    }
+
     private static TensorDescriptor[] descriptors(QwenConfig config) {
-        long metadataOffset = QwenArtifactWriter.HEADER_SIZE;
-        long metadataSize = QwenArtifactWriter.metadataSize(config);
-        long tableOffset = metadataOffset + metadataSize;
-        long tableSize = QwenArtifactWriter.tensorTableSize(new TensorDescriptor[] {
-            new TensorDescriptor(
-                    "model.embed_tokens.weight",
-                    new long[] {32_000, 4_096},
-                    TensorDataType.BF16,
-                    WeightFormat.BF16,
-                    0,
-                    4),
-            new TensorDescriptor("model.norm.weight", new long[] {4_096}, TensorDataType.FP32, WeightFormat.FP32, 0, 0)
+        long tableOffset = QwenArtifactHeader.BYTE_SIZE + QwenCompactArtifactWriter.metadataSize(config);
+        long tableSize = QwenCompactArtifactWriter.tensorTableSize(new TensorDescriptor[] {
+            descriptor("text/test_a", new long[] {1}, TensorDataType.FP32, WeightFormat.FP32, 0),
+            descriptor("text/test_b", new long[] {2}, TensorDataType.BF16, WeightFormat.BF16, 4)
         });
         long dataOffset = tableOffset + tableSize;
         return new TensorDescriptor[] {
-            new TensorDescriptor(
-                    "model.embed_tokens.weight",
-                    new long[] {32_000, 4_096},
-                    TensorDataType.BF16,
-                    WeightFormat.BF16,
-                    dataOffset,
-                    4),
-            new TensorDescriptor(
-                    "model.norm.weight", new long[] {4_096}, TensorDataType.FP32, WeightFormat.FP32, dataOffset + 4, 0)
+            descriptor("text/test_a", new long[] {1}, TensorDataType.FP32, WeightFormat.FP32, dataOffset),
+            descriptor("text/test_b", new long[] {2}, TensorDataType.BF16, WeightFormat.BF16, dataOffset + 4)
         };
     }
 
     private static QwenArtifact artifact(QwenConfig config, TensorDescriptor[] tensors) {
-        long metadataOffset = QwenArtifactWriter.HEADER_SIZE;
-        long metadataSize = QwenArtifactWriter.metadataSize(config);
+        long metadataOffset = QwenArtifactHeader.BYTE_SIZE;
+        long metadataSize = QwenCompactArtifactWriter.metadataSize(config);
         long tableOffset = metadataOffset + metadataSize;
-        long tensorDataOffset = tableOffset + QwenArtifactWriter.tensorTableSize(tensors);
+        long tensorDataOffset = tableOffset + QwenCompactArtifactWriter.tensorTableSize(tensors);
         return new QwenArtifact(
                 new QwenArtifactHeader(
                         QwenArtifactHeader.MAGIC,
-                        QwenArtifactHeader.VERSION,
+                        QwenArtifactHeader.COMPACT_VERSION,
                         metadataOffset,
                         metadataSize,
                         tableOffset,
@@ -369,7 +417,7 @@ class QwenArtifactBinaryTest {
 
     private static int tensorDataOffsetWithinEntry(TensorDescriptor descriptor) {
         int nameLength = descriptor.name().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-        return Integer.BYTES + nameLength + Integer.BYTES + Long.BYTES * descriptor.shape().length + Integer.BYTES * 2;
+        return Integer.BYTES + nameLength + Integer.BYTES + Long.BYTES * descriptor.shape().length + Integer.BYTES * 3;
     }
 
     private static int tensorEntrySize(TensorDescriptor descriptor) {
@@ -411,6 +459,7 @@ class QwenArtifactBinaryTest {
             assertArrayEquals(expected[i].shape(), actual[i].shape());
             assertEquals(expected[i].dataType(), actual[i].dataType());
             assertEquals(expected[i].format(), actual[i].format());
+            assertEquals(expected[i].layout(), actual[i].layout());
             assertEquals(expected[i].dataOffset(), actual[i].dataOffset());
             assertEquals(expected[i].byteSize(), actual[i].byteSize());
         }

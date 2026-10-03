@@ -1,3 +1,3 @@
 package io.euhedral_execution.inference.core.model_loader.layer_weights;
 
-public sealed interface QwenFfnWeights permits QwenDenseFfnWeights, QwenMoeWeights, QwenCompactDenseFfnWeights {}
+public sealed interface QwenFfnWeights permits QwenCompactDenseFfnWeights {}

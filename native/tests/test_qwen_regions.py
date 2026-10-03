@@ -5,58 +5,11 @@ import random
 import struct
 import unittest
 
-from test_q3_primitives import Gpu, NVRTC, CUDA, ROOT, _check
+from gpu_harness import Gpu, NVRTC, CUDA, ROOT, _check
 
 
 @unittest.skipIf(NVRTC is None or CUDA is None, "CUDA/NVRTC unavailable")
 class QwenRegionsTest(unittest.TestCase):
-    def test_gate_up_region_keeps_bf16_round_before_swiglu(self):
-        source = b'#include "ffn/kernels.cu"\n#include "q3/kernels.cu"\n#include "elementwise/kernels.cu"\n'
-        with contextlib.ExitStack() as scope:
-            gpu = Gpu(source)
-            scope.callback(gpu.close)
-            symbol = C.c_void_p()
-            self.assertEqual(0, gpu.function(C.byref(symbol), gpu.module, b'euhedral_q3_gate_up_swiglu_bf16'),
-                             'gate/up SwiGLU region is unavailable')
-            rng = random.Random(524)
-            for rows, width, outputs in [(1, 128, 32), (65, 256, 96), (65, 256, 192), (129, 256, 128), (256, 5120, 64)]:
-                with contextlib.ExitStack() as case:
-                    def upload(data):
-                        ptr = gpu.upload(data)
-                        case.callback(gpu.free, ptr)
-                        return ptr
-                    def alloc(size):
-                        ptr = gpu.zeros(size, 0xA5)
-                        case.callback(gpu.free, ptr)
-                        return ptr
-                    groups = outputs * (width // 64)
-                    scale = (groups * 24 + 255) & ~255
-                    packed = rng.randbytes(groups * 24) + bytes(scale - groups * 24)
-                    packed += b'\x00\x28' * groups
-                    w = upload(packed)
-                    gate_up, reference, actual = alloc(rows * outputs * 2), alloc(rows * outputs), alloc(rows * outputs)
-                    for special in [False, True]:
-                        bits = [0x3f80, 0xbf80, 0x3f81, 0x3e00, 0, 1, 0x8000, 0xbe01]
-                        if special:
-                            bits += [0x7f80, 0xff80, 0x7fc1, 0xffc7, 0x7f81]
-                        x = upload(struct.pack('<' + 'H' * (rows * width), *[rng.choice(bits) for _ in range(rows * width)]))
-                        args = [C.c_uint64(x), C.c_uint64(w), C.c_uint64(gate_up), C.c_uint(rows),
-                                C.c_uint(width), C.c_uint(outputs), C.c_uint64(scale)]
-                        gpu.launch('euhedral_q3_prefill_64_k32_cb_exact', ((rows + 63) // 64) * (outputs // 32), args)
-                        gpu.launch('euhedral_swiglu_bf16', (rows * (outputs // 2) + 127) // 128,
-                                   [C.c_uint64(gate_up), C.c_uint64(reference), C.c_uint(rows), C.c_uint(outputs // 2)])
-                        args[2] = C.c_uint64(actual)
-                        gpu.launch('euhedral_q3_gate_up_swiglu_bf16', ((rows + 63) // 64) * (outputs // 32), args)
-                        self.assertEqual(gpu.download(reference, rows * outputs), gpu.download(actual, rows * outputs),
-                                         f'gate/up BF16 boundary differs for {(rows, width, outputs, special)}')
-                        if outputs % 64 == 0:
-                            for tile in (64, 128):
-                                gpu.launch(f'euhedral_q3_gate_up_swiglu_{tile}x32',
-                                           ((rows + tile - 1) // tile) * (outputs // 64), args)
-                                self.assertEqual(gpu.download(reference, rows * outputs),
-                                                 gpu.download(actual, rows * outputs),
-                                                 f'paired {tile} boundary differs for {(rows, width, outputs, special)}')
-
     def test_control_region_preserves_fp32_projection_control_order(self):
         source = b'#include "linear/kernels.cu"\n#include "gdn/kernels.cu"\n'
         with contextlib.ExitStack() as scope:

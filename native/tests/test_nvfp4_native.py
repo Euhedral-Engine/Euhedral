@@ -15,7 +15,7 @@ try:
 except ImportError:
     np = None
 
-from test_q3_primitives import Gpu, NVRTC, CUDA, SKIP_REASON
+from gpu_harness import Gpu, NVRTC, CUDA, SKIP_REASON
 from test_nvfp4 import bf16, to_bf16_bytes, from_bf16_bytes, tensor, sd4_tensor, converter
 
 E2M1 = None if np is None else np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float64)
@@ -73,7 +73,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
         cls.gpu.close()
 
     def run_native(self, x, weights, rows, k, cols, terms, paired=False, variant=""):
-        suffix = "" if terms == 1 else "_x2"
+        suffix = ""
         out_cols = cols // 2 if paired else cols
         with contextlib.ExitStack() as stack:
             dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
@@ -92,7 +92,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
             return activations, from_bf16_bytes(self.gpu.download(dy, rows * out_cols * 2), (rows, out_cols))
 
     def test_quantizer_reconstruction_error(self):
-        for terms, bound in ((1, 0.11), (2, 0.012)):
+        for terms, bound in ((2, 0.012),):
             with self.subTest(terms=terms):
                 rows, k = 37, 5120
                 x = bf16(self.rng.standard_t(3, (rows, k)).astype(np.float32) * self.rng.uniform(0.01, 10, (rows, 1)).astype(np.float32))
@@ -103,7 +103,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                 self.assertLess(relative.max(), bound)
 
     def test_linear_matches_float64_over_its_operands(self):
-        for terms in (1, 2):
+        for terms in (2,):
             for rows, k, cols in ((3, 5120, 256), (130, 2048, 200), (257, 17408, 384)):
                 with self.subTest(terms=terms, rows=rows, k=k, cols=cols):
                     weights, dense = tensor(self.rng, cols, k)
@@ -114,7 +114,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                     self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * scale)
 
     def test_paired_gate_up_swiglu_matches_float64_over_its_operands(self):
-        for terms in (1, 2):
+        for terms in (2,):
             with self.subTest(terms=terms):
                 rows, k, cols = 70, 2048, 384
                 weights, dense = tensor(self.rng, cols, k)
@@ -127,7 +127,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                 self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * np.abs(expected).max())
 
     def test_skinny_linear_matches_float64_over_its_operands(self):
-        for terms in (1, 2):
+        for terms in (2,):
             for rows, k, cols, splits in ((2, 5120, 320, 1), (16, 2048, 200, 3), (29, 4096, 384, 2), (64, 2048, 128, 1)):
                 with self.subTest(terms=terms, rows=rows, k=k, cols=cols, splits=splits):
                     weights, dense = tensor(self.rng, cols, k)
@@ -135,7 +135,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                     fragments = 1 if rows <= 16 else 2 if rows <= 32 else 4
                     stage = (terms * 16 * fragments + 64) * 160
                     shared = min(4, 101376 // stage) * stage
-                    suffix = "" if terms == 1 else "_x2"
+                    suffix = ""
                     with contextlib.ExitStack() as stack:
                         dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
                         size = layout(rows, k, terms)[2]
@@ -158,10 +158,10 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                     self.assertLess(np.abs(y - expected).max(), 2.0 ** -7 * np.abs(expected).max())
 
 
-    def skinny(self, x, weights, k, cols, splits, terms=1, variant=""):
+    def skinny(self, x, weights, k, cols, splits, terms=2, variant=""):
         """One skinny linear (up to 16 rows) as the host runs it; BF16 output bytes."""
         rows = x.shape[0]
-        suffix = "" if terms == 1 else "_x2"
+        suffix = ""
         shared = min(4, 101376 // ((16 * terms + 64) * 160)) * (16 * terms + 64) * 160
         with contextlib.ExitStack() as stack:
             dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
@@ -195,7 +195,7 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                     self.assertEqual(together[row * cols * 2:(row + 1) * cols * 2], alone, f"row {row}")
 
     def test_sd4_kernels_are_bitwise_the_plain_kernels_on_the_expanded_tensor(self):
-        for terms in (1, 2):
+        for terms in (2,):
             for rows, k, cols in ((3, 5120, 256), (130, 2048, 384)):
                 sd4, plain = sd4_tensor(self.rng, cols, k)
                 x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))

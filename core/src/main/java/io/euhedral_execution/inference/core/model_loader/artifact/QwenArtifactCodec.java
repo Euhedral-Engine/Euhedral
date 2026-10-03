@@ -12,7 +12,7 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 
-/// Version 1 Qwen metadata and tensor-table codec.
+/// Metadata and tensor-table codec of the compact version 2 container.
 ///
 /// Metadata is encoded in the same order as `QwenConfig`: int32 scalar fields, IEEE 754 binary64
 /// floating-point fields, a length-prefixed UTF-8 activation name, a counted sequence of layer-type
@@ -140,32 +140,7 @@ final class QwenArtifactCodec {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (DataOutputStream output = new DataOutputStream(bytes)) {
             for (TensorDescriptor tensor : tensors) {
-                validateTensor(tensor);
-                byte[] name = encodeString(tensor.name(), "tensor name");
-                output.writeInt(name.length);
-                output.write(name);
-                output.writeInt(tensor.shape().length);
-                for (long dimension : tensor.shape()) {
-                    output.writeLong(dimension);
-                }
-                output.writeInt(tensor.dataType().ordinal());
-                output.writeInt(tensor.format().ordinal());
-                output.writeLong(tensor.dataOffset());
-                output.writeLong(tensor.byteSize());
-            }
-        } catch (IOException exception) {
-            throw new AssertionError("Byte array tensor table encoding failed", exception);
-        }
-        validateNonOverlapping(tensors);
-        return bytes.toByteArray();
-    }
-
-    static byte[] encodeCompactTensorTable(TensorDescriptor[] tensors) throws QwenArtifactFormatException {
-        validateTensorCount(tensors);
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (DataOutputStream output = new DataOutputStream(bytes)) {
-            for (TensorDescriptor tensor : tensors) {
-                validateCompactTensor(tensor);
+                validateTensorLayout(tensor);
                 byte[] name = encodeString(tensor.name(), "tensor name");
                 output.writeInt(name.length);
                 output.write(name);
@@ -182,7 +157,7 @@ final class QwenArtifactCodec {
         } catch (QwenArtifactFormatException exception) {
             throw exception;
         } catch (IOException exception) {
-            throw new AssertionError("Byte array compact tensor table encoding failed", exception);
+            throw new AssertionError("Byte array tensor table encoding failed", exception);
         }
         validateNonOverlapping(tensors);
         return bytes.toByteArray();
@@ -378,7 +353,7 @@ final class QwenArtifactCodec {
         checkedEnd(tensor.dataOffset(), tensor.byteSize(), "tensor data");
     }
 
-    private static void validateCompactTensor(TensorDescriptor tensor) throws QwenArtifactFormatException {
+    private static void validateTensorLayout(TensorDescriptor tensor) throws QwenArtifactFormatException {
         validateTensor(tensor);
         if (tensor.layout() == null) {
             throw invalid("compact tensor layout is required");

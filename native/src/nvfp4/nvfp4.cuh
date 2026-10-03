@@ -1,15 +1,15 @@
 #pragma once
-#include "gemm/balanced.cuh"
+#include "q3/numeric.cuh"
 #include "common/pdl.cuh"
 #include "nvfp4/scale_table.cuh"
 
 // NVFP4 weights (WeightFormat.NVFP4, row-split-k128-v1; Nvfp4Layout.java,
-// tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4). Rows of K values, K padded to
+// docs/NVFP4_NATIVE.md). Rows of K values, K padded to
 // 128: E2M1 codes two per byte with the even K in the low nibble, then a 256-aligned plane of one
 // E4M3 scale per 16 values, then a 256-aligned FP32 global scale. A weight is
 // e2m1(code) * e4m3(scale) * global.
 //
-// SD4 (row-split-k128-sd4-v1, --profile nvfp4-sd4, docs/NVFP4_COMPRESSED.md) stores each block scale
+// SD4 (row-split-k128-sd4-v1, docs/NVFP4_COMPRESSED.md) stores each block scale
 // as a 4-bit index into the tensor's table of 16 E4M3 codes: the scale plane holds K/32 bytes per row,
 // two indices per byte with the even block in the low nibble, and the table (16 bytes) precedes the
 // global scale at the 256-aligned end of the plane. Kernels look the codes up and then run exactly
@@ -219,59 +219,4 @@ static __device__ __forceinline__ void decode_rows(
             q3::write_bf16(output + (unsigned long long)t * out_features, 0, first_row + lane, out_features, mine * w.global);
     }
 }
-
-// ---------------------------------------------------------------------------------------------------
-// B operand of the balanced tile engine (gemm/balanced.cuh): one 16-column x K32 tile per warp and
-// generation, staged as BF16(e2m1 * scale * global). Lanes 8c..8c+7 own column c of each 4-column
-// pass; sublanes 0-3 hold the K32 block's four code words, sublane 4 its two block scales.
-template <bool kSd4>
-struct BT {
-    using Layout = nvfp4::LayoutT<kSd4>;
-    struct Compact { unsigned int words[4]; float global; };
-    static __device__ __forceinline__ Layout layout(const unsigned char* w, unsigned int width, unsigned int outputs,
-            unsigned long long) { return Layout(w, width, outputs); }
-    static __device__ __forceinline__ void prefetch(Compact& next, const Layout& w, unsigned int outputs,
-            unsigned int first_col, unsigned int base, unsigned int lane) {
-        const unsigned int sublane = lane & 7u;
-        #pragma unroll
-        for (unsigned int j = 0; j < 4; ++j) {
-            const unsigned int col = first_col + (lane >> 3) + 4u * j;
-            unsigned int word = 0;
-            if (col < outputs) {
-                if (sublane < 4u)
-                    word = reinterpret_cast<const unsigned int*>(w.codes + (unsigned long long)col * w.row_bytes)[base / 8u + sublane];
-                else if (sublane == 4u)
-                    word = w.scale_pair(col, base / 32u);
-            }
-            next.words[j] = word;
-        }
-        next.global = w.global;
-    }
-    template<int P>
-    static __device__ __forceinline__ void stage(__nv_bfloat16* hi, __nv_bfloat16*, const Compact& next, unsigned int lane) {
-        const unsigned int sublane = lane & 7u;
-        #pragma unroll
-        for (unsigned int j = 0; j < 4; ++j) {
-            const unsigned int col = (lane >> 3) + 4u * j;
-            const unsigned int scale_pair = __shfl_sync(0xffffffffu, next.words[j], 4, 8);
-            #pragma unroll
-            for (unsigned int h = 0; h < 2; ++h) {
-                const float scale = e4m3_to_float(h ? scale_pair >> 8 : scale_pair & 0xffu) * next.global;
-                const unsigned int word = __shfl_sync(0xffffffffu, next.words[j], h * 2u + (sublane >> 2), 8);
-                const unsigned int pair = (word >> ((sublane & 3u) * 8u)) & 0xffu;
-                const unsigned int i = k32_probe::b_index(col, h * 16u + sublane * 2u);
-                hi[i] = __float2bfloat16_rn(e2m1_value(pair & 15u) * scale);
-                hi[i + 1] = __float2bfloat16_rn(e2m1_value(pair >> 4) * scale);
-            }
-        }
-    }
-    template<int P>
-    static __device__ __forceinline__ void produce(__nv_bfloat16* hi, __nv_bfloat16* lo, const Layout& w,
-            unsigned int outputs, unsigned int col, unsigned int base, unsigned int lane) {
-        Compact now;
-        prefetch(now, w, outputs, col, base, lane);
-        stage<P>(hi, lo, now, lane);
-    }
-};
-using B = BT<false>;
 }  // namespace nvfp4

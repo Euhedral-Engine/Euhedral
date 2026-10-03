@@ -26,8 +26,7 @@ public final class LinearFrame extends QwenStageFrame {
                 : context.workspace().projectionAddress(instruction.outputBufferIndex());
         if (instruction.weights().size() == 1
                 && instruction.weightFormat() == WeightFormat.NVFP4
-                && (instruction.kind() == QwenExecutionPlan.Kind.Q3_FFN_DOWN
-                        || instruction.kind() == QwenExecutionPlan.Kind.Q3_LINEAR
+                && (instruction.kind() == QwenExecutionPlan.Kind.Q3_LINEAR
                         || instruction.kind() == QwenExecutionPlan.Kind.Q4_LINEAR
                         || instruction.kind() == QwenExecutionPlan.Kind.Q5_LINEAR)) {
             gpu().linearNvfp4Bf16(
@@ -68,29 +67,6 @@ public final class LinearFrame extends QwenStageFrame {
             long output,
             int rows) {
         switch (instruction.kind()) {
-            case Q3_FFN_DOWN -> {
-                if (instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.FFN_PARTIALS))
-                    gpu().q3FfnDownSplitBf16(
-                                    input,
-                                    instruction.weightAddress(),
-                                    output,
-                                    context.workspace().address(QwenExecutionPlan.Buffer.FFN_PARTIALS),
-                                    rows,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth(),
-                                    instruction.weightByteSize(),
-                                    instruction.weightLayout());
-                else
-                    gpu().q3FfnDownBf16(
-                                    input,
-                                    instruction.weightAddress(),
-                                    output,
-                                    rows,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth(),
-                                    instruction.weightByteSize(),
-                                    instruction.weightLayout());
-            }
             case Q3_LINEAR ->
                 gpu().linearQ3Bf16(
                                 input,

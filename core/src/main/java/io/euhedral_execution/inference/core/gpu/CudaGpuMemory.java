@@ -37,8 +37,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private static final int KERNEL_UNAVAILABLE = -4;
     /// EUHEDRAL_CUDA_ROUTE_UNAVAILABLE: a specialized route does not apply; another one must run.
     private static final int ROUTE_UNAVAILABLE = -5;
-    /// Expansion scratch above which a P2E2 linear is computed in output-row chunks. The largest
-    /// region that expands, the streamed FFN's gate/up plus down (109 MB), fits.
+    /// Expansion scratch above which a P2E2 linear is computed in output-row chunks. The largest layer
+    /// tensor that expands, the FFN gate/up (72 MB), fits with its activation region.
     private static final long Q3_SCRATCH_LIMIT = 128L << 20;
     private final Arena arena;
     private final MethodHandle malloc;
@@ -89,9 +89,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle rmsNormBf16;
     private final MethodHandle rmsNormUnitOffsetBf16;
     private final MethodHandle linearQ3Bf16;
-    private final MethodHandle linearQ3DecodeBf16;
-    private final MethodHandle linearQ3PrefillBf16;
-    /// Rows up to which a Q3 linear runs the decode kernels; more rows run the tiled prefill kernels.
+    private final MethodHandle linearQ3ReferenceBf16;
+    /// Rows up to which a quantized linear runs the decode kernels (one launch, every row bit for bit as a one-row
+    /// call); more rows run the block-scaled FP8 route.
     private static final int Q3_DECODE_MAX_ROWS = 8;
     private final MethodHandle linearQuantizedBf16;
     private final MethodHandle linearBf16ToFloat;
@@ -101,13 +101,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle gdnGatedRmsNormBf16;
     private final MethodHandle residualAddBf16;
     private final MethodHandle residualRmsNormBf16;
-    private final MethodHandle q3GateUpSwiGluBf16;
-    private final MethodHandle q3FfnDownBf16;
-    private final MethodHandle q3FfnDownSplitBf16;
     private final MethodHandle selectExactNumerics;
-    private final MethodHandle q3FfnStreamedBf16;
+    /// Mirrors the native process-wide exact-numerics selection.
+    private volatile boolean exactNumerics;
     private final MethodHandle gdnProjectControlFp32;
-    private final MethodHandle gdnProjectionsBf16;
     private final MethodHandle swiGluBf16;
     private final MethodHandle argmaxBf16;
     private final MethodHandle zeroDeviceMemory;
@@ -119,7 +116,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle embedQ3P2e2;
     private final MethodHandle copyDeviceToDevice2d;
     private final MethodHandle linearNvfp4Bf16;
-    private final MethodHandle nvfp4GateUpSwiGluBf16;
     private final MethodHandle nvfp4NativeAvailable;
     private final MethodHandle nvfp4ActivationBytes;
     private final MethodHandle linearNvfp4NativeBf16;
@@ -167,89 +163,78 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.copyDeviceToReadback = bind(linker, symbols, "euhedral_cuda_copy_device_to_readback", COPY);
             this.copyDeviceToDevice = bind(linker, symbols, "euhedral_cuda_copy_device_to_device", COPY);
             this.embedQ3 = bind(linker, symbols, "euhedral_cuda_embed_q3", EMBED_Q3);
-            this.embedQ3P2e2 = symbols.find("euhedral_cuda_embed_q3_p2e2")
-                    .map(symbol -> linker.downcallHandle(symbol, EMBED_Q3))
-                    .orElse(null);
-            this.linearQ3P2e2DecodeBf16 = symbols.find("euhedral_cuda_linear_q3_p2e2_decode_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
-                    .orElse(null);
-            this.q3P2e2Expand = symbols.find("euhedral_cuda_q3_p2e2_expand")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
-            this.linearNvfp4Bf16 = symbols.find("euhedral_cuda_linear_nvfp4_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
-                    .orElse(null);
-            this.nvfp4GateUpSwiGluBf16 = symbols.find("euhedral_cuda_nvfp4_gate_up_swiglu_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
-                    .orElse(null);
-            this.nvfp4NativeAvailable = symbols.find("euhedral_cuda_nvfp4_native_available")
-                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.nvfp4ActivationBytes = symbols.find("euhedral_cuda_nvfp4_native_scratch_bytes")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.linearNvfp4NativeBf16 = symbols.find("euhedral_cuda_linear_nvfp4_native_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
-            this.nvfp4NativeGateUpSwiGluBf16 = symbols.find("euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
-            this.q3MxAvailable = symbols.find("euhedral_cuda_q3_mx_available")
-                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.q3MxSelectSplitRows = symbols.find("euhedral_cuda_q3_mx_select_split_rows")
-                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.q3MxScratchBytes = symbols.find("euhedral_cuda_q3_mx_scratch_bytes")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT)))
-                    .orElse(null);
+            this.embedQ3P2e2 = bind(linker, symbols, "euhedral_cuda_embed_q3_p2e2", EMBED_Q3);
+            this.linearQ3P2e2DecodeBf16 =
+                    bind(linker, symbols, "euhedral_cuda_linear_q3_p2e2_decode_bf16", LINEAR_Q3_BF16);
+            this.q3P2e2Expand = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_q3_p2e2_expand",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG));
+            this.linearNvfp4Bf16 = bind(linker, symbols, "euhedral_cuda_linear_nvfp4_bf16", LINEAR_Q3_BF16);
+            this.nvfp4NativeAvailable = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_nvfp4_native_available",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT));
+            this.nvfp4ActivationBytes = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_nvfp4_native_scratch_bytes",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+            this.linearNvfp4NativeBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_linear_nvfp4_native_bf16",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
+            this.nvfp4NativeGateUpSwiGluBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
+            this.q3MxAvailable =
+                    bind(linker, symbols, "euhedral_cuda_q3_mx_available", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+            this.q3MxSelectSplitRows = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_q3_mx_select_split_rows",
+                    FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
+            this.q3MxScratchBytes = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_q3_mx_scratch_bytes",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
             FunctionDescriptor q3MxDescriptor = FunctionDescriptor.of(
                     ValueLayout.JAVA_INT,
                     ValueLayout.ADDRESS,
@@ -261,40 +246,37 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     ValueLayout.JAVA_INT,
                     ValueLayout.JAVA_LONG,
                     ValueLayout.JAVA_LONG);
-            this.linearQ3MxBf16 = symbols.find("euhedral_cuda_linear_q3_mx_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, q3MxDescriptor))
-                    .orElse(null);
-            this.linearQ45MxBf16 = symbols.find("euhedral_cuda_linear_q45_mx_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
-            this.q3MxGateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_mx_gate_up_swiglu_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, q3MxDescriptor))
-                    .orElse(null);
-            this.copyDeviceToDevice2d = symbols.find("euhedral_cuda_copy_device_to_device_2d")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
+            this.linearQ3MxBf16 = bind(linker, symbols, "euhedral_cuda_linear_q3_mx_bf16", q3MxDescriptor);
+            this.linearQ45MxBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_linear_q45_mx_bf16",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
+            this.q3MxGateUpSwiGluBf16 =
+                    bind(linker, symbols, "euhedral_cuda_q3_mx_gate_up_swiglu_bf16", q3MxDescriptor);
+            this.copyDeviceToDevice2d = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_copy_device_to_device_2d",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
             this.synchronize = bind(linker, symbols, "euhedral_cuda_synchronize", SYNCHRONIZE);
             this.streamCreate =
                     bind(linker, symbols, "euhedral_cuda_stream_create", FunctionDescriptor.of(ValueLayout.JAVA_LONG));
@@ -313,12 +295,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     symbols,
                     "euhedral_cuda_stream_select",
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
-            this.rowExactSelect = symbols.find("euhedral_cuda_row_exact_select")
-                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.pdlSelect = symbols.find("euhedral_cuda_pdl_select")
-                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
-                    .orElse(null);
+            this.rowExactSelect = bind(
+                    linker, symbols, "euhedral_cuda_row_exact_select", FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
+            this.pdlSelect =
+                    bind(linker, symbols, "euhedral_cuda_pdl_select", FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
             this.streamClear = bind(linker, symbols, "euhedral_cuda_stream_clear", FunctionDescriptor.ofVoid());
             this.eventCreate = bind(
                     linker,
@@ -364,8 +344,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.rmsNormUnitOffsetBf16 =
                     bind(linker, symbols, "euhedral_cuda_rms_norm_unit_offset_bf16", RMS_NORM_UNIT_OFFSET_BF16);
             this.linearQ3Bf16 = bind(linker, symbols, "euhedral_cuda_linear_q3_bf16", LINEAR_Q3_BF16);
-            this.linearQ3DecodeBf16 = bind(linker, symbols, "euhedral_cuda_linear_q3_decode_bf16", LINEAR_Q3_BF16);
-            this.linearQ3PrefillBf16 = bind(linker, symbols, "euhedral_cuda_linear_q3_prefill_bf16", LINEAR_Q3_BF16);
+            this.linearQ3ReferenceBf16 =
+                    bind(linker, symbols, "euhedral_cuda_linear_q3_reference_bf16", LINEAR_Q3_BF16);
             this.linearQuantizedBf16 =
                     bind(linker, symbols, "euhedral_cuda_linear_quantized_bf16", LINEAR_QUANTIZED_BF16);
             this.linearBf16ToFloat = bind(linker, symbols, "euhedral_cuda_linear_bf16_to_float", LINEAR_BF16_TO_FLOAT);
@@ -374,94 +354,41 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.gdnRecurrenceBf16 = bind(linker, symbols, "euhedral_cuda_gdn_recurrence_bf16", GDN_RECURRENCE_BF16);
             this.gdnGatedRmsNormBf16 =
                     bind(linker, symbols, "euhedral_cuda_gdn_gated_rms_norm_bf16", GDN_GATED_RMS_NORM_BF16);
-            this.q3FfnStreamedBf16 = symbols.find("euhedral_cuda_q3_ffn_streamed_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
-            this.q3FfnDownBf16 = symbols.find("euhedral_cuda_q3_ffn_down_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
-                    .orElse(null);
-            this.selectExactNumerics = symbols.find("euhedral_cuda_select_exact_numerics")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.q3FfnDownSplitBf16 = symbols.find("euhedral_cuda_q3_ffn_down_split_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
-            this.q3GateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_gate_up_swiglu_bf16")
-                    .map(symbol -> linker.downcallHandle(symbol, LINEAR_Q3_BF16))
-                    .orElse(null);
-            this.residualRmsNormBf16 = symbols.find("euhedral_cuda_residual_rms_norm_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_FLOAT)))
-                    .orElse(null);
-            this.gdnProjectControlFp32 = symbols.find("euhedral_cuda_gdn_project_control_fp32")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT)))
-                    .orElse(null);
-            this.gdnProjectionsBf16 = symbols.find("euhedral_cuda_gdn_projections_bf16")
-                    .map(symbol -> linker.downcallHandle(
-                            symbol,
-                            FunctionDescriptor.of(
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.ADDRESS,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_INT,
-                                    ValueLayout.JAVA_LONG,
-                                    ValueLayout.JAVA_LONG)))
-                    .orElse(null);
+            this.selectExactNumerics = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_select_exact_numerics",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+            this.residualRmsNormBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_residual_rms_norm_bf16",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_FLOAT));
+            this.gdnProjectControlFp32 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_gdn_project_control_fp32",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT));
             this.residualAddBf16 = bind(linker, symbols, "euhedral_cuda_residual_add_bf16", RESIDUAL_ADD_BF16);
             this.swiGluBf16 = bind(linker, symbols, "euhedral_cuda_swiglu_bf16", SWIGLU_BF16);
             this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
@@ -472,6 +399,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     bind(linker, symbols, "euhedral_cuda_attention_kv_append_nvfp4", ATTENTION_KV_APPEND_NVFP4);
             this.attentionCausalNvfp4 =
                     bind(linker, symbols, "euhedral_cuda_attention_causal_nvfp4", ATTENTION_CAUSAL_NVFP4);
+            if (!q3MxAvailable() || !nvfp4NativeAvailable())
+                throw new GpuMemoryException("an NVIDIA Blackwell GPU (compute capability 12.x) is required");
         } catch (RuntimeException exception) {
             loadedLibraryArena.close();
             throw exception;
@@ -581,7 +510,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int status;
             try {
                 status = (int) streamSelect.invokeExact(this.handle);
-                if (status == 0 && overlapPredecessor && pdlSelect != null) pdlSelect.invokeExact(1);
+                if (status == 0 && overlapPredecessor) pdlSelect.invokeExact(1);
             } catch (Throwable failure) {
                 throw new GpuMemoryException("CUDA submission stream selection invocation failed", failure);
             }
@@ -590,7 +519,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
         private void clear(boolean overlapPredecessor) {
             try {
-                if (overlapPredecessor && pdlSelect != null) pdlSelect.invokeExact(0);
+                if (overlapPredecessor) pdlSelect.invokeExact(0);
                 streamClear.invokeExact();
             } catch (Throwable failure) {
                 throw new GpuMemoryException("CUDA submission stream clear invocation failed", failure);
@@ -1073,8 +1002,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || inFeatures <= 0 || outFeatures <= 0 || weightsByteSize <= 0) {
             throw new IllegalArgumentException("Q3 linear dimensions and payload size must be positive");
         }
-        boolean decode = rows <= Q3_DECODE_MAX_ROWS;
-        if (!decode
+        if (rows > Q3_DECODE_MAX_ROWS
                 && invokeQ3Mx(
                         "Q3 FP8 linear",
                         this.linearQ3MxBf16,
@@ -1086,7 +1014,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                         outFeatures,
                         weightsByteSize)) return;
         invokeQ3(
-                decode ? this.linearQ3DecodeBf16 : this.linearQ3PrefillBf16,
+                this.linearQ3Bf16,
                 inputAddress,
                 weightsAddress,
                 outputAddress,
@@ -1111,7 +1039,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             throw new IllegalArgumentException("Q3 linear dimensions and payload size must be positive");
         }
         invokeQ3(
-                this.linearQ3Bf16,
+                this.linearQ3ReferenceBf16,
                 inputAddress,
                 weightsAddress,
                 outputAddress,
@@ -1173,7 +1101,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || inFeatures <= 0 || outFeatures <= 0 || weightsByteSize <= 0) {
             throw new IllegalArgumentException("Q3 linear dimensions and payload size must be positive");
         }
-        if (rows == 1 && linearQ3P2e2DecodeBf16 != null) {
+        if (rows == 1) {
             int status;
             try {
                 status = (int) linearQ3P2e2DecodeBf16.invokeExact(
@@ -1208,7 +1136,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         // Output-row chunks, each written to the scratch and copied into place. Every Q3 linear kernel
         // computes an output column from its own weight row alone, and the chunk widths avoid the
         // shapes that select a shape-specific kernel, so the outputs equal those of the whole tensor.
-        if (copyDeviceToDevice2d == null) throw new UnsupportedOperationException("native pitched copy unavailable");
         int chunk = linearChunkRows(rows, inFeatures);
         // The FP8 route's split-K choice, hence its summation order, follows the whole tensor, not the chunk.
         selectQ3MxSplitRows(outFeatures);
@@ -1250,7 +1177,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     /// Names the weight rows of the whole tensor for the FP8 route's split choice on this thread (0 clears it).
     private void selectQ3MxSplitRows(int weightRows) {
-        if (this.q3MxSelectSplitRows == null) return;
         try {
             this.q3MxSelectSplitRows.invokeExact(weightRows);
         } catch (Throwable failure) {
@@ -1273,6 +1199,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     private static String q3Operation(String operation, int status) {
         return status == CUDA_FORMAT_MISMATCH ? operation + " format/layout mismatch" : operation;
+    }
+
+    @Override
+    public long retainedScratchBytes() {
+        q3ScratchLock.lock();
+        try {
+            return q3ScratchBytes;
+        } finally {
+            q3ScratchLock.unlock();
+        }
+    }
+
+    @Override
+    public void q3GateUpSwiGluBf16(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        q3GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes, WeightLayout.ROW_SPLIT_K128_V1);
     }
 
     /// Frees the shared scratch (P2E2 expansion, quantized activations of the FP8 and native FP4 routes) after draining
@@ -1338,7 +1280,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int rowCount,
             long destination,
             long destinationBytes) {
-        if (q3P2e2Expand == null) throw new UnsupportedOperationException("native P2E2 expansion unavailable");
         int status;
         try {
             status = (int) q3P2e2Expand.invokeExact(
@@ -1360,7 +1301,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     public void copyRowsDeviceToDevice(
             long destination, long destinationPitch, long source, long sourcePitch, int rows) {
         ensureOpen();
-        if (copyDeviceToDevice2d == null) throw new UnsupportedOperationException("native pitched copy unavailable");
         requireAddresses(destination, source);
         copyRows(destination, destinationPitch, source, sourcePitch, rows);
     }
@@ -1408,7 +1348,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (embeddingByteSize <= 0 || tokenCount <= 0 || vocabularySize <= 0 || hiddenSize <= 0) {
             throw new IllegalArgumentException("Q3 embedding sizes must be positive");
         }
-        if (embedQ3P2e2 == null) throw new UnsupportedOperationException("native P2E2 embedding unavailable");
         int status;
         try {
             status = (int) embedQ3P2e2.invokeExact(
@@ -1425,165 +1364,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (status != 0) throw new GpuMemoryException(q3Operation("P2E2 Q3 embedding", status), status);
     }
 
-    @Override
-    public void q3FfnStreamedBf16(
-            long input,
-            long gateWeights,
-            long downWeights,
-            long output,
-            long slots,
-            long accumulators,
-            int rows,
-            int hidden,
-            int intermediate,
-            long gateBytes,
-            long downBytes,
-            WeightLayout gateLayout,
-            WeightLayout downLayout) {
-        boolean gateP2e2 = Objects.requireNonNull(gateLayout, "gateLayout") == WeightLayout.ROW_SPLIT_P2E2_V1;
-        boolean downP2e2 = Objects.requireNonNull(downLayout, "downLayout") == WeightLayout.ROW_SPLIT_P2E2_V1;
-        if (!gateP2e2 && !downP2e2) {
-            super.q3FfnStreamedBf16(
-                    input,
-                    gateWeights,
-                    downWeights,
-                    output,
-                    slots,
-                    accumulators,
-                    rows,
-                    hidden,
-                    intermediate,
-                    gateBytes,
-                    downBytes,
-                    gateLayout,
-                    downLayout);
-            return;
-        }
-        if (!gateP2e2) requireRowSplit(gateLayout, "streamed FFN region");
-        if (!downP2e2) requireRowSplit(downLayout, "streamed FFN region");
-        long gateExpanded = gateP2e2 ? P2e2Layout.expandedByteSize(2L * intermediate, hidden) : 0;
-        long downOffset = alignUp(gateExpanded, 256);
-        long downExpanded = downP2e2 ? P2e2Layout.expandedByteSize(hidden, intermediate) : 0;
-        withQ3Scratch(downOffset + downExpanded, scratch -> {
-            if (gateP2e2)
-                expandQ3(gateWeights, gateBytes, 2 * intermediate, hidden, 0, 2 * intermediate, scratch, gateExpanded);
-            if (downP2e2)
-                expandQ3(downWeights, downBytes, hidden, intermediate, 0, hidden, scratch + downOffset, downExpanded);
-            q3FfnStreamedBf16(
-                    input,
-                    gateP2e2 ? scratch : gateWeights,
-                    downP2e2 ? scratch + downOffset : downWeights,
-                    output,
-                    slots,
-                    accumulators,
-                    rows,
-                    hidden,
-                    intermediate,
-                    gateP2e2 ? gateExpanded : gateBytes,
-                    downP2e2 ? downExpanded : downBytes);
-        });
-    }
-
-    @Override
-    public void q3FfnDownBf16(
-            long input,
-            long weights,
-            long output,
-            int rows,
-            int width,
-            int outputs,
-            long weightBytes,
-            WeightLayout layout) {
-        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
-            super.q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes, layout);
-            return;
-        }
-        long expanded = P2e2Layout.expandedByteSize(outputs, width);
-        long activations = q3MxReserveBytes(rows, width, outputs), activationOffset = alignUp(expanded, 256);
-        withQ3Scratch(activationOffset + activations, scratch -> {
-            expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
-            withQ3MxReserved(
-                    scratch + activationOffset,
-                    activations,
-                    () -> q3FfnDownBf16(input, scratch, output, rows, width, outputs, expanded));
-        });
-    }
-
-    @Override
-    public void q3FfnDownSplitBf16(
-            long input,
-            long weights,
-            long output,
-            long partials,
-            int rows,
-            int width,
-            int outputs,
-            long weightBytes,
-            WeightLayout layout) {
-        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
-            super.q3FfnDownSplitBf16(input, weights, output, partials, rows, width, outputs, weightBytes, layout);
-            return;
-        }
-        long expanded = P2e2Layout.expandedByteSize(outputs, width);
-        long activations = q3MxReserveBytes(rows, width, outputs), activationOffset = alignUp(expanded, 256);
-        withQ3Scratch(activationOffset + activations, scratch -> {
-            expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
-            withQ3MxReserved(
-                    scratch + activationOffset,
-                    activations,
-                    () -> q3FfnDownSplitBf16(input, scratch, output, partials, rows, width, outputs, expanded));
-        });
-    }
-
-    @Override
-    public void q3GateUpSwiGluBf16(
-            long input,
-            long weights,
-            long output,
-            int rows,
-            int width,
-            int outputs,
-            long weightBytes,
-            WeightLayout layout) {
-        if (Objects.requireNonNull(layout, "layout") != WeightLayout.ROW_SPLIT_P2E2_V1) {
-            super.q3GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes, layout);
-            return;
-        }
-        long expanded = P2e2Layout.expandedByteSize(outputs, width);
-        long activations = q3MxReserveBytes(rows, width, outputs), activationOffset = alignUp(expanded, 256);
-        withQ3Scratch(activationOffset + activations, scratch -> {
-            expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
-            withQ3MxReserved(
-                    scratch + activationOffset,
-                    activations,
-                    () -> q3GateUpSwiGluBf16(input, scratch, output, rows, width, outputs, expanded));
-        });
-    }
-
     /// Rows from which an NVFP4 linear runs on native FP4 tensor cores: one row stays on the GEMV, which
     /// streams weights as fast and keeps BF16 activations (docs/NVFP4_NATIVE.md).
     static final int NVFP4_NATIVE_MIN_ROWS = 2;
     /// The paired gate/up region exists only in region views, from 64 rows.
     static final int NVFP4_NATIVE_REGION_MIN_ROWS = 64;
 
-    /// Rows from which a Q3, Q4 or Q5 prefill linear runs on the block-scaled FP8 route (docs/PREFILL_MX.md); smaller
-    /// quanta (speculative verification and drafting) have dedicated GEMV kernels.
-    static final int Q3_MX_MIN_ROWS = 16;
+    /// Rows from which a Q3, Q4 or Q5 linear runs on the block-scaled FP8 route (docs/PREFILL_MX.md); smaller
+    /// quanta (speculative verification, drafting and prompt tails) run the decode kernels.
+    static final int Q3_MX_MIN_ROWS = Q3_DECODE_MAX_ROWS + 1;
 
-    /// Whether the Q3 block-scaled FP8 prefill kernels are available on this device (sm_12x, not disabled by
-    /// EUHEDRAL_Q3_MX=0).
+    /// Whether the block-scaled FP8 prefill kernels are available on this device (an sm_12x GPU).
     public boolean q3MxAvailable() {
         Boolean available = this.q3Mx;
         if (available == null) {
             ensureOpen();
             try {
-                available = this.q3MxAvailable != null
-                        && this.q3MxScratchBytes != null
-                        && this.q3MxSelectSplitRows != null
-                        && this.linearQ3MxBf16 != null
-                        && this.linearQ45MxBf16 != null
-                        && this.q3MxGateUpSwiGluBf16 != null
-                        && (int) this.q3MxAvailable.invokeExact() != 0;
+                available = (int) this.q3MxAvailable.invokeExact() != 0;
             } catch (Throwable failure) {
                 throw new GpuMemoryException("Q3 FP8 prefill availability invocation failed", failure);
             }
@@ -1619,7 +1416,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int width,
             int outputs,
             long weightBytes) {
-        if (rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || !q3MxAvailable()) return false;
+        if (rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || this.exactNumerics || !q3MxAvailable()) return false;
         if (width % 128 != 0 || outputs % 128 != 0) return false;
         ensureOpen();
         requireAddresses(input, weights, output);
@@ -1722,7 +1519,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// Bytes to reserve behind expanded weights for an FP8 route over `rows` rows of `width` values, or zero
     /// when that route will not run.
     private long q3MxReserveBytes(int rows, int width, int outputs) {
-        if (rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || width % 128 != 0 || !q3MxAvailable()) return 0;
+        if (rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || this.exactNumerics || width % 128 != 0 || !q3MxAvailable())
+            return 0;
         return q3MxScratchBytes(rows, width, outputs);
     }
 
@@ -1742,14 +1540,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
     }
 
-    /// Whether the native Blackwell NVFP4 kernels are loaded: an sm_12x device, and not disabled with
-    /// EUHEDRAL_NVFP4_NATIVE=0.
+    /// Whether the native Blackwell NVFP4 kernels are loaded: an sm_12x device.
     public boolean nvfp4NativeAvailable() {
         Boolean available = this.nvfp4Native;
         if (available == null) {
             ensureOpen();
             try {
-                available = this.nvfp4NativeAvailable != null && (int) this.nvfp4NativeAvailable.invokeExact() != 0;
+                available = (int) this.nvfp4NativeAvailable.invokeExact() != 0;
             } catch (Throwable failure) {
                 throw new GpuMemoryException("native NVFP4 availability invocation failed", failure);
             }
@@ -1761,7 +1558,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void linearNvfp4Bf16(
             long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {
-        boolean route = rows >= NVFP4_NATIVE_MIN_ROWS && !ROW_EXACT.get()[0];
+        boolean route = rows >= NVFP4_NATIVE_MIN_ROWS && !ROW_EXACT.get()[0] && !this.exactNumerics;
         if (route && inFeatures % 128 == 0 && nvfp4NativeAvailable()) {
             if (invokeNativeNvfp4(
                     "native NVFP4 linear",
@@ -1781,36 +1578,101 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void nvfp4GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        if (rows <= 0 || width <= 0 || outputs <= 0 || outputs % 2 != 0 || weightBytes <= 0)
+            throw new IllegalArgumentException("invalid NVFP4 gate/up region dimensions");
         if (rows >= NVFP4_NATIVE_REGION_MIN_ROWS
                 && width % 128 == 0
                 && !ROW_EXACT.get()[0]
-                && nvfp4NativeAvailable()) {
-            if (invokeNativeNvfp4(
-                    "native NVFP4 gate/up SwiGLU region",
-                    this.nvfp4NativeGateUpSwiGluBf16,
-                    input,
-                    weights,
-                    output,
-                    rows,
-                    width,
-                    outputs,
-                    weightBytes)) return;
+                && !this.exactNumerics
+                && invokeNativeNvfp4(
+                        "native NVFP4 gate/up SwiGLU region",
+                        this.nvfp4NativeGateUpSwiGluBf16,
+                        input,
+                        weights,
+                        output,
+                        rows,
+                        width,
+                        outputs,
+                        weightBytes)) return;
+        composeGateUp(
+                output,
+                rows,
+                outputs,
+                gateUp -> linearNvfp4Bf16(input, weights, gateUp, rows, width, outputs, weightBytes));
+    }
+
+    /// The gate/up region as two operations, for the oracle and for shapes the fused route declines: `linear`
+    /// writes the rows of [gate | up] into a scratch region, SwiGLU reduces them into `output`.
+    private void composeGateUp(long output, int rows, int outputs, LongConsumer linear) {
+        long bytes = (long) rows * outputs * Short.BYTES;
+        LongConsumer run = gateUp -> {
+            linear.accept(gateUp);
+            swiGluBf16(gateUp, output, rows, outputs / 2);
+        };
+        if (q3ScratchLock.isHeldByCurrentThread()) {
+            long[] reserved = q3MxReserved.get();
+            if (reserved == null || reserved[1] < bytes)
+                throw new IllegalStateException("the gate/up composition needs a reserved scratch region");
+            run.accept(reserved[0]);
+        } else withQ3Scratch(bytes, run);
+    }
+
+    @Override
+    public void q3GateUpSwiGluBf16(
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes,
+            WeightLayout layout) {
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        if (rows <= 0 || width <= 0 || width % 128 != 0 || outputs <= 0 || outputs % 32 != 0 || weightBytes <= 0)
+            throw new IllegalArgumentException("invalid Q3 gate/up region dimensions");
+        if (Objects.requireNonNull(layout, "layout") == WeightLayout.ROW_SPLIT_P2E2_V1) {
+            long expanded = P2e2Layout.expandedByteSize(outputs, width);
+            long fused = q3MxReserveBytes(rows, width, outputs);
+            long reserve = fused > 0 ? fused : (long) rows * outputs * Short.BYTES;
+            long reserveOffset = alignUp(expanded, 256);
+            withQ3Scratch(reserveOffset + reserve, scratch -> {
+                expandQ3(weights, weightBytes, outputs, width, 0, outputs, scratch, expanded);
+                withQ3MxReserved(
+                        scratch + reserveOffset,
+                        reserve,
+                        () -> q3GateUpSwiGluRowSplit(input, scratch, output, rows, width, outputs, expanded));
+            });
+            return;
         }
-        invokeNvfp4(
-                "NVFP4 gate/up SwiGLU region",
-                nvfp4GateUpSwiGluBf16,
+        requireRowSplit(layout, "Q3 gate/up SwiGLU region");
+        q3GateUpSwiGluRowSplit(input, weights, output, rows, width, outputs, weightBytes);
+    }
+
+    /// One row-split gate/up region: the FP8 route fused, or the composition of a linear and SwiGLU.
+    private void q3GateUpSwiGluRowSplit(
+            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
+        if (invokeQ3Mx(
+                "Q3 FP8 gate/up SwiGLU region",
+                this.q3MxGateUpSwiGluBf16,
                 input,
                 weights,
                 output,
                 rows,
                 width,
                 outputs,
-                weightBytes);
+                weightBytes)) return;
+        composeGateUp(
+                output,
+                rows,
+                outputs,
+                gateUp -> linearQ3Bf16(input, weights, gateUp, rows, width, outputs, weightBytes));
     }
 
     /// Quantizes the activations into the shared scratch, ordered between lanes by its event, and runs
-    /// `kernel` on native FP4 tensor cores. False when the route declined (exact numerics select the
-    /// BF16-expansion kernels).
+    /// `kernel` on native FP4 tensor cores. False when the route declined (exact numerics).
     private boolean invokeNativeNvfp4(
             String operation,
             MethodHandle kernel,
@@ -1867,7 +1729,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         requireAddresses(input, weights, output);
         if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
             throw new IllegalArgumentException(operation + " dimensions and payload size must be positive");
-        if (kernel == null) throw new UnsupportedOperationException("native " + operation + " unavailable");
         int status;
         try {
             status = (int) kernel.invokeExact(
@@ -2111,74 +1972,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     @Override
-    public void q3FfnStreamedBf16(
-            long input,
-            long gateWeights,
-            long downWeights,
-            long output,
-            long slots,
-            long accumulators,
-            int rows,
-            int hidden,
-            int intermediate,
-            long gateBytes,
-            long downBytes) {
-        ensureOpen();
-        requireAddresses(input, gateWeights, downWeights, output, slots, accumulators);
-        if ((rows != 64 && rows != 1024) || hidden != 5120 || intermediate != 17408 || gateBytes <= 0 || downBytes <= 0)
-            throw new IllegalArgumentException("streamed FFN geometry is not qualified");
-        if (q3FfnStreamedBf16 == null) throw new UnsupportedOperationException("native streamed FFN unavailable");
-        invokeLayer(
-                "streamed FFN region",
-                q3FfnStreamedBf16,
-                MemorySegment.ofAddress(input),
-                MemorySegment.ofAddress(gateWeights),
-                MemorySegment.ofAddress(downWeights),
-                MemorySegment.ofAddress(output),
-                MemorySegment.ofAddress(slots),
-                MemorySegment.ofAddress(accumulators),
-                rows,
-                hidden,
-                intermediate,
-                gateBytes,
-                downBytes);
-    }
-
-    @Override
-    public void q3FfnDownBf16(
-            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
-        ensureOpen();
-        requireAddresses(input, weights, output);
-        if (q3FfnDownBf16 == null) {
-            linearQ3Bf16(input, weights, output, rows, width, outputs, weightBytes);
-            return;
-        }
-        if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
-            throw new IllegalArgumentException("invalid Q3 FFN down dimensions");
-        if (invokeQ3Mx(
-                "Q3 FP8 FFN down", this.linearQ3MxBf16, input, weights, output, rows, width, outputs, weightBytes))
-            return;
-        invokeLayer(
-                "Q3 FFN down",
-                q3FfnDownBf16,
-                MemorySegment.ofAddress(input),
-                MemorySegment.ofAddress(weights),
-                MemorySegment.ofAddress(output),
-                rows,
-                width,
-                outputs,
-                weightBytes);
-    }
-
-    /// Selects exact numerics process-wide: every relaxed-order kernel (contiguous Q3 decode, split-K
-    /// FFN down) is replaced by its bitwise-exact counterpart for later launches. Returns the previous
-    /// selection. For numerical comparisons against the oracle; `EUHEDRAL_EXACT=1` sets the default.
-    @Override
     public void selectRowExact(boolean enabled) {
-        if (this.rowExactSelect == null) {
-            if (enabled) throw new UnsupportedOperationException("native package has no row-exact execution");
-            return;
-        }
         try {
             this.rowExactSelect.invokeExact(enabled ? 1 : 0);
         } catch (Throwable failure) {
@@ -2191,75 +1985,21 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// (or one row at a time) when row-exact execution is selected.
     @Override
     public boolean rowExactQuantizedLinears() {
-        return this.rowExactSelect != null;
+        return true;
     }
 
+    /// Selects exact numerics process-wide: every quantized linear runs its scalar reference and every
+    /// relaxed-order operator its exact twin, for later launches. Returns the previous selection. This is the
+    /// numerical oracle for comparisons and tests; production never selects it.
     public boolean selectExactNumerics(boolean exact) {
         ensureOpen();
-        if (selectExactNumerics == null)
-            throw new UnsupportedOperationException("exact numerics selection is unavailable");
         try {
-            return (int) selectExactNumerics.invokeExact(exact ? 1 : 0) != 0;
+            boolean previous = (int) selectExactNumerics.invokeExact(exact ? 1 : 0) != 0;
+            this.exactNumerics = exact;
+            return previous;
         } catch (Throwable failure) {
             throw new IllegalStateException("exact numerics selection failed", failure);
         }
-    }
-
-    @Override
-    public void q3FfnDownSplitBf16(
-            long input, long weights, long output, long partials, int rows, int width, int outputs, long weightBytes) {
-        ensureOpen();
-        requireAddresses(input, weights, output, partials);
-        if (q3FfnDownSplitBf16 == null) {
-            q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
-            return;
-        }
-        if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
-            throw new IllegalArgumentException("invalid Q3 FFN down dimensions");
-        if (invokeQ3Mx(
-                "Q3 FP8 FFN down", this.linearQ3MxBf16, input, weights, output, rows, width, outputs, weightBytes))
-            return;
-        invokeLayer(
-                "Q3 split-K FFN down",
-                q3FfnDownSplitBf16,
-                MemorySegment.ofAddress(input),
-                MemorySegment.ofAddress(weights),
-                MemorySegment.ofAddress(output),
-                MemorySegment.ofAddress(partials),
-                rows,
-                width,
-                outputs,
-                weightBytes);
-    }
-
-    @Override
-    public void q3GateUpSwiGluBf16(
-            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
-        ensureOpen();
-        requireAddresses(input, weights, output);
-        if (rows <= 0 || width <= 0 || width % 128 != 0 || outputs <= 0 || outputs % 32 != 0 || weightBytes <= 0)
-            throw new IllegalArgumentException("invalid Q3 gate/up region dimensions");
-        if (q3GateUpSwiGluBf16 == null) throw new UnsupportedOperationException("native Q3 gate/up region unavailable");
-        if (invokeQ3Mx(
-                "Q3 FP8 gate/up SwiGLU region",
-                this.q3MxGateUpSwiGluBf16,
-                input,
-                weights,
-                output,
-                rows,
-                width,
-                outputs,
-                weightBytes)) return;
-        invokeLayer(
-                "Q3 gate/up SwiGLU region",
-                q3GateUpSwiGluBf16,
-                MemorySegment.ofAddress(input),
-                MemorySegment.ofAddress(weights),
-                MemorySegment.ofAddress(output),
-                rows,
-                width,
-                outputs,
-                weightBytes);
     }
 
     @Override
@@ -2269,8 +2009,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         requireAddresses(residual, delta, weight, hidden, normalized);
         if (rows <= 0 || width <= 0 || !Float.isFinite(epsilon) || epsilon < 0)
             throw new IllegalArgumentException("invalid residual RMSNorm region dimensions");
-        if (residualRmsNormBf16 == null)
-            throw new UnsupportedOperationException("native residual RMSNorm region unavailable");
         invokeLayer(
                 "residual RMSNorm region",
                 residualRmsNormBf16,
@@ -2300,8 +2038,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         requireAddresses(input, aWeight, bWeight, aLog, dtBias, g, beta);
         if (rows <= 0 || width <= 0 || heads <= 0)
             throw new IllegalArgumentException("invalid GDN control region dimensions");
-        if (gdnProjectControlFp32 == null)
-            throw new UnsupportedOperationException("native GDN control region unavailable");
         invokeLayer(
                 "GDN projection/control region",
                 gdnProjectControlFp32,
@@ -2315,80 +2051,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 rows,
                 width,
                 heads);
-    }
-
-    @Override
-    public void gdnProjectionsBf16(
-            long input,
-            long q4Weights,
-            long q5Weights,
-            long queryKeyOutput,
-            long valueZOutput,
-            int rows,
-            int hidden,
-            int queryKeyWidth,
-            int valueZWidth,
-            long q4Bytes,
-            long q5Bytes) {
-        if (gdnProjectionsBf16 == null) {
-            super.gdnProjectionsBf16(
-                    input,
-                    q4Weights,
-                    q5Weights,
-                    queryKeyOutput,
-                    valueZOutput,
-                    rows,
-                    hidden,
-                    queryKeyWidth,
-                    valueZWidth,
-                    q4Bytes,
-                    q5Bytes);
-            return;
-        }
-        ensureOpen();
-        requireAddresses(input, q4Weights, q5Weights, queryKeyOutput, valueZOutput);
-        if (rows <= 0 || hidden <= 0 || queryKeyWidth <= 0 || valueZWidth <= 0 || q4Bytes <= 0 || q5Bytes <= 0)
-            throw new IllegalArgumentException("invalid GDN projection dimensions");
-        // The two projections share the input; each quantizes it (a few microseconds) and runs on the FP8 route.
-        if (invokeQ3Mx(
-                "Q4 FP8 GDN projection",
-                null,
-                4,
-                input,
-                q4Weights,
-                queryKeyOutput,
-                rows,
-                hidden,
-                queryKeyWidth,
-                q4Bytes)) {
-            if (!invokeQ3Mx(
-                    "Q5 FP8 GDN projection",
-                    null,
-                    5,
-                    input,
-                    q5Weights,
-                    valueZOutput,
-                    rows,
-                    hidden,
-                    valueZWidth,
-                    q5Bytes))
-                linearQuantizedBf16(input, q5Weights, valueZOutput, rows, hidden, valueZWidth, q5Bytes, 5);
-            return;
-        }
-        invokeLayer(
-                "GDN projections",
-                gdnProjectionsBf16,
-                MemorySegment.ofAddress(input),
-                MemorySegment.ofAddress(q4Weights),
-                MemorySegment.ofAddress(q5Weights),
-                MemorySegment.ofAddress(queryKeyOutput),
-                MemorySegment.ofAddress(valueZOutput),
-                rows,
-                hidden,
-                queryKeyWidth,
-                valueZWidth,
-                q4Bytes,
-                q5Bytes);
     }
 
     @Override

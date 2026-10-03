@@ -14,5 +14,10 @@ static __device__ __forceinline__ float scale_to_float(unsigned short value) {
 static __device__ __forceinline__ unsigned short float_to_bf16(float value) {
     return __bfloat16_as_ushort(__float2bfloat16_rn(value));
 }
+// Write one FP32 result as BF16 (round-to-nearest-even). Bounds are the caller's.
+static __device__ __forceinline__ void write_bf16(
+        unsigned short* output, unsigned int row, unsigned int col, unsigned int out_features, float value) {
+    output[(unsigned long long)row * out_features + col] = float_to_bf16(value);
+}
 
 }  // namespace q45

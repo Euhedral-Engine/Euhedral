@@ -186,25 +186,16 @@ int euhedral_cuda_load_native_kernel(const void* anchor, const char* source_name
 #define PDL_CAPACITY 64
 static _Atomic(CUfunction) pdl_functions[PDL_CAPACITY];
 static atomic_uint pdl_count;
-static atomic_int pdl_mode = -1;
 #ifdef _WIN32
 static __declspec(thread) int pdl_selected;
 #else
 static _Thread_local int pdl_selected;
 #endif
 
-static atomic_int exact_numerics = -1;
+static atomic_int exact_numerics;
 
 int euhedral_cuda_exact_numerics(void) {
-    int value = atomic_load(&exact_numerics);
-    if (value < 0) {
-        const char* exact = getenv("EUHEDRAL_EXACT");
-        const char* q3 = getenv("EUHEDRAL_Q3_DECODE");
-        int initial = (exact != NULL && strcmp(exact, "1") == 0) || (q3 != NULL && strcmp(q3, "EXACT") == 0);
-        atomic_compare_exchange_strong(&exact_numerics, &value, initial);
-        value = atomic_load(&exact_numerics);
-    }
-    return value;
+    return atomic_load(&exact_numerics);
 }
 
 int euhedral_cuda_select_exact_numerics(int exact) {
@@ -241,16 +232,6 @@ void euhedral_cuda_pdl_register(CUfunction function) {
     if (slot < PDL_CAPACITY) atomic_store(&pdl_functions[slot], function);
 }
 
-static int pdl_enabled(void) {
-    int mode = atomic_load(&pdl_mode);
-    if (mode < 0) {
-        const char* value = getenv("EUHEDRAL_PDL");
-        mode = value == NULL || strcmp(value, "0") != 0;  /* EUHEDRAL_PDL=0 disables it everywhere */
-        atomic_store(&pdl_mode, mode);
-    }
-    return mode;
-}
-
 static int pdl_registered(CUfunction function) {
     unsigned int count = atomic_load(&pdl_count);
     if (count > PDL_CAPACITY) count = PDL_CAPACITY;
@@ -262,7 +243,7 @@ static int pdl_registered(CUfunction function) {
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
         unsigned int block_x, unsigned int block_y, unsigned int block_z, unsigned int shared_bytes,
         CUstream stream, void** parameters, void** extra) {
-    if (stream == NULL || extra != NULL || !pdl_selected || !pdl_enabled() || !pdl_registered(function))
+    if (stream == NULL || extra != NULL || !pdl_selected || !pdl_registered(function))
         return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
                 parameters, extra);
     CUlaunchAttribute attribute;

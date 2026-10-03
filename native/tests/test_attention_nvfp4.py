@@ -12,7 +12,7 @@ try:
 except ImportError:
     np = None
 
-from test_q3_primitives import Gpu, NVRTC, CUDA
+from gpu_harness import Gpu, NVRTC, CUDA
 
 P, U = C.c_uint64, C.c_uint
 PAGE_TOKENS = 256
@@ -212,7 +212,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                 self.assertEqual(0, local.value, name.decode() + ' must not use thread-local decode tables')
 
     def test_attention_matches_fp64_represented_cache_oracle(self):
-        for name in [b'euhedral_attention_prefill_nvfp4', b'euhedral_attention_prefill32_nvfp4', b'euhedral_attention_decode_nvfp4',
+        for name in [b'euhedral_attention_prefill32_nvfp4', b'euhedral_attention_decode_nvfp4',
                      b'euhedral_attention_merge_nvfp4']:
             symbol = C.c_void_p()
             self.assertEqual(0, self.gpu.function(C.byref(symbol), self.gpu.module, name), name)
@@ -249,11 +249,7 @@ extern "C" __global__ void probe_nvfp4_decode(float* fp32, unsigned short* fp16)
                               .astype(np.uint32) << 16).view(np.float32).reshape(rows, query_heads, 256)
                     observed.append((label, actual))
                 if rows > 1:
-                    self.gpu.launch('euhedral_attention_prefill_nvfp4', ((rows + 15) // 16) * query_heads, args)
-                    control = self.gpu.download(output, rows * query_heads * 512)
-                    capture('prefill16')
                     self.gpu.launch('euhedral_attention_prefill32_nvfp4_exact', ((rows + 31) // 32) * query_heads, args)
-                    self.assertEqual(control, self.gpu.download(output, rows * query_heads * 512))
                     capture('prefill32_exact')
                     # The relaxed kernel sums each row's softmax denominator in four partial sums.
                     self.gpu.launch('euhedral_attention_prefill32_nvfp4', ((rows + 31) // 32) * query_heads, args)

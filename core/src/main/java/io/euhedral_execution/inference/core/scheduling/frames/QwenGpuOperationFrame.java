@@ -25,21 +25,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
     @Override
     protected void perform(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         switch (instruction.kind()) {
-            case FFN_STREAMED ->
-                gpu().q3FfnStreamedBf16(
-                                input(context, instruction, 0),
-                                instruction.weightAddress(0),
-                                instruction.weightAddress(1),
-                                output(context, instruction, 0),
-                                output(context, instruction, 1),
-                                output(context, instruction, 2),
-                                context.inputTokenCount(),
-                                instruction.inputWidth(),
-                                context.plan().weights().config().intermediateSize(),
-                                instruction.weightByteSize(0),
-                                instruction.weightByteSize(1),
-                                instruction.weightLayout(0),
-                                instruction.weightLayout(1));
             case Q3_GATE_UP_SWIGLU -> {
                 if (instruction.weightFormat() == WeightFormat.NVFP4)
                     gpu().nvfp4GateUpSwiGluBf16(
@@ -83,7 +68,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                                 context.inputTokenCount(),
                                 instruction.inputWidth(),
                                 instruction.outputWidth());
-            case GDN_PROJECTIONS -> runGdnProjections(context, instruction);
             case MTP_STEM -> runMtpStem(context, instruction);
             case GDN_CONTROL -> runControl(context, instruction);
             case GDN_CONVOLUTION -> runConvolution(context, instruction);
@@ -98,45 +82,6 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                 throw new IllegalArgumentException(
                         "GPU operation frame received unsupported instruction: " + instruction.kind());
         }
-    }
-
-    private void runGdnProjections(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
-        QwenConfig config = context.plan().weights().config();
-        int valueZWidth = 2 * config.linearNumValueHeads() * config.linearValueHeadDim();
-        if (instruction.weightFormat(0) == WeightFormat.NVFP4 || instruction.weightFormat(1) == WeightFormat.NVFP4) {
-            if (instruction.weightFormat(0) != WeightFormat.NVFP4 || instruction.weightFormat(1) != WeightFormat.NVFP4)
-                throw new IllegalStateException("GDN projections mix NVFP4 and grouped formats");
-            int rows = context.inputTokenCount();
-            gpu().linearNvfp4Bf16(
-                            input(context, instruction, 0),
-                            instruction.weightAddress(0),
-                            output(context, instruction, 0),
-                            rows,
-                            instruction.inputWidth(),
-                            instruction.outputWidth(),
-                            instruction.weightByteSize(0));
-            gpu().linearNvfp4Bf16(
-                            input(context, instruction, 0),
-                            instruction.weightAddress(1),
-                            output(context, instruction, 1),
-                            rows,
-                            instruction.inputWidth(),
-                            valueZWidth,
-                            instruction.weightByteSize(1));
-            return;
-        }
-        gpu().gdnProjectionsBf16(
-                        input(context, instruction, 0),
-                        instruction.weightAddress(0),
-                        instruction.weightAddress(1),
-                        output(context, instruction, 0),
-                        output(context, instruction, 1),
-                        context.inputTokenCount(),
-                        instruction.inputWidth(),
-                        instruction.outputWidth(),
-                        valueZWidth,
-                        instruction.weightByteSize(0),
-                        instruction.weightByteSize(1));
     }
 
     private void runControl(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {

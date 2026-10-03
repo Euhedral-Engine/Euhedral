@@ -1,20 +1,17 @@
-"""Restructured Q4/Q5 kernels against the original schedule and an independent CPU model.
+"""Q4/Q5 kernels (native/src/q45, native/src/reference).
 
-The production module (native/src/q45/) and the pre-restructuring reference kernels
-(q45_reference.cu) are compiled into one NVRTC module. Every route must match the
-reference bitwise on sentinel-filled outputs; a CPU dequantization bounds both.
+The scalar reference is checked against an independent CPU dequantization; the contiguous decode kernels against
+the reference within one BF16 step; their multi-row twins bit for bit against one-row launches.
 """
 
 import contextlib
 import ctypes as C
-import pathlib
 import random
 import struct
 import unittest
 
-from test_q3_primitives import Gpu, NVRTC, SKIP_REASON, bf16_value, to_bf16
+from gpu_harness import Gpu, NVRTC, SKIP_REASON, bf16_value, to_bf16
 
-HERE = pathlib.Path(__file__).resolve().parent
 SENTINEL = 0xA5
 
 
@@ -66,8 +63,7 @@ def cpu_reference(payload, bits, values, rows, width, outputs):
 class Q45KernelTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = b'#include "q45/kernels.cu"\n' + (HERE / "q45_reference.cu").read_bytes()
-        cls.gpu = Gpu(source)
+        cls.gpu = Gpu(b'#include "q45/kernels.cu"\n#include "reference/kernels.cu"\n')
         cls.rng = random.Random(0x0545)
 
     @classmethod
@@ -78,19 +74,71 @@ class Q45KernelTest(unittest.TestCase):
         stack.callback(self.gpu.free, pointer)
         return pointer
 
-    def run_kernel(self, stack, name, grid, x, w, rows, width, outputs):
+    def run_kernel(self, stack, name, grid, x, w, rows, width, outputs, bits=None):
         y = self.owned(stack, self.gpu.zeros(rows * outputs * 2, fill=SENTINEL))
-        self.gpu.launch(name, grid, [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y),
-                                     C.c_uint(rows), C.c_uint(width), C.c_uint(outputs)])
+        arguments = [C.c_uint64(x), C.c_uint64(w), C.c_uint64(y), C.c_uint(rows), C.c_uint(width), C.c_uint(outputs)]
+        if bits is not None:
+            arguments.append(C.c_uint(bits))
+        self.gpu.launch(name, grid, arguments)
         return self.gpu.download(y, rows * outputs * 2)
 
-    def assert_written(self, output):
-        words = struct.unpack(f"<{len(output) // 2}H", output)
-        self.assertNotIn(SENTINEL * 0x101, words)
+    def reference(self, stack, x, w, rows, width, outputs, bits):
+        return self.run_kernel(stack, "euhedral_q45_reference", min(rows * outputs, 65535), x, w, rows, width, outputs, bits)
+
+    def assert_within_one_step(self, expected, actual):
+        words_e = struct.unpack(f"<{len(expected) // 2}H", expected)
+        words_a = struct.unpack(f"<{len(actual) // 2}H", actual)
+        scale = max(abs(bf16_value(w)) for w in words_e) + 1e-6
+        for index, (e, a) in enumerate(zip(words_e, words_a)):
+            near = abs(bf16_value(e) - bf16_value(a)) <= 0.01 * scale
+            self.assertTrue(abs(e - a) <= 1 or near, f"index {index}: {bf16_value(e)} vs {bf16_value(a)}")
+
+    def test_reference_matches_the_cpu_dequantization(self):
+        for bits in (4, 5):
+            for rows, width, outputs in [(1, 128, 8), (2, 256, 5), (3, 192 + 64, 17)]:
+                payload = make_weights(self.rng, bits, width, outputs)
+                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
+                with contextlib.ExitStack() as stack:
+                    x = self.owned(stack, self.gpu.upload(struct.pack(f"<{len(values)}H", *values)))
+                    w = self.owned(stack, self.gpu.upload(payload))
+                    actual = self.reference(stack, x, w, rows, width, outputs, bits)
+                expected = cpu_reference(payload, bits, values, rows, width, outputs)
+                words = struct.unpack(f"<{rows * outputs}H", actual)
+                scale = max(abs(v) for v in expected) + 1e-6
+                for index, (word, value) in enumerate(zip(words, expected)):
+                    with self.subTest(bits=bits, rows=rows, index=index):
+                        self.assertLessEqual(abs(bf16_value(word) - value), 0.01 * scale)
+
+    def test_contiguous_decode_stays_within_one_bf16_step_of_the_reference(self):
+        for bits in (4, 5):
+            for width, outputs in [(1024, 16), (2048, 40), (5120, 104)]:
+                payload = make_weights(self.rng, bits, width, outputs)
+                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(width)]
+                with contextlib.ExitStack() as stack:
+                    x = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values)))
+                    w = self.owned(stack, self.gpu.upload(payload))
+                    actual = self.run_kernel(stack, f"euhedral_q{bits}_decode_contiguous", outputs // 8, x, w, 1, width, outputs)
+                    expected = self.reference(stack, x, w, 1, width, outputs, bits)
+                with self.subTest(bits=bits, width=width, outputs=outputs):
+                    self.assert_within_one_step(expected, actual)
+
+    def test_special_scales_stay_within_one_bf16_step_of_the_reference(self):
+        width, outputs = 1024, 16
+        patterns = [0x0000, 0x8000, 0x0001, 0x03FF, 0x0400, 0x3555, 0xB555, 0x7BFF]
+        for bits in (4, 5):
+            payload = make_weights(self.rng, bits, width, outputs, lambda i: patterns[i % len(patterns)])
+            values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(width)]
+            with contextlib.ExitStack() as stack:
+                x = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values)))
+                w = self.owned(stack, self.gpu.upload(payload))
+                actual = self.run_kernel(stack, f"euhedral_q{bits}_decode_contiguous", outputs // 8, x, w, 1, width, outputs)
+                expected = self.reference(stack, x, w, 1, width, outputs, bits)
+            with self.subTest(bits=bits):
+                self.assert_within_one_step(expected, actual)
 
     def test_contiguous_rows_twins_are_bitwise_one_row_decode(self):
-        """Row-exact speculative verification: each row of euhedral_q{4,5}_decode_contiguous_rowsM is bit
-        for bit the one-row contiguous kernel's output for that row."""
+        """Each row of euhedral_q{4,5}_decode_contiguous_rowsM is bit for bit the one-row contiguous kernel's
+        output for that row."""
         width, outputs = 5120, 104
         for bits in (4, 5):
             with contextlib.ExitStack() as stack:
@@ -109,185 +157,17 @@ class Q45KernelTest(unittest.TestCase):
                                                     xt, w, 1, width, outputs)
                             self.assertEqual(together[t * outputs * 2:(t + 1) * outputs * 2], alone, f"row {t}")
 
-    def routes(self, bits, rows, outputs):
-        decode_tiles = (outputs + 7) // 8
-        prefill_tiles = (outputs + 31) // 32
-        routes = [(f"euhedral_q{bits}_prefill_exact", ((rows + 31) // 32) * prefill_tiles),
-                  (f"euhedral_q{bits}_prefill_64_exact", ((rows + 63) // 64) * prefill_tiles)]
-        for tile in (1, 2, 4):
-            routes.append((f"euhedral_q{bits}_decode_{tile}", ((rows + tile - 1) // tile) * decode_tiles))
-        return routes
-
-    def compare_all_routes(self, bits, rows, width, outputs, payload, values, input_offset=0):
-        gpu = self.gpu
-        with contextlib.ExitStack() as stack:
-            raw = struct.pack(f"<{len(values)}H", *values)
-            x_base = self.owned(stack, gpu.upload(b"\0" * input_offset + raw))
-            x = x_base + input_offset
-            w = self.owned(stack, gpu.upload(payload))
-            decode_ref = self.run_kernel(stack, f"reference_q{bits}_decode",
-                                         rows * ((outputs + 7) // 8), x, w, rows, width, outputs)
-            prefill_ref = self.run_kernel(stack, f"reference_q{bits}_prefill",
-                                          ((rows + 31) // 32) * ((outputs + 31) // 32), x, w, rows, width, outputs)
-            self.assert_written(decode_ref)
-            self.assert_written(prefill_ref)
-            for name, grid in self.routes(bits, rows, outputs):
-                with self.subTest(bits=bits, rows=rows, width=width, outputs=outputs,
-                                  offset=input_offset, kernel=name):
-                    actual = self.run_kernel(stack, name, grid, x, w, rows, width, outputs)
-                    self.assertEqual(actual, decode_ref if "decode" in name else prefill_ref)
-            return decode_ref, prefill_ref
-
-    def test_every_route_matches_the_original_kernels_bitwise(self):
-        cases = [(1, 128, 8), (1, 256, 16), (1, 5120, 16), (1, 128, 1), (2, 128, 9), (3, 256, 17), (4, 384, 33), (5, 128, 40),
-                 (9, 256, 8), (31, 128, 32), (33, 256, 35), (64, 128, 64), (65, 384, 70),
-                 (97, 256, 37), (130, 512, 66)]
-        for bits in (4, 5):
-            for rows, width, outputs in cases:
-                payload = make_weights(self.rng, bits, width, outputs)
-                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
-                self.compare_all_routes(bits, rows, width, outputs, payload, values)
-
-    def test_grouped_projection_pair_matches_separate_launches_bitwise(self):
-        gpu = self.gpu
-        for rows, width, q4_out, q5_out in [(33, 256, 96, 160), (64, 128, 64, 96), (65, 384, 70, 33), (130, 128, 32, 200)]:
-            with self.subTest(rows=rows, width=width, q4=q4_out, q5=q5_out), contextlib.ExitStack() as stack:
-                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
-                x = self.owned(stack, gpu.upload(struct.pack(f"<{len(values)}H", *values)))
-                w4 = self.owned(stack, gpu.upload(make_weights(self.rng, 4, width, q4_out)))
-                w5 = self.owned(stack, gpu.upload(make_weights(self.rng, 5, width, q5_out)))
-                tiles = (rows + 63) // 64
-                ref4 = self.run_kernel(stack, "euhedral_q4_prefill_64_exact", tiles * ((q4_out + 31) // 32), x, w4, rows, width, q4_out)
-                ref5 = self.run_kernel(stack, "euhedral_q5_prefill_64_exact", tiles * ((q5_out + 31) // 32), x, w5, rows, width, q5_out)
-                y4 = self.owned(stack, gpu.zeros(rows * q4_out * 2, fill=SENTINEL))
-                y5 = self.owned(stack, gpu.zeros(rows * q5_out * 2, fill=SENTINEL))
-                grid = tiles * ((q4_out + 31) // 32) + tiles * ((q5_out + 31) // 32)
-                gpu.launch("euhedral_q45_prefill_64_grouped_exact", grid, [
-                    C.c_uint64(x), C.c_uint64(w4), C.c_uint64(y4), C.c_uint64(w5), C.c_uint64(y5),
-                    C.c_uint(rows), C.c_uint(width), C.c_uint(q4_out), C.c_uint(q5_out)])
-                self.assertEqual(gpu.download(y4, rows * q4_out * 2), ref4)
-                self.assertEqual(gpu.download(y5, rows * q5_out * 2), ref5)
-
-    def test_special_values_match_the_original_kernels_bitwise(self):
-        special = [0x3F80, 0xBF00, 0x7FC1, 0xFFC3, 0x7F80, 0xFF80, 0x0001, 0x8000]
-        scales = [0x3555, 0xB555, 0x0001, 0x8000, 0x7BFF, 0x7C00, 0x7E11, 0xFE11]
-        for bits in (4, 5):
-            for rows, width, outputs in [(1, 128, 16), (1, 128, 9), (4, 256, 33), (65, 128, 35)]:
-                payload = make_weights(self.rng, bits, width, outputs, lambda i: scales[i % len(scales)])
-                values = [special[i % len(special)] for i in range(rows * width)]
-                self.compare_all_routes(bits, rows, width, outputs, payload, values)
-
-    def test_wide_decode_matches_the_original_decode_bitwise(self):
-        # One partial chunk (K 512), several chunks (5120), the largest supported row (8192); one and
-        # many CTAs; finite and special scales and activations.
-        special = [0x3F80, 0xBF00, 0x7FC1, 0xFFC3, 0x7F80, 0xFF80, 0x0001, 0x8000]
-        scales = [0x3555, 0xB555, 0x0001, 0x8000, 0x7BFF, 0x7C00, 0x7E11, 0xFE11]
-        for bits in (4, 5):
-            for width, outputs in [(512, 8), (1536, 16), (5120, 4104), (8192, 24)]:
-                for mode in ("finite", "special"):
-                    with self.subTest(bits=bits, width=width, outputs=outputs, mode=mode), contextlib.ExitStack() as stack:
-                        payload = make_weights(self.rng, bits, width, outputs,
-                                               (lambda i: scales[i % len(scales)]) if mode == "special" else None)
-                        values = ([special[i % len(special)] for i in range(width)] if mode == "special"
-                                  else [to_bf16(self.rng.uniform(-2, 2)) for _ in range(width)])
-                        x = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values)))
-                        w = self.owned(stack, self.gpu.upload(payload))
-                        expected = self.run_kernel(stack, f"euhedral_q{bits}_decode_1", outputs // 8, x, w, 1, width, outputs)
-                        actual = self.run_kernel(stack, f"euhedral_q{bits}_decode_wide", outputs // 8, x, w, 1, width, outputs)
-                        self.assert_written(expected)
-                        self.assertEqual(actual, expected)
-
-    def test_contiguous_decode_stays_within_one_bf16_ulp_of_the_exact_decode(self):
-        # Contiguous lane ownership reorders the FP32 accumulation: every finite output stays within
-        # one BF16 ulp of euhedral_q*_decode_1, few differ, and non-finite activations make the same
-        # outputs non-finite.
-        f = lambda bits: struct.unpack('<f', struct.pack('<I', bits << 16))[0]
-        differing = total = 0
-        for bits in (4, 5):
-            for width, outputs in [(1024, 8), (2048, 24), (5120, 4104)]:
-                for mode in ('finite', 'special'):
-                    with contextlib.ExitStack() as stack:
-                        payload = make_weights(self.rng, bits, width, outputs,
-                                               lambda i: self.rng.randrange(0x2000, 0x2c00) | (self.rng.randrange(2) << 15))
-                        values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(width)]
-                        if mode == 'special':
-                            values[self.rng.randrange(width)] = self.rng.choice([0x7F80, 0xFF80, 0x7FC1])
-                        x = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values)))
-                        w = self.owned(stack, self.gpu.upload(payload))
-                        expected = self.run_kernel(stack, f"euhedral_q{bits}_decode_1", outputs // 8, x, w, 1, width, outputs)
-                        actual = self.run_kernel(stack, f"euhedral_q{bits}_decode_contiguous", outputs // 8, x, w, 1, width, outputs)
-                        for e, a in zip(struct.unpack(f"<{outputs}H", expected), struct.unpack(f"<{outputs}H", actual)):
-                            o, c = f(e), f(a)
-                            finite = o == o and abs(o) != float('inf')
-                            self.assertEqual(finite, c == c and abs(c) != float('inf'), (bits, width, mode))
-                            if finite:
-                                total += 1
-                                if e != a:
-                                    differing += 1
-                                    self.assertLessEqual(abs(c - o), abs(o) / 128 + 1e-30, (bits, width, o, c))
-        self.assertLess(differing, max(1, total // 1000), (differing, total))
-
-    def test_two_byte_aligned_input_takes_sequential_staging(self):
-        for bits in (4, 5):
-            for rows, width, outputs in [(1, 256, 16), (67, 256, 35)]:
-                payload = make_weights(self.rng, bits, width, outputs)
-                values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
-                aligned = self.compare_all_routes(bits, rows, width, outputs, payload, values)
-                shifted = self.compare_all_routes(bits, rows, width, outputs, payload, values, input_offset=2)
-                self.assertEqual(aligned, shifted)
-
-    def test_routes_agree_with_independent_cpu_dequantization(self):
-        for bits in (4, 5):
-            rows, width, outputs = 5, 256, 12
-            payload = make_weights(self.rng, bits, width, outputs)
-            values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
-            decode_ref, prefill_ref = self.compare_all_routes(bits, rows, width, outputs, payload, values)
-            expected = cpu_reference(payload, bits, values, rows, width, outputs)
-            for label, output in (("decode", decode_ref), ("prefill", prefill_ref)):
-                got = [bf16_value(v) for v in struct.unpack(f"<{rows * outputs}H", output)]
-                for i, (want, actual) in enumerate(zip(expected, got)):
-                    with self.subTest(bits=bits, route=label, index=i):
-                        self.assertLessEqual(abs(actual - want), 1e-2 * max(1.0, abs(want)))
-
-
-@unittest.skipIf(NVRTC is None, f"CUDA probes unavailable: {SKIP_REASON}")
-class ScalarQuantizedKernelTest(unittest.TestCase):
-    """The scalar fallback strides over outputs when the grid is capped."""
-
     def test_capped_grid_matches_one_block_per_output_bitwise(self):
-        rng = random.Random(0x5CA1)
-        gpu = Gpu((HERE.parent / "src/linear/kernels.cu").read_bytes())
-        try:
-            for bits in (4, 5):
-                rows, width, outputs = 7, 256, 37
-                payload = make_weights(rng, bits, width, outputs)
-                values = [to_bf16(rng.uniform(-2, 2)) for _ in range(rows * width)]
-                x = gpu.upload(struct.pack(f"<{len(values)}H", *values))
-                w_base = gpu.upload(b"\0\0" + payload)
-                results = {}
-                try:
-                    for grid in (rows * outputs, 5, 1):
-                        y = gpu.zeros(rows * outputs * 2, fill=SENTINEL)
-                        try:
-                            gpu.launch("euhedral_linear_quantized_bf16", grid,
-                                       [C.c_uint64(x), C.c_uint64(w_base + 2), C.c_uint64(y), C.c_uint(rows),
-                                        C.c_uint(width), C.c_uint(outputs), C.c_uint(bits)])
-                            results[grid] = gpu.download(y, rows * outputs * 2)
-                        finally:
-                            gpu.free(y)
-                finally:
-                    gpu.free(w_base)
-                    gpu.free(x)
-                full = results[rows * outputs]
-                self.assertNotIn(SENTINEL * 0x101, struct.unpack(f"<{rows * outputs}H", full))
-                self.assertEqual(results[5], full)
-                self.assertEqual(results[1], full)
-                expected = cpu_reference(payload, bits, values, rows, width, outputs)
-                got = [bf16_value(v) for v in struct.unpack(f"<{rows * outputs}H", full)]
-                for want, actual in zip(expected, got):
-                    self.assertLessEqual(abs(actual - want), 1e-2 * max(1.0, abs(want)))
-        finally:
-            gpu.close()
+        """The reference strides over outputs, so a grid smaller than rows * outputs gives the same bits."""
+        bits, rows, width, outputs = 5, 3, 256, 37
+        payload = make_weights(self.rng, bits, width, outputs)
+        values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(rows * width)]
+        with contextlib.ExitStack() as stack:
+            x = self.owned(stack, self.gpu.upload(struct.pack(f"<{len(values)}H", *values)))
+            w = self.owned(stack, self.gpu.upload(payload))
+            full = self.run_kernel(stack, "euhedral_q45_reference", rows * outputs, x, w, rows, width, outputs, bits)
+            capped = self.run_kernel(stack, "euhedral_q45_reference", 7, x, w, rows, width, outputs, bits)
+        self.assertEqual(full, capped)
 
 
 if __name__ == "__main__":

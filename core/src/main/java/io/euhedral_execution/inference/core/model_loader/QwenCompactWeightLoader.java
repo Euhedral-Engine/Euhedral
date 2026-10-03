@@ -30,16 +30,9 @@ import java.util.Set;
 /// source projections at load time.
 final class QwenCompactWeightLoader {
 
-    private static final int EXPECTED_OBJECT_COUNT = 1_118;
-    private static final int EXPECTED_VISION_OBJECT_COUNT = 333;
+    private static final int EXPECTED_OBJECT_COUNT = 785;
 
     private QwenCompactWeightLoader() {}
-
-    static QwenWeights load(
-            Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, Map<String, TensorDescriptor> descriptors)
-            throws IOException {
-        return load(artifactPath, artifact, gpuMemory, descriptors, false, Set.of());
-    }
 
     static QwenWeights load(
             Path artifactPath,
@@ -92,10 +85,9 @@ final class QwenCompactWeightLoader {
         }
     }
 
-    /// Whether a load places the named object on the device: never the vision tower, and the MTP layer
-    /// and draft head only for speculative decoding.
+    /// Whether a load places the named object on the device: the MTP layer and draft head only for
+    /// speculative decoding.
     static boolean uploads(String name, boolean speculative) {
-        if (name.startsWith("vision/")) return false;
         return speculative || !(name.startsWith("mtp/") || name.startsWith("text/draft_head"));
     }
 
@@ -207,16 +199,12 @@ final class QwenCompactWeightLoader {
     private static final String MTP_ATTENTION = "mtp/layer/attention/query_key_gate_value";
 
     /// The MTP layer packs its attention projection as the base layers' query/key rows (q, k) followed by
-    /// their gate/value rows (gate, v) (tools/convert_qwen_safetensors_to_compact_edrl.py). An NVFP4
-    /// pack is split here into those two tensors, each with its rows' codes and scales and the shared
-    /// global scale, so the MTP layer executes as an ordinary attention layer (docs/MTP_CONTRACT.md §1).
+    /// their gate/value rows (gate, v) (tools/euhedral_artifacts). The NVFP4 pack is split here into those two
+    /// tensors, each with its rows' codes and scales and the shared global scale, so the MTP layer executes as an
+    /// ordinary attention layer (docs/MTP_CONTRACT.md §1).
     private static void splitMtpAttention(Map<String, TensorHandle> handles, GpuMemory gpu) {
         TensorHandle packed = handles.get(MTP_ATTENTION);
         if (packed == null || packed.hostBacked()) return;
-        if (packed.format() == WeightFormat.W8_G32_FP16) {
-            requantizeW8MtpAttention(handles, packed, gpu);
-            return;
-        }
         if (packed.format() != WeightFormat.NVFP4) return;
         long rows = packed.shape()[0], k = packed.shape()[1];
         long half = rows / 2;
@@ -225,74 +213,6 @@ final class QwenCompactWeightLoader {
                 "mtp/layer/attention/gate_value", nvfp4Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
         handles.remove(MTP_ATTENTION);
         gpu.free(packed.deviceAddress());
-    }
-
-    /// The compact Q3 artifact stores the MTP attention pack as W8G32 (int8 codes [rows][K], then FP16
-    /// scales [rows][K/32] at a 256-aligned offset), for which no linear kernel exists. Each half is
-    /// dequantized and re-quantized to NVFP4 (Nvfp4WeightQuantizer). This affects drafts only: verification
-    /// by the base model decides every output token.
-    private static void requantizeW8MtpAttention(
-            Map<String, TensorHandle> handles, TensorHandle packed, GpuMemory gpu) {
-        int rows = Math.toIntExact(packed.shape()[0]), k = Math.toIntExact(packed.shape()[1]);
-        int padded = (k + 127) / 128 * 128, groups = padded / 32;
-        long scales = align256((long) rows * padded);
-        float[] values = new float[rows * k];
-        try (var arena = java.lang.foreign.Arena.ofConfined()) {
-            var host = arena.allocate(packed.byteSize(), 16);
-            gpu.copyDeviceToHost(host, packed.deviceAddress(), packed.byteSize());
-            for (int row = 0; row < rows; row++) {
-                for (int col = 0; col < k; col++) {
-                    byte code = host.get(java.lang.foreign.ValueLayout.JAVA_BYTE, (long) row * padded + col);
-                    short half = host.get(
-                            java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED,
-                            scales + ((long) row * groups + col / 32) * 2);
-                    values[row * k + col] = code * Float.float16ToFloat(half);
-                }
-            }
-        }
-        int half = rows / 2;
-        handles.put(
-                "mtp/layer/attention/query_key",
-                uploadNvfp4(
-                        java.util.Arrays.copyOfRange(values, 0, half * k),
-                        half,
-                        k,
-                        "mtp/layer/attention/query_key",
-                        packed,
-                        gpu));
-        handles.put(
-                "mtp/layer/attention/gate_value",
-                uploadNvfp4(
-                        java.util.Arrays.copyOfRange(values, half * k, rows * k),
-                        half,
-                        k,
-                        "mtp/layer/attention/gate_value",
-                        packed,
-                        gpu));
-        handles.remove(MTP_ATTENTION);
-        gpu.free(packed.deviceAddress());
-    }
-
-    private static TensorHandle uploadNvfp4(
-            float[] values, int rows, int k, String name, TensorHandle source, GpuMemory gpu) {
-        byte[] payload = Nvfp4WeightQuantizer.quantize(values, rows, k);
-        long address = gpu.allocate(payload.length);
-        try (var arena = java.lang.foreign.Arena.ofConfined()) {
-            var host = arena.allocate(payload.length, 16);
-            host.copyFrom(java.lang.foreign.MemorySegment.ofArray(payload));
-            gpu.copyHostToDevice(address, host, payload.length);
-        } catch (RuntimeException | Error failure) {
-            gpu.free(address);
-            throw failure;
-        }
-        return new TensorHandle(
-                name,
-                new long[] {rows, k},
-                source.dataType(),
-                WeightFormat.NVFP4,
-                WeightLayout.ROW_SPLIT_K128_V1,
-                address,
-                payload.length);
     }
 
     private static TensorHandle nvfp4Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
@@ -315,10 +235,6 @@ final class QwenCompactWeightLoader {
         }
         return new TensorHandle(
                 name, new long[] {rows, k}, source.dataType(), WeightFormat.NVFP4, source.layout(), address, bytes);
-    }
-
-    private static long align256(long value) {
-        return (value + 255) & ~255L;
     }
 
     private static QwenMtpWeights buildMtp(Map<String, TensorHandle> handles) throws QwenWeightLoadException {
@@ -362,15 +278,12 @@ final class QwenCompactWeightLoader {
                 take(handles, "mtp/final_norm"));
     }
 
-    /// The text inventory is required. The vision tower is optional as a whole: the NVFP4 profile omits
-    /// it, the compact Q3 profile carries all of it.
+    /// The text inventory: every object, and no other.
     static void validateInventory(QwenConfig config, Map<String, TensorDescriptor> descriptors)
             throws QwenWeightLoadException {
-        int textObjects = EXPECTED_OBJECT_COUNT - EXPECTED_VISION_OBJECT_COUNT;
-        if (descriptors.size() != EXPECTED_OBJECT_COUNT && descriptors.size() != textObjects) {
+        if (descriptors.size() != EXPECTED_OBJECT_COUNT) {
             throw new QwenWeightLoadException("compact Qwen artifact must contain " + EXPECTED_OBJECT_COUNT
-                    + " runtime objects, or " + textObjects + " without the vision tower, found "
-                    + descriptors.size());
+                    + " runtime objects, found " + descriptors.size());
         }
         Set<String> expected = new LinkedHashSet<>();
         expected.add("text/token_embedding");
@@ -423,33 +336,9 @@ final class QwenCompactWeightLoader {
             }
             validateExpectedDescriptor(descriptor);
         }
-        int visionCount = 0;
-        Set<String> visionNames = new LinkedHashSet<>();
         for (String name : descriptors.keySet()) {
-            if (name.startsWith("vision/")) {
-                visionCount++;
-                visionNames.add(name);
-            } else if (!expected.contains(name)) {
+            if (!expected.contains(name))
                 throw new QwenWeightLoadException("compact artifact contains unknown runtime object '" + name + "'");
-            }
-        }
-        if (visionCount == 0) return;
-        if (visionCount != EXPECTED_VISION_OBJECT_COUNT) {
-            throw new QwenWeightLoadException("compact artifact must contain " + EXPECTED_VISION_OBJECT_COUNT
-                    + " vision runtime objects, found " + visionCount);
-        }
-        Set<String> expectedVisionNames = expectedVisionNames();
-        if (!visionNames.equals(expectedVisionNames)) {
-            Set<String> missing = new LinkedHashSet<>(expectedVisionNames);
-            missing.removeAll(visionNames);
-            Set<String> unexpected = new LinkedHashSet<>(visionNames);
-            unexpected.removeAll(expectedVisionNames);
-            throw new QwenWeightLoadException("compact vision inventory differs from the registered reference; missing="
-                    + missing.stream().findFirst().orElse("none")
-                    + ", unexpected=" + unexpected.stream().findFirst().orElse("none"));
-        }
-        for (String name : visionNames) {
-            validateExpectedDescriptor(descriptors.get(name));
         }
     }
 
@@ -461,8 +350,6 @@ final class QwenCompactWeightLoader {
         boolean quantized = descriptor.format() == WeightFormat.Q3_G64_FP16
                 || descriptor.format() == WeightFormat.Q4_G64_FP16
                 || descriptor.format() == WeightFormat.Q5_G64_FP16
-                || descriptor.format() == WeightFormat.Q6_G64_FP16
-                || descriptor.format() == WeightFormat.W8_G32_FP16
                 || descriptor.format() == WeightFormat.NVFP4;
         boolean p2e2 = descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
                 && descriptor.format() == WeightFormat.Q3_G64_FP16;
@@ -489,61 +376,6 @@ final class QwenCompactWeightLoader {
     }
 
     static Expected expectedDescriptor(String name) {
-        if (name.equals("vision/patch_embedding")) {
-            return quantized(new long[] {1152, 1536}, TensorDataType.BF16, WeightFormat.Q6_G64_FP16);
-        }
-        if (name.equals("vision/patch_embedding_bias")) {
-            return direct(new long[] {1152}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.equals("vision/position_embedding")) {
-            return direct(new long[] {2304, 1152}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/attention/qkv")) {
-            return quantized(new long[] {3456, 1152}, TensorDataType.BF16, WeightFormat.Q4_G64_FP16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/attention/qkv_bias")) {
-            return direct(new long[] {3456}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/attention/output")) {
-            return quantized(new long[] {1152, 1152}, TensorDataType.BF16, WeightFormat.Q5_G64_FP16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/attention/output_bias")) {
-            return direct(new long[] {1152}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/mlp/fc1")) {
-            return quantized(new long[] {4304, 1152}, TensorDataType.BF16, WeightFormat.Q4_G64_FP16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/mlp/fc1_bias")) {
-            return direct(new long[] {4304}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/mlp/fc2")) {
-            return quantized(new long[] {1152, 4304}, TensorDataType.BF16, WeightFormat.Q5_G64_FP16);
-        }
-        if (name.startsWith("vision/layers/") && name.endsWith("/mlp/fc2_bias")) {
-            return direct(new long[] {1152}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.startsWith("vision/layers/")
-                && (name.endsWith("/norm1/weight")
-                        || name.endsWith("/norm1/bias")
-                        || name.endsWith("/norm2/weight")
-                        || name.endsWith("/norm2/bias"))) {
-            return direct(new long[] {1152}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.equals("vision/merger/fc1")) {
-            return quantized(new long[] {4608, 4608}, TensorDataType.BF16, WeightFormat.W8_G32_FP16);
-        }
-        if (name.equals("vision/merger/fc1_bias")) {
-            return direct(new long[] {4608}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.equals("vision/merger/fc2")) {
-            return quantized(new long[] {5120, 4608}, TensorDataType.BF16, WeightFormat.W8_G32_FP16);
-        }
-        if (name.equals("vision/merger/fc2_bias")) {
-            return direct(new long[] {5120}, TensorDataType.BF16, WeightFormat.BF16);
-        }
-        if (name.equals("vision/merger/norm/weight") || name.equals("vision/merger/norm/bias")) {
-            return direct(new long[] {1152}, TensorDataType.BF16, WeightFormat.BF16);
-        }
         if (name.equals("text/token_embedding") || name.equals("text/output_head")) {
             return q3(new long[] {248320, 5120});
         }
@@ -568,7 +400,7 @@ final class QwenCompactWeightLoader {
             return direct(new long[] {5120}, TensorDataType.BF16, WeightFormat.BF16);
         }
         if (name.equals("mtp/layer/attention/query_key_gate_value")) {
-            return quantized(new long[] {14336, 5120}, TensorDataType.BF16, WeightFormat.W8_G32_FP16);
+            return quantized(new long[] {14336, 5120}, TensorDataType.BF16, WeightFormat.Q4_G64_FP16);
         }
         if (name.equals("mtp/layer/attention/query_norm") || name.equals("mtp/layer/attention/key_norm")) {
             return direct(new long[] {256}, TensorDataType.BF16, WeightFormat.BF16);
@@ -628,35 +460,6 @@ final class QwenCompactWeightLoader {
             return q3(new long[] {5120, 6144});
         }
         return null;
-    }
-
-    private static Set<String> expectedVisionNames() {
-        Set<String> names = new LinkedHashSet<>();
-        names.add("vision/patch_embedding");
-        names.add("vision/patch_embedding_bias");
-        names.add("vision/position_embedding");
-        for (int layer = 0; layer < 27; layer++) {
-            String prefix = "vision/layers/" + layer + "/";
-            names.add(prefix + "attention/qkv");
-            names.add(prefix + "attention/qkv_bias");
-            names.add(prefix + "attention/output");
-            names.add(prefix + "attention/output_bias");
-            names.add(prefix + "mlp/fc1");
-            names.add(prefix + "mlp/fc1_bias");
-            names.add(prefix + "mlp/fc2");
-            names.add(prefix + "mlp/fc2_bias");
-            names.add(prefix + "norm1/weight");
-            names.add(prefix + "norm1/bias");
-            names.add(prefix + "norm2/weight");
-            names.add(prefix + "norm2/bias");
-        }
-        names.add("vision/merger/fc1");
-        names.add("vision/merger/fc1_bias");
-        names.add("vision/merger/fc2");
-        names.add("vision/merger/fc2_bias");
-        names.add("vision/merger/norm/weight");
-        names.add("vision/merger/norm/bias");
-        return names;
     }
 
     private static Expected q3(long[] shape) {

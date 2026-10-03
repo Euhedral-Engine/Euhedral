@@ -5,7 +5,7 @@ import random
 import struct
 import unittest
 
-from test_q3_primitives import Gpu, NVRTC, SKIP_REASON
+from gpu_harness import Gpu, NVRTC, SKIP_REASON
 
 NEG_INF, POS_INF, NAN, NEG_ZERO = 0xFF80, 0x7F80, 0x7FC1, 0x8000
 

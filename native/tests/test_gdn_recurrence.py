@@ -6,7 +6,7 @@ import struct
 import unittest
 from pathlib import Path
 
-from test_q3_primitives import Gpu, NVRTC, _check
+from gpu_harness import Gpu, NVRTC, _check
 
 ROOT = Path(__file__).resolve().parents[2]
 PRODUCT = ROOT / 'build/native/linux-x64/share/euhedral_cuda'
@@ -133,8 +133,8 @@ class GdnRecurrenceTest(unittest.TestCase):
                     for output in actual[:-1]:
                         self.assertNotIn(b'\xa5\xa5', [output[i:i + 2] for i in range(0, len(output), 2)])
 
-    def test_column_owned_recurrences_stay_close_to_the_exact_kernel(self):
-        # The relaxed kernels reorder each key reduction and normalize the reduced dot products; over two
+    def test_column_owned_recurrence_stays_close_to_the_exact_kernel(self):
+        # The relaxed kernel reorders each key reduction and normalize the reduced dot products; over two
         # chunks the outputs and the carried state stay within FP32 reassociation error of the exact path.
         rng = random.Random(11)
         initial = struct.pack(f'<{STATE_BYTES // 4}f', *[rng.gauss(0.0, 0.05) for _ in range(STATE_BYTES // 4)])
@@ -149,7 +149,7 @@ class GdnRecurrenceTest(unittest.TestCase):
         for rows in (1, 3, 17):
             chunks = [chunk(rows, 300 + rows, False), chunk(rows, 400 + rows, False)]
             expected = self.run_chunks('euhedral_gdn_recurrence_bf16', initial, chunks, rows)
-            for kernel in ('euhedral_gdn_recurrence_c8_bf16', 'euhedral_gdn_recurrence_c4_bf16'):
+            for kernel in ('euhedral_gdn_recurrence_c8_bf16',):
                 with self.subTest(rows=rows, kernel=kernel):
                     actual = self.run_chunks(kernel, initial, chunks, rows)
                     for e, a in zip(expected[:-1], actual[:-1]):
