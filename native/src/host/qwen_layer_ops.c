@@ -1,4 +1,5 @@
 #include "cuda_kernel_loader.h"
+#include "submission.h"
 #include "euhedral_cuda.h"
 #include <cuda_runtime_api.h>
 #include <math.h>
@@ -425,7 +426,7 @@ int euhedral_cuda_zero_device_memory(void* device_address, uint64_t byte_size) {
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     cudaStream_t stream = euhedral_cuda_submission_stream();
     if (stream != NULL) {
-        cudaError_t result = cudaMemsetAsync(device_address, 0, (size_t)byte_size, stream);
+        cudaError_t result = euhedral_submit_memset(device_address, 0, (size_t)byte_size, stream);
         return result == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)result;
     }
     cudaError_t result = cudaMemset(device_address, 0, (size_t)byte_size);

@@ -8,11 +8,16 @@ EXPORTS
     cudaFree
     cudaFreeHost
     cudaGetDevice
-    cudaMalloc
+    cudaGraphDestroy
+    cudaGraphExecDestroy
+    cudaGraphGetNodes
+    cudaGraphInstantiate
+    cudaGraphLaunch
     cudaHostAlloc
     cudaHostGetDevicePointer
     cudaHostRegister
     cudaHostUnregister
+    cudaMalloc
     cudaMemGetInfo
     cudaMemcpy
     cudaMemcpy2D
@@ -20,9 +25,11 @@ EXPORTS
     cudaMemcpyAsync
     cudaMemset
     cudaMemsetAsync
-    cudaStreamAddCallback
     cudaSetDevice
+    cudaStreamAddCallback
+    cudaStreamBeginCapture
     cudaStreamCreateWithFlags
     cudaStreamDestroy
+    cudaStreamEndCapture
     cudaStreamSynchronize
     cudaStreamWaitEvent

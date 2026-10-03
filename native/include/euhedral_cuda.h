@@ -328,6 +328,24 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_record(uint64_t event, u
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_wait_event(uint64_t stream, uint64_t event);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_query(uint64_t event);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_destroy(uint64_t event);
+/// Captured quanta (CUDA graphs). The calling thread's submissions are recorded, checked, or ordinary
+/// (src/host/submission.h). Recording submits to the selected stream and again to `shadow`, a stream under
+/// capture; `overlap` lets the shadow's registered kernels use programmatic dependent launch. Checking only
+/// hashes each submission; its selected stream is the thread's sink (`check_begin`), which `check_end`
+/// verifies captured nothing. `finish` returns the hash of the submissions since `record` or `check`
+/// (never 0), or 0 when the shadow submission failed.
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_submission_record(uint64_t shadow, int overlap);
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_submission_check(void);
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_submission_finish(void);
+/// Ends the calling thread's recording: the quantum did something its graph could not repeat.
+EUHEDRAL_CUDA_EXPORT void euhedral_cuda_submission_mark_unrecordable(void);
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_submission_check_begin(void);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_submission_check_end(void);
+/// Graph capture on `stream`: `capture_end` always ends the capture, and instantiates it into `*exec`.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_graph_capture_begin(uint64_t stream);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_graph_capture_end(uint64_t stream, uint64_t* exec);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_graph_launch(uint64_t exec, uint64_t stream);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_graph_destroy(uint64_t exec);
 /// Schedules a notification after preceding stream work and the recorded event.
 /// The callback must not call CUDA APIs or finalize frames.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_notify(

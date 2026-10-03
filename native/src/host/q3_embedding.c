@@ -148,7 +148,7 @@ int euhedral_cuda_embed_q3(
         &scale_offset_argument,
     };
 
-    CUresult status = cuLaunchKernel(
+    CUresult status = euhedral_launch_kernel(
             q3_embedding_function,
             (unsigned int) grid_size,
             1,
@@ -202,7 +202,7 @@ int euhedral_cuda_embed_q3_p2e2(
     void* kernel_parameters[] = {
         &token_ids, &weights, &output, &token_count_argument, &vocabulary_size_argument, &hidden_size_argument,
     };
-    CUresult status = cuLaunchKernel(q3_p2e2_embedding_function, (unsigned int) grid_size, 1, 1, 128, 1, 1, 0,
+    CUresult status = euhedral_launch_kernel(q3_p2e2_embedding_function, (unsigned int) grid_size, 1, 1, 128, 1, 1, 0,
             euhedral_cuda_submission_stream(), kernel_parameters, NULL);
     return status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : (int) status;
 }
