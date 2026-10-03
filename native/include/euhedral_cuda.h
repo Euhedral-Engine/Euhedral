@@ -154,6 +154,24 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
 
+/* Q3 prefill on block-scaled FP8 tensor cores (docs/PREFILL_MX.md): quantizes the BF16 input rows into two E4M3
+ * terms and a power-of-two block scale in `scratch` (euhedral_cuda_q3_mx_scratch_bytes, 256-aligned) and multiplies
+ * with the Q3 codes (exact in E4M3) at the full FP8 MMA rate, FP32 accumulation, FP16 group scales applied in
+ * FP32. Returns EUHEDRAL_CUDA_ROUTE_UNAVAILABLE off sm_12x, when EUHEDRAL_Q3_MX=0, under exact numerics or
+ * row-exact execution, for unaligned operands, and when in_features or the weight rows are not a multiple of 128;
+ * the BF16 kernels then run. The BF16 activations are represented exactly (down to 2^-9 of a 32-block's maximum),
+ * so the results differ from the BF16 route only by its rounding of code * scale to BF16. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_available(void);
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_q3_mx_scratch_bytes(uint32_t rows, uint32_t width);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_mx_bf16(
+        const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
+        uint64_t scratch_byte_size);
+/* The paired gate/up region: `outputs` weight rows (gate first), outputs / 2 SwiGLU values per row. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_gate_up_swiglu_bf16(
+        const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
+
 /* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/COMPRESSED_Q3.md): the same Q3G64_F16S values in
  * a smaller, entropy-coded layout. The decode route runs one row with relaxed numerics on the shapes
  * of euhedral_cuda_linear_q3_decode_bf16's contiguous kernel, bitwise identical to it, and returns

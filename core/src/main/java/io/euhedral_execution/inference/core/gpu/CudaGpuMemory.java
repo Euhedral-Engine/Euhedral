@@ -124,6 +124,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle nvfp4ActivationBytes;
     private final MethodHandle linearNvfp4NativeBf16;
     private final MethodHandle nvfp4NativeGateUpSwiGluBf16;
+    private final MethodHandle q3MxAvailable;
+    private final MethodHandle q3MxScratchBytes;
+    private final MethodHandle linearQ3MxBf16;
+    private final MethodHandle q3MxGateUpSwiGluBf16;
+    /// Whether the Q3 block-scaled FP8 prefill module loaded (null until first asked).
+    private volatile Boolean q3Mx;
     /// Whether the native Blackwell NVFP4 module loaded (null until first asked).
     private volatile Boolean nvfp4Native;
     /// The stream whose launches the current thread is submitting, or null for synchronous calls.
@@ -232,6 +238,31 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                                     ValueLayout.JAVA_INT,
                                     ValueLayout.JAVA_LONG,
                                     ValueLayout.JAVA_LONG)))
+                    .orElse(null);
+            this.q3MxAvailable = symbols.find("euhedral_cuda_q3_mx_available")
+                    .map(symbol -> linker.downcallHandle(symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            this.q3MxScratchBytes = symbols.find("euhedral_cuda_q3_mx_scratch_bytes")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
+                    .orElse(null);
+            FunctionDescriptor q3MxDescriptor = FunctionDescriptor.of(
+                    ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_LONG);
+            this.linearQ3MxBf16 = symbols.find("euhedral_cuda_linear_q3_mx_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, q3MxDescriptor))
+                    .orElse(null);
+            this.q3MxGateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_mx_gate_up_swiglu_bf16")
+                    .map(symbol -> linker.downcallHandle(symbol, q3MxDescriptor))
                     .orElse(null);
             this.copyDeviceToDevice2d = symbols.find("euhedral_cuda_copy_device_to_device_2d")
                     .map(symbol -> linker.downcallHandle(
@@ -1054,10 +1085,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || inFeatures <= 0 || outFeatures <= 0 || weightsByteSize <= 0) {
             throw new IllegalArgumentException("Q3 linear dimensions and payload size must be positive");
         }
+        Q3DispatchMode resolved = Objects.requireNonNull(mode, "mode").select(rows, this.q3SmallRowThreshold);
+        if (resolved == Q3DispatchMode.PREFILL
+                && invokeQ3Mx(
+                        "Q3 FP8 linear",
+                        this.linearQ3MxBf16,
+                        inputAddress,
+                        weightsAddress,
+                        outputAddress,
+                        rows,
+                        inFeatures,
+                        outFeatures,
+                        weightsByteSize)) return;
         int status;
         try {
             MethodHandle kernel =
-                    switch (Objects.requireNonNull(mode, "mode").select(rows, this.q3SmallRowThreshold)) {
+                    switch (resolved) {
                         case SCALAR -> this.linearQ3Bf16;
                         case DECODE -> this.linearQ3DecodeBf16;
                         case PREFILL -> this.linearQ3PrefillBf16;
@@ -1458,6 +1501,78 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     static final int NVFP4_NATIVE_MIN_ROWS = 2;
     /// The paired gate/up region exists only in region views, from 64 rows.
     static final int NVFP4_NATIVE_REGION_MIN_ROWS = 64;
+
+    /// Rows from which a Q3 prefill linear runs on the block-scaled FP8 route (docs/PREFILL_MX.md): below one 128-row
+    /// tile the BF16 tile kernels waste less.
+    static final int Q3_MX_MIN_ROWS = Integer.getInteger("euhedral.q3mx.minRows", 128);
+
+    /// Whether the Q3 block-scaled FP8 prefill kernels are available on this device (sm_12x, not disabled by
+    /// EUHEDRAL_Q3_MX=0).
+    public boolean q3MxAvailable() {
+        Boolean available = this.q3Mx;
+        if (available == null) {
+            ensureOpen();
+            try {
+                available = this.q3MxAvailable != null
+                        && this.q3MxScratchBytes != null
+                        && this.linearQ3MxBf16 != null
+                        && this.q3MxGateUpSwiGluBf16 != null
+                        && (int) this.q3MxAvailable.invokeExact() != 0;
+            } catch (Throwable failure) {
+                throw new GpuMemoryException("Q3 FP8 prefill availability invocation failed", failure);
+            }
+            this.q3Mx = available;
+        }
+        return available;
+    }
+
+    /// Runs `kernel` (a Q3 FP8 prefill route) with its quantized-activation scratch. False when the route
+    /// declined (exact numerics, odd shapes), in which case nothing ran.
+    private boolean invokeQ3Mx(
+            String operation,
+            MethodHandle kernel,
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes) {
+        // Inside a P2E2 expansion the shared scratch holds the expanded weights; this route needs it for activations.
+        if (rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || q3ScratchLock.isHeldByCurrentThread() || !q3MxAvailable())
+            return false;
+        if (width % 128 != 0 || outputs % 128 != 0) return false;
+        ensureOpen();
+        requireAddresses(input, weights, output);
+        long scratchBytes;
+        try {
+            scratchBytes = (long) this.q3MxScratchBytes.invokeExact(rows, width);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("Q3 FP8 scratch size invocation failed", failure);
+        }
+        boolean[] ran = {false};
+        withQ3Scratch(scratchBytes, scratch -> {
+            int status;
+            try {
+                status = (int) kernel.invokeExact(
+                        MemorySegment.ofAddress(input),
+                        MemorySegment.ofAddress(weights),
+                        MemorySegment.ofAddress(output),
+                        MemorySegment.ofAddress(scratch),
+                        rows,
+                        width,
+                        outputs,
+                        weightBytes,
+                        scratchBytes);
+            } catch (Throwable throwable) {
+                throw new GpuMemoryException(operation + " invocation failed", throwable);
+            }
+            if (status == ROUTE_UNAVAILABLE) return;
+            if (status != 0) throw new GpuMemoryException(q3Operation(operation, status), status);
+            ran[0] = true;
+        });
+        return ran[0];
+    }
 
     /// Whether the native Blackwell NVFP4 kernels are loaded: an sm_12x device, and not disabled with
     /// EUHEDRAL_NVFP4_NATIVE=0.
@@ -1873,6 +1988,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
             throw new IllegalArgumentException("invalid Q3 FFN down dimensions");
+        if (invokeQ3Mx(
+                "Q3 FP8 FFN down", this.linearQ3MxBf16, input, weights, output, rows, width, outputs, weightBytes))
+            return;
         invokeLayer(
                 "Q3 FFN down",
                 q3FfnDownBf16,
@@ -1931,6 +2049,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (rows <= 0 || width <= 0 || outputs <= 0 || weightBytes <= 0)
             throw new IllegalArgumentException("invalid Q3 FFN down dimensions");
+        if (invokeQ3Mx(
+                "Q3 FP8 FFN down", this.linearQ3MxBf16, input, weights, output, rows, width, outputs, weightBytes))
+            return;
         invokeLayer(
                 "Q3 split-K FFN down",
                 q3FfnDownSplitBf16,
@@ -1952,6 +2073,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || width <= 0 || width % 128 != 0 || outputs <= 0 || outputs % 32 != 0 || weightBytes <= 0)
             throw new IllegalArgumentException("invalid Q3 gate/up region dimensions");
         if (q3GateUpSwiGluBf16 == null) throw new UnsupportedOperationException("native Q3 gate/up region unavailable");
+        if (invokeQ3Mx(
+                "Q3 FP8 gate/up SwiGLU region",
+                this.q3MxGateUpSwiGluBf16,
+                input,
+                weights,
+                output,
+                rows,
+                width,
+                outputs,
+                weightBytes)) return;
         invokeLayer(
                 "Q3 gate/up SwiGLU region",
                 q3GateUpSwiGluBf16,
