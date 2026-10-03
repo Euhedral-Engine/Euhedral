@@ -257,6 +257,7 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         config.attentionHeadDim(),
                         rotaryDim,
                         context.startPosition(),
+                        context.workspace().positionAddress(),
                         (float) config.rmsNormEpsilon(),
                         config.ropeTheta());
     }
@@ -277,7 +278,8 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         context.inputTokenCount(),
                         queryWidth,
                         keyValueWidth,
-                        context.startPosition());
+                        context.startPosition(),
+                        context.workspace().positionAddress());
         state.appendSubmitted(context.inputTokenCount());
     }
 
@@ -320,6 +322,7 @@ public final class QwenGpuOperationFrame extends QwenStageFrame {
                         // readable here but not committed until the quantum retires.
                         state.submittedLength(),
                         context.startPosition(),
+                        context.workspace().positionAddress(),
                         context.inputTokenCount() == 1
                                         || context.kind() == QwenExecutionContext.ExecutionKind.VERIFY
                                         || draftRowTwins(context)

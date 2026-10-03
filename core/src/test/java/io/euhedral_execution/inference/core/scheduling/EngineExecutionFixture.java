@@ -134,8 +134,10 @@ public final class EngineExecutionFixture {
                 int tokenCount,
                 int vocabularySize,
                 int hiddenSize) {
-            int[] tokenIds = this.uploadedTokenIds.get(tokenIdsAddress);
-            if (tokenIds == null) throw new IllegalStateException("embedding did not receive uploaded token IDs");
+            int[] record = this.uploadedTokenIds.get(tokenIdsAddress);
+            if (record == null) throw new IllegalStateException("embedding did not receive uploaded token IDs");
+            // The input record carries the token IDs, then the start position.
+            int[] tokenIds = java.util.Arrays.copyOf(record, tokenCount);
             this.embeddingInputs.add(tokenIds.clone());
             this.embeddingAddresses.add(embeddingAddress);
             this.lastTokenCount = tokenCount;
@@ -254,6 +256,7 @@ public final class EngineExecutionFixture {
                 int headDim,
                 int rotaryDim,
                 long startPosition,
+                long positionAddress,
                 float epsilon,
                 double ropeTheta) {
             this.attentionStartPositions.add(startPosition);
@@ -268,7 +271,8 @@ public final class EngineExecutionFixture {
                 int rows,
                 int queryWidth,
                 int keyValueWidth,
-                long startPosition) {
+                long startPosition,
+                long positionAddress) {
             this.keyCacheAddresses.add(keyCacheAddress);
         }
 
@@ -285,6 +289,7 @@ public final class EngineExecutionFixture {
                 int headDim,
                 int cacheLength,
                 long startPosition,
+                long positionAddress,
                 long scratchAddress) {}
     }
 }

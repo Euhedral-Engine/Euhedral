@@ -2129,10 +2129,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int headDim,
             int rotaryDim,
             long startPosition,
+            long positionAddress,
             float epsilon,
             double ropeTheta) {
         ensureOpen();
-        requireAddresses(queryKeyAddress, queryNormAddress, keyNormAddress, outputAddress);
+        requireAddresses(queryKeyAddress, queryNormAddress, keyNormAddress, outputAddress, positionAddress);
         if (rows <= 0
                 || queryHeads <= 0
                 || keyValueHeads <= 0
@@ -2161,6 +2162,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 headDim,
                 rotaryDim,
                 startPosition,
+                MemorySegment.ofAddress(positionAddress),
                 epsilon,
                 ropeTheta);
     }
@@ -2174,9 +2176,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int rows,
             int queryWidth,
             int keyValueWidth,
-            long startPosition) {
+            long startPosition,
+            long positionAddress) {
         ensureOpen();
-        requireAddresses(queryKeyAddress, gateValueAddress, keyCacheAddress, valueCacheAddress);
+        requireAddresses(queryKeyAddress, gateValueAddress, keyCacheAddress, valueCacheAddress, positionAddress);
         if (rows <= 0
                 || queryWidth <= 0
                 || keyValueWidth <= 0
@@ -2195,7 +2198,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 rows,
                 queryWidth,
                 keyValueWidth,
-                startPosition);
+                startPosition,
+                MemorySegment.ofAddress(positionAddress));
     }
 
     @Override
@@ -2211,9 +2215,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int headDim,
             int cacheLength,
             long startPosition,
+            long positionAddress,
             long scratchAddress) {
         ensureOpen();
-        requireAddresses(queryKeyAddress, gateValueAddress, keyCacheAddress, valueCacheAddress, outputAddress);
+        requireAddresses(
+                queryKeyAddress, gateValueAddress, keyCacheAddress, valueCacheAddress, outputAddress, positionAddress);
         if (rows <= 0
                 || queryHeads <= 0
                 || keyValueHeads <= 0
@@ -2239,6 +2245,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 headDim,
                 cacheLength,
                 startPosition,
+                MemorySegment.ofAddress(positionAddress),
                 MemorySegment.ofAddress(scratchAddress));
     }
 

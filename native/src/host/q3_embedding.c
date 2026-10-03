@@ -124,7 +124,9 @@ int euhedral_cuda_embed_q3(
         return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     }
 
-    int kernel_status = ensure_q3_embedding_kernel();
+    // Bind this thread to the device context first: the lookup may be the first CUDA call on its worker.
+    int kernel_status = euhedral_cuda_bind_thread_context();
+    if (kernel_status == EUHEDRAL_CUDA_SUCCESS) kernel_status = ensure_q3_embedding_kernel();
     if (kernel_status != EUHEDRAL_CUDA_SUCCESS) {
         return kernel_status;
     }
@@ -182,7 +184,9 @@ int euhedral_cuda_embed_q3_p2e2(
     if (grid_size > 2147483647u) {
         return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     }
-    int kernel_status = ensure_q3_embedding_kernel();
+    // Bind this thread to the device context first: the lookup may be the first CUDA call on its worker.
+    int kernel_status = euhedral_cuda_bind_thread_context();
+    if (kernel_status == EUHEDRAL_CUDA_SUCCESS) kernel_status = ensure_q3_embedding_kernel();
     if (kernel_status != EUHEDRAL_CUDA_SUCCESS) {
         return kernel_status;
     }

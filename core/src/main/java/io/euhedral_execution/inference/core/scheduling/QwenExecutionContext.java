@@ -64,6 +64,8 @@ public final class QwenExecutionContext implements StageQuantum {
     private final CompletableFuture<Outcome> outcome = new CompletableFuture<>();
     private QwenSequenceState.ExecutionLease lease;
     private QwenExecutionWorkspace workspace;
+    /// The pinned staging of the quantum's input record, held until its device work retired.
+    private ExecutionGpu.UploadBuffer inputUpload;
     private QwenDeviceLogits logitsOutput;
     private ExecutionGpu gpu;
     private Consumer<? super QwenExecutionContext> terminalConsumer;
@@ -367,6 +369,7 @@ public final class QwenExecutionContext implements StageQuantum {
                             this.plan.weights().config().hiddenSize(),
                             this.plan.projectionWidths());
             this.workspace.allocateBuffers();
+            uploadInput(gpu);
             return true;
         } catch (RuntimeException | Error error) {
             // Initialization can queue zeroes before a later allocation fails. Keep every allocation
@@ -376,6 +379,21 @@ public final class QwenExecutionContext implements StageQuantum {
             retire(null);
             return false;
         }
+    }
+
+    /// Queues the input record (token IDs and start position) ahead of every stage of the quantum.
+    private void uploadInput(ExecutionGpu gpu) {
+        ExecutionGpu.UploadBuffer upload = gpu.allocateUploadBuffer(this.workspace.inputByteSize());
+        this.inputUpload = upload;
+        this.workspace.writeInput(upload.segment(), this.tokenIds, this.startPosition);
+        gpu.copyUploadToDevice(this.workspace.tokenIdsAddress(), upload);
+    }
+
+    /// A poisoned GPU cannot prove that DMA has stopped reading pinned host memory.
+    private void releaseInputUpload() {
+        ExecutionGpu.UploadBuffer upload = this.inputUpload;
+        this.inputUpload = null;
+        if (upload != null && this.gpu.completionProven()) upload.close();
     }
 
     private void initializeSequenceState(ExecutionGpu gpu) {
@@ -460,6 +478,11 @@ public final class QwenExecutionContext implements StageQuantum {
             } catch (Throwable consumerFailure) {
                 fail(consumerFailure);
             }
+        }
+        try {
+            releaseInputUpload();
+        } catch (Throwable releaseFailure) {
+            fail(releaseFailure);
         }
         if (this.workspace != null) {
             try {

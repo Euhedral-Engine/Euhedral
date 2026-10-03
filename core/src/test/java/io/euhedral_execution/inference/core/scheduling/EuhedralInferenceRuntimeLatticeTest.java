@@ -712,6 +712,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 int headDim,
                 int rotaryDim,
                 long startPosition,
+                long positionAddress,
                 float epsilon,
                 double ropeTheta) {}
 
@@ -724,7 +725,8 @@ class EuhedralInferenceRuntimeLatticeTest {
                 int rows,
                 int queryWidth,
                 int keyValueWidth,
-                long startPosition) {
+                long startPosition,
+                long positionAddress) {
             this.kvAppendCalls.incrementAndGet();
         }
 
@@ -741,6 +743,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 int headDim,
                 int cacheLength,
                 long startPosition,
+                long positionAddress,
                 long scratchAddress) {}
 
         @Override

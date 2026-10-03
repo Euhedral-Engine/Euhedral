@@ -26,6 +26,11 @@ class QwenWorkspaceReuseTest {
                 List.of(QwenExecutionFixtures.q3("projection", 64, 201)));
     }
 
+    /// Token IDs padded to 8 bytes, then the 64-bit start position.
+    private static long inputRecordBytes(int rows) {
+        return ((long) rows * Integer.BYTES + 7) / 8 * 8 + Long.BYTES;
+    }
+
     private static List<Long> bound(QwenExecutionContext context) {
         var workspace = context.workspace();
         return List.of(
@@ -52,9 +57,9 @@ class QwenWorkspaceReuseTest {
             assertEquals(retained, runtime.retainedWorkspaceBytes(), "retained storage must not grow per quantum");
         }
         assertEquals(1, new HashSet<>(addresses).size(), "every quantum bound the first quantum's buffers");
-        assertEquals(4, gpu.allocations.size(), "hidden, normalized, projection and token IDs, once");
+        assertEquals(4, gpu.allocations.size(), "hidden, normalized, projection and input record, once");
         assertTrue(gpu.frees.isEmpty(), "retirement released bindings, not device storage");
-        assertEquals((3L * 64 * Short.BYTES) + Integer.BYTES, retained);
+        assertEquals((3L * 64 * Short.BYTES) + inputRecordBytes(1), retained);
         runtime.close();
         QwenExecutionFixtures.assertEachAllocationFreedOnce(gpu);
         assertEquals(0, runtime.retainedWorkspaceBytes());
@@ -125,10 +130,14 @@ class QwenWorkspaceReuseTest {
             assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.join().status());
             retained[index] = runtime.retainedWorkspaceBytes();
         }
-        long perRow = 3L * 64 * Short.BYTES + Integer.BYTES;
-        assertEquals(2 * perRow, retained[0]);
-        assertEquals(5 * perRow, retained[1], "the five-row quantum replaced each undersized slot");
-        assertEquals(5 * perRow, retained[2], "a smaller quantum neither grows nor shrinks the storage");
+        long perRow = 3L * 64 * Short.BYTES;
+        assertEquals(2 * perRow + inputRecordBytes(2), retained[0]);
+        assertEquals(
+                5 * perRow + inputRecordBytes(5), retained[1], "the five-row quantum replaced each undersized slot");
+        assertEquals(
+                5 * perRow + inputRecordBytes(5),
+                retained[2],
+                "a smaller quantum neither grows nor shrinks the storage");
         assertEquals(gpu.allocations.subList(0, 4), gpu.frees, "only the outgrown two-row buffers were freed");
         assertEquals(addresses.get(1), addresses.get(2));
         assertTrue(Collections.disjoint(addresses.get(0), addresses.get(1)));

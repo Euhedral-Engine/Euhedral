@@ -442,9 +442,10 @@ int euhedral_cuda_attention_kv_append_nvfp4(
         uint32_t rows,
         uint32_t query_width,
         uint32_t key_value_width,
-        uint64_t start_position) {
+        uint64_t start_position,
+        const void* device_position) {
     if (device_query_key == NULL || device_gate_value == NULL || device_key_cache == NULL || device_value_cache == NULL
-            || rows == 0 || query_width == 0 || key_value_width == 0 || query_width % key_value_width != 0
+            || device_position == NULL || rows == 0 || query_width == 0 || key_value_width == 0 || query_width % key_value_width != 0
             || key_value_width % 256 != 0 || query_width % 256 != 0
             || start_position > UINT32_MAX - (uint64_t)rows)
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
@@ -458,11 +459,17 @@ int euhedral_cuda_attention_kv_append_nvfp4(
     CUdeviceptr gate_value = (CUdeviceptr)(uintptr_t)device_gate_value;
     CUdeviceptr key_cache = (CUdeviceptr)(uintptr_t)device_key_cache;
     CUdeviceptr value_cache = (CUdeviceptr)(uintptr_t)device_value_cache;
+    CUdeviceptr position = (CUdeviceptr)(uintptr_t)device_position;
     uint32_t rows_arg = rows, query_width_arg = query_width, key_value_width_arg = key_value_width;
     void* parameters[] = {&query_key, &gate_value, &key_cache, &value_cache,
-            &rows_arg, &query_width_arg, &key_value_width_arg, &start_position};
+            &rows_arg, &query_width_arg, &key_value_width_arg, &position};
     return launch_and_synchronize(attention_append_nvfp4, (uint32_t)((count / 256 + 3) / 4), 128, parameters);
 }
+
+static int qk_norm_rope(const void* device_query_key, const void* device_query_norm, const void* device_key_norm,
+        void* device_output, uint32_t rows, uint32_t query_heads, uint32_t key_value_heads, uint32_t head_dim,
+        uint32_t rotary_dim, uint64_t start_position, const void* device_position, uint64_t position_offset,
+        float epsilon, double rope_theta);
 
 int euhedral_cuda_attention_qk_norm_rope_bf16(
         const void* device_query_key,
@@ -475,8 +482,19 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
         uint32_t head_dim,
         uint32_t rotary_dim,
         uint64_t start_position,
+        const void* device_position,
         float epsilon,
         double rope_theta) {
+    return qk_norm_rope(device_query_key, device_query_norm, device_key_norm, device_output, rows, query_heads,
+            key_value_heads, head_dim, rotary_dim, start_position, device_position, 0, epsilon, rope_theta);
+}
+
+/* `start_position` is the host's copy of the quantum's position, which the kernels read from `device_position`;
+ * `position_offset` is this call's first row within the quantum. */
+static int qk_norm_rope(const void* device_query_key, const void* device_query_norm, const void* device_key_norm,
+        void* device_output, uint32_t rows, uint32_t query_heads, uint32_t key_value_heads, uint32_t head_dim,
+        uint32_t rotary_dim, uint64_t start_position, const void* device_position, uint64_t position_offset,
+        float epsilon, double rope_theta) {
     // Row-exact: the one-row kernel already maps block -> (row, head) with position start + row, so a
     // rows x heads launch of it computes every row exactly as one-row launches would. The in-place query
     // path reads and writes only its own (row, head) block.
@@ -485,15 +503,15 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
             && ((uint64_t)rows * ((uint64_t)query_heads + key_value_heads) > UINT32_MAX)) {
         const uint64_t width = ((uint64_t)query_heads + key_value_heads) * head_dim * 2u;
         for (uint32_t row = 0; row < rows; ++row) {
-            int status = euhedral_cuda_attention_qk_norm_rope_bf16((const char*)device_query_key + row * width, device_query_norm,
+            int status = qk_norm_rope((const char*)device_query_key + row * width, device_query_norm,
                     device_key_norm, (char*)device_output + row * width, 1u, query_heads, key_value_heads, head_dim,
-                    rotary_dim, start_position + row, epsilon, rope_theta);
+                    rotary_dim, start_position + row, device_position, position_offset + row, epsilon, rope_theta);
             if (status != 0) return status;
         }
         return 0;
     }
     if (device_query_key == NULL || device_query_norm == NULL || device_key_norm == NULL || device_output == NULL
-            || rows == 0 || query_heads == 0 || key_value_heads == 0 || query_heads % key_value_heads != 0
+            || device_position == NULL || rows == 0 || query_heads == 0 || key_value_heads == 0 || query_heads % key_value_heads != 0
             || head_dim != 256 || rotary_dim == 0 || rotary_dim > head_dim || (rotary_dim & 1) != 0
             || start_position > UINT64_MAX - rows || !isfinite(epsilon) || epsilon <= 0.0f
             || !isfinite(rope_theta) || rope_theta <= 0.0)
@@ -510,26 +528,41 @@ int euhedral_cuda_attention_qk_norm_rope_bf16(
     CUdeviceptr key_norm = (CUdeviceptr)(uintptr_t)device_key_norm;
     CUdeviceptr output = (CUdeviceptr)(uintptr_t)device_output;
     uint32_t rows_arg = rows, query_heads_arg = query_heads, key_value_heads_arg = key_value_heads;
+    CUdeviceptr position = (CUdeviceptr)(uintptr_t)device_position;
     uint32_t head_dim_arg = head_dim, rotary_dim_arg = rotary_dim;
     void* parameters[] = {&query_key, &query_norm, &key_norm, &output, &rows_arg, &query_heads_arg,
-            &key_value_heads_arg, &head_dim_arg, &rotary_dim_arg, &start_position, &epsilon, &rope_theta};
+            &key_value_heads_arg, &head_dim_arg, &rotary_dim_arg, &position, &position_offset, &epsilon, &rope_theta};
     // A single row (decode) keeps one CTA per head; from two rows one CTA per row shares the angles.
     if (rows > 1 && !row_exact_heads)
         return launch_and_synchronize(attention_qk_norm_rope_rows, rows, 256, parameters);
     return launch_and_synchronize(attention_qk_norm_rope, (uint32_t)blocks, head_dim, parameters);
 }
 
+static int attention_causal(const void* query_key, const void* gate, const void* keys, const void* values, void* output,
+        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t cache_length, uint64_t start,
+        const void* device_position, uint64_t position_offset, void* scratch);
+
 int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
-        uint32_t cache_length, uint64_t start, void* scratch) {
+        uint32_t cache_length, uint64_t start, const void* device_position, void* scratch) {
+    if (device_position == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    return attention_causal(query_key, gate, keys, values, output, rows, query_heads, key_heads, head_dim, cache_length,
+            start, device_position, 0, scratch);
+}
+
+/* Decode kernels read the quantum's position from `device_position` (plus `position_offset`, this call's first row
+ * within the quantum); `start` is the host's copy, which sizes the grids. Prefill kernels take `start` by value. */
+static int attention_causal(const void* query_key, const void* gate, const void* keys, const void* values, void* output,
+        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t cache_length, uint64_t start,
+        const void* device_position, uint64_t position_offset, void* scratch) {
     // The row twins also serve small non-row-exact quanta that bring decode scratch (speculative drafting):
     // a 32-row prefill tile over a long cache is one CTA per head, about 9.5 ms over 32K keys for 2-4 rows
     // against 0.45-0.75 ms for the twins.
     if (rows > 1 && (euhedral_cuda_row_exact() || rows <= 8u) && query_key && gate && keys && values && output && scratch
             && query_heads && key_heads && query_heads % key_heads == 0 && head_dim == 256 && rows <= 64u
             && start <= cache_length && rows <= cache_length - start && start + rows <= UINT32_MAX
-            && !euhedral_cuda_exact_numerics()) {
+            && position_offset == 0 && !euhedral_cuda_exact_numerics()) {
         /* Row-exact twins: row j is one-row decode at position start + j, all rows in one launch each for
          * decode and merge. Rows use the one-row kernel choice at their own length: the GQA kernel from
          * 2048 keys when the group fits, else the per-head kernel. The scratch holds one
@@ -544,22 +577,22 @@ int euhedral_cuda_attention_causal_nvfp4(
             const uint32_t first = (uint32_t)start + 1u, last = (uint32_t)start + rows;
             unsigned long long row_stride = (unsigned long long)query_heads * 64u * 258u;
             uint32_t qh = query_heads, kh = key_heads, from_arg = from;
-            unsigned long long start_arg = start;
+            CUdeviceptr position = (CUdeviceptr)(uintptr_t)device_position;
             if (first < from) {
                 uint32_t below = last < from ? last : from - 1u, splits = (below + 47u) / 48u;
                 if (splits > 64u) splits = 64u;
-                void* args[] = {&query_key, &keys, &values, &qh, &kh, &start_arg, &scratch, &row_stride, &from_arg};
+                void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &from_arg};
                 status = launch_and_synchronize_2d(attention_decode_rows, query_heads * splits, rows, 128, args);
                 if (status != 0) return status;
             }
             if (last >= from) {
                 uint32_t splits = (last + 31u) / 32u;
                 if (splits > 64u) splits = 64u;
-                void* args[] = {&query_key, &keys, &values, &qh, &kh, &start_arg, &scratch, &row_stride, &from_arg};
+                void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &from_arg};
                 status = launch_and_synchronize_2d(attention_decode_gqa_rows, key_heads * splits, rows, 96, args);
                 if (status != 0) return status;
             }
-            void* merge_args[] = {&gate, &output, &scratch, &qh, &kh, &start_arg, &row_stride, &from_arg};
+            void* merge_args[] = {&gate, &output, &scratch, &qh, &kh, &position, &row_stride, &from_arg};
             return launch_and_synchronize_2d(attention_merge_rows, query_heads, rows, 128, merge_args);
         }
     }
@@ -567,8 +600,9 @@ int euhedral_cuda_attention_causal_nvfp4(
         /* Row-exact: row j is one-row decode at position start + j over the keys up to it. */
         const uint64_t width = ((uint64_t)query_heads + key_heads) * head_dim * 2u, out = (uint64_t)query_heads * head_dim * 2u;
         for (uint32_t row = 0; row < rows; ++row) {
-            int status = euhedral_cuda_attention_causal_nvfp4((const char*)query_key + row * width, (const char*)gate + row * width,
-                    keys, values, (char*)output + row * out, 1u, query_heads, key_heads, head_dim, cache_length, start + row, scratch);
+            int status = attention_causal((const char*)query_key + row * width, (const char*)gate + row * width, keys, values,
+                    (char*)output + row * out, 1u, query_heads, key_heads, head_dim, cache_length, start + row, device_position,
+                    position_offset + row, scratch);
             if (status != 0) return status;
         }
         return 0;
@@ -610,8 +644,10 @@ int euhedral_cuda_attention_causal_nvfp4(
     uint32_t splits = (uint32_t)(((uint64_t)length + 47) / 48);
     if (splits > 64) splits = 64;
     CUstream stream = euhedral_cuda_submission_stream();
+    CUdeviceptr position = (CUdeviceptr)(uintptr_t)device_position;
+    unsigned long long offset_arg = position_offset;
     void* args[] = {&query_key, &gate, &keys, &values, &output, &rows, &query_heads,
-            &key_heads, &head_dim, &length, &start, &scratch, &splits};
+            &key_heads, &head_dim, &position, &offset_arg, &scratch, &splits};
     void* merge[] = {&gate, &output, &scratch, &query_heads, &key_heads, &splits};
     // Exact numerics keep the per-element (lane + 32 d) kernel.
     int exact = euhedral_cuda_exact_numerics();

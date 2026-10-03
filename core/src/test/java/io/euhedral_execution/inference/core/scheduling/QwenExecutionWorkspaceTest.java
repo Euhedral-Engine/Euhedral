@@ -20,18 +20,19 @@ class QwenExecutionWorkspaceTest {
         QwenExecutionWorkspace workspace = new QwenExecutionWorkspace(gpu, 3, 4096);
         workspace.allocateBuffers();
         long hiddenStateAddress = workspace.hiddenStateAddress();
+        long inputAddress = workspace.tokenIdsAddress();
 
         assertEquals(3, workspace.tokenCount());
         assertEquals(4096, workspace.hiddenSize());
         assertEquals(3L * 4096 * Short.BYTES, workspace.byteSize());
-        assertEquals(List.of(hiddenStateAddress), gpu.allocations());
+        assertEquals(List.of(inputAddress, hiddenStateAddress), gpu.allocations());
         assertFalse(workspace.isClosed());
 
         workspace.close();
         workspace.close();
 
         assertTrue(workspace.isClosed());
-        assertEquals(List.of(hiddenStateAddress), gpu.frees());
+        assertEquals(List.of(inputAddress, hiddenStateAddress), gpu.frees());
         assertThrows(IllegalStateException.class, workspace::hiddenStateAddress);
     }
 
@@ -51,17 +52,19 @@ class QwenExecutionWorkspaceTest {
         QwenExecutionWorkspace workspace = new QwenExecutionWorkspace(gpu, 2, 64);
         workspace.allocateBuffers();
         long hiddenStateAddress = workspace.hiddenStateAddress();
+        long inputAddress = workspace.tokenIdsAddress();
         gpu.freeFailuresRemaining = 1;
 
+        // The input record's free fails; the hidden state is still freed, and the record kept for a retry.
         assertThrows(IllegalStateException.class, workspace::close);
         assertFalse(workspace.isClosed());
         assertEquals(hiddenStateAddress, workspace.hiddenStateAddress());
-        assertTrue(gpu.frees().isEmpty());
+        assertEquals(List.of(hiddenStateAddress), gpu.frees());
 
         workspace.close();
 
         assertTrue(workspace.isClosed());
-        assertEquals(List.of(hiddenStateAddress), gpu.frees());
+        assertEquals(List.of(hiddenStateAddress, inputAddress), gpu.frees());
     }
 
     private static final class RecordingGpuMemory implements GpuMemory {
