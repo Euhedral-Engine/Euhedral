@@ -282,3 +282,22 @@ and two sequences; 512 is the production chunk. No tolerance was changed.
 - **`cp.async.bulk` with the `.shared::cluster` destination** compiled to a helper call and 8 bytes of local memory per thread; the
   `.shared::cta` forms need none, which matters because the first launch of a kernel with local memory allocates device memory
   that a model filling the card may not have.
+- **Larger tiles on `setmaxnreg`** (384 threads: a producer warpgroup at 40 registers, two consumer warpgroups at 232; the 288-thread
+  block is capped at 168 registers because the allocation rounds to warpgroups). At 1024 rows, kernel only:
+
+  | Tile | gate_up us | down us | GDN output us | input us |
+  |---|---|---|---|---|
+  | 128 x 128 (as shipped, 168 registers) | 1158 | 525 | 195 | 365 |
+  | 128 x 256 | 1119 | 622 | 230 | 392 |
+  | 256 x 128 | 1121 | 619 | 230 | 389 |
+
+  The 64 x 64 warp tiles shorten the MMA loop only slightly and cost wave quantization: down at 1024 rows is 160 tiles on 70 SMs
+  (3 waves, 76% used) against 320 tiles of 128 x 128 (5 waves, 91%); at 512 rows down takes 416 us and GDN output 153 us.
+  Only gate_up gains (3% at 512 to 2048 rows, about 1% of a prefill), which does not pay for a second tile shape and its SD4 twin.
+  A 192 x 128 tile would use 3 of 4 m-tiles' worth of a 512-row chunk (89%).
+- **`setmaxnreg` on the 128 x 128 tile**: 1158 against 1165 us for gate_up, no change.
+- **Persistent CTAs again, on the `setmaxnreg` layout**: the per-tile fixed cost falls (gate_up with K = 2560: 668 against 695 us)
+  but the K = 20480 time rises (4206 against 4112 us) and K = 5120 is unchanged (1156 against 1163 us).
+- **Where the time goes.** gate_up at 1024 rows takes 695, 1163, 2131 and 4112 us for K = 2560, 5120, 10240 and 20480: the
+  asymptotic block-scaled MMA loop runs at 737 TFLOPS (90% of the 815 TFLOPS peak) and each kernel carries about 150 us of fixed
+  cost (pipeline fill, epilogue and wave tails over 31 waves), which is the remaining headroom of the tile.
