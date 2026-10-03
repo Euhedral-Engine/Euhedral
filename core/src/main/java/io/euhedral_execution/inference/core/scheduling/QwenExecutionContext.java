@@ -293,7 +293,7 @@ public final class QwenExecutionContext implements StageQuantum {
 
     /// Decode, verification and draft quanta are captured (docs/CUDA_GRAPHS.md). The key holds what their
     /// stages' submissions depend on apart from the input record: the kind, rows and outputs, the launch
-    /// geometry of decode attention, programmatic dependent launch, and a fingerprint of the workspace and
+    /// geometry of decode attention, and a fingerprint of the workspace and
     /// sequence-owned device addresses. A quantum whose reservation would allocate KV pages or upload a page
     /// table is not captured; neither are quanta under exact numerics or with host-staged weights.
     @Override
@@ -319,7 +319,6 @@ public final class QwenExecutionContext implements StageQuantum {
             this.seedsDraft ? 1 : 0,
             this.draftSeedAddress,
             this.draftCommittedRows,
-            overlapLaunches() ? 1 : 0,
             attentionGeometry(config.numAttentionHeads() / config.numKeyValueHeads()),
             fingerprint.value()
         });

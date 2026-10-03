@@ -119,7 +119,7 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
                 owner.used(lane);
             }
             // A launch that waits on another lane does not overlap its stream predecessor.
-            owner.submit(this, stream, lane, owner.overlapLaunches() && !awaited);
+            owner.submit(this, stream, lane, owner.overlapLaunches() && !awaited, !awaited);
             if (this.marker != 0) {
                 stream.mark(this.marker);
                 if (recording) owner.shadowMark(lane, this.shadowMarker);
