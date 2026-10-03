@@ -73,8 +73,9 @@ activation terms counted) of the 815 TFLOPS OMMA peak: gate_up 1.18 ms and down 
 at 512 tokens; TTFT at 16K is 5.2 s. Results, the cp.async variants that located the limit, and the persistent-CTA rejection are in
 [NVFP4_NATIVE.md](../NVFP4_NATIVE.md).
 
-**Not tried:** `setmaxnreg` register rebalancing (the consumers use 142 registers), a 192×128 tile, and a store warp. At
-80–86% of the MMA peak they bound the remaining gain at about 15%.
+**Also tried:** `setmaxnreg` 40/232 with 128 × 256 and 256 × 128 tiles (only gate_up gains, 3%), persistent CTAs, and
+three stages instead of two; none is kept ([NVFP4_NATIVE.md](../NVFP4_NATIVE.md)). The loop itself runs at 90% of the MMA peak;
+the rest is about 150 us of fixed cost per kernel. A 192 × 128 tile and a store warp were not built.
 
 ## Tier 2: clear but smaller, or needs a structural change
 
