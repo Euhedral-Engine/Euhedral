@@ -130,6 +130,8 @@ class CudaGpuOperationsIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
+            // The BF16 tile routes are what is compared; the FP8 route (rows >= 128) has its own tests.
+            gpu.selectQ3Mx(false);
             var symbols = java.lang.foreign.SymbolLookup.libraryLookup(library, arena);
             var descriptor = java.lang.foreign.FunctionDescriptor.of(
                     java.lang.foreign.ValueLayout.JAVA_INT,

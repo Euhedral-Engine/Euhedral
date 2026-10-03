@@ -131,6 +131,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle q3MxGateUpSwiGluBf16;
     /// Whether the Q3 block-scaled FP8 prefill module loaded (null until first asked).
     private volatile Boolean q3Mx;
+
+    private volatile boolean q3MxEnabled = true;
     /// Whether the native Blackwell NVFP4 module loaded (null until first asked).
     private volatile Boolean nvfp4Native;
     /// The stream whose launches the current thread is submitting, or null for synchronous calls.
@@ -1523,6 +1525,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// tile the BF16 tile kernels waste less.
     static final int Q3_MX_MIN_ROWS = Integer.getInteger("euhedral.q3mx.minRows", 128);
 
+    /// Enables or disables the FP8 prefill route for later launches (it is on by default where available). The BF16
+    /// tile routes it replaces stay selectable, for comparisons between them.
+    public void selectQ3Mx(boolean enabled) {
+        this.q3MxEnabled = enabled;
+    }
+
     /// Whether the Q3 block-scaled FP8 prefill kernels are available on this device (sm_12x, not disabled by
     /// EUHEDRAL_Q3_MX=0).
     public boolean q3MxAvailable() {
@@ -1572,8 +1580,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int outputs,
             long weightBytes) {
         // Inside a P2E2 expansion the shared scratch holds the expanded weights; this route needs it for activations.
-        if (rows < Q3_MX_MIN_ROWS || ROW_EXACT.get()[0] || q3ScratchLock.isHeldByCurrentThread() || !q3MxAvailable())
-            return false;
+        if (!q3MxEnabled
+                || rows < Q3_MX_MIN_ROWS
+                || ROW_EXACT.get()[0]
+                || q3ScratchLock.isHeldByCurrentThread()
+                || !q3MxAvailable()) return false;
         if (width % 128 != 0 || outputs % 128 != 0) return false;
         ensureOpen();
         requireAddresses(input, weights, output);

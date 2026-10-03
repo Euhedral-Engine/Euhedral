@@ -46,6 +46,11 @@ cold KV pages, bitwise against the current kernel's per-row results.
 
 ### 2. Get prefill off the half-rate BF16 tensor path
 
+**Status (2026-10-03): done with the MXFP8 option.** Q3, Q4 and Q5 prefill linears, the FFN gate/up and down and the GDN
+input projections run on block-scaled E4M3 MMA with two exact activation terms: 1.4-1.7x per operator, time to first
+token -26% at 4K, -25% at 16K, -23% at 32K, decode unchanged, drift against the exact oracle unchanged. INT8 was
+screened and rejected. See [../PREFILL_MX.md](../PREFILL_MX.md).
+
 **Evidence** ([tensor-cores.md](tensor-cores.md))
 - Q3/Q4/Q5 prefill uses BF16 HMMA with FP32 accumulate: a 102 TFLOPS ceiling, 57 achieved in the FFN
   at 512 rows.
