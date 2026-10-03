@@ -2,19 +2,33 @@
 
 This directory contains the plain C ABI used by the Java Foreign Function & Memory binding.
 
+The engine requires an NVIDIA Blackwell GPU (compute capability 12.x); `CudaGpuMemory` fails to construct on any other device.
+
 The minimum CUDA header/runtime ABI is 13.1.x. An installed newer CUDA 13.x toolkit is accepted
 when its headers and target libraries are complete. The host must also provide the CUDA driver library and NVRTC runtime; the driver must
 support the target GPU. This native layer does not install or manage NVIDIA drivers.
 
 ## Source layout
 
-`src/host/` holds the C ABI compiled into the library. `euhedral_cuda.c` is limited to memory
-allocation, memory queries, streams, markers and copies; `cuda_kernel_loader.c` loads an installed
-CUDA module root and compiles it once per process with NVRTC for `compute_90`, and the CUDA driver
-JITs that PTX for the active device. `q3_embedding.c`, `rms_norm_bf16.c`, `q3_linear_bf16.c` and
-`qwen_layer_ops.c` own the operator entry points; the `*_policy.h` headers hold the shape-only
-dispatch decisions their tests exercise without a GPU. These operators accept opaque device
-addresses and know nothing about Euhedral frames.
+`src/host/` holds the C ABI compiled into the library. It accepts opaque device addresses and knows nothing about Euhedral frames:
+
+| File | Entry points |
+| --- | --- |
+| `euhedral_cuda.c` | Memory allocation (device, pinned host, huge-page host weights), memory queries, streams, markers and completion events, copies. |
+| `cuda_kernel_loader.c`, `.h` | Compiles an installed CUDA module root once per process with NVRTC and loads it. Ordinary modules compile for `compute_90` and the driver JITs that PTX for the active device; the Blackwell-only modules (`q3_mx`, `nvfp4_native`) compile for `sm_<major><minor>a` and exist only on compute capability 12.x. Also holds the thread-local selections: exact numerics, row-exact execution and programmatic dependent launch. |
+| `q3_embedding.c` | Q3 row-split and P2E2 embedding gather to BF16 hidden states (rows may be read in place from mapped host memory). |
+| `rms_norm_bf16.c` | Standalone BF16 RMSNorm. |
+| `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |
+| `q45_linear.c` | Q4/Q5 decode (one row and the 2 to 8 row twins). |
+| `nvfp4_linear.c` | NVFP4 decode (plain and SD4 scale-table layouts, one row and 2 to 8 rows) and the native FP4 tensor-core route. |
+| `q3_mx.c` | The block-scaled MXFP8 route for Q3/Q4/Q5 linears and the paired gate/up SwiGLU region. |
+| `reference.c`, `.h` | The scalar numerical references (Q3, Q4/Q5, NVFP4 plain and SD4): the oracle exact numerics select, and the fallback for shapes no kernel takes. |
+| `qwen_layer_ops.c` | GDN control, convolution, recurrence and gated norm; residual add, residual RMSNorm and SwiGLU; NVFP4 KV append, QK norm/RoPE and attention; greedy argmax; the BF16-to-FP32 linear. |
+| `decode_shapes.h`, `q3_p2e2_geometry.h` | Shape-only dispatch decisions and layout geometry checks (header-only). |
+
+Quantized linears dispatch on the row count: 1 to 8 rows run the decode kernels (every row of the twins is bit for bit the one-row
+result), 9 or more rows run the MXFP8 route for Q3/Q4/Q5, and NVFP4 linears from 2 rows run the native FP4 route; exact numerics and
+any shape no kernel takes run the scalar reference. There are no environment variables or options that change this.
 
 Every other file under `src/` is CUDA source, installed unchanged at the same relative path under
 `share/euhedral_cuda/` next to the library. Each domain folder's `kernels.cu` is the NVRTC module
@@ -23,20 +37,59 @@ root the host loads; its headers are that module's leaves and strategies:
 | Folder | Module contents |
 | --- | --- |
 | `common/` | Shared device helpers (`pdl.cuh`: programmatic dependent launch). |
-| `embedding/` | Q3 row-split embedding (`ROW_SPLIT_K128_V1`) to BF16 hidden states. |
+| `embedding/` | Q3 row-split (`ROW_SPLIT_K128_V1`) and P2E2 embedding to BF16 hidden states. |
 | `norm/` | Standalone BF16 RMSNorm. |
-| `elementwise/` | Residual add, residual RMSNorm and SwiGLU. |
-| `linear/` | Generic quantized and BF16-to-FP32 linear fallbacks. |
-| `q3/`, `q45/` | Q3 and Q4/Q5 weight formats: layout, numerics, primitives, decode and prefill strategies. |
-| `gemm/` | The prefill tensor-core tile engines (`tiles.cuh`, `balanced.cuh`) and their weight producers (`formats.cuh`), shared by `q3/`, `q45/` and `ffn/`. |
-| `ffn/` | Gate/up SwiGLU, down (unsplit, split-K and reduce) and the streamed FFN regions. |
+| `elementwise/` | Residual add, residual RMSNorm (including the one-row kernel) and SwiGLU. |
+| `linear/` | BF16-to-FP32 linear. |
+| `q3/`, `q45/` | Q3 and Q4/Q5 weight formats: layout, numerics, the one-row contiguous decode kernel and its 2 to 8 row twins; `q3/p2e2.cuh` holds the lossless P2E2 decode and expansion kernels. |
+| `q3_mx/` | Prefill on block-scaled MXFP8 tensor cores for Q3, Q4 and Q5 linears and the paired gate/up SwiGLU region (`sm_12xa`). |
+| `nvfp4/` | NVFP4 weights (plain and SD4 scale tables): scale-table helpers, the decode kernel and its 2 to 8 row twins. |
+| `nvfp4_native/` | Native FP4 tensor-core route: activation quantization, the 128x128 linear, the paired gate/up SwiGLU tile and the skinny kernels up to 64 rows (`sm_12xa`). |
+| `reference/` | Scalar references (Q3, Q4/Q5, NVFP4 plain and SD4). |
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
-| `attention/` | NVFP4 KV append, QK norm/RoPE, decode and prefill attention leaves. |
+| `attention/` | NVFP4 KV append, QK norm/RoPE, per-head and GQA decode attention with row twins, the 32-row prefill tile and the producer-warp FA2 prefill kernel, and the exact twins and single-warp controls used as test oracles. |
 | `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
-| `experiments/` | Test-only research modules (Q3 cluster, fragment, hierarchical and pipeline kernels); no host dispatch loads them. |
 
 Includes within a folder are relative; includes across folders name the path from the tree root
-(`common/pdl.cuh`, `gemm/balanced.cuh`), which NVRTC resolves through the installed root.
+(`common/pdl.cuh`, `nvfp4/nvfp4.cuh`), which NVRTC resolves through the installed root.
+
+The exported C API (`include/euhedral_cuda.h`) falls into these groups:
+- memory and transfers: `euhedral_cuda_malloc`/`free`, `host_malloc`/`host_free`, `host_weights_malloc`/`free`/`device_pointer`,
+  `device_memory_info`, the `copy_*` family, `zero_device_memory`, `synchronize`;
+- streams, markers and completion: `stream_create`/`destroy`/`select`/`clear`/`synchronize`/`wait_event`, `completion_event_*`,
+  `completion_notify`;
+- selections: `select_exact_numerics`, `row_exact_select`, `pdl_select`;
+- embedding: `embed_q3`, `embed_q3_p2e2`;
+- norms and elementwise: `rms_norm_bf16`, `rms_norm_unit_offset_bf16`, `residual_add_bf16`, `residual_rms_norm_bf16`, `swiglu_bf16`;
+- linears: `linear_bf16_to_float`, `linear_q3_bf16`, `linear_quantized_bf16` (Q4/Q5), `linear_nvfp4_bf16`, the P2E2 pair
+  `linear_q3_p2e2_decode_bf16` and `q3_p2e2_expand`, the MXFP8 route (`q3_mx_available`, `linear_q3_mx_bf16`,
+  `linear_q45_mx_bf16`, `q3_mx_gate_up_swiglu_bf16`, `q3_mx_scratch_bytes`, `q3_mx_select_split_rows`), the native FP4 route
+  (`nvfp4_native_available`, `linear_nvfp4_native_bf16`, `nvfp4_native_gate_up_swiglu_bf16`, `nvfp4_native_scratch_bytes`) and
+  `linear_q3_reference_bf16`;
+- GDN: `gdn_control_fp32`, `gdn_project_control_fp32`, `gdn_convolution_bf16`, `gdn_recurrence_bf16`, `gdn_gated_rms_norm_bf16`;
+- attention: `attention_kv_append_nvfp4`, `attention_qk_norm_rope_bf16`, `attention_causal_nvfp4`;
+- sampling: `argmax_bf16`.
+
+## Tests
+
+`tests/` holds the native Python/CUDA tests. They compile a source with the pinned NVRTC runtime and launch its kernels on the device,
+and skip when the runtime or a GPU is unavailable; the pinned runtime is built by the Gradle native tasks. Several tests (attention, MXFP8, native FP4) need
+NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading, launches); the tests are:
+
+| Test | Covers |
+| --- | --- |
+| `test_q3_kernels.py` | Q3 reference against FP64, contiguous decode against the reference, the 2 to 8 row twins bit for bit one-row. |
+| `test_q45_kernels.py` | Q4/Q5 reference, contiguous decode, row twins, the capped grid. |
+| `test_q3_conversion.py` | The device-level Q3 scale-conversion contract. |
+| `test_q3_mx.py` | The MXFP8 route: activation quantizer, Q3/Q4/Q5 linears, split-K and the gate/up kernel against FP64 (`sm_12x`). |
+| `test_q3_p2e2.py` | P2E2 decode, expansion and embedding bit for bit against the row-split routes. |
+| `test_nvfp4.py` | NVFP4 decode and row twins, the scalar reference, and the SD4 kernels against the plain kernels. |
+| `test_nvfp4_native.py` | The native FP4 route: quantizer, linear, paired gate/up and skinny kernels against FP64, determinism, SD4 (`sm_12x`). |
+| `test_attention_nvfp4.py` | NVFP4 KV format and attention against a mathematical oracle, the GQA decode kernel and the row twins bit for bit. |
+| `test_gdn_convolution.py`, `test_gdn_recurrence.py` | GDN convolution and recurrence against the frozen reference kernels. |
+| `test_qwen_regions.py` | Fused regions (control, residual norm, row-owned QK norm/RoPE) against the unfused numerical boundaries. |
+| `test_sampling_argmax.py` | Device greedy selection against the host argmax. |
+| `test_products.py` | The installed CUDA products against `native-products.json`. |
 
 `native-products.json` defines the two supported targets: `x86_64-linux-gnu` (`linux-x64`)
 and `x86_64-windows-gnu` (`windows-x64`). There is no macOS CUDA product. The normal Gradle
@@ -63,7 +116,7 @@ and caches them under the Gradle user home. The Windows driver import is generat
 pinned Zig `dlltool` from an explicit driver ABI export list; it does not link the host's
 Linux driver stub or NVIDIA's Windows static loader. Downloads include no NVIDIA kernel driver.
 
-Use Java 25, Gradle 9.6.1, and Zig 0.16.0 (the versions recorded in `.mise.toml`).
+Use Java 25, Gradle 9.6.1, and Zig 0.16.0 (the versions recorded in `mise.toml`).
 Gradle invokes Zig directly with argument lists (and honors `ZIG` when set); no shell is needed
 by the host build. Build and verify both products with:
 
@@ -91,68 +144,22 @@ the Linux product, useful for the container image. `nativeBuildLinuxX64` and
 integration tests. The integration task adds the resolved CUDA runtime DLL/SO directory to
 the test process search path; a compatible host driver is still required.
 
-Run the isolated CUDA integration suite with the same automatic CUDA resolution. The full compact-model test also
-requires the compact Qwen EDRL artifact, its BF16 reference EDRL artifact, and sufficient free device
-memory to keep the whole compact model resident:
+Build and test with the tasks of `mise.toml`:
 
 ```text
-./gradlew cudaIntegrationTest
+mise run native-build      # ./gradlew nativeBuildLinuxX64
+mise run native-test       # python3 -m unittest discover -s native/tests -p 'test_*.py' (needs a GPU)
+mise run native-verify     # ./gradlew nativeVerify: both products, installed tree equals src/
+mise run cuda-test         # ./gradlew :core:cudaIntegrationTest :api:cudaIntegrationTest --rerun-tasks (reserve the GPU first)
+mise run full-build        # ./gradlew nativeVerify nativePackage :api:bootJar build
 ```
+
+The full-model CUDA integration tests need a `q3` artifact (`-Peuhedral.qwen.artifact`) and enough free device memory to keep it
+resident; some also take an `nvfp4` artifact (`-Peuhedral.qwen.nvfp4-artifact`) or a `q3-compressed` artifact
+(`-Peuhedral.qwen.q3-compressed-artifact`). Do not overlap the core and API suites on one GPU.
 
 The runtime needs a compatible NVIDIA driver installed on the host (or injected by NVIDIA
 Container Toolkit), along with target-matching CUDA user-space runtime/NVRTC libraries and
 the CUDA headers used by NVRTC to compile the installed CUDA sources. Set
 `EUHEDRAL_CUDA_INCLUDE_DIR` to their include directory. Driver stubs and development import
 libraries are for linking only, not runtime deployment.
-
-## Opt-in Q3 temporal fragment pipeline
-
-`experiments/q3/pipeline_kernels.cu` is a separate C++17 NVRTC translation unit, not a production
-Q3 dispatch mode. Its `euhedral_q3_pipeline_<rows>_<cm>x<cn>` entry points take the
-same Q3 matrix arguments as the fragment-node kernels, followed by a nullable
-`unsigned long long* observations`. Launch 256 threads per CTA, with a 2D grid
-rounded up to the kernel's fixed `(cn, cm, 1)` cluster dimensions. Supported row
-tiles are 32 and 64; compositions `(cm,cn)` are `(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`,
-`(1,4)` and `(2,2)`. Compilation needs the CUDA include directory and its `cccl`
-subdirectory on the include path. The normal C++14 Q3 source and dispatch are unchanged.
-
-Each A or B branch owns two execution-storage slots and separate ready, parent-ready
-and borrower-release barriers per slot. Generation identity is branch/slot-local;
-there is no CTA-wide current-generation stamp. Generations are consecutive from
-zero, with `slot = generation % kSlots` and phase derived from the slot's reuse
-count. The generation protocol does not encode a K extent. This first storage,
-producer and MMA policy still uses K64; changing that extent also requires changing
-those policy-specific layouts and loops, not merely selecting a different kernel name.
-
-The first mapping uses four branch-producer warps and the existing four MMA warps.
-Only the strategy assigns physical warp IDs. A single producer warp collectively
-begins, accepts and publishes each branch generation; each registered descendant
-warp acquires and releases it once in order. A parent owner aliases its local
-execution slot. Remote producers copy each branch fragment once into their own slot,
-release the parent borrow immediately after that copy, then publish locally to
-sibling MMA descendants. Parent reuse counts both local MMA borrowers and remote
-copy borrowers; child-slot reuse counts its local MMA borrowers. No extra full-tile
-intermediate is introduced. Warp FP32 accumulators retain the existing K/high/low
-numerical order and flow through CTA result storage to BF16 output.
-
-Steady-state handoffs use scoped release arrivals and acquire waits on CUDA
-`mbarrier` objects. Producer warps wait only for their branch slot's previous
-borrowers; remote acceptance waits only on that parent branch's publication; MMA
-warps wait only on their A and B branches. Warp joins connect all-lane reads/writes
-to a leader's notification. There are no whole-CTA or whole-cluster barriers inside
-the K loop. Relative to the single-slot fragment strategy, each generation removes
-six explicit CTA barriers (one parent-production, one begin, two publish, two release)
-and two cluster barriers (publication and retirement).
-
-Two whole-cluster joins remain per launch: bootstrap makes initialized barriers and
-DSM CTA lifetimes available, and the terminal join prevents any CTA exiting while a
-peer still accesses its shared memory. The terminal join also publishes CTA result
-writes before output writeback. Neither join scales with the number of generations.
-
-A non-null observation buffer requires `grid.x * grid.y * ceil(width/64) * 44`
-64-bit words. Per CTA/generation, four branches each record six words (production
-start, acceptance complete, pre-publication timestamp, logical remote-fragment count,
-generation, slot); four consumers each record five words (acquired, MMA complete,
-pre-release timestamp, first A address, first B address). Timestamps use the device
-global timer. These records are diagnostics, never synchronization state; publication
-and release stamps precede the actual notifications. Timed launches pass null.

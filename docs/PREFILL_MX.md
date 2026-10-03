@@ -3,7 +3,7 @@
 GeForce Blackwell runs a BF16 or FP16 MMA with FP32 accumulation at 102 TFLOPS, but the block-scaled FP8 kind
 (`mma.sync kind::mxf8f6f4`) at 408 TFLOPS with FP32 accumulation (docs/nvidia/tensor-cores.md). Prefill linears run on
 the second. This file describes the kernels, their measured performance, the numerics, and the variants that were
-rejected.
+rejected. It covers the Q3, Q4 and Q5 linears; NVFP4 linears run on native FP4 tensor cores ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
 
 Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running. Sources:
 `native/src/q3_mx/kernels.cu` (kernels), `native/src/host/q3_mx.c` (host route), `CudaGpuMemory.invokeQ3Mx` (Java route).
@@ -29,7 +29,7 @@ one E4M3 byte pair per nibble pair (and per pair of fifth bits for Q5) in a 256 
 - 4 producer warps stream the activation tiles (cp.async) and expand the weights into a ring of three stages, up to three groups
   ahead, handed over by mbarriers (the cp.async copies arrive on the barrier themselves);
 - `setmaxnreg` moves registers from the producers to the consumers: 168 per thread at launch, 216 for consumers, 72 for producers;
-- 75 KiB of shared memory, one CTA per SM.
+- 73.5 KiB of dynamic shared memory (three stages of A hi, A lo, expanded weights and the FP32 group scales), one CTA per SM.
 
 The paired gate/up kernel orders each tile as 16 gate rows then 16 up rows per warp, so SwiGLU runs in registers on gate and up
 rounded to BF16.
@@ -40,9 +40,11 @@ better). Splits write FP32 partials that `euhedral_q3mx_reduce` sums in split or
 region never splits. A P2E2 tensor too large to expand at once runs in output-row chunks whose results must equal the whole
 tensor's, so the host chooses the split from the whole tensor's rows (`euhedral_cuda_q3_mx_select_split_rows`).
 
-**Routing.** From 16 rows (a smaller quantum has dedicated GEMV kernels): Q3 linears, FFN gate/up and down, Q4 and Q5 linears,
-and the GDN input projections. P2E2 tensors expand into the shared scratch and the expansion reserves an activation region
-behind the expanded weights. `EUHEDRAL_Q3_MX=0` disables the route; exact numerics and row-exact execution decline it.
+**Routing.** From 9 rows (one to eight rows run the decode kernels): Q3 linears, FFN gate/up and down, Q4 and Q5 linears, and the
+GDN input projections, plus the paired gate/up region (`euhedral_q3mx_gate_up_swiglu_128x64`) of the plan's 64-row region view. A
+linear needs K and the output rows to be multiples of 128. P2E2 tensors expand into the shared scratch and the expansion reserves
+an activation region behind the expanded weights. Exact numerics and row-exact execution (verification quanta) decline the route
+and run the decode twins or the scalar reference.
 
 ### The scale register contract (measured)
 
@@ -81,7 +83,7 @@ The quantize pass costs 8 us for 512 rows of width 5120 (24 us for the FFN down 
 
 ### Prefill, end to end
 
-Q3 compact artifact, chunk 512, one fork, warmup 1 and 2 measured iterations. Decode tokens per second is the 128-token greedy
+`q3` artifact, chunk 512, one fork, warmup 1 and 2 measured iterations. Decode tokens per second is the 128-token greedy
 decode that follows the prompt.
 
 | Prompt | Time to first token | Prefill | Decode |
@@ -90,9 +92,6 @@ decode that follows the prompt.
 | 4K | 2.15 s | 1906 tok/s | 61.5 tok/s |
 | 16K | 9.12 s | 1796 tok/s | 60.5 tok/s |
 | 32K | 20.0 s | 1640 tok/s | 59.0 tok/s |
-
-At 16K, kernel time is split gate/up 31%, Q3 linears 24%, FA2 attention 18%, Q5 12%, Q4 5%, GDN recurrence 4% and
-quantization 1.3% (Nsight Systems, before the FA2 rewrite below).
 
 ### Prefill attention
 
@@ -108,16 +107,18 @@ single-role kernel kept as the test control (`reference_prefill_fa2.cuh`). One 5
 | 16384 | 3529 us | 59 |
 | 32768 | 6955 us | 60 |
 
-Query-head groups above 6 use the 32-row tile kernel (the CTA needs 32 (G + 2) threads).
+The FA2 kernel serves quanta of 512 or more rows, or of 128 or more rows once the cache holds 2048 keys, when the query-head group
+is at most 6 (the CTA needs 32 (G + 2) threads). Smaller grids and larger groups use the 32-row prefill tile
+(`euhedral_attention_prefill32_nvfp4`), which is faster on few CTAs.
 
 ## Numerics
 
 - `native/tests/test_q3_mx.py` compares the quantizer and the Q3, Q4 and Q5 linears, the split-K linear and the gate/up kernel with
   FP64 on exact products (they agree to the BF16 output rounding); the FA2 test compares the production kernel with the control bitwise.
-- `RelaxedNumericsDriftCudaIntegrationTest` against the exact oracle, Q3 compact and P2E2 artifacts alike: KL 5.1e-3, hidden relative
+- `RelaxedNumericsDriftCudaIntegrationTest` against the exact oracle, `q3` and `q3-compressed` artifacts alike: KL 5.1e-3, hidden relative
   error 6.0e-2, top-1 agreement 0.961 over 8 windows of 48 positions, with no growth by position.
 - The route is deterministic: 60 repeated launches of each kernel variant gave identical bits.
-- A P2E2 artifact reproduces the compact artifact bitwise.
+- The `q3-compressed` artifact reproduces the `q3` artifact bitwise.
 
 ## Rejected
 
@@ -136,5 +137,5 @@ Query-head groups above 6 use the 32-row tile kernel (the CTA needs 32 (G + 2) t
   projection at 1024 rows were no faster than one.
 - **A fixed split factor** (always 2, always 4): a factor above the wave model's choice slightly lowers the rate through the FP32 partials (the down projection at 512 rows ran 935 us at 2 and 950 us at 4).
 - **FA2 with more compute warps per query head or two CTAs per SM.** Not built: each compute warp holds the 16 x 256 output accumulators
-  and the query fragments (about 230 registers), so a CTA of 8 warps already fills the register file and the 67.6 KiB double buffer
+  and the query fragments (about 230 registers), so a CTA of 8 warps already fills the register file and the 66 KiB double buffer
   fills the shared memory. The remaining imbalance is that 6 compute warps share 4 schedulers (two schedulers carry two compute warps).
