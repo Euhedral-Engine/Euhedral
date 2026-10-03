@@ -20,14 +20,10 @@ euhedral:
     # cuda-library-path: /path/to/libeuhedral_cuda.so
     # worker-cpus: 2,3            (processor IDs or inclusive ranges, e.g. 2-5,8)
     # model-id: qwen3.8-27b       (the name clients send as "model")
-    # prefill-chunk-tokens: 512  (optional; prompt tokens per prefill quantum, default 512)
-    # host-weight-mib: 1280      (optional; weights kept in pinned host memory for longer contexts, default 0)
-    # staging-slots: 4           (optional; device slots staging host-backed projections, default 4)
-    # speculative-depth: 3       (optional; MTP drafts per verification for greedy requests, default 0: off)
+    # max-context-tokens: 32768   (optional; longest prompt plus completion; longer contexts hold weights in host memory)
     shutdown-timeout: 10s
   api:
     default-max-tokens: 4096
-    max-concurrent-generations: 1
     max-queued-generations: 16
     max-request-bytes: 1048576
     request-timeout: 30m

@@ -49,8 +49,7 @@ class StreamOrderedEngineCudaIntegrationTest {
 
     private static Result generate(
             Path artifact, Path tokenizer, Path library, BitSet cpus, RecordingBootstrap bootstrap) throws Exception {
-        var config =
-                new InferenceConfig(artifact, tokenizer, library, new InferenceTuning(cpus, 4), Duration.ofSeconds(10));
+        var config = new InferenceConfig(artifact, tokenizer, library, cpus, Duration.ofSeconds(10));
         Result first;
         try (var engine = InferenceEngine.load(config, bootstrap)) {
             assertTrue(
@@ -78,7 +77,7 @@ class StreamOrderedEngineCudaIntegrationTest {
     }
 
     private static Result generateSession(InferenceEngine engine) throws Exception {
-        try (var session = engine.createSession(GenerationConfig.greedy(91L))) {
+        try (var session = engine.createSession(GenerationConfig.greedy(91L), 4)) {
             StringBuilder output = new StringBuilder();
             List<Integer> tokens = session.generate(PROMPT, 300, output::append);
             long position = session.currentTokenPosition();
@@ -97,13 +96,13 @@ class StreamOrderedEngineCudaIntegrationTest {
         private ExecutionGpu gpu;
 
         /// The stream-ordered CUDA binding unless a subclass supplies another GPU.
-        ExecutionGpu create(Path path, InferenceTuning tuning) {
-            return super.openGpu(path, tuning);
+        ExecutionGpu create(Path path) {
+            return super.openGpu(path);
         }
 
         @Override
-        final ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
-            this.gpu = create(path, tuning);
+        final ExecutionGpu openGpu(Path path) {
+            this.gpu = create(path);
             return this.gpu;
         }
 
@@ -115,7 +114,7 @@ class StreamOrderedEngineCudaIntegrationTest {
     /// Loads the model on the synchronous reference GPU fixture.
     private static final class ReferenceBootstrap extends RecordingBootstrap {
         @Override
-        ExecutionGpu create(Path path, InferenceTuning tuning) {
+        ExecutionGpu create(Path path) {
             return new SynchronousReferenceGpu(path);
         }
 

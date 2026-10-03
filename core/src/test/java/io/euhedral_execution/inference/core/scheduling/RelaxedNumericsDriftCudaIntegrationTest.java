@@ -5,7 +5,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
@@ -53,11 +52,8 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         int steps = Integer.getInteger("euhedral.numerics.drift.steps", 384);
         int prefixLength = Integer.getInteger("euhedral.numerics.drift.prefix", 256);
         // Calibration: "exact" runs the exact kernels on both sequences (determinism floor).
-        // "native": sequence A runs ordinary decode, B native-numerics NVFP4 decode (the speculative native
-        // mode's numerics), both without exact numerics; run it on the NVFP4 artifact.
         String mode = System.getProperty("euhedral.numerics.drift.candidate", "");
         boolean candidate = "exact".equals(mode);
-        boolean nativeCandidate = "native".equals(mode);
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
         Path tokenizerDirectory =
@@ -65,8 +61,7 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         int[] tokens = forcedTokens(QwenTokenizer.load(tokenizerDirectory), prefixLength + steps);
         List<Metrics> metrics = new ArrayList<>();
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                QwenModel model =
-                        QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu, WeightResidency.EXECUTED);
+                QwenModel model = QwenModel.load(artifact, QwenArtifactReader.read(artifact), gpu);
                 var lattice = new PullingLattice()) {
             var plan = new QwenExecutionPlan(model.weights());
             var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
@@ -74,21 +69,20 @@ class RelaxedNumericsDriftCudaIntegrationTest {
             var contiguous = new QwenSequenceState(2);
             try {
                 int[] prefix = java.util.Arrays.copyOf(tokens, prefixLength);
-                select(gpu, false, candidate, nativeCandidate);
+                select(gpu, false, candidate);
                 run(runtime, gpu, plan, exact, QwenExecutionContext.ExecutionKind.PREFILL, prefix);
-                select(gpu, true, candidate, nativeCandidate);
+                select(gpu, true, candidate);
                 run(runtime, gpu, plan, contiguous, QwenExecutionContext.ExecutionKind.PREFILL, prefix);
                 for (int step = 0; step < steps; step++) {
                     int[] token = {tokens[prefixLength + step]};
-                    select(gpu, false, candidate, nativeCandidate);
+                    select(gpu, false, candidate);
                     Step a = run(runtime, gpu, plan, exact, QwenExecutionContext.ExecutionKind.DECODE, token);
-                    select(gpu, true, candidate, nativeCandidate);
+                    select(gpu, true, candidate);
                     Step b = run(runtime, gpu, plan, contiguous, QwenExecutionContext.ExecutionKind.DECODE, token);
                     metrics.add(compare(prefixLength + step, a, b));
                 }
             } finally {
                 gpu.selectExactNumerics(false);
-                if (nativeCandidate) gpu.selectNvfp4NativeDecode(false);
                 exact.complete();
                 contiguous.complete();
                 runtime.close();
@@ -133,13 +127,9 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         assertEquals(steps, metrics.size());
     }
 
-    /// Numerics for sequence A (the oracle) or B. Exact mode: A exact, B relaxed (exact when calibrating with
-    /// `calibrate`). Native mode: A ordinary decode, B native-numerics NVFP4 decode.
-    private static void select(CudaGpuMemory gpu, boolean sequenceB, boolean calibrate, boolean nativeMode) {
-        if (nativeMode) {
-            gpu.selectExactNumerics(false);
-            gpu.selectNvfp4NativeDecode(sequenceB);
-        } else gpu.selectExactNumerics(!sequenceB || calibrate);
+    /// Numerics for sequence A (the oracle: exact) or B (relaxed; exact when calibrating with `calibrate`).
+    private static void select(CudaGpuMemory gpu, boolean sequenceB, boolean calibrate) {
+        gpu.selectExactNumerics(!sequenceB || calibrate);
     }
 
     private static int[] forcedTokens(QwenTokenizer tokenizer, int count) throws Exception {

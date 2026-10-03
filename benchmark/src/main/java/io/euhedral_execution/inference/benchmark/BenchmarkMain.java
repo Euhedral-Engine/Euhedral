@@ -6,11 +6,8 @@ import io.euhedral_execution.inference.benchmark.result.ResultStore;
 import io.euhedral_execution.inference.benchmark.result.Summary;
 import io.euhedral_execution.inference.benchmark.run.BenchmarkRunner;
 import io.euhedral_execution.inference.benchmark.run.EngineTarget;
-import io.euhedral_execution.inference.benchmark.run.GpuCapacity;
 import io.euhedral_execution.inference.benchmark.run.Prerequisites;
-import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.ProcessorTopology;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
@@ -27,14 +24,13 @@ public final class BenchmarkMain {
     static final String USAGE = """
             usage:
               run CONFIG.json [--fork-id ID] [--validate-only]
-              q3 CONFIG.json [MATRIX ROWS]
-              q45 CONFIG.json [MATRIX ROWS]
               import --input FILE --implementation LABEL --output FILE [--note TEXT] [--overwrite|--append]
 
             CONFIG.json requires "artifact", "tokenizer", and "cudaLibrary"; see docs/BENCHMARKING.md.
             --fork-id labels this JVM as one externally launched fork; iterations are never forks.
             --validate-only checks configuration and prerequisites, prints the plan, and exits without
-            touching the GPU.
+            touching the GPU. Exit codes: 0 success, 1 a measured row failed or was ineligible, 2 usage,
+            3 the engine did not load.
             """;
 
     private BenchmarkMain() {}
@@ -52,24 +48,6 @@ public final class BenchmarkMain {
         try {
             return switch (args.getFirst()) {
                 case "run" -> run(rest, String.join(" ", args));
-                case "q3" -> {
-                    if (rest.size() != 1 && rest.size() != 3)
-                        throw new IllegalArgumentException("q3 needs CONFIG.json [MATRIX ROWS]");
-                    io.euhedral_execution.inference.benchmark.run.Q3Microbenchmark.run(
-                            BenchmarkOptions.load(Path.of(rest.getFirst()), Instant.now()),
-                            rest.size() == 3 ? rest.get(1) : null,
-                            rest.size() == 3 ? Integer.valueOf(rest.get(2)) : null);
-                    yield 0;
-                }
-                case "q45" -> {
-                    if (rest.size() != 1 && rest.size() != 3)
-                        throw new IllegalArgumentException("q45 needs CONFIG.json [MATRIX ROWS]");
-                    io.euhedral_execution.inference.benchmark.run.Q45Microbenchmark.run(
-                            BenchmarkOptions.load(Path.of(rest.getFirst()), Instant.now()),
-                            rest.size() == 3 ? rest.get(1) : null,
-                            rest.size() == 3 ? Integer.valueOf(rest.get(2)) : null);
-                    yield 0;
-                }
                 case "import" -> importResults(rest);
                 default -> throw new IllegalArgumentException("unknown command " + args.getFirst());
             };
@@ -107,7 +85,7 @@ public final class BenchmarkMain {
         var prepared = Prerequisites.check(options, ProcessorTopology.system());
         System.out.println("workers: processors " + prepared.workers().processorIds() + ", cores "
                 + prepared.workers().coreIds());
-        System.out.println("prefill chunks: " + options.prefillChunks() + "; warmup " + options.warmup()
+        System.out.println("max context: " + options.maxContextTokens() + " tokens; warmup " + options.warmup()
                 + ", measured " + options.iterations() + " per scenario; generation " + options.generation()
                 + "; fork " + (forkId == null ? "unspecified" : forkId));
         prepared.prompts()
@@ -119,18 +97,6 @@ public final class BenchmarkMain {
             System.out.println("validation passed; no model was loaded");
             return 0;
         }
-        String capacity = GpuCapacity.check(
-                options.cudaLibrary(),
-                options.artifact(),
-                options.gpuHeadroomMiB(),
-                options.speculativeDepth() > 0 ? WeightResidency.SPECULATIVE : options.weightResidency(),
-                options.hostWeightMiB() * 1024L * 1024L,
-                options.stagingSlots());
-        if (capacity != null) {
-            System.err.println("not run: " + capacity);
-            return 3;
-        }
-
         var runtime = ManagementFactory.getRuntimeMXBean();
         var context = new BenchmarkRunner.Context(
                 UUID.randomUUID().toString(),
@@ -143,23 +109,36 @@ public final class BenchmarkMain {
                         "measured", "euhedral-inference-benchmark", commandLine, null, null, null),
                 Clock.systemUTC());
         var factory = EngineTarget.factory(
-                options.artifact(), options.tokenizer(), options.cudaLibrary(), options.shutdownTimeout());
+                options.artifact(),
+                options.tokenizer(),
+                options.cudaLibrary(),
+                prepared.workers().processorIds(),
+                options.maxContextTokens(),
+                options.shutdownTimeout());
+        // Load before creating the output, so a refused load leaves no empty result file.
+        BenchmarkRunner.Target target;
+        try {
+            target = factory.open();
+        } catch (IOException failure) {
+            System.err.println("not run: the engine did not load: " + failure.getMessage());
+            return 3;
+        }
         List<BenchmarkResult> rows;
-        try (var writer =
-                new ResultStore.Writer(options.output(), options.json(), options.overwrite(), options.append())) {
-            BenchmarkRunner.run(
-                    options,
-                    InferenceTuning.defaults(prepared.workers()),
-                    prepared.prompts(),
-                    factory,
-                    context,
-                    row -> {
-                        writer.write(row);
-                        System.out.println((row.warmup() ? "warmup " : "measured ")
-                                + row.scenario().name() + " #"
-                                + row.iteration() + ": " + row.status()
-                                + (row.statusReason() == null ? "" : " (" + row.statusReason() + ")"));
-                    });
+        ResultStore.Writer opened;
+        try {
+            opened = new ResultStore.Writer(options.output(), options.json(), options.overwrite(), options.append());
+        } catch (IOException | RuntimeException failure) {
+            target.close();
+            throw failure;
+        }
+        try (var writer = opened) {
+            BenchmarkRunner.run(options, prepared.prompts(), () -> target, context, row -> {
+                writer.write(row);
+                System.out.println((row.warmup() ? "warmup " : "measured ")
+                        + row.scenario().name() + " #"
+                        + row.iteration() + ": " + row.status()
+                        + (row.statusReason() == null ? "" : " (" + row.statusReason() + ")"));
+            });
             rows = writer.rows();
         }
         System.out.println();

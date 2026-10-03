@@ -48,17 +48,11 @@ public class ChatCompletionService implements DisposableBean {
                 ? new SynchronousQueue<>()
                 : new ArrayBlockingQueue<>(properties.maxQueuedGenerations());
         var threadIds = new AtomicInteger();
-        this.executor = new ThreadPoolExecutor(
-                properties.maxConcurrentGenerations(),
-                properties.maxConcurrentGenerations(),
-                0L,
-                TimeUnit.MILLISECONDS,
-                queue,
-                task -> {
-                    Thread thread = new Thread(task, "euhedral-generation-" + threadIds.incrementAndGet());
-                    thread.setDaemon(true);
-                    return thread;
-                });
+        this.executor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, queue, task -> {
+            Thread thread = new Thread(task, "euhedral-generation-" + threadIds.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     /// Non-streaming completion. The servlet thread is released while generation runs.

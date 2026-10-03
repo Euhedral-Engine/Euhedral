@@ -92,10 +92,9 @@ class QwenFullModelCudaIntegrationTest {
             QwenExecutionPlan.Buffer.FFN_DELTA,
             QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
 
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.EnumSource(Q3DispatchMode.class)
+    @Test
     @Timeout(value = 1200, unit = TimeUnit.SECONDS)
-    void realCompactQwenRunsAllLayersMatchesLocalReferencesAndPreservesState(Q3DispatchMode mode) throws Exception {
+    void realCompactQwenRunsAllLayersMatchesLocalReferencesAndPreservesState() throws Exception {
         Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact"));
         Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
         assertTrue(Files.isRegularFile(artifactPath), "compact Qwen artifact is missing: " + artifactPath);
@@ -104,7 +103,7 @@ class QwenFullModelCudaIntegrationTest {
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(QwenLayerType.FULL_ATTENTION));
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(QwenLayerType.GATED_DELTA_NET));
 
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath, mode, Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD)) {
+        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
             long allocatedBefore = gpu.allocatedBytes();
             QwenModel model = QwenModel.load(artifactPath, artifact, gpu);
             QwenWeights weights = model.weights();
@@ -255,14 +254,14 @@ class QwenFullModelCudaIntegrationTest {
                                 .forLayer(3)
                                 .length());
                 reportError(
-                        mode + " hidden",
+                        "hidden",
                         reference.layerOutputs().get(63),
                         cleanSequence.buffers().get(QwenExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
                 reportError(
-                        mode + " normalized",
+                        "normalized",
                         reference.finalNormalized(),
                         cleanSequence.buffers().get(QwenExecutionPlan.Buffer.FINAL_NORMALIZED));
-                reportError(mode + " logits", reference.logits(), cleanSequence.logits());
+                reportError("logits", reference.logits(), cleanSequence.logits());
                 // NVFP4 has a discrete, lossy KV boundary. Independent CPU/GPU
                 // projection rounding can select different codes and compound across
                 // layers. Accumulated hidden/logit differences are diagnostic, not a

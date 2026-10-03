@@ -13,7 +13,6 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
 import java.util.SplittableRandom;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -49,7 +48,7 @@ class CudaGpuOperationsIntegrationTest {
                     long x = upload(gpu, arena, input), w = upload(gpu, arena, packed);
                     long y = gpu.allocate((long) rows * outputs * Short.BYTES);
                     try {
-                        gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, Q3DispatchMode.SCALAR);
+                        gpu.referenceLinearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
                         short[] expected = download(gpu, arena, y, rows * outputs);
                         int status = (int) kernel.invokeExact(
                                 MemorySegment.ofAddress(x),
@@ -102,7 +101,7 @@ class CudaGpuOperationsIntegrationTest {
                         long x = upload(gpu, arena, input), w = upload(gpu, arena, packed);
                         long y = gpu.allocate((long) rows * outputs * Short.BYTES);
                         try {
-                            gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, Q3DispatchMode.SCALAR);
+                            gpu.referenceLinearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
                             short[] expected = download(gpu, arena, y, rows * outputs);
                             int status = (int) kernel.invokeExact(
                                     MemorySegment.ofAddress(x),
@@ -121,69 +120,6 @@ class CudaGpuOperationsIntegrationTest {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    @Test
-    void mixerQ3AutoMatchesExplicitTile64AcrossDispatchBoundary() throws Throwable {
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                Arena arena = Arena.ofConfined()) {
-            // The BF16 tile routes are what is compared; the FP8 route (rows >= 128) has its own tests.
-            gpu.selectQ3Mx(false);
-            var symbols = java.lang.foreign.SymbolLookup.libraryLookup(library, arena);
-            var descriptor = java.lang.foreign.FunctionDescriptor.of(
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.ADDRESS,
-                    java.lang.foreign.ValueLayout.ADDRESS,
-                    java.lang.foreign.ValueLayout.ADDRESS,
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.JAVA_LONG);
-            var explicit = java.lang.foreign.Linker.nativeLinker()
-                    .downcallHandle(
-                            symbols.find("euhedral_cuda_linear_q3_prefill_64_bf16")
-                                    .orElseThrow(),
-                            descriptor);
-            int width = 6144, outputs = 5120;
-            byte[] packed = q3Weights(outputs, width);
-            long w = upload(gpu, arena, packed);
-            try {
-                for (int rows : new int[] {96, 97, 127, 128, 256, 511, 512, 513}) {
-                    short[] input = new short[rows * width];
-                    for (int i = 0; i < input.length; i++) input[i] = floatToBf16((i % 23 - 11) * 0.125f);
-                    long x = upload(gpu, arena, input);
-                    short[] sentinel = new short[rows * outputs];
-                    Arrays.fill(sentinel, (short) 0x7fff);
-                    long autoOutput = upload(gpu, arena, sentinel);
-                    long explicitOutput = upload(gpu, arena, sentinel);
-                    try {
-                        gpu.linearQ3Bf16(x, w, autoOutput, rows, width, outputs, packed.length);
-                        int status = (int) explicit.invokeExact(
-                                MemorySegment.ofAddress(x),
-                                MemorySegment.ofAddress(w),
-                                MemorySegment.ofAddress(explicitOutput),
-                                rows,
-                                width,
-                                outputs,
-                                (long) packed.length);
-                        assertEquals(0, status, "explicit tile64 at rows=" + rows);
-                        short[] actual = download(gpu, arena, autoOutput, rows * outputs);
-                        assertArrayEquals(download(gpu, arena, explicitOutput, rows * outputs), actual, "rows=" + rows);
-                        for (short value : actual) {
-                            if (value == (short) 0x7fff)
-                                throw new AssertionError("unwritten mixer output at rows=" + rows);
-                        }
-                    } finally {
-                        gpu.free(explicitOutput);
-                        gpu.free(autoOutput);
-                        gpu.free(x);
-                    }
-                }
-            } finally {
-                gpu.free(w);
             }
         }
     }
@@ -208,27 +144,21 @@ class CudaGpuOperationsIntegrationTest {
                 long y = gpu.allocate((long) rows * outputs * Short.BYTES);
                 boolean previous = gpu.selectExactNumerics(true);
                 try {
-                    gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, Q3DispatchMode.SCALAR);
+                    gpu.referenceLinearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
                     short[] expected = download(gpu, arena, y, rows * outputs);
-                    // Exact numerics: the specialized paths match the scalar reference to one BF16 step.
-                    for (var mode : new Q3DispatchMode[] {Q3DispatchMode.DECODE, Q3DispatchMode.PREFILL}) {
-                        gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, mode);
-                        short[] actual = download(gpu, arena, y, rows * outputs);
-                        if (mode == Q3DispatchMode.DECODE) assertArrayEquals(expected, actual);
-                        else
-                            for (int i = 0; i < actual.length; i++) {
-                                float error = Math.abs(bf16ToFloat(expected[i]) - bf16ToFloat(actual[i]));
-                                boolean adjacent = (expected[i] < 0) == (actual[i] < 0)
-                                        && Math.abs((expected[i] & 0xffff) - (actual[i] & 0xffff)) <= 1;
-                                assertTrue(
-                                        Float.isFinite(error) && (error <= 0.001f || adjacent),
-                                        "scale edge index " + i);
-                            }
+                    // Exact numerics: the production route matches the scalar reference to one BF16 step.
+                    gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
+                    short[] actual = download(gpu, arena, y, rows * outputs);
+                    for (int i = 0; i < actual.length; i++) {
+                        float error = Math.abs(bf16ToFloat(expected[i]) - bf16ToFloat(actual[i]));
+                        boolean adjacent = (expected[i] < 0) == (actual[i] < 0)
+                                && Math.abs((expected[i] & 0xffff) - (actual[i] & 0xffff)) <= 1;
+                        assertTrue(Float.isFinite(error) && (error <= 0.001f || adjacent), "scale edge index " + i);
                     }
                     // Relaxed numerics stage the BF16 rounding of each code * scale: the result stays within
                     // 1% of the output RMS of the reference, at every scale edge.
                     gpu.selectExactNumerics(false);
-                    gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length, Q3DispatchMode.PREFILL);
+                    gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
                     short[] relaxed = download(gpu, arena, y, rows * outputs);
                     double sum = 0;
                     for (short value : expected) sum += (double) bf16ToFloat(value) * bf16ToFloat(value);

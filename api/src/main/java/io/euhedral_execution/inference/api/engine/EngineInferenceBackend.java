@@ -39,7 +39,9 @@ public final class EngineInferenceBackend implements InferenceBackend {
 
     @Override
     public int contextLength() {
-        return this.engine.modelConfig().maxPositionEmbeddings();
+        return Math.min(
+                this.engine.config().maxContextTokens(),
+                this.engine.modelConfig().maxPositionEmbeddings());
     }
 
     @Override

@@ -10,7 +10,6 @@ import io.euhedral_execution.inference.benchmark.BenchmarkFixtures;
 import io.euhedral_execution.inference.benchmark.config.Scenario;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.run.BenchmarkRunner;
-import io.euhedral_execution.inference.core.InferenceTuning;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -28,8 +27,7 @@ class ResultStoreTest {
                 List.of(new Scenario(Scenario.Kind.PREFILL, 6, 0), new Scenario(Scenario.Kind.SUSTAINED_DECODE, 2, 3));
         List<BenchmarkResult> rows = new ArrayList<>();
         BenchmarkRunner.run(
-                BenchmarkFixtures.options(List.of(512), scenarios, 1, 2),
-                InferenceTuning.defaults(BenchmarkFixtures.bits(0)),
+                BenchmarkFixtures.options(scenarios, 1, 2),
                 BenchmarkFixtures.prompts(scenarios),
                 BenchmarkFixtures.FakeTarget::new,
                 BenchmarkFixtures.context(),
@@ -139,7 +137,7 @@ class ResultStoreTest {
                         .map(BenchmarkResult::implementation)
                         .distinct()
                         .toList());
-        assertTrue(Summary.format(combined).contains("ninfer | chunk - | prefill-1024"), Summary.format(combined));
+        assertTrue(Summary.format(combined).contains("ninfer | - | prefill-1024"), Summary.format(combined));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> ResultStore.importRows(source, "euhedral-inference", null),

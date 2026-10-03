@@ -1,9 +1,8 @@
 package io.euhedral_execution.inference.core;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.euhedral_execution.inference.core.gpu.Q3DispatchMode;
+import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
@@ -14,26 +13,26 @@ import java.util.Objects;
 
 /// Immutable record of one engine's effective experiment inputs, suitable for stable JSON.
 ///
-/// Worker processor IDs appear only under `tuning`, in ascending order. `workerCoreIds` are the
+/// Worker processor IDs appear only under `configuration`, in ascending order. `workerCoreIds` are the
 /// Euhedral core IDs derived from them at load; one lattice worker runs per core. These are the
 /// validated processors handed to Euhedral, not a live observation of active workers. Identity
 /// values are measured once at load, outside any generation. `generation` is null unless supplied.
 public record InferenceRunSnapshot(
         int schemaVersion,
-        Tuning tuning,
+        Configuration configuration,
         List<Integer> workerCoreIds,
         Model model,
         GenerationConfig generation,
         RuntimeIdentity runtime) {
-    /// Version 2 dropped `tuning.gpuExecutionMode`: every run submits asynchronously.
-    public static final int SCHEMA_VERSION = 2;
+    /// Version 3 replaced the tuning axes with `configuration`: the engine derives its policy from the artifact.
+    public static final int SCHEMA_VERSION = 3;
     /// Explicit value for identity the runtime does not expose.
     public static final String UNAVAILABLE = "unavailable";
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
     public InferenceRunSnapshot {
-        Objects.requireNonNull(tuning, "tuning");
+        Objects.requireNonNull(configuration, "configuration");
         workerCoreIds = List.copyOf(workerCoreIds);
         Objects.requireNonNull(model, "model");
         Objects.requireNonNull(runtime, "runtime");
@@ -48,32 +47,20 @@ public record InferenceRunSnapshot(
         }
     }
 
-    /// Version-1 records carried `gpuExecutionMode`; it is ignored when they are read.
-    @JsonIgnoreProperties({"gpuExecutionMode"})
-    public record Tuning(
-            List<Integer> workerProcessorIds,
-            int prefillChunkTokens,
-            Q3DispatchMode q3DispatchMode,
-            int q3SmallRowThreshold) {
-        public Tuning {
+    /// The inputs the engine was loaded with and the policy it derived from the artifact.
+    /// `artifact` is [ArtifactProfile#artifactName()], null when no artifact was profiled.
+    public record Configuration(
+            List<Integer> workerProcessorIds, int maxContextTokens, String artifact, int speculativeDepth) {
+        public Configuration {
             workerProcessorIds = List.copyOf(workerProcessorIds);
-            q3DispatchMode = q3DispatchMode == null ? Q3DispatchMode.SCALAR : q3DispatchMode;
         }
 
-        public Tuning(List<Integer> workerProcessorIds, int prefillChunkTokens) {
-            this(
-                    workerProcessorIds,
-                    prefillChunkTokens,
-                    Q3DispatchMode.AUTO,
-                    Q3DispatchMode.DEFAULT_SMALL_ROW_THRESHOLD);
-        }
-
-        public static Tuning of(InferenceTuning tuning) {
-            return new Tuning(
-                    ids(tuning.workerProcessorIds()),
-                    tuning.prefillChunkTokens(),
-                    tuning.q3DispatchMode(),
-                    tuning.q3SmallRowThreshold());
+        public static Configuration of(InferenceConfig config, ArtifactProfile profile) {
+            return new Configuration(
+                    ids(config.workerCpus()),
+                    config.maxContextTokens(),
+                    profile == null ? null : profile.artifactName(),
+                    profile == null ? 0 : profile.speculativeDepth());
         }
     }
 

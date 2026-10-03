@@ -9,14 +9,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
-import io.euhedral_execution.inference.benchmark.BenchmarkFixtures;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
-import io.euhedral_execution.inference.core.InferenceTuning;
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.BitSet;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -47,7 +45,7 @@ class BenchmarkOptionsTest {
     void defaultsMatchTheProductionEngineDefaults() throws Exception {
         var options = load("");
         assertEquals(Path.of("/m.edrl"), options.artifact());
-        assertEquals(List.of(InferenceTuning.DEFAULT_PREFILL_CHUNK_TOKENS), options.prefillChunks());
+        assertEquals(InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS, options.maxContextTokens());
         assertEquals("all", options.cpus());
         assertEquals(Scenario.DEFAULT_SUITE, options.scenarios());
         assertEquals(1, options.warmup());
@@ -57,35 +55,25 @@ class BenchmarkOptionsTest {
         assertEquals(Path.of("benchmark-results/euhedral-20260925T120000Z.jsonl"), options.output());
         assertFalse(options.json());
         assertFalse(options.gpuMemory());
-        assertEquals(1024L, options.gpuHeadroomMiB());
         assertEquals(10L, options.shutdownTimeout().toSeconds());
     }
 
     @Test
-    void retiredExecutionModeOptionIsRejected() {
-        // Every run submits asynchronously; a configuration that still selects a mode is stale.
-        assertThrows(Exception.class, () -> load("\"gpuExecutionMode\":\"SYNC\""));
+    void unknownEngineOptionsAreRejected() {
+        assertInstanceOf(
+                UnrecognizedPropertyException.class,
+                assertThrows(Exception.class, () -> load("\"gpuExecutionMode\":\"SYNC\"")));
     }
 
     @Test
-    void q3PolicySurvivesDefaultOutputAndSweep() throws Exception {
-        var options = load("\"q3DispatchMode\":\"AUTO\",\"q3SmallRowThreshold\":8,\"prefillChunks\":[256,512]");
-        var tuning = options.sweep(InferenceTuning.defaults(BenchmarkFixtures.bits(2)))
-                .getFirst();
-        assertEquals(io.euhedral_execution.inference.core.gpu.Q3DispatchMode.AUTO, tuning.q3DispatchMode());
-        assertEquals(8, tuning.q3SmallRowThreshold());
-        assertEquals(256, tuning.prefillChunkTokens());
-        assertTrue(rejection("\"q3SmallRowThreshold\":-1").contains("threshold"));
-    }
-
-    @Test
-    void bindsEveryAxisAndExpandsThePrefillSweep() throws Exception {
+    void bindsEveryOption() throws Exception {
         var options = load("""
-                "cpus":"2-5,8","excludeCpus":[3],"excludeCores":[1],"prefillChunks":[512,256,1024],
+                "maxContextTokens":8192,"cpus":"2-5,8","excludeCpus":[3],"excludeCores":[1],
                 "scenarios":["prefill:64","decode:32:128"],"warmup":0,"iterations":5,
                 "generation":{"mode":"sample","seed":9,"temperature":0.6,"topK":10,"topP":0.9},
-                "promptSeed":4,"output":"out/run.json","gpuMemory":true,"gpuHeadroomMiB":512,
+                "promptSeed":4,"output":"out/run.json","gpuMemory":true,
                 "shutdownTimeoutSeconds":30""");
+        assertEquals(8192, options.maxContextTokens());
         assertEquals("2-5,8", options.cpus());
         assertEquals(List.of(3), options.excludeCpus());
         assertEquals(List.of(1), options.excludeCores());
@@ -99,13 +87,6 @@ class BenchmarkOptionsTest {
                 options.generation().toConfig());
         assertTrue(options.json(), "a .json output writes one document");
         assertTrue(options.gpuMemory());
-        BitSet workers = BenchmarkFixtures.bits(4);
-        assertEquals(
-                List.of(
-                        new InferenceTuning(workers, 512),
-                        new InferenceTuning(workers, 256),
-                        new InferenceTuning(workers, 1024)),
-                options.sweep(InferenceTuning.defaults(workers)));
     }
 
     @Test
@@ -130,9 +111,7 @@ class BenchmarkOptionsTest {
         assertInstanceOf(
                 UnrecognizedPropertyException.class,
                 assertThrows(Exception.class, () -> load("\"generation\":{\"beam\":4}")));
-        assertEquals("prefillChunks values must be positive", rejection("\"prefillChunks\":[0]"));
-        assertEquals("prefillChunks contains duplicates", rejection("\"prefillChunks\":[512,512]"));
-        assertEquals("prefillChunks selects no values", rejection("\"prefillChunks\":[]"));
+        assertEquals("maxContextTokens must be positive", rejection("\"maxContextTokens\":0"));
         assertEquals("iterations must be positive", rejection("\"iterations\":0"));
         assertEquals("warmup must not be negative", rejection("\"warmup\":-1"));
         assertEquals("generation.mode must be greedy or sample", rejection("\"generation\":{\"mode\":\"beam\"}"));

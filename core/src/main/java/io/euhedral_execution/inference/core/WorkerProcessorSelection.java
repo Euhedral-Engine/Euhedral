@@ -6,7 +6,7 @@ import java.util.Objects;
 /// Immutable, non-empty set of worker processor IDs resolved against a [ProcessorTopology].
 ///
 /// Obtain one from the topology (all processors, one per physical core, performance cores, or
-/// explicit IDs), refine it, then pass [#processorIds()] to [InferenceTuning]. Every refinement
+/// explicit IDs), refine it, then pass [#processorIds()] to [InferenceConfig]. Every refinement
 /// returns a new selection and rejects results that are empty or reference unavailable IDs.
 public final class WorkerProcessorSelection {
     private final ProcessorTopology topology;

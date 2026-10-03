@@ -22,12 +22,10 @@ import java.lang.invoke.VarHandle;
 public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     private static final VarHandle ARRIVALS;
-    private static final VarHandle CONTINUED;
 
     static {
         try {
             ARRIVALS = MethodHandles.lookup().findVarHandle(StageFrame.class, "arrivals", int.class);
-            CONTINUED = MethodHandles.lookup().findVarHandle(StageFrame.class, "continued", int.class);
         } catch (ReflectiveOperationException failure) {
             throw new ExceptionInInitializerError(failure);
         }
@@ -39,8 +37,6 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     StageFrame[] submittedSuccessors;
     StageGraph.RetiredEdge[] retiredEdges;
     StageFrame[] submittedPredecessors;
-    /// The only predecessor when this stage continues a linear chain; null otherwise.
-    StageFrame chainPredecessor;
     /// The predecessor whose longest remaining path continues through this stage; null otherwise.
     StageFrame pathPredecessor;
     /// Recorded on this stage's lane after it submits when it has successors (multi-lane pools only).
@@ -51,10 +47,6 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     @SuppressWarnings("unused")
     private volatile int arrivals;
-
-    /// 1 once a successor continued this stage's lane in the current quantum (FORK placement).
-    @SuppressWarnings("unused")
-    private volatile int continued;
 
     boolean attempted;
     boolean submitted;
@@ -157,29 +149,15 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         return (int) ARRIVALS.getAndAdd(this, 1) + 1 == this.inDegree;
     }
 
-    /// The lane this stage may continue under the pool's placement, or -1.
+    /// The lane this stage continues, or -1: its path predecessor's, or the graph's home lane for a root.
     private int continuedLane(LanePool pool, StageGraph owner) {
-        if (pool.placement() == LanePool.Placement.CHAIN) {
-            return this.chainPredecessor == null ? -1 : this.chainPredecessor.lane;
-        }
         if (pool.size() == 1) return -1;
-        if (pool.placement() == LanePool.Placement.PATH) {
-            if (this.submittedPredecessors.length == 0) return owner.home();
-            return this.pathPredecessor == null ? -1 : this.pathPredecessor.lane;
-        }
-        if (pool.placement() != LanePool.Placement.FORK) return -1;
         if (this.submittedPredecessors.length == 0) return owner.home();
-        // Latest predecessor first: it is the most recent work in its lane.
-        for (int index = this.submittedPredecessors.length - 1; index >= 0; index--) {
-            StageFrame predecessor = this.submittedPredecessors[index];
-            if ((int) CONTINUED.compareAndExchange(predecessor, 0, 1) == 0) return predecessor.lane;
-        }
-        return -1;
+        return this.pathPredecessor == null ? -1 : this.pathPredecessor.lane;
     }
 
     final void reset() {
         ARRIVALS.set(this, 0);
-        CONTINUED.set(this, 0);
         this.attempted = false;
         this.submitted = false;
     }

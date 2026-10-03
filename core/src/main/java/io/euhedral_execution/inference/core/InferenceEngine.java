@@ -8,9 +8,9 @@ import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.model_loader.HostWeightSelection;
+import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
+import io.euhedral_execution.inference.core.model_loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
@@ -49,7 +49,8 @@ public final class InferenceEngine implements AutoCloseable {
     private final ControlPlaneLattice lattice;
     private final QwenExecutionPlan plan;
     private final EuhedralInferenceRuntime runtime;
-    private final InferenceTuning tuning;
+    private final InferenceConfig config;
+    private final ArtifactProfile profile;
     private final BitSet workerCoreIds;
     private final InferenceRunSnapshot.Model modelIdentity;
     private final InferenceRunSnapshot.RuntimeIdentity runtimeIdentity;
@@ -66,7 +67,8 @@ public final class InferenceEngine implements AutoCloseable {
             ControlPlaneLattice lattice,
             QwenExecutionPlan plan,
             EuhedralInferenceRuntime runtime,
-            InferenceTuning tuning,
+            InferenceConfig config,
+            ArtifactProfile profile,
             BitSet workerCoreIds,
             InferenceRunSnapshot.Model modelIdentity,
             InferenceRunSnapshot.RuntimeIdentity runtimeIdentity) {
@@ -77,26 +79,26 @@ public final class InferenceEngine implements AutoCloseable {
         this.lattice = lattice;
         this.plan = plan;
         this.runtime = runtime;
-        this.tuning = tuning;
+        this.config = config;
+        this.profile = profile;
         this.workerCoreIds = workerCoreIds;
         this.modelIdentity = modelIdentity;
         this.runtimeIdentity = runtimeIdentity;
     }
 
     /// Loads all model resources and starts the lattice before returning an engine.
-    /// The config's [InferenceTuning] is applied as given; worker processor IDs are checked against
-    /// the host [ProcessorTopology] before the tokenizer, model, or GPU is loaded.
+    /// Worker processor IDs are checked against the host [ProcessorTopology] before the tokenizer, model,
+    /// or GPU is loaded. The execution policy and weight residency are derived from the artifact.
     public static InferenceEngine load(InferenceConfig config) throws IOException {
         return load(config, new Bootstrap());
     }
 
     static InferenceEngine load(InferenceConfig config, Bootstrap bootstrap) throws IOException {
         Objects.requireNonNull(config, "config");
-        InferenceTuning tuning = config.tuning();
         // Euhedral silently drops unavailable CPUs; fail before claiming the lattice or loading anything.
         ProcessorTopology topology = bootstrap.processorTopology();
-        topology.requireAvailable(tuning.workerProcessorIds());
-        BitSet workerCoreIds = topology.coreIds(tuning.workerProcessorIds());
+        topology.requireAvailable(config.workerCpus());
+        BitSet workerCoreIds = topology.coreIds(config.workerCpus());
         if (!LATTICE_OWNED.compareAndSet(false, true))
             throw new IllegalStateException("an inference engine already owns the process-wide Euhedral lattice");
         ExecutionGpu gpu = null;
@@ -105,8 +107,9 @@ public final class InferenceEngine implements AutoCloseable {
         try {
             QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
             QwenArtifact artifact = bootstrap.readArtifact(config.artifactPath());
-            gpu = bootstrap.openGpu(config.cudaLibraryPath(), tuning);
-            model = bootstrap.loadModel(config.artifactPath(), artifact, gpu, tuning);
+            gpu = bootstrap.openGpu(config.cudaLibraryPath());
+            ArtifactProfile profile = artifact == null ? null : ArtifactProfile.of(artifact);
+            model = bootstrap.loadModel(config.artifactPath(), artifact, profile, gpu, config.maxContextTokens());
             QwenExecutionPlan plan = new QwenExecutionPlan(model.weights(), model.staging());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
@@ -119,7 +122,8 @@ public final class InferenceEngine implements AutoCloseable {
                     lattice,
                     plan,
                     runtime,
-                    tuning,
+                    config,
+                    profile,
                     workerCoreIds,
                     modelIdentity(config.artifactPath(), artifact, model),
                     runtimeIdentity(config.cudaLibraryPath()));
@@ -191,6 +195,12 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// Creates independent sequence/sampler/decoder state borrowing this engine's shared runtime.
     public synchronized QwenGenerationSession createSession(GenerationConfig config) {
+        return createSession(config, QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS);
+    }
+
+    /// As [#createSession(GenerationConfig)] with a smaller prefill chunk, so tests can exercise several
+    /// prefill quanta on short prompts.
+    synchronized QwenGenerationSession createSession(GenerationConfig config, int prefillChunkTokens) {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
         this.gpu.ensureHealthy();
         var session = new QwenGenerationSession(
@@ -200,10 +210,10 @@ public final class InferenceEngine implements AutoCloseable {
                 this.gpu,
                 SEQUENCE_IDS.getAndIncrement(),
                 Objects.requireNonNull(config, "config"),
-                this.tuning.prefillChunkTokens(),
+                prefillChunkTokens,
                 this::releaseSession);
-        if (this.tuning.speculativeDepth() > 0 && this.plan.drafts())
-            session.enableSpeculativeDecoding(this.tuning.speculativeDepth());
+        if (this.profile != null && this.profile.speculativeDepth() > 0 && this.plan.drafts())
+            session.enableSpeculativeDecoding(this.profile.speculativeDepth());
         this.sessions.add(session);
         return session;
     }
@@ -220,9 +230,14 @@ public final class InferenceEngine implements AutoCloseable {
         return this.model.weights().config();
     }
 
-    /// Returns the immutable tuning this engine was loaded with; its worker IDs are the engine's workers.
-    public InferenceTuning tuning() {
-        return this.tuning;
+    /// Returns the configuration this engine was loaded with; its worker IDs are the engine's workers.
+    public InferenceConfig config() {
+        return this.config;
+    }
+
+    /// Returns what the loaded artifact is, or null when the engine was started without a profiled artifact.
+    public ArtifactProfile profile() {
+        return this.profile;
     }
 
     /// Returns an experiment snapshot without generation settings. Identity was measured at load.
@@ -234,7 +249,7 @@ public final class InferenceEngine implements AutoCloseable {
     public InferenceRunSnapshot snapshot(GenerationConfig generation) {
         return new InferenceRunSnapshot(
                 InferenceRunSnapshot.SCHEMA_VERSION,
-                InferenceRunSnapshot.Tuning.of(this.tuning),
+                InferenceRunSnapshot.Configuration.of(this.config, this.profile),
                 InferenceRunSnapshot.ids(this.workerCoreIds),
                 this.modelIdentity,
                 generation,
@@ -392,29 +407,20 @@ public final class InferenceEngine implements AutoCloseable {
             return QwenArtifactReader.read(path);
         }
 
-        ExecutionGpu openGpu(Path path, InferenceTuning tuning) {
-            return new CudaGpuMemory(path, tuning.q3DispatchMode(), tuning.q3SmallRowThreshold());
+        ExecutionGpu openGpu(Path path) {
+            return new CudaGpuMemory(path);
         }
 
-        QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu) throws IOException {
-            return QwenModel.load(path, artifact, gpu);
-        }
-
-        QwenModel loadModel(Path path, QwenArtifact artifact, ExecutionGpu gpu, InferenceTuning tuning)
+        /// Loads the artifact's executed objects, keeping in host memory only as many weights as a context
+        /// of `maxContextTokens` needs to fit in the device's free memory.
+        QwenModel loadModel(
+                Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContextTokens)
                 throws IOException {
-            boolean speculative = tuning.speculativeDepth() > 0;
-            if (!speculative && tuning.weightResidency() == WeightResidency.ALL && tuning.hostWeightBytes() == 0)
-                return loadModel(path, artifact, gpu);
-            // Speculative decoding needs the MTP layer prepared for execution and the draft head; only the
-            // SPECULATIVE residency loads them so (it leaves out the vision tower).
-            WeightResidency residency = speculative ? WeightResidency.SPECULATIVE : tuning.weightResidency();
-            return QwenModel.load(
-                    path,
-                    artifact,
-                    gpu,
-                    residency,
-                    HostWeightSelection.select(artifact, tuning.hostWeightBytes()),
-                    tuning.stagingSlots());
+            var plan = ResidencyPlanner.plan(artifact, profile, memoryInfo(gpu).freeBytes(), maxContextTokens);
+            if (!plan.fits())
+                throw new IOException("a context of " + maxContextTokens + " tokens does not fit on this GPU; set a "
+                        + "smaller max context");
+            return QwenModel.load(path, artifact, gpu, profile.speculative(), plan.hostBacked());
         }
 
         ControlPlaneLattice createLattice(InferenceConfig config) {

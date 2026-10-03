@@ -127,8 +127,7 @@ class StageGraphTest {
         side.base = 100;
         idle.base = 200;
         // Stage 2 runs on lane 1; every other stage on lane 0 (the graph's home lane). Lane 2 stays unused.
-        LanePool pool = new LanePool(
-                new RecordingStream[] {home, side, idle}, LanePool.Placement.RANDOM, stage -> stage == 2 ? 1 : 0);
+        LanePool pool = new LanePool(new RecordingStream[] {home, side, idle}, stage -> stage == 2 ? 1 : 0);
         StageGraph graph =
                 new StageGraph(DIAMOND, StageGraphFixtures.TestStage::new, pool, true, this.source, this.recycler);
         TestQuantum quantum = start(graph);
@@ -155,13 +154,13 @@ class StageGraphTest {
     }
 
     @Test
-    void pathPlacementKeepsTheLongestChainOnTheHomeLaneWhicheverBranchRunsFirst() {
+    void placementKeepsTheLongestChainOnTheHomeLaneWhicheverBranchRunsFirst() {
         RecordingStream home = this.stream, side = new RecordingStream(), other = new RecordingStream();
         side.base = 100;
         other.base = 200;
         // 0 -> 1 -> 3 -> 4 is the longest path; 0 -> 2 -> 4 is the side branch.
         StageTopology topology = StageTopology.submitted(new int[][] {{}, {0}, {0}, {1}, {2, 3}});
-        LanePool pool = new LanePool(new RecordingStream[] {home, side, other}, LanePool.Placement.PATH);
+        LanePool pool = new LanePool(new RecordingStream[] {home, side, other});
         StageGraph graph =
                 new StageGraph(topology, StageGraphFixtures.TestStage::new, pool, true, this.source, this.recycler);
         TestQuantum quantum = start(graph);
@@ -191,7 +190,7 @@ class StageGraphTest {
         copy.base = 200;
         // 1 and 3 are transfers feeding 2 and 4; 0 -> 2 -> 4 is the compute chain.
         StageTopology topology = StageTopology.submitted(new int[][] {{}, {}, {0, 1}, {2}, {2, 3}});
-        LanePool pool = LanePool.withTransferLane(new RecordingStream[] {home, side}, copy, LanePool.Placement.PATH);
+        LanePool pool = LanePool.withTransferLane(new RecordingStream[] {home, side}, copy);
         assertEquals(2, pool.transferLane());
         for (int stage = 0; stage < 64; stage++) assertTrue(pool.choose(stage, 2) < 2, "compute never takes it");
         StageGraph graph = new StageGraph(

@@ -3,8 +3,9 @@
 The `benchmark` Gradle module is an end-to-end harness. It loads `InferenceEngine`, creates a fresh
 `QwenGenerationSession` for every iteration, and runs the real tokenizer -> Euhedral lattice -> CUDA
 path. It is not part of `core` or `api` and is not packaged in the API JAR. The `run` command writes
-end-to-end engine measurements. The separate `q3` command writes explicitly labeled operator
-microbenchmarks, not engine results.
+end-to-end engine measurements. The engine derives its execution policy (kernels, speculative
+depth, host-backed weight residency) from the artifact, and prefill runs in 512-token chunks, so
+the harness measures what a user of the engine gets.
 
 ## Workflow
 
@@ -25,8 +26,9 @@ Change one variable at a time and keep the JSON for every run you compare.
    ./gradlew cudaIntegrationTest -Peuhedral.qwen.artifact=/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl
    ```
 
-3. **Check the GPU is free.** The harness refuses to load when free device memory is below the
-   artifact size plus `gpuHeadroomMiB` (default 1024). It never stops other processes. Look first:
+3. **Check the GPU is free.** The engine refuses to load, and the run exits with code 3 without
+   writing results, when the model and a KV cache for `maxContextTokens` do not fit in free device
+   memory. The harness never stops other processes. Look first:
 
    ```bash
    nvidia-smi --query-gpu=memory.used,memory.total --format=csv
@@ -43,8 +45,8 @@ Change one variable at a time and keep the JSON for every run you compare.
    ./gradlew :benchmark:run --args="run benchmark/configs/baseline.json --validate-only"
    ```
 
-5. **Baseline benchmark.** The default suite with production defaults: all available processors
-   and 512-token prefill chunks.
+5. **Baseline benchmark.** The default suite on all available processors with the default
+   context capacity.
 
    ```bash
    ./gradlew :benchmark:run --args="run benchmark/configs/baseline.json"
@@ -75,10 +77,9 @@ Change one variable at a time and keep the JSON for every run you compare.
    from timing baselines. The example `smoke.json` output must not already exist unless a separate
    profiling config opts into overwriting it.
 
-8. **Change one variable**, for example the prefill chunk or the CPU selection:
+8. **Change one variable**, for example the CPU selection:
 
    ```bash
-   ./gradlew :benchmark:run --args="run benchmark/configs/prefill-chunk-256.json"
    ./gradlew :benchmark:run --args="run benchmark/configs/custom-cpus.json"
    ```
 
@@ -99,19 +100,17 @@ against the working directory, which is the repository root under `./gradlew :be
 | Field | Default | Meaning |
 | ----- | ------- | ------- |
 | `artifact`, `tokenizer`, `cudaLibrary` | required | Model artifact, tokenizer directory, native library. |
+| `maxContextTokens` | `32768` | Longest sequence (prompt plus generation) the engine keeps device memory for; scenarios that need more positions are rejected. Recorded in the run snapshot. |
 | `cpus` | `all` | `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges (`"2-5,8"`). |
 | `excludeCpus`, `excludeCores` | `[]` | Processor IDs or Euhedral core IDs removed from the selection. |
-| `prefillChunks` | `[512]` | Prefill chunk sweep. One engine load per value; each runs every scenario. |
 | `scenarios` | default suite | Strings: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`. |
-| `warmup`, `iterations` | `1`, `3` | Warmup and measured iterations per scenario and chunk value. |
+| `warmup`, `iterations` | `1`, `3` | Warmup and measured iterations per scenario. |
 | `generation` | `{"mode":"greedy","seed":1}` | `sample` mode also takes `temperature`, `topK`, `topP` (0.7, 20, 0.8). |
 | `promptSeed` | `20260925` | Seed for prompt material. |
 | `output` | `benchmark-results/euhedral-<UTC>.jsonl` | A `.json` path writes one document; any other path writes JSONL. |
 | `overwrite`, `append` | `false` | Required when `output` exists. `append` is JSONL only. |
 | `gpuMemory` | `false` | Record device free/total memory before and after each iteration, outside timing. |
-| `gpuHeadroomMiB` | `1024` | Free memory required beyond the artifact size before loading. |
-| `q3DispatchMode` | `AUTO` | `SCALAR` retains the reference implementation; `DECODE` and `PREFILL` force independently callable kernels; `AUTO` selects by token-row count. |
-| `q3SmallRowThreshold` | `8` | `AUTO` uses decode at or below this row count and tiled prefill above it. Zero forces all nonempty Q3 projections through prefill. Recorded with the dispatch mode in run snapshots. |
+| `promptCorpus` | `words` | `words` draws seeded random words; `chat` uses chat-templated prompts (thinking disabled) built from a fixed corpus; iteration i runs prompt i mod corpus size. |
 | `shutdownTimeoutSeconds` | `10` | Engine shutdown timeout. |
 
 CPU selection uses the core `ProcessorTopology`. Unavailable IDs are rejected, not dropped. On hosts
@@ -136,66 +135,6 @@ done
 The checked-in `forks.json` sets `"append": true` and writes to `benchmark-results/forks.jsonl`.
 Record the exact artifact and native library alongside these fork results; iterations inside one
 JVM are not independent replicates.
-
-## Packed Q3 operator screens
-
-The `q3 CONFIG.json [MATRIX ROWS]` command loads real packed artifact weights and compares scalar,
-decode, and tiled-prefill kernels on identical deterministic BF16 activations. Matrix names are
-`mixer-output`, `mlp-gate-up`, `mlp-down`, and `vocabulary`. Without a selector it sweeps 1, 2, 4,
-8, 16, 32, 256, and 512 token rows; the vocabulary sweep stops at 32 because generation now
-projects at most one row. Explicit selectors can request larger vocabulary cases.
-
-Build the distribution and set the native environment as shown above, then run:
-
-```bash
-benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
-  q3 benchmark/configs/smoke.json mlp-gate-up 256
-```
-
-Use a fresh non-`.json` output path: operator screens reject existing output even when the engine configuration
-allows append or overwrite. The output is always JSONL, with a distinct
-`euhedral-inference.q3-microbenchmark` schema. `warmup` and `iterations` control each forced path.
-The screen uses synchronous native-call timing including launch, clears 128 MiB of device memory
-before each sample outside timing, and records every sample plus BF16 absolute-error distributions
-against scalar. Decode must match scalar bitwise; tiled prefill must stay within one BF16 step
-or 0.001 absolute error near zero. A failed gate is recorded as `failed` and aborts the screen;
-such timing samples are not eligible results. That cache-clear size targets the current GPU; it is not a portable guarantee of
-complete cache eviction. Engine CPU selection, generation scenarios, and dispatch selection do not
-control these deliberately isolated operator calls.
-
-These screens are for rejecting poor candidates and measuring the row crossover. They do not
-replace full-model numerical qualification or independent JVM forks of `run`.
-
-## Packed Q4/Q5 operator screens
-
-The `q45 CONFIG.json [MATRIX ROWS]` command uses real packed weights from the first GDN and
-attention layers. Matrix names are `gdn-q4`, `gdn-q5`, `attention-q4`, and `attention-q5`.
-Without a selector it sweeps 1, 2, 4, 8, 9, 12, 16, 32, 256, and 512 rows. Set
-`EUHEDRAL_Q45_DISPATCH` to `SCALAR`, `DECODE`, `PREFILL`, or `PREFILL64` in a separate JVM for each
-forced path. Each path writes its own JSONL results and per-case raw BF16 output files;
-compare the latter against the forced scalar run before accepting timings. Output files must
-not exist before a run. The screen clears 128 MiB of device memory outside each timed
-synchronous native call. It does not substitute for full-model or end-to-end validation.
-For example, after building the benchmark distribution and writing a configuration whose
-`output` points to a new `screen-scalar.jsonl` file:
-
-```sh
-EUHEDRAL_Q45_DISPATCH=SCALAR \
-  benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
-  q45 screen-scalar.json gdn-q4 32
-```
-
-Use separate configuration/output paths for `DECODE`, `PREFILL`, and `PREFILL64`; archive and
-compare all four sets of raw BF16 files, not just their timings.
-
-Normal inference uses `AUTO` (also the default when the variable is unset): Q4 selects decode
-through 9 rows and Q5 through 4 rows, then uses the 32-row prefill tile below 64 rows and the
-64-row tile from 64 rows. Decode groups 1, 2, or 4 token rows per CTA; `PREFILL` forces the
-32-row tile and `PREFILL64` the 64-row tile. The optional environment
-variables `EUHEDRAL_Q4_DECODE_MAX_ROWS` and `EUHEDRAL_Q5_DECODE_MAX_ROWS` override those
-thresholds independently. Archive the exact environment alongside any benchmark results;
-these native experiment controls are not fields in the engine snapshot. `SCALAR` retains the
-original packed-weight reference kernel, without changing the persistent Q4/Q5 layout.
 
 ## Prompts
 
@@ -288,19 +227,18 @@ below is illustrative; its values are not a measurement.
   "timings": {"tokenization": 0, "prefill": 0, "firstTokenSample": 0, "timeToFirstToken": 0, "decode": 0,
               "decodeQuantaSum": 0, "finalCommit": 0, "timeToLastToken": 0, "endToEnd": 0},
   "throughput": {"prefillTokensPerSecond": 0.0, "decodeTokensPerSecond": 0.0, "endToEndOutputTokensPerSecond": 0.0},
-  "engine": {"schemaVersion": 2, "tuning": {"workerProcessorIds": [0, 1], "prefillChunkTokens": 512,
-             "q3DispatchMode": "AUTO", "q3SmallRowThreshold": 8},
+  "engine": {"schemaVersion": 3, "configuration": {"workerProcessorIds": [0, 1], "maxContextTokens": 32768,
+             "artifact": "qwen3_5_27b_compact_q3.edrl", "speculativeDepth": 2},
              "workerCoreIds": [0], "model": {}, "generation": {}, "runtime": {}},
   "gpuMemory": {"beforeFreeBytes": 0, "afterFreeBytes": 0, "totalBytes": 0}
 }
 ```
 
-`engine` is the engine's `InferenceRunSnapshot`: tuning, worker cores, model identity and dimensions,
-generation settings, and Java/Euhedral/native identity. Values the runtime does not expose, such as
-the CUDA runtime version, are `"unavailable"`. Snapshot version 2 dropped `tuning.gpuExecutionMode`:
-every run submits stream-ordered work asynchronously. Version-1 rows remain readable and ignore that
-field. `gpuMemory` is null unless `gpuMemory` is enabled; it is device-wide, so it includes other
-processes.
+`engine` is the engine's `InferenceRunSnapshot`: configuration (worker processors, context
+capacity, artifact name, and the speculative depth the engine selected), worker cores, model
+identity and dimensions, generation settings, and Java/Euhedral/native identity. Values the runtime
+does not expose, such as the CUDA runtime version, are `"unavailable"`. `gpuMemory` is null unless
+`gpuMemory` is enabled; it is device-wide, so it includes other processes.
 
 ## Importing external results
 

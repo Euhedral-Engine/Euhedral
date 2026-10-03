@@ -8,16 +8,16 @@ import io.euhedral_execution.inference.benchmark.measure.Metrics;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.BenchmarkResult;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
-import io.euhedral_execution.inference.core.InferenceTuning;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.io.IOException;
 import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
-/// Runs the sweep: one engine per prefill-chunk value, then for each scenario its warmup rows
-/// followed by its measured rows. Every iteration uses a fresh session and sequence.
+/// Loads one engine, then runs each scenario's warmup rows followed by its measured rows. Every
+/// iteration uses a fresh session and sequence.
 public final class BenchmarkRunner {
     private BenchmarkRunner() {}
 
@@ -44,7 +44,7 @@ public final class BenchmarkRunner {
     }
 
     public interface TargetFactory {
-        Target open(InferenceTuning tuning) throws IOException;
+        Target open() throws IOException;
     }
 
     public record Context(
@@ -52,51 +52,45 @@ public final class BenchmarkRunner {
 
     public static void run(
             BenchmarkOptions options,
-            InferenceTuning baseTuning,
             Map<Scenario, List<PromptMaterial>> prompts,
             TargetFactory factory,
             Context context,
             Consumer<BenchmarkResult> sink)
             throws IOException, InterruptedException {
-        for (InferenceTuning tuning : options.sweep(baseTuning)) {
-            try (Target target = factory.open(tuning)) {
-                // Parse the serialized snapshot so the row holds exactly what is stored (e.g. floats as JSON numbers).
-                JsonNode engine = BenchmarkResult.JSON.readTree(
-                        target.snapshot(options.generation().toConfig()).toJson());
-                for (Scenario scenario : options.scenarios()) {
-                    List<PromptMaterial> scenarioPrompts = prompts.get(scenario);
-                    if (scenarioPrompts == null || scenarioPrompts.isEmpty())
-                        throw new IllegalStateException("no prompt prepared for " + scenario.name());
-                    for (int index = 0; index < options.warmup(); index++)
-                        sink.accept(iteration(
-                                options,
-                                tuning,
-                                scenario,
-                                scenarioPrompts.get(index % scenarioPrompts.size()),
-                                target,
-                                engine,
-                                context,
-                                true,
-                                index));
-                    for (int index = 0; index < options.iterations(); index++)
-                        sink.accept(iteration(
-                                options,
-                                tuning,
-                                scenario,
-                                scenarioPrompts.get(index % scenarioPrompts.size()),
-                                target,
-                                engine,
-                                context,
-                                false,
-                                index));
-                }
+        try (Target target = factory.open()) {
+            // Parse the serialized snapshot so the row holds exactly what is stored (e.g. floats as JSON numbers).
+            JsonNode engine = BenchmarkResult.JSON.readTree(
+                    target.snapshot(options.generation().toConfig()).toJson());
+            for (Scenario scenario : options.scenarios()) {
+                List<PromptMaterial> scenarioPrompts = prompts.get(scenario);
+                if (scenarioPrompts == null || scenarioPrompts.isEmpty())
+                    throw new IllegalStateException("no prompt prepared for " + scenario.name());
+                for (int index = 0; index < options.warmup(); index++)
+                    sink.accept(iteration(
+                            options,
+                            scenario,
+                            scenarioPrompts.get(index % scenarioPrompts.size()),
+                            target,
+                            engine,
+                            context,
+                            true,
+                            index));
+                for (int index = 0; index < options.iterations(); index++)
+                    sink.accept(iteration(
+                            options,
+                            scenario,
+                            scenarioPrompts.get(index % scenarioPrompts.size()),
+                            target,
+                            engine,
+                            context,
+                            false,
+                            index));
             }
         }
     }
 
     static BenchmarkResult iteration(
             BenchmarkOptions options,
-            InferenceTuning tuning,
             Scenario scenario,
             PromptMaterial prompt,
             Target target,
@@ -108,7 +102,8 @@ public final class BenchmarkRunner {
         if (options.gpuMemory()) target.resetPeakMemory();
         long[] before = options.gpuMemory() ? target.memory() : null;
         var timing = new IterationTiming(
-                Math.ceilDiv(prompt.actualTokens(), tuning.prefillChunkTokens()), scenario.requestedNewTokens());
+                Math.ceilDiv(prompt.actualTokens(), QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS),
+                scenario.requestedNewTokens());
         List<Integer> tokens = null;
         Throwable failure = null;
         try {

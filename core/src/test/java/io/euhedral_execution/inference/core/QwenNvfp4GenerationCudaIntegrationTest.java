@@ -5,7 +5,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.hardware_utils.SystemInfo;
-import io.euhedral_execution.inference.core.model_loader.WeightResidency;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.nio.file.Files;
@@ -30,17 +29,18 @@ class QwenNvfp4GenerationCudaIntegrationTest {
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("tokenizer.json")));
         BitSet cpus = SystemInfo.getPCpuSet();
-        var tuning = InferenceTuning.defaults(cpus).withWeightResidency(WeightResidency.EXECUTED);
-        List<Integer> resident = generate(artifact, tokenizer, library, tuning, "resident");
-        // About 1 GiB of GDN projections stay in host memory and are staged per use: same tokens.
-        List<Integer> staged =
-                generate(artifact, tokenizer, library, tuning.withHostWeights(1L << 30, 4), "host-backed");
+        List<Integer> resident = generate(artifact, tokenizer, library, cpus, 4096, "resident");
+        // A 128K context leaves no device room for all weights: part of the projections stay in host
+        // memory and are staged per use. Same tokens.
+        List<Integer> staged = generate(artifact, tokenizer, library, cpus, 131072, "host-backed");
         assertEquals(resident, staged);
     }
 
     private static List<Integer> generate(
-            Path artifact, Path tokenizer, String library, InferenceTuning tuning, String label) throws Exception {
-        var config = new InferenceConfig(artifact, tokenizer, Path.of(library), tuning, Duration.ofSeconds(10));
+            Path artifact, Path tokenizer, String library, BitSet cpus, int maxContextTokens, String label)
+            throws Exception {
+        var config = new InferenceConfig(
+                artifact, tokenizer, Path.of(library), cpus, maxContextTokens, Duration.ofSeconds(10));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             StringBuilder output = new StringBuilder();
             List<Integer> tokens;
