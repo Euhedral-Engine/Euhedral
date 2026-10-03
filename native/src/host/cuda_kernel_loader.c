@@ -14,6 +14,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <pthread.h>
 #endif
 
 #ifndef PATH_MAX
@@ -25,6 +26,54 @@ int euhedral_cuda_bind_thread_context(void) {
     cudaError_t status = cudaGetDevice(&device);
     if (status == cudaSuccess) status = cudaSetDevice(device);
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
+/* NVRTC compiles recursively and overflows the 1 MiB stack of a typical worker thread (a SIGSEGV inside
+ * nvrtcCompileProgram, or in the driver's PTX compiler), and the first caller of a module is whichever worker
+ * thread reaches it first. The compilation therefore runs on a thread of its own with a stack that cannot
+ * overflow; it needs no CUDA context. */
+#define COMPILE_STACK_BYTES ((size_t)256 << 20)
+struct compile_job {
+    nvrtcProgram program;
+    int option_count;
+    const char* const* options;
+    nvrtcResult result;
+};
+
+#ifdef _WIN32
+static DWORD WINAPI compile_thread(LPVOID argument) {
+    struct compile_job* job = (struct compile_job*)argument;
+    job->result = nvrtcCompileProgram(job->program, job->option_count, job->options);
+    return 0;
+}
+#else
+static void* compile_thread(void* argument) {
+    struct compile_job* job = (struct compile_job*)argument;
+    job->result = nvrtcCompileProgram(job->program, job->option_count, job->options);
+    return NULL;
+}
+#endif
+
+static nvrtcResult compile_on_large_stack(nvrtcProgram program, int option_count, const char* const* options) {
+    struct compile_job job = {program, option_count, options, NVRTC_ERROR_INTERNAL_ERROR};
+#ifdef _WIN32
+    HANDLE thread = CreateThread(NULL, COMPILE_STACK_BYTES, compile_thread, &job, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (thread == NULL) return nvrtcCompileProgram(program, option_count, options);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+#else
+    pthread_attr_t attributes;
+    pthread_t thread;
+    if (pthread_attr_init(&attributes) != 0) return nvrtcCompileProgram(program, option_count, options);
+    if (pthread_attr_setstacksize(&attributes, COMPILE_STACK_BYTES) != 0
+            || pthread_create(&thread, &attributes, compile_thread, &job) != 0) {
+        pthread_attr_destroy(&attributes);
+        return nvrtcCompileProgram(program, option_count, options);
+    }
+    pthread_attr_destroy(&attributes);
+    pthread_join(thread, NULL);
+#endif
+    return job.result;
 }
 
 /* Compiles share/euhedral_cuda/<source_name> with `architecture` and loads `function_name`. A virtual
@@ -120,7 +169,7 @@ static int load_kernel(const void* anchor, const char* source_name, const char* 
     const int real_architecture = strncmp(architecture, "sm_", 3) == 0;
     const char* options[] = {"--std=c++14", architecture_option, include_option, source_include_option,
             root_include_option};
-    nv_status = nvrtcCompileProgram(program, 5, options);
+    nv_status = compile_on_large_stack(program, 5, options);
     if (nv_status != NVRTC_SUCCESS) {
         size_t log_size = 0;
         nvrtcGetProgramLogSize(program, &log_size);
@@ -153,9 +202,25 @@ static int load_kernel(const void* anchor, const char* source_name, const char* 
     return status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 }
 
+/* The device's real architecture (sm_XY): the engine runs on Blackwell only, so every module is compiled to the
+ * device's own code and no PTX is left for the driver to JIT. */
+static int device_architecture(char* architecture, size_t capacity) {
+    CUdevice device;
+    int major = 0, minor = 0;
+    if (cuInit(0) != CUDA_SUCCESS || cuCtxGetDevice(&device) != CUDA_SUCCESS
+            || cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != CUDA_SUCCESS
+            || cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != CUDA_SUCCESS)
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    int length = snprintf(architecture, capacity, "sm_%d%d", major, minor);
+    return length > 0 && (size_t)length < capacity ? EUHEDRAL_CUDA_SUCCESS : EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+}
+
 int euhedral_cuda_load_kernel(const void* anchor, const char* source_name, const char* function_name,
         CUmodule* module, CUfunction* function) {
-    return load_kernel(anchor, source_name, function_name, module, function, "compute_90");
+    char architecture[16];
+    int status = device_architecture(architecture, sizeof(architecture));
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    return load_kernel(anchor, source_name, function_name, module, function, architecture);
 }
 
 int euhedral_cuda_native_architecture(char* architecture, size_t capacity) {
