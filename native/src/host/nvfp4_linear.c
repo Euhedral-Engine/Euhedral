@@ -125,7 +125,8 @@ int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void
  * quantized to two NVFP4 terms (the value and its quantized residual) into caller scratch, then multiplied
  * with block-scaled FP4 tensor-core MMA (OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X). The module is compiled for
  * this device's sm_12xa target and exists only there. */
-#define NATIVE_SHARED_BYTES 67584u  /* nvfp4n::Pipeline<1 or 2>::kSharedBytes */
+#define NATIVE_SHARED_BYTES 85040u  /* nvfp4n::Pipeline<2>::kSharedBytes */
+#define NATIVE_TILE_THREADS 288u   /* nvfp4n::kThreads: eight consumer warps and a producer warp */
 #define SKINNY_MAX_ROWS 64u
 #define SKINNY_COLUMNS 64u
 #define SKINNY_TARGET_CTAS 140u  /* two per SM */
@@ -220,12 +221,14 @@ int euhedral_cuda_nvfp4_native_available(void) {
     return ensure_native() == EUHEDRAL_CUDA_SUCCESS;
 }
 
-/* Activations of `rows` rows of `in_features` values in the selected number of terms: codes, a
- * 256-aligned scale plane and one FP32 global per row (nvfp4n::ActivationLayout). */
+/* Activations of `rows` rows of `in_features` values in the selected number of terms: codes, the tile-major
+ * scales (rows rounded up to 128 per tile and term, 8 bytes per row) and one FP32 global per row
+ * (nvfp4n::ActivationLayout). */
 static uint64_t activation_bytes(uint32_t rows, uint32_t in_features) {
     uint64_t k = ((uint64_t)in_features + 127u) / 128u * 128u, planes = (uint64_t)rows * NATIVE_TERMS;
+    uint64_t pad = ((uint64_t)rows + 127u) / 128u * 128u;
     uint64_t scales = align256(planes * k / 2u);
-    return align256(scales + planes * k / 16u) + 4ull * rows;
+    return align256(scales + k / 128u * NATIVE_TERMS * pad * 8u) + 4ull * rows;
 }
 
 /* Scratch for one native linear: the activations, then (split-K skinny shapes) FP32 partials. */
@@ -234,6 +237,15 @@ uint64_t euhedral_cuda_nvfp4_native_scratch_bytes(uint32_t rows, uint32_t in_fea
     if (skinny_route(rows, in_features) && skinny_splits(in_features, out_features) > 1u)
         bytes = align256(bytes) + 4ull * skinny_splits(in_features, out_features) * rows * out_features;
     return bytes;
+}
+
+/* A tiled tensor map over bytes (the TMA descriptors of the tile kernels). */
+static CUresult byte_map(CUtensorMap* map, CUdeviceptr address, cuuint32_t rank, const cuuint64_t* dims,
+        const cuuint64_t* strides, const cuuint32_t* box, CUtensorMapSwizzle swizzle) {
+    const cuuint32_t element_strides[3] = {1u, 1u, 1u};
+    return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank, (void*)(uintptr_t)address, dims, strides, box,
+            element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
 static int launch_native(int paired, uint64_t columns, const void* input, const void* weights, void* output,
@@ -268,6 +280,11 @@ static int launch_native(int paired, uint64_t columns, const void* input, const 
     if (in_features % 128u != 0 || euhedral_cuda_exact_numerics()) return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
     status = prepare(input, weights, output, rows, in_features, out_features, weights_byte_size, &layout);
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    /* The tile kernels' TMA descriptors need 16-byte strides: the scale rows (K / 16 bytes, or K / 32 for SD4) and
+     * a 16-byte aligned scratch. */
+    const int skinny_shape = !paired && skinny_route(rows, in_features);
+    if (!skinny_shape && (in_features % (layout ? 512u : 256u) != 0 || ((uintptr_t)scratch & 15u) != 0))
+        return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
     CUfunction kernel = paired ? native_gate_up[layout] : native_linear[layout];
     const int skinny = !paired && skinny_route(rows, in_features);
     if (scratch == NULL || scratch_byte_size < (skinny ? euhedral_cuda_nvfp4_native_scratch_bytes(rows, in_features, out_features)
@@ -297,7 +314,24 @@ static int launch_native(int paired, uint64_t columns, const void* input, const 
         return finish(euhedral_launch_kernel(native_finish, (count + 255u) / 256u, 1, 1, 256, 1, 1, 0, stream,
                 finish_params, NULL));
     }
-    void* linear_params[] = {&scratch_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg};
-    return finish(euhedral_launch_kernel(kernel, (unsigned int)grid, 1, 1, 256, 1, 1, NATIVE_SHARED_BYTES,
+    /* Tile kernels: TMA descriptors over the activation code planes (K / 2 bytes, rows, terms), the weight codes
+     * (K / 2 bytes, weight rows) and the weight scales (row_scales bytes, weight rows). */
+    const uint64_t row_bytes = in_features / 2u, row_scales = in_features / (layout ? 32u : 16u);
+    const uint64_t scale_offset = align256((uint64_t)out_features * row_bytes);
+    const cuuint32_t b_rows = paired ? 64u : 128u;
+    CUtensorMap tm_a, tm_b, tm_bs;
+    const cuuint64_t a_dims[3] = {row_bytes, rows, NATIVE_TERMS}, a_strides[2] = {row_bytes, row_bytes * rows};
+    const cuuint32_t a_box[3] = {64u, 128u, 1u};
+    const cuuint64_t b_dims[2] = {row_bytes, out_features}, b_strides[1] = {row_bytes};
+    const cuuint32_t b_box[2] = {64u, b_rows};
+    const cuuint64_t s_dims[2] = {row_scales, out_features}, s_strides[1] = {row_scales};
+    const cuuint32_t s_box[2] = {16u, b_rows};
+    result = byte_map(&tm_a, scratch_ptr, 3, a_dims, a_strides, a_box, CU_TENSOR_MAP_SWIZZLE_64B);
+    if (result == CUDA_SUCCESS) result = byte_map(&tm_b, weights_ptr, 2, b_dims, b_strides, b_box, CU_TENSOR_MAP_SWIZZLE_64B);
+    if (result == CUDA_SUCCESS)
+        result = byte_map(&tm_bs, weights_ptr + scale_offset, 2, s_dims, s_strides, s_box, CU_TENSOR_MAP_SWIZZLE_NONE);
+    if (result != CUDA_SUCCESS) return finish(result);
+    void* linear_params[] = {&tm_a, &tm_b, &tm_bs, &scratch_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg};
+    return finish(euhedral_launch_kernel(kernel, (unsigned int)grid, 1, 1, NATIVE_TILE_THREADS, 1, 1, NATIVE_SHARED_BYTES,
             stream, linear_params, NULL));
 }

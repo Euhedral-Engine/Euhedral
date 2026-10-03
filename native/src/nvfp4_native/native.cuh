@@ -31,6 +31,7 @@ struct Matrix {
     const unsigned char* codes;
     const unsigned char* scales;
     unsigned int row_bytes, row_scales;
+    unsigned int pad;         // activations: rows of a scale plane (a multiple of 128)
     nvfp4::ScaleTable table;  // SD4 weights only
 };
 
@@ -39,6 +40,7 @@ template <bool kSd4>
 static __device__ __forceinline__ Matrix weights(const unsigned char* w, unsigned int k, unsigned int rows, float* global) {
     const unsigned long long padded = (k + 127u) / 128u * 128u;
     Matrix m;
+    m.pad = 0;
     m.row_bytes = (unsigned int)(padded / 2u);
     m.row_scales = (unsigned int)(padded / (kSd4 ? 32u : 16u));
     const unsigned long long scale_offset = align256((unsigned long long)rows * m.row_bytes);
@@ -61,15 +63,20 @@ static __device__ __forceinline__ unsigned int b_scale_quad(const unsigned char*
     return *reinterpret_cast<const unsigned int*>(row_scales + 4u * quad);
 }
 
-// Activation buffer: `terms` planes of `rows` rows (term t at rows t * rows..), codes then scales, then
-// one FP32 global per row shared by every term. Term 0 quantizes the activations; term 1, when present,
-// quantizes the residual x - term0, so their sum carries about 1% error instead of about 10%.
+// Activation buffer: `terms` planes of `rows` rows of codes, then the scales, then one FP32 global per row
+// shared by every term. Term 0 quantizes the activations; term 1, when present, quantizes the residual
+// x - term0, so their sum carries about 1% error instead of about 10%.
+// The scales are tile-major: the 8 scale bytes of a row for K tile j (128 values) of term t are at
+//   scales + ((j * terms + t) * pad + row) * 8,  pad = rows rounded up to 128,
+// so the scales of 128 rows of one K tile and term are one contiguous KiB (one bulk copy).
 struct ActivationLayout {
     unsigned long long scale_offset, global_offset, bytes;
+    unsigned int pad;
     __host__ __device__ ActivationLayout(unsigned int rows, unsigned int k, unsigned int terms) {
         const unsigned long long padded = (k + 127u) / 128u * 128u, planes = (unsigned long long)rows * terms;
+        pad = (rows + 127u) / 128u * 128u;
         scale_offset = align256(planes * (padded / 2u));
-        global_offset = align256(scale_offset + planes * (padded / 16u));
+        global_offset = align256(scale_offset + (padded / 128u) * terms * pad * 8ull);
         bytes = global_offset + 4ull * rows;
     }
 };
@@ -152,7 +159,8 @@ static __device__ __forceinline__ void quantize_rows(
 #pragma unroll
         for (int t = 0; t < kTerms; ++t) {
             const unsigned long long plane_row = (unsigned long long)t * rows + row;
-            const uint2 codes = quantize16(v, global, inverse_global, output + layout.scale_offset + plane_row * blocks + b);
+            unsigned char* scale_out = output + layout.scale_offset + (((unsigned long long)(b >> 3) * kTerms + t) * layout.pad + row) * 8u + (b & 7u);
+            const uint2 codes = quantize16(v, global, inverse_global, scale_out);
             *reinterpret_cast<uint2*>(output + plane_row * (k / 2u) + 8u * b) = codes;
         }
     }
@@ -161,20 +169,31 @@ static __device__ __forceinline__ void quantize_rows(
 
 // ---------------------------------------------------------------------------------------------------
 // Linear: output[M][N] (BF16) = activations[M][K] * weights[N][K]^T, both NVFP4.
-// CTA tile 128 x 128, K tile 128 values (64 code bytes per row), a cp.async pipeline of Stages<kTerms>
-// stages. 8 warps as 2 (M) x 4 (N); a warp owns 64 x 32: 4 m16 fragments by 4 n8 fragments, and issues
-// kTerms MMAs per fragment and K step (one per activation term) into one FP32 accumulator.
-// Shared code rows are padded to 80 bytes, so the eight 16-byte rows an ldmatrix phase reads fall in
-// distinct bank groups.
-static constexpr int kBM = 128, kBN = 128, kBK = 128, kThreads = 256;
-static constexpr int kRowBytes = kBK / 2, kRowStride = kRowBytes + 16, kScaleBytes = kBK / 16;
-static constexpr int kCodeTile = kBM * kRowStride;            // A and B code tiles are the same size
-static constexpr int kScaleTile = kBM * kScaleBytes;
+//
+// CTA tile 128 x 128 (a paired gate/up tile: 64 gate and 64 up weight rows, 64 outputs) and K tile 128 values.
+// A producer warp (warp 8, one elected lane) streams the operands with TMA into a ring of kStages stages
+// guarded by mbarriers; 8 consumer warps (2 along M x 4 along N, 64 x 32 each) run the MMAs without ever
+// issuing a load: a warp issues kTerms MMAs per fragment and K step (one per activation term) into one FP32
+// accumulator, and releases a stage with one mbarrier arrival per warp.
+//   codes   tensor maps of the code planes, 64-byte rows (one K tile of a row), SWIZZLE_64B: chunk c of row r is
+//           stored at chunk c ^ ((r >> 1) & 3), which makes every ldmatrix phase conflict-free.
+//   A scales   one bulk copy per term of the tile-major activation scales (ActivationLayout).
+//   B scales   a tensor map of the weight scales whose 16-byte boxes cover kScaleGroup K tiles (2 for E4M3 scales,
+//              4 for the 4-bit SD4 indices); the group is fetched with the first tile that needs it and lives in
+//              one of two slots.
+// Every code and scale element a consumer reads is bit for bit the one the cp.async tile read, in the same
+// order, so the results are unchanged.
+struct alignas(64) TensorMap { unsigned long long opaque[16]; };
+
+static constexpr int kBM = 128, kBN = 128, kBK = 128;
+static constexpr int kTile = kBM * 64;                       // bytes of one operand's codes for one K tile
+static constexpr int kAScale = kBM * 8;                      // activation scales of one tile and one term
+static constexpr int kStages = 3;
+static constexpr int kThreads = 288;                         // 8 consumer warps and the producer warp
+static constexpr int kSlotBytes = kBN * 16;                  // B scales of one group of K tiles
 template <int kTerms> struct Pipeline {
-    // Stage: A code tiles (one per term), the B code tile, A scale tiles, the B scale tile.
-    static constexpr int kStageBytes = (kTerms + 1) * (kCodeTile + kScaleTile);
-    static constexpr int kStages = kTerms == 1 ? 3 : 2;       // within the 99 KiB per-block limit
-    static constexpr int kSharedBytes = kStages * kStageBytes;
+    static constexpr int kStageBytes = (kTerms + 1) * kTile + kTerms * kAScale;
+    static constexpr int kSharedBytes = kStages * kStageBytes + 2 * kSlotBytes + 2 * kStages * 8 + 1024;
 };
 
 static __device__ __forceinline__ unsigned int smem_address(const void* p) {
@@ -206,124 +225,155 @@ static __device__ __forceinline__ void mma(float (&d)[4], const unsigned int (&a
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa), "r"(sb), "n"(SA), "n"(SB));
 }
 
-// Weight row held in row `r` of a B tile starting at output column n0. A plain linear holds rows
-// n0..n0+127. A paired gate/up tile (half = gate rows = up rows) holds 64 output columns: warp slice
-// r / 32 holds gate rows n0 + 16 (r / 32) + 0..15, then the matching up rows (half + the same).
-template <bool kPaired>
-static __device__ __forceinline__ unsigned int b_row(unsigned int r, unsigned int n0, unsigned int cols, bool* valid) {
-    if (!kPaired) {
-        *valid = n0 + r < cols;
-        return n0 + r;
-    }
-    const unsigned int half = cols / 2u, column = n0 + (r >> 5) * 16u + (r & 15u);
-    *valid = column < half;
-    return column + ((r >> 4) & 1u) * half;
+static __device__ __forceinline__ void mbar_init(unsigned long long* bar, unsigned int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_address(bar)), "r"(count));
 }
-
-// Issues the cp.async copies of K tile `tile` into `stage`. Rows past the matrix are zero-filled.
-template <int kTerms, bool kPaired, bool kSd4>
-static __device__ __forceinline__ void load_stage(
-        unsigned char* stage, const Matrix& a, const Matrix& b, unsigned int m0, unsigned int n0,
-        unsigned int rows, unsigned int cols, unsigned int tile) {
-    unsigned char* b_codes = stage + kTerms * kCodeTile;
-    unsigned char* scales = stage + (kTerms + 1) * kCodeTile;
-    unsigned char* b_scales = scales + kTerms * kScaleTile;
-    const unsigned int byte0 = tile * kRowBytes, scale0 = tile * kScaleBytes;
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const unsigned int chunk = threadIdx.x + i * kThreads;     // 512 chunks of 16 bytes per operand
-        const unsigned int r = chunk >> 2, c = (chunk & 3u) * 16u;
-        const bool va = m0 + r < rows;
-#pragma unroll
-        for (int t = 0; t < kTerms; ++t)
-            cp_async(stage + t * kCodeTile + r * kRowStride + c,
-                     a.codes + ((unsigned long long)t * rows + (va ? m0 + r : 0)) * a.row_bytes + byte0 + c, 16, va);
-        bool vb;
-        const unsigned int br = b_row<kPaired>(r, n0, cols, &vb);
-        cp_async(b_codes + r * kRowStride + c, b.codes + (unsigned long long)(vb ? br : 0) * b.row_bytes + byte0 + c, 16, vb);
-    }
-    const unsigned int r = threadIdx.x & 127u;
-    if (threadIdx.x < 128u) {
-        const bool v = m0 + r < rows;
-#pragma unroll
-        for (int t = 0; t < kTerms; ++t)
-            cp_async(scales + t * kScaleTile + r * kScaleBytes,
-                     a.scales + ((unsigned long long)t * rows + (v ? m0 + r : 0)) * a.row_scales + scale0, 8, v);
-    } else {
-        bool v;
-        const unsigned int br = b_row<kPaired>(r, n0, cols, &v);
-        constexpr int bytes = kSd4 ? kScaleBytes / 2 : kScaleBytes;
-        cp_async(b_scales + r * kScaleBytes, b.scales + (unsigned long long)(v ? br : 0) * b.row_scales + (kSd4 ? tile * bytes : scale0),
-                 bytes, v);
-    }
+static __device__ __forceinline__ void mbar_expect_tx(unsigned long long* bar, unsigned int bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_address(bar)), "r"(bytes) : "memory");
+}
+static __device__ __forceinline__ void mbar_arrive(unsigned long long* bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_address(bar)) : "memory");
+}
+static __device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned int parity) {
+    asm volatile(
+            "{\n.reg .pred p;\nWAIT_%=:\n"
+            "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+            "@!p bra WAIT_%=;\n}" ::"r"(smem_address(bar)), "r"(parity) : "memory");
+}
+static __device__ __forceinline__ void tma_2d(void* dst, const TensorMap* map, int c0, int c1, unsigned long long* bar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                 ::"r"(smem_address(dst)), "l"(map), "r"(c0), "r"(c1), "r"(smem_address(bar)) : "memory");
+}
+static __device__ __forceinline__ void tma_3d(void* dst, const TensorMap* map, int c0, int c1, int c2, unsigned long long* bar) {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+                 ::"r"(smem_address(dst)), "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(smem_address(bar)) : "memory");
+}
+static __device__ __forceinline__ void bulk_copy(void* dst, const void* src, unsigned int bytes, unsigned long long* bar) {
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 ::"r"(smem_address(dst)), "l"(src), "r"(bytes), "r"(smem_address(bar)) : "memory");
+}
+// Byte offset of 16-byte chunk c16 of row r of a SWIZZLE_64B tile with 64-byte rows.
+static __device__ __forceinline__ unsigned int swizzled(unsigned int r, unsigned int c16) {
+    return r * 64u + ((c16 ^ ((r >> 1) & 3u)) << 4);
 }
 
 // kPaired: `cols` weight rows are gate rows then up rows; output[M][cols / 2] = SwiGLU(gate, up), with
-// gate and up rounded to BF16 first, as the BF16 regions do.
+// gate and up rounded to BF16 first, as the BF16 regions do. A paired tile holds 64 gate rows and the
+// matching 64 up rows; its warps' fragments 0 and 1 are 16 gate columns, fragments 2 and 3 the same up columns.
+// The maps: tm_a over the code planes (K / 2 bytes, rows, terms), tm_b over the weight codes (K / 2, cols), tm_bs
+// over the weight scales (row_scales bytes, cols).
 template <int kTerms, bool kPaired, bool kSd4 = false>
 static __device__ __forceinline__ void linear(
+        const TensorMap* tm_a, const TensorMap* tm_b, const TensorMap* tm_bs,
         const unsigned char* activations, const unsigned char* weight_tensor, __nv_bfloat16* output,
         unsigned int rows, unsigned int k, unsigned int cols) {
     using P = Pipeline<kTerms>;
-    extern __shared__ __align__(128) unsigned char shared[];
+    constexpr unsigned int kScaleGroup = kSd4 ? 4u : 2u;       // K tiles per 16-byte B scale box
+    constexpr unsigned int kTileScaleBytes = kSd4 ? 4u : 8u;   // B scale bytes of one tile and row
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    unsigned char* shared = reinterpret_cast<unsigned char*>((reinterpret_cast<unsigned long long>(smem_raw) + 1023ull) & ~1023ull);
+    unsigned char* slots = shared + kStages * P::kStageBytes;
+    unsigned long long* full = reinterpret_cast<unsigned long long*>(slots + 2 * kSlotBytes);
+    unsigned long long* empty = full + kStages;
+
     const ActivationLayout act(rows, k, kTerms);
-    const Matrix a{activations, activations + act.scale_offset, k / 2u, k / 16u};
+    const unsigned char* a_scales_global = activations + act.scale_offset;
+    const float* row_globals = reinterpret_cast<const float*>(activations + act.global_offset);
     float weight_global;
     const Matrix b = weights<kSd4>(weight_tensor, k, cols, &weight_global);
-    const float* row_globals = reinterpret_cast<const float*>(activations + act.global_offset);
 
-    const unsigned int tile_cols = kPaired ? kBN / 2 : kBN;
+    constexpr unsigned int tile_cols = kPaired ? kBN / 2 : kBN;
     const unsigned int out_cols = kPaired ? cols / 2u : cols;
-    const unsigned int tiles_n = (out_cols + tile_cols - 1) / tile_cols;
-    const unsigned int m0 = (blockIdx.x / tiles_n) * kBM, n0 = (blockIdx.x % tiles_n) * tile_cols;
-    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    const unsigned int wm = (warp >> 2) * 64u, wn = (warp & 3u) * 32u;
-    const unsigned int g = lane >> 2, t = lane & 3u;
+    const unsigned int tiles_m = (rows + kBM - 1) / kBM;
+    // M varies fastest: the CTAs running together share weight tiles.
+    const unsigned int m0 = (blockIdx.x % tiles_m) * kBM, n0 = (blockIdx.x / tiles_m) * tile_cols;
     const unsigned int k_tiles = k / kBK;
+    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < kStages; ++s) {
+            mbar_init(&full[s], 1);
+            mbar_init(&empty[s], 8);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    euhedral_pdl_begin();
+
+    if (warp == 8) {
+        if (lane == 0) {
+            const unsigned int half = cols / 2u;
+            for (unsigned int tile = 0; tile < k_tiles; ++tile) {
+                const unsigned int s = tile % kStages;
+                if (tile >= kStages) mbar_wait(&empty[s], ((tile / kStages) - 1u) & 1u);
+                unsigned char* stage = shared + s * P::kStageBytes;
+                const bool first_of_group = tile % kScaleGroup == 0;
+                mbar_expect_tx(&full[s], (kTerms + 1) * kTile + kTerms * kAScale + (first_of_group ? kSlotBytes : 0));
+#pragma unroll
+                for (int t = 0; t < kTerms; ++t) {
+                    tma_3d(stage + t * kTile, tm_a, (int)(tile * 64u), (int)m0, t, &full[s]);
+                    bulk_copy(stage + (kTerms + 1) * kTile + t * kAScale,
+                              a_scales_global + (((unsigned long long)tile * kTerms + t) * act.pad + m0) * 8ull, kAScale, &full[s]);
+                }
+                unsigned char* b_dst = stage + kTerms * kTile;
+                unsigned char* slot = slots + ((tile / kScaleGroup) & 1u) * kSlotBytes;
+                if (kPaired) {
+                    tma_2d(b_dst, tm_b, (int)(tile * 64u), (int)n0, &full[s]);
+                    tma_2d(b_dst + kTile / 2, tm_b, (int)(tile * 64u), (int)(half + n0), &full[s]);
+                    if (first_of_group) {
+                        tma_2d(slot, tm_bs, (int)((tile / kScaleGroup) * 16u), (int)n0, &full[s]);
+                        tma_2d(slot + kSlotBytes / 2, tm_bs, (int)((tile / kScaleGroup) * 16u), (int)(half + n0), &full[s]);
+                    }
+                } else {
+                    tma_2d(b_dst, tm_b, (int)(tile * 64u), (int)n0, &full[s]);
+                    if (first_of_group) tma_2d(slot, tm_bs, (int)((tile / kScaleGroup) * 16u), (int)n0, &full[s]);
+                }
+            }
+        }
+        return;
+    }
+
+    const unsigned int wm = (warp >> 2) * 64u, wn = (warp & 3u) * 32u;
+    const unsigned int g = lane >> 2, t = lane & 3u, mat = lane >> 3, r8 = lane & 7u;
+    // Tile row of B fragment pair np (16 rows) and of the scale row of fragment nf.
+    unsigned int brow[2], bsrow[4];
+#pragma unroll
+    for (int np = 0; np < 2; ++np) brow[np] = kPaired ? (np == 0 ? wn / 2u : kBN / 2u + wn / 2u) : wn + np * 16u;
+#pragma unroll
+    for (int nf = 0; nf < 4; ++nf)
+        bsrow[nf] = kPaired ? ((nf < 2 ? wn / 2u : kBN / 2u + wn / 2u) + (nf & 1) * 8u + g) : wn + nf * 8u + g;
 
     float acc[4][4][4] = {};
-    euhedral_pdl_begin();
-#pragma unroll
-    for (int s = 0; s < P::kStages - 1; ++s) {
-        if ((unsigned int)s < k_tiles) load_stage<kTerms, kPaired, kSd4>(shared + s * P::kStageBytes, a, b, m0, n0, rows, cols, s);
-        asm volatile("cp.async.commit_group;");
-    }
     for (unsigned int tile = 0; tile < k_tiles; ++tile) {
-        asm volatile("cp.async.wait_group %0;" ::"n"(P::kStages - 2));
-        __syncthreads();
-        const unsigned int next = tile + P::kStages - 1;
-        if (next < k_tiles) load_stage<kTerms, kPaired, kSd4>(shared + (next % P::kStages) * P::kStageBytes, a, b, m0, n0, rows, cols, next);
-        asm volatile("cp.async.commit_group;");
-
-        const unsigned char* stage = shared + (tile % P::kStages) * P::kStageBytes;
-        const unsigned char* b_codes = stage + kTerms * kCodeTile;
-        const unsigned char* a_scales = stage + (kTerms + 1) * kCodeTile;
-        const unsigned char* b_scales = a_scales + kTerms * kScaleTile;
-        // A scales: lane t serves row g + 8 (t & 1) for K step t >> 1 (selector 0 for step 0, 1 for
-        // step 1). B scales: lane t serves column g for K step t (selectors 0 and 1).
+        const unsigned int s = tile % kStages;
+        mbar_wait(&full[s], (tile / kStages) & 1u);
+        const unsigned char* stage = shared + s * P::kStageBytes;
+        const unsigned char* b_codes = stage + kTerms * kTile;
+        const unsigned char* a_scales = stage + (kTerms + 1) * kTile;
+        const unsigned char* b_scales = slots + ((tile / kScaleGroup) & 1u) * kSlotBytes + (tile % kScaleGroup) * kTileScaleBytes;
+        // A scales: lane t serves row g + 8 (t & 1) for K step t >> 1 (selector 0 for step 0, 1 for step 1).
+        // B scales: lane t serves column g for K step t (selectors 0 and 1).
         unsigned int sa[kTerms][4], sb[4];
 #pragma unroll
         for (int term = 0; term < kTerms; ++term)
 #pragma unroll
             for (int mf = 0; mf < 4; ++mf)
                 sa[term][mf] = *reinterpret_cast<const unsigned int*>(
-                        a_scales + term * kScaleTile + (wm + mf * 16u + g + 8u * (t & 1u)) * kScaleBytes + 4u * (t >> 1));
+                        a_scales + term * kAScale + (wm + mf * 16u + g + 8u * (t & 1u)) * 8u + 4u * (t >> 1));
 #pragma unroll
-        for (int nf = 0; nf < 4; ++nf)
-            sb[nf] = b_scale_quad<kSd4>(b_scales + (wn + nf * 8u + g) * kScaleBytes, t & 1u, b);
+        for (int nf = 0; nf < 4; ++nf) sb[nf] = b_scale_quad<kSd4>(b_scales + bsrow[nf] * 16u, t & 1u, b);
 #pragma unroll
         for (int step = 0; step < 2; ++step) {
-            const unsigned int mat = lane >> 3, r8 = lane & 7u;
             unsigned int bf[2][4];
 #pragma unroll
             for (int np = 0; np < 2; ++np)
-                ldmatrix_x4(bf[np], b_codes + (wn + np * 16u + r8 + 8u * (mat >> 1)) * kRowStride + 32u * step + 16u * (mat & 1u));
+                ldmatrix_x4(bf[np], b_codes + swizzled(brow[np] + r8 + 8u * (mat >> 1), 2u * step + (mat & 1u)));
 #pragma unroll
             for (int term = 0; term < kTerms; ++term) {
                 unsigned int af[4][4];
 #pragma unroll
                 for (int mf = 0; mf < 4; ++mf)
-                    ldmatrix_x4(af[mf], stage + term * kCodeTile + (wm + mf * 16u + r8 + 8u * (mat & 1u)) * kRowStride + 32u * step + 16u * (mat >> 1));
+                    ldmatrix_x4(af[mf], stage + term * kTile + swizzled(wm + mf * 16u + r8 + 8u * (mat & 1u), 2u * step + (mat >> 1)));
 #pragma unroll
                 for (int mf = 0; mf < 4; ++mf)
 #pragma unroll
@@ -334,8 +384,9 @@ static __device__ __forceinline__ void linear(
                     }
             }
         }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&empty[s]);
     }
-    asm volatile("cp.async.wait_group 0;");
     if (kPaired) {
         // Fragments 0 and 1 hold gate columns n0 + wn/2 + 0..15, fragments 2 and 3 the matching up columns.
 #pragma unroll
@@ -427,10 +478,14 @@ static __device__ __forceinline__ void skinny_load(unsigned char* stage, const M
         const bool v = r < rows;
         cp_async(a_codes + pr * kSkinnyStride + c, a.codes + ((unsigned long long)term * rows + (v ? r : 0)) * a.row_bytes + byte0 + c, 16, v);
     }
+    // The 16 scale bytes of a row for this 256-value tile are the two 8-byte pieces of K tiles 2 tile and 2 tile + 1.
     for (unsigned int pr = threadIdx.x; pr < (unsigned int)(kTerms * R); pr += kSkinnyThreads) {
         const unsigned int term = pr / R, r = pr % R;
         const bool v = r < rows;
-        cp_async(a_scales + pr * kSkinnyScaleBytes, a.scales + ((unsigned long long)term * rows + (v ? r : 0)) * a.row_scales + scale0, 16, v);
+#pragma unroll
+        for (int half = 0; half < 2; ++half)
+            cp_async(a_scales + pr * kSkinnyScaleBytes + 8 * half,
+                     a.scales + (((unsigned long long)(2u * tile + half) * kTerms + term) * a.pad + (v ? r : 0)) * 8ull, 8, v);
     }
 }
 
@@ -442,7 +497,7 @@ static __device__ __forceinline__ void skinny_linear(
     constexpr int R = S::kRows;
     extern __shared__ __align__(128) unsigned char shared[];
     const ActivationLayout act(rows, k, kTerms);
-    const Matrix a{activations, activations + act.scale_offset, k / 2u, k / 16u};
+    const Matrix a{activations, activations + act.scale_offset, k / 2u, k / 16u, act.pad};
     float weight_global;
     const Matrix b = weights<kSd4>(weight_tensor, k, cols, &weight_global);
     const float* row_globals = reinterpret_cast<const float*>(activations + act.global_offset);

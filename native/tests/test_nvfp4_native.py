@@ -19,7 +19,7 @@ from gpu_harness import Gpu, NVRTC, CUDA, SKIP_REASON
 from test_nvfp4 import bf16, to_bf16_bytes, from_bf16_bytes, tensor, sd4_tensor, converter
 
 E2M1 = None if np is None else np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], np.float64)
-SHARED = 67584
+SHARED = 85040  # nvfp4n::Pipeline<2>::kSharedBytes (the tile kernels)
 
 
 def device_architecture():
@@ -43,20 +43,27 @@ def e4m3(b):
 
 
 def layout(rows, k, terms):
+    """(scale offset, global offset, bytes) of the activation buffer (nvfp4n::ActivationLayout): code planes,
+    tile-major scales (rows padded to 128), one FP32 global per row."""
     a256 = lambda v: (v + 255) // 256 * 256
+    pad = (rows + 127) // 128 * 128
     scales = a256(terms * rows * k // 2)
-    globals_ = a256(scales + terms * rows * k // 16)
+    globals_ = a256(scales + (k // 128) * terms * pad * 8)
     return scales, globals_, globals_ + 4 * rows
 
 
 def dequantize(buffer, rows, k, terms):
     so, go, _ = layout(rows, k, terms)
     planes = terms * rows
+    pad = (rows + 127) // 128 * 128
     data = np.frombuffer(buffer, np.uint8)
     codes = data[:planes * k // 2].reshape(planes, k // 2)
     values = np.empty((planes, k))
     values[:, 0::2], values[:, 1::2] = E2M1[codes & 15], E2M1[codes >> 4]
-    values *= np.repeat(e4m3(data[so:so + planes * k // 16].reshape(planes, k // 16)), 16, axis=1)
+    # [tile][term][row][8 bytes] -> [term * rows + row][K / 16]
+    tiles = data[so:so + (k // 128) * terms * pad * 8].reshape(k // 128, terms, pad, 8)[:, :, :rows, :]
+    scales = tiles.transpose(1, 2, 0, 3).reshape(planes, k // 16)
+    values *= np.repeat(e4m3(scales), 16, axis=1)
     globals_ = np.frombuffer(data[go:go + 4 * rows].tobytes(), np.float32).astype(np.float64)
     return values.reshape(terms, rows, k).sum(0) * globals_[:, None]
 
@@ -85,9 +92,16 @@ class Nvfp4NativeKernelTest(unittest.TestCase):
                             [C.c_uint64(dx), C.c_uint64(da), C.c_uint(rows), C.c_uint(k)], block=128)
             kernel = f"euhedral_nvfp4n_gate_up_swiglu{suffix}_128x64" if paired else f"euhedral_nvfp4n_linear{suffix}_128x128"
             kernel += variant
+            sd4 = variant.endswith("_sd4")
+            row_bytes, row_scales = k // 2, k // (32 if sd4 else 16)
+            scale_offset = (cols * row_bytes + 255) // 256 * 256
+            box_rows = 64 if paired else 128
+            maps = [self.gpu.tensor_map(da, [row_bytes, rows, terms], [row_bytes, rows * row_bytes], [64, 128, 1], 2),
+                    self.gpu.tensor_map(dw, [row_bytes, cols], [row_bytes], [64, box_rows], 2),
+                    self.gpu.tensor_map(dw + scale_offset, [row_scales, cols], [row_scales], [16, box_rows], 0)]
             grid = (rows + 127) // 128 * ((cols + 127) // 128)
-            self.gpu.launch(kernel, grid, [C.c_uint64(da), C.c_uint64(dw), C.c_uint64(dy), C.c_uint(rows), C.c_uint(k),
-                                           C.c_uint(cols)], block=256, shared=SHARED)
+            self.gpu.launch(kernel, grid, maps + [C.c_uint64(da), C.c_uint64(dw), C.c_uint64(dy), C.c_uint(rows), C.c_uint(k),
+                                                  C.c_uint(cols)], block=288, shared=SHARED)
             activations = self.gpu.download(da, size)
             return activations, from_bf16_bytes(self.gpu.download(dy, rows * out_cols * 2), (rows, out_cols))
 
