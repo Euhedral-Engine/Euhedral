@@ -20,7 +20,7 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
-static CUfunction quantize, linear, gate_up;
+static CUfunction quantize, linear, gate_up, linear_q4, linear_q5;
 static int init_status = EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
 
 /* q3mx::kSharedBytes of native/src/q3_mx/kernels.cu: three stages of (A hi, A lo, expanded W, 128 FP32 scales). */
@@ -33,6 +33,10 @@ static void initialize(void) {
     if (status == EUHEDRAL_CUDA_SUCCESS
             && (cuModuleGetFunction(&linear, module, "euhedral_q3mx_linear_128x128") != CUDA_SUCCESS
                     || cuModuleGetFunction(&gate_up, module, "euhedral_q3mx_gate_up_swiglu_128x64") != CUDA_SUCCESS
+                    || cuModuleGetFunction(&linear_q4, module, "euhedral_q4mx_linear_128x128") != CUDA_SUCCESS
+                    || cuModuleGetFunction(&linear_q5, module, "euhedral_q5mx_linear_128x128") != CUDA_SUCCESS
+                    || cuFuncSetAttribute(linear_q4, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)Q3MX_SHARED_BYTES) != CUDA_SUCCESS
+                    || cuFuncSetAttribute(linear_q5, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)Q3MX_SHARED_BYTES) != CUDA_SUCCESS
                     || cuFuncSetAttribute(linear, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)Q3MX_SHARED_BYTES) != CUDA_SUCCESS
                     || cuFuncSetAttribute(gate_up, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)Q3MX_SHARED_BYTES) != CUDA_SUCCESS))
         status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
@@ -80,7 +84,7 @@ static int finish(CUresult status) {
 /* `weight_rows` Q3 rows (Layout: 24-byte groups, FP16 scales after a 256-aligned code plane) against `rows` BF16
  * activation rows of `width` values. paired: the weight rows are gate rows then up rows and the output is the
  * SwiGLU, weight_rows / 2 values per row. */
-static int run(int paired, const void* input, const void* weights, void* output, void* scratch, uint32_t rows,
+static int run(int bits, int paired, const void* input, const void* weights, void* output, void* scratch, uint32_t rows,
         uint32_t width, uint32_t weight_rows, uint64_t weight_bytes, uint64_t scratch_bytes) {
     if (rows == 0 || width % 128u != 0 || weight_rows % 128u != 0
             || ((uintptr_t)input & 15u) != 0 || ((uintptr_t)weights & 3u) != 0 || ((uintptr_t)output & 3u) != 0)
@@ -90,7 +94,9 @@ static int run(int paired, const void* input, const void* weights, void* output,
     int status = ensure();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     const uint64_t groups = (uint64_t)weight_rows * (width / 64u);
-    const uint64_t scale_offset = align256(groups * 24u);
+    /* Q3: 24-byte code groups, then the scales. Q4/Q5: 32-byte nibble groups, 8-byte fifth-bit groups (Q5), the scales. */
+    const uint64_t high_offset = bits == 3 ? 0u : align256(groups * 32u);
+    const uint64_t scale_offset = bits == 3 ? align256(groups * 24u) : high_offset + (bits == 5 ? align256(groups * 8u) : 0u);
     if (weight_bytes != scale_offset + groups * 2u) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
     if (scratch == NULL || ((uintptr_t)scratch & 255u) != 0 || scratch_bytes < euhedral_cuda_q3_mx_scratch_bytes(rows, width))
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
@@ -102,22 +108,28 @@ static int run(int paired, const void* input, const void* weights, void* output,
     CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output, hi_ptr = (CUdeviceptr)(uintptr_t)scratch;
     CUdeviceptr lo_ptr = hi_ptr + plane, scale_ptr = hi_ptr + 2u * plane;
     unsigned int rows_arg = rows, width_arg = width, weight_rows_arg = weight_rows;
-    unsigned long long scale_offset_arg = scale_offset;
+    unsigned long long high_offset_arg = high_offset, scale_offset_arg = scale_offset;
     void* quantize_params[] = {&input_ptr, &hi_ptr, &lo_ptr, &scale_ptr, &rows_arg, &width_arg};
     CUresult result = euhedral_launch_kernel(quantize, (unsigned int)blocks, 1, 1, 256, 1, 1, 0, stream, quantize_params, NULL);
     if (result != CUDA_SUCCESS) return finish(result);
     void* gemm_params[] = {&hi_ptr, &lo_ptr, &scale_ptr, &weights_ptr, &output_ptr, &rows_arg, &weight_rows_arg, &width_arg,
-            &scale_offset_arg};
-    return finish(euhedral_launch_kernel(paired ? gate_up : linear, (unsigned int)grid, 1, 1, 256, 1, 1, Q3MX_SHARED_BYTES, stream,
+            &high_offset_arg, &scale_offset_arg};
+    return finish(euhedral_launch_kernel(paired ? gate_up : bits == 4 ? linear_q4 : bits == 5 ? linear_q5 : linear, (unsigned int)grid, 1, 1, 256, 1, 1, Q3MX_SHARED_BYTES, stream,
             gemm_params, NULL));
 }
 
 int euhedral_cuda_linear_q3_mx_bf16(const void* input, const void* weights, void* output, void* scratch, uint32_t rows,
         uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size, uint64_t scratch_byte_size) {
-    return run(0, input, weights, output, scratch, rows, in_features, out_features, weights_byte_size, scratch_byte_size);
+    return run(3, 0, input, weights, output, scratch, rows, in_features, out_features, weights_byte_size, scratch_byte_size);
 }
 
 int euhedral_cuda_q3_mx_gate_up_swiglu_bf16(const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size) {
-    return run(1, input, weights, output, scratch, rows, width, outputs, weight_bytes, scratch_byte_size);
+    return run(3, 1, input, weights, output, scratch, rows, width, outputs, weight_bytes, scratch_byte_size);
+}
+
+int euhedral_cuda_linear_q45_mx_bf16(int bits, const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size, uint64_t scratch_byte_size) {
+    if (bits != 4 && bits != 5) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    return run(bits, 0, input, weights, output, scratch, rows, in_features, out_features, weights_byte_size, scratch_byte_size);
 }

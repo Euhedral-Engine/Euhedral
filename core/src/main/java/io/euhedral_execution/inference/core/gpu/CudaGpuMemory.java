@@ -127,6 +127,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle q3MxAvailable;
     private final MethodHandle q3MxScratchBytes;
     private final MethodHandle linearQ3MxBf16;
+    private final MethodHandle linearQ45MxBf16;
     private final MethodHandle q3MxGateUpSwiGluBf16;
     /// Whether the Q3 block-scaled FP8 prefill module loaded (null until first asked).
     private volatile Boolean q3Mx;
@@ -260,6 +261,22 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     ValueLayout.JAVA_LONG);
             this.linearQ3MxBf16 = symbols.find("euhedral_cuda_linear_q3_mx_bf16")
                     .map(symbol -> linker.downcallHandle(symbol, q3MxDescriptor))
+                    .orElse(null);
+            this.linearQ45MxBf16 = symbols.find("euhedral_cuda_linear_q45_mx_bf16")
+                    .map(symbol -> linker.downcallHandle(
+                            symbol,
+                            FunctionDescriptor.of(
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.ADDRESS,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_INT,
+                                    ValueLayout.JAVA_LONG,
+                                    ValueLayout.JAVA_LONG)))
                     .orElse(null);
             this.q3MxGateUpSwiGluBf16 = symbols.find("euhedral_cuda_q3_mx_gate_up_swiglu_bf16")
                     .map(symbol -> linker.downcallHandle(symbol, q3MxDescriptor))
@@ -1516,6 +1533,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 available = this.q3MxAvailable != null
                         && this.q3MxScratchBytes != null
                         && this.linearQ3MxBf16 != null
+                        && this.linearQ45MxBf16 != null
                         && this.q3MxGateUpSwiGluBf16 != null
                         && (int) this.q3MxAvailable.invokeExact() != 0;
             } catch (Throwable failure) {
@@ -1531,6 +1549,21 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private boolean invokeQ3Mx(
             String operation,
             MethodHandle kernel,
+            long input,
+            long weights,
+            long output,
+            int rows,
+            int width,
+            int outputs,
+            long weightBytes) {
+        return invokeQ3Mx(operation, kernel, 3, input, weights, output, rows, width, outputs, weightBytes);
+    }
+
+    /// `bits` 3 runs `kernel`; 4 and 5 run the Q4/Q5 linear.
+    private boolean invokeQ3Mx(
+            String operation,
+            MethodHandle kernel,
+            int bits,
             long input,
             long weights,
             long output,
@@ -1554,16 +1587,28 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         withQ3Scratch(scratchBytes, scratch -> {
             int status;
             try {
-                status = (int) kernel.invokeExact(
-                        MemorySegment.ofAddress(input),
-                        MemorySegment.ofAddress(weights),
-                        MemorySegment.ofAddress(output),
-                        MemorySegment.ofAddress(scratch),
-                        rows,
-                        width,
-                        outputs,
-                        weightBytes,
-                        scratchBytes);
+                status = bits == 3
+                        ? (int) kernel.invokeExact(
+                                MemorySegment.ofAddress(input),
+                                MemorySegment.ofAddress(weights),
+                                MemorySegment.ofAddress(output),
+                                MemorySegment.ofAddress(scratch),
+                                rows,
+                                width,
+                                outputs,
+                                weightBytes,
+                                scratchBytes)
+                        : (int) this.linearQ45MxBf16.invokeExact(
+                                bits,
+                                MemorySegment.ofAddress(input),
+                                MemorySegment.ofAddress(weights),
+                                MemorySegment.ofAddress(output),
+                                MemorySegment.ofAddress(scratch),
+                                rows,
+                                width,
+                                outputs,
+                                weightBytes,
+                                scratchBytes);
             } catch (Throwable throwable) {
                 throw new GpuMemoryException(operation + " invocation failed", throwable);
             }
@@ -1768,6 +1813,17 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (rows <= 0 || inFeatures <= 0 || outFeatures <= 0 || weightsByteSize <= 0) {
             throw new IllegalArgumentException("quantized linear dimensions and payload size must be positive");
         }
+        if (invokeQ3Mx(
+                "Q" + bits + " FP8 linear",
+                null,
+                bits,
+                inputAddress,
+                weightsAddress,
+                outputAddress,
+                rows,
+                inFeatures,
+                outFeatures,
+                weightsByteSize)) return;
         int status;
         try {
             status = (int) linearQuantizedBf16.invokeExact(
@@ -2182,6 +2238,32 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         requireAddresses(input, q4Weights, q5Weights, queryKeyOutput, valueZOutput);
         if (rows <= 0 || hidden <= 0 || queryKeyWidth <= 0 || valueZWidth <= 0 || q4Bytes <= 0 || q5Bytes <= 0)
             throw new IllegalArgumentException("invalid GDN projection dimensions");
+        // The two projections share the input; each quantizes it (a few microseconds) and runs on the FP8 route.
+        if (invokeQ3Mx(
+                "Q4 FP8 GDN projection",
+                null,
+                4,
+                input,
+                q4Weights,
+                queryKeyOutput,
+                rows,
+                hidden,
+                queryKeyWidth,
+                q4Bytes)) {
+            if (!invokeQ3Mx(
+                    "Q5 FP8 GDN projection",
+                    null,
+                    5,
+                    input,
+                    q5Weights,
+                    valueZOutput,
+                    rows,
+                    hidden,
+                    valueZWidth,
+                    q5Bytes))
+                linearQuantizedBf16(input, q5Weights, valueZOutput, rows, hidden, valueZWidth, q5Bytes, 5);
+            return;
+        }
         invokeLayer(
                 "GDN projections",
                 gdnProjectionsBf16,

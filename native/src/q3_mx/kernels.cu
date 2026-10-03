@@ -9,6 +9,9 @@
 //   y = sum over groups of w_scale * (sum over k in group of (hi + lo) * 2^e * code)
 // has exact operands and FP32 accumulation. The relaxed BF16 route rounds code * scale to BF16 first.
 //
+// Q4 and Q5 (native/src/q45 layout: nibble plane, fifth-bit plane, scale plane) run the same engine; their codes (-8..7, -16..15)
+// are exact in E4M3 too. Q3 expands by byte permute; Q4/Q5 look up one E4M3 pair per nibble pair (and fifth-bit pair).
+//
 // Flow: euhedral_q3mx_quantize (BF16 rows -> hi, lo, scale planes), then a 128 x 128 tile GEMM, 8 warps of 64 x 32.
 // A tiles arrive by cp.async; the compact Q3 weight groups (24 bytes) are expanded to E4M3 bytes by two threads
 // per row, one group ahead of the MMAs.
@@ -56,13 +59,42 @@ __device__ __forceinline__ unsigned expand_word(unsigned w0, unsigned w1, unsign
     return __byte_perm(kCodeBytesLow, kCodeBytesHigh, selector);
 }
 
+// Word J (four codes) of a 32-code half group from its raw words: Q3 three words of a 3-bit stream; Q4 four words of
+// nibbles (code K at nibble K); Q5 the same plus the fifth bits of the half (bit K of raw[4]).
+template<int BITS, int J>
+__device__ __forceinline__ unsigned expand_any(const unsigned (&raw)[5], const unsigned short* pair_table) {
+    if (BITS == 3) return expand_word<J>(raw[0], raw[1], raw[2]);
+    const unsigned word = raw[J >> 1], shift = 16u * (J & 1);
+    unsigned first = (word >> shift) & 0xFFu, second = (word >> (shift + 8u)) & 0xFFu;
+    if (BITS == 5) {
+        const unsigned fifth = raw[4] >> (4 * J);
+        first |= (fifth & 3u) << 8;
+        second |= ((fifth >> 2) & 3u) << 8;
+    }
+    return (unsigned)pair_table[first] | ((unsigned)pair_table[second] << 16);
+}
+
 // One tile: PAIRED = 0 writes out[row][col] for 128 weight rows; PAIRED = 1 treats the weight rows as gate rows
 // followed by up rows, pairs 64 of each per tile and writes silu(gate) * up. `width` is the output row length.
-template<int PAIRED>
+template<int BITS, int PAIRED>
 __device__ __forceinline__ void gemm(const unsigned char* a_hi, const unsigned char* a_lo, const unsigned char* a_scales,
         const unsigned char* codes, unsigned short* out, unsigned rows, unsigned weight_rows, unsigned k,
-        unsigned long long scale_offset) {
+        unsigned long long high_offset, unsigned long long scale_offset) {
     extern __shared__ __align__(128) unsigned char smem[];
+    // Q4/Q5: E4M3 byte pair of a byte of two nibbles (and for Q5 two fifth bits at bits 8, 9).
+    __shared__ unsigned short pair_table[BITS == 5 ? 1024 : BITS == 4 ? 256 : 1];
+    if (BITS != 3) {
+        for (unsigned i = threadIdx.x; i < (BITS == 5 ? 1024u : 256u); i += 256u) {
+            int c[2];
+            for (int s = 0; s < 2; s++) {
+                const unsigned n = (i >> (4 * s)) & 15u;
+                c[s] = BITS == 5 ? (int)n - (int)(((i >> (8 + s)) & 1u) << 4) : (int)n - (int)((n >> 3) << 4);
+            }
+            const unsigned short pair = __nv_cvt_float2_to_fp8x2(make_float2((float)c[0], (float)c[1]), __NV_SATFINITE, __NV_E4M3);
+            pair_table[i] = pair;
+        }
+        __syncthreads();
+    }
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
     const unsigned tiles_m = (rows + 127u) / 128u;
     const unsigned tm = blockIdx.x % tiles_m, tn = blockIdx.x / tiles_m;
@@ -96,12 +128,21 @@ __device__ __forceinline__ void gemm(const unsigned char* a_hi, const unsigned c
     } else {
         weight_row = tn * 128u + produce_row;
     }
-    const unsigned char* weight_group = codes + ((unsigned long long)weight_row * groups) * 24u + half * 12u;
-    const unsigned short* weight_scale = weight_scales + (unsigned long long)weight_row * groups;
-    unsigned raw[3], raw_scale = 0;
+    constexpr unsigned kCodeBytes = BITS == 3 ? 24u : 32u, kHalfBytes = kCodeBytes / 2u;
+    const unsigned long long first_group = (unsigned long long)weight_row * groups;
+    const unsigned char* weight_group = codes + first_group * kCodeBytes + half * kHalfBytes;
+    const unsigned char* high_group = codes + high_offset + first_group * 8u + half * 4u;
+    const unsigned short* weight_scale = weight_scales + first_group;
+    unsigned raw[5], raw_scale = 0;
     auto load_weights = [&](unsigned group) {
-        const unsigned* p = reinterpret_cast<const unsigned*>(weight_group + (unsigned long long)group * 24u);
-        raw[0] = p[0]; raw[1] = p[1]; raw[2] = p[2];
+        if (BITS == 3) {
+            const unsigned* p = reinterpret_cast<const unsigned*>(weight_group + (unsigned long long)group * 24u);
+            raw[0] = p[0]; raw[1] = p[1]; raw[2] = p[2];
+        } else {
+            const uint4 p = *reinterpret_cast<const uint4*>(weight_group + (unsigned long long)group * 32u);
+            raw[0] = p.x; raw[1] = p.y; raw[2] = p.z; raw[3] = p.w;
+            if (BITS == 5) raw[4] = *reinterpret_cast<const unsigned*>(high_group + (unsigned long long)group * 8u);
+        }
         if (half == 0) raw_scale = weight_scale[group];
     };
     // Expansion of the group fetched one group ago into the next stage, spread over the MMA loop below: word J of
@@ -109,14 +150,14 @@ __device__ __forceinline__ void gemm(const unsigned char* a_hi, const unsigned c
     unsigned expanded[4];
     auto expand_step = [&](int j, unsigned stage) {
         switch (j) {
-            case 0: expanded[0] = expand_word<0>(raw[0], raw[1], raw[2]); break;
-            case 1: expanded[1] = expand_word<1>(raw[0], raw[1], raw[2]); break;
-            case 2: expanded[2] = expand_word<2>(raw[0], raw[1], raw[2]); break;
-            case 3: expanded[3] = expand_word<3>(raw[0], raw[1], raw[2]); break;
-            case 4: expanded[0] = expand_word<4>(raw[0], raw[1], raw[2]); break;
-            case 5: expanded[1] = expand_word<5>(raw[0], raw[1], raw[2]); break;
-            case 6: expanded[2] = expand_word<6>(raw[0], raw[1], raw[2]); break;
-            default: expanded[3] = expand_word<7>(raw[0], raw[1], raw[2]); break;
+            case 0: expanded[0] = expand_any<BITS, 0>(raw, pair_table); break;
+            case 1: expanded[1] = expand_any<BITS, 1>(raw, pair_table); break;
+            case 2: expanded[2] = expand_any<BITS, 2>(raw, pair_table); break;
+            case 3: expanded[3] = expand_any<BITS, 3>(raw, pair_table); break;
+            case 4: expanded[0] = expand_any<BITS, 4>(raw, pair_table); break;
+            case 5: expanded[1] = expand_any<BITS, 5>(raw, pair_table); break;
+            case 6: expanded[2] = expand_any<BITS, 6>(raw, pair_table); break;
+            default: expanded[3] = expand_any<BITS, 7>(raw, pair_table); break;
         }
         if (j == 3 || j == 7) {
             unsigned char* tile = a_tile(stage, 2);
@@ -292,17 +333,17 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q3mx_quantize(const u
 }
 
 // Linear: out[rows][weight_rows] = x * W^T. Grid = ceil(rows / 128) * (weight_rows / 128), 256 threads,
-// q3mx::kSharedBytes dynamic shared memory. weight_rows % 128 == 0, k % 128 == 0.
-extern "C" __global__ __launch_bounds__(256, 1) void euhedral_q3mx_linear_128x128(const unsigned char* a_hi,
-        const unsigned char* a_lo, const unsigned char* a_scales, const unsigned char* codes, unsigned short* out,
-        unsigned rows, unsigned weight_rows, unsigned k, unsigned long long scale_offset) {
-    q3mx::gemm<0>(a_hi, a_lo, a_scales, codes, out, rows, weight_rows, k, scale_offset);
+// q3mx::kSharedBytes dynamic shared memory. weight_rows % 128 == 0, k % 128 == 0. Q3: the codes then the scales at
+// scale_offset; Q4/Q5: the nibble plane, the fifth-bit plane at high_offset (Q5), the scales at scale_offset.
+#define EUHEDRAL_Q3MX_KERNEL(NAME, BITS, PAIRED) \
+extern "C" __global__ __launch_bounds__(256, 1) void NAME(const unsigned char* a_hi, const unsigned char* a_lo, \
+        const unsigned char* a_scales, const unsigned char* codes, unsigned short* out, unsigned rows, \
+        unsigned weight_rows, unsigned k, unsigned long long high_offset, unsigned long long scale_offset) { \
+    q3mx::gemm<BITS, PAIRED>(a_hi, a_lo, a_scales, codes, out, rows, weight_rows, k, high_offset, scale_offset); \
 }
-
-// Gate/up SwiGLU: weight_rows = gate rows followed by up rows; out[rows][weight_rows / 2]. 64 outputs per tile:
-// grid = ceil(rows / 128) * (weight_rows / 128).
-extern "C" __global__ __launch_bounds__(256, 1) void euhedral_q3mx_gate_up_swiglu_128x64(const unsigned char* a_hi,
-        const unsigned char* a_lo, const unsigned char* a_scales, const unsigned char* codes, unsigned short* out,
-        unsigned rows, unsigned weight_rows, unsigned k, unsigned long long scale_offset) {
-    q3mx::gemm<1>(a_hi, a_lo, a_scales, codes, out, rows, weight_rows, k, scale_offset);
-}
+EUHEDRAL_Q3MX_KERNEL(euhedral_q3mx_linear_128x128, 3, 0)
+// Gate/up SwiGLU: weight_rows = gate rows followed by up rows; out[rows][weight_rows / 2]. 64 outputs per tile.
+EUHEDRAL_Q3MX_KERNEL(euhedral_q3mx_gate_up_swiglu_128x64, 3, 1)
+EUHEDRAL_Q3MX_KERNEL(euhedral_q4mx_linear_128x128, 4, 0)
+EUHEDRAL_Q3MX_KERNEL(euhedral_q5mx_linear_128x128, 5, 0)
+#undef EUHEDRAL_Q3MX_KERNEL
