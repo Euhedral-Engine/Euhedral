@@ -167,6 +167,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_mx_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
         uint64_t scratch_byte_size);
+/* Q4 and Q5 tensors (bits = 4 or 5) on the same route. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q45_mx_bf16(
+        int bits, const void* input, const void* weights, void* output, void* scratch,
+        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size,
+        uint64_t scratch_byte_size);
 /* The paired gate/up region: `outputs` weight rows (gate first), outputs / 2 SwiGLU values per row. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_gate_up_swiglu_bf16(
         const void* input, const void* weights, void* output, void* scratch,

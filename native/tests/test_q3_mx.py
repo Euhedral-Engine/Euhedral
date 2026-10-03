@@ -35,6 +35,26 @@ def pack_q3(codes, scales):
     return buffer.tobytes(), offset
 
 
+def pack_q45(codes, scales, bits):
+    """codes int [N][K] (Q4 -8..7, Q5 -16..15) -> nibble plane, fifth-bit plane (Q5), scales; planes 256-aligned.
+    Returns (buffer, high_offset, scale_offset)."""
+    n, k = codes.shape
+    groups = k // 64
+    align = lambda v: (v + 255) // 256 * 256
+    u = (codes & ((1 << bits) - 1)).astype(np.uint8).reshape(n, groups, 64)
+    nibbles = u & 15
+    code_bytes = (nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)).reshape(-1)
+    code_plane = align(n * groups * 32)
+    high_plane = align(n * groups * 8) if bits == 5 else 0
+    buffer = np.zeros(code_plane + high_plane + n * groups * 2, np.uint8)
+    buffer[:code_bytes.size] = code_bytes
+    if bits == 5:
+        fifth = ((u >> 4) & 1).astype(np.uint8)
+        buffer[code_plane:code_plane + n * groups * 8] = np.packbits(fifth, axis=-1, bitorder="little").reshape(-1)
+    buffer[code_plane + high_plane:] = scales.astype(np.float16).reshape(-1).view(np.uint8)
+    return buffer.tobytes(), code_plane, code_plane + high_plane
+
+
 def bf16_values(rng, shape, scale=1.0):
     bits, values = bf16(rng.standard_normal(shape).astype(np.float32) * scale)
     return bits.reshape(shape), values.reshape(shape)
@@ -101,7 +121,7 @@ class Q3MxTest(unittest.TestCase):
         dout = gpu.zeros(rows * width * 2, 0xAA)
         grid = ((rows + 127) // 128) * (n // 128)
         name = "euhedral_q3mx_gate_up_swiglu_128x64" if paired else "euhedral_q3mx_linear_128x128"
-        gpu.launch(name, grid, [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(scale_offset)],
+        gpu.launch(name, grid, [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset)],
                    block=256, shared=SHARED)
         got = (np.frombuffer(gpu.download(dout, rows * width * 2), np.uint16).astype(np.uint32) << 16).view(np.float32)
         got = got.reshape(rows, width).astype(np.float64)
@@ -121,6 +141,32 @@ class Q3MxTest(unittest.TestCase):
                 # FP32 accumulation of exact products, then BF16 output rounding (2^-9).
                 np.testing.assert_allclose(got, y, rtol=2.0 ** -8, atol=2.0 ** -8 * np.abs(y).max() * 1e-3)
                 self.assertLess(np.max(np.abs(got - y)) / np.abs(y).max(), 2.0 ** -8)
+
+    def test_q4_and_q5_linears_match_float64(self):
+        gpu, rng = self.gpu, self.rng
+        for bits in (4, 5):
+            for rows, n, k in [(128, 128, 128), (200, 256, 384), (37, 384, 256)]:
+                with self.subTest(bits=bits, rows=rows, n=n, k=k):
+                    low, high = -(1 << (bits - 1)), (1 << (bits - 1))
+                    codes = rng.integers(low, high, (n, k)).astype(np.int8)
+                    codes[0, :64] = low                                  # the most negative code throughout a group
+                    codes[1, :64] = high - 1
+                    scales = rng.uniform(0.002, 0.02, (n, k // 64)).astype(np.float16)
+                    weights, high_offset, scale_offset = pack_q45(codes, scales, bits)
+                    bits16, x = bf16_values(rng, (rows, k))
+                    hi, lo, sc = self.quantize(bits16, rows, k)
+                    dhi, dlo, dsc, dw = gpu.upload(hi.tobytes()), gpu.upload(lo.tobytes()), gpu.upload(sc.tobytes()), gpu.upload(weights)
+                    dout = gpu.zeros(rows * n * 2, 0xAA)
+                    gpu.launch(f"euhedral_q{bits}mx_linear_128x128", ((rows + 127) // 128) * (n // 128),
+                               [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(high_offset),
+                                C.c_uint64(scale_offset)], block=256, shared=SHARED)
+                    got = (np.frombuffer(gpu.download(dout, rows * n * 2), np.uint16).astype(np.uint32) << 16).view(np.float32)
+                    got = got.reshape(rows, n).astype(np.float64)
+                    for p in (dhi, dlo, dsc, dw, dout):
+                        gpu.free(p)
+                    w64 = (codes.reshape(n, k // 64, 64) * scales.astype(np.float64)[:, :, None]).reshape(n, k)
+                    y = x.astype(np.float64) @ w64.T
+                    self.assertLess(np.max(np.abs(got - y)) / np.abs(y).max(), 2.0 ** -8)
 
     def test_gate_up_swiglu_matches_float64(self):
         for rows, n, k in [(128, 128, 128), (200, 256, 384), (65, 512, 256)]:
@@ -148,7 +194,7 @@ class Q3MxTest(unittest.TestCase):
         dhi, dlo, dsc, dw = gpu.upload(hi.tobytes()), gpu.upload(lo.tobytes()), gpu.upload(sc.tobytes()), gpu.upload(weights)
         dout = gpu.zeros(rows * n * 2, 0xAA)
         gpu.launch("euhedral_q3mx_linear_128x128", ((rows + 127) // 128) * (n // 128),
-                   [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(scale_offset)], block=256, shared=SHARED)
+                   [P(dhi), P(dlo), P(dsc), P(dw), P(dout), U(rows), U(n), U(k), C.c_uint64(0), C.c_uint64(scale_offset)], block=256, shared=SHARED)
         got = (np.frombuffer(gpu.download(dout, rows * n * 2), np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(rows, n)
         weights64 = (codes.reshape(n, k // 64, 64) * scales.astype(np.float64)[:, :, None]).reshape(n, k)
         y = x.astype(np.float64) @ weights64.T
