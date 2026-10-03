@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Losslessly transcode the Q3 tensors of a compact EDRL artifact to the P2E2 layout.
+"""Losslessly transcode the Q3 tensors of a Q3 artifact to the P2E2 layout (the compressed Q3 artifact).
 
 P2E2 ("row-split-p2e2-v1") stores the same Q3G64_F16S values in less memory: the signed 3-bit codes
 are entropy coded as a fixed 2-bit primary plane plus a short payload stream, and the FP16 scale
@@ -9,36 +8,21 @@ decoded back and compared byte for byte with its source before the output is pub
 
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
 import os
 from pathlib import Path
 import struct
-import sys
 import tempfile
-from typing import Any, NoReturn
+from typing import Any
 
 import numpy as np
 
-MAGIC = 0x5157454E
-VERSION = 2
-HEADER_SIZE = 48
-FORMAT_Q3 = 5
-LAYOUT_ROW_SPLIT = 1
-LAYOUT_P2E2 = 2
+from euhedral_artifacts.edrl import (FORMAT_Q3, HEADER_FORMAT, LAYOUT_P2E2, LAYOUT_ROW_SPLIT, align_up,
+                                     encode_descriptors, fail, read_table)
+
 SLICE = 1024
 PAYLOAD_PAD_WORDS = 80
 ROW_CHUNK_CODES = 1 << 25
 BIG_VALUES = np.array([-3, -2, 2, 3], dtype=np.int8)
-
-
-def fail(message: str) -> NoReturn:
-    raise ValueError(message)
-
-
-def align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 def row_split_q3_size(rows: int, k: int) -> int:
@@ -173,53 +157,13 @@ def decode(tensor: bytes | np.ndarray, rows: int, k: int) -> bytes:
     return out.tobytes()
 
 
-def read_table(handle) -> tuple[bytes, bytes, list[dict[str, Any]]]:
-    header = handle.read(HEADER_SIZE)
-    magic, version, metadata_offset, metadata_size, table_offset, count, reserved, data_offset = struct.unpack(
-            ">iiqqqiiq", header)
-    if magic != MAGIC or version != VERSION or reserved != 0:
-        fail("input is not a compact EDRL v2 artifact")
-    handle.seek(metadata_offset)
-    metadata = handle.read(metadata_size)
-    handle.seek(table_offset)
-    objects = []
-    for _ in range(count):
-        name_size = struct.unpack(">i", handle.read(4))[0]
-        name = handle.read(name_size).decode("utf-8")
-        rank = struct.unpack(">i", handle.read(4))[0]
-        shape = struct.unpack(f">{rank}q", handle.read(8 * rank))
-        dtype, fmt, layout, offset, size = struct.unpack(">iiiqq", handle.read(28))
-        objects.append({"name": name, "shape": tuple(shape), "dtype": dtype, "format": fmt, "layout": layout,
-                        "offset": offset, "bytes": size})
-    if handle.tell() != data_offset:
-        fail("unexpected gap between the tensor table and the data")
-    return header, metadata, objects
-
-
-def encode_table(objects: list[dict[str, Any]]) -> bytes:
-    result = bytearray()
-    for obj in objects:
-        name = obj["name"].encode("utf-8")
-        result += struct.pack(">i", len(name)) + name + struct.pack(">i", len(obj["shape"]))
-        result += struct.pack(f">{len(obj['shape'])}q", *obj["shape"])
-        result += struct.pack(">iiiqq", obj["dtype"], obj["format"], obj["layout"], obj["offset"], obj["bytes"])
-    return bytes(result)
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(16 * 1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def convert(input_path: Path, output_path: Path, force: bool) -> dict[str, Any]:
+def transcode(input_path: Path, output_path: Path, force: bool = False) -> dict[str, Any]:
+    """Writes the P2E2 artifact of the Q3 artifact `input_path`; returns its manifest fields."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     with input_path.open("rb") as source:
         header, metadata, objects = read_table(source)
-        data_offset = struct.unpack(">iiqqqiiq", header)[7]
+        data_offset = struct.unpack(HEADER_FORMAT, header)[7]
         planned = []
         cursor = data_offset
         for obj in objects:
@@ -258,8 +202,8 @@ def convert(input_path: Path, output_path: Path, force: bool) -> dict[str, Any]:
                     if index % 32 == 0 or index == len(objects):
                         print(f"transcoded {index}/{len(objects)} {obj['name']}", flush=True)
                 sink.truncate(cursor)
-                table = encode_table(planned)
-                if len(table) != data_offset - struct.unpack(">iiqqqiiq", header)[4]:
+                table = encode_descriptors(planned)
+                if len(table) != data_offset - struct.unpack(HEADER_FORMAT, header)[4]:
                     fail("tensor table size changed")
                 sink.seek(0)
                 sink.write(header)
@@ -271,38 +215,12 @@ def convert(input_path: Path, output_path: Path, force: bool) -> dict[str, Any]:
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-    manifest = {
-        "format": "edrl-v2-compact-q3-p2e2",
-        "source_artifact": str(input_path),
+    return {
         "object_count": len(objects),
         "p2e2_tensor_count": stats["tensors"],
         "p2e2_source_bytes": stats["source_bytes"],
         "p2e2_bytes": stats["p2e2_bytes"],
         "payload_bytes": sum(out["bytes"] for out in planned),
         "file_bytes": cursor,
-        "sha256": sha256(output_path),
         "round_trip": "exact",
     }
-    with Path(f"{output_path}.manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    return manifest
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("input", type=Path, help="compact EDRL v2 artifact")
-    parser.add_argument("output", type=Path, help="P2E2 EDRL v2 artifact to write")
-    parser.add_argument("--force", action="store_true", help="replace an existing output")
-    args = parser.parse_args(argv)
-    try:
-        manifest = convert(args.input, args.output, args.force)
-    except ValueError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
-    print(json.dumps(manifest, indent=2, sort_keys=True))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

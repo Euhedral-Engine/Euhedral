@@ -1,16 +1,13 @@
-import importlib.util
 from pathlib import Path
 import sys
 import unittest
 
 import numpy as np
 
-MODULE_PATH = Path(__file__).with_name("convert_compact_edrl_to_p2e2.py")
-spec = importlib.util.spec_from_file_location("p2e2_converter", MODULE_PATH)
-assert spec is not None and spec.loader is not None
-p2e2 = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = p2e2
-spec.loader.exec_module(p2e2)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from euhedral_artifacts import edrl, q3_p2e2 as p2e2  # noqa: E402
+
 
 
 def row_split(codes: np.ndarray, rng: np.random.Generator) -> bytes:
@@ -19,7 +16,7 @@ def row_split(codes: np.ndarray, rng: np.random.Generator) -> bytes:
     out = bytearray(p2e2.row_split_q3_size(rows, k))
     planes = p2e2.pack_q3(codes)
     out[: len(planes)] = planes
-    scale_offset = p2e2.align_up(rows * groups * 24, 256)
+    scale_offset = edrl.align_up(rows * groups * 24, 256)
     scales = rng.integers(0, 1 << 15, rows * groups, dtype=np.uint16).astype("<u2").tobytes()
     out[scale_offset:scale_offset + len(scales)] = scales
     return bytes(out)
@@ -110,10 +107,10 @@ class P2e2ConverterTest(unittest.TestCase):
             p2e2.decode(bytes(corrupt), 4, 1024)
 
     def test_eligibility_requires_q3_row_split_and_whole_slices(self):
-        self.assertTrue(p2e2.eligible((8, 5120), p2e2.FORMAT_Q3, p2e2.LAYOUT_ROW_SPLIT))
-        self.assertFalse(p2e2.eligible((8, 5120), 6, p2e2.LAYOUT_ROW_SPLIT))
-        self.assertFalse(p2e2.eligible((8, 4608), p2e2.FORMAT_Q3, p2e2.LAYOUT_ROW_SPLIT))
-        self.assertFalse(p2e2.eligible((8, 5120), p2e2.FORMAT_Q3, p2e2.LAYOUT_P2E2))
+        self.assertTrue(p2e2.eligible((8, 5120), edrl.FORMAT_Q3, edrl.LAYOUT_ROW_SPLIT))
+        self.assertFalse(p2e2.eligible((8, 5120), 6, edrl.LAYOUT_ROW_SPLIT))
+        self.assertFalse(p2e2.eligible((8, 4608), edrl.FORMAT_Q3, edrl.LAYOUT_ROW_SPLIT))
+        self.assertFalse(p2e2.eligible((8, 5120), edrl.FORMAT_Q3, edrl.LAYOUT_P2E2))
 
 
 if __name__ == "__main__":
