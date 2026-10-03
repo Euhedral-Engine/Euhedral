@@ -1,16 +1,9 @@
-#ifndef _WIN32
-#define _GNU_SOURCE
-#endif
-
+#include "cuda_kernel_loader.h"
 #include "q3_p2e2_geometry.h"
-#include "euhedral_cuda.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-#include <nvrtc.h>
 
-#include <errno.h>
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,16 +13,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
-#include <dlfcn.h>
 #include <pthread.h>
 #endif
 
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 13010
 #error "Euhedral CUDA ABI requires CUDA toolkit 13.1 or newer"
-#endif
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
 #endif
 
 #ifdef _WIN32
@@ -42,181 +30,13 @@ static CUfunction q3_embedding_function;
 static CUfunction q3_p2e2_embedding_function;
 static int q3_embedding_init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
-static int native_module_path(char* path, size_t capacity) {
-#ifdef _WIN32
-    HMODULE module = NULL;
-    DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-    if (!GetModuleHandleExA(flags, (LPCSTR)(const void*)&q3_embedding_once, &module)) {
-        return 0;
-    }
-    DWORD path_length = GetModuleFileNameA(module, path, (DWORD) capacity);
-    if (path_length == 0 || path_length >= capacity) {
-        return 0;
-    }
-    path[path_length] = '\0';
-    return 1;
-#else
-    Dl_info module_info;
-    if (dladdr(&q3_embedding_once, &module_info) == 0 || module_info.dli_fname == NULL) {
-        return 0;
-    }
-    size_t path_length = strlen(module_info.dli_fname);
-    if (path_length >= capacity) {
-        return 0;
-    }
-    memcpy(path, module_info.dli_fname, path_length + 1u);
-    return 1;
-#endif
-}
-
-static char* load_q3_embedding_source(void) {
-    char module_path[PATH_MAX];
-    if (!native_module_path(module_path, sizeof(module_path))) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: cannot locate native library path\n");
-        return NULL;
-    }
-    const char* last_separator = strrchr(module_path, '/');
-    const char* windows_separator = strrchr(module_path, '\\');
-    if (windows_separator != NULL && (last_separator == NULL || windows_separator > last_separator)) {
-        last_separator = windows_separator;
-    }
-    if (last_separator == NULL) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: native library path has no directory\n");
-        return NULL;
-    }
-    size_t directory_length = (size_t)(last_separator - module_path);
-
-    char source_path[PATH_MAX];
-    int path_length = snprintf(
-            source_path,
-            sizeof(source_path),
-            "%.*s/../share/euhedral_cuda/embedding/kernels.cu",
-            (int) directory_length,
-            module_path);
-    if (path_length < 0 || (size_t) path_length >= sizeof(source_path)) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: kernel source path is too long\n");
-        return NULL;
-    }
-
-    FILE* source_file = fopen(source_path, "rb");
-    if (source_file == NULL) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: cannot open %s: %s\n", source_path, strerror(errno));
-        return NULL;
-    }
-    if (fseek(source_file, 0, SEEK_END) != 0) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: cannot seek kernel source %s\n", source_path);
-        fclose(source_file);
-        return NULL;
-    }
-    long source_length = ftell(source_file);
-    if (source_length <= 0 || (uintmax_t) source_length >= SIZE_MAX) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: kernel source has an invalid size\n");
-        fclose(source_file);
-        return NULL;
-    }
-    rewind(source_file);
-
-    char* source = (char*) malloc((size_t) source_length + 1u);
-    if (source == NULL) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: unable to allocate kernel source\n");
-        fclose(source_file);
-        return NULL;
-    }
-    size_t bytes_read = fread(source, 1, (size_t) source_length, source_file);
-    fclose(source_file);
-    if (bytes_read != (size_t) source_length) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: short read from %s\n", source_path);
-        free(source);
-        return NULL;
-    }
-    source[source_length] = '\0';
-    return source;
-}
-
 static void initialize_q3_embedding_kernel(void) {
-    char* source = load_q3_embedding_source();
-    if (source == NULL) {
-        return;
-    }
-
-    nvrtcProgram program = NULL;
-    nvrtcResult compiler_status = nvrtcCreateProgram(&program, source, "embedding/kernels.cu", 0, NULL, NULL);
-    if (compiler_status != NVRTC_SUCCESS) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: NVRTC program creation failed: %s\n",
-                nvrtcGetErrorString(compiler_status));
-        free(source);
-        return;
-    }
-
-    const char* options[] = {"--std=c++14", "--gpu-architecture=compute_90"};
-    compiler_status = nvrtcCompileProgram(program, 2, options);
-    if (compiler_status != NVRTC_SUCCESS) {
-        size_t log_size = 0;
-        (void) nvrtcGetProgramLogSize(program, &log_size);
-        char* log = log_size == 0 ? NULL : (char*) malloc(log_size);
-        if (log != NULL) {
-            (void) nvrtcGetProgramLog(program, log);
-            fprintf(stderr, "Euhedral CUDA Q3 embedding NVRTC compilation failed:\n%s\n", log);
-            free(log);
-        } else {
-            fprintf(stderr, "Euhedral CUDA Q3 embedding: NVRTC compilation failed: %s\n",
-                    nvrtcGetErrorString(compiler_status));
-        }
-        (void) nvrtcDestroyProgram(&program);
-        free(source);
-        return;
-    }
-
-    size_t ptx_size = 0;
-    compiler_status = nvrtcGetPTXSize(program, &ptx_size);
-    char* ptx = compiler_status == NVRTC_SUCCESS ? (char*) malloc(ptx_size) : NULL;
-    if (compiler_status != NVRTC_SUCCESS || ptx == NULL) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: unable to allocate NVRTC PTX output\n");
-        (void) nvrtcDestroyProgram(&program);
-        free(source);
-        return;
-    }
-    compiler_status = nvrtcGetPTX(program, ptx);
-    (void) nvrtcDestroyProgram(&program);
-    free(source);
-    if (compiler_status != NVRTC_SUCCESS) {
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: NVRTC PTX retrieval failed: %s\n",
-                nvrtcGetErrorString(compiler_status));
-        free(ptx);
-        return;
-    }
-
-    CUresult driver_status = cuInit(0);
-    CUcontext context = NULL;
-    if (driver_status == CUDA_SUCCESS) {
-        driver_status = cuCtxGetCurrent(&context);
-    }
-    if (driver_status == CUDA_SUCCESS && context == NULL) {
-        driver_status = CUDA_ERROR_INVALID_CONTEXT;
-    }
-    if (driver_status == CUDA_SUCCESS) {
-        driver_status = cuModuleLoadData(&q3_embedding_module, ptx);
-    }
-    free(ptx);
-    if (driver_status == CUDA_SUCCESS) {
-        driver_status = cuModuleGetFunction(
-                &q3_embedding_function, q3_embedding_module, "euhedral_q3_embedding");
-    }
-    if (driver_status != CUDA_SUCCESS) {
-        const char* message = NULL;
-        (void) cuGetErrorString(driver_status, &message);
-        fprintf(stderr, "Euhedral CUDA Q3 embedding: driver initialization failed: %s\n",
-                message == NULL ? "unknown CUDA driver error" : message);
-        if (q3_embedding_module != NULL) {
-            (void) cuModuleUnload(q3_embedding_module);
-            q3_embedding_module = NULL;
-        }
-        return;
-    }
+    int status = euhedral_cuda_load_kernel((const void*)&q3_embedding_once, "embedding/kernels.cu",
+            "euhedral_q3_embedding", &q3_embedding_module, &q3_embedding_function);
+    if (status != EUHEDRAL_CUDA_SUCCESS) return;
     if (cuModuleGetFunction(&q3_p2e2_embedding_function, q3_embedding_module, "euhedral_q3_p2e2_embedding")
-            != CUDA_SUCCESS) {
+            != CUDA_SUCCESS)
         q3_p2e2_embedding_function = NULL;
-    }
     q3_embedding_init_status = EUHEDRAL_CUDA_SUCCESS;
 }
 

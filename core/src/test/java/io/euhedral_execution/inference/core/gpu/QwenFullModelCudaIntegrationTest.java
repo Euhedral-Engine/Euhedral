@@ -489,7 +489,7 @@ class QwenFullModelCudaIntegrationTest {
             var production = new QwenExecutionPlan(model.weights());
             var reference = QwenExecutionPlan.reference(model.weights());
             // The route structure is bitwise against the reference under exact numerics; relaxed-order
-            // kernels (split-K down, contiguous decode) are bounded by RelaxedNumericsDriftCudaIntegrationTest.
+            // kernels (the FP8 route, contiguous decode) are bounded by RelaxedNumericsDriftCudaIntegrationTest.
             boolean previous = gpu.selectExactNumerics(true);
             try {
                 for (int rows : new int[] {64, 256, 512, 1024}) {

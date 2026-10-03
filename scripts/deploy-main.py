@@ -21,7 +21,7 @@ from contextlib import contextmanager
 SERVICE = "euhedral-inference-serve"
 IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
-MODEL_ID = os.environ.get("EUHEDRAL_DEPLOY_MODEL_ID", "qwen3.8-27b-compact-q3")
+MODEL_ID = os.environ.get("EUHEDRAL_DEPLOY_MODEL_ID", "qwen3.8-27b-q3")
 
 
 def command(*args):
