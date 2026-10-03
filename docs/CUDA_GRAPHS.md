@@ -16,7 +16,7 @@ not change with its position. The host keeps its copy of the position to validat
 
 **Capture key.** A quantum's key holds what its submissions depend on apart from the input record:
 
-- kind, rows, logits requirement, host logits, draft seed and committed rows, programmatic dependent launch;
+- kind, rows, logits requirement, host logits, draft seed and committed rows;
 - the split counts that size decode attention (48-key splits below 2048 keys, 32-key splits from 2048, at most 64 each): below
   2048 keys the key changes every 48 positions, from 2048 it is constant;
 - a fingerprint of the workspace storage and of every sequence-owned device address (KV page tables, decode scratch, draft seed
@@ -27,8 +27,9 @@ stage; so do prefill quanta, quanta under exact numerics, and plans that stage h
 
 **Recording.** The first quantum with a key runs stage by stage, allocating whatever its stages allocate lazily. The second
 records: every launch, copy and memset goes to its lane as usual and again to the lane's shadow, a stream under capture.
-Marker waits and records are mirrored on the shadows, so the captured graph keeps the quantum's lane branches, and the
-quantum's programmatic launches become programmatic edges. Recording costs no device time: the quantum itself runs as usual.
+Marker waits and records are mirrored on the shadows, so the captured graph keeps the quantum's lane branches. Registered
+kernels of a stage that waits on no other lane are captured with programmatic dependent launch at every position and in
+every kind of quantum, drafts included (stream submission keeps it below 1024 positions for decode and verification only). Recording costs no device time: the quantum itself runs as usual.
 The capture is instantiated when the quantum's last stage submitted, while its device work still runs. A recording that meets a
 submission a graph cannot repeat (a synchronous copy, the shared P2E2/FP8 scratch with its device-wide event) is abandoned, and
 its key is never recorded again.

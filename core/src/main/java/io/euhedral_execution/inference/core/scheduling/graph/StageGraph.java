@@ -579,7 +579,10 @@ public final class StageGraph implements AutoCloseable {
     }
 
     /// Submits `stage` to `stream` on `lane`, recording it on the lane's shadow while the recording holds.
-    void submit(StageFrame stage, GpuStream stream, int lane, boolean overlap) {
+    /// A stage that waits on no other lane (`independent`) is captured with programmatic dependent launch
+    /// for its registered kernels whatever the quantum's stream policy: inside a graph the edges pay at
+    /// every position and in every kind of quantum.
+    void submit(StageFrame stage, GpuStream stream, int lane, boolean overlap, boolean independent) {
         if (!recording()) {
             stream.submit(stage, overlap);
             return;
@@ -595,7 +598,7 @@ public final class StageGraph implements AutoCloseable {
             stream.submit(stage, overlap);
             return;
         }
-        long hash = stream.submitRecording(stage, overlap, shadow, false);
+        long hash = stream.submitRecording(stage, overlap, shadow, independent);
         if (hash == 0) breakRecording(new IllegalStateException("stage " + stage.stage() + " could not be recorded"));
         else this.stageHashes[stage.stage()] = hash;
     }
