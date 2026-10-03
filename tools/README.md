@@ -61,6 +61,6 @@ transcoded tensor is decoded back and compared byte for byte with its source bef
   - `edrl.py`, `sources.py`, `device.py`: container format, safetensors access, CPU/CUDA selection.
 - `test_*.py`: unit tests, which need NumPy and no GPU or checkpoint (`python3 -m unittest discover -s tools`;
   three CUDA-versus-CPU byte-equality tests run when PyTorch has a CUDA device).
-- `compare_teacher_forced.py`: compares teacher-forced logits reports (NumPy).
-- `compare_compact_edrl_reference.py`: compares an artifact's objects and payloads with an NInfer v2 artifact.
+- `compare_teacher_forced.py`: compares teacher-forced logits reports with one another (NumPy).
+- `compare_reference.py`: compares teacher-forced logits reports with a BF16 reference written by llama.cpp (NumPy).
 - `render_qwen_chat_template_golden.py`: renders chat-template golden prompts (jinja2).
