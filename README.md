@@ -41,14 +41,14 @@ after the first token. Prefill and time to first token (TTFT) include the whole 
 | | 32K | 1,543 | 21.1 s | 91.1 |
 | | 64K | 1,332 | 45.7 s | 82.0 |
 | | 128K (128,000) | 987 | 135 s | 60.7 |
-| `nvfp4` | 4K | 2,380 | 1.78 s | 63.8 |
-| | 16K | 2,133 | 7.77 s | 54.5 |
-| | 32K | 1,900 | 17.2 s | 56.1 |
-| | 64K | 1,591 | 38.7 s | 60.3 |
-| `nvfp4-compressed` | 4K | 2,420 | 1.73 s | 97.6 |
-| | 16K | 2,158 | 7.66 s | 91.4 |
-| | 32K | 1,932 | 16.9 s | 82.3 |
-| | 64K | 1,613 | 38.5 s | 61.9 |
+| `nvfp4` | 4K | 3,874 | 1.13 s | 70.7 |
+| | 16K | 3,254 | 5.19 s | 61.2 |
+| | 32K | 2,762 | 12.0 s | 63.8 |
+| | 64K | 2,145 | 29.0 s | 57.7 |
+| `nvfp4-compressed` | 4K | 3,815 | 1.14 s | 97.6 |
+| | 16K | 3,219 | 5.23 s | 92.6 |
+| | 32K | 2,728 | 12.1 s | 82.6 |
+| | 64K | 2,131 | 29.2 s | 64.0 |
 
 The 4K, 16K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
 and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are

@@ -76,18 +76,34 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
   - Block scale = `e4m3_rn(block amax / (6 x global))`.
   - Codes = `e2m1_rn` with saturation (`F2FP.SATFINITE.E2M1.F32`).
   - Term 1 quantizes the residual x - term0 with the same global.
-- **`euhedral_nvfp4n_linear_128x128`**:
-  - CTA tile 128 x 128 and K tile 128, 256 threads, with two `cp.async` stages (67,584 bytes of shared memory).
-  - Code rows are padded to 80 bytes for conflict-free `ldmatrix`.
-  - 8 warps of 64 x 32, epilogue x row global x weight global.
-  - SASS: 64 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` per K tile, `LDGSTS`, `LDSM.16.M88.4`; no weight conversion.
-- **`euhedral_nvfp4n_gate_up_swiglu_128x64`**: the paired variant puts 16 gate rows and their 16 up rows in each warp's slice and
-  applies SwiGLU to BF16-rounded gate and up.
+  - Buffer layout (`nvfp4n::ActivationLayout`): the code planes (`terms x rows` rows of K/2 bytes), then the scales **tile-major**,
+    then one FP32 global per row. The 8 scale bytes of a row for K tile j and term t are at
+    `scales + ((j * terms + t) * pad + row) * 8` with `pad` the rows rounded up to 128, so the scales of 128 rows of one tile and
+    term are one contiguous KiB. A row-major plane would make every tile load 128 separate 8-byte pieces.
+- **`euhedral_nvfp4n_linear_128x128`**: a TMA, warp-specialized tile.
+  - CTA tile 128 x 128, K tile 128, 288 threads: eight consumer warps (2 along M x 4 along N, 64 x 32 each) and one producer
+    warp whose first lane issues every load. Three stages of 26,624 bytes plus two scale slots (85,040 bytes of shared memory,
+    one CTA per SM), guarded by an mbarrier pair per stage (full: the TMA transaction count; empty: one arrival per consumer warp).
+  - Code tiles come from two tensor maps (activation planes `[K/2, rows, 2]`, weight rows `[K/2, N]`) with 64-byte boxes and
+    `SWIZZLE_64B`, so every `ldmatrix` phase is conflict-free without padding. Out-of-range rows are zero-filled by the map.
+  - Activation scales are tile-major (see the activation layout below): one 1 KiB bulk copy per term and K tile.
+    Weight scales come from a third map in 16-byte boxes that cover two K tiles (four for the SD4 indices), fetched with the
+    first tile of the group into one of two slots.
+  - The consumers never issue a load. SASS: 64 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` per K tile and warp, `LDSM.16.M88.4`,
+    `UBLKCP` and `SYNCS`; no weight conversion. The grid is `tiles_m * tiles_n` with M varying fastest, so the CTAs that run
+    together share weight tiles. Epilogue: x row global x weight global.
+  - Each output element accumulates its K tiles in order, two MMAs (one per term) per K step, as the scalar definition of the
+    kernel (`test_nvfp4_native.py` checks it against float64 over the quantized operands).
+  - Requirements (host dispatch): K a multiple of 256 (512 for SD4 weights, so the scale rows are multiples of 16 bytes), 16-byte
+    aligned weights and scratch.
+- **`euhedral_nvfp4n_gate_up_swiglu_128x64`**: the paired variant. A tile holds 64 gate rows and the matching 64 up rows (two boxes
+    per operand); each warp's fragments 0 and 1 are 16 gate columns and fragments 2 and 3 the same up columns, and SwiGLU is applied
+    to BF16-rounded gate and up.
 - **`euhedral_nvfp4n_skinny_{16,32,64}`** and **`euhedral_nvfp4n_skinny_finish`**: the decode-like kernels (below).
 - Every kernel has an `_sd4` twin for the SD4 scale-table layout ([NVFP4_COMPRESSED.md](NVFP4_COMPRESSED.md)); the twin computes,
   bit for bit, what the plain kernel computes on the tensor expanded to plain NVFP4 (`native/tests/test_nvfp4.py` and
-  `test_nvfp4_native.py` check this with every table entry in use). The native kernels stage the index bytes with `cp.async`, half
-  of plain's scale bytes, and look each B scale register (4 E4M3 codes) up in registers just before its MMAs: two `prmt` over the
+  `test_nvfp4_native.py` check this with every table entry in use). The native kernels fetch the index bytes (half of plain's scale
+  bytes, 16-byte boxes of four K tiles) and look each B scale register (4 E4M3 codes) up in registers just before its MMAs: two `prmt` over the
   table's halves, merged on each index's bit 3.
 
 **Dispatch** (`CudaGpuMemory`, `native/src/host/nvfp4_linear.c`):
@@ -95,13 +111,14 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
 | Rows | NVFP4 linear (`linearNvfp4Bf16`) | Paired gate/up + SwiGLU (`nvfp4GateUpSwiGluBf16`) |
 |---|---|---|
 | 1 | the BF16-activation GEMV (`euhedral_nvfp4_decode`) | not formed: decode and small views run gate/up as a linear |
-| 2-63 | native skinny kernel when K is a multiple of 256, else the 128 x 128 tile | not formed (small views run gate/up as a linear) |
+| 2-63 | native skinny kernel when K is a multiple of 256, else the tile when it qualifies | not formed (small views run gate/up as a linear) |
 | 64 | native skinny kernel (same condition) | native paired tile |
 | 65 and more | native 128 x 128 tile | native paired tile |
 
 - **Thresholds:** `NVFP4_NATIVE_MIN_ROWS` = 2 for linears; `NVFP4_NATIVE_REGION_MIN_ROWS` = 64 for the paired region; the host's
   `SKINNY_MAX_ROWS` = 64.
-- The native route needs K to be a multiple of 128 (the GEMV: K a multiple of 1024 and N of 16, as in every model shape).
+- The native route needs K to be a multiple of 128, and for the tile kernels a multiple of 256 (512 for SD4 weights) with 16-byte
+  aligned weights and scratch (the GEMV: K a multiple of 1024 and N of 16, as in every model shape).
   A shape the native route declines runs the decode kernels up to 8 rows, the scalar reference beyond.
 - Verification quanta run row-exact (every row bit for bit as one-row decode) and never take the native route: they run the
   GEMV twins (`euhedral_nvfp4_decode_rows<M>`, 2 to 8 rows) as [MTP_CONTRACT.md](MTP_CONTRACT.md) section 6 requires.
@@ -110,49 +127,63 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
 
 ## Operator results
 
-Real layer weights, rotated over 4 layers. Production entry points on one stream, CUDA events. Times include activation
-quantization (two terms), in ms.
+Synthetic FFN-shaped tensors with random codes and scales, tile kernels only (activation quantization is below), one stream,
+CUDA events, the average of 20 launches. TFLOPS count both activation terms (2 x 2 x rows x N x K).
 
-| Family | Rows | Time |
-|---|---|---|
-| gate_up + SwiGLU | 64 | 0.262 |
-| | 256 | 0.632 |
-| | 512 | 1.211 |
-| | 1024 | 2.405 |
-| | 2048 | 4.707 |
-| FFN down | 64 | 0.200 |
-| | 256 | 0.466 |
-| | 512 | 0.724 |
-| | 1024 | 1.275 |
-| | 2048 | 2.502 |
-| GDN output | 64 | 0.074 |
-| | 256 | 0.175 |
-| | 512 | 0.242 |
-| | 1024 | 0.405 |
-| | 2048 | 0.878 |
+| Family (N x K) | Rows | Plain | | SD4 | |
+|---|---|---|---|---|---|
+| | | us | TFLOPS | us | TFLOPS |
+| gate_up + SwiGLU (34816 x 5120) | 256 | 300 | 608 | 311 | 587 |
+| | 512 | 591 | 617 | 615 | 593 |
+| | 1024 | 1183 | 617 | 1221 | 598 |
+| | 2048 | 2339 | 624 | 2407 | 607 |
+| FFN down (5120 x 17408) | 256 | 218 | 419 | 227 | 403 |
+| | 512 | 323 | 565 | 336 | 543 |
+| | 1024 | 531 | 687 | 555 | 658 |
+| | 2048 | 1063 | 687 | 1114 | 655 |
+| GDN output / attention output (5120 x 6144) | 256 | 80 | 404 | 83 | 387 |
+| | 512 | 120 | 537 | 125 | 517 |
+| | 1024 | 197 | 655 | 205 | 629 |
+| | 2048 | 390 | 661 | 406 | 635 |
+| GDN/attention input (12288 x 5120) | 256 | 102 | 634 | 106 | 610 |
+| | 512 | 200 | 644 | 208 | 621 |
+| | 1024 | 368 | 700 | 383 | 673 |
+| | 2048 | 733 | 703 | 767 | 672 |
+
+The block-scaled MMA loop alone peaks at 815 TFLOPS. Activation quantization (two terms) takes 6.1, 9.6 and 16 us for 512, 1024
+and 2048 rows of K = 5120, and 16, 47 and 156 us for K = 17408.
 
 ## End to end
 
-The `nvfp4` artifact, native two terms, default 512-row prefill chunk, NVFP4 arms load executed objects only. Paired gates of 6
-forks, each arm in a fresh JVM, start order rotated per fork, warmup 2, 3 iterations; medians of per-fork medians.
+The `nvfp4` artifact, native two terms, default 512-row prefill chunk, one run (warmup 1, 3 iterations for the short prompts).
 
 | Scenario | Result |
 |---|---|
-| prefill 8 | 278 tok/s |
-| prefill 16 | 557 tok/s |
-| prefill 32 | 1003 tok/s |
-| prefill 64 | 1492 tok/s |
-| prefill 256 | 2211 tok/s |
-| prefill 512 | 2506 tok/s |
-| prefill 1024 | 2504 tok/s |
-| prefill 2048 | 2477 tok/s |
-| TTFT, 16-token prompt | 29.1 ms |
-| TTFT, 64-token prompt | 44.8 ms |
-| TTFT, 1024-token prompt | 434 ms |
-| decode at 64 / 1024 tokens (one row, GEMV) | 51.2 / 50.6 tok/s |
+| prefill 64 | 1567 tok/s |
+| prefill 256 | 3577 tok/s |
+| prefill 512 | 4180 tok/s |
+| prefill 1024 | 4186 tok/s |
+| prefill 2048 | 4160 tok/s |
+| TTFT, 16-token prompt | 38 ms |
+| TTFT, 64-token prompt | 46 ms |
+| TTFT, 1024-token prompt | 327 ms |
 
-Rows of 64 and fewer use the skinny kernel; larger rows form quanta of more than 64 rows, which the 128 x 128 tile serves.
-These gates predate the producer-warp FA2 prefill attention ([PREFILL_MX.md](PREFILL_MX.md)), so the attention share of long-context prefill has changed.
+Chat corpus, MTP3, default 32768-token context (65536 for the 59K row), 128 generated tokens:
+
+| Artifact | Prompt tokens | Prefill tok/s | TTFT |
+|---|---|---|---|
+| `nvfp4` | 3,964 | 3,874 | 1.13 s |
+| | 15,930 | 3,254 | 5.19 s |
+| | 31,906 | 2,762 | 11.98 s |
+| | 59,111 | 2,145 | 29.0 s |
+| `nvfp4-compressed` | 3,964 | 3,815 | 1.14 s |
+| | 15,930 | 3,219 | 5.23 s |
+| | 31,906 | 2,728 | 12.09 s |
+| | 59,111 | 2,131 | 29.2 s |
+
+Rows of 64 and fewer use the skinny kernel; larger rows form quanta of more than 64 rows, which the tile serves. In a 4K prefill
+the two tile kernels take 68% of the kernel time (about 650 TFLOPS), the GDN recurrence 10%, FA2 attention 8%, and quantization
+2.5%.
 
 ## Decode-like row counts
 
@@ -238,3 +269,16 @@ and two sequences; 512 is the production chunk. No tolerance was changed.
 - **Native FP4 verification** (every verifier row on the skinny kernel): about 4% faster than exact verification at depth 4
   against 3, but it changed every generated text (top-1 96.4%, KL 3-6e-3), so verification stays row-exact
   ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
+- **cp.async tile variants** (kept in the record because they located the limit). The tile is bound by its loads, not its MMAs:
+  with the loads removed it ran at about 600 TFLOPS, with the MMAs removed it took nearly as long as the full kernel.
+  - Row-major activation scales (8-byte pieces per row and K tile) cost a third of the load time: gate_up at 1024 rows took
+    2.25 ms with them and 1.65 ms with tile-major scales.
+  - Sixteen-byte B scale boxes on the cp.async tile: 1.61 ms. Burst-loading the scales of four K tiles into an eight-tile ring: no gain.
+  - M-fastest rasterization on the cp.async tile: 1.65 ms, no change (DRAM was at 40%).
+  - Three stages instead of two: 1.55 ms. A 128 x 256 tile: 1.52 ms (L2 traffic per FLOP down a third; the kernel was not L2-bound).
+- **Persistent CTAs** on the TMA tile (one per SM looping over output tiles, so epilogues overlap the next tile's loads): gate_up at
+  1024 rows 1.21 ms and down 0.56 ms against 1.18 and 0.53 ms for one CTA per tile.
+- **Two stages instead of three** on the TMA tile: the same time; four stages do not fit the 99 KiB limit.
+- **`cp.async.bulk` with the `.shared::cluster` destination** compiled to a helper call and 8 bytes of local memory per thread; the
+  `.shared::cta` forms need none, which matters because the first launch of a kernel with local memory allocates device memory
+  that a model filling the card may not have.
