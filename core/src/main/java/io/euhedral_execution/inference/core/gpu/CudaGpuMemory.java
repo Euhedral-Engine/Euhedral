@@ -585,10 +585,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
         @Override
         public long submitRecording(
-                Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
+                Runnable launches,
+                boolean overlapPredecessor,
+                GpuStream shadow,
+                boolean shadowOverlap,
+                SharedOrdering shared) {
             ensureOpen();
             if (!(shadow instanceof CudaStream capture))
                 throw new IllegalArgumentException("shadow is not a CUDA stream");
+            RECORDING_SHADOW.set(capture);
+            RECORDING_ORDER.set(Objects.requireNonNull(shared, "shared"));
             select(overlapPredecessor);
             CudaStream previous = submitting.get();
             submitting.set(this);
@@ -596,6 +602,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             try {
                 submissionRecord.invokeExact(capture.handle, shadowOverlap ? 1 : 0);
             } catch (Throwable failure) {
+                RECORDING_SHADOW.remove();
+                RECORDING_ORDER.remove();
                 submitting.set(previous);
                 clear(overlapPredecessor);
                 throw new GpuMemoryException("CUDA submission recording invocation failed", failure);
@@ -606,6 +614,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 launches.run();
             } finally {
                 mode[0] = 0;
+                RECORDING_SHADOW.remove();
+                RECORDING_ORDER.remove();
                 hash = finishSubmission();
                 submitting.set(previous);
                 clear(overlapPredecessor);
@@ -683,15 +693,51 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     LOG.debug("CUDA graph capture ended with status {}", status);
                     return 0;
                 }
-                return exec.get(ValueLayout.JAVA_LONG, 0);
+                long graph = exec.get(ValueLayout.JAVA_LONG, 0);
+                q3ScratchLock.lock();
+                try {
+                    graphScratch.put(graph, new long[] {q3ScratchAddress, q3ScratchBytes});
+                } finally {
+                    q3ScratchLock.unlock();
+                }
+                return graph;
             } catch (Throwable failure) {
                 throw new GpuMemoryException("CUDA graph capture invocation failed", failure);
             }
         }
 
         @Override
-        public void launchGraph(long graph) {
+        public boolean takeRecordedShared() {
+            boolean[] recorded = SCRATCH_RECORDED.get();
+            boolean used = recorded[0];
+            recorded[0] = false;
+            return used;
+        }
+
+        /// An ordered graph runs between the shared scratch's previous and next uses on any stream, as its
+        /// recorded quantum did, and only while that scratch is still in place.
+        @Override
+        public boolean launchGraph(long graph, boolean ordered) {
             ensureOpen();
+            if (!ordered) {
+                launch(graph);
+                return true;
+            }
+            q3ScratchLock.lock();
+            try {
+                long[] recorded = graphScratch.get(graph);
+                if (recorded == null || recorded[0] != q3ScratchAddress || recorded[1] != q3ScratchBytes) return false;
+                if (q3ScratchEvent != 0) await(q3ScratchEvent);
+                launch(graph);
+                if (q3ScratchEvent == 0) q3ScratchEvent = openMarker();
+                mark(q3ScratchEvent);
+                return true;
+            } finally {
+                q3ScratchLock.unlock();
+            }
+        }
+
+        private void launch(long graph) {
             int status;
             try {
                 status = (int) graphLaunch.invokeExact(graph, this.handle);
@@ -703,6 +749,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
         @Override
         public void destroyGraph(long graph) {
+            graphScratch.remove(graph);
             int status;
             try {
                 status = (int) graphDestroy.invokeExact(graph);
@@ -890,18 +937,35 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
     }
 
-    /// The shared P2E2 scratch orders its uses across streams with a device-wide event and may drain the
-    /// device, neither of which a captured quantum can repeat: it ends the thread's recording, and a
-    /// checked (replayed) quantum must not reach it.
-    private void requireRepeatableScratch() {
-        int mode = SUBMISSION.get()[0];
-        if (mode == CHECKING) throw new IllegalStateException("a replayed quantum reached the shared P2E2 scratch");
-        if (mode == RECORDING) {
-            try {
-                submissionMarkUnrecordable.invokeExact();
-            } catch (Throwable failure) {
-                throw new GpuMemoryException("CUDA submission invocation failed", failure);
-            }
+    /// While a thread records: its shadow, and the recording's order of shared-scratch uses.
+    private static final ThreadLocal<CudaStream> RECORDING_SHADOW = new ThreadLocal<>();
+
+    private static final ThreadLocal<GpuStream.SharedOrdering> RECORDING_ORDER = new ThreadLocal<>();
+
+    /// The calling thread recorded a use of the shared scratch since it last asked.
+    private static final ThreadLocal<boolean[]> SCRATCH_RECORDED = ThreadLocal.withInitial(() -> new boolean[1]);
+
+    /// The shared scratch (address and bytes) when each captured graph was instantiated: an ordered graph runs
+    /// only while the scratch it was recorded with is still in place.
+    private final ConcurrentHashMap<Long, long[]> graphScratch = new ConcurrentHashMap<>();
+
+    private void shadowOrder(CudaStream shadow, GpuStream.SharedOrdering order, boolean after) {
+        try {
+            if (after) {
+                shadow.mark(order.marker);
+                order.recorded = true;
+            } else shadow.await(order.marker);
+        } catch (RuntimeException failure) {
+            LOG.debug("shared scratch order could not be recorded", failure);
+            markUnrecordable();
+        }
+    }
+
+    private void markUnrecordable() {
+        try {
+            submissionMarkUnrecordable.invokeExact();
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA submission invocation failed", failure);
         }
     }
 
@@ -1444,11 +1508,30 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     /// Runs `use` with the shared scratch of at least `bytes`, ordered after its previous use on any
     /// stream; growing it first drains the device.
+    ///
+    /// A recorded use orders the captured graph's runs on the scratch's event instead (see
+    /// [CudaStream#launchGraph]); growing the scratch cannot be recorded. A checked use submits nothing.
     private void withQ3Scratch(long bytes, LongConsumer use) {
-        requireRepeatableScratch();
+        int mode = SUBMISSION.get()[0];
         q3ScratchLock.lock();
         try {
             ensureOpen();
+            if (mode == CHECKING) {
+                if (bytes > q3ScratchBytes)
+                    throw new IllegalStateException("a replayed quantum would grow the shared scratch");
+                use.accept(q3ScratchAddress);
+                return;
+            }
+            GpuStream.SharedOrdering order = null;
+            CudaStream shadow = null;
+            if (mode == RECORDING) {
+                if (bytes > q3ScratchBytes) markUnrecordable();
+                else {
+                    SCRATCH_RECORDED.get()[0] = true;
+                    order = RECORDING_ORDER.get();
+                    shadow = RECORDING_SHADOW.get();
+                }
+            }
             CudaStream stream = submitting.get();
             if (bytes > q3ScratchBytes) {
                 synchronize();
@@ -1464,7 +1547,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             } else if (q3ScratchEvent != 0) {
                 stream.await(q3ScratchEvent);
             }
+            // A recording chains its uses the same way on the shadows, so the captured graph keeps them ordered
+            // across its branches.
+            if (shadow != null && order.recorded) shadowOrder(shadow, order, false);
             use.accept(q3ScratchAddress);
+            if (shadow != null) shadowOrder(shadow, order, true);
             if (stream != null) {
                 if (q3ScratchEvent == 0) {
                     try {

@@ -23,7 +23,9 @@ not change with its position. The host keeps its copy of the position to validat
   rows, GDN states and their speculative checkpoints, the host logits' buffers), plus the pending ReplaySSM rows.
 
 A quantum whose KV reservation would allocate pages or upload a page table (every 256 positions) has no key and runs stage by
-stage; so do prefill quanta, quanta under exact numerics, and plans that stage host-backed weights.
+stage; so do prefill quanta and quanta under exact numerics. Views that stage host-backed weights are captured: their transfers
+copy from fixed pinned weights into fixed ring slots, and the ring's ordering with other quanta (`stagingIdle`) is submitted
+around the graph on the home lane, as for a quantum that runs stage by stage.
 
 **Recording.** The first quantum with a key runs stage by stage, allocating whatever its stages allocate lazily. The second
 records: every launch, copy and memset goes to its lane as usual and again to the lane's shadow, a stream under capture.
@@ -31,8 +33,19 @@ Marker waits and records are mirrored on the shadows, so the captured graph keep
 kernels of a stage that waits on no other lane are captured with programmatic dependent launch at every position and in
 every kind of quantum, drafts included (stream submission keeps it below 1024 positions for decode and verification only). Recording costs no device time: the quantum itself runs as usual.
 The capture is instantiated when the quantum's last stage submitted, while its device work still runs. A recording that meets a
-submission a graph cannot repeat (a synchronous copy, the shared P2E2/FP8 scratch with its device-wide event) is abandoned, and
-its key is never recorded again.
+submission a graph cannot repeat (a synchronous copy, growing the shared scratch) is abandoned, and its key is never recorded
+again.
+
+**Shared scratch.** The P2E2 expansion and the FP8 and native FP4 activations live in one scratch that every stream shares; each
+use waits on the scratch's marker and records it after itself. A recording chains its uses the same way on the shadows with a
+marker of its own, so uses on different branches of the captured graph stay ordered, and marks the capture *ordered*. An ordered
+graph runs only while the scratch it captured is still in place (otherwise the quantum runs stage by stage and the capture is
+discarded), behind the scratch's marker, which it records again after itself. Drafts of 2 to 8 rows use the scratch (the MTP
+input projection is NVFP4 and runs on native FP4 tensor cores from 2 rows).
+
+The ordering is not visible to the submission hash. A capture that omitted it computed different drafts (verifications still
+kept the output exact, so only acceptance dropped); `CapturedQuantaCudaIntegrationTest` therefore compares tokens and the
+accepted drafts of every verification between a capturing runtime and one that submits stage by stage.
 
 **Replay.** Every later quantum with the key is one lattice frame. It launches the graph on the home lane, behind the input
 record's upload, then runs every stage in topological order with its submissions checked instead of run: each stage keeps its
@@ -41,9 +54,6 @@ would have submitted (function, launch geometry, dynamic shared memory and param
 must equal the recorded stage's. The checked stages select a sink stream under capture, so a submission that bypasses the hooks is
 captured there and never runs. A divergence fails the quantum and discards the capture. Each stage graph keeps at most eight
 captures, releasing the least recently used.
-
-**Not captured.** Draft catch-up quanta of 2 or 3 rows run their linears on the FP8 route through the shared scratch, which a
-graph cannot repeat; they run stage by stage.
 
 ## Measurements
 

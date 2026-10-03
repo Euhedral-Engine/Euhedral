@@ -43,6 +43,7 @@ subprojects {
             exclude("**/QwenNvfp4GenerationCudaIntegrationTest.class")
             exclude("**/SpeculativeVerifyCudaIntegrationTest.class")
             exclude("**/SpeculativeDecodeCudaIntegrationTest.class")
+            exclude("**/CapturedQuantaCudaIntegrationTest.class")
             exclude("**/TeacherForcedQualityCudaIntegrationTest.class")
             useJUnitPlatform()
         }
@@ -73,6 +74,7 @@ subprojects {
             include("**/QwenNvfp4GenerationCudaIntegrationTest.class")
             include("**/SpeculativeVerifyCudaIntegrationTest.class")
             include("**/SpeculativeDecodeCudaIntegrationTest.class")
+            include("**/CapturedQuantaCudaIntegrationTest.class")
             include("**/TeacherForcedQualityCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",

@@ -48,11 +48,28 @@ public interface GpuStream extends AutoCloseable {
         return false;
     }
 
+    /// The order of one recording's uses of device storage that quanta on other streams share: a marker
+    /// recorded after each use on the user's shadow, awaited before the next use. Uses on the real streams
+    /// are ordered the same way by the storage's own marker.
+    final class SharedOrdering {
+        public final long marker;
+        public boolean recorded;
+
+        public SharedOrdering(long marker) {
+            this.marker = marker;
+        }
+    }
+
     /// As [#submit], also submitting every launch, copy and memset to `shadow`, a stream under capture
-    /// (with programmatic dependent launch where `shadowOverlap` allows it). Returns the hash of the
-    /// submissions, never 0, or 0 when the shadow submission failed; the stream's own work is unaffected.
+    /// (with programmatic dependent launch where `shadowOverlap` allows it); uses of shared storage are
+    /// chained by `shared` on the shadows. Returns the hash of the submissions, never 0, or 0 when the
+    /// shadow submission failed; the stream's own work is unaffected.
     default long submitRecording(
-            Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
+            Runnable launches,
+            boolean overlapPredecessor,
+            GpuStream shadow,
+            boolean shadowOverlap,
+            SharedOrdering shared) {
         throw new UnsupportedOperationException("graph capture is not supported");
     }
 
@@ -84,8 +101,16 @@ public interface GpuStream extends AutoCloseable {
         throw new UnsupportedOperationException("graph capture is not supported");
     }
 
-    /// Submits one run of an instantiated graph.
-    default void launchGraph(long graph) {
+    /// Whether the calling thread's submissions since it last asked used device storage that quanta on other
+    /// streams share; a graph that captured such a use runs `ordered`. Cleared by reading it.
+    default boolean takeRecordedShared() {
+        return false;
+    }
+
+    /// Submits one run of an instantiated graph. An `ordered` graph runs after every earlier use, on any
+    /// stream, of the shared storage it captured; it is refused (false) when that storage was replaced
+    /// since the capture.
+    default boolean launchGraph(long graph, boolean ordered) {
         throw new UnsupportedOperationException("graph capture is not supported");
     }
 

@@ -52,6 +52,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage instead.
     static final boolean CAPTURE_GRAPHS = !"0".equals(System.getenv("EUHEDRAL_CUDA_GRAPHS"));
 
+    private final boolean captureGraphs;
+
     /// Lanes in the shared pool: one per available processor, at most [LanePool#MAX_LANES].
     static int laneCount() {
         return Math.min(Runtime.getRuntime().availableProcessors(), LanePool.MAX_LANES);
@@ -103,6 +105,13 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     /// A runtime whose graphs share `laneCount` device lanes.
     public EuhedralInferenceRuntime(LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu, int laneCount) {
+        this(lattice, plan, gpu, laneCount, CAPTURE_GRAPHS);
+    }
+
+    /// A runtime that captures decode, verification and draft quanta into CUDA graphs only with `captureGraphs`.
+    EuhedralInferenceRuntime(
+            LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu, int laneCount, boolean captureGraphs) {
+        this.captureGraphs = captureGraphs;
         this.lattice = Objects.requireNonNull(lattice, "lattice");
         this.plan = Objects.requireNonNull(plan, "plan").executionOwner();
         this.gpu = Objects.requireNonNull(gpu, "gpu");
@@ -293,6 +302,13 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return bytes;
     }
 
+    /// Quanta replayed from captured CUDA graphs.
+    public long replayedQuanta() {
+        long replayed = 0;
+        for (GraphPool pool : this.pools.values()) replayed += pool.replayedQuanta();
+        return replayed;
+    }
+
     /// Admitted quanta whose graphs have not yet retired.
     public int activeQuanta() {
         int active = 0;
@@ -340,22 +356,23 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu);
             // Independent branches of every view spread over lanes: decode leaves the GPU idle between
             // dependent kernels, and a prefill side branch fills the tail waves of the chain's GEMMs.
-            StageGraph graph = CAPTURE_GRAPHS && lanes.lane(0).capturesGraphs()
-                    ? new StageGraph(
-                            this.view.stageTopology(),
-                            frames,
-                            lanes,
-                            true,
-                            new QwenExecutionSource(),
-                            retired -> recycle(pooled[0]),
-                            gpu::openStream)
-                    : new StageGraph(
-                            this.view.stageTopology(),
-                            frames,
-                            lanes,
-                            true,
-                            new QwenExecutionSource(),
-                            retired -> recycle(pooled[0]));
+            StageGraph graph =
+                    EuhedralInferenceRuntime.this.captureGraphs && lanes.lane(0).capturesGraphs()
+                            ? new StageGraph(
+                                    this.view.stageTopology(),
+                                    frames,
+                                    lanes,
+                                    true,
+                                    new QwenExecutionSource(),
+                                    retired -> recycle(pooled[0]),
+                                    gpu::openStream)
+                            : new StageGraph(
+                                    this.view.stageTopology(),
+                                    frames,
+                                    lanes,
+                                    true,
+                                    new QwenExecutionSource(),
+                                    retired -> recycle(pooled[0]));
             pooled[0] = new PooledGraph(graph, storage);
             synchronized (EuhedralInferenceRuntime.this.closeLock) {
                 // A close that ran during this build saw no such graph; it would never release it.
@@ -406,6 +423,14 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     active += pooled.graph().source().activeGraphs();
             }
             return active;
+        }
+
+        long replayedQuanta() {
+            long replayed = 0;
+            synchronized (this.built) {
+                for (PooledGraph pooled : this.built) replayed += pooled.graph().replayedQuanta();
+            }
+            return replayed;
         }
 
         boolean attached() {

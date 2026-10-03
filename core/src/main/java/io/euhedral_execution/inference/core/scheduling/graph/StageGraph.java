@@ -91,9 +91,14 @@ public final class StageGraph implements AutoCloseable {
     private Capture recording;
     private Capture replaying;
     private final AtomicBoolean recordingBroken = new AtomicBoolean();
+    /// The current recording used device storage that other streams' quanta share, chained by this order.
+    private final AtomicBoolean recordingShared = new AtomicBoolean();
+    private GpuStream.SharedOrdering sharedOrdering;
+    private long sharedMarker;
     /// Lanes whose shadow joined the current recording.
     private final AtomicLong shadowLanes = new AtomicLong();
     private long[] stageHashes;
+    private final AtomicLong replays = new AtomicLong();
 
     /// Builds a graph that owns one stream: every stage keeps that stream's order.
     public StageGraph(
@@ -348,6 +353,7 @@ public final class StageGraph implements AutoCloseable {
             else if (capture.sightings++ > 0 && !capture.unrecordable) beginRecording(capture);
         }
         if (this.replaying != null) {
+            this.replays.incrementAndGet();
             // The replay frame and admission's hold.
             this.live.set(2);
             this.source.publish(this.replay);
@@ -477,6 +483,11 @@ public final class StageGraph implements AutoCloseable {
         if (this.ownsPool) this.pool.close();
     }
 
+    /// Quanta this graph replayed from captures.
+    public long replayedQuanta() {
+        return this.replays.get();
+    }
+
     /// The capture for `key`, created on first sight; null for a quantum that is never captured.
     private Capture capture(Object key) {
         if (key == null) return null;
@@ -518,6 +529,8 @@ public final class StageGraph implements AutoCloseable {
             return;
         }
         this.recordingBroken.set(false);
+        this.recordingShared.set(false);
+        this.sharedOrdering = new GpuStream.SharedOrdering(this.sharedMarker);
         this.shadowLanes.set(1L << this.home);
         java.util.Arrays.fill(this.stageHashes, 0L);
         this.recording = capture;
@@ -527,6 +540,7 @@ public final class StageGraph implements AutoCloseable {
         GpuStream any = this.pool.lane(this.home);
         long[] tails = new long[this.tails.length];
         try {
+            this.sharedMarker = any.openMarker();
             if (this.pool.size() > 1) {
                 this.shadowPrepared = any.openMarker();
                 for (StageFrame stage : this.stages) if (stage.marker != 0) stage.shadowMarker = any.openMarker();
@@ -598,7 +612,9 @@ public final class StageGraph implements AutoCloseable {
             stream.submit(stage, overlap);
             return;
         }
-        long hash = stream.submitRecording(stage, overlap, shadow, independent);
+        stream.takeRecordedShared();
+        long hash = stream.submitRecording(stage, overlap, shadow, independent, this.sharedOrdering);
+        if (stream.takeRecordedShared()) this.recordingShared.set(true);
         if (hash == 0) breakRecording(new IllegalStateException("stage " + stage.stage() + " could not be recorded"));
         else this.stageHashes[stage.stage()] = hash;
     }
@@ -629,6 +645,7 @@ public final class StageGraph implements AutoCloseable {
         this.recording = null;
         if (complete) {
             capture.graph = graph;
+            capture.ordered = this.recordingShared.get();
             capture.hashes = this.stageHashes.clone();
             return;
         }
@@ -644,7 +661,12 @@ public final class StageGraph implements AutoCloseable {
         GpuStream home = this.pool.lane(this.home);
         if (stopRequested()) return;
         try {
-            home.launchGraph(capture.graph);
+            if (!home.launchGraph(capture.graph, capture.ordered)) {
+                // The shared storage the capture used was replaced: this quantum runs stage by stage.
+                capture.diverged = true;
+                runStages();
+                return;
+            }
         } catch (RuntimeException | Error failure) {
             capture.diverged = true;
             fail(failure);
@@ -683,6 +705,15 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
+    /// Publishes the root stages of a quantum that was to replay; the replay frame's own count keeps the
+    /// quantum live until they are published.
+    private void runStages() {
+        this.replaying = null;
+        if (this.prepared != 0) this.pool.lane(this.home).mark(this.prepared);
+        this.live.addAndGet(this.roots.length);
+        for (StageFrame root : this.roots) this.source.publish(root);
+    }
+
     private void closeCaptures() {
         RuntimeException failure = null;
         for (Capture capture : this.captures.values()) {
@@ -712,6 +743,8 @@ public final class StageGraph implements AutoCloseable {
         int sightings;
         long graph;
         long[] hashes;
+        /// Its runs are ordered with other streams' uses of shared device storage.
+        boolean ordered;
         /// Its recording broke (a submission the graph cannot repeat): it is never recorded again.
         boolean unrecordable;
         /// A replay diverged; the capture is released before the next quantum.
@@ -768,6 +801,8 @@ public final class StageGraph implements AutoCloseable {
         }
         if (this.shadowPrepared != 0) any.closeMarker(this.shadowPrepared);
         this.shadowPrepared = 0;
+        if (this.sharedMarker != 0) any.closeMarker(this.sharedMarker);
+        this.sharedMarker = 0;
         for (int lane = 0; lane < this.tails.length; lane++) {
             if (this.tails[lane] == 0) continue;
             any.closeMarker(this.tails[lane]);
