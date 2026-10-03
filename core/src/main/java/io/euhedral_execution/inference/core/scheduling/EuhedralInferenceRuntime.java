@@ -48,6 +48,10 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// preparation awaits it, so its first copies follow every earlier read of the ring.
     private long stagingIdle;
 
+    /// Decode, verification and draft quanta replay CUDA graphs captured from earlier quanta
+    /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage instead.
+    static final boolean CAPTURE_GRAPHS = !"0".equals(System.getenv("EUHEDRAL_CUDA_GRAPHS"));
+
     /// Lanes in the shared pool: one per available processor, at most [LanePool#MAX_LANES].
     static int laneCount() {
         return Math.min(Runtime.getRuntime().availableProcessors(), LanePool.MAX_LANES);
@@ -332,16 +336,26 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             QwenWorkspaceStorage storage = new QwenWorkspaceStorage(gpu);
             PooledGraph[] pooled = new PooledGraph[1];
             List<QwenExecutionPlan.Instruction> instructions = this.view.instructions();
-            StageGraph graph = new StageGraph(
-                    this.view.stageTopology(),
-                    (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu),
-                    lanes,
-                    // Independent branches of every view spread over lanes: decode leaves the GPU idle
-                    // between dependent kernels, and a prefill side branch fills the tail waves of the
-                    // chain's GEMMs.
-                    true,
-                    new QwenExecutionSource(),
-                    retired -> recycle(pooled[0]));
+            StageGraph.StageFactory frames =
+                    (owner, stage) -> QwenStageFrame.create(owner, instructions.get(stage), gpu);
+            // Independent branches of every view spread over lanes: decode leaves the GPU idle between
+            // dependent kernels, and a prefill side branch fills the tail waves of the chain's GEMMs.
+            StageGraph graph = CAPTURE_GRAPHS && lanes.lane(0).capturesGraphs()
+                    ? new StageGraph(
+                            this.view.stageTopology(),
+                            frames,
+                            lanes,
+                            true,
+                            new QwenExecutionSource(),
+                            retired -> recycle(pooled[0]),
+                            gpu::openStream)
+                    : new StageGraph(
+                            this.view.stageTopology(),
+                            frames,
+                            lanes,
+                            true,
+                            new QwenExecutionSource(),
+                            retired -> recycle(pooled[0]));
             pooled[0] = new PooledGraph(graph, storage);
             synchronized (EuhedralInferenceRuntime.this.closeLock) {
                 // A close that ran during this build saw no such graph; it would never release it.

@@ -86,6 +86,16 @@ public final class AttentionKvState implements AutoCloseable {
         this.capacity = nextCapacity;
     }
 
+    /// Whether appending `tokenCount` rows at `startPosition` fits the reserved pages, so that reservation
+    /// neither allocates nor uploads a page table.
+    boolean reserves(long startPosition, int tokenCount) {
+        return !this.closed && startPosition + tokenCount <= this.capacity;
+    }
+
+    void fingerprint(CaptureFingerprint fingerprint) {
+        fingerprint.add(this.table).add(this.tableSlots).add(this.decodeScratch);
+    }
+
     /// Records that the writes for `tokenCount` reserved rows after the committed frontier were
     /// submitted to the owning quantum's stream.
     public void appendSubmitted(int tokenCount) {

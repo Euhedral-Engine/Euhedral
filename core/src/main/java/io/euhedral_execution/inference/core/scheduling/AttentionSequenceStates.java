@@ -86,6 +86,24 @@ public final class AttentionSequenceStates implements AutoCloseable {
         return this.decodeScratch;
     }
 
+    /// Whether every cache a quantum of `rows` rows at `start` appends to is already reserved: the base
+    /// layers', or the MTP layer's (the last state) for a draft.
+    boolean reserves(long start, int rows, boolean draft) {
+        if (this.closed) return false;
+        for (int index = 0; index < this.states.length; index++) {
+            AttentionKvState state = this.states[index];
+            if (state == null || (index == this.states.length - 1) != draft) continue;
+            if (!state.reserves(start, rows)) return false;
+        }
+        return true;
+    }
+
+    void fingerprint(CaptureFingerprint fingerprint) {
+        for (AttentionKvState state : this.states) if (state != null) state.fingerprint(fingerprint);
+        fingerprint.add(this.draftSeedRows).add(this.draftSeedCapacity).add(this.draftRecursionHidden);
+        fingerprint.add(this.decodeScratch).add(this.decodeScratchRows);
+    }
+
     public AttentionKvState forLayer(int layerIndex) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
         if (layerIndex < 0 || layerIndex >= this.states.length || this.states[layerIndex] == null) {

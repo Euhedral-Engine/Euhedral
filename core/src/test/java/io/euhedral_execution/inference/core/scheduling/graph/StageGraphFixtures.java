@@ -44,7 +44,7 @@ final class StageGraphFixtures {
     }
 
     /// A device stream that records kernel order and holds each retirement boundary until released.
-    static final class RecordingStream implements GpuStream {
+    static class RecordingStream implements GpuStream {
         final List<String> kernels = Collections.synchronizedList(new ArrayList<>());
         final List<String> threads = Collections.synchronizedList(new ArrayList<>());
         final List<Registration> registrations = Collections.synchronizedList(new ArrayList<>());
@@ -168,6 +168,8 @@ final class StageGraphFixtures {
         volatile Error error;
         volatile Runnable beforeLaunch;
         volatile int launches;
+        /// Overrides the launched kernel's name (`k` and the stage index by default).
+        volatile String kernel;
 
         TestStage(StageGraph graph, int stage) {
             super(graph, stage);
@@ -178,7 +180,8 @@ final class StageGraphFixtures {
             Runnable hook = this.beforeLaunch;
             if (hook != null) hook.run();
             this.launches++;
-            ((RecordingStream) laneStream()).kernel("k" + stage());
+            String name = this.kernel;
+            ((RecordingStream) laneStream()).kernel(name != null ? name : "k" + stage());
             RuntimeException injected = this.failure;
             if (injected != null) throw injected;
             Error fatal = this.error;
@@ -201,6 +204,12 @@ final class StageGraphFixtures {
         volatile boolean cancelled;
         volatile boolean overlap;
         volatile Runnable onOutcome;
+        volatile Object captureKey;
+
+        @Override
+        public Object captureKey() {
+            return this.captureKey;
+        }
 
         @Override
         public boolean stopRequested() {

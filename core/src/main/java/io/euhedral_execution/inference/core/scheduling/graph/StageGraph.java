@@ -3,10 +3,13 @@ package io.euhedral_execution.inference.core.scheduling.graph;
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.util.ArrayDeque;
+import java.util.LinkedHashMap;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,6 +35,15 @@ import org.slf4j.LoggerFactory;
 /// cancelled. The graph then arms the quantum's single retirement boundary. The retirement frame
 /// confirms it, runs each attempted stage's retirement hook and the quantum's terminal work, and
 /// returns the graph to its recycler before publishing the outcome.
+///
+/// Captured quanta. A graph built with shadow streams captures the device work of quanta that carry a
+/// [StageQuantum#captureKey] into CUDA graphs, one per key. The second quantum with a key records: each
+/// stage submits as usual and again to the shadow of its lane, a stream under capture, whose markers
+/// mirror the lanes' so the captured graph keeps the quantum's branches. Every later quantum with the key
+/// replays: one frame launches the captured graph on the home lane, then runs every stage in topological
+/// order with its submissions checked instead of run. That keeps each stage's host-side effects and
+/// retirement hooks, and proves that the stage would have submitted exactly what was captured: a stage
+/// whose submissions hash differently fails the quantum and discards the capture.
 public final class StageGraph implements AutoCloseable {
 
     /// Creates the frame for one stage while the graph is built.
@@ -48,6 +60,8 @@ public final class StageGraph implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(StageGraph.class);
     private static final long NO_TICKET = 0L;
+    /// Captured graphs kept per stage graph; the least recently used is released first.
+    static final int MAX_CAPTURES = 8;
 
     private final StageTopology topology;
     private final LanePool pool;
@@ -66,6 +80,20 @@ public final class StageGraph implements AutoCloseable {
     private final AtomicInteger live = new AtomicInteger();
     private StageQuantum quantum;
     private boolean overlap;
+    /// Opens the shadow streams that record captured quanta; null when quanta are never captured.
+    private final Supplier<GpuStream> shadowStreams;
+    private final GpuStream[] shadows;
+    private long shadowPrepared;
+    private long[] shadowTails;
+    private final LinkedHashMap<Object, Capture> captures = new LinkedHashMap<>(16, 0.75f, true);
+    private final StageFrame[] order;
+    private final Replay replay;
+    private Capture recording;
+    private Capture replaying;
+    private final AtomicBoolean recordingBroken = new AtomicBoolean();
+    /// Lanes whose shadow joined the current recording.
+    private final AtomicLong shadowLanes = new AtomicLong();
+    private long[] stageHashes;
 
     /// Builds a graph that owns one stream: every stage keeps that stream's order.
     public StageGraph(
@@ -81,7 +109,8 @@ public final class StageGraph implements AutoCloseable {
                 recycler,
                 LanePool.single(Objects.requireNonNull(stream, "stream")),
                 true,
-                true);
+                true,
+                null);
     }
 
     /// Builds a graph whose stages run on the lanes of a shared `pool`, which outlives the graph. With
@@ -94,7 +123,19 @@ public final class StageGraph implements AutoCloseable {
             boolean spread,
             QwenExecutionSource source,
             Recycler recycler) {
-        this(topology, factory, source, recycler, pool, false, spread);
+        this(topology, factory, source, recycler, pool, false, spread, null);
+    }
+
+    /// As above, capturing quanta that carry a capture key on shadow streams from `shadowStreams`.
+    public StageGraph(
+            StageTopology topology,
+            StageFactory factory,
+            LanePool pool,
+            boolean spread,
+            QwenExecutionSource source,
+            Recycler recycler,
+            Supplier<GpuStream> shadowStreams) {
+        this(topology, factory, source, recycler, pool, false, spread, Objects.requireNonNull(shadowStreams));
     }
 
     private StageGraph(
@@ -104,7 +145,10 @@ public final class StageGraph implements AutoCloseable {
             Recycler recycler,
             LanePool pool,
             boolean ownsPool,
-            boolean spread) {
+            boolean spread,
+            Supplier<GpuStream> shadowStreams) {
+        this.shadowStreams = shadowStreams;
+        this.shadows = new GpuStream[pool.size()];
         this.spread = spread;
         this.topology = Objects.requireNonNull(topology, "topology");
         this.pool = Objects.requireNonNull(pool, "pool");
@@ -170,6 +214,28 @@ public final class StageGraph implements AutoCloseable {
         this.roots = new StageFrame[rootStages.length];
         for (int index = 0; index < rootStages.length; index++) this.roots[index] = this.stages[rootStages[index]];
         this.retirement = new Retirement(this);
+        this.order = topologicalOrder(this.stages);
+        this.replay = new Replay(this);
+    }
+
+    /// Stages in an order where every stage follows its submitted predecessors.
+    private static StageFrame[] topologicalOrder(StageFrame[] stages) {
+        int[] pending = new int[stages.length];
+        ArrayDeque<StageFrame> ready = new ArrayDeque<>();
+        for (StageFrame stage : stages) {
+            pending[stage.stage()] = stage.submittedPredecessors.length;
+            if (pending[stage.stage()] == 0) ready.add(stage);
+        }
+        StageFrame[] order = new StageFrame[stages.length];
+        int count = 0;
+        while (!ready.isEmpty()) {
+            StageFrame stage = ready.poll();
+            order[count++] = stage;
+            for (StageFrame successor : stage.submittedSuccessors)
+                if (--pending[successor.stage()] == 0) ready.add(successor);
+        }
+        if (count != stages.length) throw new IllegalArgumentException("stage topology has a cycle");
+        return order;
     }
 
     public StageTopology topology() {
@@ -224,6 +290,10 @@ public final class StageGraph implements AutoCloseable {
         return this.prepared;
     }
 
+    long shadowPrepared() {
+        return this.shadowPrepared;
+    }
+
     void used(int lane) {
         long bit = 1L << lane;
         if ((this.usedLanes.get() & bit) == 0) this.usedLanes.getAndUpdate(mask -> mask | bit);
@@ -260,7 +330,8 @@ public final class StageGraph implements AutoCloseable {
         return this.quantum.stopRequested();
     }
 
-    /// Binds a quantum whose resources are already prepared and publishes the root stages.
+    /// Binds a quantum whose resources are already prepared and publishes the root stages, or the frame
+    /// that replays the quantum's captured graph.
     public void start(StageQuantum quantum) {
         Objects.requireNonNull(quantum, "quantum");
         if (this.quantum != null) throw new IllegalStateException("stage graph already runs a quantum");
@@ -269,8 +340,25 @@ public final class StageGraph implements AutoCloseable {
         for (StageFrame stage : this.stages) stage.reset();
         this.retirement.reset();
         this.usedLanes.set(1L << this.home);
+        this.recording = null;
+        this.replaying = null;
+        Capture capture = this.shadowStreams == null ? null : capture(quantum.captureKey());
+        if (capture != null) {
+            if (capture.graph != 0) this.replaying = capture;
+            else if (capture.sightings++ > 0 && !capture.unrecordable) beginRecording(capture);
+        }
+        if (this.replaying != null) {
+            // The replay frame and admission's hold.
+            this.live.set(2);
+            this.source.publish(this.replay);
+            stageFinished();
+            return;
+        }
         // Roots on other lanes order behind the preparation already submitted to the home lane.
-        if (this.prepared != 0) this.pool.lane(this.home).mark(this.prepared);
+        if (this.prepared != 0) {
+            this.pool.lane(this.home).mark(this.prepared);
+            if (this.recording != null) shadowMark(this.home, this.shadowPrepared);
+        }
         // Admission holds one count so that fast roots cannot retire the quantum before all publish.
         this.live.set(this.roots.length + 1);
         for (StageFrame root : this.roots) this.source.publish(root);
@@ -335,6 +423,7 @@ public final class StageGraph implements AutoCloseable {
                 this.pool.lane(lane).mark(this.tails[lane]);
                 home.await(this.tails[lane]);
             }
+            if (this.recording != null) finishRecording();
             this.quantum.lanesJoined(home);
             home.notifyRetired(terminal);
         } catch (RuntimeException | Error failure) {
@@ -378,22 +467,304 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Releases the graph's markers, and its stream when it owns one. Only an unbound graph whose work
-    /// has retired may be closed.
+    /// Releases the graph's markers and captured graphs, and its stream when it owns one. Only an unbound
+    /// graph whose work has retired may be closed.
     @Override
     public void close() {
         if (this.quantum != null) throw new IllegalStateException("stage graph still runs a quantum");
+        closeCaptures();
         closeMarkers();
         if (this.ownsPool) this.pool.close();
+    }
+
+    /// The capture for `key`, created on first sight; null for a quantum that is never captured.
+    private Capture capture(Object key) {
+        if (key == null) return null;
+        Capture capture = this.captures.get(key);
+        if (capture != null && capture.diverged) {
+            release(capture);
+            this.captures.remove(key);
+            capture = null;
+        }
+        if (capture == null) {
+            if (this.captures.size() >= MAX_CAPTURES) {
+                var eldest = this.captures.entrySet().iterator();
+                release(eldest.next().getValue());
+                eldest.remove();
+            }
+            capture = new Capture();
+            this.captures.put(key, capture);
+        }
+        return capture;
+    }
+
+    /// Releases a capture's graph. Only while the graph is unbound: no run of it is outstanding.
+    private void release(Capture capture) {
+        if (capture.graph == 0) return;
+        try {
+            this.pool.lane(this.home).destroyGraph(capture.graph);
+        } finally {
+            capture.graph = 0;
+        }
+    }
+
+    private void beginRecording(Capture capture) {
+        try {
+            if (this.stageHashes == null) openShadowMarkers();
+            shadow(this.home).beginCapture();
+        } catch (RuntimeException | Error failure) {
+            LOG.debug("Qwen quantum capture could not start", failure);
+            capture.unrecordable = true;
+            return;
+        }
+        this.recordingBroken.set(false);
+        this.shadowLanes.set(1L << this.home);
+        java.util.Arrays.fill(this.stageHashes, 0L);
+        this.recording = capture;
+    }
+
+    private void openShadowMarkers() {
+        GpuStream any = this.pool.lane(this.home);
+        long[] tails = new long[this.tails.length];
+        try {
+            if (this.pool.size() > 1) {
+                this.shadowPrepared = any.openMarker();
+                for (StageFrame stage : this.stages) if (stage.marker != 0) stage.shadowMarker = any.openMarker();
+                for (int lane = 0; lane < tails.length; lane++) if (lane != this.home) tails[lane] = any.openMarker();
+            }
+        } finally {
+            this.shadowTails = tails;
+            this.stageHashes = new long[this.stages.length];
+        }
+    }
+
+    /// Whether the current quantum records its submissions.
+    boolean recording() {
+        return this.recording != null && !this.recordingBroken.get();
+    }
+
+    /// The shadow of `lane`, opened on first use.
+    private synchronized GpuStream shadow(int lane) {
+        GpuStream shadow = this.shadows[lane];
+        if (shadow == null) {
+            shadow = Objects.requireNonNull(this.shadowStreams.get(), "shadow stream");
+            this.shadows[lane] = shadow;
+        }
+        return shadow;
+    }
+
+    /// Mirrors a marker wait on `lane`'s shadow; the shadow joins the recording by its first wait. A failed
+    /// shadow operation ends the recording, never the quantum.
+    void shadowAwait(int lane, long marker) {
+        if (!recording()) return;
+        try {
+            shadow(lane).await(marker);
+            this.shadowLanes.getAndUpdate(lanes -> lanes | (1L << lane));
+        } catch (RuntimeException | Error failure) {
+            breakRecording(failure);
+        }
+    }
+
+    void shadowMark(int lane, long marker) {
+        if (!recording()) return;
+        if ((this.shadowLanes.get() & (1L << lane)) == 0) {
+            breakRecording(new IllegalStateException("shadow lane " + lane + " has not joined the capture"));
+            return;
+        }
+        try {
+            shadow(lane).mark(marker);
+        } catch (RuntimeException | Error failure) {
+            breakRecording(failure);
+        }
+    }
+
+    /// Submits `stage` to `stream` on `lane`, recording it on the lane's shadow while the recording holds.
+    void submit(StageFrame stage, GpuStream stream, int lane, boolean overlap) {
+        if (!recording()) {
+            stream.submit(stage, overlap);
+            return;
+        }
+        GpuStream shadow;
+        try {
+            // A shadow that has not joined the capture would run the work a second time.
+            if ((this.shadowLanes.get() & (1L << lane)) == 0)
+                throw new IllegalStateException("shadow lane " + lane + " has not joined the capture");
+            shadow = shadow(lane);
+        } catch (RuntimeException | Error failure) {
+            breakRecording(failure);
+            stream.submit(stage, overlap);
+            return;
+        }
+        long hash = stream.submitRecording(stage, overlap, shadow, false);
+        if (hash == 0) breakRecording(new IllegalStateException("stage " + stage.stage() + " could not be recorded"));
+        else this.stageHashes[stage.stage()] = hash;
+    }
+
+    private void breakRecording(Throwable cause) {
+        if (this.recordingBroken.compareAndSet(false, true)) LOG.debug("Qwen quantum recording ended", cause);
+    }
+
+    /// Joins every shadow lane to the home shadow, ends the capture, and keeps the graph when the whole
+    /// quantum was recorded.
+    private void finishRecording() {
+        Capture capture = this.recording;
+        long joined = this.shadowLanes.get() & ~(1L << this.home);
+        while (joined != 0) {
+            int lane = Long.numberOfTrailingZeros(joined);
+            joined &= joined - 1;
+            shadowMark(lane, this.shadowTails[lane]);
+            shadowAwait(this.home, this.shadowTails[lane]);
+        }
+        long graph = 0;
+        try {
+            graph = shadow(this.home).endCapture();
+        } catch (RuntimeException | Error failure) {
+            breakRecording(failure);
+        }
+        boolean complete = graph != 0 && !this.recordingBroken.get() && !this.quantum.stopRequested();
+        for (StageFrame stage : this.stages) complete &= stage.submitted;
+        this.recording = null;
+        if (complete) {
+            capture.graph = graph;
+            capture.hashes = this.stageHashes.clone();
+            return;
+        }
+        if (graph != 0) this.pool.lane(this.home).destroyGraph(graph);
+        // A recording that broke would break again; a stopped quantum may record next time.
+        if (this.recordingBroken.get()) capture.unrecordable = true;
+        else capture.sightings = 1;
+    }
+
+    /// Launches the captured graph, then checks every stage against it in topological order.
+    private void replayCaptured() {
+        Capture capture = this.replaying;
+        GpuStream home = this.pool.lane(this.home);
+        if (stopRequested()) return;
+        try {
+            home.launchGraph(capture.graph);
+        } catch (RuntimeException | Error failure) {
+            capture.diverged = true;
+            fail(failure);
+            recover(failure);
+            return;
+        }
+        long sink;
+        try {
+            sink = home.beginChecking();
+        } catch (RuntimeException | Error failure) {
+            capture.diverged = true;
+            fail(failure);
+            return;
+        }
+        try {
+            for (StageFrame stage : this.order) {
+                if (stopRequested()) break;
+                stage.attempted = true;
+                stage.lane = this.home;
+                long hash = home.submitChecking(stage, sink);
+                stage.submitted = true;
+                if (hash != capture.hashes[stage.stage()]) {
+                    capture.diverged = true;
+                    fail(new IllegalStateException("stage " + stage.stage() + " diverged from its captured quantum"));
+                    break;
+                }
+            }
+        } catch (RuntimeException | Error failure) {
+            capture.diverged = true;
+            fail(failure);
+        } finally {
+            if (!home.endChecking()) {
+                capture.diverged = true;
+                fail(new IllegalStateException("a replayed quantum submitted work outside its capture"));
+            }
+        }
+    }
+
+    private void closeCaptures() {
+        RuntimeException failure = null;
+        for (Capture capture : this.captures.values()) {
+            try {
+                release(capture);
+            } catch (RuntimeException releaseFailure) {
+                if (failure == null) failure = releaseFailure;
+                else failure.addSuppressed(releaseFailure);
+            }
+        }
+        this.captures.clear();
+        for (int lane = 0; lane < this.shadows.length; lane++) {
+            if (this.shadows[lane] == null) continue;
+            try {
+                this.shadows[lane].close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
+            this.shadows[lane] = null;
+        }
+        if (failure != null) throw failure;
+    }
+
+    /// One key's captured graph and the hash of each stage's submissions in it.
+    static final class Capture {
+        int sightings;
+        long graph;
+        long[] hashes;
+        /// Its recording broke (a submission the graph cannot repeat): it is never recorded again.
+        boolean unrecordable;
+        /// A replay diverged; the capture is released before the next quantum.
+        boolean diverged;
+    }
+
+    /// The single frame of a replayed quantum.
+    static final class Replay extends AbstractFrame {
+        private final StageGraph graph;
+
+        Replay(StageGraph graph) {
+            super(0L);
+            this.graph = graph;
+            randomizeHash(graph.routingSeed);
+        }
+
+        @Override
+        public void execute() {
+            try {
+                this.graph.replayCaptured();
+            } catch (RuntimeException | Error failure) {
+                this.graph.fail(failure);
+            }
+        }
+
+        @Override
+        public void doFinally() {
+            this.graph.stageFinished();
+        }
+
+        /// The lattice rejected the frame without running it: nothing was launched.
+        @Override
+        public void doFinallyWithError(Throwable rejection) {
+            this.graph.fail(new IllegalStateException("the lattice rejected a replayed quantum", rejection));
+            this.graph.stageFinished();
+        }
     }
 
     private void closeMarkers() {
         GpuStream any = this.pool.lane(this.home);
         for (StageFrame stage : this.stages) {
-            if (stage == null || stage.marker == 0) continue;
+            if (stage == null) continue;
+            if (stage.shadowMarker != 0) any.closeMarker(stage.shadowMarker);
+            stage.shadowMarker = 0;
+            if (stage.marker == 0) continue;
             any.closeMarker(stage.marker);
             stage.marker = 0;
         }
+        if (this.shadowTails != null) {
+            for (int lane = 0; lane < this.shadowTails.length; lane++) {
+                if (this.shadowTails[lane] != 0) any.closeMarker(this.shadowTails[lane]);
+                this.shadowTails[lane] = 0;
+            }
+        }
+        if (this.shadowPrepared != 0) any.closeMarker(this.shadowPrepared);
+        this.shadowPrepared = 0;
         for (int lane = 0; lane < this.tails.length; lane++) {
             if (this.tails[lane] == 0) continue;
             any.closeMarker(this.tails[lane]);
