@@ -99,7 +99,8 @@ class QwenAttentionAppendTransactionTest {
                 int rows,
                 int queryWidth,
                 int keyValueWidth,
-                long start) {
+                long start,
+                long position) {
             called = true;
             cache = ((AttentionSequenceStates) sequence.kvCacheState()).forLayer(1);
             cacheAddress = keys;

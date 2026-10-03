@@ -290,14 +290,16 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_zero_device_memory(void* device_address, 
 
 // NVFP4 K/V arguments are device page-address tables. Pages contain 256 tokens,
 // token-major heads, with 128 E2M1 code bytes and 16 E4M3 scales per D256 head.
+// Position-dependent kernels read the quantum's start position from `position` (one uint64 in device memory,
+// written before the quantum's first launch); `start` is the host's copy, which validates and sizes the launch.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_kv_append_nvfp4(
         const void* query_key, const void* gate, void* keys, void* values,
-        uint32_t rows, uint32_t query_width, uint32_t key_width, uint64_t start);
+        uint32_t rows, uint32_t query_width, uint32_t key_width, uint64_t start, const void* position);
 // Scratch: query_heads * 64 * 258 FP32 elements for single-token decode; null for prefill.
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
-        uint32_t cache_length, uint64_t start, void* scratch);
+        uint32_t cache_length, uint64_t start, const void* position, void* scratch);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         const void* device_query_key,
@@ -310,6 +312,7 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         uint32_t head_dim,
         uint32_t rotary_dim,
         uint64_t start_position,
+        const void* position,
         float epsilon,
         double rope_theta);
 

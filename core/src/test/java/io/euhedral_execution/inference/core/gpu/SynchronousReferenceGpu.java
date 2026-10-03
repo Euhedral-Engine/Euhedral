@@ -407,6 +407,7 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
             int headDim,
             int rotaryDim,
             long startPosition,
+            long positionAddress,
             float epsilon,
             double ropeTheta) {
         this.delegate.attentionQkNormRopeBf16(
@@ -420,6 +421,7 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
                 headDim,
                 rotaryDim,
                 startPosition,
+                positionAddress,
                 epsilon,
                 ropeTheta);
     }
@@ -433,7 +435,8 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
             int rows,
             int queryWidth,
             int keyValueWidth,
-            long startPosition) {
+            long startPosition,
+            long positionAddress) {
         this.delegate.attentionKvAppendNvfp4(
                 queryKeyAddress,
                 gateValueAddress,
@@ -442,7 +445,8 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
                 rows,
                 queryWidth,
                 keyValueWidth,
-                startPosition);
+                startPosition,
+                positionAddress);
     }
 
     @Override
@@ -458,6 +462,7 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
             int headDim,
             int cacheLength,
             long startPosition,
+            long positionAddress,
             long scratchAddress) {
         this.delegate.attentionCausalNvfp4(
                 queryKeyAddress,
@@ -471,6 +476,7 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
                 headDim,
                 cacheLength,
                 startPosition,
+                positionAddress,
                 scratchAddress);
     }
 }

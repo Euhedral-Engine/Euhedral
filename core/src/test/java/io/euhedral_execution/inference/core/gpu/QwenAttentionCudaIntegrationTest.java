@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.scheduling.AttentionKvState;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,6 +46,7 @@ class QwenAttentionCudaIntegrationTest {
             long queryNormDevice = CudaGpuOperationsIntegrationTest.upload(gpu, arena, queryNorm);
             long keyNormDevice = CudaGpuOperationsIntegrationTest.upload(gpu, arena, keyNorm);
             long normalizedDevice = gpu.allocate((long) normalized.length * Short.BYTES);
+            long prefillPosition = position(gpu, arena, 0);
             try {
                 gpu.attentionQkNormRopeBf16(
                         queryKeyDevice,
@@ -56,6 +59,7 @@ class QwenAttentionCudaIntegrationTest {
                         HEAD_DIM,
                         ROTARY_DIM,
                         0,
+                        prefillPosition,
                         EPSILON,
                         ROPE_THETA);
                 normalized = CudaGpuOperationsIntegrationTest.download(gpu, arena, normalizedDevice, normalized.length);
@@ -71,7 +75,8 @@ class QwenAttentionCudaIntegrationTest {
                         prefillRows,
                         QUERY_WIDTH,
                         KEY_VALUE_WIDTH,
-                        0);
+                        0,
+                        prefillPosition);
                 cache.appendSubmitted(prefillRows);
                 cache.commitSubmitted();
                 expectedOutput = causalAttention(
@@ -90,6 +95,7 @@ class QwenAttentionCudaIntegrationTest {
                             HEAD_DIM,
                             cache.length(),
                             0,
+                            prefillPosition,
                             cache.decodeScratchAddress(QUERY_HEADS));
                     short[] actual =
                             CudaGpuOperationsIntegrationTest.download(gpu, arena, outputDevice, expectedOutput.length);
@@ -105,6 +111,7 @@ class QwenAttentionCudaIntegrationTest {
                 long decodeGateValueDevice = CudaGpuOperationsIntegrationTest.upload(gpu, arena, decodeGateValue);
                 long decodeNormalizedDevice = gpu.allocate((long) QUERY_KEY_WIDTH * Short.BYTES);
                 long decodeOutputDevice = gpu.allocate((long) QUERY_WIDTH * Short.BYTES);
+                long decodePositionDevice = position(gpu, arena, decodePosition);
                 try {
                     gpu.attentionQkNormRopeBf16(
                             decodeQueryKeyDevice,
@@ -117,6 +124,7 @@ class QwenAttentionCudaIntegrationTest {
                             HEAD_DIM,
                             ROTARY_DIM,
                             decodePosition,
+                            decodePositionDevice,
                             EPSILON,
                             ROPE_THETA);
                     short[] expectedDecodeNormalized =
@@ -136,7 +144,8 @@ class QwenAttentionCudaIntegrationTest {
                             1,
                             QUERY_WIDTH,
                             KEY_VALUE_WIDTH,
-                            decodePosition);
+                            decodePosition,
+                            decodePositionDevice);
                     cache.appendSubmitted(1);
                     cache.commitSubmitted();
                     assertTrue(cache.capacity() >= 4);
@@ -163,6 +172,7 @@ class QwenAttentionCudaIntegrationTest {
                             HEAD_DIM,
                             cache.length(),
                             decodePosition,
+                            decodePositionDevice,
                             cache.decodeScratchAddress(QUERY_HEADS));
                     assertBf16Close(
                             expectedDecodeOutput,
@@ -170,12 +180,14 @@ class QwenAttentionCudaIntegrationTest {
                                     gpu, arena, decodeOutputDevice, expectedDecodeOutput.length),
                             0.03f);
                 } finally {
+                    gpu.free(decodePositionDevice);
                     gpu.free(decodeOutputDevice);
                     gpu.free(decodeNormalizedDevice);
                     gpu.free(decodeGateValueDevice);
                     gpu.free(decodeQueryKeyDevice);
                 }
             } finally {
+                gpu.free(prefillPosition);
                 gpu.free(normalizedDevice);
                 gpu.free(keyNormDevice);
                 gpu.free(queryNormDevice);
@@ -183,6 +195,15 @@ class QwenAttentionCudaIntegrationTest {
                 gpu.free(queryKeyDevice);
             }
         }
+    }
+
+    /// A device copy of a quantum's start position, which position-dependent kernels read.
+    private static long position(CudaGpuMemory gpu, Arena arena, long value) {
+        MemorySegment host = arena.allocate(Long.BYTES, Long.BYTES);
+        host.set(ValueLayout.JAVA_LONG, 0, value);
+        long device = gpu.allocate(Long.BYTES);
+        gpu.copyHostToDevice(device, host, Long.BYTES);
+        return device;
     }
 
     private static short[] qkNormRope(short[] input, short[] queryNorm, short[] keyNorm, int rows, long position) {

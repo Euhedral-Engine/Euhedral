@@ -145,9 +145,10 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_n
         const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
         const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
-        unsigned int headDim, unsigned int cacheLength, unsigned long long start,
+        unsigned int headDim, const unsigned long long* position, unsigned long long positionOffset,
         float* partial, unsigned int splits) {
     euhedral_pdl_begin();
+    const unsigned int cacheLength = (unsigned int)(*position + positionOffset) + 1u;
     gqa_reference::decode_block(blockIdx.x, queryKey, keyPages, valuePages, queryHeads, keyHeads, cacheLength, partial, splits);
 }
 
@@ -157,10 +158,10 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_n
 // writes its own partials (rowStride floats apart). Grid: keyHeads * (largest split count) x rows.
 extern "C" __global__ __launch_bounds__(32) void euhedral_attention_decode_gqa_nvfp4_rows_reference(
         const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        unsigned int queryHeads, unsigned int keyHeads, unsigned long long start, float* partial,
+        unsigned int queryHeads, unsigned int keyHeads, const unsigned long long* position, float* partial,
         unsigned long long rowStride, unsigned int from) {
     const unsigned row = blockIdx.y;
-    const unsigned length = (unsigned)start + row + 1u;
+    const unsigned length = (unsigned)*position + row + 1u;
     if (length < from) return;
     unsigned splits = (length + 31u) / 32u;
     if (splits > 64u) splits = 64u;
@@ -203,9 +204,9 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4
 }
 extern "C" __global__ __launch_bounds__(128) void euhedral_attention_merge_nvfp4_rows_reference(
         const __nv_bfloat16* gateValue, __nv_bfloat16* output, const float* partial, unsigned int queryHeads,
-        unsigned int keyHeads, unsigned long long start, unsigned long long rowStride, unsigned int from) {
+        unsigned int keyHeads, const unsigned long long* position, unsigned long long rowStride, unsigned int from) {
     const unsigned int row = blockIdx.y;
-    const unsigned int length = (unsigned int)start + row + 1u;
+    const unsigned int length = (unsigned int)*position + row + 1u;
     unsigned int splits = length >= from ? (length + 31u) / 32u : (length + 47u) / 48u;
     if (splits > 64u) splits = 64u;
     euhedral_pdl_begin();

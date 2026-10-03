@@ -10,14 +10,14 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_kv_append_n
         const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
         unsigned char* const* keyPages, unsigned char* const* valuePages,
         unsigned int rows, unsigned int queryWidth, unsigned int keyValueWidth,
-        unsigned long long startPosition) {
+        const unsigned long long* startPosition) {
     euhedral_pdl_begin();
     const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const unsigned int heads = keyValueWidth / 256;
     const unsigned int rowHead = blockIdx.x * 4 + warp;
     if (rowHead >= rows * heads) return;
     const unsigned int row = rowHead / heads, head = rowHead % heads;
-    const unsigned long long position = startPosition + row;
+    const unsigned long long position = *startPosition + row;
     const unsigned long long source = (unsigned long long)row * (queryWidth + keyValueWidth)
             + queryWidth + head * 256;
     const unsigned int offset = ((position % 256) * heads + head) * 144;

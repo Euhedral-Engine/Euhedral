@@ -212,6 +212,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS,
             ValueLayout.JAVA_FLOAT,
             ValueLayout.JAVA_DOUBLE);
     protected static final FunctionDescriptor ATTENTION_KV_APPEND_NVFP4 = FunctionDescriptor.of(
@@ -223,7 +224,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
-            ValueLayout.JAVA_LONG);
+            ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS);
     protected static final FunctionDescriptor ATTENTION_CAUSAL_NVFP4 = FunctionDescriptor.of(
             ValueLayout.JAVA_INT,
             ValueLayout.ADDRESS,
@@ -237,6 +239,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,
             ValueLayout.JAVA_LONG,
+            ValueLayout.ADDRESS,
             ValueLayout.ADDRESS);
     protected static final int CUDA_FORMAT_MISMATCH = -3;
 
@@ -507,7 +510,9 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("device memory zeroing is not implemented by this GPU");
     }
 
-    /// Applies per-head Q/K RMSNorm and partial RoPE to one compact projection result.
+    /// Applies per-head Q/K RMSNorm and partial RoPE to one compact projection result. Position-dependent
+    /// kernels read the start position from `positionAddress` (one 64-bit value in device memory, written
+    /// before the launch); `startPosition` is the host's copy, which validates and sizes the launch.
     public void attentionQkNormRopeBf16(
             long queryKeyAddress,
             long queryNormAddress,
@@ -519,6 +524,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             int headDim,
             int rotaryDim,
             long startPosition,
+            long positionAddress,
             float epsilon,
             double ropeTheta) {
         throw new UnsupportedOperationException("Qwen attention Q/K normalization and RoPE are not implemented");
@@ -533,7 +539,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             int rows,
             int queryWidth,
             int keyValueWidth,
-            long startPosition) {
+            long startPosition,
+            long positionAddress) {
         throw new UnsupportedOperationException("Qwen attention KV append is not implemented");
     }
 
@@ -550,6 +557,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             int headDim,
             int cacheLength,
             long startPosition,
+            long positionAddress,
             long scratchAddress) {
         throw new UnsupportedOperationException("Qwen causal attention is not implemented");
     }

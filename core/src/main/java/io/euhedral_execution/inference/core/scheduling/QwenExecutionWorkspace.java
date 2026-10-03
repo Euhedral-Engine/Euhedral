@@ -1,6 +1,8 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -32,7 +34,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
     private final int[] storageOwners;
     private long normalizedAddress;
     private long hiddenStateAddress;
-    private long tokenIdsAddress;
+    private long inputAddress;
     private boolean allocated;
     private boolean closed;
 
@@ -186,6 +188,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
             throw new IllegalStateException("workspace has already been allocated or closed");
         }
         this.allocated = true;
+        this.inputAddress = this.storage.acquire(TOKEN_IDS_SLOT, inputByteSize());
         if (hasFirstLayerBuffers()) {
             for (int index = 0; index < this.firstLayerByteSizes.length; index++) {
                 if (this.storageByteSizes[index] != 0) {
@@ -206,11 +209,36 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         }
     }
 
-    /// Returns device storage for this submission's `bytes` bytes of token IDs.
-    public long tokenIdsAddress(long bytes) {
-        if (this.closed) throw new IllegalStateException("Qwen execution workspace is closed");
-        if (this.tokenIdsAddress == 0) this.tokenIdsAddress = this.storage.acquire(TOKEN_IDS_SLOT, bytes);
-        return this.tokenIdsAddress;
+    /// Bytes of the quantum's input record: its token IDs (32-bit), then its start position (64-bit, 8-byte
+    /// aligned). The quantum uploads the record once at admission, before its first launch, so kernels read
+    /// the position from device memory instead of taking it as a launch parameter.
+    public long inputByteSize() {
+        return positionOffset() + Long.BYTES;
+    }
+
+    private long positionOffset() {
+        return ((long) this.tokenCount * Integer.BYTES + Long.BYTES - 1) / Long.BYTES * Long.BYTES;
+    }
+
+    /// The input record's device address: its token IDs.
+    public long tokenIdsAddress() {
+        if (this.closed || this.inputAddress == 0) throw new IllegalStateException("input record is unavailable");
+        return this.inputAddress;
+    }
+
+    /// The device address of the quantum's start position in its input record.
+    public long positionAddress() {
+        return tokenIdsAddress() + positionOffset();
+    }
+
+    /// Fills `record` (at least [#inputByteSize] bytes) with the input record for `tokenIds` at `startPosition`.
+    public void writeInput(MemorySegment record, int[] tokenIds, long startPosition) {
+        if (tokenIds.length != this.tokenCount) throw new IllegalArgumentException("token count mismatch");
+        for (int index = 0; index < tokenIds.length; index++)
+            record.set(ValueLayout.JAVA_INT, (long) index * Integer.BYTES, tokenIds[index]);
+        for (long offset = (long) tokenIds.length * Integer.BYTES; offset < positionOffset(); offset += Integer.BYTES)
+            record.set(ValueLayout.JAVA_INT, offset, 0);
+        record.set(ValueLayout.JAVA_LONG_UNALIGNED, positionOffset(), startPosition);
     }
 
     public int tokenCount() {
@@ -315,7 +343,7 @@ public final class QwenExecutionWorkspace implements AutoCloseable {
         Arrays.fill(this.projectionAddresses, 0);
         this.hiddenStateAddress = 0;
         this.normalizedAddress = 0;
-        this.tokenIdsAddress = 0;
+        this.inputAddress = 0;
     }
 
     private boolean hasFirstLayerBuffers() {

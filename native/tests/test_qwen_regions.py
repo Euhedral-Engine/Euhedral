@@ -163,7 +163,9 @@ class QwenRegionsTest(unittest.TestCase):
                     for name, grid in [('euhedral_attention_qk_norm_rope_bf16', rows * heads),
                                        ('euhedral_attention_qk_norm_rope_rows_bf16', rows)]:
                         qk = upload(data)  # in place, as production launches it
-                        args = [p(qk), p(qn), p(kn), p(qk), u(rows), u(qh), u(kh), u(hd), u(rotary), p(start),
+                        # The kernels read the quantum's start position from device memory.
+                        position = upload(struct.pack('<Q', start))
+                        args = [p(qk), p(qn), p(kn), p(qk), u(rows), u(qh), u(kh), u(hd), u(rotary), p(position), p(0),
                                 C.c_float(1e-6), C.c_double(1e7)]
                         gpu.launch(name, grid, args, block=256)
                         outputs.append(gpu.download(qk, count * 2))

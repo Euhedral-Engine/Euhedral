@@ -615,8 +615,10 @@ class QwenGenerationSessionTest {
                 int tokenCount,
                 int vocabularySize,
                 int hiddenSize) {
-            int[] tokenIds = this.uploadedTokenIds.get(tokenIdsAddress);
-            if (tokenIds == null) throw new IllegalStateException("embedding did not receive uploaded token IDs");
+            int[] record = this.uploadedTokenIds.get(tokenIdsAddress);
+            if (record == null) throw new IllegalStateException("embedding did not receive uploaded token IDs");
+            // The input record carries the token IDs, then the start position.
+            int[] tokenIds = java.util.Arrays.copyOf(record, tokenCount);
             this.embeddingInputs.add(tokenIds.clone());
             this.lastTokenCount = tokenCount;
             super.embedQ3(
@@ -734,6 +736,7 @@ class QwenGenerationSessionTest {
                 int headDim,
                 int rotaryDim,
                 long startPosition,
+                long positionAddress,
                 float epsilon,
                 double ropeTheta) {
             this.attentionStartPositions.add(startPosition);
@@ -748,7 +751,8 @@ class QwenGenerationSessionTest {
                 int rows,
                 int queryWidth,
                 int keyValueWidth,
-                long startPosition) {
+                long startPosition,
+                long positionAddress) {
             this.keyCacheAddresses.add(keyCacheAddress);
         }
 
@@ -765,6 +769,7 @@ class QwenGenerationSessionTest {
                 int headDim,
                 int cacheLength,
                 long startPosition,
+                long positionAddress,
                 long scratchAddress) {}
     }
 }

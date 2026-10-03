@@ -126,8 +126,10 @@ static __device__ __forceinline__ void qk_norm_rope_rows(
 extern "C" __global__ __launch_bounds__(256) void euhedral_attention_qk_norm_rope_rows_bf16(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* queryNorm, const __nv_bfloat16* keyNorm,
         __nv_bfloat16* output, uint32_t rows, uint32_t queryHeads, uint32_t keyValueHeads,
-        uint32_t headDim, uint32_t rotaryDim, uint64_t startPosition, float epsilon, double ropeTheta) {
+        uint32_t headDim, uint32_t rotaryDim, const uint64_t* position, uint64_t positionOffset, float epsilon,
+        double ropeTheta) {
     euhedral_pdl_begin();
+    const uint64_t startPosition = *position + positionOffset;
     qk_norm_rope_rows(queryKey, queryNorm, keyNorm, output, rows, queryHeads, keyValueHeads,
             headDim, rotaryDim, startPosition, epsilon, ropeTheta);
 }
@@ -135,8 +137,10 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_attention_qk_norm_rop
 extern "C" __global__ void euhedral_attention_qk_norm_rope_bf16(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* queryNorm, const __nv_bfloat16* keyNorm,
         __nv_bfloat16* output, uint32_t rows, uint32_t queryHeads, uint32_t keyValueHeads,
-        uint32_t headDim, uint32_t rotaryDim, uint64_t startPosition, float epsilon, double ropeTheta) {
+        uint32_t headDim, uint32_t rotaryDim, const uint64_t* position, uint64_t positionOffset, float epsilon,
+        double ropeTheta) {
     euhedral_pdl_begin();
+    const uint64_t startPosition = *position + positionOffset;
     qk_norm_rope(queryKey, queryNorm, keyNorm, output, rows, queryHeads, keyValueHeads,
             headDim, rotaryDim, startPosition, epsilon, ropeTheta);
 }
