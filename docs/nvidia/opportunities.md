@@ -67,22 +67,14 @@ cold KV pages, bitwise against the current kernel's per-row results.
 
 ### 3. Native NVFP4 GEMM at more than 30% of peak
 
-**Evidence**
-- The native tile reaches 225–290 TFLOPS of an 815 TFLOPS OMMA peak (docs/NVFP4_NATIVE.md).
-- CUTLASS-style SM120 block-scaled GEMMs reach 83% on an RTX PRO 6000 with:
-  - TMA loads;
-  - a dedicated load warp and a store warp;
-  - 2–4 stages;
-  - `setmaxnreg` 40/232;
-  - 192×128 tiles;
-  - an SFA layout that avoids bank conflicts
-  ([Colfax](https://research.colfax-intl.com/optimizing-an-nvfp4-blockscaled-gemm-on-rtx-pro-6000-blackwell-gpu-sm120/)).
-- Euhedral's tile uses `cp.async` and no TMA.
+**Done (TMA + producer warp):** the native tile loads with TMA from a producer warp into three mbarrier-guarded stages, its
+activation scales are tile-major and its weight scales come as 16-byte boxes. At the FFN shapes it runs at 600–700 TFLOPS (two
+activation terms counted) of the 815 TFLOPS OMMA peak: gate_up 1.18 ms and down 0.53 ms at 1024 rows. NVFP4 prefill is 4,180 tok/s
+at 512 tokens; TTFT at 16K is 5.2 s. Results, the cp.async variants that located the limit, and the persistent-CTA rejection are in
+[NVFP4_NATIVE.md](../NVFP4_NATIVE.md).
 
-**Upper bound:** about 2–2.5× on NVFP4 GEMM time. NVFP4 TTFT at 16K is about 9.7 s today.
-
-**First test:** a TMA plus warp-specialized variant of the native tile in the synthetic FFN bench.
-`setmaxnreg` needs the `sm_120a` target the module already has.
+**Not tried:** `setmaxnreg` register rebalancing (the consumers use 142 registers), a 192×128 tile, and a store warp. At
+80–86% of the MMA peak they bound the remaining gain at about 15%.
 
 ## Tier 2: clear but smaller, or needs a structural change
 

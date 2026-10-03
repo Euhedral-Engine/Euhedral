@@ -46,7 +46,8 @@ A ring of `cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes` co
 - **Even one CTA per SM with 64 KiB in flight saturates DRAM.** This is the cheapest way, in issue
   slots, to keep a lot of memory in flight.
 - It leaves every other warp free for math.
-- Euhedral tried a TMA ring for Q3 decode and found no gain on cold weights (docs/FRAME_MODEL.md).
+- Euhedral tried a TMA ring for Q3 decode and found no gain on cold weights (docs/FRAME_MODEL.md). The native NVFP4 prefill tile
+  does gain: TMA loads from a producer warp take it to 600–700 TFLOPS ([NVFP4_NATIVE.md](../NVFP4_NATIVE.md)).
   That kernel was already at DRAM speed, so the result is consistent with this measurement.
 
 ### Latency
