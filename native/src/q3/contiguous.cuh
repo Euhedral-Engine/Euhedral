@@ -1,5 +1,6 @@
 #pragma once
-#include "decode.cuh"
+#include "layout.cuh"
+#include "numeric.cuh"
 #include "common/pdl.cuh"
 
 namespace q3 {
@@ -12,9 +13,9 @@ namespace q3 {
 // every row. Each lane forms an FP32 dot product of its 32 codes, scales it once by the group
 // scale, and accumulates across slices; a warp shuffle reduces each row.
 //
-// Numerical contract: FP32 accumulation in a different order from cooperative_decode<1>, the exact
-// oracle (euhedral_q3_decode_1 and euhedral_q3_decode_wide), so results agree within FP32 rounding
-// before the BF16 output rounding, not bitwise. Products x * code are exact in FP32. The contract
+// Numerical contract: FP32 accumulation in a different order from the scalar reference
+// (reference/kernels.cu), so results agree within FP32 rounding before the BF16 output rounding, not
+// bitwise. Products x * code are exact in FP32. The contract
 // covers finite FP16 scales, which is what the artifact stores; a non-finite scale multiplies the
 // half group's dot product as IEEE arithmetic, which the exact kernels do not reproduce.
 //

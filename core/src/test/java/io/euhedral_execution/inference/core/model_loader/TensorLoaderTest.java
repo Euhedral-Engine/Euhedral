@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.model_loader.artifact.TensorDescript
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDataType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
@@ -82,7 +83,13 @@ class TensorLoaderTest {
 
     private static TensorDescriptor descriptor(long offset, long byteSize) {
         return new TensorDescriptor(
-                "layer.weight", new long[] {2, 2}, TensorDataType.FP16, WeightFormat.NVFP4, offset, byteSize);
+                "layer.weight",
+                new long[] {2, 2},
+                TensorDataType.FP16,
+                WeightFormat.NVFP4,
+                WeightLayout.CONTIGUOUS_LE_V1,
+                offset,
+                byteSize);
     }
 
     private static final class FakeGpuMemory implements GpuMemory {

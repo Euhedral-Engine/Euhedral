@@ -25,16 +25,15 @@ int euhedral_cuda_load_native_kernel(
 
 /* Programmatic dependent launch. Only kernels registered here call griddepcontrol.wait first,
  * so only they may be launched with the serialization attribute. Only threads that called euhedral_cuda_pdl_select(1)
- * launch with it; EUHEDRAL_PDL=0 disables it everywhere. */
+ * launch with it. */
 void euhedral_cuda_pdl_register(CUfunction function);
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_pdl_select(int enabled);
 /* Row-exact execution for the calling thread: a multi-row call computes each row exactly as a one-row
  * call at that row's position would (speculative verification against one-row decode). */
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_row_exact_select(int enabled);
 int euhedral_cuda_row_exact(void);
-/* Exact numerics: nonzero routes every kernel whose FP32 accumulation order was relaxed back to the
- * exact kernels that reproduce the scalar references bit for bit (the numerical oracle). Initialized
- * from EUHEDRAL_EXACT=1 (or the older EUHEDRAL_Q3_DECODE=EXACT); settable for comparisons. */
+/* Exact numerics: nonzero routes every quantized linear to its scalar reference and every relaxed-order
+ * operator to its exact twin (the numerical oracle). Off by default; selectable for comparisons only. */
 int euhedral_cuda_exact_numerics(void);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_select_exact_numerics(int exact);
 CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,

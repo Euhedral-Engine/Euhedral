@@ -24,11 +24,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-/// The P2E2 artifact (tools/convert_compact_edrl_to_p2e2.py) holds the compact artifact's Q3 values in
+/// The P2E2 artifact (tools/euhedral_artifacts/q3_p2e2.py) holds the compact artifact's Q3 values in
 /// less memory. Run through every route that reads them, it must reproduce the compact artifact's
 /// logits bit for bit: prefill regions and an all-token LM head (expanded, the head in output-row
 /// chunks), short prompts on the small-row kernels, single-row decode on the P2E2 kernel, and exact
-/// numerics. Skipped unless -Peuhedral.qwen.p2e2-artifact names an existing artifact.
+/// numerics. Skipped unless -Peuhedral.qwen.q3-compressed-artifact names an existing artifact.
 class QwenP2e2CudaIntegrationTest {
 
     private static final int PROMPT = 80;
@@ -39,7 +39,7 @@ class QwenP2e2CudaIntegrationTest {
     @Timeout(value = 1800, unit = TimeUnit.SECONDS)
     void p2e2ArtifactReproducesTheCompactArtifactBitwise() throws Exception {
         Path compact = Path.of(System.getProperty("euhedral.qwen.artifact"));
-        Path p2e2 = Path.of(System.getProperty("euhedral.qwen.p2e2-artifact", ""));
+        Path p2e2 = Path.of(System.getProperty("euhedral.qwen.q3-compressed-artifact", ""));
         assumeTrue(Files.isRegularFile(p2e2), "no P2E2 artifact: " + p2e2);
         Trace expected = trace(compact, false);
         Trace actual = trace(p2e2, true);

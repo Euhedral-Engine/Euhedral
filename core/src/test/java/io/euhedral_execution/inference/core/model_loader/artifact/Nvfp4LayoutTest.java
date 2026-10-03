@@ -20,7 +20,7 @@ class Nvfp4LayoutTest {
 
     @Test
     void geometryFollowsTheConverter() {
-        // tools/convert_qwen_safetensors_to_compact_edrl.py nvfp4_offsets((3, 1024)) == (1536, 1792, 1796)
+        // tools/euhedral_artifacts/nvfp4.py nvfp4_offsets((3, 1024)) == (1536, 1792, 1796)
         assertEquals(1536, Nvfp4Layout.scaleOffset(3, 1024));
         assertEquals(1792, Nvfp4Layout.globalScaleOffset(3, 1024));
         assertEquals(1796, Nvfp4Layout.byteSize(3, 1024));

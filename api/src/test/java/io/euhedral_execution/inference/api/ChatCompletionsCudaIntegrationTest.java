@@ -80,8 +80,8 @@ class ChatCompletionsCudaIntegrationTest {
         String configuredLibrary = System.getProperty("euhedral.cuda.library");
         assumeTrue(configuredLibrary != null && Files.isRegularFile(Path.of(configuredLibrary)));
         library = Path.of(configuredLibrary);
-        artifact = Path.of(System.getProperty(
-                "euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl"));
+        artifact = Path.of(
+                System.getProperty("euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl"));
         tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("chat_template.jinja")));
     }

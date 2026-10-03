@@ -1,14 +1,13 @@
 """P2E2 Q3 tensors: the compressed routes must reproduce the row-split routes bit for bit.
 
 The production q3 module and the embedding module are compiled with NVRTC. Tensors are built from
-code matrices with tools/convert_compact_edrl_to_p2e2.py, the reference encoder. Each case covers
+code matrices with tools/euhedral_artifacts/q3_p2e2.py, the reference encoder. Each case covers
 the paths a kernel takes on its own data: lanes with more than 16 BIG codes, slices whose payload
 outruns the 32 prefetched words, rows without BIG codes, and realistic code distributions.
 """
 
 import contextlib
 import ctypes as C
-import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,7 +20,7 @@ try:
 except ImportError:
     np = None
 
-from test_q3_primitives import Gpu, NVRTC, SKIP_REASON
+from gpu_harness import Gpu, NVRTC, SKIP_REASON
 
 ROOT = Path(__file__).resolve().parents[2]
 SENTINEL = 0xA5
@@ -32,11 +31,9 @@ elif np is None:
     UNAVAILABLE = "NumPy unavailable"
 p2e2 = None
 if np is not None:
-    # The reference encoder (tools/convert_compact_edrl_to_p2e2.py) needs NumPy.
-    spec = importlib.util.spec_from_file_location("p2e2_converter", ROOT / "tools/convert_compact_edrl_to_p2e2.py")
-    p2e2 = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = p2e2
-    spec.loader.exec_module(p2e2)
+    # The reference encoder (tools/euhedral_artifacts/q3_p2e2.py) needs NumPy.
+    sys.path.insert(0, str(ROOT / "tools"))
+    from euhedral_artifacts import q3_p2e2 as p2e2
 
 HOST_SOURCE = r'''#include <stdint.h>
 #include <cuda.h>
@@ -63,6 +60,14 @@ CUresult euhedral_launch_kernel(CUfunction function, unsigned int gx, unsigned i
         unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared, CUstream stream,
         void** parameters, void** extra) {
     return cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared, stream, parameters, extra);
+}
+/* The scalar reference is a separate module; this harness only checks routes that never reach it. */
+#include "reference.h"
+int euhedral_reference_q3(const void* input, const void* weights, void* output, uint32_t rows,
+        uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
+    (void)input; (void)weights; (void)output; (void)rows; (void)in_features; (void)out_features;
+    (void)weights_byte_size;
+    return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 }
 #include "q3_linear_bf16.c"
 '''

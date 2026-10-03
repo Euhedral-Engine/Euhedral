@@ -22,7 +22,7 @@ class P2e2LayoutTest {
 
     @Test
     void planeOffsetsFollowTheConverter() {
-        // tools/convert_compact_edrl_to_p2e2.py p2e2_offsets(3, 1024): (768, 1024, 1280)
+        // tools/euhedral_artifacts/q3_p2e2.py p2e2_offsets(3, 1024): (768, 1024, 1280)
         assertEquals(768, P2e2Layout.rowBaseOffset(3, 1024));
         assertEquals(1024, P2e2Layout.scaleOffset(3, 1024));
         assertEquals(1280, P2e2Layout.payloadOffset(3, 1024));

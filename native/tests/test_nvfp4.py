@@ -1,13 +1,11 @@
 """NVFP4 weight kernels against a float64 reference of the dequantized weights.
 
-Tensors come from the converter's NVFP4 quantizer (tools/convert_qwen_safetensors_to_compact_edrl.py).
-Decode accumulates in FP32 in its own order; the tile kernels stage BF16(weight) and accumulate with
-FP32 MMAs, so the reference uses BF16-rounded weights for them.
+Tensors come from the converter's NVFP4 quantizer (tools/euhedral_artifacts/nvfp4.py).
+Decode accumulates in FP32 in its own order; the scalar reference (native/src/reference) in another.
 """
 
 import contextlib
 import ctypes as C
-import importlib.util
 from pathlib import Path
 import sys
 import unittest
@@ -17,17 +15,15 @@ try:
 except ImportError:
     np = None
 
-from test_q3_primitives import Gpu, NVRTC, SKIP_REASON
+from gpu_harness import Gpu, NVRTC, SKIP_REASON
 
 ROOT = Path(__file__).resolve().parents[2]
 UNAVAILABLE = (f"CUDA probes unavailable: {SKIP_REASON}" if NVRTC is None
                else "NumPy unavailable" if np is None else None)
 converter = None
 if np is not None:
-    spec = importlib.util.spec_from_file_location("compact_converter", ROOT / "tools/convert_qwen_safetensors_to_compact_edrl.py")
-    converter = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = converter
-    spec.loader.exec_module(converter)
+    sys.path.insert(0, str(ROOT / "tools"))
+    from euhedral_artifacts import nvfp4 as converter
 
 
 def bf16(values):
@@ -84,7 +80,7 @@ def sd4_tensor(rng, rows, k):
 class Nvfp4KernelTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.gpu = Gpu(b'#include "nvfp4/kernels.cu"\n')
+        cls.gpu = Gpu(b'#include "nvfp4/kernels.cu"\n#include "reference/kernels.cu"\n')
         cls.rng = np.random.default_rng(0xF4)
 
     @classmethod
@@ -126,28 +122,14 @@ class Nvfp4KernelTest(unittest.TestCase):
                                             [C.c_uint(k), C.c_uint(n)], 1)
                     self.assertTrue(np.array_equal(together[row].view(np.uint32), alone[0].view(np.uint32)), f"row {row}")
 
-    def test_tile_kernels_match_the_reference(self):
-        for name, tile in (("euhedral_nvfp4_prefill_128x64", 128), ("euhedral_nvfp4_prefill_64x64", 64)):
-            for rows, k, n in ((3, 1024, 64), (130, 2048, 96), (64, 5120, 128)):
-                with self.subTest(kernel=name, rows=rows, k=k, n=n):
-                    weights, dense = tensor(self.rng, n, k)
-                    x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
-                    expected = x.astype(np.float64) @ bf16(dense).astype(np.float64).T
-                    grid = (rows + tile - 1) // tile * ((n + 63) // 64)
-                    actual = self.run_kernel(name, grid, x, weights, n, [C.c_uint(rows), C.c_uint(k), C.c_uint(n)], rows)
-                    self.assert_close(actual, expected, np.abs(expected).max())
-
-    def test_gate_up_swiglu_matches_the_reference(self):
-        rows, k, n = 70, 2048, 128
-        weights, dense = tensor(self.rng, n, k)
-        x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
-        projected = x.astype(np.float64) @ bf16(dense).astype(np.float64).T
-        gate, up = bf16(projected[:, : n // 2]).astype(np.float64), bf16(projected[:, n // 2:]).astype(np.float64)
-        expected = gate / (1.0 + np.exp(-gate)) * up
-        for name, tile in (("euhedral_nvfp4_gate_up_swiglu_128x32", 128), ("euhedral_nvfp4_gate_up_swiglu_64x32", 64)):
-            with self.subTest(kernel=name):
-                grid = (rows + tile - 1) // tile * (n // 2 // 32)
-                actual = self.run_kernel(name, grid, x, weights, n // 2, [C.c_uint(rows), C.c_uint(k), C.c_uint(n)], rows)
+    def test_scalar_reference_matches_the_float64_dequantization(self):
+        for rows, k, n in ((1, 1024, 16), (3, 2048, 24), (9, 5120, 40)):
+            with self.subTest(rows=rows, k=k, n=n):
+                weights, dense = tensor(self.rng, n, k)
+                x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                expected = x.astype(np.float64) @ dense.astype(np.float64).T
+                actual = self.run_kernel("euhedral_nvfp4_reference", rows * n, x, weights, n,
+                                         [C.c_uint(rows), C.c_uint(k), C.c_uint(n)], rows)
                 self.assert_close(actual, expected, np.abs(expected).max())
 
     def assert_bitwise(self, actual, expected):
@@ -164,20 +146,12 @@ class Nvfp4KernelTest(unittest.TestCase):
                     name = "euhedral_nvfp4_decode" if rows == 1 else f"euhedral_nvfp4_decode_rows{rows}"
                     self.assert_bitwise(self.run_kernel(name + "_sd4", n // 16, x, sd4, n, shape, rows),
                                         self.run_kernel(name, n // 16, x, plain, n, shape, rows))
-            for rows in (3, 130):
-                x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
-                for name, tile in (("euhedral_nvfp4_prefill_128x64", 128), ("euhedral_nvfp4_prefill_64x64", 64)):
-                    with self.subTest(kernel=name, k=k, rows=rows):
-                        grid = (rows + tile - 1) // tile * ((n + 63) // 64)
-                        args = [C.c_uint(rows), C.c_uint(k), C.c_uint(n)]
-                        self.assert_bitwise(self.run_kernel(name + "_sd4", grid, x, sd4, n, args, rows),
-                                            self.run_kernel(name, grid, x, plain, n, args, rows))
-                for name, tile in (("euhedral_nvfp4_gate_up_swiglu_128x32", 128), ("euhedral_nvfp4_gate_up_swiglu_64x32", 64)):
-                    with self.subTest(kernel=name, k=k, rows=rows):
-                        grid = (rows + tile - 1) // tile * (n // 2 // 32)
-                        args = [C.c_uint(rows), C.c_uint(k), C.c_uint(n)]
-                        self.assert_bitwise(self.run_kernel(name + "_sd4", grid, x, sd4, n // 2, args, rows),
-                                            self.run_kernel(name, grid, x, plain, n // 2, args, rows))
+            for rows in (1, 3):
+                with self.subTest(kernel="reference", k=k, rows=rows):
+                    x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                    args = [C.c_uint(rows), C.c_uint(k), C.c_uint(n)]
+                    self.assert_bitwise(self.run_kernel("euhedral_nvfp4_reference_sd4", rows * n, x, sd4, n, args, rows),
+                                        self.run_kernel("euhedral_nvfp4_reference", rows * n, x, plain, n, args, rows))
 
 
 if __name__ == "__main__":

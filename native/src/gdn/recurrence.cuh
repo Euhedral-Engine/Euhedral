@@ -195,5 +195,4 @@ extern "C" __global__ __launch_bounds__(32) void euhedral_gdn_recurrence_c##C##_
     gdn_recurrence_columns<C>(convolved, alpha, beta, recurrentState, output, rows, keyHeads, valueHeads, outputScale); \
 }
 QWEN_GDN_RECURRENCE_COLUMNS(8)
-QWEN_GDN_RECURRENCE_COLUMNS(4)
 #undef QWEN_GDN_RECURRENCE_COLUMNS

@@ -26,7 +26,6 @@ subprojects {
             exclude("**/CudaGpuMemoryIntegrationTest.class")
             exclude("**/CudaGpuStreamIntegrationTest.class")
             exclude("**/QwenCompactCudaResidencyIntegrationTest.class")
-            exclude("**/QwenEmbeddingCudaIntegrationTest.class")
             exclude("**/CudaGpuOperationsIntegrationTest.class")
             exclude("**/QwenInstructionCudaIntegrationTest.class")
             exclude("**/QwenCompactCudaExecutionIntegrationTest.class")
@@ -57,7 +56,6 @@ subprojects {
             include("**/CudaGpuMemoryIntegrationTest.class")
             include("**/CudaGpuStreamIntegrationTest.class")
             include("**/QwenCompactCudaResidencyIntegrationTest.class")
-            include("**/QwenEmbeddingCudaIntegrationTest.class")
             include("**/CudaGpuOperationsIntegrationTest.class")
             include("**/QwenInstructionCudaIntegrationTest.class")
             include("**/QwenCompactCudaExecutionIntegrationTest.class")
@@ -82,24 +80,19 @@ subprojects {
             systemProperty(
                     "euhedral.qwen.artifact",
                     providers.gradleProperty("euhedral.qwen.artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl")
                             .get())
-            // Optional NVFP4 artifact (tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4).
+            // Optional NVFP4 artifact (tools/convert_checkpoint.py --quantization nvfp4).
             systemProperty(
                     "euhedral.qwen.nvfp4-artifact",
                     providers.gradleProperty("euhedral.qwen.nvfp4-artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_nvfp4.edrl")
                             .get())
-            // Optional P2E2 transcode of the compact artifact (tools/convert_compact_edrl_to_p2e2.py).
+            // Optional compressed Q3 artifact (tools/convert_checkpoint.py --quantization q3 --compressed).
             systemProperty(
-                    "euhedral.qwen.p2e2-artifact",
-                    providers.gradleProperty("euhedral.qwen.p2e2-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3_p2e2.edrl")
-                            .get())
-            systemProperty(
-                    "euhedral.qwen.reference-artifact",
-                    providers.gradleProperty("euhedral.qwen.reference-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_bf16.edrl")
+                    "euhedral.qwen.q3-compressed-artifact",
+                    providers.gradleProperty("euhedral.qwen.q3-compressed-artifact")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3_compressed.edrl")
                             .get())
             // Teacher-forced relaxed-numerics drift: decode length, prefill prefix, an optional per-step CSV
             // report, and `exact` to run the oracle on both sequences.

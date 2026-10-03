@@ -98,6 +98,9 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_rms_norm_unit_offset_bf16(
         uint32_t width,
         float epsilon);
 
+/* Q3G64_F16S linear on BF16 rows, the production dispatch: 1 to 8 rows on the contiguous decode kernels (every row
+ * bit for bit as a one-row call). Larger batches run on the FP8 route below; exact numerics, and shapes or alignments
+ * no decode kernel takes, run the scalar reference. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_bf16(
         const void* device_input,
         const void* device_weights,
@@ -106,39 +109,30 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_bf16(
         uint32_t in_features,
         uint32_t out_features,
         uint64_t weights_byte_size);
-
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_decode_bf16(
-        const void* input, const void* weights, void* output,
-        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
-/* Selects exact numerics (nonzero) for later launches in this process and returns the previous
- * selection: every kernel with a relaxed FP32 accumulation order (contiguous Q3 decode, split-K FFN
- * down, ...) is replaced by its bitwise-exact counterpart. The default is relaxed unless the
- * environment sets EUHEDRAL_EXACT=1 (or EUHEDRAL_Q3_DECODE=EXACT). The second name is an alias. */
+/* The scalar Q3 reference: the numerical oracle the production kernels are measured against. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_reference_bf16(
+        const void* device_input,
+        const void* device_weights,
+        void* device_output,
+        uint32_t rows,
+        uint32_t in_features,
+        uint32_t out_features,
+        uint64_t weights_byte_size);
+/* Selects exact numerics (nonzero) for later launches in this process and returns the previous selection: every
+ * quantized linear runs its scalar reference and every relaxed-order operator its exact twin. The default is relaxed.
+ * For numerical comparisons against the oracle. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_select_exact_numerics(int exact);
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_decode_select_exact(int exact);
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_bf16(
-        const void* input, const void* weights, void* output,
-        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_prefill_64_bf16(
-        const void* input, const void* weights, void* output,
-        uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
 
-/* NVFP4 weights (Nvfp4Layout): `in_features` x `out_features` (weight rows) linear on BF16 rows, one
- * row on the decode kernel and other row counts on the balanced tile engine; and the paired gate/up
- * projection with SwiGLU, `outputs` weight rows (gate first) giving outputs / 2 values per row. FP32
- * accumulation; the tile kernels round each weight to BF16. */
+/* NVFP4 weights (Nvfp4Layout) linear on BF16 rows, `in_features` x `out_features` (weight rows): one row on the decode
+ * kernel, 2 to 8 rows on its row twins (each bit for bit as a one-row call), exact numerics and other shapes on the
+ * scalar reference. Larger batches run on the native route below. FP32 accumulation. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_nvfp4_bf16(
         const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size);
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_gate_up_swiglu_bf16(
-        const void* input, const void* weights, void* output,
-        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);
-/* Native Blackwell NVFP4 linear (docs/NVFP4_NATIVE.md): quantizes the BF16 input rows to NVFP4 in
- * `scratch` (euhedral_cuda_nvfp4_activation_bytes) and multiplies with block-scaled FP4 tensor-core MMA.
- * Available only on sm_12x devices (euhedral_cuda_nvfp4_native_available); returns
- * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE otherwise, when EUHEDRAL_NVFP4_NATIVE=0, under exact numerics, or when
- * in_features is not a multiple of 128. Activations are quantized (two NVFP4 terms by default, one with
- * EUHEDRAL_NVFP4_NATIVE=1), so results differ from euhedral_cuda_linear_nvfp4_bf16. */
+/* Native Blackwell NVFP4 linear (docs/NVFP4_NATIVE.md): quantizes the BF16 input rows to two NVFP4 terms in `scratch`
+ * (euhedral_cuda_nvfp4_native_scratch_bytes) and multiplies with block-scaled FP4 tensor-core MMA. Returns
+ * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE under exact numerics or when in_features is not a multiple of 128; the activations
+ * are quantized, so results differ from euhedral_cuda_linear_nvfp4_bf16. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_available(void);
 /* Scratch for one native linear or gate/up region: quantized activations, plus FP32 split-K partials for
  * decode-like row counts (2 to 64 rows run the skinny weight-streaming kernel). */
@@ -154,13 +148,12 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16(
         const void* input, const void* weights, void* output, void* scratch,
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
 
-/* Q3 prefill on block-scaled FP8 tensor cores (docs/PREFILL_MX.md): quantizes the BF16 input rows into two E4M3
+/* Prefill (9 or more rows) on block-scaled FP8 tensor cores (docs/PREFILL_MX.md): quantizes the BF16 input rows into two E4M3
  * terms and a power-of-two block scale in `scratch` (euhedral_cuda_q3_mx_scratch_bytes, 256-aligned) and multiplies
  * with the Q3 codes (exact in E4M3) at the full FP8 MMA rate, FP32 accumulation, FP16 group scales applied in
- * FP32. Returns EUHEDRAL_CUDA_ROUTE_UNAVAILABLE off sm_12x, when EUHEDRAL_Q3_MX=0, under exact numerics or
- * row-exact execution, for unaligned operands, and when in_features or the weight rows are not a multiple of 128;
- * the BF16 kernels then run. The BF16 activations are represented exactly (down to 2^-9 of a 32-block's maximum),
- * so the results differ from the BF16 route only by its rounding of code * scale to BF16. */
+ * FP32. Returns EUHEDRAL_CUDA_ROUTE_UNAVAILABLE off sm_12x, under exact numerics or row-exact execution, for
+ * unaligned operands, and when in_features or the weight rows are not a multiple of 128. The BF16 activations are
+ * represented exactly (down to 2^-9 of a 32-block's maximum). */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_available(void);
 EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_q3_mx_scratch_bytes(uint32_t rows, uint32_t width, uint32_t weight_rows);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_mx_bf16(
@@ -181,8 +174,8 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_mx_gate_up_swiglu_bf16(
         uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes, uint64_t scratch_byte_size);
 
 /* P2E2 Q3 tensors (layout row-split-p2e2-v1, docs/COMPRESSED_Q3.md): the same Q3G64_F16S values in
- * a smaller, entropy-coded layout. The decode route runs one row with relaxed numerics on the shapes
- * of euhedral_cuda_linear_q3_decode_bf16's contiguous kernel, bitwise identical to it, and returns
+ * a smaller, entropy-coded layout. The decode route runs one row on the shapes of the contiguous decode
+ * kernel, bitwise identical to it, and returns
  * EUHEDRAL_CUDA_ROUTE_UNAVAILABLE otherwise. Every other route expands the tensor into the row-split
  * layout (`destination` holds at least that many bytes) and runs the row-split entry points. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_q3_p2e2_decode_bf16(
@@ -201,16 +194,8 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_embed_q3_p2e2(
         uint32_t hidden_size,
         uint64_t embedding_byte_size);
 
-/* Split-K FFN down for the measured prefill shapes: K splits accumulate into `partials`
- * (splits x rows x outputs FP32, splits = 4) and a reduction writes BF16 `output`. Other shapes, or
- * a NULL `partials`, run euhedral_cuda_q3_ffn_down_bf16. FP32 order differs from the unsplit leaf. */
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_ffn_down_split_bf16(
-        const void* input, const void* weights, void* output, float* partials,
-        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_ffn_down_bf16(
-        const void* input, const void* weights, void* output,
-        uint32_t rows, uint32_t width, uint32_t outputs, uint64_t weight_bytes);
-
+/* Q4 (bits = 4) and Q5 (bits = 5) linear: 1 to 8 rows on the contiguous decode kernels (every row bit for bit as a
+ * one-row call); exact numerics and other shapes on the scalar reference. Larger batches run on the FP8 route. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_quantized_bf16(
         const void* device_input,
         const void* device_weights,
@@ -274,17 +259,6 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_gated_rms_norm_bf16(
         uint32_t head_dim,
         float epsilon);
 
-// Owns internal streams even with synchronous outer submission. On ANY error, the caller
-// must prove device completion or quarantine all borrowed buffers before releasing them.
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_ffn_streamed_bf16(
-        const void* input, const void* gate_weights, const void* down_weights, void* output,
-        void* slots, float* accumulators, uint32_t rows, uint32_t hidden, uint32_t intermediate,
-        uint64_t gate_bytes, uint64_t down_bytes);
-
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_q3_gate_up_swiglu_bf16(
-        const void* input, const void* weights, void* output, uint32_t rows,
-        uint32_t width, uint32_t outputs, uint64_t weight_bytes);
-
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_rms_norm_bf16(
         const void* residual, const void* delta, const void* weight,
         void* hidden, void* normalized, uint32_t rows, uint32_t width, float epsilon);
@@ -293,11 +267,6 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_project_control_fp32(
         const void* input, const void* a_weight, const void* b_weight,
         const float* a_log, const float* dt_bias, float* alpha, float* beta,
         uint32_t rows, uint32_t width, uint32_t heads);
-
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_gdn_projections_bf16(
-        const void* input, const void* q4, const void* q5, void* qk_output, void* value_z_output,
-        uint32_t rows, uint32_t hidden, uint32_t qk_width, uint32_t value_z_width,
-        uint64_t q4_bytes, uint64_t q5_bytes);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_add_bf16(
         const void* device_residual,
@@ -343,29 +312,6 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         uint64_t start_position,
         float epsilon,
         double rope_theta);
-
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_kv_append_bf16(
-        const void* device_query_key,
-        const void* device_gate_value,
-        void* device_key_cache,
-        void* device_value_cache,
-        uint32_t rows,
-        uint32_t query_width,
-        uint32_t key_value_width,
-        uint64_t start_position);
-
-EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_causal_bf16(
-        const void* device_query_key,
-        const void* device_gate_value,
-        const void* device_key_cache,
-        const void* device_value_cache,
-        void* device_output,
-        uint32_t rows,
-        uint32_t query_heads,
-        uint32_t key_value_heads,
-        uint32_t head_dim,
-        uint32_t cache_length,
-        uint64_t start_position);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_synchronize(void);
 EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_stream_create(void);

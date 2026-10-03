@@ -1,5 +1,5 @@
 #pragma once
-#include "strategies/decode_contiguous.cuh"
+#include "contiguous.cuh"
 #include "common/pdl.cuh"
 
 // P2E2: a lossless, smaller persistent layout of Q3G64_F16S tensors (layout "row-split-p2e2-v1",

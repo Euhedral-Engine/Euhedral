@@ -8,8 +8,8 @@ import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan.Kind;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-/// Production prefill routing: streamed C only at its qualified geometry, A+B+D+F elsewhere
-/// from 64 rows, A+D below 64 rows, and A+D in a separate view for decode.
+/// Production prefill routing: the fused gate/up region from 64 rows, residual-norm and early GDN control
+/// regions below 64 rows, and the small topology in a separate view for decode.
 class QwenPrefillRouteTest {
     private static final int[] QUALIFIED_ROWS = {64, 256, 512, 1024};
 
@@ -24,9 +24,6 @@ class QwenPrefillRouteTest {
         // Same fused topology as short prefill, but its own plan: graphs and logits stay per view.
         assertNotSame(small, decode);
         assertNotSame(plan, decode);
-        // Decode keeps the GDN Q4 and Q5 projections as separate leaf frames.
-        assertFalse(has(decode, Kind.GDN_PROJECTIONS));
-        assertEquals(count(small, Kind.GDN_PROJECTIONS), count(decode, Kind.Q4_LINEAR) - count(small, Kind.Q4_LINEAR));
         assertEquals(small.bufferSpecs(), decode.bufferSpecs());
         assertTrue(has(decode, Kind.RESIDUAL_RMS_NORM));
         assertTrue(has(decode, Kind.GDN_PROJECT_CONTROL));
@@ -112,7 +109,6 @@ class QwenPrefillRouteTest {
         assertTrue(has(small, Kind.GDN_PROJECT_CONTROL));
         assertTrue(has(small, Kind.ATTENTION_KV_APPEND));
         assertFalse(has(small, Kind.Q3_GATE_UP_SWIGLU));
-        assertFalse(has(small, Kind.FFN_STREAMED));
         assertFalse(small.reusePrefillStorage());
         assertTopology(small);
     }
@@ -124,80 +120,6 @@ class QwenPrefillRouteTest {
         var combined = plan.forExecution(ExecutionKind.PREFILL, 64);
         for (int rows : QUALIFIED_ROWS) assertSame(combined, plan.forExecution(ExecutionKind.PREFILL, rows));
         assertCombined(weights.config().numHiddenLayers(), combined);
-    }
-
-    @Test
-    void streamedFfnIsSelectedOnlyAtItsExactQualifiedGeometry() {
-        var weights = QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
-        var plan = new QwenExecutionPlan(weights);
-        var streamed = plan.forExecution(ExecutionKind.PREFILL, 1024);
-        int layers = weights.config().numHiddenLayers();
-        assertEquals(layers, count(streamed, Kind.FFN_STREAMED));
-        assertFalse(has(streamed, Kind.Q3_GATE_UP_SWIGLU));
-        assertFalse(hasBuffer(streamed, Buffer.SWIGLU));
-        assertTrue(hasBuffer(streamed, Buffer.FFN_STAGING));
-        assertTrue(hasBuffer(streamed, Buffer.FFN_ACCUMULATORS));
-        assertEquals(8192, streamed.bufferWidth(Buffer.FFN_STAGING));
-        assertEquals(5120, streamed.bufferWidth(Buffer.FFN_ACCUMULATORS));
-        assertTrue(streamed.reusePrefillStorage());
-        assertTopology(streamed);
-        for (int rows : new int[] {64, 65, 255, 256, 257, 512, 1023, 1025}) {
-            var fallback = plan.forExecution(ExecutionKind.PREFILL, rows);
-            assertNotSame(streamed, fallback, "rows=" + rows);
-            assertCombined(layers, fallback);
-        }
-    }
-
-    @Test
-    void materializedFfnDownHasItsOwnSemanticInstruction() {
-        var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408));
-        for (int rows : new int[] {256, 512}) {
-            var selected = plan.forExecution(ExecutionKind.PREFILL, rows);
-            assertTrue(selected.instructions().stream()
-                    .anyMatch(i -> i.kind().name().equals("Q3_FFN_DOWN")));
-            assertFalse(selected.instructions().stream()
-                    .anyMatch(
-                            i -> i.kind() == Kind.Q3_LINEAR && i.outputBuffers().contains(Buffer.FFN_DELTA)));
-        }
-    }
-
-    @Test
-    void qualifiedFfnDownSplitsKIntoBorrowedProjectionStorage() {
-        var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408));
-        for (int rows : new int[] {64, 256, 512}) {
-            var selected = plan.forExecution(ExecutionKind.PREFILL, rows);
-            var downs = selected.instructions().stream()
-                    .filter(i -> i.kind() == Kind.Q3_FFN_DOWN)
-                    .toList();
-            assertEquals(selected.weights().config().numHiddenLayers(), downs.size());
-            assertTrue(downs.stream()
-                    .allMatch(i -> i.outputBuffers().equals(List.of(Buffer.FFN_DELTA, Buffer.FFN_PARTIALS))));
-            assertEquals(4 * 5120, selected.bufferWidth(Buffer.FFN_PARTIALS));
-            var gpu = new QwenExecutionFixtures.RecordingGpu();
-            try (var workspace = new QwenExecutionWorkspace(gpu, rows, selected, QwenLogitsRequirement.NONE)) {
-                workspace.allocateBuffers();
-                assertShared(workspace, Buffer.QK_PROJECTED, Buffer.FFN_PARTIALS);
-            }
-        }
-        // Other FFN geometries keep the unsplit down and no partials buffer.
-        var other = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17280))
-                .forExecution(ExecutionKind.PREFILL, 256);
-        assertFalse(hasBuffer(other, Buffer.FFN_PARTIALS));
-    }
-
-    @Test
-    void nearMissGeometryNeverSelectsStreamedFfn() {
-        for (var weights : List.of(
-                QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17280),
-                QwenExecutionFixtures.statefulCompactWeights(8, 4992, 17408))) {
-            var plan = new QwenExecutionPlan(weights);
-            for (int rows : QUALIFIED_ROWS) {
-                var selected = plan.forExecution(ExecutionKind.PREFILL, rows);
-                assertFalse(has(selected, Kind.FFN_STREAMED));
-                assertCombined(weights.config().numHiddenLayers(), selected);
-            }
-            assertEquals(3, plan.executionVariants().size());
-        }
     }
 
     @Test
@@ -222,13 +144,8 @@ class QwenPrefillRouteTest {
         var combined = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights())
                 .forExecution(ExecutionKind.PREFILL, 256);
         int control = firstId(combined, Kind.GDN_PROJECT_CONTROL);
-        int heavy = firstId(combined, Kind.GDN_PROJECTIONS);
+        int heavy = firstId(combined, Kind.Q4_LINEAR);
         assertTrue(control < heavy);
-        assertFalse(combined.instructions().stream()
-                .anyMatch(i -> i.kind() == Kind.Q4_LINEAR
-                        && i.outputBuffers().equals(List.of(Buffer.QK_PROJECTED))
-                        && i.layerIndex() >= 0
-                        && i.outputWidth() == 2 * 16 * 128));
     }
 
     @Test
@@ -300,26 +217,8 @@ class QwenPrefillRouteTest {
         }
     }
 
-    @Test
-    void streamedWorkspaceHostsBoundedSlotsAndCarryInRetiredProjectionStorage() {
-        var plan = new QwenExecutionPlan(QwenExecutionFixtures.statefulCompactWeights(8, 5120, 17408))
-                .forExecution(ExecutionKind.PREFILL, 1024);
-        var gpu = new QwenExecutionFixtures.RecordingGpu();
-        try (var workspace = new QwenExecutionWorkspace(gpu, 64, plan, QwenLogitsRequirement.NONE)) {
-            workspace.allocateBuffers();
-            assertShared(workspace, Buffer.VALUE_Z_PROJECTED, Buffer.FFN_STAGING);
-            assertShared(workspace, Buffer.QK_PROJECTED, Buffer.FFN_ACCUMULATORS);
-            assertShared(workspace, Buffer.HIDDEN_STATE, Buffer.FINAL_HIDDEN_STATE);
-            assertThrows(IllegalStateException.class, () -> workspace.address(Buffer.SWIGLU));
-            assertThrows(IllegalStateException.class, () -> workspace.detachAddress(Buffer.FFN_STAGING));
-        }
-        assertEquals(gpu.allocations.size(), gpu.frees.size());
-        assertEquals(gpu.frees.size(), new java.util.HashSet<>(gpu.frees).size());
-    }
-
     private static void assertCombined(int layers, QwenExecutionPlan plan) {
         assertEquals(layers, count(plan, Kind.Q3_GATE_UP_SWIGLU));
-        assertFalse(has(plan, Kind.FFN_STREAMED));
         assertFalse(has(plan, Kind.SWIGLU));
         // The attention producers stay leaf frames: Q4 -> QK norm/RoPE and Q5 -> cache append.
         assertTrue(has(plan, Kind.ATTENTION_KV_APPEND));

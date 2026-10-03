@@ -340,25 +340,6 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("NVFP4 gate/up SwiGLU region is not implemented by this GPU");
     }
 
-    /// Computes the Q4 query/key and Q5 value/gate projections of one GDN layer. The default runs
-    /// the two linear routes; a native implementation may fuse them where that is faster, with
-    /// bitwise identical outputs.
-    public void gdnProjectionsBf16(
-            long input,
-            long q4Weights,
-            long q5Weights,
-            long queryKeyOutput,
-            long valueZOutput,
-            int rows,
-            int hidden,
-            int queryKeyWidth,
-            int valueZWidth,
-            long q4Bytes,
-            long q5Bytes) {
-        linearQ4Bf16(input, q4Weights, queryKeyOutput, rows, hidden, queryKeyWidth, q4Bytes);
-        linearQ5Bf16(input, q5Weights, valueZOutput, rows, hidden, valueZWidth, q5Bytes);
-    }
-
     /// Executes one row-split Q4 projection over BF16 activations.
     public void linearQ4Bf16(
             long inputAddress,
@@ -446,10 +427,6 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("BF16 residual add is not implemented by this GPU");
     }
 
-    /// Greedy selection over `count` BF16 logits at `logitsAddress`: queues a kernel that writes one
-    /// 64-bit key to `resultAddress`, whose low word is `0xFFFFFFFF` minus the host argmax's token ID
-    /// (0 when no logit is selectable). False, with nothing queued, when this GPU cannot select on the
-    /// device.
     /// Copies `rows` contiguous rows of `sourcePitch` bytes to rows `destinationPitch` bytes apart, on the
     /// selected stream.
     public void copyRowsDeviceToDevice(
@@ -467,36 +444,18 @@ public abstract class ExecutionGpu implements GpuMemory {
         return false;
     }
 
+    /// Device bytes of the shared scratch that prefill and verification routes keep allocated between
+    /// launches (expanded P2E2 weights, quantized activations); zero when this GPU keeps none.
+    public long retainedScratchBytes() {
+        return 0;
+    }
+
+    /// Greedy selection over `count` BF16 logits at `logitsAddress`: queues a kernel that writes one
+    /// 64-bit key to `resultAddress`, whose low word is `0xFFFFFFFF` minus the host argmax's token ID
+    /// (0 when no logit is selectable). False, with nothing queued, when this GPU cannot select on the
+    /// device.
     public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
         return false;
-    }
-
-    public void q3FfnStreamedBf16(
-            long input,
-            long gateWeights,
-            long downWeights,
-            long output,
-            long slots,
-            long accumulators,
-            int rows,
-            int hidden,
-            int intermediate,
-            long gateBytes,
-            long downBytes) {
-        throw new UnsupportedOperationException("streamed FFN region is not implemented");
-    }
-
-    /// Consumes the FFN's BF16 activation. Non-CUDA backends retain ordinary Q3 semantics.
-    public void q3FfnDownBf16(
-            long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
-        linearQ3Bf16(input, weights, output, rows, width, outputs, weightBytes);
-    }
-
-    /// Split-K FFN down: `partials` holds FP32 sums of each K split (width * 4 floats per row) before
-    /// one BF16 rounding. Backends without it, and shapes outside its policy, run [#q3FfnDownBf16].
-    public void q3FfnDownSplitBf16(
-            long input, long weights, long output, long partials, int rows, int width, int outputs, long weightBytes) {
-        q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
     }
 
     public void q3GateUpSwiGluBf16(
@@ -504,65 +463,8 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("Q3 gate/up SwiGLU region is not implemented");
     }
 
-    /// Layout-aware forms of the Q3 FFN regions; backends without P2E2 support accept only
-    /// [WeightLayout#ROW_SPLIT_K128_V1].
-    public void q3FfnStreamedBf16(
-            long input,
-            long gateWeights,
-            long downWeights,
-            long output,
-            long slots,
-            long accumulators,
-            int rows,
-            int hidden,
-            int intermediate,
-            long gateBytes,
-            long downBytes,
-            WeightLayout gateLayout,
-            WeightLayout downLayout) {
-        requireRowSplit(gateLayout, "streamed FFN region");
-        requireRowSplit(downLayout, "streamed FFN region");
-        q3FfnStreamedBf16(
-                input,
-                gateWeights,
-                downWeights,
-                output,
-                slots,
-                accumulators,
-                rows,
-                hidden,
-                intermediate,
-                gateBytes,
-                downBytes);
-    }
-
-    public void q3FfnDownBf16(
-            long input,
-            long weights,
-            long output,
-            int rows,
-            int width,
-            int outputs,
-            long weightBytes,
-            WeightLayout layout) {
-        requireRowSplit(layout, "Q3 FFN down");
-        q3FfnDownBf16(input, weights, output, rows, width, outputs, weightBytes);
-    }
-
-    public void q3FfnDownSplitBf16(
-            long input,
-            long weights,
-            long output,
-            long partials,
-            int rows,
-            int width,
-            int outputs,
-            long weightBytes,
-            WeightLayout layout) {
-        requireRowSplit(layout, "Q3 split-K FFN down");
-        q3FfnDownSplitBf16(input, weights, output, partials, rows, width, outputs, weightBytes);
-    }
-
+    /// The paired gate/up projection with SwiGLU in one region: `outputs` weight rows, gate rows first, giving
+    /// outputs / 2 values per row. Backends without P2E2 support accept only [WeightLayout#ROW_SPLIT_K128_V1].
     public void q3GateUpSwiGluBf16(
             long input,
             long weights,

@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model_loader.artifact;
 
+import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -15,6 +16,24 @@ public final class QwenCompactArtifactWriter {
 
     private QwenCompactArtifactWriter() {}
 
+    /// The encoded size of the metadata section for `config`.
+    public static long metadataSize(QwenConfig config) {
+        try {
+            return QwenArtifactCodec.encodeMetadata(config).length;
+        } catch (QwenArtifactFormatException exception) {
+            throw new IllegalArgumentException(exception.getMessage(), exception);
+        }
+    }
+
+    /// The encoded size of the tensor table for `tensors`.
+    public static long tensorTableSize(TensorDescriptor[] tensors) {
+        try {
+            return QwenArtifactCodec.encodeTensorTable(tensors).length;
+        } catch (QwenArtifactFormatException exception) {
+            throw new IllegalArgumentException(exception.getMessage(), exception);
+        }
+    }
+
     public static void write(Path path, QwenArtifact artifact, byte[][] tensorData) throws IOException {
         if (path == null || artifact == null || artifact.header() == null || tensorData == null) {
             throw new QwenArtifactFormatException("compact writer arguments are incomplete");
@@ -27,7 +46,7 @@ public final class QwenCompactArtifactWriter {
             throw new QwenArtifactFormatException("compact payload count does not match descriptors");
         }
         byte[] metadata = QwenArtifactCodec.encodeMetadata(artifact.config());
-        byte[] table = QwenArtifactCodec.encodeCompactTensorTable(tensors);
+        byte[] table = QwenArtifactCodec.encodeTensorTable(tensors);
         long expectedMetadataEnd =
                 QwenArtifactCodec.checkedEnd(QwenArtifactHeader.BYTE_SIZE, metadata.length, "metadata");
         if (artifact.header().metadataOffset() != QwenArtifactHeader.BYTE_SIZE

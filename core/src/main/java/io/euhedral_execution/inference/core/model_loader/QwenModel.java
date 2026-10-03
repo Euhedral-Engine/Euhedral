@@ -9,7 +9,7 @@ import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Set;
 
-/// Owns the device allocations made by model loading, including non-compact artifacts.
+/// Owns the device allocations made by model loading.
 /// The GPU is borrowed and must outlive this model. Close only after all model executions stop.
 public final class QwenModel implements AutoCloseable {
     private final Allocations allocations;

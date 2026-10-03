@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.gpu;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -26,9 +27,8 @@ import org.junit.jupiter.api.Test;
 
 class QwenCompactCudaResidencyIntegrationTest {
 
-    private static final long EXPECTED_OBJECT_COUNT = 1_118;
-    private static final Path DEFAULT_ARTIFACT =
-            Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_compact_q3.edrl");
+    private static final long EXPECTED_OBJECT_COUNT = 771;
+    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_5_27b_q3.edrl");
 
     @Test
     void reportsCudaDeviceMemory() throws Exception {
@@ -48,7 +48,13 @@ class QwenCompactCudaResidencyIntegrationTest {
 
         QwenArtifact artifact = QwenArtifactReader.read(artifactPath);
         assertEquals(QwenArtifactHeader.COMPACT_VERSION, artifact.header().version(), "artifact is not compact EDRL");
-        TensorDescriptor[] descriptors = artifact.tensors();
+        // A base load places the text model on the device: no vision tower, and the MTP layer and draft head
+        // only come with speculative decoding.
+        TensorDescriptor[] descriptors = java.util.Arrays.stream(artifact.tensors())
+                .filter(descriptor -> !descriptor.name().startsWith("vision/")
+                        && !descriptor.name().startsWith("mtp/")
+                        && !descriptor.name().startsWith("text/draft_head"))
+                .toArray(TensorDescriptor[]::new);
         assertEquals(EXPECTED_OBJECT_COUNT, descriptors.length, "compact runtime object inventory changed");
         long expectedDeviceBytes = sumDescriptorBytes(descriptors);
         Set<String> descriptorNames = descriptorNames(descriptors);
@@ -160,7 +166,7 @@ class QwenCompactCudaResidencyIntegrationTest {
         assertNotNull(weights.finalNorm(), "final norm is missing");
         assertNotNull(weights.lmHead(), "output head is missing");
         assertEquals(64, weights.layers().length, "Qwen text layer assembly is incomplete");
-        assertNotNull(weights.mtp(), "MTP weights are missing");
+        assertNull(weights.mtp(), "a base load carries no MTP layer");
         assertEquals(EXPECTED_OBJECT_COUNT, weights.runtimeObjects().size(), "not every object was loaded");
         assertEquals(descriptorNames, weights.runtimeObjects().keySet(), "loaded object names differ from EDRL");
 

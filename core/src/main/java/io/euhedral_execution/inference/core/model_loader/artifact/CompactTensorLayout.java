@@ -95,26 +95,19 @@ public final class CompactTensorLayout {
         if (format == WeightFormat.NVFP4) {
             return Nvfp4Layout.byteSize(shape[0], shape[1]);
         }
-        int bits;
-        int groupSize;
-        switch (format) {
-            case Q3_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16 -> {
-                bits = format == WeightFormat.Q3_G64_FP16
-                        ? 3
-                        : format == WeightFormat.Q4_G64_FP16 ? 4 : format == WeightFormat.Q5_G64_FP16 ? 5 : 6;
-                groupSize = 64;
-            }
-            case W8_G32_FP16 -> {
-                bits = 8;
-                groupSize = 32;
-            }
-            default -> throw new IllegalArgumentException("unsupported row-split format " + format);
-        }
+        int bits =
+                switch (format) {
+                    case Q3_G64_FP16 -> 3;
+                    case Q4_G64_FP16 -> 4;
+                    case Q5_G64_FP16 -> 5;
+                    default -> throw new IllegalArgumentException("unsupported row-split format " + format);
+                };
+        int groupSize = 64;
         long n = shape[0];
         long kPad = alignUp(shape[1], K_ALIGNMENT);
         long groups = kPad / groupSize;
-        long basePerGroup = bits == 3 ? 24 : bits == 8 ? 32 : 32;
-        long highPerGroup = bits <= 4 || bits == 8 ? 0 : bits == 5 ? 8 : 16;
+        long basePerGroup = bits == 3 ? 24 : 32;
+        long highPerGroup = bits <= 4 ? 0 : 8;
         long baseRow = multiply(groups, basePerGroup);
         long highRow = multiply(groups, highPerGroup);
         long baseBytes = multiply(n, baseRow);

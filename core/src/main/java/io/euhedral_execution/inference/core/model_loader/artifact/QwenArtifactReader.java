@@ -9,7 +9,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
-/// Reads and validates version 1 raw and version 2 compact EDRL artifacts.
+/// Reads and validates compact version 2 EDRL artifacts.
 public final class QwenArtifactReader {
 
     private QwenArtifactReader() {}
@@ -56,8 +56,9 @@ public final class QwenArtifactReader {
         if (header.magic() != QwenArtifactHeader.MAGIC) {
             throw new QwenArtifactFormatException("unsupported artifact magic");
         }
-        if (header.version() != QwenArtifactHeader.VERSION && header.version() != QwenArtifactHeader.COMPACT_VERSION) {
-            throw new QwenArtifactFormatException("unsupported artifact version: " + header.version());
+        if (header.version() != QwenArtifactHeader.COMPACT_VERSION) {
+            throw new QwenArtifactFormatException("unsupported artifact version " + header.version()
+                    + ": only compact version " + QwenArtifactHeader.COMPACT_VERSION + " artifacts are supported");
         }
         if (header.tensorCount() < 0 || header.tensorCount() > QwenArtifactCodec.MAX_COUNT) {
             throw new QwenArtifactFormatException("tensor count is outside the supported range");
@@ -112,10 +113,8 @@ public final class QwenArtifactReader {
                     cursor.readInt("tensor data type"), TensorDataType.values(), "tensor data type");
             WeightFormat format = QwenArtifactCodec.enumValue(
                     cursor.readInt("tensor weight format"), WeightFormat.values(), "tensor weight format");
-            WeightLayout layout = header.version() == QwenArtifactHeader.COMPACT_VERSION
-                    ? QwenArtifactCodec.enumValue(
-                            cursor.readInt("tensor weight layout"), WeightLayout.values(), "tensor weight layout")
-                    : null;
+            WeightLayout layout = QwenArtifactCodec.enumValue(
+                    cursor.readInt("tensor weight layout"), WeightLayout.values(), "tensor weight layout");
             long dataOffset = cursor.readLong("tensor data offset");
             long byteSize = cursor.readLong("tensor byte size");
             if (dataOffset < header.tensorDataOffset()) {
@@ -125,19 +124,14 @@ public final class QwenArtifactReader {
             if (dataEnd > fileSize) {
                 throw new QwenArtifactFormatException("tensor data extends beyond the file: " + name);
             }
-            tensors[i] = header.version() == QwenArtifactHeader.COMPACT_VERSION
-                    ? new TensorDescriptor(name, shape, dataType, format, layout, dataOffset, byteSize)
-                    : new TensorDescriptor(name, shape, dataType, format, dataOffset, byteSize);
-            if (header.version() == QwenArtifactHeader.COMPACT_VERSION) {
-                try {
-                    if (!CompactTensorLayout.acceptsByteSize(shape, dataType, format, layout, byteSize)) {
-                        throw new QwenArtifactFormatException(
-                                "compact tensor byte size does not match metadata: " + name);
-                    }
-                } catch (IllegalArgumentException exception) {
-                    throw new QwenArtifactFormatException(
-                            "unsupported compact tensor metadata for '" + name + "': " + exception.getMessage());
+            tensors[i] = new TensorDescriptor(name, shape, dataType, format, layout, dataOffset, byteSize);
+            try {
+                if (!CompactTensorLayout.acceptsByteSize(shape, dataType, format, layout, byteSize)) {
+                    throw new QwenArtifactFormatException("compact tensor byte size does not match metadata: " + name);
                 }
+            } catch (IllegalArgumentException exception) {
+                throw new QwenArtifactFormatException(
+                        "unsupported compact tensor metadata for '" + name + "': " + exception.getMessage());
             }
         }
         if (cursor.position() != header.tensorDataOffset()) {

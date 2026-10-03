@@ -494,9 +494,6 @@ class QwenFullModelCudaIntegrationTest {
             try {
                 for (int rows : new int[] {64, 256, 512, 1024}) {
                     var selected = production.forExecution(QwenExecutionContext.ExecutionKind.PREFILL, rows);
-                    boolean streamed = selected.instructions().stream()
-                            .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.FFN_STREAMED);
-                    assertEquals(rows == 1024, streamed, "streamed FFN qualification M=" + rows);
                     assertTrue(selected.instructions().stream()
                             .anyMatch(i -> i.kind() == QwenExecutionPlan.Kind.ATTENTION_KV_APPEND));
                     int[] tokens = new int[rows];
@@ -508,7 +505,7 @@ class QwenFullModelCudaIntegrationTest {
                     assertEquals(expected.state(), actual.state(), "state M=" + rows);
                     assertArrayEquals(expected.decodeLogits(), actual.decodeLogits(), "decode M=" + rows);
                     assertEquals(expected.decodeState(), actual.decodeState(), "decode state M=" + rows);
-                    System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows + " streamed=" + streamed
+                    System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows
                             + " workspace_bytes=" + actual.workspaceBytes()
                             + " reference_workspace_bytes=" + expected.workspaceBytes());
                 }

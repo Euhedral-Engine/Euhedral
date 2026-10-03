@@ -1,5 +1,5 @@
 #pragma once
-// KV cache append: BF16 K/V rows into NVFP4 cache pages, and the exact BF16 cache append.
+// KV cache append: BF16 K/V rows into NVFP4 cache pages.
 #include "nvfp4_kv.cuh"
 #include "reductions.cuh"
 #include "common/pdl.cuh"
@@ -26,24 +26,4 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_kv_append_n
     __shared__ float scratch[4][256];
     nvfp4kv::quantize_row(queryKey + source, key, key + 128, scratch[warp], lane);
     nvfp4kv::quantize_row(gateValue + source, value, value + 128, scratch[warp], lane);
-}
-
-extern "C" __global__ void euhedral_attention_kv_append_bf16(
-        const __nv_bfloat16* queryKey,
-        const __nv_bfloat16* gateValue,
-        __nv_bfloat16* keyCache,
-        __nv_bfloat16* valueCache,
-        uint32_t rows,
-        uint32_t queryWidth,
-        uint32_t keyValueWidth,
-        uint64_t startPosition) {
-    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const uint64_t count = static_cast<uint64_t>(rows) * keyValueWidth;
-    if (index >= count) return;
-    const uint32_t row = static_cast<uint32_t>(index / keyValueWidth);
-    const uint32_t column = static_cast<uint32_t>(index % keyValueWidth);
-    const uint64_t sourceOffset = static_cast<uint64_t>(row) * (queryWidth + keyValueWidth);
-    const uint64_t destinationOffset = (startPosition + row) * keyValueWidth + column;
-    keyCache[destinationOffset] = queryKey[sourceOffset + queryWidth + column];
-    valueCache[destinationOffset] = gateValue[sourceOffset + queryWidth + column];
 }

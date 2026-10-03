@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDataType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -111,6 +112,12 @@ class TensorDataReaderTest {
 
     private static TensorDescriptor descriptor(long dataOffset, long byteSize) {
         return new TensorDescriptor(
-                "test.tensor", new long[] {4}, TensorDataType.UINT8, WeightFormat.Q4, dataOffset, byteSize);
+                "test.tensor",
+                new long[] {4},
+                TensorDataType.UINT8,
+                WeightFormat.Q4_G64_FP16,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                dataOffset,
+                byteSize);
     }
 }

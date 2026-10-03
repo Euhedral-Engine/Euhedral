@@ -28,16 +28,14 @@ public abstract class QwenStageFrame extends StageFrame {
             case EMBEDDING -> new EmbeddingFrame(graph, instruction, gpu);
             case WEIGHT_TRANSFER -> new WeightTransferFrame(graph, instruction, gpu);
             case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNormFrame(graph, instruction, gpu);
-            case Q3_LINEAR, Q3_FFN_DOWN, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new LinearFrame(graph, instruction, gpu);
+            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new LinearFrame(graph, instruction, gpu);
             case GDN_CONTROL,
                     GDN_CONVOLUTION,
                     GDN_RECURRENCE,
                     GDN_GATED_RMS_NORM,
-                    FFN_STREAMED,
                     Q3_GATE_UP_SWIGLU,
                     RESIDUAL_RMS_NORM,
                     GDN_PROJECT_CONTROL,
-                    GDN_PROJECTIONS,
                     RESIDUAL_ADD,
                     SWIGLU,
                     ATTENTION_QK_NORM_ROPE,

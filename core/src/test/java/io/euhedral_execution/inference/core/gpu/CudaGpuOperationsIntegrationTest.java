@@ -20,80 +20,58 @@ import org.junit.jupiter.api.Test;
 
 class CudaGpuOperationsIntegrationTest {
 
+    /// Shapes a decode kernel takes (K in whole 1024-value slices, 16-row CTAs) run the contiguous kernels,
+    /// within one BF16 step of the scalar reference; every row of a multi-row launch is bit for bit the
+    /// one-row result.
     @Test
-    void specializedQ3PathsMatchReferenceAcrossRowsAndEdgeTiles() throws Throwable {
+    void decodeKernelsMatchReferenceAndMultiRowLaunchesMatchOneRowLaunches() throws Throwable {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            var symbols = java.lang.foreign.SymbolLookup.libraryLookup(library, arena);
-            var descriptor = java.lang.foreign.FunctionDescriptor.of(
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.ADDRESS,
-                    java.lang.foreign.ValueLayout.ADDRESS,
-                    java.lang.foreign.ValueLayout.ADDRESS,
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.JAVA_INT,
-                    java.lang.foreign.ValueLayout.JAVA_LONG);
-            for (String name :
-                    new String[] {"euhedral_cuda_linear_q3_decode_bf16", "euhedral_cuda_linear_q3_prefill_bf16"}) {
-                assertTrue(symbols.find(name).isPresent(), "missing independently callable Q3 path: " + name);
-                var kernel = java.lang.foreign.Linker.nativeLinker()
-                        .downcallHandle(symbols.find(name).orElseThrow(), descriptor);
-                for (int rows : new int[] {1, 2, 4, 17, 32, 33, 256, 512}) {
-                    int width = 192, outputs = 35;
-                    byte[] packed = q3Weights(outputs, width);
-                    short[] input = new short[rows * width];
-                    for (int i = 0; i < input.length; i++) input[i] = floatToBf16((i % 23 - 11) * 0.125f);
-                    long x = upload(gpu, arena, input), w = upload(gpu, arena, packed);
-                    long y = gpu.allocate((long) rows * outputs * Short.BYTES);
-                    try {
-                        gpu.referenceLinearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
-                        short[] expected = download(gpu, arena, y, rows * outputs);
-                        int status = (int) kernel.invokeExact(
-                                MemorySegment.ofAddress(x),
-                                MemorySegment.ofAddress(w),
-                                MemorySegment.ofAddress(y),
-                                rows,
-                                width,
-                                outputs,
-                                (long) packed.length);
-                        assertEquals(0, status, name);
-                        short[] actual = download(gpu, arena, y, rows * outputs);
-                        if (name.contains("decode")) assertArrayEquals(expected, actual);
-                        else assertBf16Equals(expected, actual, 0.02f);
-                    } finally {
-                        gpu.free(y);
-                        gpu.free(w);
-                        gpu.free(x);
+            for (int width : new int[] {1024, 2048}) {
+                int outputs = 48;
+                byte[] packed = q3Weights(outputs, width);
+                int maxRows = 8;
+                short[] input = new short[maxRows * width];
+                for (int i = 0; i < input.length; i++) input[i] = floatToBf16((i % 23 - 11) * 0.125f);
+                long x = upload(gpu, arena, input), w = upload(gpu, arena, packed);
+                long y = gpu.allocate((long) maxRows * outputs * Short.BYTES);
+                try {
+                    short[][] oneRow = new short[maxRows][];
+                    for (int row = 0; row < maxRows; row++) {
+                        gpu.linearQ3Bf16(x + (long) row * width * Short.BYTES, w, y, 1, width, outputs, packed.length);
+                        oneRow[row] = download(gpu, arena, y, outputs);
+                        gpu.referenceLinearQ3Bf16(
+                                x + (long) row * width * Short.BYTES, w, y, 1, width, outputs, packed.length);
+                        assertBf16Equals(download(gpu, arena, y, outputs), oneRow[row], 0.05f);
                     }
+                    for (int rows = 2; rows <= maxRows; rows++) {
+                        gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
+                        short[] actual = download(gpu, arena, y, rows * outputs);
+                        for (int row = 0; row < rows; row++)
+                            assertArrayEquals(
+                                    oneRow[row],
+                                    java.util.Arrays.copyOfRange(actual, row * outputs, (row + 1) * outputs),
+                                    "rows=" + rows + " row=" + row);
+                    }
+                } finally {
+                    gpu.free(y);
+                    gpu.free(w);
+                    gpu.free(x);
                 }
             }
         }
     }
 
+    /// Shapes and row counts no production kernel takes (odd K, partial CTAs, no FP8 route) run the scalar
+    /// reference, so the dispatch answers every shape with the reference's bits.
     @Test
-    void sixtyFourRowQ3PrefillMatchesScalarAtRowAndOutputEdges() throws Throwable {
+    void unqualifiedShapesRunTheScalarReference() throws Throwable {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Arena arena = Arena.ofConfined()) {
-            var symbols = java.lang.foreign.SymbolLookup.libraryLookup(library, arena);
-            var symbol = symbols.find("euhedral_cuda_linear_q3_prefill_64_bf16");
-            assertTrue(symbol.isPresent(), "missing independent 64-row Q3 prefill path");
-            var kernel = java.lang.foreign.Linker.nativeLinker()
-                    .downcallHandle(
-                            symbol.orElseThrow(),
-                            java.lang.foreign.FunctionDescriptor.of(
-                                    java.lang.foreign.ValueLayout.JAVA_INT,
-                                    java.lang.foreign.ValueLayout.ADDRESS,
-                                    java.lang.foreign.ValueLayout.ADDRESS,
-                                    java.lang.foreign.ValueLayout.ADDRESS,
-                                    java.lang.foreign.ValueLayout.JAVA_INT,
-                                    java.lang.foreign.ValueLayout.JAVA_INT,
-                                    java.lang.foreign.ValueLayout.JAVA_INT,
-                                    java.lang.foreign.ValueLayout.JAVA_LONG));
             for (int width : new int[] {65, 192}) {
-                for (int rows : new int[] {31, 33, 63, 64, 65}) {
+                for (int rows : new int[] {1, 2, 9, 33, 65}) {
                     for (int outputs : new int[] {35, 65}) {
                         byte[] packed = q3Weights(outputs, width);
                         short[] input = new short[rows * width];
@@ -103,16 +81,11 @@ class CudaGpuOperationsIntegrationTest {
                         try {
                             gpu.referenceLinearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
                             short[] expected = download(gpu, arena, y, rows * outputs);
-                            int status = (int) kernel.invokeExact(
-                                    MemorySegment.ofAddress(x),
-                                    MemorySegment.ofAddress(w),
-                                    MemorySegment.ofAddress(y),
-                                    rows,
-                                    width,
-                                    outputs,
-                                    (long) packed.length);
-                            assertEquals(0, status, "rows=" + rows + " outputs=" + outputs);
-                            assertBf16Equals(expected, download(gpu, arena, y, rows * outputs), 0.02f);
+                            gpu.linearQ3Bf16(x, w, y, rows, width, outputs, packed.length);
+                            assertArrayEquals(
+                                    expected,
+                                    download(gpu, arena, y, rows * outputs),
+                                    "rows=" + rows + " outputs=" + outputs);
                         } finally {
                             gpu.free(y);
                             gpu.free(w);
@@ -125,11 +98,11 @@ class CudaGpuOperationsIntegrationTest {
     }
 
     @Test
-    void specializedQ3PathsPreserveScaleEdgesAndPartialK() {
+    void q3RoutesPreserveScaleEdges() {
         try (var gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
                 var arena = Arena.ofConfined()) {
-            for (int width : new int[] {65, 192}) {
-                int rows = 33, outputs = 35, groups = ((width + 127) / 128) * 2;
+            for (int width : new int[] {1024, 2048}) {
+                int rows = 33, outputs = 128, groups = ((width + 127) / 128) * 2;
                 byte[] packed = q3Weights(outputs, width);
                 int scaleOffset = (outputs * groups * 24 + 255) & ~255;
                 var scales = ByteBuffer.wrap(packed).order(ByteOrder.LITTLE_ENDIAN);

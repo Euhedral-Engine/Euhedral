@@ -31,9 +31,9 @@ class CompactArtifactTest {
                 0,
                 byteSize);
         QwenConfig config = emptyConfig();
-        long metadataSize = QwenArtifactWriter.metadataSize(config);
+        long metadataSize = QwenCompactArtifactWriter.metadataSize(config);
         long tableOffset = QwenArtifactHeader.BYTE_SIZE + metadataSize;
-        long tableSize = QwenArtifactCodec.encodeCompactTensorTable(new TensorDescriptor[] {descriptor}).length;
+        long tableSize = QwenArtifactCodec.encodeTensorTable(new TensorDescriptor[] {descriptor}).length;
         long dataOffset = tableOffset + tableSize;
         descriptor = new TensorDescriptor(
                 descriptor.name(),
@@ -77,7 +77,7 @@ class CompactArtifactTest {
                 3327);
         assertThrows(
                 QwenArtifactFormatException.class,
-                () -> QwenArtifactCodec.encodeCompactTensorTable(new TensorDescriptor[] {malformed}));
+                () -> QwenArtifactCodec.encodeTensorTable(new TensorDescriptor[] {malformed}));
     }
 
     @Test
@@ -89,39 +89,6 @@ class CompactArtifactTest {
                         TensorDataType.INT32,
                         WeightFormat.Q3_G64_FP16,
                         WeightLayout.ROW_SPLIT_K128_V1));
-    }
-
-    @Test
-    void preservesLegacyV1ArtifactWhenRewritten() throws Exception {
-        QwenConfig config = emptyConfig();
-        long metadataSize = QwenArtifactWriter.metadataSize(config);
-        long tableOffset = QwenArtifactHeader.BYTE_SIZE + metadataSize;
-        TensorDescriptor descriptor =
-                new TensorDescriptor("text/legacy", new long[] {1}, TensorDataType.FP32, WeightFormat.FP32, null, 0, 4);
-        long dataOffset = tableOffset + QwenArtifactWriter.tensorTableSize(new TensorDescriptor[] {descriptor});
-        descriptor = new TensorDescriptor(
-                descriptor.name(), descriptor.shape(), descriptor.dataType(), descriptor.format(), null, dataOffset, 4);
-        QwenArtifact artifact = new QwenArtifact(
-                new QwenArtifactHeader(
-                        QwenArtifactHeader.MAGIC,
-                        QwenArtifactHeader.VERSION,
-                        QwenArtifactHeader.BYTE_SIZE,
-                        metadataSize,
-                        tableOffset,
-                        1,
-                        dataOffset),
-                config,
-                new TensorDescriptor[] {descriptor});
-        Path original = tempDirectory.resolve("legacy-original.edrl");
-        Path rewritten = tempDirectory.resolve("legacy-rewritten.edrl");
-        byte[][] payload = {new byte[] {1, 2, 3, 4}};
-        QwenArtifactWriter.write(original, artifact, payload);
-        QwenArtifact decoded = QwenArtifactReader.read(original);
-        QwenArtifactWriter.write(rewritten, decoded, payload);
-
-        assertEquals(
-                QwenArtifactHeader.VERSION,
-                QwenArtifactReader.read(rewritten).header().version());
     }
 
     private static QwenConfig emptyConfig() {

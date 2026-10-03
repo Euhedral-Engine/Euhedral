@@ -12,8 +12,8 @@
 
 /* Q3 prefill on block-scaled FP8 tensor cores (native/src/q3_mx, docs/PREFILL_MX.md): the BF16 activations are
  * split into two E4M3 terms with a power-of-two block scale (exact for BF16), the Q3 codes are exact E4M3, and the
- * MMA accumulates in FP32 at the full FP8 rate of GeForce Blackwell. Needs an sm_12x device;
- * EUHEDRAL_Q3_MX=0 disables it, exact numerics decline it. */
+ * MMA accumulates in FP32 at the full FP8 rate of GeForce Blackwell. Needs an sm_12x device; exact numerics
+ * and row-exact execution decline it. */
 #ifdef _WIN32
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 #else
@@ -28,8 +28,6 @@ static int init_status = EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
 #define Q3MX_SHARED_BYTES (3u * (3u * 128u * 64u + 128u * 4u))
 
 static void initialize(void) {
-    const char* selected = getenv("EUHEDRAL_Q3_MX");
-    if (selected != NULL && strcmp(selected, "0") == 0) return;
     int status = euhedral_cuda_load_native_kernel((const void*)&once, "q3_mx/kernels.cu", "euhedral_q3mx_quantize", &module, &quantize);
     if (status == EUHEDRAL_CUDA_SUCCESS
             && (cuModuleGetFunction(&linear, module, "euhedral_q3mx_linear_128x128") != CUDA_SUCCESS

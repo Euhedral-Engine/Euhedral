@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core.gpu;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
@@ -18,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-/// The NVFP4 artifact (tools/convert_qwen_safetensors_to_compact_edrl.py --profile nvfp4): the text and
+/// The NVFP4 artifact (tools/euhedral_artifacts/nvfp4.py): the text and
 /// MTP inventory without the vision tower, NVFP4 projections and a Q3 embedding, loads onto the GPU
 /// with exactly its payload resident. Skipped unless -Peuhedral.qwen.nvfp4-artifact names an artifact.
 class QwenNvfp4CudaLoadIntegrationTest {
@@ -35,7 +34,9 @@ class QwenNvfp4CudaLoadIntegrationTest {
                 Arrays.stream(artifact.tensors())
                         .filter(t -> t.name().startsWith("vision/"))
                         .count());
+        // The MTP layer and draft head are speculative decoding's, loaded with it; this load is the base model.
         long payload = Arrays.stream(artifact.tensors())
+                .filter(t -> !t.name().startsWith("mtp/") && !t.name().startsWith("text/draft_head"))
                 .mapToLong(TensorDescriptor::byteSize)
                 .sum();
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
@@ -49,8 +50,6 @@ class QwenNvfp4CudaLoadIntegrationTest {
                 assertEquals(WeightFormat.NVFP4, ffn.gateUp().format());
                 assertEquals(WeightFormat.NVFP4, ffn.down().format());
             }
-            assertNotNull(weights.mtp());
-            assertEquals(WeightFormat.NVFP4, weights.mtp().projection().format());
             var memory = gpu.deviceMemoryInfo();
             System.out.println("NVFP4_LOAD PASS objects=785 resident_bytes=" + gpu.allocatedBytes()
                     + " device_free_bytes=" + memory.freeBytes() + " device_total_bytes=" + memory.totalBytes());

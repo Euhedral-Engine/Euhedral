@@ -13,7 +13,7 @@ try:
 except ImportError:
     np = None
 
-from test_q3_primitives import Gpu, NVRTC, CUDA, SKIP_REASON, P
+from gpu_harness import Gpu, NVRTC, CUDA, SKIP_REASON, P
 from test_nvfp4_native import ARCH, UNAVAILABLE, e4m3
 from test_attention_nvfp4 import bf16
 
@@ -135,7 +135,7 @@ class Q3MxTest(unittest.TestCase):
         return got, y, x
 
     def test_linear_matches_float64(self):
-        for rows, n, k in [(128, 128, 128), (200, 256, 384), (37, 384, 256), (512, 128, 1024)]:
+        for rows, n, k in [(128, 128, 128), (200, 256, 384), (37, 384, 256), (512, 128, 1024), (9, 128, 128), (15, 256, 384)]:
             with self.subTest(rows=rows, n=n, k=k):
                 got, y, _ = self.run_gemm(False, rows, n, k)
                 # FP32 accumulation of exact products, then BF16 output rounding (2^-9).
@@ -145,7 +145,7 @@ class Q3MxTest(unittest.TestCase):
     def test_q4_and_q5_linears_match_float64(self):
         gpu, rng = self.gpu, self.rng
         for bits in (4, 5):
-            for rows, n, k in [(128, 128, 128), (200, 256, 384), (37, 384, 256)]:
+            for rows, n, k in [(128, 128, 128), (200, 256, 384), (37, 384, 256), (9, 128, 256), (15, 128, 128)]:
                 with self.subTest(bits=bits, rows=rows, n=n, k=k):
                     low, high = -(1 << (bits - 1)), (1 << (bits - 1))
                     codes = rng.integers(low, high, (n, k)).astype(np.int8)

@@ -6,7 +6,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 
 /// Row-split geometry of [io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat#NVFP4]
-/// tensors (tools/convert_qwen_safetensors_to_compact_edrl.py, `--profile nvfp4`). Rows of K values, K
+/// tensors (tools/euhedral_artifacts/nvfp4.py). Rows of K values, K
 /// padded to a multiple of 128:
 ///
 /// - code plane at 0: E2M1 codes, two per byte, the even K in the low nibble (K/2 bytes per row);
