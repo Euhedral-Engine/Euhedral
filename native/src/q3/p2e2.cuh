@@ -104,46 +104,57 @@ static __device__ __forceinline__ float2 pair(const char* table, unsigned int wo
     return *reinterpret_cast<const float2*>(table + mad_u32(wa, 128u, nibble_offset<I>(word)));
 }
 
-template<int I>
+// Accumulates M activation rows against one decoded lane-row: row t's chain is the one-row chain
+// (pairs in order, x[2i] then x[2i + 1]), so each row is bit for bit what a one-row decode computes.
+template<int M, int I>
 struct Dot {
-    static __device__ __forceinline__ float run(const char* table, const float (&x)[32], uint2 p, unsigned int bx,
-            unsigned int by, unsigned int xl, unsigned int xh, unsigned int yl, unsigned int yh, float sum) {
+    static __device__ __forceinline__ void run(const char* table, const float (&x)[M][32], uint2 p, unsigned int bx,
+            unsigned int by, unsigned int xl, unsigned int xh, unsigned int yl, unsigned int yh, float (&sum)[M]) {
         const float2 f = I < 8 ? pair<I>(table, p.x, bx, xl, xh) : pair<I>(table, p.y, by, yl, yh);
-        sum = fmaf(x[2 * I], f.x, sum);
-        sum = fmaf(x[2 * I + 1], f.y, sum);
-        return Dot<I + 1>::run(table, x, p, bx, by, xl, xh, yl, yh, sum);
+        #pragma unroll
+        for (int t = 0; t < M; t++) {
+            sum[t] = fmaf(x[t][2 * I], f.x, sum[t]);
+            sum[t] = fmaf(x[t][2 * I + 1], f.y, sum[t]);
+        }
+        Dot<M, I + 1>::run(table, x, p, bx, by, xl, xh, yl, yh, sum);
     }
 };
-template<>
-struct Dot<16> {
-    static __device__ __forceinline__ float run(const char*, const float (&)[32], uint2, unsigned int, unsigned int,
-            unsigned int, unsigned int, unsigned int, unsigned int, float sum) { return sum; }
+template<int M>
+struct Dot<M, 16> {
+    static __device__ __forceinline__ void run(const char*, const float (&)[M][32], uint2, unsigned int, unsigned int,
+            unsigned int, unsigned int, unsigned int, unsigned int, float (&)[M]) {}
 };
 
 // Any lane-row: units consumed one BIG code at a time from a 64-bit window (up to 32 units).
-template<int I>
+template<int M, int I>
 struct DotAny {
-    static __device__ __forceinline__ float run(const Table& table, const float (&x)[32], uint2 p, unsigned long long q,
-            unsigned int used, float sum) {
+    static __device__ __forceinline__ void run(const Table& table, const float (&x)[M][32], uint2 p,
+            unsigned long long q, unsigned int used, float (&sum)[M]) {
         const unsigned int word = I < 8 ? p.x : p.y, nib = (word >> (4 * (I & 7))) & 15u;
         unsigned int wa = 0;
         if ((nib & 3u) == 3u) wa |= (unsigned int)(q >> (2 * used++)) & 3u;
         if ((nib >> 2) == 3u) wa |= ((unsigned int)(q >> (2 * used++)) & 3u) << 2;
         const float2 f = table.pair[nib | wa << 4];
-        sum = fmaf(x[2 * I], f.x, sum);
-        sum = fmaf(x[2 * I + 1], f.y, sum);
-        return DotAny<I + 1>::run(table, x, p, q, used, sum);
+        #pragma unroll
+        for (int t = 0; t < M; t++) {
+            sum[t] = fmaf(x[t][2 * I], f.x, sum[t]);
+            sum[t] = fmaf(x[t][2 * I + 1], f.y, sum[t]);
+        }
+        DotAny<M, I + 1>::run(table, x, p, q, used, sum);
     }
 };
-template<>
-struct DotAny<16> {
-    static __device__ __forceinline__ float run(const Table&, const float (&)[32], uint2, unsigned long long,
-            unsigned int, float sum) { return sum; }
+template<int M>
+struct DotAny<M, 16> {
+    static __device__ __forceinline__ void run(const Table&, const float (&)[M][32], uint2, unsigned long long,
+            unsigned int, float (&)[M]) {}
 };
 }  // namespace decode
 
-// Requirements (checked by host dispatch): one row, in_features a multiple of 1024, out_features a
-// multiple of 4 * kRows, a 16-byte aligned input and a 16-byte aligned tensor.
+// M activation rows (1 to 4) against each weight row. Row t of the output is bit for bit what the contiguous
+// one-row kernel gives for it alone: the weights are decoded once and every row runs the same FMA chain.
+// Requirements (checked by host dispatch): in_features a multiple of 1024, out_features a multiple of
+// 4 * kRows, a 16-byte aligned input and a 16-byte aligned tensor.
+template<int M>
 static __device__ __forceinline__ void p2e2_decode(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int in_features, unsigned int out_features) {
@@ -158,7 +169,7 @@ static __device__ __forceinline__ void p2e2_decode(
     const unsigned int slices = in_features / kSlice;
     const uint2* primary = reinterpret_cast<const uint2*>(w.primary + (unsigned long long)first_row * w.words) + lane;
     const unsigned short* scale_rows = w.scales + (unsigned long long)first_row * w.groups + (lane >> 1);
-    float sums[kRows] = {};
+    float sums[M][kRows] = {};
     euhedral_pdl_begin();
     unsigned int base[kRows];
     #pragma unroll
@@ -173,16 +184,20 @@ static __device__ __forceinline__ void p2e2_decode(
             sc[r] = __half2float(__ushort_as_half(scale_rows[(unsigned long long)r * w.groups + slice * 16u]));
             window[r] = w.payload[(base[r] >> 4) + lane];
         }
-        float x[32];
-        const uint4* activation = reinterpret_cast<const uint4*>(input + slice * kSlice + 32u * lane);
+        float x[M][32];
         #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const uint4 v = activation[i];
-            const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+        for (int t = 0; t < M; t++) {
+            const uint4* activation = reinterpret_cast<const uint4*>(
+                    input + (unsigned long long)t * in_features + slice * kSlice + 32u * lane);
             #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
-                x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = activation[i];
+                const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    x[t][i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
+                    x[t][i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+                }
             }
         }
         unsigned int bx[kRows], by[kRows], cx[kRows], count[kRows], before[kRows], total[kRows];
@@ -224,8 +239,10 @@ static __device__ __forceinline__ void p2e2_decode(
             for (int r = 0; r < kRows; r++) {
                 const unsigned int sy = 2u * cx[r];
                 const unsigned int yl = __funnelshift_rc(lo[r], hi[r], sy), yh = sy >= 32u ? 0u : hi[r] >> sy;
-                const float dot = Dot<0>::run(table_bytes, x, prim[r], bx[r], by[r], lo[r], hi[r], yl, yh, 0.0f);
-                sums[r] = fmaf(dot, sc[r], sums[r]);
+                float dot[M] = {};
+                Dot<M, 0>::run(table_bytes, x, prim[r], bx[r], by[r], lo[r], hi[r], yl, yh, dot);
+                #pragma unroll
+                for (int t = 0; t < M; t++) sums[t][r] = fmaf(dot[t], sc[r], sums[t][r]);
             }
         } else {
             // A lane with more than 16 BIG codes, or a slice whose units outrun the 32 prefetched words.
@@ -236,22 +253,29 @@ static __device__ __forceinline__ void p2e2_decode(
                 const unsigned int shift = (unit & 15u) * 2u;
                 const unsigned long long window64 = (unsigned long long)__funnelshift_r(q[1], q[2], shift) << 32
                         | __funnelshift_r(q[0], q[1], shift);
-                const float dot = DotAny<0>::run(table, x, prim[r], window64, 0u, 0.0f);
-                sums[r] = fmaf(dot, sc[r], sums[r]);
+                float dot[M] = {};
+                DotAny<M, 0>::run(table, x, prim[r], window64, 0u, dot);
+                #pragma unroll
+                for (int t = 0; t < M; t++) sums[t][r] = fmaf(dot[t], sc[r], sums[t][r]);
             }
         }
         #pragma unroll
         for (int r = 0; r < kRows; r++) base[r] += total[r];
     }
     #pragma unroll
-    for (int r = 0; r < kRows; r++) {
+    for (int t = 0; t < M; t++) {
         #pragma unroll
-        for (int distance = 16; distance; distance >>= 1) sums[r] += __shfl_xor_sync(0xffffffffu, sums[r], distance);
+        for (int r = 0; r < kRows; r++) {
+            #pragma unroll
+            for (int distance = 16; distance; distance >>= 1)
+                sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], distance);
+        }
+        float mine = sums[t][0];
+        #pragma unroll
+        for (int r = 1; r < kRows; r++) mine = lane == (unsigned int)r ? sums[t][r] : mine;
+        if (lane < (unsigned int)kRows)
+            write_bf16(output + (unsigned long long)t * out_features, 0, first_row + lane, out_features, mine);
     }
-    float mine = sums[0];
-    #pragma unroll
-    for (int r = 1; r < kRows; r++) mine = lane == (unsigned int)r ? sums[r] : mine;
-    if (lane < (unsigned int)kRows) write_bf16(output, 0, first_row + lane, out_features, mine);
 }
 
 // ---------------------------------------------------------------------------------------------------

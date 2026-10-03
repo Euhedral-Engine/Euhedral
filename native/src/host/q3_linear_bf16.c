@@ -24,7 +24,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction decode_one, decode_rows[EUHEDRAL_DECODE_MAX_ROWS + 1];  /* [M]: 2..8 rows */
-static CUfunction p2e2_decode, p2e2_expand;
+static CUfunction p2e2_decode_rows[5], p2e2_expand;  /* [M]: 1..4 rows */
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static int get_function(CUfunction* function, const char* name) {
@@ -40,12 +40,17 @@ static void initialize(void) {
         if (get_function(&decode_rows[m], name) != EUHEDRAL_CUDA_SUCCESS) init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
         euhedral_cuda_pdl_register(decode_rows[m]);
     }
-    if (get_function(&p2e2_decode, "euhedral_q3_p2e2_decode") != EUHEDRAL_CUDA_SUCCESS
+    if (get_function(&p2e2_decode_rows[1], "euhedral_q3_p2e2_decode") != EUHEDRAL_CUDA_SUCCESS
             || get_function(&p2e2_expand, "euhedral_q3_p2e2_expand") != EUHEDRAL_CUDA_SUCCESS)
         init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    for (unsigned int m = 2; m <= 4; m++) {
+        char name[48];
+        snprintf(name, sizeof(name), "euhedral_q3_p2e2_decode_rows%u", m);
+        if (get_function(&p2e2_decode_rows[m], name) != EUHEDRAL_CUDA_SUCCESS) init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    }
     // The decode kernels begin with euhedral_pdl_begin() (see cuda_kernel_loader.h).
     euhedral_cuda_pdl_register(decode_one);
-    euhedral_cuda_pdl_register(p2e2_decode);
+    for (unsigned int m = 1; m <= 4; m++) euhedral_cuda_pdl_register(p2e2_decode_rows[m]);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -113,16 +118,25 @@ int euhedral_cuda_linear_q3_p2e2_decode_bf16(const void* input, const void* weig
     if (context_status != EUHEDRAL_CUDA_SUCCESS) return context_status;
     int status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    // The fused route reproduces euhedral_q3_decode_contiguous only; every other route expands.
-    if (euhedral_cuda_exact_numerics() || rows != 1u || ((uintptr_t)input & 15u) != 0u
+    // The fused route reproduces the contiguous decode kernels, which serve 1 to 8 rows; every other route expands.
+    if (euhedral_cuda_exact_numerics() || rows > EUHEDRAL_DECODE_MAX_ROWS || ((uintptr_t)input & 15u) != 0u
             || ((uintptr_t)weights & 15u) != 0u || !euhedral_q3_decode_shape(in_features, out_features))
         return EUHEDRAL_CUDA_ROUTE_UNAVAILABLE;
-    CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
-    CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
-    unsigned int in_arg = in_features, out_arg = out_features;
-    void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
-    return finish_launch(euhedral_launch_kernel(p2e2_decode, out_features / 16u, 1, 1, 128, 1, 1, 0,
-            euhedral_cuda_submission_stream(), params, NULL));
+    /* Up to four rows per launch; each row is the one-row result whichever launch computes it. */
+    for (uint32_t first = 0; first < rows; first += 4u) {
+        uint32_t count = rows - first < 4u ? rows - first : 4u;
+        CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input + (CUdeviceptr)first * in_features * 2u;
+        CUdeviceptr weights_ptr = (CUdeviceptr)(uintptr_t)weights;
+        CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output + (CUdeviceptr)first * out_features * 2u;
+        unsigned int in_arg = in_features, out_arg = out_features;
+        void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
+        CUresult result = euhedral_launch_kernel(p2e2_decode_rows[count], out_features / 16u, 1, 1, 128, 1, 1, 0,
+                euhedral_cuda_submission_stream(), params, NULL);
+        if (result != CUDA_SUCCESS) return (int)result;
+    }
+    if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
+    cudaError_t sync = cudaDeviceSynchronize();
+    return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
 }
 
 int euhedral_cuda_q3_p2e2_expand(const void* weights, uint64_t weights_byte_size, uint32_t rows,
