@@ -8,15 +8,16 @@ needs beyond the free device memory; staging covers the rest ([NVFP4_RESIDENCY.m
   table of 16 E4M3 codes. Its teacher-forced NLL equals plain NVFP4's within noise. The drafting stack (MTP layer, draft head)
   stays plain NVFP4.
 
-**Result:** the compressed artifact runs 64K-token contexts with MTP3 speculative decoding at 47-48 tok/s, with prefill of a
-63K-token prompt in about 50 s. Measured end to end, 256 generated tokens, MTP3, chat corpus, one fork per context, with the host
-memory each context needed set by hand (the engine now plans it, see below):
+**Result:** the compressed artifact runs 64K-token contexts with MTP3 speculative decoding at 62 tok/s, with prefill of a
+59K-token prompt in 38.5 s. Measured end to end on the engine's own residency plan, 128 generated tokens, chat corpus, after one
+warmup, with `max-context-tokens` 32768 (4K to 32K) and 65536:
 
-| Context | Decode | Verification | Time to first token |
+| Prompt | Prefill | Decode | Time to first token |
 |---|---|---|---|
-| 16K | 84.3 tok/s | 29.8 ms | 8.3 s |
-| 32K | 68.0 tok/s | 36.5 ms | 20.2 s |
-| 64K | 47.8 tok/s | 52.2 ms | 53.1 s |
+| 4K (3,964 tokens) | 2,420 tok/s | 97.6 tok/s | 1.73 s |
+| 16K (15,930) | 2,158 tok/s | 91.4 tok/s | 7.66 s |
+| 32K (31,906) | 1,932 tok/s | 82.3 tok/s | 16.9 s |
+| 64K (59,111) | 1,613 tok/s | 61.9 tok/s | 38.5 s |
 
 With the embedding read in place, plain NVFP4 stages 1.65 GiB of projections per step at 64K and verification is long enough to
 hide it, so SD4's value at 64K is memory: about 0.9 GiB less host memory for the same context. That margin matters, because

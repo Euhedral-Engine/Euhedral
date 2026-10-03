@@ -1,0 +1,11 @@
+{
+  "artifact": "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl",
+  "tokenizer": "/mnt/shared/qwen38-quant/source/qwen",
+  "cudaLibrary": "build/native/linux-x64/lib/libeuhedral_cuda.so",
+  "promptCorpus": "chat",
+  "scenarios": ["prompt-to-n:4096:128", "prompt-to-n:16384:128", "prompt-to-n:32000:128"],
+  "warmup": 1,
+  "iterations": 1,
+  "gpuMemory": true,
+  "output": "benchmark-results/context.jsonl"
+}
