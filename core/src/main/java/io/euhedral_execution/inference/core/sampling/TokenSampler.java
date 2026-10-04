@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.sampling;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.SplittableRandom;
+import java.util.function.IntPredicate;
 
 /// Selects one token from a single vocabulary-logit row using a generation-local random stream.
 /// Create one sampler per generation; instances are not thread-safe and must not be shared concurrently.
@@ -11,6 +12,8 @@ import java.util.SplittableRandom;
 /// Selection runs once per generated token on the host-serial token boundary, so each row is scanned
 /// once, and stochastic sampling reuses this generation's scratch rows instead of allocating them.
 public final class TokenSampler {
+    /// Fewest best candidates a constrained selection ranks before it tests them.
+    static final int MIN_RANKED = 64;
 
     private final GenerationConfig config;
     private final int vocabularySize;
@@ -18,6 +21,7 @@ public final class TokenSampler {
     private double[] scaledScores;
     private int[] candidateIds;
     private double[] probabilities;
+    private int[] ranked;
 
     public TokenSampler(GenerationConfig config, int vocabularySize) {
         this.config = Objects.requireNonNull(config, "config");
@@ -45,11 +49,7 @@ public final class TokenSampler {
 
         // Scale scores before applying the filters; top-k ties prefer the lower token ID. Only the
         // candidates' entries of the reused score row are written and read.
-        if (this.scaledScores == null) {
-            this.scaledScores = new double[this.vocabularySize];
-            this.candidateIds = new int[this.vocabularySize];
-            this.probabilities = new double[this.vocabularySize];
-        }
+        ensureScratch();
         double[] scaledScores = this.scaledScores;
         int[] candidateIds = this.candidateIds;
         int topK = this.config.topK();
@@ -58,8 +58,63 @@ public final class TokenSampler {
                 : scaleAll(logits, scaledScores, candidateIds);
         if (candidateCount == 0) throw new IllegalArgumentException("logit row has no selectable token");
 
+        return drawFrom(candidateIds, candidateCount, this.config.topP() < 1.0f);
+    }
+
+    /// Selects as [#selectToken(float[])] would from the row with every token `allowed` rejects removed, testing
+    /// as few tokens as it can: the best candidates are tested in order until enough are allowed (one for a
+    /// greedy selection, `topK` when sampling), and every token only when they are not, in which case the
+    /// disallowed entries of `logits` are overwritten with negative infinity.
+    ///
+    /// A greedy selection, and sampling with top-p below one, select exactly what the masked row selects. With
+    /// top-p at one the same candidates and probabilities are drawn in priority order rather than in the
+    /// masked row's heap order, so a seed may select another token of the same distribution.
+    public int selectToken(float[] logits, IntPredicate allowed) {
+        Objects.requireNonNull(logits, "logits");
+        Objects.requireNonNull(allowed, "allowed");
+        if (logits.length != this.vocabularySize) {
+            throw new IllegalArgumentException(
+                    "expected " + this.vocabularySize + " vocabulary logits, got " + logits.length);
+        }
+        int topK = this.config.topK();
+        int needed = greedy() ? 1 : topK > 0 && topK < this.vocabularySize ? topK : 0;
+        if (needed > 0) {
+            int limit = Math.min(this.vocabularySize, Math.max(MIN_RANKED, needed * 4));
+            if (this.ranked == null || this.ranked.length < limit) this.ranked = new int[limit];
+            int[] candidates = this.ranked;
+            int rankedCount = rankBest(logits, limit, candidates);
+            int found = 0;
+            for (int index = 0; index < rankedCount && found < needed; index++)
+                if (allowed.test(candidates[index])) candidates[found++] = candidates[index];
+            // Every selectable token was ranked when fewer than the limit exist, so the allowed ones are all found.
+            if (found == needed || (rankedCount < limit && found > 0)) {
+                if (greedy()) return candidates[0];
+                ensureScratch();
+                for (int index = 0; index < found; index++)
+                    this.scaledScores[candidates[index]] =
+                            (double) logits[candidates[index]] / this.config.temperature();
+                // Ranked order is priority order, which a top-p sort keeps.
+                System.arraycopy(candidates, 0, this.candidateIds, 0, found);
+                return drawFrom(this.candidateIds, found, this.config.topP() < 1.0f);
+            }
+        }
+        for (int tokenId = 0; tokenId < logits.length; tokenId++)
+            if (!allowed.test(tokenId)) logits[tokenId] = Float.NEGATIVE_INFINITY;
+        return selectToken(logits);
+    }
+
+    private void ensureScratch() {
+        if (this.scaledScores == null) {
+            this.scaledScores = new double[this.vocabularySize];
+            this.candidateIds = new int[this.vocabularySize];
+            this.probabilities = new double[this.vocabularySize];
+        }
+    }
+
+    /// Normalizes the candidates' scaled scores, keeps the top-p prefix when `applyTopP`, and draws.
+    private int drawFrom(int[] candidateIds, int candidateCount, boolean applyTopP) {
+        double[] scaledScores = this.scaledScores;
         // Top-p uses the normalized top-k distribution, and draw renormalizes the retained prefix.
-        boolean applyTopP = this.config.topP() < 1.0f;
         if (applyTopP) sortByPriority(candidateIds, candidateCount, scaledScores);
 
         double[] probabilities =
@@ -77,6 +132,55 @@ public final class TokenSampler {
         }
 
         return draw(candidateIds, probabilities, retainedCount);
+    }
+
+    /// Writes the `limit` best selectable tokens to `ranked`, best first (higher logit, then lower token ID),
+    /// and returns how many there are: fewer than `limit` only when the row has fewer selectable tokens.
+    private static int rankBest(float[] logits, int limit, int[] ranked) {
+        int size = 0;
+        for (int tokenId = 0; tokenId < logits.length; tokenId++) {
+            float logit = logits[tokenId];
+            if (Float.isNaN(logit) || logit == Float.NEGATIVE_INFINITY) continue;
+            if (size < limit) {
+                ranked[size] = tokenId;
+                siftUpRanked(ranked, size++, logits);
+            } else if (logit > logits[ranked[0]]) {
+                // A later token with an equal logit has the higher ID and ranks lower: it never enters.
+                ranked[0] = tokenId;
+                siftDownRanked(ranked, size, 0, logits);
+            }
+        }
+        for (int end = size - 1; end > 0; end--) {
+            swap(ranked, 0, end);
+            siftDownRanked(ranked, end, 0, logits);
+        }
+        return size;
+    }
+
+    /// Worst-first order of the ranking heap: a lower logit, or an equal logit and a higher ID, is worse.
+    private static boolean ranksBelow(int left, int right, float[] logits) {
+        return logits[left] < logits[right] || (logits[left] == logits[right] && left > right);
+    }
+
+    private static void siftUpRanked(int[] heap, int index, float[] logits) {
+        while (index > 0) {
+            int parent = (index - 1) >>> 1;
+            if (!ranksBelow(heap[index], heap[parent], logits)) return;
+            swap(heap, parent, index);
+            index = parent;
+        }
+    }
+
+    private static void siftDownRanked(int[] heap, int size, int index, float[] logits) {
+        while (true) {
+            int left = (index << 1) + 1;
+            if (left >= size) return;
+            int right = left + 1;
+            int worse = right < size && ranksBelow(heap[right], heap[left], logits) ? right : left;
+            if (!ranksBelow(heap[worse], heap[index], logits)) return;
+            swap(heap, index, worse);
+            index = worse;
+        }
     }
 
     /// One comparison per logit. NaN never compares greater, negative infinity never beats the initial

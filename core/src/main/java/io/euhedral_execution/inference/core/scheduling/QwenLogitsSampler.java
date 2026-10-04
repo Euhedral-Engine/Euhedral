@@ -70,16 +70,12 @@ public final class QwenLogitsSampler {
         }
     }
 
-    /// Converts a BF16 row exactly to FP32 in the reusable scratch row, masking disallowed tokens.
+    /// Converts a BF16 row exactly to FP32 in the reusable scratch row; a constraint is tested only on the
+    /// candidates selection needs ([TokenSampler#selectToken(float[], IntPredicate)]).
     private int select(MemorySegment row, IntPredicate allowed) {
         float[] hostLogits = this.scratch;
         convertBf16(row, hostLogits);
-        if (allowed != null) {
-            for (int tokenId = 0; tokenId < hostLogits.length; tokenId++) {
-                if (!allowed.test(tokenId)) hostLogits[tokenId] = Float.NEGATIVE_INFINITY;
-            }
-        }
-        return this.sampler.selectToken(hostLogits);
+        return allowed == null ? this.sampler.selectToken(hostLogits) : this.sampler.selectToken(hostLogits, allowed);
     }
 
     /// BF16 is the upper half of FP32, so each value converts exactly by a shift. The row is read two
