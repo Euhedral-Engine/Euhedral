@@ -251,6 +251,34 @@ class ResponsesApiTest {
     }
 
     @Test
+    void aConversationRendersAsTheEquivalentChatCompletionAndEncodesOnce() throws Exception {
+        this.backend.emptyReasoning = true;
+        int encoded = this.backend.encoded.get();
+        post(
+                200,
+                "{\"model\":\"" + MODEL + "\",\"instructions\":\"Be brief.\",\"input\":[{\"role\":\"user\","
+                        + "\"content\":\"a\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":"
+                        + "\"output_text\",\"text\":\"b\"}]},{\"role\":\"user\",\"content\":\"c\"}]}");
+        assertEquals(encoded + 1, this.backend.encoded.get(), "a request's prompt is encoded once");
+        String responses = this.backend.only().prompt;
+        this.backend.generations.clear();
+        try (var client = HttpClient.newHttpClient()) {
+            var chat = client.send(
+                    HttpRequest.newBuilder(URI.create("http://localhost:" + this.port + "/v1/chat/completions"))
+                            .header("Content-Type", "application/json")
+                            .POST(
+                                    HttpRequest.BodyPublishers.ofString(
+                                            "{\"model\":\"" + MODEL + "\",\"messages\":["
+                                                    + "{\"role\":\"system\",\"content\":\"Be brief.\"},{\"role\":\"user\",\"content\":\"a\"},"
+                                                    + "{\"role\":\"assistant\",\"content\":\"b\"},{\"role\":\"user\",\"content\":\"c\"}]}"))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, chat.statusCode(), chat.body());
+        }
+        assertEquals(responses, this.backend.only().prompt, "the two surfaces share cached prefixes");
+    }
+
+    @Test
     void developerMessagesJoinTheInstructions() throws Exception {
         this.backend.emptyReasoning = true;
         post(

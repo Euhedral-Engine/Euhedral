@@ -48,6 +48,7 @@ class AnthropicMessagesTest {
 
     @Test
     void aMessageWithASystemPromptRendersLikeTheEquivalentChatCompletion() throws Exception {
+        int encoded = this.backend.encoded.get();
         JsonNode message = post(
                 200,
                 "/v1/messages",
@@ -58,6 +59,7 @@ class AnthropicMessagesTest {
         assertTrue(message.get("id").asString().startsWith("msg_"));
         assertEquals(MODEL, message.get("model").asString());
         assertEquals("Hello, world", message.at("/content/0/text").asString());
+        assertEquals(encoded + 1, this.backend.encoded.get(), "a request's prompt is encoded once");
         assertEquals(1, message.get("content").size());
         assertEquals("end_turn", message.get("stop_reason").asString());
         assertTrue(message.get("stop_sequence").isNull());
