@@ -69,10 +69,14 @@ public final class PrefixTree {
         for (PrefixNode node : match.chain()) node.pins--;
     }
 
-    /// The published child of `parent` whose span `[parent.position, position)` equals `tokens`, or null.
-    public synchronized PrefixNode find(PrefixNode parent, int[] tokens, int position) {
+    /// The published child of `parent` whose span `[parent.position, position)` equals `tokens` and whose MTP
+    /// state matches `mtp`, or null. A span can be stored once with MTP state and once without.
+    public synchronized PrefixNode find(PrefixNode parent, int[] tokens, int position, boolean mtp) {
         for (PrefixNode child : parent.children)
-            if (child.position() == position && position <= tokens.length && matches(child, tokens)) {
+            if (child.position() == position
+                    && child.hasMtp() == mtp
+                    && position <= tokens.length
+                    && matches(child, tokens)) {
                 child.lastUse = ++this.clock;
                 return child;
             }

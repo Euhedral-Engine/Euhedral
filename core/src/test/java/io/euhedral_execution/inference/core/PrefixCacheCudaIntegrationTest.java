@@ -29,10 +29,13 @@ class PrefixCacheCudaIntegrationTest {
     private static final int INTERVAL = 2048;
 
     private static InferenceConfig config(long cacheBytes) {
+        return config("euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl", cacheBytes);
+    }
+
+    private static InferenceConfig config(String artifactProperty, String artifactDefault, long cacheBytes) {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)));
-        Path artifact = Path.of(
-                System.getProperty("euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl"));
+        Path artifact = Path.of(System.getProperty(artifactProperty, artifactDefault));
         Path tokenizer =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         assumeTrue(Files.isRegularFile(artifact) && Files.isRegularFile(tokenizer.resolve("tokenizer.json")));
@@ -165,6 +168,44 @@ class PrefixCacheCudaIntegrationTest {
             long hits = stats.hits();
             generate(engine, last, 4, 1);
             assertEquals(hits + 1, engine.prefixCacheStats().hits(), "the newest prompt is still stored");
+        }
+    }
+
+    @Test
+    @Timeout(3600)
+    void aSpeculativePromptRestoresThroughMtpCheckpointsAndGeneratesTheSameTokens() throws Exception {
+        String property = "euhedral.qwen.nvfp4-artifact";
+        String artifact = "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl";
+        int[] diverging;
+        List<Integer> restored;
+        try (InferenceEngine engine =
+                InferenceEngine.load(config(property, artifact, CACHE_BYTES), new RecordingBootstrap())) {
+            assumeTrue(
+                    engine.profile() != null && engine.profile().speculative(), "needs an artifact with the MTP layer");
+            // Greedy and unconstrained: the engine drafts with MTP. The cold run stores MTP checkpoints at 2048,
+            // 4096 and 4608; the warm run restores 4608, re-pairs its last MTP row and prefills the rest.
+            int[] prompt = prompt(engine, "Kilo", 5000);
+            List<Integer> cold = greedy(engine, prompt, 48);
+            assertEquals(3, engine.prefixCacheStats().captured());
+            List<Integer> warm = greedy(engine, prompt, 48);
+            assertEquals(cold, warm);
+            assertEquals(1, engine.prefixCacheStats().hits());
+            assertEquals(4608, engine.prefixCacheStats().reusedTokens());
+            // A prompt that diverges after 4200 tokens restores the node at 4096.
+            diverging = Arrays.copyOf(prompt, 5000);
+            for (int i = 4200; i < diverging.length; i++) diverging[i] = prompt[i] ^ 1;
+            restored = greedy(engine, diverging, 48);
+            assertEquals(4096, engine.prefixCacheStats().reusedTokens() - 4608);
+        }
+        try (InferenceEngine reference =
+                InferenceEngine.load(config(property, artifact, 0), new RecordingBootstrap())) {
+            assertEquals(greedy(reference, diverging, 48), restored);
+        }
+    }
+
+    private static List<Integer> greedy(InferenceEngine engine, int[] prompt, int newTokens) throws Exception {
+        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+            return session.generate(prompt, newTokens, text -> {}, null);
         }
     }
 

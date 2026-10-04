@@ -161,9 +161,32 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
     /// `onToken` and `timing` run on those workers, one call at a time, in generation order.
     public CompletableFuture<List<Integer>> generateAsync(
             int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing) {
+        return generateAsync(prompt, maxNewTokens, onToken, timing, null, 0);
+    }
+
+    /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk and its MTP
+    /// catch-up, with the address of the base hidden row of the chunk's last position, before the next chunk
+    /// overwrites the draft seed rows. The future completes when the cache is done with the sequence's state.
+    public interface PrefixHooks {
+        CompletableFuture<Void> afterChunk(int end, long lastSeedRowAddress);
+    }
+
+    /// As [#generateAsync(int[], int, IntConsumer, GenerationTimingListener)] for a sequence restored from the
+    /// prefix cache at `startPosition` (0 for a fresh one): its base state holds `[0, startPosition)`, its MTP
+    /// cache `[0, startPosition - 1)`, and its draft seed buffer the hidden row of position `startPosition - 1`.
+    /// `hooks`, when not null, is called after each prefill chunk.
+    public CompletableFuture<List<Integer>> generateAsync(
+            int[] prompt,
+            int maxNewTokens,
+            IntConsumer onToken,
+            GenerationTimingListener timing,
+            PrefixHooks hooks,
+            int startPosition) {
         if (prompt.length == 0 || maxNewTokens <= 0) throw new IllegalArgumentException("empty generation");
+        if (startPosition < 0 || startPosition >= prompt.length)
+            throw new IllegalArgumentException("startPosition must lie within the prompt");
         this.statistics = new Statistics(this.depth);
-        return new Run(prompt, maxNewTokens, onToken, timing).prefill(0);
+        return new Run(prompt, maxNewTokens, onToken, timing, hooks, startPosition).start();
     }
 
     /// One generation's continuations. The steps are those of the sequential algorithm, in its order.
@@ -172,15 +195,44 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         private final int maxNewTokens;
         private final IntConsumer onToken;
         private final GenerationTimingListener timing;
+        private final PrefixHooks hooks;
+        private final int startPosition;
         private final List<Integer> output = new ArrayList<>();
         private int first = -1;
         private int[] drafts;
 
-        Run(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing) {
+        Run(
+                int[] prompt,
+                int maxNewTokens,
+                IntConsumer onToken,
+                GenerationTimingListener timing,
+                PrefixHooks hooks,
+                int startPosition) {
             this.prompt = prompt;
             this.maxNewTokens = maxNewTokens;
             this.onToken = onToken;
             this.timing = timing;
+            this.hooks = hooks;
+            this.startPosition = startPosition;
+        }
+
+        /// A restored sequence's MTP cache stops one row short of its position; its seed buffer holds that
+        /// row's base hidden. Pair it with the token that follows the stored prefix, as the catch-up after
+        /// that chunk would have, then prefill the rest.
+        CompletableFuture<List<Integer>> start() {
+            if (this.startPosition == 0) return prefill(0);
+            int boundary = this.startPosition;
+            long seeds = states().draftSeedRows(1, QwenSpeculativeDecoder.this.hidden);
+            return catchUpPiece(boundary - 1, new int[] {this.prompt[boundary]}, false, seeds, 0)
+                    .thenCompose(ignored -> prefill(boundary));
+        }
+
+        /// Gives the prefix cache the state after a chunk, then goes on.
+        private CompletableFuture<Void> afterChunk(int offset, int end) {
+            if (this.hooks == null) return CompletableFuture.completedFuture(null);
+            int hidden = QwenSpeculativeDecoder.this.hidden;
+            long seeds = states().draftSeedRows(end - offset, hidden);
+            return this.hooks.afterChunk(end, seeds + (long) (end - offset - 1) * hidden * Short.BYTES);
         }
 
         /// Prompt: prefill chunks that seed drafting, each followed by its MTP catch-up.
@@ -213,7 +265,7 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
                         return catchUp(offset, next, last).thenCompose(chunkDrafts -> {
                             QwenSpeculativeDecoder.this.statistics.promptCatchUpNanos += System.nanoTime() - catchingUp;
                             if (last) this.drafts = chunkDrafts;
-                            return prefill(end);
+                            return afterChunk(offset, end).thenCompose(stored -> prefill(end));
                         });
                     });
         }

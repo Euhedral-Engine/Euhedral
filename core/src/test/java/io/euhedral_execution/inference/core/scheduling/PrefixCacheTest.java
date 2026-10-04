@@ -37,7 +37,7 @@ class PrefixCacheTest {
 
     private PrefixCache cache(long bytes, int interval) {
         Arena arena = Arena.ofShared();
-        return new PrefixCache(this.gpu, CONFIG, arena.allocate(bytes), arena::close, interval);
+        return new PrefixCache(this.gpu, CONFIG, false, arena.allocate(bytes), arena::close, interval);
     }
 
     private QwenExecutionPlan plan() {
@@ -228,7 +228,7 @@ class PrefixCacheTest {
     void closeFreesTheArena() {
         var released = new AtomicBoolean();
         Arena arena = Arena.ofShared();
-        var cache = new PrefixCache(this.gpu, CONFIG, arena.allocate(1 << 20), () -> released.set(true), 512);
+        var cache = new PrefixCache(this.gpu, CONFIG, false, arena.allocate(1 << 20), () -> released.set(true), 512);
         cache.close();
         cache.close();
         assertTrue(released.get());
@@ -239,6 +239,133 @@ class PrefixCacheTest {
         Arena arena = Arena.ofShared();
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new PrefixCache(this.gpu, CONFIG, arena.allocate(1 << 20), arena::close, 1000));
+                () -> new PrefixCache(this.gpu, CONFIG, false, arena.allocate(1 << 20), arena::close, 1000));
+    }
+
+    // --- MTP state
+
+    private PrefixCache mtpCache(long bytes) {
+        Arena arena = Arena.ofShared();
+        return new PrefixCache(this.gpu, CONFIG, true, arena.allocate(bytes), arena::close, 512);
+    }
+
+    /// A sequence as a speculative prefill leaves it: `rows` base rows, `mtpRows` MTP rows, recognizable bytes.
+    private QwenSequenceState sequenceWithMtp(int rows, int mtpRows, int seed) {
+        var sequence = new QwenSequenceState(1);
+        var lease = sequence.claimExecution(0);
+        attachMtpStates(sequence, lease);
+        var attention = (AttentionSequenceStates) sequence.kvCacheState();
+        var gdn = (GdnSequenceStates) sequence.recurrentState();
+        AttentionKvState kv = attention.forLayer(1);
+        kv.prepareAppend(0, rows);
+        kv.appendSubmitted(rows);
+        kv.commitSubmitted();
+        AttentionKvState mtp = attention.forLayer(CONFIG.numHiddenLayers());
+        mtp.prepareAppend(0, mtpRows);
+        mtp.appendSubmitted(mtpRows);
+        mtp.commitSubmitted();
+        this.gpu.fill(
+                gdn.forLayer(0).recurrentStateAddress(), (int) gdn.forLayer(0).recurrentBytes(), seed);
+        this.gpu.fill(
+                gdn.forLayer(0).convolutionStateAddress(), (int) gdn.forLayer(0).convolutionBytes(), seed + 1);
+        for (int i = 0; i < kv.pageAddresses().size(); i++)
+            this.gpu.fill(kv.pageAddresses().get(i), (int) (2 * kv.planePageBytes()), seed + 2 + i);
+        for (int i = 0; i < mtp.pageAddresses().size(); i++)
+            this.gpu.fill(mtp.pageAddresses().get(i), (int) (2 * mtp.planePageBytes()), seed + 50 + i);
+        sequence.releaseExecution(lease, rows);
+        return sequence;
+    }
+
+    private void attachMtpStates(QwenSequenceState sequence, QwenSequenceState.ExecutionLease lease) {
+        sequence.setRecurrentState(
+                lease,
+                GdnSequenceStates.allocate(
+                        this.gpu,
+                        CONFIG.layerTypes(),
+                        CONFIG.linearNumKeyHeads(),
+                        CONFIG.linearNumValueHeads(),
+                        CONFIG.linearKeyHeadDim(),
+                        CONFIG.linearValueHeadDim(),
+                        CONFIG.linearConvKernelDim()));
+        sequence.setKvCacheState(
+                lease,
+                AttentionSequenceStates.allocate(
+                        this.gpu, CONFIG.layerTypes(), CONFIG.numKeyValueHeads() * CONFIG.attentionHeadDim(), true));
+    }
+
+    private long seedRow(int seed) {
+        long address = this.gpu.allocate(CONFIG.hiddenSize() * 2L);
+        this.gpu.fill(address, CONFIG.hiddenSize() * 2, seed);
+        return address;
+    }
+
+    @Test
+    void anMtpCheckpointRestoresTheMtpCacheAndTheSeedRowOfItsLastPosition() throws Exception {
+        PrefixCache cache = mtpCache(8L << 20);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        QwenSequenceState source = sequenceWithMtp(1024, 1023, 4);
+        long seed = seedRow(9);
+        PrefixNode node =
+                cache.capture(INLINE, source, cache.root(), tokens, 1024, seed).get();
+        assertTrue(node.hasMtp());
+
+        var hit = cache.lookup(tokens, true);
+        assertNotNull(hit);
+        var target = new QwenSequenceState(2);
+        var lease = target.claimExecution(0);
+        attachMtpStates(target, lease);
+        target.releaseExecution(lease, 0);
+        assertTrue(cache.restore(INLINE, plan(), target, hit, true).get());
+        cache.release(hit);
+        var sourceMtp = ((AttentionSequenceStates) source.kvCacheState()).forLayer(CONFIG.numHiddenLayers());
+        var restoredStates = (AttentionSequenceStates) target.kvCacheState();
+        var restoredMtp = restoredStates.forLayer(CONFIG.numHiddenLayers());
+        assertEquals(1023, restoredMtp.length(), "the MTP cache stops one row short of the position");
+        assertEquals(1024, restoredStates.forLayer(1).length());
+        int pageBytes = (int) (2 * sourceMtp.planePageBytes());
+        for (int page = 0; page < 4; page++)
+            assertArrayEquals(
+                    this.gpu.bytes(sourceMtp.pageAddresses().get(page), pageBytes),
+                    this.gpu.bytes(restoredMtp.pageAddresses().get(page), pageBytes),
+                    "MTP page " + page);
+        long restoredSeed = restoredStates.draftSeedRows(1, CONFIG.hiddenSize());
+        assertArrayEquals(this.gpu.bytes(seed, 256), this.gpu.bytes(restoredSeed, 256));
+    }
+
+    @Test
+    void aCacheWithoutMtpIgnoresTheSeedRowAndStoresPlainNodes() throws Exception {
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        PrefixNode node = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024, seedRow(9))
+                .get();
+        assertFalse(node.hasMtp());
+        assertFalse(cache.supportsMtp());
+    }
+
+    @Test
+    void aSequenceWhoseMtpCacheLagsIsStoredWithoutMtpState() throws Exception {
+        PrefixCache cache = mtpCache(8L << 20);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        QwenSequenceState lagging = sequenceWithMtp(1024, 700, 4);
+        PrefixNode node = cache.capture(INLINE, lagging, cache.root(), tokens, 1024, seedRow(9))
+                .get();
+        assertFalse(node.hasMtp(), "rows [0, 1023) of the MTP cache are not all there");
+        assertNull(cache.lookup(tokens, true));
+        assertNotNull(cache.lookup(tokens, false));
+    }
+
+    @Test
+    void aSpanStoredWithAndWithoutMtpStateKeepsBothVariants() throws Exception {
+        PrefixCache cache = mtpCache(16L << 20);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        PrefixNode plain = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024)
+                .get();
+        PrefixNode withMtp = cache.capture(
+                        INLINE, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, seedRow(9))
+                .get();
+        assertFalse(plain.hasMtp());
+        assertTrue(withMtp.hasMtp());
+        assertEquals(2, cache.stats().captured());
+        assertEquals(withMtp.position(), cache.lookup(tokens, true).position());
     }
 }

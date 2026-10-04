@@ -572,6 +572,36 @@ public final class QwenGenerationSession implements AutoCloseable {
                     this.tokenizer::isGenerationEosToken,
                     this.speculativeDepth,
                     this.prefillChunkTokens);
+        PrefixCache cache = this.prefixCache;
+        if (cache == null || !cache.supportsMtp())
+            return runSpeculative(promptTokenIds, maxNewTokens, text, timing, null, 0);
+        // A speculative prompt restores only through checkpoints that hold MTP state, and stores them.
+        PrefixCache.Hit hit = cache.lookup(promptTokenIds, true);
+        this.cursor = hit == null ? cache.root() : hit.cursor();
+        QwenSpeculativeDecoder.PrefixHooks hooks = (end, seedRow) -> {
+            if (end <= this.cursor.position() || !cache.wantsCheckpoint(end, promptTokenIds.length))
+                return CompletableFuture.completedFuture(null);
+            return cache.capture(this.runtime.frames(), this.sequence, this.cursor, promptTokenIds, end, seedRow)
+                    .thenAccept(node -> this.cursor = node);
+        };
+        if (hit == null) return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, 0);
+        long started = System.nanoTime();
+        return cache.restore(this.runtime.frames(), this.plan, this.sequence, hit, true)
+                .whenComplete((restored, failure) -> cache.release(hit))
+                .thenCompose(restored -> {
+                    if (!restored || isStopRequested()) return CompletableFuture.completedFuture(List.<Integer>of());
+                    if (timing != null) timing.prefixRestored(hit.position(), System.nanoTime() - started);
+                    return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, hit.position());
+                });
+    }
+
+    private CompletableFuture<List<Integer>> runSpeculative(
+            int[] promptTokenIds,
+            int maxNewTokens,
+            Consumer<String> text,
+            GenerationTimingListener timing,
+            QwenSpeculativeDecoder.PrefixHooks hooks,
+            int startPosition) {
         return this.speculative
                 .generateAsync(
                         promptTokenIds,
@@ -583,7 +613,9 @@ public final class QwenGenerationSession implements AutoCloseable {
                             // As in ordinary decode, a generation terminator is returned but never decoded into text.
                             if (!this.tokenizer.isGenerationEosToken(token)) emit(text, this.decoder.append(token));
                         },
-                        timing)
+                        timing,
+                        hooks,
+                        startPosition)
                 .thenApply(tokens -> {
                     this.promptPrefilled = true;
                     if (!isStopRequested()) finishDecoder(text);
