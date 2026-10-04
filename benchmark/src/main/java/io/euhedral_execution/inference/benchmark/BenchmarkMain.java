@@ -85,7 +85,8 @@ public final class BenchmarkMain {
         var prepared = Prerequisites.check(options, ProcessorTopology.system());
         System.out.println("workers: processors " + prepared.workers().processorIds() + ", cores "
                 + prepared.workers().coreIds());
-        System.out.println("max context: " + options.maxContextTokens() + " tokens; warmup " + options.warmup()
+        System.out.println("max context: " + options.maxContextTokens() + " tokens; prefix cache "
+                + options.prefixCacheBytes() + " bytes; warmup " + options.warmup()
                 + ", measured " + options.iterations() + " per scenario; generation " + options.generation()
                 + "; fork " + (forkId == null ? "unspecified" : forkId));
         prepared.prompts()
@@ -114,6 +115,7 @@ public final class BenchmarkMain {
                 options.cudaLibrary(),
                 prepared.workers().processorIds(),
                 options.maxContextTokens(),
+                options.prefixCacheBytes(),
                 options.shutdownTimeout());
         // Load before creating the output, so a refused load leaves no empty result file.
         BenchmarkRunner.Target target;

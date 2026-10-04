@@ -46,6 +46,7 @@ class BenchmarkOptionsTest {
         var options = load("");
         assertEquals(Path.of("/m.edrl"), options.artifact());
         assertEquals(InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS, options.maxContextTokens());
+        assertEquals(0L, options.prefixCacheBytes(), "benchmark iterations repeat prompts, so the cache is off");
         assertEquals("all", options.cpus());
         assertEquals(Scenario.DEFAULT_SUITE, options.scenarios());
         assertEquals(1, options.warmup());
@@ -68,12 +69,13 @@ class BenchmarkOptionsTest {
     @Test
     void bindsEveryOption() throws Exception {
         var options = load("""
-                "maxContextTokens":8192,"cpus":"2-5,8","excludeCpus":[3],"excludeCores":[1],
+                "maxContextTokens":8192,"prefixCacheBytes":1073741824,"cpus":"2-5,8","excludeCpus":[3],"excludeCores":[1],
                 "scenarios":["prefill:64","decode:32:128"],"warmup":0,"iterations":5,
                 "generation":{"mode":"sample","seed":9,"temperature":0.6,"topK":10,"topP":0.9},
                 "promptSeed":4,"output":"out/run.json","gpuMemory":true,
                 "shutdownTimeoutSeconds":30""");
         assertEquals(8192, options.maxContextTokens());
+        assertEquals(1073741824L, options.prefixCacheBytes());
         assertEquals("2-5,8", options.cpus());
         assertEquals(List.of(3), options.excludeCpus());
         assertEquals(List.of(1), options.excludeCores());
@@ -112,6 +114,7 @@ class BenchmarkOptionsTest {
                 UnrecognizedPropertyException.class,
                 assertThrows(Exception.class, () -> load("\"generation\":{\"beam\":4}")));
         assertEquals("maxContextTokens must be positive", rejection("\"maxContextTokens\":0"));
+        assertEquals("prefixCacheBytes must not be negative", rejection("\"prefixCacheBytes\":-1"));
         assertEquals("iterations must be positive", rejection("\"iterations\":0"));
         assertEquals("warmup must not be negative", rejection("\"warmup\":-1"));
         assertEquals("generation.mode must be greedy or sample", rejection("\"generation\":{\"mode\":\"beam\"}"));

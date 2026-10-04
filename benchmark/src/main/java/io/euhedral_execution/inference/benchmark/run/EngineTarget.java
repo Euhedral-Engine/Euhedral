@@ -28,11 +28,19 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             Path cudaLibrary,
             BitSet workerCpus,
             int maxContextTokens,
+            long prefixCacheBytes,
             Duration shutdown) {
         return () -> {
             try {
-                var engine = InferenceEngine.load(
-                        new InferenceConfig(artifact, tokenizer, cudaLibrary, workerCpus, maxContextTokens, shutdown));
+                var engine = InferenceEngine.load(new InferenceConfig(
+                        artifact,
+                        tokenizer,
+                        cudaLibrary,
+                        workerCpus,
+                        maxContextTokens,
+                        shutdown,
+                        prefixCacheBytes,
+                        InferenceConfig.DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS));
                 System.out.println("loaded: " + engine.allocatedDeviceBytes() + " device bytes, "
                         + engine.hostBackedWeightBytes() + " host-backed weight bytes");
                 return new EngineTarget(engine);

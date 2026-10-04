@@ -39,7 +39,7 @@ public final class BenchmarkFixtures {
     public static InferenceRunSnapshot snapshot(GenerationConfig generation) {
         return new InferenceRunSnapshot(
                 InferenceRunSnapshot.SCHEMA_VERSION,
-                new InferenceRunSnapshot.Configuration(List.of(0), 32768, "fake.edrl", 0),
+                new InferenceRunSnapshot.Configuration(List.of(0), 32768, "fake.edrl", 0, 0),
                 List.of(0),
                 new InferenceRunSnapshot.Model(
                         "/fake.edrl",
@@ -141,6 +141,7 @@ public final class BenchmarkFixtures {
                 Path.of("/a"),
                 Path.of("/t"),
                 Path.of("/l"),
+                null,
                 null,
                 null,
                 null,

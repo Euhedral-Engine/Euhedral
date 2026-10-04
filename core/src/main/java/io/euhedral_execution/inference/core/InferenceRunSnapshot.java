@@ -25,7 +25,7 @@ public record InferenceRunSnapshot(
         GenerationConfig generation,
         RuntimeIdentity runtime) {
     /// Version 3 replaced the tuning axes with `configuration`: the engine derives its policy from the artifact.
-    public static final int SCHEMA_VERSION = 3;
+    public static final int SCHEMA_VERSION = 4;
     /// Explicit value for identity the runtime does not expose.
     public static final String UNAVAILABLE = "unavailable";
 
@@ -49,8 +49,13 @@ public record InferenceRunSnapshot(
 
     /// The inputs the engine was loaded with and the policy it derived from the artifact.
     /// `artifact` is [ArtifactProfile#artifactName()], null when no artifact was profiled.
+    /// `prefixCacheBytes` is the pinned host memory configured for the prefix cache (0 when off).
     public record Configuration(
-            List<Integer> workerProcessorIds, int maxContextTokens, String artifact, int speculativeDepth) {
+            List<Integer> workerProcessorIds,
+            int maxContextTokens,
+            String artifact,
+            int speculativeDepth,
+            long prefixCacheBytes) {
         public Configuration {
             workerProcessorIds = List.copyOf(workerProcessorIds);
         }
@@ -60,7 +65,8 @@ public record InferenceRunSnapshot(
                     ids(config.workerCpus()),
                     config.maxContextTokens(),
                     profile == null ? null : profile.artifactName(),
-                    profile == null ? 0 : profile.speculativeDepth());
+                    profile == null ? 0 : profile.speculativeDepth(),
+                    config.prefixCacheBytes());
         }
     }
 

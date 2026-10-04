@@ -545,7 +545,7 @@ class InferenceEngineTest {
             int cpu = config.workerCpus().nextSetBit(0);
             assertEquals(
                     new InferenceRunSnapshot.Configuration(
-                            List.of(cpu), InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS, null, 0),
+                            List.of(cpu), InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS, null, 0, 0),
                     snapshot.configuration());
             assertEquals(List.of(SystemInfo.getCpuInfo(cpu).core()), snapshot.workerCoreIds());
             assertEquals(generation, snapshot.generation());
