@@ -23,6 +23,8 @@ from contextlib import contextmanager
 SERVICE = "euhedral-inference-serve"
 IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
+# What this process runs; the pull below may bring a newer version of the script.
+SCRIPT_SOURCE = Path(__file__).read_bytes()
 REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_CHECKPOINT_DIR", "EUHEDRAL_INFERENCE_MODEL_ID", "EUHEDRAL_INFERENCE_WORKER_CPUS")
 # The image fixes these and mounts the host files there.
 CONTAINER_PATHS = ("EUHEDRAL_INFERENCE_ARTIFACT_PATH", "EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY", "EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH")
@@ -124,15 +126,17 @@ def verify_ready(port):
             models = get_json(base + "/v1/models").get("data", [])
             if health == "healthy" and status.get("status") == "up" and status.get("engine") == "ready" and models:
                 model = models[0]["id"]
+                # Whatever the image's reasoning default, generated text lands in the answer or in the reasoning.
                 response = get_json(
                     base + "/v1/chat/completions",
-                    json.dumps({"model": model, "messages": [{"role": "user", "content": "Say READY"}], "max_tokens": 1, "temperature": 0}).encode(),
+                    json.dumps({"model": model, "messages": [{"role": "user", "content": "Say READY"}], "max_tokens": 16,
+                                "temperature": 0}).encode(),
                 )
                 choices = response.get("choices") or []
                 usage = response.get("usage") or {}
                 if usage.get("completion_tokens", 0) > 0 and any(
-                    isinstance(choice.get("message", {}).get("content"), str)
-                    and choice["message"]["content"].strip() for choice in choices
+                    isinstance(choice.get("message", {}).get(field), str) and choice["message"][field].strip()
+                    for choice in choices for field in ("content", "reasoning_content")
                 ):
                     return model
                 last_error = "chat smoke response had no generated text"
@@ -178,6 +182,10 @@ def deploy(repository, settings):
         raise RuntimeError("Invalid HTTP port")
 
     command("git", "pull", "--ff-only", "origin", "main")
+    if Path(__file__).read_bytes() != SCRIPT_SOURCE:
+        # Deploying main with the script of an older main can pass the wrong settings to the new image.
+        print("The pull changed the deploy script; running the new version", flush=True)
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
     revision = command("git", "rev-parse", "HEAD")
     if revision != command("git", "rev-parse", "origin/main"):
         raise RuntimeError("Local main does not match origin/main")

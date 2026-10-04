@@ -1,6 +1,7 @@
 """Safety tests for the local production deployment script."""
 
 import importlib.util
+import json
 from contextlib import nullcontext
 import tempfile
 import unittest
@@ -123,6 +124,30 @@ class DeploymentTests(unittest.TestCase):
                 MODULE.deploy(self.root, self.settings)
         self.assertTrue(any(e[:2] == ("docker", "start") for e in self.events))
         self.assertFalse(any(e[:3] == ("docker", "image", "rm") for e in self.events))
+
+    def test_a_pull_that_changes_the_script_runs_the_new_version(self):
+        class Replaced(Exception):
+            pass
+
+        with patch.object(MODULE, "SCRIPT_SOURCE", b"an older script"), patch.object(MODULE.os, "execv", side_effect=Replaced) as execv:
+            with self.assertRaises(Replaced):
+                self.deploy(lambda port: "qwen3.8-27b-nvfp4-compressed")
+        self.assertEqual(str(SCRIPT.resolve()), execv.call_args.args[1][1])
+        pull = next(i for i, e in enumerate(self.events) if e[:2] == ("git", "pull"))
+        self.assertFalse(any(e[:2] in (("docker", "build"), ("docker", "stop")) for e in self.events[pull:]))
+
+    def test_reasoning_text_counts_as_generated(self):
+        def response(url, data=None):
+            if data is not None:
+                self.assertNotIn("reasoning_effort", json.loads(data))
+                return {"choices": [{"message": {"content": None, "reasoning_content": "The user"}}],
+                        "usage": {"completion_tokens": 16}}
+            if url.endswith("/health"):
+                return {"status": "up", "engine": "ready"}
+            return {"data": [{"id": "qwen"}]}
+
+        with patch.object(MODULE, "command", return_value="healthy"), patch.object(MODULE, "get_json", side_effect=response):
+            self.assertEqual("qwen", MODULE.verify_ready(18080))
 
     def test_without_driver_libraries_the_container_toolkit_provides_the_gpu(self):
         toolkit = MODULE.Settings(self.env_file, self.model, self.tokenizer, "qwen", 18080)
