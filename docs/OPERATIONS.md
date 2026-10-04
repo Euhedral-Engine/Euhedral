@@ -3,7 +3,9 @@
 ## Settings
 
 Each setting is a property or its environment variable: `euhedral.inference.artifact-path` is
-`EUHEDRAL_INFERENCE_ARTIFACT_PATH`. `PORT` sets the port (1738).
+`EUHEDRAL_INFERENCE_ARTIFACT_PATH`. `PORT` sets the port (1738). The container and `mise run deploy` read them from a
+`.env` file ([.env.example](../.env.example)); there the image fixes the artifact, checkpoint and CUDA library paths,
+and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHEDRAL_CHECKPOINT_DIR`).
 
 | Setting | Default | Meaning |
 |---|---|---|

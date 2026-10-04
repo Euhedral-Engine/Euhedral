@@ -28,6 +28,10 @@ class DeploymentTests(unittest.TestCase):
         self.driver.touch()
         self.ptx = self.root / "libnvidia-ptxjitcompiler.so.1"
         self.ptx.touch()
+        self.env_file = self.root / ".env"
+        self.env_file.touch()
+        self.settings = MODULE.Settings(self.env_file, self.model, self.tokenizer, "qwen3.8-27b-nvfp4-compressed", 18080,
+                                        self.driver, self.ptx)
         self.events = []
 
     def command(self, *args):
@@ -62,7 +66,7 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(MODULE, "build_context", return_value=nullcontext(self.root)), patch.object(MODULE, "command", side_effect=self.command), patch.object(
             MODULE, "verify_ready", side_effect=ready
         ):
-            return MODULE.deploy(self.root, self.model, self.tokenizer, self.driver, self.ptx, 18080)
+            return MODULE.deploy(self.root, self.settings)
 
     def test_cleanup_only_after_new_service_is_ready(self):
         def ready(port):
@@ -85,7 +89,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(any(e[:3] == ("docker", "inspect", "--format") and "State.Health.Status" in str(e) for e in events[index(lambda e: e[:2] == ("docker", "rm")):]))
         run = next(e for e in events if e[:2] == ("docker", "run"))
         self.assertNotIn("euhedral.qwen.prefillRegions", str(run))
-        self.assertIn("EUHEDRAL_INFERENCE_MODEL_ID=qwen3.8-27b-nvfp4-compressed", run)
+        self.assertIn(str(self.env_file), run[run.index("--env-file") + 1])
+        self.assertIn("/dev/nvidia0", run)
+        self.assertNotIn("--gpus", run)
 
     def test_failure_restores_old_service_without_deleting_its_image(self):
         def not_ready(port):
@@ -114,9 +120,13 @@ class DeploymentTests(unittest.TestCase):
 
         with patch.object(MODULE, "build_context", return_value=nullcontext(self.root)), patch.object(MODULE, "command", side_effect=checked_command), patch.object(MODULE, "verify_ready", return_value="qwen3.8-27b-nvfp4-compressed"):
             with self.assertRaisesRegex(RuntimeError, "became unhealthy before cleanup"):
-                MODULE.deploy(self.root, self.model, self.tokenizer, self.driver, self.ptx, 18080)
+                MODULE.deploy(self.root, self.settings)
         self.assertTrue(any(e[:2] == ("docker", "start") for e in self.events))
         self.assertFalse(any(e[:3] == ("docker", "image", "rm") for e in self.events))
+
+    def test_without_driver_libraries_the_container_toolkit_provides_the_gpu(self):
+        toolkit = MODULE.Settings(self.env_file, self.model, self.tokenizer, "qwen", 18080)
+        self.assertEqual(["--gpus", "all"], MODULE.gpu_arguments(toolkit))
 
     def test_build_context_contains_only_committed_source(self):
         with MODULE.build_context(SCRIPT.parents[1]) as context:
@@ -134,6 +144,46 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(MODULE, "command", return_value="healthy"), patch.object(MODULE, "get_json", side_effect=response), patch.object(MODULE.time, "monotonic", side_effect=[0, 1, 301]), patch.object(MODULE.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "did not become ready"):
                 MODULE.verify_ready(18080)
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / ".env"
+
+    def load(self, text):
+        self.path.write_text(text)
+        return MODULE.load_settings(self.path)
+
+    def test_the_example_lists_every_required_setting(self):
+        example = MODULE.read_env(SCRIPT.parents[1] / ".env.example")
+        self.assertLessEqual(set(MODULE.REQUIRED), example.keys())
+
+    def test_reads_docker_env_file_syntax(self):
+        settings = self.load("# comment\n\nEUHEDRAL_ARTIFACT_FILE=/m/a b.edrl\nEUHEDRAL_CHECKPOINT_DIR=/c\n"
+                             "EUHEDRAL_INFERENCE_MODEL_ID=qwen\nEUHEDRAL_INFERENCE_WORKER_CPUS=2-5\nPORT=18080\n")
+        self.assertEqual(Path("/m/a b.edrl"), settings.artifact)
+        self.assertEqual(("qwen", 18080, None), (settings.model_id, settings.port, settings.driver))
+
+    def test_port_defaults_to_the_servers(self):
+        settings = self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_CHECKPOINT_DIR=/c\nEUHEDRAL_INFERENCE_MODEL_ID=q\n"
+                             "EUHEDRAL_INFERENCE_WORKER_CPUS=0\n")
+        self.assertEqual(1738, settings.port)
+
+    def test_refuses_a_missing_file_missing_keys_and_paths_the_image_fixes(self):
+        with self.assertRaisesRegex(RuntimeError, "copy .env.example"):
+            MODULE.load_settings(self.path)
+        with self.assertRaisesRegex(RuntimeError, "EUHEDRAL_CHECKPOINT_DIR, EUHEDRAL_INFERENCE_WORKER_CPUS"):
+            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_INFERENCE_MODEL_ID=q\n")
+        with self.assertRaisesRegex(RuntimeError, "EUHEDRAL_INFERENCE_ARTIFACT_PATH, which the image fixes"):
+            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_CHECKPOINT_DIR=/c\nEUHEDRAL_INFERENCE_MODEL_ID=q\n"
+                      "EUHEDRAL_INFERENCE_WORKER_CPUS=0\nEUHEDRAL_INFERENCE_ARTIFACT_PATH=/a\n")
+        with self.assertRaisesRegex(RuntimeError, "both EUHEDRAL_CUDA_DRIVER_FILE and EUHEDRAL_PTX_JIT_FILE"):
+            self.load("EUHEDRAL_ARTIFACT_FILE=/a\nEUHEDRAL_CHECKPOINT_DIR=/c\nEUHEDRAL_INFERENCE_MODEL_ID=q\n"
+                      "EUHEDRAL_INFERENCE_WORKER_CPUS=0\nEUHEDRAL_CUDA_DRIVER_FILE=/d\n")
+        with self.assertRaisesRegex(RuntimeError, "expected KEY=VALUE"):
+            self.load("just words\n")
 
 
 if __name__ == "__main__":

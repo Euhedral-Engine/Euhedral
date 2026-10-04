@@ -224,13 +224,15 @@ A field that would change the output and is not implemented is refused with 400,
 
 ## Docker
 
+The container takes its settings from a `.env` file: copy [.env.example](.env.example) to `.env` (git ignores it) and
+set the artifact and checkpoint paths, the model ID and the worker CPUs.
+
 ```bash
 docker build -t euhedral-inference:local .
-docker run --rm --gpus all -p 1738:1738 --stop-timeout 45 \
-  --mount type=bind,src=/absolute/path/model.edrl,dst=/models/model.edrl,readonly \
-  --mount type=bind,src=/absolute/path/tokenizer,dst=/tokenizer,readonly \
-  -e EUHEDRAL_INFERENCE_WORKER_CPUS=2-5 \
-  -e EUHEDRAL_INFERENCE_MODEL_ID=qwen \
+set -a; . ./.env; set +a
+docker run --rm --gpus all --env-file .env -p "$PORT:$PORT" --stop-timeout 45 \
+  --mount type=bind,src="$EUHEDRAL_ARTIFACT_FILE",dst=/models/model.edrl,readonly \
+  --mount type=bind,src="$EUHEDRAL_CHECKPOINT_DIR",dst=/tokenizer,readonly \
   euhedral-inference:local
 ```
 
@@ -241,13 +243,14 @@ compatible host driver. Hosts without the toolkit can pass the device nodes and 
 ```text
 --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-modeset \
 --mount type=bind,src=/usr/lib/x86_64-linux-gnu/libcuda.so.1,dst=/opt/euhedral/lib/libcuda.so.1,readonly \
---mount type=bind,src=/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1,dst=/opt/euhedral/lib/libnvidia-ptxjitcompiler.so.1,readonly
+--mount type=bind,src=/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1,dst=/opt/euhedral/lib/libnvidia-ptxjitcompiler.so.1,readonly
 ```
 
-`mise run deploy` pulls `origin/main`, builds an image from exactly that commit, switches the `euhedral-inference-serve`
-container on localhost port 18080 after checking Docker health, `/health`, `/v1/models` and a one-token completion, and
-restores the previous container if the candidate fails. It serves the `nvfp4-compressed` artifact by default; the artifact, model ID and
-port are overridable through `EUHEDRAL_DEPLOY_*` variables (`scripts/deploy-main.py`).
+`mise run deploy` reads the same `.env`. It pulls `origin/main`, builds an image from exactly that commit, switches the
+`euhedral-inference-serve` container (published on `127.0.0.1:$PORT`) after checking Docker health, `/health`,
+`/v1/models` and a one-token completion, and restores the previous container if the candidate fails. With
+`EUHEDRAL_CUDA_DRIVER_FILE` and `EUHEDRAL_PTX_JIT_FILE` set it passes the device nodes and those libraries instead of
+`--gpus all`.
 
 ## Configuration
 
