@@ -30,7 +30,7 @@ final class PromptTokenization {
     private final Runnable terminated;
     private final CompletableFuture<int[]> result = new CompletableFuture<>();
     /// Routing seeds of the job's frames, consecutive from one base (FrameSeeds); frames are built on many workers.
-    private final long seedBase = new FrameSeeds().next();
+    private final long seedBase = FrameSeeds.forHostWork().next();
     private final AtomicLong nextSeed = new AtomicLong();
     private final AtomicBoolean finished = new AtomicBoolean();
     private QwenTokenizer.Pretokens pretokens;
