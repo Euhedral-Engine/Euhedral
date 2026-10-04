@@ -329,8 +329,8 @@ class ChatCompletionsCudaIntegrationTest {
         }
 
         @Override
-        public int countPromptTokens(String prompt) {
-            return this.delegate.countPromptTokens(prompt);
+        public EncodedPrompt encodePrompt(String prompt) throws InterruptedException {
+            return this.delegate.encodePrompt(prompt);
         }
 
         @Override
@@ -339,7 +339,7 @@ class ChatCompletionsCudaIntegrationTest {
             this.opened.incrementAndGet();
             return new Generation() {
                 @Override
-                public Result generate(String prompt, int maxNewTokens, Consumer<String> output)
+                public Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
                         throws InterruptedException, ExecutionException {
                     Result result = generation.generate(prompt, maxNewTokens, output);
                     TrackingBackend.this.lastCompletionTokens.set(result.completionTokens());

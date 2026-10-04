@@ -45,9 +45,9 @@ public final class EngineInferenceBackend implements InferenceBackend {
     }
 
     @Override
-    public int countPromptTokens(String prompt) {
-        // A fresh session encodes its first prompt with the tokenizer's model special tokens.
-        return this.engine.tokenizer().encodeWithModelSpecialTokens(prompt).length;
+    public EncodedPrompt encodePrompt(String prompt) throws InterruptedException {
+        // Every generation runs on a fresh session, whose first prompt carries the model special tokens.
+        return new EncodedPrompt(prompt, this.engine.tokenizePrompt(prompt));
     }
 
     @Override
@@ -74,9 +74,11 @@ public final class EngineInferenceBackend implements InferenceBackend {
             implements Generation {
 
         @Override
-        public Result generate(String prompt, int maxNewTokens, Consumer<String> output)
+        public Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
                 throws InterruptedException, ExecutionException {
-            List<Integer> tokenIds = this.session.generate(prompt, maxNewTokens, output, this.constraint);
+            if (!this.session.expectsFirstPrompt())
+                throw new IllegalStateException("an encoded prompt needs a fresh session");
+            List<Integer> tokenIds = this.session.generate(prompt.tokenIds(), maxNewTokens, output, this.constraint);
             boolean stopToken = !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast());
             return new Result(tokenIds.size(), stopToken);
         }

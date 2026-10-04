@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.api.chat;
 
+import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.List;
 
@@ -9,8 +10,7 @@ public record ChatCompletionPlan(
         String id,
         long created,
         String model,
-        String prompt,
-        int promptTokens,
+        InferenceBackend.EncodedPrompt prompt,
         int maxTokens,
         GenerationConfig sampling,
         List<String> stops,
@@ -20,5 +20,9 @@ public record ChatCompletionPlan(
 
     public ChatCompletionPlan {
         stops = List.copyOf(stops);
+    }
+
+    public int promptTokens() {
+        return this.prompt.tokenCount();
     }
 }

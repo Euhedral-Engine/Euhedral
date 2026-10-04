@@ -204,24 +204,69 @@ public final class QwenTokenizer {
 
     /// Encodes text exactly as the checkpoint tokenizer, without automatic BOS/EOS insertion.
     public int[] encodeText(String text) {
-        Objects.requireNonNull(text, "text");
-        List<Integer> ids = new ArrayList<>();
-        Matcher controls = this.controlTokenPattern.matcher(text);
-        int cursor = 0;
-        while (controls.find()) {
-            encodeNormalizedText(text.substring(cursor, controls.start()), ids);
-            ids.add(this.controlTokenIds.get(controls.group()));
-            cursor = controls.end();
-        }
-        encodeNormalizedText(text.substring(cursor), ids);
-        return ids.stream().mapToInt(Integer::intValue).toArray();
+        Pretokens pretokens = pretokenize(text);
+        return encode(pretokens, 0, pretokens.size());
     }
 
     /// Encodes text with only the BOS/EOS tokens enabled by tokenizer_config.json.
     ///
     /// <p>Generation-config BOS/stop IDs are exposed separately and are not inserted implicitly.
     public int[] encodeWithModelSpecialTokens(String text) {
-        int[] plain = encodeText(text);
+        return withModelSpecialTokens(encodeText(text));
+    }
+
+    /// A text split into the pieces BPE encodes independently, in order: each piece is either an added
+    /// control token or one NFC-normalized pre-token. Encoding the pieces in any grouping and concatenating
+    /// the results in order equals [#encodeText].
+    public static final class Pretokens {
+        private final String[] texts;
+        private final int[] controlIds;
+
+        private Pretokens(String[] texts, int[] controlIds) {
+            this.texts = texts;
+            this.controlIds = controlIds;
+        }
+
+        public int size() {
+            return this.texts.length;
+        }
+    }
+
+    /// Splits text on control tokens, normalizes each run between them, and splits it into pre-tokens.
+    public Pretokens pretokenize(String text) {
+        Objects.requireNonNull(text, "text");
+        List<String> texts = new ArrayList<>();
+        List<Integer> controls = new ArrayList<>();
+        Matcher control = this.controlTokenPattern.matcher(text);
+        int cursor = 0;
+        while (control.find()) {
+            pretokenizeNormalized(text.substring(cursor, control.start()), texts, controls);
+            texts.add(null);
+            controls.add(this.controlTokenIds.get(control.group()));
+            cursor = control.end();
+        }
+        pretokenizeNormalized(text.substring(cursor), texts, controls);
+        return new Pretokens(
+                texts.toArray(String[]::new),
+                controls.stream().mapToInt(Integer::intValue).toArray());
+    }
+
+    /// The token IDs of pieces [`from`, `to`) of `pretokens`.
+    public int[] encode(Pretokens pretokens, int from, int to) {
+        Objects.requireNonNull(pretokens, "pretokens");
+        Objects.checkFromToIndex(from, to, pretokens.size());
+        List<Integer> ids = new ArrayList<>();
+        for (int index = from; index < to; index++) {
+            String piece = pretokens.texts[index];
+            if (piece == null) ids.add(pretokens.controlIds[index]);
+            else encodePretoken(piece, ids);
+        }
+        return ids.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    /// `plain` with the BOS/EOS tokens enabled by tokenizer_config.json added.
+    public int[] withModelSpecialTokens(int[] plain) {
+        Objects.requireNonNull(plain, "plain");
         int prefix = this.addBosToken ? 1 : 0;
         int suffix = this.addEosToken ? 1 : 0;
         int[] result = new int[plain.length + prefix + suffix];
@@ -338,17 +383,23 @@ public final class QwenTokenizer {
         return this.byteByCodePoint[codePoint];
     }
 
-    private void encodeNormalizedText(String text, List<Integer> ids) {
+    private void pretokenizeNormalized(String text, List<String> texts, List<Integer> controls) {
         if (text.isEmpty()) return;
         String normalized = Normalizer.normalize(text, Normalizer.Form.NFC);
         Matcher matcher = this.pretokenPattern.matcher(normalized);
         int cursor = 0;
         while (matcher.find()) {
-            if (matcher.start() > cursor) encodePretoken(normalized.substring(cursor, matcher.start()), ids);
-            encodePretoken(matcher.group(), ids);
+            if (matcher.start() > cursor) addPretoken(normalized.substring(cursor, matcher.start()), texts, controls);
+            addPretoken(matcher.group(), texts, controls);
             cursor = matcher.end();
         }
-        if (cursor < normalized.length()) encodePretoken(normalized.substring(cursor), ids);
+        if (cursor < normalized.length()) addPretoken(normalized.substring(cursor), texts, controls);
+    }
+
+    private static void addPretoken(String pretoken, List<String> texts, List<Integer> controls) {
+        if (pretoken.isEmpty()) return;
+        texts.add(pretoken);
+        controls.add(-1);
     }
 
     private void encodePretoken(String text, List<Integer> ids) {

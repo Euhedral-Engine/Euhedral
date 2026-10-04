@@ -86,9 +86,17 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     }
 
     /// Deterministic stand-in for tokenization: one token per character.
-    @Override
     public int countPromptTokens(String prompt) {
         return prompt.length();
+    }
+
+    /// Prompts encoded so far; a request encodes its prompt once.
+    final AtomicInteger encoded = new AtomicInteger();
+
+    @Override
+    public EncodedPrompt encodePrompt(String prompt) {
+        this.encoded.incrementAndGet();
+        return new EncodedPrompt(prompt, new int[countPromptTokens(prompt)]);
     }
 
     @Override
@@ -120,11 +128,11 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         }
 
         @Override
-        public Result generate(String prompt, int maxNewTokens, Consumer<String> output)
+        public Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
                 throws InterruptedException, ExecutionException {
             if (this.closeCount.get() > 0) throw new IllegalStateException("Qwen generation session is closed");
             if (this.cancelled.get()) throw new IllegalStateException("Qwen generation session is cancelled");
-            this.prompt = prompt;
+            this.prompt = prompt.text();
             this.maxNewTokens = maxNewTokens;
             this.generatingThread = Thread.currentThread().getName();
             this.started.countDown();

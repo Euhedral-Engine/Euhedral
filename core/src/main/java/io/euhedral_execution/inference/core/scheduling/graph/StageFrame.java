@@ -54,7 +54,7 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     boolean submitted;
 
     protected StageFrame(StageGraph graph, int stage) {
-        super(StageGraph.FRAME_ID_HASH);
+        super(FrameSeeds.ID_HASH);
         this.graph = graph;
         this.stage = stage;
         this.inDegree = graph.topology().inDegree(stage);
