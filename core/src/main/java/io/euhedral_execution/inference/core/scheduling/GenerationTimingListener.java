@@ -32,6 +32,9 @@ public interface GenerationTimingListener {
     /// `selectedNanos` equals `executedNanos` and `selectedTokenId` is -1 when `sampled` is false.
     void decodeQuantum(long startNanos, long executedNanos, long selectedNanos, boolean sampled, int selectedTokenId);
 
+    /// A cached prefix of `tokens` tokens was restored in `nanos` before the first prefill quantum.
+    default void prefixRestored(int tokens, long nanos) {}
+
     /// Speculative decoding: one verification, started at `startNanos` (after the previous step's
     /// drafting) and resolved at `executedNanos`, committed `outputs` tokens, accepting `acceptedDrafts`
     /// drafts. It replaces decode quanta, except a final commit-only quantum at the token budget.

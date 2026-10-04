@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.IncrementalDecoder;
 import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
@@ -52,6 +53,9 @@ public final class QwenGenerationSession implements AutoCloseable {
     /// MTP draft depth for greedy unconstrained generation from a fresh sequence; 0 disables it.
     private int speculativeDepth;
     private QwenSpeculativeDecoder speculative;
+    private PrefixCache prefixCache;
+    /// Where the next checkpoint of this sequence attaches: the deepest stored node of its prefix.
+    private PrefixNode cursor;
 
     /// Creates a session with a new persistent sequence owned by this instance.
     /// The plan, runtime, GPU, and tokenizer are borrowed and must remain usable until the session is closed.
@@ -102,6 +106,16 @@ public final class QwenGenerationSession implements AutoCloseable {
         this.sampler = new QwenLogitsSampler(config, plan.weights().config().vocabSize());
         this.hostLogits = new QwenHostLogits(gpu, plan.weights().config().vocabSize());
         this.decoder = tokenizer.newIncrementalDecoder();
+    }
+
+    /// Reuses and stores the state of this session's first prompt in `cache`; null stops using one. Set before
+    /// the first prompt. The cache's checkpoints sit on the prefill chunk grid, so the session must prefill in
+    /// that chunk size.
+    public void usePrefixCache(PrefixCache cache) {
+        if (cache != null && this.prefillChunkTokens != PrefixCache.CHUNK_TOKENS)
+            throw new IllegalStateException(
+                    "the prefix cache needs prefill chunks of " + PrefixCache.CHUNK_TOKENS + " tokens");
+        this.prefixCache = cache;
     }
 
     /// Generates greedy, unconstrained calls from a fresh sequence with MTP speculative decoding of
@@ -349,7 +363,9 @@ public final class QwenGenerationSession implements AutoCloseable {
             return generateSpeculative(promptTokenIds, maxNewTokens, text, timing);
         }
         Chain chain = new Chain(promptTokenIds, maxNewTokens, constraint, timing, text);
-        chain.prefillNext();
+        PrefixCache cache = this.prefixCache;
+        if (cache == null || this.promptPrefilled || this.sequence.currentTokenPosition() != 0) chain.prefillNext();
+        else chain.startFromCache(cache);
         return chain.result;
     }
 
@@ -381,6 +397,66 @@ public final class QwenGenerationSession implements AutoCloseable {
             this.text = text;
         }
 
+        /// Restores the longest stored prefix of the prompt, then prefills what is left.
+        void startFromCache(PrefixCache cache) {
+            PrefixCache.Hit hit = cache.lookup(this.promptTokenIds, false);
+            QwenGenerationSession.this.cursor = hit == null ? cache.root() : hit.cursor();
+            if (hit == null) {
+                prefillNext();
+                return;
+            }
+            long started = System.nanoTime();
+            cache.restore(
+                            QwenGenerationSession.this.runtime.frames(),
+                            QwenGenerationSession.this.plan,
+                            QwenGenerationSession.this.sequence,
+                            hit)
+                    .whenComplete((restored, failure) -> {
+                        cache.release(hit);
+                        try {
+                            if (failure != null) {
+                                this.result.completeExceptionally(failure);
+                                return;
+                            }
+                            if (!restored || isStopRequested()) {
+                                this.result.complete(List.of());
+                                return;
+                            }
+                            if (this.timing != null)
+                                this.timing.prefixRestored(hit.position(), System.nanoTime() - started);
+                            this.offset = hit.position();
+                            prefillNext();
+                        } catch (Throwable continuationFailure) {
+                            this.result.completeExceptionally(continuationFailure);
+                        }
+                    });
+        }
+
+        /// After a prefill chunk that ended at `end`: store a checkpoint when the cache wants one, then go on.
+        private void checkpointThen(int end, Runnable next) {
+            PrefixCache cache = QwenGenerationSession.this.prefixCache;
+            if (cache == null
+                    || end <= QwenGenerationSession.this.cursor.position()
+                    || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) {
+                next.run();
+                return;
+            }
+            cache.capture(
+                            QwenGenerationSession.this.runtime.frames(),
+                            QwenGenerationSession.this.sequence,
+                            QwenGenerationSession.this.cursor,
+                            this.promptTokenIds,
+                            end)
+                    .whenComplete((node, failure) -> {
+                        try {
+                            if (failure == null) QwenGenerationSession.this.cursor = node;
+                            next.run();
+                        } catch (Throwable continuationFailure) {
+                            this.result.completeExceptionally(continuationFailure);
+                        }
+                    });
+        }
+
         void prefillNext() {
             if (this.offset >= this.promptTokenIds.length) {
                 afterPrefill();
@@ -408,7 +484,7 @@ public final class QwenGenerationSession implements AutoCloseable {
                     return;
                 }
                 this.offset = end;
-                prefillNext();
+                checkpointThen(end, this::prefillNext);
             });
         }
 

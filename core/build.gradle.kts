@@ -22,6 +22,7 @@ dependencies {
 val latticeTestClasses = listOf(
     "**/EuhedralInferenceRuntimeLatticeTest.class",
     "**/QwenGenerationSessionTest.class",
+    "**/QwenGenerationSessionPrefixCacheTest.class",
     "**/InferenceEngineTest.class",
 )
 

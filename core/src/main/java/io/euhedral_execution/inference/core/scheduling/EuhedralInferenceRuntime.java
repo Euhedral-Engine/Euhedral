@@ -252,6 +252,16 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return result;
     }
 
+    /// Host work for the prefix cache: each piece runs as one frame on the lattice's workers.
+    public PrefixCache.Frames frames() {
+        return new PrefixCache.Frames() {
+            @Override
+            public <T> CompletableFuture<T> run(Supplier<T> work) {
+                return onWorker(work);
+            }
+        };
+    }
+
     /// One piece of host work for [#onWorker].
     private static final class HostTask<T> extends AbstractFrame {
         private final Supplier<T> work;
