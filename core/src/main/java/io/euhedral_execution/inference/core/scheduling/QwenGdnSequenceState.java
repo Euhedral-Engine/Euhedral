@@ -100,14 +100,22 @@ public final class QwenGdnSequenceState implements AutoCloseable {
 
     void fingerprint(CaptureFingerprint fingerprint) {
         fingerprint
-                .add(this.convolutionStateAddress)
-                .add(this.recurrentStateAddress)
+                .add(this.gpu, this.convolutionStateAddress)
+                .add(this.gpu, this.recurrentStateAddress)
                 .add(this.pendingReplayRows);
         Speculative buffers = this.speculative;
         if (buffers == null) return;
-        fingerprint.add(buffers.capacity()).add(buffers.recurrentCheckpoint()).add(buffers.convolutionCheckpoint());
-        fingerprint.add(buffers.queryKeyRows()).add(buffers.valueZRows()).add(buffers.alphaRows());
-        fingerprint.add(buffers.betaRows()).add(buffers.replayConvolved()).add(buffers.replayOutput());
+        fingerprint.add(buffers.capacity());
+        for (long address : new long[] {
+            buffers.recurrentCheckpoint(),
+            buffers.convolutionCheckpoint(),
+            buffers.queryKeyRows(),
+            buffers.valueZRows(),
+            buffers.alphaRows(),
+            buffers.betaRows(),
+            buffers.replayConvolved(),
+            buffers.replayOutput()
+        }) fingerprint.add(this.gpu, address);
     }
 
     public int pendingReplayRows() {

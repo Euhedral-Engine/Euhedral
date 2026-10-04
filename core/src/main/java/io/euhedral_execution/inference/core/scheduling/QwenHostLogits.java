@@ -48,11 +48,12 @@ public final class QwenHostLogits implements AutoCloseable {
     }
 
     void fingerprint(CaptureFingerprint fingerprint) {
-        fingerprint.add(this.selectOnDevice ? 1 : 0).add(this.deviceSelection).add(this.deviceRowSelections);
+        fingerprint.add(this.selectOnDevice ? 1 : 0).add(this.gpu, this.deviceSelection);
+        fingerprint.add(this.gpu, this.deviceRowSelections);
         fingerprint.add(this.rowSelectionCapacity);
         for (ExecutionGpu.ReadbackBuffer buffer :
                 new ExecutionGpu.ReadbackBuffer[] {this.row, this.selection, this.rowSelections})
-            fingerprint.add(buffer == null ? 0 : buffer.segment().address());
+            fingerprint.add(this.gpu, buffer == null ? 0 : buffer.segment().address());
     }
 
     /// Whether the next sampling quanta select greedily on the device instead of copying the row. Only

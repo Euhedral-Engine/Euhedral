@@ -17,6 +17,13 @@ public interface GpuMemory {
 
     void free(long address);
 
+    /// Identifies the live allocation that starts at `address` (device memory, or a pinned readback buffer):
+    /// distinct for every allocation, so an address that a later allocation reuses identifies differently.
+    /// A provider that does not track allocations returns the address itself.
+    default long allocationId(long address) {
+        return address;
+    }
+
     /// Pins `byteSize` bytes of host memory that the device's copy engines read directly, for weights
     /// staged to the device on use. Returns its host address.
     default long allocateHostWeights(long byteSize) {

@@ -93,7 +93,7 @@ public final class AttentionKvState implements AutoCloseable {
     }
 
     void fingerprint(CaptureFingerprint fingerprint) {
-        fingerprint.add(this.table).add(this.tableSlots).add(this.decodeScratch);
+        fingerprint.add(this.gpu, this.table).add(this.tableSlots).add(this.gpu, this.decodeScratch);
     }
 
     /// Records that the writes for `tokenCount` reserved rows after the committed frontier were

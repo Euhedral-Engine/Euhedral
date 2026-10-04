@@ -98,6 +98,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final AtomicInteger pinnedUploadCount = new AtomicInteger();
     /// The size of every live device allocation, by address; [#allocate] is the only native allocator.
     private final ConcurrentHashMap<Long, Long> allocationSizes = new ConcurrentHashMap<>();
+    /// Live device allocations and pinned readback buffers by start address: a serial per allocation.
+    private final ConcurrentHashMap<Long, Long> allocationIds = new ConcurrentHashMap<>();
+    private final AtomicLong allocationSerial = new AtomicLong();
     private final AtomicLong allocatedBytes = new AtomicLong();
     /// High-water mark of [#allocatedBytes] since construction or the last [#resetPeakAllocatedBytes].
     private final AtomicLong peakAllocatedBytes = new AtomicLong();
@@ -696,7 +699,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 long graph = exec.get(ValueLayout.JAVA_LONG, 0);
                 q3ScratchLock.lock();
                 try {
-                    graphScratch.put(graph, new long[] {q3ScratchAddress, q3ScratchBytes});
+                    graphScratch.put(
+                            graph, new long[] {q3ScratchAddress, q3ScratchBytes, allocationId(q3ScratchAddress)});
                 } finally {
                     q3ScratchLock.unlock();
                 }
@@ -726,7 +730,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             q3ScratchLock.lock();
             try {
                 long[] recorded = graphScratch.get(graph);
-                if (recorded == null || recorded[0] != q3ScratchAddress || recorded[1] != q3ScratchBytes) return false;
+                if (recorded == null
+                        || recorded[0] != q3ScratchAddress
+                        || recorded[1] != q3ScratchBytes
+                        || recorded[2] != allocationId(q3ScratchAddress)) return false;
                 if (q3ScratchEvent != 0) await(q3ScratchEvent);
                 launch(graph);
                 if (q3ScratchEvent == 0) q3ScratchEvent = openMarker();
@@ -911,6 +918,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             long value = address.address();
             if (value == 0) throw new GpuMemoryException("CUDA allocation returned a null address");
             allocationSizes.put(value, byteSize);
+            allocationIds.put(value, allocationSerial.incrementAndGet());
             long live = allocatedBytes.addAndGet(byteSize);
             peakAllocatedBytes.accumulateAndGet(live, Math::max);
             return value;
@@ -1101,7 +1109,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (address.address() == 0) throw new GpuMemoryException("CUDA pinned readback allocation returned null");
         MemorySegment allocation = address.reinterpret(byteSize);
-        return new ReadbackBuffer(allocation, () -> freePinned(allocation));
+        allocationIds.put(allocation.address(), allocationSerial.incrementAndGet());
+        return new ReadbackBuffer(allocation, () -> {
+            allocationIds.remove(allocation.address());
+            freePinned(allocation);
+        });
     }
 
     @Override
@@ -2563,7 +2575,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (status != 0) throw new GpuMemoryException("CUDA free", status);
         Long size = allocationSizes.remove(address);
+        allocationIds.remove(address);
         if (size != null) allocatedBytes.addAndGet(-size);
+    }
+
+    @Override
+    public long allocationId(long address) {
+        return allocationIds.getOrDefault(address, 0L);
     }
 
     /// Device bytes allocated through this binding and not yet freed: the resident footprint of the
