@@ -188,6 +188,8 @@ class ToolCallingTest {
                     .andExpect(jsonPath("$.error.type").value("server_error"))
                     .andExpect(jsonPath("$.error.code").value("invalid_tool_call"));
             var generation = this.backend.only();
+            // The response's last write may reach the client before the completion closes the session.
+            assertTrue(generation.awaitClosed(), output);
             assertEquals(1, generation.closeCount.get(), output);
             if (!incomplete) {
                 assertTrue(generation.isCancelled(), "an invalid call must cancel decoding: " + output);
@@ -346,6 +348,8 @@ class ToolCallingTest {
         assertTrue(!generation.constraint.parallel(), "the request's single-call limit must reach the sampler");
         assertTrue(generation.isCancelled(), "decoding must stop once the single allowed call is complete");
         assertEquals(1, generation.emitted.get(), "no quantum may run after the single allowed call");
+        // The response's last write may reach the client before the completion closes the session.
+        assertTrue(generation.awaitClosed());
         assertEquals(1, generation.closeCount.get());
 
         // A multi-call envelope cannot be truncated without silently changing the model's request.
