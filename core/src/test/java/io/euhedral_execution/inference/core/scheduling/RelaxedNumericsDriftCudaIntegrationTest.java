@@ -135,15 +135,14 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         gpu.selectExactNumerics(!sequenceB || calibrate);
     }
 
+    /// A fixed text: the README and three docs as they were when the bounds were calibrated. The window error
+    /// depends on the tokens, and reading the live docs let an edit to the README fail the test.
     private static int[] forcedTokens(QwenTokenizer tokenizer, int count) throws Exception {
-        Path root = Path.of(System.getProperty("user.dir")).toAbsolutePath();
-        while (!Files.isDirectory(root.resolve("docs"))) root = root.getParent();
-        StringBuilder text = new StringBuilder();
-        for (String name :
-                List.of("README.md", "docs/FRAME_MODEL.md", "docs/BENCHMARKING.md", "docs/COMPACT_Q3_REFERENCE.md")) {
-            text.append(Files.readString(root.resolve(name))).append("\n\n");
+        String text;
+        try (var input = RelaxedNumericsDriftCudaIntegrationTest.class.getResourceAsStream("drift-forced-text.md")) {
+            text = new String(input.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
         }
-        int[] all = tokenizer.encodeText(text.toString());
+        int[] all = tokenizer.encodeText(text);
         if (all.length < count) throw new IllegalStateException("only " + all.length + " forced tokens available");
         return java.util.Arrays.copyOf(all, count);
     }

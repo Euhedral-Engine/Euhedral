@@ -84,33 +84,48 @@ class QwenGenerationSessionCudaIntegrationTest {
                         AtomicReference<Object> recurrentState = new AtomicReference<>();
                         AtomicReference<Object> kvState = new AtomicReference<>();
 
-                        List<Integer> generated = session.generate(prompt, 5, text -> {
-                            output.append(text);
-                            callbackPositions.add(session.currentTokenPosition());
-                            assertEquals(
-                                    0, runtime.activeQuanta(), "a token is emitted only after its quantum retired");
-                            Object currentRecurrent = session.sequenceState().recurrentState();
-                            Object currentKv = session.sequenceState().kvCacheState();
-                            if (recurrentState.compareAndSet(null, currentRecurrent)) {
-                                assertTrue(currentRecurrent instanceof GdnSequenceStates);
-                            } else {
-                                assertSame(recurrentState.get(), currentRecurrent);
-                            }
-                            if (kvState.compareAndSet(null, currentKv)) {
-                                assertTrue(currentKv instanceof AttentionSequenceStates);
-                            } else {
-                                assertSame(kvState.get(), currentKv);
-                            }
-                            long generatedCount = session.generatedTokenIds().size();
-                            assertTrue(session.currentTokenPosition() >= promptTokenCount + generatedCount - 1L);
-                            assertTrue(session.currentTokenPosition() <= promptTokenCount + generatedCount);
-                            // The first text callback follows prefill, before lazy split-KV
-                            // scratch reservation. Compare steady-state decode callbacks only;
-                            // scratch address stability and ownership have separate exact tests.
-                            if (session.currentTokenPosition() > promptTokenCount) {
-                                decodeCallbackAllocated.add(gpu.allocatedBytes());
-                            }
-                        });
+                        // The asynchronous form's text sink runs before the next quantum is admitted; the blocking
+                        // form hands text to the caller while later quanta run.
+                        List<Integer> generated = session.generateAsync(
+                                        prompt,
+                                        5,
+                                        text -> {
+                                            output.append(text);
+                                            callbackPositions.add(session.currentTokenPosition());
+                                            assertEquals(
+                                                    0,
+                                                    runtime.activeQuanta(),
+                                                    "a token is emitted only after its quantum retired");
+                                            Object currentRecurrent =
+                                                    session.sequenceState().recurrentState();
+                                            Object currentKv =
+                                                    session.sequenceState().kvCacheState();
+                                            if (recurrentState.compareAndSet(null, currentRecurrent)) {
+                                                assertTrue(currentRecurrent instanceof GdnSequenceStates);
+                                            } else {
+                                                assertSame(recurrentState.get(), currentRecurrent);
+                                            }
+                                            if (kvState.compareAndSet(null, currentKv)) {
+                                                assertTrue(currentKv instanceof AttentionSequenceStates);
+                                            } else {
+                                                assertSame(kvState.get(), currentKv);
+                                            }
+                                            long generatedCount =
+                                                    session.generatedTokenIds().size();
+                                            assertTrue(session.currentTokenPosition()
+                                                    >= promptTokenCount + generatedCount - 1L);
+                                            assertTrue(session.currentTokenPosition()
+                                                    <= promptTokenCount + generatedCount);
+                                            // The first text callback follows prefill, before lazy split-KV
+                                            // scratch reservation. Compare steady-state decode callbacks only;
+                                            // scratch address stability and ownership have separate exact tests.
+                                            if (session.currentTokenPosition() > promptTokenCount) {
+                                                decodeCallbackAllocated.add(gpu.allocatedBytes());
+                                            }
+                                        },
+                                        null,
+                                        null)
+                                .join();
 
                         assertTrue(generated.size() >= 4, "model stopped before several decode quanta");
                         List<Integer> visibleTokens = generated.stream()
