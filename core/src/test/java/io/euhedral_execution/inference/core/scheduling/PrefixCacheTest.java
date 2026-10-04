@@ -176,19 +176,38 @@ class PrefixCacheTest {
     }
 
     @Test
-    void aCancelledSequenceRestoresNothing() throws Exception {
+    void aSequenceCancelledBeforeTheRestoreRestoresNothingAndIsNotAnError() throws Exception {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
         var hit = cache.lookup(tokens, false);
         var target = new QwenSequenceState(3);
         target.cancel();
-        assertThrows(
-                ExecutionException.class,
-                () -> cache.restore(INLINE, plan(), target, hit).get());
+        assertFalse(cache.restore(INLINE, plan(), target, hit).get(), "cancelled: no restore, and no failure");
         cache.release(hit);
         assertEquals(QwenSequenceState.TerminalState.CANCELLED, target.terminalState());
         assertFalse(target.isExecutionClaimed());
+    }
+
+    @Test
+    void aCancellationRequestedWhileTheLeaseIsFreeStopsTheRestoreWithoutAnError() throws Exception {
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
+        var hit = cache.lookup(tokens, false);
+        var target = new QwenSequenceState(3);
+        // Cancelled once the restore's copies began: the sequence held the lease, so cancel() only flags it.
+        PrefixCache.Frames cancelling = new PrefixCache.Frames() {
+            @Override
+            public <T> CompletableFuture<T> run(Supplier<T> work) {
+                target.cancel();
+                return INLINE.run(work);
+            }
+        };
+        assertFalse(cache.restore(cancelling, plan(), target, hit).get());
+        cache.release(hit);
+        assertFalse(target.isExecutionClaimed(), "the lease was released");
+        assertEquals(QwenSequenceState.TerminalState.CANCELLED, target.terminalState());
     }
 
     @Test
@@ -367,5 +386,57 @@ class PrefixCacheTest {
         assertTrue(withMtp.hasMtp());
         assertEquals(2, cache.stats().captured());
         assertEquals(withMtp.position(), cache.lookup(tokens, true).position());
+    }
+
+    @Test
+    void aClosedCacheStoresAndRestoresNothing() throws Exception {
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
+        var hit = cache.lookup(tokens, false);
+        cache.close();
+        assertSame(
+                cache.root(),
+                cache.capture(INLINE, sequence(1024, 5), cache.root(), tokens, 1024)
+                        .get());
+        var target = new QwenSequenceState(3);
+        assertThrows(
+                ExecutionException.class,
+                () -> cache.restore(INLINE, plan(), target, hit).get());
+        assertEquals(QwenSequenceState.TerminalState.ACTIVE, target.terminalState(), "nothing was claimed");
+        assertFalse(target.isExecutionClaimed());
+    }
+
+    @Test
+    void aFrameThatRunsAfterCloseCopiesNothing() throws Exception {
+        // Freed native memory stays addressable from Java, so only the cache's own check can stop the copy.
+        Arena arena = Arena.ofShared();
+        PrefixCache cache = new PrefixCache(this.gpu, CONFIG, false, arena.allocate(8L << 20), () -> {}, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        QwenSequenceState source = sequence(1024, 4);
+        PrefixCache.Frames closing = new PrefixCache.Frames() {
+            @Override
+            public <T> CompletableFuture<T> run(Supplier<T> work) {
+                cache.close();
+                return INLINE.run(work);
+            }
+        };
+        PrefixNode result =
+                cache.capture(closing, source, cache.root(), tokens, 1024).get();
+        assertSame(cache.root(), result, "the copy failed, so the node was not published");
+        assertEquals(1, cache.stats().failed());
+    }
+
+    @Test
+    void aSamplingPromptReusesAnMtpNodeInsteadOfStoringASecondOne() throws Exception {
+        PrefixCache cache = mtpCache(16L << 20);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        PrefixNode withMtp = cache.capture(
+                        INLINE, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, seedRow(9))
+                .get();
+        PrefixNode reused = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024)
+                .get();
+        assertSame(withMtp, reused, "an MTP node is a superset of a plain one");
+        assertEquals(1, cache.stats().captured());
     }
 }

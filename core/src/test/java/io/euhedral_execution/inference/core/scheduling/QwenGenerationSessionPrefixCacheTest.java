@@ -263,11 +263,8 @@ class QwenGenerationSessionPrefixCacheTest {
                 try (var second = session(h, 10 + attempt)) {
                     var future = second.generateAsync(prompt, 50, text -> {}, null);
                     second.cancel();
-                    try {
-                        future.get(30, TimeUnit.SECONDS);
-                    } catch (java.util.concurrent.ExecutionException cancelled) {
-                        // a cancelled generation may report either way
-                    }
+                    // Cancelling before, during or after the restore ends the generation normally, never in an error.
+                    future.get(30, TimeUnit.SECONDS);
                     assertFalse(second.sequenceState().isExecutionClaimed());
                 }
             }
