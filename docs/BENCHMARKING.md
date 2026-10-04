@@ -169,7 +169,7 @@ a listener the session records nothing and calls nothing extra.
 | `tokenization` | entry -> prompt encoded | tokenization | quanta |
 | `prefill` | first prefill quantum start -> last prefill execution | all prefill quanta and host work between them | tokenization, sampling |
 | `firstTokenSample` | last prefill execution -> first token selected | logits sampling | output callback |
-| `timeToFirstToken` | entry -> first token selected | tokenization, prefill, sampling | output callback, text decoding |
+| `timeToFirstToken` | entry -> first token selected | tokenization, prefix restore, prefill, sampling | output callback, text decoding |
 | `decode` | first decode quantum start -> selection by the last sampling decode quantum | decode quanta and host work between them (output callback, incremental text decoding) | first token, final commit, decoder flush |
 | `decodeQuantaSum` | sum over sampling decode quanta of start -> selection | quanta and sampling only | host work between quanta |
 | `finalCommit` | start -> execution of the commit-only quantum | committing the last token | sampling |
@@ -180,7 +180,9 @@ The output callback is a no-op; incremental text decoding still runs.
 
 Throughput uses actual completed work:
 
-- `prefillTokensPerSecond` = prompt tokens executed by prefill quanta / `prefill`.
+- `prefillTokensPerSecond` = prompt tokens executed by prefill quanta / `prefill`. With a prefix cache, a restored
+  prefix is not executed by prefill: `work.prefixRestoredTokens` counts it, `timings.prefixRestore` is the time the
+  restore took, and `prefillTokens + prefixRestoredTokens` is the prompt.
 - `decodeTokensPerSecond` = tokens sampled by decode quanta / `decode`. The first token is sampled
   by prefill and belongs to `timeToFirstToken`. The unsampled final commit is excluded. A sampled
   terminator counts, because it was sampled work.
@@ -224,9 +226,10 @@ below is illustrative; its values are not a measurement.
   "warmup": false, "iteration": 0,
   "status": "success", "statusReason": null,
   "work": {"promptTokens": 32, "prefillQuanta": 1, "prefillTokens": 32, "generatedTokens": 256,
-           "decodeSampledTokens": 255, "finalCommitQuanta": 1, "eosObserved": false},
+           "decodeSampledTokens": 255, "finalCommitQuanta": 1, "eosObserved": false,
+           "prefixRestoredTokens": null},
   "timings": {"tokenization": 0, "prefill": 0, "firstTokenSample": 0, "timeToFirstToken": 0, "decode": 0,
-              "decodeQuantaSum": 0, "finalCommit": 0, "timeToLastToken": 0, "endToEnd": 0},
+              "decodeQuantaSum": 0, "finalCommit": 0, "timeToLastToken": 0, "endToEnd": 0, "prefixRestore": null},
   "throughput": {"prefillTokensPerSecond": 0.0, "decodeTokensPerSecond": 0.0, "endToEndOutputTokensPerSecond": 0.0},
   "engine": {"schemaVersion": 4, "configuration": {"workerProcessorIds": [0, 1], "maxContextTokens": 32768,
              "artifact": "qwen3_8_27b_q3.edrl", "speculativeDepth": 2, "prefixCacheBytes": 0},

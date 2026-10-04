@@ -14,6 +14,8 @@ public final class IterationTiming implements GenerationTimingListener {
     boolean encoded;
     long encodedNanos;
     int promptTokens;
+    int restoredTokens;
+    long restoreNanos;
     int prefillCount;
     long[] prefillStart;
     long[] prefillExecuted;
@@ -71,6 +73,12 @@ public final class IterationTiming implements GenerationTimingListener {
         this.encoded = true;
         this.encodedNanos = nanos;
         this.promptTokens = promptTokens;
+    }
+
+    @Override
+    public void prefixRestored(int tokens, long nanos) {
+        this.restoredTokens = tokens;
+        this.restoreNanos = nanos;
     }
 
     @Override
