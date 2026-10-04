@@ -227,6 +227,46 @@ class MetricsTest {
     }
 
     @Test
+    void aRestoredPrefixCountsTowardsThePromptAndIsReported() {
+        var timing = new IterationTiming(1, 1);
+        timing.markEntry(0);
+        timing.promptEncoded(1, 5);
+        timing.prefixRestored(3, 50);
+        timing.prefillQuantum(60, 160, 2);
+        timing.markReturn(200);
+        var outcome = Metrics.evaluate(new Scenario(Scenario.Kind.PREFILL, 5, 0), timing, List.of(), id -> false, null);
+        assertEquals(BenchmarkResult.SUCCESS, outcome.status());
+        assertEquals(3, outcome.work().prefixRestoredTokens());
+        assertEquals(2, outcome.work().prefillTokens());
+        assertEquals(50L, outcome.timings().prefixRestore());
+        assertEquals(100L, outcome.timings().prefill(), "restoring is not prefill");
+    }
+
+    @Test
+    void aRestoredPrefixDoesNotExcuseMissingPrefill() {
+        var timing = new IterationTiming(1, 1);
+        timing.markEntry(0);
+        timing.promptEncoded(1, 5);
+        timing.prefixRestored(3, 50);
+        timing.prefillQuantum(60, 160, 1);
+        timing.markReturn(200);
+        var outcome = Metrics.evaluate(new Scenario(Scenario.Kind.PREFILL, 5, 0), timing, List.of(), id -> false, null);
+        assertEquals("incomplete_prefill", outcome.reason());
+    }
+
+    @Test
+    void anIterationWithoutARestoreReportsNone() {
+        var outcome = Metrics.evaluate(
+                new Scenario(Scenario.Kind.PROMPT_TO_N, 5, 3),
+                completedPromptToThree(),
+                List.of(1, 2, 3),
+                id -> id == EOS,
+                null);
+        assertNull(outcome.work().prefixRestoredTokens());
+        assertNull(outcome.timings().prefixRestore());
+    }
+
+    @Test
     void completeTokenCountWithoutFirstSelectionIsNotAValidMeasurement() {
         var timing = completedPromptToThree();
         timing.firstSelected = false;

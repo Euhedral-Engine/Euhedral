@@ -104,6 +104,8 @@ public record BenchmarkResult(
     /// Actual completed work. `generatedTokens` counts every returned token ID, including a sampled
     /// terminator. `decodeSampledTokens` counts tokens sampled by decode quanta (tokens 2..N);
     /// `finalCommitQuanta` is 1 when the last token was committed by a decode quantum that sampled nothing.
+    /// `prefixRestoredTokens` is the prompt prefix a prefix cache restored instead of prefilling (null: none), so
+    /// `prefillTokens + prefixRestoredTokens` is the prompt.
     public record Work(
             Integer promptTokens,
             Integer prefillQuanta,
@@ -113,7 +115,31 @@ public record BenchmarkResult(
             Integer finalCommitQuanta,
             Boolean eosObserved,
             Speculative speculative,
-            String outputSha256) {
+            String outputSha256,
+            Integer prefixRestoredTokens) {
+        public Work(
+                Integer promptTokens,
+                Integer prefillQuanta,
+                Integer prefillTokens,
+                Integer generatedTokens,
+                Integer decodeSampledTokens,
+                Integer finalCommitQuanta,
+                Boolean eosObserved,
+                Speculative speculative,
+                String outputSha256) {
+            this(
+                    promptTokens,
+                    prefillQuanta,
+                    prefillTokens,
+                    generatedTokens,
+                    decodeSampledTokens,
+                    finalCommitQuanta,
+                    eosObserved,
+                    speculative,
+                    outputSha256,
+                    null);
+        }
+
         public Work(
                 Integer promptTokens,
                 Integer prefillQuanta,
@@ -182,7 +208,8 @@ public record BenchmarkResult(
         }
     }
 
-    /// Nanosecond durations. Null means the boundary was not reached.
+    /// Nanosecond durations. Null means the boundary was not reached. `prefixRestore` is the time spent restoring a
+    /// cached prompt prefix before prefill (null: none); `timeToFirstToken` includes it.
     public record Timings(
             Long tokenization,
             Long prefill,
@@ -192,7 +219,31 @@ public record BenchmarkResult(
             Long decodeQuantaSum,
             Long finalCommit,
             Long timeToLastToken,
-            Long endToEnd) {}
+            Long endToEnd,
+            Long prefixRestore) {
+        public Timings(
+                Long tokenization,
+                Long prefill,
+                Long firstTokenSample,
+                Long timeToFirstToken,
+                Long decode,
+                Long decodeQuantaSum,
+                Long finalCommit,
+                Long timeToLastToken,
+                Long endToEnd) {
+            this(
+                    tokenization,
+                    prefill,
+                    firstTokenSample,
+                    timeToFirstToken,
+                    decode,
+                    decodeQuantaSum,
+                    finalCommit,
+                    timeToLastToken,
+                    endToEnd,
+                    null);
+        }
+    }
 
     public record Throughput(
             Double prefillTokensPerSecond, Double decodeTokensPerSecond, Double endToEndOutputTokensPerSecond) {}

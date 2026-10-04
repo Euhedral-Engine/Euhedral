@@ -103,7 +103,8 @@ public final class Metrics {
                 commitOnly >= 0 ? 1 : 0,
                 eos,
                 speculative,
-                Work.outputSha256(tokens));
+                Work.outputSha256(tokens),
+                timing.restoredTokens > 0 ? timing.restoredTokens : null);
 
         Long prefill = timing.prefillCount == 0
                 ? null
@@ -125,7 +126,8 @@ public final class Metrics {
                 lastSampled >= 0 ? decodeQuantaSum : null,
                 finalCommit,
                 timeToLast,
-                endToEnd);
+                endToEnd,
+                timing.restoredTokens > 0 ? timing.restoreNanos : null);
         Throughput throughput = new Throughput(
                 perSecond(prefillTokens, prefill),
                 perSecond(sampledDecode, decode),
@@ -133,7 +135,7 @@ public final class Metrics {
 
         String status = BenchmarkResult.SUCCESS;
         String reason = null;
-        if (promptTokens == null || prefillTokens != promptTokens || timing.prefillCount == 0) {
+        if (promptTokens == null || prefillTokens + timing.restoredTokens != promptTokens || timing.prefillCount == 0) {
             status = BenchmarkResult.FAILED;
             reason = "incomplete_prefill";
         } else {
