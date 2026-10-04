@@ -4,12 +4,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
-import java.util.function.IntPredicate;
 
 /// Request-local byte grammar for a JSON answer or tool-call envelope. Token candidates are checked
 /// against borrowed Qwen BPE bytes, not independently decoded strings: a UTF-8 character may span tokens.
-/// This enforces envelope syntax and offered names, not the full JSON Schema of tool arguments.
-public final class JsonEnvelopeConstraint implements IntPredicate {
+/// This enforces envelope syntax and offered names, not the full JSON Schema of tool arguments. It serves as
+/// a token constraint of its own, or as the byte grammar of an answer that follows reasoning.
+public final class JsonEnvelopeConstraint implements TokenConstraint, ByteGrammar {
     private static final byte[] CALL_PREFIX = ascii("{\"tool_calls\":[{\"name\":\"");
     private static final byte[] CONTENT_PREFIX = ascii("{\"content\":\"");
     private static final byte[] AFTER_NAME = ascii(",\"arguments\":{");
@@ -35,33 +35,40 @@ public final class JsonEnvelopeConstraint implements IntPredicate {
         this.parallel = parallel;
     }
 
-    @Override
-    public boolean test(int tokenId) {
-        return allows(tokenId);
-    }
-
     /// Does not change the committed grammar state; sampling may query every vocabulary token.
+    @Override
     public boolean allows(int tokenId) {
         if (this.tokenizer.isGenerationEosToken(tokenId)) return complete();
         byte[] bytes = this.tokenizer.generationTokenBytes(tokenId);
         if (bytes == null || bytes.length == 0) return false;
-        this.scratch.copyFrom(this.current);
-        for (byte value : bytes)
-            if (!this.scratch.feed(value & 0xff, this.toolNames, this.requiresCall, this.parallel)) return false;
-        return true;
+        return allows(bytes, 0);
     }
 
     /// Commits only the token that sampling selected, on the generation thread.
+    @Override
     public void accept(int tokenId) {
         if (!allows(tokenId)) throw new IllegalArgumentException("token violates the JSON envelope constraint");
         if (this.tokenizer.isGenerationEosToken(tokenId)) return;
-        byte[] bytes = this.tokenizer.generationTokenBytes(tokenId);
-        for (byte value : bytes) {
-            if (!this.current.feed(value & 0xff, this.toolNames, this.requiresCall, this.parallel))
+        accept(this.tokenizer.generationTokenBytes(tokenId), 0);
+    }
+
+    @Override
+    public boolean allows(byte[] bytes, int from) {
+        this.scratch.copyFrom(this.current);
+        for (int index = from; index < bytes.length; index++)
+            if (!this.scratch.feed(bytes[index] & 0xff, this.toolNames, this.requiresCall, this.parallel)) return false;
+        return true;
+    }
+
+    @Override
+    public void accept(byte[] bytes, int from) {
+        for (int index = from; index < bytes.length; index++) {
+            if (!this.current.feed(bytes[index] & 0xff, this.toolNames, this.requiresCall, this.parallel))
                 throw new IllegalStateException("committed token failed JSON validation");
         }
     }
 
+    @Override
     public boolean complete() {
         return this.current.phase == Phase.DONE;
     }
