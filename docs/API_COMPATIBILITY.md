@@ -74,3 +74,32 @@ The response is `chat.completion` with one choice. `message.reasoning_content` c
   reachable by others.
 - A request body is limited to `euhedral.api.max-request-bytes` (1 MiB, 413 beyond) and a request to
   `euhedral.api.request-timeout` (30 minutes).
+
+## Real clients
+
+`tools/client_compatibility.py` runs the OpenAI and Anthropic Python clients and `curl` against a running server and
+checks what a client relies on: response shapes, stream order, finish and stop reasons, tool-call loops, cached-token
+counts, cancellation and refusals. Start the server with `EUHEDRAL_API_MAX_QUEUED_GENERATIONS=1` so the capacity
+scenario can fill the queue.
+
+Run on 2026-10-04: RTX 5070 Ti, `qwen3_8_27b_nvfp4_compressed`, openai 3.24.0, anthropic 1.11.0. The prefix-cache
+scenario's first prompt was already cached from an earlier run of the script, so its time is two restored requests. The
+capacity scenario waits for two long generations.
+
+| Scenario | Client | Result | Time | Observed |
+|---|---|---|---|---|
+| Chat, JSON response | openai | pass | 1.1 s | finish=stop, 55 tokens: 'The three primary colors are **Red**, **Blue**, and **Yellow' |
+| Chat, streaming with reasoning on (low) | openai | pass | 1.4 s | 39 reasoning chunks before 3 content chunks; reasoning_tokens=51; answer '391' |
+| Chat, reasoning off | openai | pass | 0.2 s | no reasoning_content; answer '391' |
+| Chat, raw SSE | curl | pass | 0.3 s | 11 chat.completion.chunk events, then [DONE] |
+| Structured output, json_schema (sampled) | openai | pass | 1.2 s | valid document: {"name": "Elena Voss", "age": 29, "languages": ["Rust", "Python", "Go"]} |
+| Tool call, single | openai | pass | 0.5 s | 1 call (parallel_tool_calls=false): get_weather({"city":"Paris"}) |
+| Tool calls, parallel, and tool-result continuation | openai | pass | 1.6 s | parallel calls for ['Paris', 'Rome']; after the results: 'The weather in Paris is 18°C and raining. In Rome, it is 27°C and sunn' |
+| Responses, JSON and streaming | openai | pass | 0.9 s | output ['reasoning', 'message'], text 'Tokyo'; stream of 11 events |
+| Responses, tool call and function_call_output | openai | pass | 1.0 s | function_call {"city":"Oslo"}, then 'It is -3°C and snowing in Oslo.' |
+| Messages, JSON and streaming | anthropic | pass | 0.6 s | 'Saturn'; stream of 13 text deltas |
+| Messages, thinking enabled | anthropic | pass | 1.0 s | blocks ['thinking', 'text']; answer '12 × 34 = **408**' |
+| Messages, tool_use and tool_result | anthropic | pass | 1.1 s | tool_use {'city': 'Lima'}, then 'It is currently 21°C and cloudy in Lima.' |
+| Long conversation, prefix cache (and across APIs) | openai + anthropic | pass | 3.3 s | prompt 22925 tokens; follow-up restored 22528 of 22985 (0.91 s); the same conversation through Messages restored 22528 |
+| Disconnect mid-stream | openai | pass | 1.0 s | closed after 20 chunks; next request answered in 0.18 s; cancelled +1 |
+| Capacity rejection (queue of one) | openai + anthropic | pass | 142.9 s | running and queued requests answered; a third refused: openai 503 service_unavailable_error, anthropic 529 OverloadedError |

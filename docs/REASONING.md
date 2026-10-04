@@ -24,6 +24,11 @@ The template's variables are also accepted directly, as other servers for this m
 user message. Settings that contradict each other (`reasoning_effort: "low"` with `enable_thinking: false`) are refused.
 No other template variable is accepted.
 
+Responses takes the same levels as `reasoning.effort` and returns a `reasoning` item ([RESPONSES_API.md](RESPONSES_API.md)).
+Messages thinks only when asked, as Anthropic defines it: `thinking: {"type": "adaptive"}` or `"enabled"` (with
+`budget_tokens`, a hard limit that closes the block), `output_config.effort` for the level, and a `thinking` block in the
+response ([ANTHROPIC_API.md](ANTHROPIC_API.md)).
+
 Because the controls only change the rendered prompt, they change the prompt's tokens and therefore its prefix-cache
 identity: requests that differ in effort share cached state only up to the first token where their prompts differ (the
 system message, for any effort that has instructions).
