@@ -23,6 +23,8 @@ import org.slf4j.LoggerFactory;
 /// and it cancels the session so no further quantum starts.
 final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.Output {
     private static final Logger LOG = LoggerFactory.getLogger(ChatGeneration.class);
+    /// The per-request summary; turn it off with `logging.level.euhedral.requests=warn`.
+    private static final Logger REQUESTS = LoggerFactory.getLogger("euhedral.requests");
     private static final tools.jackson.databind.json.JsonMapper JSON = tools.jackson.databind.json.JsonMapper.builder()
             .enable(tools.jackson.core.StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(tools.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
@@ -191,6 +193,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             startSink();
             write(() -> this.sink.finish(finish));
             report(ServerMetrics.Outcome.SUCCESS, null);
+            logFinish(finish);
             if (this.telemetry != null) {
                 this.telemetry
                         .metrics()
@@ -319,6 +322,29 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
         this.sinkStarted = true;
         int cached = this.generation.cachedPromptTokens();
         write(() -> this.sink.start(cached));
+    }
+
+    /// One line per answered generation, the prefix cache's share included, for an operator reading the log.
+    private void logFinish(Finish finish) {
+        if (!REQUESTS.isInfoEnabled()) return;
+        TokenUsage usage = finish.usage();
+        long now = System.nanoTime();
+        long first = this.firstTokenNanos;
+        double ttft = first == 0 ? 0 : (first - this.startedNanos) / 1e9;
+        double decode =
+                first == 0 || usage.completionTokens() < 2 ? 0 : (usage.completionTokens() - 1) * 1e9 / (now - first);
+        REQUESTS.info(
+                "{} {}: prompt {} tokens ({} restored from the prefix cache), {} generated{}, first token {} s,"
+                        + " {} tok/s, {}",
+                this.telemetry == null ? "-" : this.telemetry.api(),
+                this.plan.id(),
+                usage.promptTokens(),
+                usage.cachedPromptTokens(),
+                usage.completionTokens(),
+                usage.reasoningTokens() == null ? "" : " (" + usage.reasoningTokens() + " reasoning)",
+                String.format(java.util.Locale.ROOT, "%.3f", ttft),
+                String.format(java.util.Locale.ROOT, "%.1f", decode),
+                finish.reason().name().toLowerCase(java.util.Locale.ROOT));
     }
 
     private void report(ServerMetrics.Outcome outcome, String constraintFailure) {

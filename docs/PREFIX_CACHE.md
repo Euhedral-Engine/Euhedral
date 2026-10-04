@@ -114,6 +114,21 @@ checkpoints are 9 x 147 MiB of GDN state and 18 KiB of KV per token, about 1.6 G
 At the default size the arena holds the GDN state of at most 27 checkpoints, so a deployment with many distinct long
 prefixes evicts; the interval and the size are settings for that reason.
 
+## Seeing it work
+
+- Each response reports the prompt tokens restored instead of prefilled: `usage.prompt_tokens_details.cached_tokens`
+  (Chat Completions), `usage.input_tokens_details.cached_tokens` (Responses), `usage.cache_read_input_tokens`
+  (Messages, whose `input_tokens` then counts only the prefilled ones).
+- The server logs one line per answered request under the `euhedral.requests` logger: prompt tokens, how many the
+  cache restored, tokens generated, time to the first token and decode rate.
+- `/metrics` exports lookups, hits, restored tokens, captures, restores and their times, evictions, checkpoints held
+  and arena bytes ([OPERATIONS.md](OPERATIONS.md)).
+
+All three API surfaces render a conversation through the same template, so the same conversation sent through any of
+them is the same prompt and shares checkpoints; a request's prompt is encoded once, by the planner. Reasoning settings,
+replayed reasoning and tool definitions are part of the rendered prompt, so requests that differ in them share cached
+state only up to the first token where their prompts differ.
+
 ## Limits
 
 - A prompt shorter than 512 tokens has no checkpoint, and one of 513 to 1024 tokens reuses at most its first 512.
