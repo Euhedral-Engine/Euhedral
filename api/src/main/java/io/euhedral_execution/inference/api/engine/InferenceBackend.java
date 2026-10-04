@@ -46,10 +46,15 @@ public interface InferenceBackend {
     CompletableFuture<EncodedPrompt> encodePrompt(String prompt);
 
     /// How a generation's output is shaped. With `reasoning` the prompt opened the model's think block, so the
-    /// output is reasoning up to `</think>` and the answer after it. A non-null `grammar` (llguidance Lark)
-    /// constrains the answer; a backend must enforce it while sampling.
-    record OutputSpec(boolean reasoning, String grammar) {
-        public static final OutputSpec TEXT = new OutputSpec(false, null);
+    /// output is reasoning up to `</think>`, at most `reasoningBudget` tokens (`Integer.MAX_VALUE`: no cap),
+    /// and the answer after it. A non-null `grammar` (llguidance Lark) constrains the answer. A backend must
+    /// enforce both while sampling.
+    record OutputSpec(boolean reasoning, int reasoningBudget, String grammar) {
+        public static final OutputSpec TEXT = new OutputSpec(false, Integer.MAX_VALUE, null);
+
+        public OutputSpec(boolean reasoning, String grammar) {
+            this(reasoning, Integer.MAX_VALUE, grammar);
+        }
     }
 
     /// Compiles an answer grammar (llguidance Lark) without generating; throws
@@ -80,6 +85,11 @@ public interface InferenceBackend {
 
         void cancel();
 
+        /// Prompt tokens the generation restored from the prefix cache; known once it produced its first text.
+        default int cachedPromptTokens() {
+            return 0;
+        }
+
         /// True when cancellation was requested by any party, including engine shutdown.
         boolean isCancelled();
 
@@ -88,10 +98,15 @@ public interface InferenceBackend {
     }
 
     /// `completionTokens` counts every sampled token, including a terminating stop token; `reasoningTokens` counts
-    /// those of the reasoning, before `</think>`.
-    record Result(int completionTokens, boolean stopTokenReached, int reasoningTokens) {
+    /// those of the reasoning, before `</think>`; `cachedPromptTokens` of the prompt were restored from the prefix
+    /// cache instead of prefilled.
+    record Result(int completionTokens, boolean stopTokenReached, int reasoningTokens, int cachedPromptTokens) {
         public Result(int completionTokens, boolean stopTokenReached) {
-            this(completionTokens, stopTokenReached, 0);
+            this(completionTokens, stopTokenReached, 0, 0);
+        }
+
+        public Result(int completionTokens, boolean stopTokenReached, int reasoningTokens) {
+            this(completionTokens, stopTokenReached, reasoningTokens, 0);
         }
     }
 }

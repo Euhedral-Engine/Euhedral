@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.api.chat;
 
-import io.euhedral_execution.inference.api.openai.OpenAiException;
 import java.util.Map;
 
 /// Resolves a request's reasoning controls into the checkpoint template's thinking variables.
@@ -19,14 +18,13 @@ public final class Reasoning {
         Map<?, ?> kwargs = Map.of();
         if (templateKwargs != null) {
             if (!(templateKwargs instanceof Map<?, ?> map))
-                throw OpenAiException.invalidRequest(
-                        "'chat_template_kwargs' must be an object.", "chat_template_kwargs");
+                throw ApiException.invalidRequest("'chat_template_kwargs' must be an object.", "chat_template_kwargs");
             kwargs = map;
             for (Object key : kwargs.keySet()) {
                 if (!key.equals("enable_thinking")
                         && !key.equals("reasoning_effort")
                         && !key.equals("preserve_thinking"))
-                    throw OpenAiException.unsupportedParameter("chat_template_kwargs." + key);
+                    throw ApiException.unsupportedParameter("chat_template_kwargs." + key);
             }
         }
         Boolean enable = flag(kwargs.get("enable_thinking"), "chat_template_kwargs.enable_thinking");
@@ -36,17 +34,17 @@ public final class Reasoning {
                 ? null
                 : level(kwargs.get("reasoning_effort"), "chat_template_kwargs.reasoning_effort");
         if (templateLevel == Level.NONE)
-            throw OpenAiException.invalidRequest(
+            throw ApiException.invalidRequest(
                     "'chat_template_kwargs.reasoning_effort' must be low, medium or xhigh; use enable_thinking to turn"
                             + " thinking off.",
                     "chat_template_kwargs.reasoning_effort");
         if (level != null && templateLevel != null && level != templateLevel)
-            throw OpenAiException.invalidRequest(
+            throw ApiException.invalidRequest(
                     "'reasoning_effort' and 'chat_template_kwargs.reasoning_effort' conflict; send only one.",
                     "reasoning_effort");
         if (level == null) level = templateLevel;
         if (enable != null && level != null && enable != (level != Level.NONE))
-            throw OpenAiException.invalidRequest(
+            throw ApiException.invalidRequest(
                     "'chat_template_kwargs.enable_thinking' conflicts with 'reasoning_effort'.", "reasoning_effort");
         boolean enabled = enable != null ? enable : level != Level.NONE;
         QwenChatTemplate.Effort resolved =
@@ -79,7 +77,7 @@ public final class Reasoning {
                 case "high", "xhigh":
                     return Level.HIGH;
                 case "minimal":
-                    throw OpenAiException.invalidRequest(
+                    throw ApiException.invalidRequest(
                             "'" + param + "' 'minimal' is not supported: this model's reasoning levels are none, low,"
                                     + " medium and high.",
                             param);
@@ -87,13 +85,12 @@ public final class Reasoning {
                     break;
             }
         }
-        throw OpenAiException.invalidRequest(
-                "'" + param + "' must be one of none, low, medium, high (or xhigh).", param);
+        throw ApiException.invalidRequest("'" + param + "' must be one of none, low, medium, high (or xhigh).", param);
     }
 
     private static Boolean flag(Object value, String param) {
         if (value == null) return null;
         if (value instanceof Boolean flag) return flag;
-        throw OpenAiException.invalidRequest("'" + param + "' must be a boolean.", param);
+        throw ApiException.invalidRequest("'" + param + "' must be a boolean.", param);
     }
 }

@@ -1,8 +1,9 @@
 package io.euhedral_execution.inference.api.web;
 
+import io.euhedral_execution.inference.api.anthropic.AnthropicErrors;
+import io.euhedral_execution.inference.api.chat.ApiException;
 import io.euhedral_execution.inference.api.engine.InferenceUnavailableException;
 import io.euhedral_execution.inference.api.openai.OpenAiError;
-import io.euhedral_execution.inference.api.openai.OpenAiException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,37 +17,45 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
-/// Maps every failure to an OpenAI error object. Internal exception text is logged, never returned.
+/// Maps every failure to the error object of the surface the request addressed: Anthropic's for `/v1/messages`,
+/// OpenAI's otherwise. Internal exception text is logged, never returned.
 @RestControllerAdvice
-public class OpenAiErrorHandler {
-    private static final Logger LOG = LoggerFactory.getLogger(OpenAiErrorHandler.class);
+public class ApiErrorHandler {
+    private static final Logger LOG = LoggerFactory.getLogger(ApiErrorHandler.class);
 
-    @ExceptionHandler(OpenAiException.class)
-    ResponseEntity<OpenAiError> openAi(OpenAiException exception) {
-        return body(exception.status(), exception.toError());
+    @ExceptionHandler(ApiException.class)
+    ResponseEntity<Object> api(ApiException exception, HttpServletRequest request) {
+        Object body = request.getRequestURI().startsWith("/v1/messages")
+                ? AnthropicErrors.body(exception)
+                : OpenAiError.of(exception);
+        return body(exception.status(), body);
     }
 
     @ExceptionHandler(InferenceUnavailableException.class)
-    ResponseEntity<OpenAiError> unavailable(InferenceUnavailableException exception) {
-        return openAi(OpenAiException.unavailable("The inference engine is unavailable: " + exception.getMessage()));
+    ResponseEntity<Object> unavailable(InferenceUnavailableException exception, HttpServletRequest request) {
+        return api(ApiException.unavailable("The inference engine is unavailable: " + exception.getMessage()), request);
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
-    ResponseEntity<OpenAiError> unreadable(HttpMessageNotReadableException exception) {
+    ResponseEntity<Object> unreadable(HttpMessageNotReadableException exception, HttpServletRequest request) {
         for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
-            if (cause instanceof ChatRequestBodyLimit.TooLarge) return openAi(OpenAiException.requestTooLarge());
+            if (cause instanceof ChatRequestBodyLimit.TooLarge) return api(ApiException.requestTooLarge(), request);
         }
         LOG.debug("Unreadable request body", exception);
-        return openAi(OpenAiException.invalidRequest(
-                "We could not parse the JSON body of your request. Check that it is valid JSON and that each"
-                        + " field has the documented type.",
-                null));
+        return api(
+                ApiException.invalidRequest(
+                        "We could not parse the JSON body of your request. Check that it is valid JSON and that each"
+                                + " field has the documented type.",
+                        null),
+                request);
     }
 
     @ExceptionHandler(NoResourceFoundException.class)
-    ResponseEntity<OpenAiError> notFound(HttpServletRequest request) {
-        return openAi(OpenAiException.notFound(
-                "Unknown request URL: " + request.getMethod() + " " + request.getRequestURI() + "."));
+    ResponseEntity<Object> notFound(HttpServletRequest request) {
+        return api(
+                ApiException.notFound(
+                        "Unknown request URL: " + request.getMethod() + " " + request.getRequestURI() + "."),
+                request);
     }
 
     /// The client disconnected; there is nobody to answer.
@@ -55,20 +64,19 @@ public class OpenAiErrorHandler {
 
     /// Spring MVC protocol errors (405, 415, 406, ...) implement `ErrorResponse` and keep their status.
     @ExceptionHandler(Exception.class)
-    ResponseEntity<OpenAiError> unexpected(Exception exception) {
+    ResponseEntity<Object> unexpected(Exception exception, HttpServletRequest request) {
         if (exception instanceof ErrorResponse framework
                 && framework.getStatusCode().is4xxClientError()) {
             String detail = framework.getBody().getDetail();
-            return body(
-                    framework.getStatusCode(),
-                    new OpenAiError(new OpenAiError.Body(
-                            detail == null ? "Invalid request." : detail, "invalid_request_error", null, null)));
+            return api(
+                    ApiException.protocol(framework.getStatusCode(), detail == null ? "Invalid request." : detail),
+                    request);
         }
         LOG.error("Unhandled API failure", exception);
-        return openAi(OpenAiException.serverError());
+        return api(ApiException.serverError(), request);
     }
 
-    private static ResponseEntity<OpenAiError> body(HttpStatusCode status, OpenAiError error) {
+    private static ResponseEntity<Object> body(HttpStatusCode status, Object error) {
         // Explicit type: an SSE Accept header must not turn an error into a 406.
         return ResponseEntity.status(status)
                 .contentType(MediaType.APPLICATION_JSON)
