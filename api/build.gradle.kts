@@ -22,6 +22,8 @@ dependencies {
     implementation(platform(libs.spring.boot.dependencies))
     implementation(project(":core"))
     implementation(libs.spring.boot.starter.webmvc)
+    implementation(libs.spring.boot.starter.actuator)
+    implementation(libs.micrometer.registry.prometheus)
     testImplementation(platform(libs.spring.boot.dependencies))
     testImplementation(libs.spring.boot.starter.webmvc.test)
     testImplementation(libs.euhedral.core)

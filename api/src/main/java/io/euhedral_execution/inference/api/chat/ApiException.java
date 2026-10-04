@@ -23,6 +23,11 @@ public final class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.valueOf(status.value()), "invalid_request_error", message, null, null);
     }
 
+    /// A JSON Schema or grammar that cannot be enforced while sampling.
+    public static ApiException unenforceableSchema(String message, String param) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "invalid_request_error", message, param, "unsupported_schema");
+    }
+
     public static ApiException invalidRequest(String message, String param) {
         return new ApiException(HttpStatus.BAD_REQUEST, "invalid_request_error", message, param, null);
     }

@@ -2,6 +2,8 @@ package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.SamplingDefaults;
+import io.euhedral_execution.inference.api.metrics.EngineMetrics;
+import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import java.io.IOException;
 import org.slf4j.Logger;
@@ -50,7 +52,16 @@ public class InferenceEngineConfiguration {
 
     @Bean(destroyMethod = "close")
     EngineInferenceBackend inferenceBackend(
-            InferenceEngine engine, InferenceProperties properties, QwenChatTemplate chatTemplate) {
-        return new EngineInferenceBackend(engine, properties.modelId(), chatTemplate);
+            InferenceEngine engine,
+            InferenceProperties properties,
+            QwenChatTemplate chatTemplate,
+            ServerMetrics metrics) {
+        return new EngineInferenceBackend(engine, properties.modelId(), chatTemplate, metrics);
+    }
+
+    @Bean
+    EngineMetrics engineMetrics(
+            InferenceEngine engine, InferenceProperties properties, EngineInferenceBackend backend) {
+        return new EngineMetrics(engine, properties.modelId(), backend.contextLength());
     }
 }

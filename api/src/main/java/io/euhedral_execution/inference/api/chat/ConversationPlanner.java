@@ -118,7 +118,8 @@ public class ConversationPlanner {
         try {
             this.backend.checkJsonSchema(OutputGrammar.schemaText(schema));
         } catch (GrammarException refused) {
-            throw ApiException.invalidRequest("The JSON Schema cannot be enforced: " + refused.getMessage(), param);
+            throw ApiException.unenforceableSchema(
+                    "The JSON Schema cannot be enforced: " + refused.getMessage(), param);
         }
     }
 
