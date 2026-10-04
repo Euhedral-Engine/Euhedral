@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.api.anthropic.MessagesRequest;
 import io.euhedral_execution.inference.api.chat.ApiException;
 import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
+import io.euhedral_execution.inference.api.responses.ResponsesRequest;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -28,7 +29,9 @@ final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
     @Override
     public boolean supports(
             MethodParameter method, Type targetType, Class<? extends HttpMessageConverter<?>> converter) {
-        return targetType == ChatCompletionRequest.class || targetType == MessagesRequest.class;
+        return targetType == ChatCompletionRequest.class
+                || targetType == MessagesRequest.class
+                || targetType == ResponsesRequest.class;
     }
 
     @Override

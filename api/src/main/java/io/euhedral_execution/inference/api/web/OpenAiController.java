@@ -6,6 +6,8 @@ import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
 import io.euhedral_execution.inference.api.openai.ChatRequestMapper;
 import io.euhedral_execution.inference.api.openai.ModelList;
+import io.euhedral_execution.inference.api.responses.ResponsesMapper;
+import io.euhedral_execution.inference.api.responses.ResponsesRequest;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,12 +32,18 @@ public class OpenAiController {
     private final InferenceBackend backend;
     private final GenerationService generations;
     private final ChatRequestMapper chatRequests;
+    private final ResponsesMapper responses;
     private final long createdAt = Instant.now().getEpochSecond();
 
-    public OpenAiController(InferenceBackend backend, GenerationService generations, ChatRequestMapper chatRequests) {
+    public OpenAiController(
+            InferenceBackend backend,
+            GenerationService generations,
+            ChatRequestMapper chatRequests,
+            ResponsesMapper responses) {
         this.backend = backend;
         this.generations = generations;
         this.chatRequests = chatRequests;
+        this.responses = responses;
     }
 
     /// The served model, in OpenAI's list format, or Anthropic's for a client that sends `anthropic-version`.
@@ -74,5 +82,11 @@ public class OpenAiController {
     @PostMapping(path = "/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
     public DeferredResult<Object> chatCompletions(@RequestBody ChatCompletionRequest request) {
         return this.generations.submit(this.chatRequests.planAsync(request));
+    }
+
+    /// The Responses API over the same generation: a `response` body or its event stream.
+    @PostMapping(path = "/responses", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public DeferredResult<Object> responses(@RequestBody ResponsesRequest request) {
+        return this.generations.submit(this.responses.planAsync(request));
     }
 }

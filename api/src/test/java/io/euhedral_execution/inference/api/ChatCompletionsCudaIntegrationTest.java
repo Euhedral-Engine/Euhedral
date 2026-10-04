@@ -374,6 +374,25 @@ class ChatCompletionsCudaIntegrationTest {
         assertSessionsReleased(before);
     }
 
+    @Test
+    @Order(10)
+    void responsesReturnOutputItemsFromTheSamePipeline() throws Exception {
+        DeviceBytes before = deviceBytes();
+        var response = post(
+                "/v1/responses",
+                "{\"model\":\"" + MODEL + "\",\"temperature\":0,\"max_output_tokens\":1024,"
+                        + "\"reasoning\":{\"effort\":\"low\"},\"input\":\"What is 6 times 7? Reply with the number.\"}");
+        assertEquals(200, response.statusCode(), response.body());
+        JsonNode body = JSON.readTree(response.body());
+        System.out.println("Responses: " + body);
+        assertEquals("completed", body.get("status").asString());
+        assertEquals("reasoning", body.at("/output/0/type").asString());
+        assertFalse(body.at("/output/0/content/0/text").asString().isBlank());
+        assertEquals("message", body.at("/output/1/type").asString());
+        assertTrue(body.at("/output/1/content/0/text").asString().contains("42"));
+        assertSessionsReleased(before);
+    }
+
     /// The engine's device bytes and the part its execution graphs retain between quanta.
     private record DeviceBytes(long allocated, long retainedWorkspace) {}
 

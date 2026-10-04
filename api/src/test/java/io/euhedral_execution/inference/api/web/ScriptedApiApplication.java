@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.openai.ChatRequestMapper;
+import io.euhedral_execution.inference.api.responses.ResponsesMapper;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import org.springframework.boot.SpringBootConfiguration;
@@ -26,6 +27,7 @@ import org.springframework.context.annotation.Import;
     OpenAiController.class,
     AnthropicController.class,
     MessagesMapper.class,
+    ResponsesMapper.class,
     HealthController.class,
     ApiErrorHandler.class,
     ChatRequestBodyLimit.class,
