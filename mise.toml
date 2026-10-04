@@ -2,6 +2,8 @@
 gradle = "9.6.1"
 java = "25.0.2"
 zig = "0.16.0"
+rust = { version = "1.95.0", targets = "x86_64-pc-windows-gnu", profile = "minimal" }
+"cargo:cargo-zigbuild" = "0.23.4"
 
 [tasks."format-check"]
 description = "Check Java formatting."

@@ -237,8 +237,9 @@ quantum and every write to the client run as lattice work (docs/FRAME_MODEL.md, 
 
 ## Building and testing
 
-Requirements: Java 25, Gradle 9.6.1 (the wrapper is committed), Zig 0.16.0 for the native library; CUDA 13.1+ headers and
-libraries are resolved automatically. `mise.toml` records the versions and the common tasks.
+Requirements: Java 25, Gradle 9.6.1 (the wrapper is committed), Zig 0.16.0 for the native library, and Rust 1.95.0 with
+cargo-zigbuild 0.23.4 for llguidance (constrained decoding, built from its pinned crates.io release); CUDA 13.1+ headers
+and libraries are resolved automatically. `mise.toml` records the versions and the common tasks (`mise install`).
 
 ```bash
 ./gradlew build            # compiles, formats, runs the CPU tests, builds the Linux and Windows native products
