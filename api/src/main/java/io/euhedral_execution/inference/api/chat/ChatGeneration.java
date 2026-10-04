@@ -146,6 +146,11 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                 this.delivered = true;
                 return;
             }
+            // Before the failure: a cancelled speculative step ends the generation exceptionally.
+            if (this.shutdown.get()) {
+                deliverFailure(ApiException.unavailable("Generation was interrupted by server shutdown."));
+                return;
+            }
             if (failure != null) {
                 Throwable cause =
                         failure instanceof java.util.concurrent.CompletionException ? failure.getCause() : failure;
@@ -154,10 +159,6 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                 return;
             }
             if (this.malformedToolCall != null) throw this.malformedToolCall;
-            if (this.shutdown.get()) {
-                deliverFailure(ApiException.unavailable("Generation was interrupted by server shutdown."));
-                return;
-            }
             // Nobody in this request cancelled, so the engine did: it is shutting down. Sampled before the
             // flush below, which may itself match a stop sequence and cancel.
             boolean endedByRequest = this.stopFilter.matched() || this.callLimitReached;

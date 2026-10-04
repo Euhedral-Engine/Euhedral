@@ -14,6 +14,6 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 public class EuhedralInferenceApplication {
 
     static void main(String[] args) {
-        SpringApplication.run(EuhedralInferenceApplication.class, args);
+        ShutdownSignals.install(SpringApplication.run(EuhedralInferenceApplication.class, args));
     }
 }

@@ -13,6 +13,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.context.request.async.DeferredResult;
@@ -26,10 +28,18 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 /// the workers write, both in the format of the surface's [Responder]. One generation runs at a time and at most
 /// `maxQueuedGenerations` wait; a finished generation starts the next on a worker. Validation and capacity
 /// failures reach the client as HTTP errors, because a stream's emitter becomes the result only once its request
-/// was planned and admitted. Because this service depends on the backend, Spring destroys it before the engine:
-/// waiting requests are refused and the running generation is stopped before the engine closes.
+/// was planned and admitted.
+///
+/// At shutdown the web server first stops accepting connections and waits for the requests in flight, queued ones
+/// included, up to `spring.lifecycle.timeout-per-shutdown-phase`. This service stops next, in a lifecycle phase
+/// between that wait and the web server's stop, while responses can still be written: requests still waiting are
+/// refused with 503 and the running generation is stopped and answered with an error. Spring destroys the engine
+/// after that, because this service depends on it.
 @Service
-public class GenerationService implements DisposableBean {
+public class GenerationService implements SmartLifecycle, DisposableBean {
+    /// After the web server's graceful shutdown, before it stops.
+    private static final int PHASE = WebServerApplicationContext.GRACEFUL_SHUTDOWN_PHASE - 512;
+
     private static final Logger LOG = LoggerFactory.getLogger(GenerationService.class);
 
     private final InferenceBackend backend;
@@ -38,6 +48,7 @@ public class GenerationService implements DisposableBean {
     private final ArrayDeque<Admission> waiting = new ArrayDeque<>();
     private Admission running;
     private boolean closed;
+    private boolean started;
 
     private final ServerMetrics metrics;
 
@@ -257,12 +268,36 @@ public class GenerationService implements DisposableBean {
         return ApiException.from(failure);
     }
 
+    /// Also reopens a service stopped by a context that is started again.
     @Override
-    public void destroy() throws InterruptedException {
-        // Graceful web shutdown has already drained what it could; stop the rest before the engine closes.
+    public synchronized void start() {
+        this.started = true;
+        this.closed = false;
+    }
+
+    /// Pausing a context (Spring stops its lifecycle beans while it is idle) must not refuse requests.
+    @Override
+    public boolean isPauseable() {
+        return false;
+    }
+
+    @Override
+    public synchronized boolean isRunning() {
+        return this.started && !this.closed;
+    }
+
+    @Override
+    public int getPhase() {
+        return PHASE;
+    }
+
+    /// Graceful web shutdown has drained what it could; refuse what waits and stop what runs.
+    @Override
+    public void stop() {
         List<Admission> refused;
         Admission active;
         synchronized (this) {
+            if (this.closed) return;
             this.closed = true;
             refused = List.copyOf(this.waiting);
             this.waiting.clear();
@@ -270,15 +305,31 @@ public class GenerationService implements DisposableBean {
         }
         for (Admission admission : refused) {
             this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
-            admission.result.setErrorResult(ApiException.unavailable("The server is shutting down."));
+            try {
+                admission.result.setErrorResult(ApiException.unavailable("The server is shutting down."));
+            } catch (RuntimeException completed) {
+                // The container already ended the request.
+            }
         }
         ChatGeneration job = active == null ? null : active.generation;
+        LOG.info(
+                "Shutting down: {} waiting requests refused, {}",
+                refused.size(),
+                job == null ? "no generation running" : "stopping the running generation");
         if (job == null) return;
         job.shutDown();
         try {
             job.responded().get(30, TimeUnit.SECONDS);
         } catch (TimeoutException | ExecutionException late) {
             LOG.warn("The running generation did not stop within 30s; engine shutdown will cancel its session");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
+    }
+
+    /// For a context that closes without having started its lifecycle.
+    @Override
+    public void destroy() {
+        stop();
     }
 }

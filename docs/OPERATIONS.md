@@ -1,5 +1,87 @@
 # Operations
 
+## Settings
+
+Each setting is a property or its environment variable: `euhedral.inference.artifact-path` is
+`EUHEDRAL_INFERENCE_ARTIFACT_PATH`. `PORT` sets the port (1738).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `euhedral.inference.artifact-path` | required | The `.edrl` artifact to serve. |
+| `euhedral.inference.tokenizer-directory` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
+| `euhedral.inference.cuda-library-path` | required | `libeuhedral_cuda.so` (`euhedral_cuda.dll` on Windows). `libllguidance.so` sits beside it and the kernel sources in `../share/euhedral_cuda/`, as the build lays them out. |
+| `euhedral.inference.worker-cpus` | required | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`. |
+| `euhedral.inference.model-id` | required | The name clients send as `model`. |
+| `euhedral.inference.max-context-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
+| `euhedral.inference.prefix-cache-bytes` | 4294967296 | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
+| `euhedral.inference.prefix-cache-checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
+| `euhedral.inference.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
+| `euhedral.api.default-max-tokens` | 4096 | Completion length when a request sets none. |
+| `euhedral.api.max-queued-generations` | 16 | Requests waiting behind the running generation; more are refused with 503. |
+| `euhedral.api.max-request-bytes` | 1048576 | Request body limit (413 beyond). |
+| `euhedral.api.request-timeout` | 30m | Per-request limit. |
+| `spring.lifecycle.timeout-per-shutdown-phase` | 30s | How long a shutdown waits for requests in flight (below). |
+
+`EUHEDRAL_CUDA_INCLUDE_DIR` points at the CUDA headers the kernels compile against at startup (else `CUDA_HOME/include`,
+`CUDA_PATH/include`, `/usr/local/cuda/include`); `LD_LIBRARY_PATH` must reach the CUDA runtime and NVRTC libraries. The
+image sets both.
+
+## Starting
+
+Before anything loads, the server checks the files the settings name: the artifact, the checkpoint's tokenizer files,
+the CUDA library with llguidance and the kernel sources beside it, and the CUDA headers. It reports every problem at
+once, each with the setting to change, and exits within about a second:
+
+```text
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+The server's settings point at files that are missing:
+
+    euhedral.inference.artifact-path (EUHEDRAL_INFERENCE_ARTIFACT_PATH): no file at /models/nope.edrl
+    euhedral.inference.cuda-library-path (EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH): the constrained-decoding library belongs at /opt/euhedral/lib/libllguidance.so, beside the CUDA library, and is missing
+
+Action:
+
+Correct the settings above. The settings and their environment variables are listed in docs/OPERATIONS.md.
+```
+
+What fails later, while the engine loads, is reported the same way, with the messages of its causes instead of the
+chain of Spring beans around them: worker CPUs this process may not run on, a context longer than the model's positions
+or than the GPU can hold with every weight in host memory, a GPU that is missing or not a Blackwell, a CUDA runtime
+the native library cannot load. A port in use is reported by Spring Boot, after the weights have loaded.
+
+A successful start logs the context and how it fits (RTX 5070 Ti, `qwen3_8_27b_q3`, the default context):
+
+```text
+Context 32768 tokens: 13854 MiB of the 15100 MiB free on the GPU, 0 MiB of weights in host memory
+Prefix cache: 4096 MiB pinned, a checkpoint every 2048 tokens
+Started EuhedralInferenceApplication in 7.761 seconds (process running for 7.951)
+```
+
+With `qwen3_8_27b_nvfp4` and a context of 131072 the same card keeps 3485 MiB of weights in host memory.
+
+The port opens only after the engine has loaded, so a server that answers is ready.
+
+## Health
+
+`GET /health` answers `200 {"status":"up","engine":"ready","model":"..."}`, and `503` with `"engine":"closed"` once the
+engine has closed. The image's Docker health check calls it.
+
+## Shutting down
+
+On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
+`spring.lifecycle.timeout-per-shutdown-phase` (30 s) for the requests in flight, queued ones included, to finish. What is
+left after that is answered before the server stops: a request still queued gets 503 (`The server is shutting down.`),
+the running generation is stopped at its next quantum and gets an error (in a stream, an `error` event), and the engine
+then closes its sessions, its workers and the GPU. A second signal exits at once.
+
+Give the process longer than the window to exit: Docker's default is 10 s, so run the container with
+`--stop-timeout 45` (Kubernetes: `terminationGracePeriodSeconds: 45`), or shorten the window.
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text format. Point a Prometheus scrape job at `http://host:1738/metrics`; no other
