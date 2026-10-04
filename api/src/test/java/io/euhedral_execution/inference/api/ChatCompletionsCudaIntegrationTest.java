@@ -340,6 +340,40 @@ class ChatCompletionsCudaIntegrationTest {
         assertSessionsReleased(before);
     }
 
+    @Test
+    @Order(9)
+    void anthropicMessagesShareThePipelineAndItsCachedPrefixes() throws Exception {
+        DeviceBytes before = deviceBytes();
+        String system = "Answer with one word. " + "Follow the house style guide closely. ".repeat(160);
+        String body = "{\"model\":\"" + MODEL + "\",\"max_tokens\":16,\"temperature\":0,\"system\":\"" + system
+                + "\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}";
+        JsonNode cold = JSON.readTree(post("/v1/messages", body).body());
+        System.out.println("Anthropic message: " + cold);
+        assertEquals("message", cold.get("type").asString());
+        assertTrue(cold.at("/content/0/text")
+                .asString()
+                .toLowerCase(java.util.Locale.ROOT)
+                .contains("paris"));
+        assertEquals("end_turn", cold.get("stop_reason").asString());
+        JsonNode warm = JSON.readTree(post("/v1/messages", body).body());
+        int cached = warm.at("/usage/cache_read_input_tokens").asInt();
+        assertTrue(cached >= 512 && cached % 512 == 0, warm.toString());
+        assertEquals(
+                cold.at("/usage/input_tokens").asInt(),
+                warm.at("/usage/input_tokens").asInt() + cached);
+        // The same conversation through Chat Completions renders the same prompt and restores the same prefix.
+        JsonNode chat = JSON.readTree(post(
+                        "/v1/chat/completions",
+                        "{\"model\":\"" + MODEL
+                                + "\",\"reasoning_effort\":\"none\",\"max_tokens\":16,\"temperature\":0,"
+                                + "\"messages\":[{\"role\":\"system\",\"content\":\"" + system + "\"},{\"role\":"
+                                + "\"user\",\"content\":\"What is the capital of France?\"}]}")
+                .body());
+        assertEquals(
+                cached, chat.at("/usage/prompt_tokens_details/cached_tokens").asInt(), chat.toString());
+        assertSessionsReleased(before);
+    }
+
     /// The engine's device bytes and the part its execution graphs retain between quanta.
     private record DeviceBytes(long allocated, long retainedWorkspace) {}
 
@@ -370,9 +404,13 @@ class ChatCompletionsCudaIntegrationTest {
     }
 
     private HttpResponse<String> post(String body) throws Exception {
+        return post("/v1/chat/completions", body);
+    }
+
+    private HttpResponse<String> post(String path, String body) throws Exception {
         try (var client = HttpClient.newHttpClient()) {
             return client.send(
-                    HttpRequest.newBuilder(uri("/v1/chat/completions"))
+                    HttpRequest.newBuilder(uri(path))
                             .header("Content-Type", "application/json")
                             .POST(HttpRequest.BodyPublishers.ofString(body))
                             .build(),

@@ -1,11 +1,7 @@
 package io.euhedral_execution.inference.api.chat;
 
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
-import io.euhedral_execution.inference.api.openai.OpenAiException;
-import io.euhedral_execution.inference.api.openai.ToolCall;
-import io.euhedral_execution.inference.api.openai.Usage;
 import java.io.IOException;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
@@ -31,7 +27,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             .enable(tools.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             .build();
 
-    private final ChatCompletionPlan plan;
+    private final GenerationPlan plan;
     private final InferenceBackend.Generation generation;
     private final CompletionSink sink;
     private final SerialTasks delivery;
@@ -49,12 +45,13 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     private final CompletableFuture<Void> responded = new CompletableFuture<>();
     // Confined to the generation's callbacks, which the generation orders one after another.
     private boolean delivered;
+    private boolean sinkStarted;
     private ToolCallParser.MalformedToolCallException malformedToolCall;
     // Set when the single call allowed by parallel_tool_calls=false is complete.
     private boolean callLimitReached;
 
     ChatGeneration(
-            ChatCompletionPlan plan,
+            GenerationPlan plan,
             InferenceBackend.Generation generation,
             CompletionSink sink,
             SerialTasks delivery,
@@ -94,7 +91,6 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
 
     /// Starts the generation on the workers and returns.
     void start() {
-        write(this.sink::start);
         CompletableFuture<InferenceBackend.Result> result;
         try {
             result = this.abandoned.get()
@@ -113,13 +109,13 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             if (failure != null) {
                 Throwable cause =
                         failure instanceof java.util.concurrent.CompletionException ? failure.getCause() : failure;
-                LOG.error("Chat completion {} failed", this.plan.id(), cause);
-                deliverFailure(OpenAiException.serverError());
+                LOG.error("Generation {} failed", this.plan.id(), cause);
+                deliverFailure(ApiException.serverError());
                 return;
             }
             if (this.malformedToolCall != null) throw this.malformedToolCall;
             if (this.shutdown.get()) {
-                deliverFailure(OpenAiException.unavailable("Generation was interrupted by server shutdown."));
+                deliverFailure(ApiException.unavailable("Generation was interrupted by server shutdown."));
                 return;
             }
             // Nobody in this request cancelled, so the engine did: it is shutting down. Sampled before the
@@ -136,44 +132,49 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                 }
             }
             if (engineCancelled) {
-                deliverFailure(OpenAiException.unavailable("Generation was interrupted by engine shutdown."));
+                deliverFailure(ApiException.unavailable("Generation was interrupted by engine shutdown."));
                 return;
             }
             // The grammar admits only valid documents; a finished one that does not parse is never returned.
             if (this.jsonAnswer != null && result.stopTokenReached() && !isJson(this.jsonAnswer.toString())) {
-                LOG.error("Chat completion {} produced invalid JSON under its response format", this.plan.id());
-                deliverFailure(OpenAiException.invalidStructuredOutput());
+                LOG.error("Generation {} produced invalid JSON under its response format", this.plan.id());
+                deliverFailure(ApiException.invalidStructuredOutput());
                 return;
             }
-            String finishReason = finishReason(result);
-            Usage usage = Usage.of(
+            var usage = new TokenUsage(
                     this.plan.promptTokens(),
+                    result.cachedPromptTokens(),
                     result.completionTokens(),
                     this.plan.reasoning() ? result.reasoningTokens() : null);
+            Finish.Reason reason = finishReason(result);
+            var finish = new Finish(
+                    reason, reason == Finish.Reason.STOP_SEQUENCE ? this.stopFilter.matchedStop() : null, usage);
             this.delivered = true;
-            write(() -> this.sink.finish(finishReason, usage));
+            startSink();
+            write(() -> this.sink.finish(finish));
         } catch (ToolCallParser.MalformedToolCallException malformed) {
-            LOG.warn("Chat completion {} failed: {}", this.plan.id(), malformed.getMessage());
-            deliverFailure(OpenAiException.invalidToolCall(malformed.getMessage()));
+            LOG.warn("Generation {} failed: {}", this.plan.id(), malformed.getMessage());
+            deliverFailure(ApiException.invalidToolCall(malformed.getMessage()));
         } catch (RuntimeException | Error closeFailure) {
-            if (!this.abandoned.get()) LOG.error("Chat completion {} failed", this.plan.id(), closeFailure);
-            deliverFailure(OpenAiException.serverError());
+            if (!this.abandoned.get()) LOG.error("Generation {} failed", this.plan.id(), closeFailure);
+            deliverFailure(ApiException.serverError());
         } finally {
             this.delivery.execute(() -> this.responded.complete(null));
             this.finished.run();
         }
     }
 
-    private String finishReason(InferenceBackend.Result result) {
-        if (this.stopFilter.matched()) return "stop";
-        if (this.callLimitReached) return "tool_calls";
-        if (!result.stopTokenReached()) return "length";
-        return this.toolParser != null && this.toolParser.calls() > 0 ? "tool_calls" : "stop";
+    private Finish.Reason finishReason(InferenceBackend.Result result) {
+        if (this.stopFilter.matched()) return Finish.Reason.STOP_SEQUENCE;
+        if (this.callLimitReached) return Finish.Reason.TOOL_CALLS;
+        if (!result.stopTokenReached()) return Finish.Reason.LENGTH;
+        return this.toolParser != null && this.toolParser.calls() > 0 ? Finish.Reason.TOOL_CALLS : Finish.Reason.END;
     }
 
     /// One decoded text, on the worker that retired its quantum and before the next quantum is admitted.
     private void onText(String text) {
         if (this.abandoned.get() || this.malformedToolCall != null || this.stopFilter.matched()) return;
+        startSink();
         if (this.reasoning == null) answer(text);
         else this.reasoning.accept(text, this);
     }
@@ -221,16 +222,24 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     /// A complete call after raw output has passed stop-sequence filtering.
     @Override
     public void toolCall(String name, String arguments) {
-        String id = "call_" + UUID.randomUUID().toString().replace("-", "");
         int index = this.toolParser.calls() - 1;
-        write(() -> this.sink.toolCall(index, ToolCall.function(id, name, arguments)));
+        var call = new GeneratedCall(name, arguments);
+        write(() -> this.sink.toolCall(index, call));
         if (!this.plan.tools().parallel()) {
             this.callLimitReached = true;
             this.generation.cancel();
         }
     }
 
-    private void deliverFailure(OpenAiException error) {
+    /// Starts the response at the first token, when the prefix cache's restore is known.
+    private void startSink() {
+        if (this.sinkStarted) return;
+        this.sinkStarted = true;
+        int cached = this.generation.cachedPromptTokens();
+        write(() -> this.sink.start(cached));
+    }
+
+    private void deliverFailure(ApiException error) {
         if (this.abandoned.get() || this.delivered) return;
         this.delivered = true;
         this.delivery.execute(() -> {

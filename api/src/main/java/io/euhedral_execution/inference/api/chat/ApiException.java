@@ -1,15 +1,16 @@
-package io.euhedral_execution.inference.api.openai;
+package io.euhedral_execution.inference.api.chat;
 
 import org.springframework.http.HttpStatus;
 
-/// An API failure with its HTTP status and OpenAI error fields. Messages are client-safe by construction.
-public final class OpenAiException extends RuntimeException {
+/// An API failure with its HTTP status and error fields, in OpenAI's vocabulary (`type`, `param`, `code`); each API
+/// surface serializes it in its own error format. Messages are client-safe by construction.
+public final class ApiException extends RuntimeException {
     private final HttpStatus status;
     private final String type;
     private final String param;
     private final String code;
 
-    private OpenAiException(HttpStatus status, String type, String message, String param, String code) {
+    private ApiException(HttpStatus status, String type, String message, String param, String code) {
         super(message);
         this.status = status;
         this.type = type;
@@ -17,12 +18,17 @@ public final class OpenAiException extends RuntimeException {
         this.code = code;
     }
 
-    public static OpenAiException invalidRequest(String message, String param) {
-        return new OpenAiException(HttpStatus.BAD_REQUEST, "invalid_request_error", message, param, null);
+    /// A protocol error the web framework raised (405, 415, ...), with its status.
+    public static ApiException protocol(org.springframework.http.HttpStatusCode status, String message) {
+        return new ApiException(HttpStatus.valueOf(status.value()), "invalid_request_error", message, null, null);
     }
 
-    public static OpenAiException requestTooLarge() {
-        return new OpenAiException(
+    public static ApiException invalidRequest(String message, String param) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "invalid_request_error", message, param, null);
+    }
+
+    public static ApiException requestTooLarge() {
+        return new ApiException(
                 HttpStatus.CONTENT_TOO_LARGE,
                 "invalid_request_error",
                 "The chat completion request body exceeds the configured size limit.",
@@ -30,8 +36,8 @@ public final class OpenAiException extends RuntimeException {
                 "request_too_large");
     }
 
-    public static OpenAiException unsupportedParameter(String param) {
-        return new OpenAiException(
+    public static ApiException unsupportedParameter(String param) {
+        return new ApiException(
                 HttpStatus.BAD_REQUEST,
                 "invalid_request_error",
                 "Unsupported parameter: '" + param + "' is not supported by this server.",
@@ -39,8 +45,8 @@ public final class OpenAiException extends RuntimeException {
                 "unsupported_parameter");
     }
 
-    public static OpenAiException unrecognizedArgument(String param) {
-        return new OpenAiException(
+    public static ApiException unrecognizedArgument(String param) {
+        return new ApiException(
                 HttpStatus.BAD_REQUEST,
                 "invalid_request_error",
                 "Unrecognized request argument supplied: " + param,
@@ -48,13 +54,13 @@ public final class OpenAiException extends RuntimeException {
                 "unrecognized_argument");
     }
 
-    public static OpenAiException contextLengthExceeded(String message, String param) {
-        return new OpenAiException(
+    public static ApiException contextLengthExceeded(String message, String param) {
+        return new ApiException(
                 HttpStatus.BAD_REQUEST, "invalid_request_error", message, param, "context_length_exceeded");
     }
 
-    public static OpenAiException modelNotFound(String model) {
-        return new OpenAiException(
+    public static ApiException modelNotFound(String model) {
+        return new ApiException(
                 HttpStatus.NOT_FOUND,
                 "invalid_request_error",
                 "The model '" + model + "' does not exist or you do not have access to it.",
@@ -62,17 +68,17 @@ public final class OpenAiException extends RuntimeException {
                 "model_not_found");
     }
 
-    public static OpenAiException notFound(String message) {
-        return new OpenAiException(HttpStatus.NOT_FOUND, "invalid_request_error", message, null, null);
+    public static ApiException notFound(String message) {
+        return new ApiException(HttpStatus.NOT_FOUND, "invalid_request_error", message, null, null);
     }
 
-    public static OpenAiException unavailable(String message) {
-        return new OpenAiException(
+    public static ApiException unavailable(String message) {
+        return new ApiException(
                 HttpStatus.SERVICE_UNAVAILABLE, "service_unavailable_error", message, null, "engine_unavailable");
     }
 
-    public static OpenAiException serverError() {
-        return new OpenAiException(
+    public static ApiException serverError() {
+        return new ApiException(
                 HttpStatus.INTERNAL_SERVER_ERROR,
                 "server_error",
                 "The server had an error while processing your request.",
@@ -82,8 +88,8 @@ public final class OpenAiException extends RuntimeException {
 
     /// The model's output began a tool call that cannot be returned for the offered tools. The reason
     /// describes only the generated text and the request's own definitions.
-    public static OpenAiException invalidToolCall(String reason) {
-        return new OpenAiException(
+    public static ApiException invalidToolCall(String reason) {
+        return new ApiException(
                 HttpStatus.INTERNAL_SERVER_ERROR,
                 "server_error",
                 "The model produced an invalid tool call: " + reason + ".",
@@ -93,8 +99,8 @@ public final class OpenAiException extends RuntimeException {
 
     /// The model's output under a JSON response format is not a JSON document; never expected, since the
     /// grammar admits only documents, but never returned as a success either.
-    public static OpenAiException invalidStructuredOutput() {
-        return new OpenAiException(
+    public static ApiException invalidStructuredOutput() {
+        return new ApiException(
                 HttpStatus.INTERNAL_SERVER_ERROR,
                 "server_error",
                 "The model's output is not valid JSON for the requested response format.",
@@ -102,8 +108,8 @@ public final class OpenAiException extends RuntimeException {
                 "invalid_structured_output");
     }
 
-    public static OpenAiException timeout() {
-        return new OpenAiException(
+    public static ApiException timeout() {
+        return new ApiException(
                 HttpStatus.SERVICE_UNAVAILABLE,
                 "service_unavailable_error",
                 "The request timed out before generation completed.",
@@ -111,11 +117,31 @@ public final class OpenAiException extends RuntimeException {
                 "timeout");
     }
 
+    /// The API failure a failed request future carries: itself, the engine's unavailability, or a server error.
+    public static ApiException from(Throwable failure) {
+        Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
+                ? failure.getCause()
+                : failure;
+        if (cause instanceof ApiException api) return api;
+        if (cause instanceof io.euhedral_execution.inference.api.engine.InferenceUnavailableException unavailable)
+            return unavailable("The inference engine is unavailable: " + unavailable.getMessage());
+        org.slf4j.LoggerFactory.getLogger(ApiException.class).error("Request failed", cause);
+        return serverError();
+    }
+
     public HttpStatus status() {
         return this.status;
     }
 
-    public OpenAiError toError() {
-        return new OpenAiError(new OpenAiError.Body(getMessage(), this.type, this.param, this.code));
+    public String type() {
+        return this.type;
+    }
+
+    public String param() {
+        return this.param;
+    }
+
+    public String code() {
+        return this.code;
     }
 }

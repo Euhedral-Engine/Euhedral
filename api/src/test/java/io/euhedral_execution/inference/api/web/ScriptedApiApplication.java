@@ -1,10 +1,12 @@
 package io.euhedral_execution.inference.api.web;
 
-import io.euhedral_execution.inference.api.chat.ChatCompletionService;
-import io.euhedral_execution.inference.api.chat.ChatRequestMapper;
+import io.euhedral_execution.inference.api.anthropic.MessagesMapper;
+import io.euhedral_execution.inference.api.chat.ConversationPlanner;
+import io.euhedral_execution.inference.api.chat.GenerationService;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.engine.ApiProperties;
+import io.euhedral_execution.inference.api.openai.ChatRequestMapper;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import org.springframework.boot.SpringBootConfiguration;
@@ -22,10 +24,13 @@ import org.springframework.context.annotation.Import;
 @EnableConfigurationProperties(ApiProperties.class)
 @Import({
     OpenAiController.class,
+    AnthropicController.class,
+    MessagesMapper.class,
     HealthController.class,
-    OpenAiErrorHandler.class,
+    ApiErrorHandler.class,
     ChatRequestBodyLimit.class,
-    ChatCompletionService.class,
+    GenerationService.class,
+    ConversationPlanner.class,
     ChatRequestMapper.class
 })
 class ScriptedApiApplication {

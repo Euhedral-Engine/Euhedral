@@ -1,8 +1,9 @@
 package io.euhedral_execution.inference.api.web;
 
+import io.euhedral_execution.inference.api.anthropic.MessagesRequest;
+import io.euhedral_execution.inference.api.chat.ApiException;
 import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
-import io.euhedral_execution.inference.api.openai.OpenAiException;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -13,7 +14,8 @@ import org.springframework.http.converter.HttpMessageConverter;
 import org.springframework.web.bind.annotation.ControllerAdvice;
 import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
 
-/// Limits chat request bytes while Jackson reads the body, before it allocates tool schemas or renders
+/// Limits generation request bytes (Chat Completions and Messages) while Jackson reads the body, before it allocates
+/// tool schemas or renders
 /// the prompt. A declared length is rejected immediately; chunked bodies are counted as they arrive.
 @ControllerAdvice
 final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
@@ -26,7 +28,7 @@ final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
     @Override
     public boolean supports(
             MethodParameter method, Type targetType, Class<? extends HttpMessageConverter<?>> converter) {
-        return targetType == ChatCompletionRequest.class;
+        return targetType == ChatCompletionRequest.class || targetType == MessagesRequest.class;
     }
 
     @Override
@@ -36,7 +38,7 @@ final class ChatRequestBodyLimit extends RequestBodyAdviceAdapter {
             Type targetType,
             Class<? extends HttpMessageConverter<?>> converter)
             throws IOException {
-        if (message.getHeaders().getContentLength() > this.maxBytes) throw OpenAiException.requestTooLarge();
+        if (message.getHeaders().getContentLength() > this.maxBytes) throw ApiException.requestTooLarge();
         return new HttpInputMessage() {
             @Override
             public InputStream getBody() throws IOException {

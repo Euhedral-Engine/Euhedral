@@ -9,14 +9,20 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-/// One validated OpenAI function tool. `description` and `parameters` are null when the request omits
-/// them; `parameters` keeps the request's JSON Schema object, key order included. A `strict` tool's arguments
-/// are generated under its schema; the others' only as a JSON object.
-public record FunctionTool(String name, String description, Map<String, Object> parameters, boolean strict) {
+/// One validated function tool, from any API surface. `description` and `parameters` are null when the request
+/// omits them; `parameters` keeps the request's JSON Schema object, key order included. A `strict` tool's
+/// arguments are generated under its schema; the others' only as a JSON object. `parametersParam` names the schema's
+/// request field in errors.
+public record FunctionTool(
+        String name, String description, Map<String, Object> parameters, boolean strict, String parametersParam) {
 
     public FunctionTool {
         Objects.requireNonNull(name, "name");
         if (parameters != null) parameters = Collections.unmodifiableMap(new LinkedHashMap<>(parameters));
+    }
+
+    public FunctionTool(String name, String description, Map<String, Object> parameters, boolean strict) {
+        this(name, description, parameters, strict, "parameters");
     }
 
     public FunctionTool(String name, String description, Map<String, Object> parameters) {

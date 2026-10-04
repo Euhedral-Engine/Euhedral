@@ -92,9 +92,10 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
         try {
             QwenTokenizer tokenizer = this.engine.tokenizer();
             TokenConstraint answer = output.grammar() == null ? null : this.grammars.constraint(output.grammar());
-            // Free reasoning needs no constraint, so a greedy request keeps speculative decoding.
-            TokenConstraint constraint = output.reasoning() && answer != null
-                    ? new ReasoningConstraint(tokenizer, Integer.MAX_VALUE, answer)
+            // Free, uncapped reasoning needs no constraint, so a greedy request keeps speculative decoding.
+            boolean capped = output.reasoning() && output.reasoningBudget() < Integer.MAX_VALUE;
+            TokenConstraint constraint = output.reasoning() && (answer != null || capped)
+                    ? new ReasoningConstraint(tokenizer, output.reasoningBudget(), answer)
                     : answer;
             int thinkEnd = output.reasoning()
                     ? tokenizer.controlTokenId(QwenChatTemplate.THINK_END).orElseThrow()
@@ -126,7 +127,11 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
                     .thenApply(tokenIds -> {
                         boolean stopped =
                                 !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast());
-                        return new Result(tokenIds.size(), stopped, reasoningTokens(tokenIds, stopped));
+                        return new Result(
+                                tokenIds.size(),
+                                stopped,
+                                reasoningTokens(tokenIds, stopped),
+                                this.session.restoredPromptTokens());
                     });
         }
 
@@ -140,6 +145,11 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
         @Override
         public void cancel() {
             this.session.cancel();
+        }
+
+        @Override
+        public int cachedPromptTokens() {
+            return this.session.restoredPromptTokens();
         }
 
         @Override
