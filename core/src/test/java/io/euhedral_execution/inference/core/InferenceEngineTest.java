@@ -396,6 +396,24 @@ class InferenceEngineTest {
     }
 
     @Test
+    void refusesAContextLongerThanTheModelsPositions() {
+        var layers = new io.euhedral_execution.inference.core.model_loader.config.QwenLayerType[4];
+        java.util.Arrays.fill(
+                layers, io.euhedral_execution.inference.core.model_loader.config.QwenLayerType.FULL_ATTENTION);
+        var artifact = new QwenArtifact(
+                null,
+                InferenceRunSnapshotTest.config(layers),
+                new io.euhedral_execution.inference.core.model_loader.artifact.TensorDescriptor[0]);
+        var failure = assertThrows(
+                IllegalArgumentException.class,
+                () -> new InferenceEngine.Bootstrap().loadModel(Path.of("model.edrl"), artifact, null, null, 262145));
+        assertEquals(
+                "a context of 262145 tokens is longer than the 262144 positions the model supports; set a smaller max "
+                        + "context",
+                failure.getMessage());
+    }
+
+    @Test
     void rejectsASecondEngineWithoutDisturbingTheFirst() throws Exception {
         var config = config();
         try (var engine = InferenceEngine.load(config, new FakeBootstrap())) {

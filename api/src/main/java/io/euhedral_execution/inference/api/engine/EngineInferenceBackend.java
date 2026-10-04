@@ -30,7 +30,11 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
     private final ServerMetrics metrics;
 
     public EngineInferenceBackend(
-            InferenceEngine engine, String modelId, QwenChatTemplate chatTemplate, ServerMetrics metrics) {
+            InferenceEngine engine,
+            String modelId,
+            QwenChatTemplate chatTemplate,
+            Llguidance llguidance,
+            ServerMetrics metrics) {
         this.metrics = metrics;
         this.engine = Objects.requireNonNull(engine, "engine");
         this.modelId = Objects.requireNonNull(modelId, "modelId");
@@ -44,9 +48,7 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
                 throw new IllegalStateException("tokenizer lacks chat-template control token " + token);
         }
         this.grammars = GrammarCompiler.forTokenizer(
-                Llguidance.load(Llguidance.besideLibrary(engine.config().cudaLibraryPath())),
-                engine.tokenizer(),
-                engine.modelConfig().vocabSize());
+                llguidance, engine.tokenizer(), engine.modelConfig().vocabSize());
     }
 
     @Override

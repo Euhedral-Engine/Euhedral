@@ -163,7 +163,17 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         Objects.requireNonNull(libraryPath, "libraryPath");
         Arena loadedLibraryArena = Arena.ofShared();
         try {
-            SymbolLookup symbols = SymbolLookup.libraryLookup(libraryPath, loadedLibraryArena);
+            SymbolLookup symbols;
+            try {
+                symbols = SymbolLookup.libraryLookup(libraryPath, loadedLibraryArena);
+            } catch (IllegalArgumentException unloadable) {
+                // The loader does not say which library failed; when the file exists, it is one the file links.
+                throw new GpuMemoryException(
+                        "cannot load " + libraryPath + " or a library it links: the CUDA 13 "
+                                + "runtime (libcudart, libnvrtc) must be on the library path and the NVIDIA driver (libcuda) "
+                                + "installed",
+                        unloadable);
+            }
             Linker linker = Linker.nativeLinker();
             this.arena = loadedLibraryArena;
             this.malloc = bind(linker, symbols, "euhedral_cuda_malloc", MALLOC);
