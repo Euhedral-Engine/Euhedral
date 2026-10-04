@@ -374,6 +374,21 @@ public final class QwenTokenizer {
         return tokenId < 0 || tokenId >= cached.length ? null : cached[tokenId];
     }
 
+    /// A token's bytes as a grammar sees them: its text for an ordinary token; for a control token, and for an
+    /// ID the vocabulary leaves unused, `0xFF` followed by its name, which a grammar matches only by naming it.
+    public byte[] grammarTokenBytes(int tokenId) {
+        byte[] bytes = generationTokenBytes(tokenId);
+        if (bytes != null && bytes.length > 0) return bytes.clone();
+        String name = tokenId >= 0 && tokenId < this.tokensById.size() && this.tokensById.get(tokenId) != null
+                ? this.tokensById.get(tokenId)
+                : "<[unused " + tokenId + "]>";
+        byte[] text = name.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] special = new byte[text.length + 1];
+        special[0] = (byte) 0xff;
+        System.arraycopy(text, 0, special, 1, text.length);
+        return special;
+    }
+
     String tokenText(int tokenId) {
         return this.tokensById.get(tokenId);
     }

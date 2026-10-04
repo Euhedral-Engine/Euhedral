@@ -1,12 +1,13 @@
 package io.euhedral_execution.inference.core.tokenizer;
 
-import java.util.function.IntPredicate;
+import io.euhedral_execution.inference.core.sampling.TokenFilter;
 
 /// A request-local restriction on which tokens generation may select next.
 ///
 /// `allows` is queried for candidate tokens and must not change state; `accept` commits the token sampling
-/// selected. Both run on the worker that selects the token, one generation step after another.
-public interface TokenConstraint extends IntPredicate {
+/// selected. Both run on the worker that selects the token, one generation step after another. A constraint
+/// holding native state frees it in `close`, after the generation ended.
+public interface TokenConstraint extends TokenFilter, AutoCloseable {
 
     boolean allows(int tokenId);
 
@@ -17,4 +18,7 @@ public interface TokenConstraint extends IntPredicate {
     default boolean test(int tokenId) {
         return allows(tokenId);
     }
+
+    @Override
+    default void close() {}
 }

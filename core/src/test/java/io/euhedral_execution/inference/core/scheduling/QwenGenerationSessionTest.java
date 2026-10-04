@@ -15,8 +15,8 @@ import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
@@ -241,7 +241,18 @@ class QwenGenerationSessionTest {
         var lattice = createLattice();
         var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
         var session = new QwenGenerationSession(tokenizer, plan, runtime, gpu, 817, GenerationConfig.greedy(48L));
-        var constraint = new JsonEnvelopeConstraint(tokenizer, List.of("read_file"), true);
+        int brace = tokenizer.encodeText("{")[0];
+        var constraint = new TokenConstraint() {
+            @Override
+            public boolean allows(int tokenId) {
+                return tokenId == brace;
+            }
+
+            @Override
+            public void accept(int tokenId) {
+                if (tokenId != brace) throw new IllegalArgumentException("not allowed");
+            }
+        };
         lattice.start();
         awaitWorker(lattice);
         try {
