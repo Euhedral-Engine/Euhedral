@@ -138,7 +138,7 @@ def deploy(repository, model, tokenizer, driver, ptx, port):
             command("docker", "rename", SERVICE, previous_name)
             old_renamed = True
         command(
-            "docker", "run", "-d", "--name", SERVICE, "--restart", "unless-stopped",
+            "docker", "run", "-d", "--name", SERVICE, "--restart", "unless-stopped", "--stop-timeout", "45",
             "-p", f"127.0.0.1:{port}:{port}", "-e", f"PORT={port}",
             "-e", f"EUHEDRAL_INFERENCE_MODEL_ID={MODEL_ID}",
             "--device", "/dev/nvidia0", "--device", "/dev/nvidiactl",
