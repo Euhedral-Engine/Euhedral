@@ -27,3 +27,6 @@ __pycache__/
 
 # Retained benchmark results (keep, compare, or archive deliberately)
 /benchmark-results/
+
+# Local settings (.env.example is the template)
+.env

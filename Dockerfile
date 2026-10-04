@@ -42,10 +42,9 @@ ENV LD_LIBRARY_PATH=/opt/euhedral/lib \
     EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH=/opt/euhedral/lib/libeuhedral_cuda.so \
     EUHEDRAL_INFERENCE_ARTIFACT_PATH=/models/model.edrl \
     EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY=/tokenizer \
-    EUHEDRAL_INFERENCE_WORKER_CPUS=0 \
-    EUHEDRAL_INFERENCE_MODEL_ID=qwen \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
+# The model ID, worker CPUs and the other settings come from the run's environment: docker run --env-file .env
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD ["/opt/euhedral/jre/bin/java", "-cp", "/opt/euhedral/health", "HealthProbe"]
 ENTRYPOINT ["/opt/euhedral/jre/bin/java", "--enable-native-access=ALL-UNNAMED", "-jar", "/opt/euhedral/app.jar"]

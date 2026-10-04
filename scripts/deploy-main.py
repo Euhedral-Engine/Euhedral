@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Pull, build, and deploy main; clean up only after a healthy cutover.
 
-Run on the deployment host from any directory. Override EUHEDRAL_DEPLOY_MODEL,
-EUHEDRAL_DEPLOY_TOKENIZER, EUHEDRAL_DEPLOY_DRIVER, EUHEDRAL_DEPLOY_PTX,
-and EUHEDRAL_DEPLOY_PORT if this host's paths or port change.
+Run on the deployment host from any directory. Every setting comes from the repository's .env (or --env-file):
+copy .env.example and fill it in. The file is passed to the container as its environment, and its host paths are
+mounted into it.
 """
 
+import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -21,7 +23,77 @@ from contextlib import contextmanager
 SERVICE = "euhedral-inference-serve"
 IMAGE_REPOSITORY = "euhedral-inference"
 REPOSITORY = Path(__file__).resolve().parents[1]
-MODEL_ID = os.environ.get("EUHEDRAL_DEPLOY_MODEL_ID", "qwen3.8-27b-nvfp4-compressed")
+REQUIRED = ("EUHEDRAL_ARTIFACT_FILE", "EUHEDRAL_CHECKPOINT_DIR", "EUHEDRAL_INFERENCE_MODEL_ID", "EUHEDRAL_INFERENCE_WORKER_CPUS")
+# The image fixes these and mounts the host files there.
+CONTAINER_PATHS = ("EUHEDRAL_INFERENCE_ARTIFACT_PATH", "EUHEDRAL_INFERENCE_TOKENIZER_DIRECTORY", "EUHEDRAL_INFERENCE_CUDA_LIBRARY_PATH")
+DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
+
+
+@dataclass(frozen=True)
+class Settings:
+    env_file: Path
+    artifact: Path
+    checkpoint: Path
+    model_id: str
+    port: int
+    driver: Path | None = None
+    ptx_jit: Path | None = None
+
+
+def read_env(path):
+    """Docker's env-file format: KEY=VALUE lines, values taken literally, # comments on their own lines."""
+    values = {}
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, value = stripped.partition("=")
+        if not separator or not key:
+            raise RuntimeError(f"{path}:{number}: expected KEY=VALUE, got {line!r}")
+        values[key] = value
+    return values
+
+
+def load_settings(path):
+    if not path.is_file():
+        raise RuntimeError(f"No settings file at {path}; copy .env.example to .env and fill it in")
+    values = read_env(path)
+    missing = [key for key in REQUIRED if not values.get(key)]
+    if missing:
+        raise RuntimeError(f"{path} does not set {', '.join(missing)} (see .env.example)")
+    fixed = [key for key in CONTAINER_PATHS if key in values]
+    if fixed:
+        raise RuntimeError(f"{path} sets {', '.join(fixed)}, which the image fixes; set the host paths in "
+                           "EUHEDRAL_ARTIFACT_FILE and EUHEDRAL_CHECKPOINT_DIR instead")
+    driver, ptx_jit = values.get("EUHEDRAL_CUDA_DRIVER_FILE"), values.get("EUHEDRAL_PTX_JIT_FILE")
+    if bool(driver) != bool(ptx_jit):
+        raise RuntimeError(f"{path} must set both EUHEDRAL_CUDA_DRIVER_FILE and EUHEDRAL_PTX_JIT_FILE, or neither")
+    try:
+        port = int(values.get("PORT", "1738"))
+    except ValueError:
+        raise RuntimeError(f"{path}: PORT must be a number") from None
+    return Settings(
+        env_file=path.resolve(),
+        artifact=Path(values["EUHEDRAL_ARTIFACT_FILE"]),
+        checkpoint=Path(values["EUHEDRAL_CHECKPOINT_DIR"]),
+        model_id=values["EUHEDRAL_INFERENCE_MODEL_ID"],
+        port=port,
+        driver=Path(driver) if driver else None,
+        ptx_jit=Path(ptx_jit) if ptx_jit else None,
+    )
+
+
+def gpu_arguments(settings):
+    """The GPU through the NVIDIA Container Toolkit, or, with the driver libraries set, the device nodes and those
+    libraries mounted beside the native library."""
+    if settings.driver is None:
+        return ["--gpus", "all"]
+    arguments = []
+    for device in DEVICES:
+        arguments += ["--device", f"/dev/{device}"]
+    arguments += ["--mount", f"type=bind,src={settings.driver},dst=/opt/euhedral/lib/libcuda.so.1,readonly",
+                  "--mount", f"type=bind,src={settings.ptx_jit},dst=/opt/euhedral/lib/libnvidia-ptxjitcompiler.so.1,readonly"]
+    return arguments
 
 
 def command(*args):
@@ -87,19 +159,21 @@ def build_context(repository):
         yield context
 
 
-def deploy(repository, model, tokenizer, driver, ptx, port):
+def deploy(repository, settings):
+    model, tokenizer, port = settings.artifact, settings.checkpoint, settings.port
     if command("git", "branch", "--show-current") != "main":
         raise RuntimeError("Deploy only from main; switch to main before invoking this script")
     if command("git", "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("Tracked working-tree changes must be committed or moved before deployment")
-    for path in (model, driver, ptx):
-        if not path.is_file():
+    for path in (model, settings.driver, settings.ptx_jit):
+        if path is not None and not path.is_file():
             raise RuntimeError(f"Missing required host file: {path}")
     if not tokenizer.is_dir():
         raise RuntimeError(f"Missing tokenizer directory: {tokenizer}")
-    for device in ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset"):
-        if not Path("/dev", device).exists():
-            raise RuntimeError(f"Missing NVIDIA device: /dev/{device}")
+    if settings.driver is not None:
+        for device in DEVICES:
+            if not Path("/dev", device).exists():
+                raise RuntimeError(f"Missing NVIDIA device: /dev/{device}")
     if not 1 <= port <= 65535:
         raise RuntimeError("Invalid HTTP port")
 
@@ -139,19 +213,15 @@ def deploy(repository, model, tokenizer, driver, ptx, port):
             old_renamed = True
         command(
             "docker", "run", "-d", "--name", SERVICE, "--restart", "unless-stopped", "--stop-timeout", "45",
-            "-p", f"127.0.0.1:{port}:{port}", "-e", f"PORT={port}",
-            "-e", f"EUHEDRAL_INFERENCE_MODEL_ID={MODEL_ID}",
-            "--device", "/dev/nvidia0", "--device", "/dev/nvidiactl",
-            "--device", "/dev/nvidia-uvm", "--device", "/dev/nvidia-modeset",
-            "--mount", f"type=bind,src={driver},dst=/opt/euhedral/lib/libcuda.so.1,readonly",
-            "--mount", f"type=bind,src={ptx},dst=/opt/euhedral/lib/libnvidia-ptxjitcompiler.so.1,readonly",
+            "--env-file", str(settings.env_file), "-e", f"PORT={port}", "-p", f"127.0.0.1:{port}:{port}",
+            *gpu_arguments(settings),
             "--mount", f"type=bind,src={model},dst=/models/model.edrl,readonly",
             "--mount", f"type=bind,src={tokenizer},dst=/tokenizer,readonly",
             image,
         )
         model_id = verify_ready(port)
-        if model_id != MODEL_ID:
-            raise RuntimeError(f"Unexpected public model ID {model_id!r}, expected {MODEL_ID!r}")
+        if model_id != settings.model_id:
+            raise RuntimeError(f"Unexpected public model ID {model_id!r}, expected {settings.model_id!r}")
         if command("docker", "image", "inspect", "--format", "{{.Id}}", image) != new_image_id:
             raise RuntimeError("Deployment image changed before cleanup")
         if command("docker", "inspect", "--format", "{{.State.Health.Status}}", SERVICE) != "healthy":
@@ -207,13 +277,11 @@ def deploy(repository, model, tokenizer, driver, ptx, port):
 
 
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parents[1]
-    model_path = Path(os.environ.get("EUHEDRAL_DEPLOY_MODEL", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl"))
-    tokenizer_path = Path(os.environ.get("EUHEDRAL_DEPLOY_TOKENIZER", "/mnt/shared/qwen38-quant/source/qwen"))
-    driver_path = Path(os.environ.get("EUHEDRAL_DEPLOY_DRIVER", "/usr/lib/x86_64-linux-gnu/libcuda.so.1"))
-    ptx_path = Path(os.environ.get("EUHEDRAL_DEPLOY_PTX", "/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1"))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--env-file", type=Path, default=REPOSITORY / ".env", help="settings file (default: .env)")
+    arguments = parser.parse_args()
     try:
-        deploy(root, model_path, tokenizer_path, driver_path, ptx_path, int(os.environ.get("EUHEDRAL_DEPLOY_PORT", "18080")))
+        deploy(REPOSITORY, load_settings(arguments.env_file))
     except (RuntimeError, subprocess.CalledProcessError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError):
