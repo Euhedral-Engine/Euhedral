@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
@@ -142,155 +143,219 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
     }
 
     /// As [#generate(int[], int, IntConsumer)], reporting prefill chunks, the first token, every
-    /// verification step and a final commit-only quantum to `timing` (when not null).
+    /// verification step and a final commit-only quantum to `timing` (when not null). Blocks the caller
+    /// until [#generateAsync] completes.
     public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
+        try {
+            return generateAsync(prompt, maxNewTokens, onToken, timing).get();
+        } catch (ExecutionException failure) {
+            if (failure.getCause() instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (failure.getCause() instanceof Error error) throw error;
+            throw failure;
+        }
+    }
+
+    /// Generates as [#generate(int[], int, IntConsumer, GenerationTimingListener)] as a chain of
+    /// continuations: each quantum's outcome, on the worker that retired it, admits the next quantum.
+    /// `onToken` and `timing` run on those workers, one call at a time, in generation order.
+    public CompletableFuture<List<Integer>> generateAsync(
+            int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing) {
         if (prompt.length == 0 || maxNewTokens <= 0) throw new IllegalArgumentException("empty generation");
         this.statistics = new Statistics(this.depth);
-        List<Integer> output = new ArrayList<>();
-        // Prompt: prefill chunks that seed drafting, each followed by its MTP catch-up.
-        int first = -1;
-        int[] drafts = null;
-        for (int offset = 0; offset < prompt.length; offset += this.prefillChunk) {
-            int end = Math.min(prompt.length, offset + this.prefillChunk);
-            boolean last = end == prompt.length;
+        return new Run(prompt, maxNewTokens, onToken, timing).prefill(0);
+    }
+
+    /// One generation's continuations. The steps are those of the sequential algorithm, in its order.
+    private final class Run {
+        private final int[] prompt;
+        private final int maxNewTokens;
+        private final IntConsumer onToken;
+        private final GenerationTimingListener timing;
+        private final List<Integer> output = new ArrayList<>();
+        private int first = -1;
+        private int[] drafts;
+
+        Run(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing) {
+            this.prompt = prompt;
+            this.maxNewTokens = maxNewTokens;
+            this.onToken = onToken;
+            this.timing = timing;
+        }
+
+        /// Prompt: prefill chunks that seed drafting, each followed by its MTP catch-up.
+        CompletableFuture<List<Integer>> prefill(int offset) {
+            if (offset >= this.prompt.length) return afterPrompt();
+            int end = Math.min(this.prompt.length, offset + QwenSpeculativeDecoder.this.prefillChunk);
+            boolean last = end == this.prompt.length;
             long started = System.nanoTime();
-            execute(new QwenExecutionContext(
-                            this.plan,
-                            this.sequence,
-                            QwenExecutionContext.ExecutionKind.PREFILL,
-                            offset,
-                            Arrays.copyOfRange(prompt, offset, end),
-                            last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
-                            last ? this.baseLogits : null)
-                    .seedingDraft());
-            long executed = System.nanoTime();
-            this.statistics.prefillNanos += executed - started;
-            if (timing != null) timing.prefillQuantum(started, executed, end - offset);
-            int[] next = new int[end - offset];
-            System.arraycopy(prompt, offset + 1, next, 0, end - offset - 1);
-            if (last) {
-                first = this.baseLogits.selectedToken();
-                if (timing != null) timing.firstTokenSelected(System.nanoTime(), first);
-                next[next.length - 1] = first;
-            } else next[next.length - 1] = prompt[end];
-            long catchingUp = System.nanoTime();
-            int[] chunkDrafts = catchUp(offset, next, last);
-            this.statistics.promptCatchUpNanos += System.nanoTime() - catchingUp;
-            if (last) drafts = chunkDrafts;
+            return execute(new QwenExecutionContext(
+                                    QwenSpeculativeDecoder.this.plan,
+                                    QwenSpeculativeDecoder.this.sequence,
+                                    QwenExecutionContext.ExecutionKind.PREFILL,
+                                    offset,
+                                    Arrays.copyOfRange(this.prompt, offset, end),
+                                    last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                                    last ? QwenSpeculativeDecoder.this.baseLogits : null)
+                            .seedingDraft())
+                    .thenCompose(ignored -> {
+                        long executed = System.nanoTime();
+                        QwenSpeculativeDecoder.this.statistics.prefillNanos += executed - started;
+                        if (this.timing != null) this.timing.prefillQuantum(started, executed, end - offset);
+                        int[] next = new int[end - offset];
+                        System.arraycopy(this.prompt, offset + 1, next, 0, end - offset - 1);
+                        if (last) {
+                            this.first = QwenSpeculativeDecoder.this.baseLogits.selectedToken();
+                            if (this.timing != null) this.timing.firstTokenSelected(System.nanoTime(), this.first);
+                            next[next.length - 1] = this.first;
+                        } else next[next.length - 1] = this.prompt[end];
+                        long catchingUp = System.nanoTime();
+                        return catchUp(offset, next, last).thenCompose(chunkDrafts -> {
+                            QwenSpeculativeDecoder.this.statistics.promptCatchUpNanos += System.nanoTime() - catchingUp;
+                            if (last) this.drafts = chunkDrafts;
+                            return prefill(end);
+                        });
+                    });
         }
-        output.add(first);
-        onToken.accept(first);
-        this.statistics.outputTokens++;
-        if (this.endOfGeneration.test(first)) return output;
-        if (maxNewTokens == 1) {
-            feedFinal(first, timing);
-            return output;
+
+        private CompletableFuture<List<Integer>> afterPrompt() {
+            this.output.add(this.first);
+            this.onToken.accept(this.first);
+            QwenSpeculativeDecoder.this.statistics.outputTokens++;
+            if (QwenSpeculativeDecoder.this.endOfGeneration.test(this.first))
+                return CompletableFuture.completedFuture(this.output);
+            if (this.maxNewTokens == 1)
+                return feedFinal(this.first, this.timing).thenApply(ignored -> this.output);
+            return verify(this.first);
         }
-        int current = first;
-        while (true) {
-            int[] rows = new int[this.depth + 1];
+
+        /// One verification of `current` and the drafts, then the catch-up and drafting of the next step.
+        private CompletableFuture<List<Integer>> verify(int current) {
+            int[] rows = new int[QwenSpeculativeDecoder.this.depth + 1];
             rows[0] = current;
-            System.arraycopy(drafts, 0, rows, 1, this.depth);
-            long position = this.sequence.currentTokenPosition();
-            var acceptance = new SpeculativeAcceptance(rows, this.endOfGeneration, maxNewTokens - output.size());
+            System.arraycopy(this.drafts, 0, rows, 1, QwenSpeculativeDecoder.this.depth);
+            long position = QwenSpeculativeDecoder.this.sequence.currentTokenPosition();
+            var acceptance = new SpeculativeAcceptance(
+                    rows, QwenSpeculativeDecoder.this.endOfGeneration, this.maxNewTokens - this.output.size());
             long started = System.nanoTime();
-            execute(new QwenExecutionContext(
-                            this.plan,
-                            this.sequence,
-                            QwenExecutionContext.ExecutionKind.VERIFY,
-                            position,
-                            rows,
-                            QwenLogitsRequirement.ALL_TOKENS,
-                            this.baseLogits)
-                    .withAcceptance(acceptance)
-                    .seedingDraft());
-            long executed = System.nanoTime();
-            this.statistics.verifyNanos += executed - started;
-            this.statistics.verifications++;
-            this.statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
-            int[] committed = acceptance.outputs();
-            int rejected = acceptance.rejectedBaseToken();
-            int rejection =
-                    rejected < 0 ? -1 : rejected < this.inShortlist.length && this.inShortlist[rejected] ? 0 : 1;
-            if (rejection == 0) this.statistics.rejectionsInShortlist++;
-            if (rejection == 1) this.statistics.rejectionsOutsideShortlist++;
-            if (timing != null)
-                timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts(), rejection);
-            for (int token : committed) {
-                output.add(token);
-                onToken.accept(token);
-            }
-            this.statistics.outputTokens += committed.length;
-            current = committed[committed.length - 1];
-            if (this.endOfGeneration.test(current)) return output;
-            if (output.size() >= maxNewTokens) {
-                feedFinal(current, timing);
-                return output;
-            }
-            // Discard the previous step's recursive draft rows, then catch the MTP cache up.
-            mtpCache().truncate(Math.toIntExact(position));
-            drafts = catchUp(position, committed, true);
+            return execute(new QwenExecutionContext(
+                                    QwenSpeculativeDecoder.this.plan,
+                                    QwenSpeculativeDecoder.this.sequence,
+                                    QwenExecutionContext.ExecutionKind.VERIFY,
+                                    position,
+                                    rows,
+                                    QwenLogitsRequirement.ALL_TOKENS,
+                                    QwenSpeculativeDecoder.this.baseLogits)
+                            .withAcceptance(acceptance)
+                            .seedingDraft())
+                    .thenCompose(ignored -> {
+                        Statistics statistics = QwenSpeculativeDecoder.this.statistics;
+                        long executed = System.nanoTime();
+                        statistics.verifyNanos += executed - started;
+                        statistics.verifications++;
+                        statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
+                        int[] committed = acceptance.outputs();
+                        int rejected = acceptance.rejectedBaseToken();
+                        boolean[] shortlist = QwenSpeculativeDecoder.this.inShortlist;
+                        int rejection = rejected < 0 ? -1 : rejected < shortlist.length && shortlist[rejected] ? 0 : 1;
+                        if (rejection == 0) statistics.rejectionsInShortlist++;
+                        if (rejection == 1) statistics.rejectionsOutsideShortlist++;
+                        if (this.timing != null)
+                            this.timing.speculativeStep(
+                                    started, executed, committed.length, acceptance.acceptedDrafts(), rejection);
+                        for (int token : committed) {
+                            this.output.add(token);
+                            this.onToken.accept(token);
+                        }
+                        statistics.outputTokens += committed.length;
+                        int next = committed[committed.length - 1];
+                        if (QwenSpeculativeDecoder.this.endOfGeneration.test(next))
+                            return CompletableFuture.completedFuture(this.output);
+                        if (this.output.size() >= this.maxNewTokens)
+                            return feedFinal(next, this.timing).thenApply(done -> this.output);
+                        // Discard the previous step's recursive draft rows, then catch the MTP cache up.
+                        mtpCache().truncate(Math.toIntExact(position));
+                        return catchUp(position, committed, true).thenCompose(drafts -> {
+                            this.drafts = drafts;
+                            return verify(next);
+                        });
+                    });
         }
     }
 
     /// MTP catch-up over the base hidden rows just seeded, paired with `tokens` (the token each row
     /// predicted), at MTP positions from `position`. When `draft` is set, its last row drafts d₁ and the
-    /// recursive rows draft the rest.
-    private int[] catchUp(long position, int[] tokens, boolean draft) throws InterruptedException, ExecutionException {
+    /// recursive rows draft the rest; the future then holds the drafts, else null.
+    private CompletableFuture<int[]> catchUp(long position, int[] tokens, boolean draft) {
         AttentionSequenceStates states = states();
         long seeds = states.draftSeedRows(tokens.length, this.hidden);
         long started = System.nanoTime();
         boolean prompt = this.statistics.outputTokens == 0;
-        // Pieces of at most CATCH_UP_ROWS rows: the draft view's workspace is retained at the largest
-        // quantum it ran, and MTP cache appends are contiguous, so the pieces equal one catch-up.
-        for (int first = 0; first < tokens.length; first += CATCH_UP_ROWS) {
-            int count = Math.min(CATCH_UP_ROWS, tokens.length - first);
-            boolean last = first + count == tokens.length;
-            execute(new QwenExecutionContext(
-                            this.plan,
-                            this.sequence,
-                            QwenExecutionContext.ExecutionKind.DRAFT,
-                            position + first,
-                            Arrays.copyOfRange(tokens, first, first + count),
-                            draft && last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
-                            draft && last ? this.draftLogits : null)
-                    .withDraftSeed(seeds + (long) first * this.hidden * Short.BYTES, count));
-        }
-        if (!prompt) this.statistics.catchUpNanos += System.nanoTime() - started;
-        if (!draft) return null;
-        int[] drafts = new int[this.depth];
-        drafts[0] = this.draftTokens[this.draftLogits.selectedToken()];
-        started = System.nanoTime();
-        for (int i = 1; i < this.depth; i++) {
-            execute(new QwenExecutionContext(
-                            this.plan,
-                            this.sequence,
-                            QwenExecutionContext.ExecutionKind.DRAFT,
-                            position + tokens.length + i - 1,
-                            new int[] {drafts[i - 1]},
-                            QwenLogitsRequirement.LAST_TOKEN,
-                            this.draftLogits)
-                    .withDraftSeed(states.draftRecursionHidden(this.hidden), 1));
-            drafts[i] = this.draftTokens[this.draftLogits.selectedToken()];
-        }
-        if (!prompt) this.statistics.recursionNanos += System.nanoTime() - started;
-        return drafts;
+        return catchUpPiece(position, tokens, draft, seeds, 0).thenCompose(ignored -> {
+            if (!prompt) this.statistics.catchUpNanos += System.nanoTime() - started;
+            if (!draft) return CompletableFuture.completedFuture(null);
+            int[] drafts = new int[this.depth];
+            drafts[0] = this.draftTokens[this.draftLogits.selectedToken()];
+            long recursion = System.nanoTime();
+            return recurse(position + tokens.length, drafts, 1, states).thenApply(done -> {
+                if (!prompt) this.statistics.recursionNanos += System.nanoTime() - recursion;
+                return drafts;
+            });
+        });
+    }
+
+    /// Pieces of at most CATCH_UP_ROWS rows: the draft view's workspace is retained at the largest quantum it
+    /// ran, and MTP cache appends are contiguous, so the pieces equal one catch-up.
+    private CompletableFuture<Void> catchUpPiece(long position, int[] tokens, boolean draft, long seeds, int first) {
+        if (first >= tokens.length) return CompletableFuture.completedFuture(null);
+        int count = Math.min(CATCH_UP_ROWS, tokens.length - first);
+        boolean last = first + count == tokens.length;
+        return execute(new QwenExecutionContext(
+                                this.plan,
+                                this.sequence,
+                                QwenExecutionContext.ExecutionKind.DRAFT,
+                                position + first,
+                                Arrays.copyOfRange(tokens, first, first + count),
+                                draft && last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                                draft && last ? this.draftLogits : null)
+                        .withDraftSeed(seeds + (long) first * this.hidden * Short.BYTES, count))
+                .thenCompose(ignored -> catchUpPiece(position, tokens, draft, seeds, first + count));
+    }
+
+    /// Recursive draft rows `index` and on, each seeded by the MTP's own hidden of the previous row.
+    private CompletableFuture<Void> recurse(long base, int[] drafts, int index, AttentionSequenceStates states) {
+        if (index >= this.depth) return CompletableFuture.completedFuture(null);
+        return execute(new QwenExecutionContext(
+                                this.plan,
+                                this.sequence,
+                                QwenExecutionContext.ExecutionKind.DRAFT,
+                                base + index - 1,
+                                new int[] {drafts[index - 1]},
+                                QwenLogitsRequirement.LAST_TOKEN,
+                                this.draftLogits)
+                        .withDraftSeed(states.draftRecursionHidden(this.hidden), 1))
+                .thenCompose(ignored -> {
+                    drafts[index] = this.draftTokens[this.draftLogits.selectedToken()];
+                    return recurse(base, drafts, index + 1, states);
+                });
     }
 
     /// Ordinary decode feeds the last allowed token without sampling; so does the decoder, so both leave
     /// the same state.
-    private void feedFinal(int token, GenerationTimingListener timing) throws InterruptedException, ExecutionException {
+    private CompletableFuture<Void> feedFinal(int token, GenerationTimingListener timing) {
         long started = System.nanoTime();
-        execute(new QwenExecutionContext(
-                this.plan,
-                this.sequence,
-                QwenExecutionContext.ExecutionKind.DECODE,
-                this.sequence.currentTokenPosition(),
-                new int[] {token},
-                QwenLogitsRequirement.NONE));
-        long executed = System.nanoTime();
-        if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
+        return execute(new QwenExecutionContext(
+                        this.plan,
+                        this.sequence,
+                        QwenExecutionContext.ExecutionKind.DECODE,
+                        this.sequence.currentTokenPosition(),
+                        new int[] {token},
+                        QwenLogitsRequirement.NONE))
+                .thenApply(ignored -> {
+                    long executed = System.nanoTime();
+                    if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
+                    return null;
+                });
     }
 
     private AttentionSequenceStates states() {
@@ -301,10 +366,19 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         return states().forLayer(this.plan.weights().config().numHiddenLayers());
     }
 
-    private void execute(QwenExecutionContext context) throws InterruptedException, ExecutionException {
-        var outcome = this.runtime.execute(List.of(context)).getFirst();
-        if (outcome.status() != QwenExecutionContext.Status.SUCCESS)
-            throw new IllegalStateException("speculative quantum " + outcome.status(), outcome.failure());
+    /// Admits `context`; the future completes on the worker that retired it, failing unless it succeeded.
+    private CompletableFuture<Void> execute(QwenExecutionContext context) {
+        CompletableFuture<QwenExecutionContext.Outcome> outcome;
+        try {
+            outcome = this.runtime.submit(context);
+        } catch (RuntimeException | Error failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+        return outcome.thenApply(completed -> {
+            if (completed.status() != QwenExecutionContext.Status.SUCCESS)
+                throw new IllegalStateException("speculative quantum " + completed.status(), completed.failure());
+            return null;
+        });
     }
 
     @Override

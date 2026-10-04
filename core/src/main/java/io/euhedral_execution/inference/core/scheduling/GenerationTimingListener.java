@@ -2,8 +2,9 @@ package io.euhedral_execution.inference.core.scheduling;
 
 /// Opt-in observer of the execution boundaries of one [QwenGenerationSession#generate] call.
 ///
-/// Every timestamp is `System.nanoTime()` taken on the generating thread. Callbacks run
-/// synchronously between quanta, so they must be cheap and must not call session operations.
+/// Every timestamp is `System.nanoTime()`. Callbacks run between quanta on the lattice worker that advances
+/// the generation (the one that retired the previous quantum), one at a time and in the order below; the
+/// generating call returns after the last one. They must be cheap and must not call session operations.
 /// Only successfully executed quanta are reported. Without a listener the session records nothing.
 ///
 /// Boundaries, in call order:
@@ -18,9 +19,9 @@ package io.euhedral_execution.inference.core.scheduling;
 ///   call that reaches `maxNewTokens` only commits (`sampled` is false). A sampled generation
 ///   terminator is never submitted as a decode quantum.
 ///
-/// The output callback and incremental text decoding for a token run after its selection and
-/// before the decode quantum that commits it, so they fall between reported quanta. The final
-/// decoder flush runs after the last quantum.
+/// Incremental text decoding for a token runs after its selection and before the decode quantum that
+/// commits it; the output callback receives the text on the calling thread, concurrently with later quanta.
+/// The final decoder flush runs after the last quantum.
 public interface GenerationTimingListener {
     void promptEncoded(long nanos, int promptTokens);
 

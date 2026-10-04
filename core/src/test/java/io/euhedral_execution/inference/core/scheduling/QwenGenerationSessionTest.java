@@ -67,19 +67,19 @@ class QwenGenerationSessionTest {
         lattice.start();
         awaitWorker(lattice);
         try {
+            // Text reaches the calling thread while later quanta run; quanta advance on the lattice's workers.
             StringBuilder firstOutput = new StringBuilder();
-            List<Long> firstOutputPositions = new ArrayList<>();
+            java.util.Set<Thread> outputThreads = java.util.concurrent.ConcurrentHashMap.newKeySet();
             List<Integer> firstTokens = session.generate("!", 3, text -> {
                 firstOutput.append(text);
-                firstOutputPositions.add(session.currentTokenPosition());
-                assertEquals(0, runtime.activeQuanta());
+                outputThreads.add(Thread.currentThread());
                 assertTrue(gpu.closedLogits.isEmpty(), "device logits belong to their graph, not to a token");
             });
 
             int[] firstPromptTokens = tokenizer.encodeWithModelSpecialTokens("!");
             assertArrayEquals(new int[] {0}, firstPromptTokens);
             assertEquals(List.of(1, 2, 3), firstTokens);
-            assertEquals(List.of(1L, 2L, 3L), firstOutputPositions);
+            assertEquals(java.util.Set.of(Thread.currentThread()), outputThreads, "output runs on the caller");
             assertEquals(tokenizer.decode(new int[] {1, 2, 3}), firstOutput.toString());
             assertEquals(firstPromptTokens.length + 3L, session.currentTokenPosition());
             assertEquals(List.of(1, 2, 3), session.generatedTokenIds());
@@ -97,7 +97,6 @@ class QwenGenerationSessionTest {
             StringBuilder secondOutput = new StringBuilder();
             List<Integer> secondTokens = session.generate("!", 2, text -> {
                 secondOutput.append(text);
-                assertEquals(0, runtime.activeQuanta());
                 assertTrue(gpu.closedLogits.isEmpty(), "device logits belong to their graph, not to a token");
             });
 
@@ -144,6 +143,44 @@ class QwenGenerationSessionTest {
             lattice.close();
         }
         assertLogitsFreedOnceWithTheirGraphs(gpu);
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void aBlockedOutputCallbackNeverStallsTheQuanta() throws Exception {
+        int vocabularySize = testVocabularySize();
+        var weights = QwenExecutionFixtures.statefulCompactWeights(vocabularySize);
+        var plan = new QwenExecutionPlan(weights);
+        var gpu = new SamplingGpu(vocabularySize);
+        gpu.selectedTokenIds = new int[] {1, 2, 3, 4};
+        var lattice = createLattice();
+        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var session = new QwenGenerationSession(tokenizer, plan, runtime, gpu, 815, GenerationConfig.greedy(43L));
+        lattice.start();
+        awaitWorker(lattice);
+        try {
+            // The first text is held until every quantum of the call has run: generation advances on the workers
+            // whatever the calling thread does with its text.
+            long finalPosition = tokenizer.encodeWithModelSpecialTokens("!").length + 4L;
+            boolean[] advancedWhileBlocked = {false};
+            StringBuilder output = new StringBuilder();
+            List<Integer> tokens = session.generate("!", 4, text -> {
+                if (output.isEmpty()) {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                    while (session.currentTokenPosition() < finalPosition && System.nanoTime() < deadline)
+                        Thread.onSpinWait();
+                    advancedWhileBlocked[0] = session.currentTokenPosition() == finalPosition;
+                }
+                output.append(text);
+            });
+            assertTrue(advancedWhileBlocked[0], "every quantum ran while the first output was blocked");
+            assertEquals(List.of(1, 2, 3, 4), tokens);
+            assertEquals(tokenizer.decode(new int[] {1, 2, 3, 4}), output.toString());
+        } finally {
+            session.close();
+            runtime.close();
+            lattice.close();
+        }
     }
 
     @Test
