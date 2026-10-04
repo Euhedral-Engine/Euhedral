@@ -85,6 +85,19 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         };
     }
 
+    /// Reports `quanta` prefill quanta `delayMillis` apart, then emits `tok0 tok1 ...` until cancelled or the budget
+    /// is used.
+    static Script prefilling(int quanta, long delayMillis) {
+        return (generation, maxNewTokens, output) -> {
+            for (int quantum = 0; quantum < quanta; quantum++) {
+                if (generation.isCancelled()) return new Result(0, false);
+                generation.prefill();
+                Thread.sleep(delayMillis);
+            }
+            return endless(delayMillis).run(generation, maxNewTokens, output);
+        };
+    }
+
     void reset() {
         this.generations.clear();
         this.available = true;
@@ -182,6 +195,8 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         final CountDownLatch started = new CountDownLatch(1);
         final CountDownLatch closed = new CountDownLatch(1);
         final AtomicInteger emitted = new AtomicInteger();
+        final AtomicInteger prefills = new AtomicInteger();
+        private volatile Runnable prefilled = () -> {};
         /// Chunks emitted before the first one holding `</think>`; -1 until one does.
         volatile int reasoningChunks = -1;
         final AtomicInteger emittedAfterCancel = new AtomicInteger();
@@ -203,7 +218,8 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         }
 
         @Override
-        public CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
+        public CompletableFuture<Result> generate(
+                EncodedPrompt prompt, int maxNewTokens, Consumer<String> text, Runnable prefilled) {
             if (this.closeCount.get() > 0) throw new IllegalStateException("Qwen generation session is closed");
             if (this.cancelled.get()) throw new IllegalStateException("Qwen generation session is cancelled");
             this.prompt = prompt.text();
@@ -211,6 +227,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
             return CompletableFuture.supplyAsync(
                     () -> {
                         this.generatingThread = Thread.currentThread().getName();
+                        this.prefilled = prefilled;
                         this.started.countDown();
                         try {
                             Result result = this.script.run(this, maxNewTokens, text);
@@ -225,6 +242,12 @@ final class ScriptedInferenceBackend implements InferenceBackend {
                         }
                     },
                     this.workers);
+        }
+
+        /// One retired prefill quantum, as the engine reports it.
+        void prefill() {
+            this.prefills.incrementAndGet();
+            this.prefilled.run();
         }
 
         void emit(Consumer<String> output, String text) {

@@ -231,6 +231,12 @@ record AnthropicResponder(String model, boolean stream) implements GenerationSer
             }
         }
 
+        /// Anthropic's own keep-alive event.
+        @Override
+        public void keepAlive() throws IOException {
+            send("ping", ordered("type", "ping"));
+        }
+
         /// Headers are already committed, so errors are reported in-band as an `error` event.
         @Override
         public void fail(ApiException error) {

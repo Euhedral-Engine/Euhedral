@@ -81,7 +81,14 @@ public interface InferenceBackend {
         /// Starts prefill and decode on the workers and returns at once. `text` receives newly decoded,
         /// non-empty text on a worker, one call at a time and in order, and must not block; the future
         /// completes on a worker after the last text.
-        CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text);
+        default CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
+            return generate(prompt, maxNewTokens, text, () -> {});
+        }
+
+        /// As above; `prefilled` runs on a worker after each prefill quantum retires, before the next is admitted,
+        /// and must not block.
+        CompletableFuture<Result> generate(
+                EncodedPrompt prompt, int maxNewTokens, Consumer<String> text, Runnable prefilled);
 
         void cancel();
 

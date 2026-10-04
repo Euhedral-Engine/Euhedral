@@ -23,5 +23,9 @@ public interface CompletionSink {
 
     void finish(Finish finish) throws IOException;
 
+    /// Writes nothing a client reads (an SSE comment or ping) while a stream's prompt is prefilled, so a client that
+    /// left is noticed by the failed write. JSON responses write nothing.
+    default void keepAlive() throws IOException {}
+
     void fail(ApiException error);
 }

@@ -32,6 +32,9 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     private final CompletionSink sink;
     private final SerialTasks delivery;
     private final Runnable finished;
+    private final Client client;
+    // A probe of the client's connection is queued and has not run yet.
+    private final AtomicBoolean probing = new AtomicBoolean();
     private final StopSequenceFilter stopFilter;
     // Null when the output does not open in the think block.
     private final ReasoningSplitter reasoning;
@@ -46,6 +49,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     // Confined to the generation's callbacks, which the generation orders one after another.
     private boolean delivered;
     private boolean sinkStarted;
+    private int prefillQuanta;
     private ToolCallParser.MalformedToolCallException malformedToolCall;
     // Set when the single call allowed by parallel_tool_calls=false is complete.
     private boolean callLimitReached;
@@ -55,7 +59,9 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             InferenceBackend.Generation generation,
             CompletionSink sink,
             SerialTasks delivery,
-            Runnable finished) {
+            Runnable finished,
+            Client client) {
+        this.client = client;
         this.plan = plan;
         this.generation = generation;
         this.sink = sink;
@@ -67,6 +73,21 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                 ? new JsonToolCallParser(plan.tools(), plan.format().json())
                 : null;
         this.jsonAnswer = plan.format().json() && this.toolParser == null ? new StringBuilder() : null;
+    }
+
+    /// The client's connection, probed as the generation progresses: `gone` completes the request when the probe
+    /// finds it closed, and `others` probes the queued requests' clients on the same task.
+    record Client(ClientLink link, Runnable gone, Runnable others) {
+        static final Client NONE = new Client(ClientLink.NONE, () -> {}, () -> {});
+    }
+
+    ChatGeneration(
+            GenerationPlan plan,
+            InferenceBackend.Generation generation,
+            CompletionSink sink,
+            SerialTasks delivery,
+            Runnable finished) {
+        this(plan, generation, sink, delivery, finished, Client.NONE);
     }
 
     /// The client disconnected or timed out: stop generating. Safe from any thread and after completion.
@@ -95,7 +116,8 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
         try {
             result = this.abandoned.get()
                     ? CompletableFuture.completedFuture(null)
-                    : this.generation.generate(this.plan.prompt(), this.plan.maxTokens(), this::onText);
+                    : this.generation.generate(
+                            this.plan.prompt(), this.plan.maxTokens(), this::onText, this::prefilled);
         } catch (RuntimeException | Error failure) {
             result = CompletableFuture.failedFuture(failure);
         }
@@ -173,6 +195,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
 
     /// One decoded text, on the worker that retired its quantum and before the next quantum is admitted.
     private void onText(String text) {
+        probe();
         if (this.abandoned.get() || this.malformedToolCall != null || this.stopFilter.matched()) return;
         startSink();
         if (this.reasoning == null) answer(text);
@@ -229,6 +252,34 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             this.callLimitReached = true;
             this.generation.cancel();
         }
+    }
+
+    /// After each prefill quantum: a stream writes a keep-alive, which fails once its client left; the connection is
+    /// probed as well. The first quantum writes none: a prompt of one quantum produces its first token next, which
+    /// writes anyway.
+    private void prefilled() {
+        if (this.plan.stream() && this.prefillQuanta++ > 0 && !this.sinkStarted && !this.abandoned.get())
+            write(this.sink::keepAlive);
+        probe();
+    }
+
+    /// Queues one probe of the client's connection behind the response's writes, unless one is already queued. A
+    /// client found gone abandons the generation, which stops before its next quantum, and completes the request.
+    /// Runs after every prefill quantum and every decoded text: a client that leaves during a long prompt is
+    /// noticed within a chunk, without a thread to watch it.
+    private void probe() {
+        if (this.client.link() == ClientLink.NONE || !this.probing.compareAndSet(false, true)) return;
+        this.delivery.execute(() -> {
+            this.probing.set(false);
+            // A stream is watched by its writes; its committed connection reads nothing.
+            if (!this.plan.stream()
+                    && !this.abandoned.get()
+                    && this.client.link().gone()) {
+                abandon();
+                this.client.gone().run();
+            }
+            this.client.others().run();
+        });
     }
 
     /// Starts the response at the first token, when the prefix cache's restore is known.

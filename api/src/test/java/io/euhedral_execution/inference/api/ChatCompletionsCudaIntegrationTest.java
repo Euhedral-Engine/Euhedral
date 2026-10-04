@@ -393,6 +393,41 @@ class ChatCompletionsCudaIntegrationTest {
         assertSessionsReleased(before);
     }
 
+    @Test
+    @Order(11)
+    void aJsonClientThatLeavesStopsItsGenerationAndFreesTheSlot() throws Exception {
+        DeviceBytes before = deviceBytes();
+        int maxTokens = 2000;
+        String body = "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_tokens\":" + maxTokens
+                + ",\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse.\"}]}";
+        this.tracking.resetCounts();
+        int opened = this.tracking.opened.get();
+        try (var socket = new Socket("localhost", this.port)) {
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            socket.getOutputStream()
+                    .write(("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                                    + "Content-Type: application/json\r\nContent-Length: " + bytes.length + "\r\n\r\n")
+                            .getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().write(bytes);
+            socket.getOutputStream().flush();
+            while (this.tracking.opened.get() == opened) Thread.sleep(10);
+            // Let it generate for a while; a JSON client sees nothing until the end.
+            Thread.sleep(1500);
+        }
+        long left = System.nanoTime();
+        assertTrue(this.tracking.closed.await(60, TimeUnit.SECONDS), "session was not closed after the client left");
+        System.out.println("JSON session closed "
+                + Duration.ofNanos(System.nanoTime() - left).toMillis() + " ms after the client left; tokens sampled: "
+                + this.tracking.lastCompletionTokens.get());
+        assertEquals(1, this.tracking.cancelled.get(), "leaving must cancel the session");
+        assertTrue(this.tracking.lastCompletionTokens.get() < 500, "generation went on after the client left");
+        assertSessionsReleased(before);
+        // The slot is free: the next request runs at once.
+        var next = post("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_tokens\":4,"
+                + "\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}");
+        assertEquals(200, next.statusCode(), next.body());
+    }
+
     /// The engine's device bytes and the part its execution graphs retain between quanta.
     private record DeviceBytes(long allocated, long retainedWorkspace) {}
 
@@ -521,11 +556,13 @@ class ChatCompletionsCudaIntegrationTest {
             return new Generation() {
                 @Override
                 public java.util.concurrent.CompletableFuture<Result> generate(
-                        EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
-                    return generation.generate(prompt, maxNewTokens, text).thenApply(result -> {
-                        TrackingBackend.this.lastCompletionTokens.set(result.completionTokens());
-                        return result;
-                    });
+                        EncodedPrompt prompt, int maxNewTokens, Consumer<String> text, Runnable prefilled) {
+                    return generation
+                            .generate(prompt, maxNewTokens, text, prefilled)
+                            .thenApply(result -> {
+                                TrackingBackend.this.lastCompletionTokens.set(result.completionTokens());
+                                return result;
+                            });
                 }
 
                 @Override

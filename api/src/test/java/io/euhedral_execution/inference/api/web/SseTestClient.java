@@ -44,9 +44,15 @@ final class SseTestClient implements AutoCloseable {
         throw new IOException("connection closed before the expected line; saw " + lines);
     }
 
+    /// Closes the connection in order (FIN), as a client that gives up and closes its socket would.
+    void closeGracefully() throws IOException {
+        this.socket.close();
+    }
+
     /// Drops the TCP connection, as a client that navigates away or is killed would.
     @Override
     public void close() throws IOException {
+        if (this.socket.isClosed()) return;
         this.socket.setSoLinger(true, 0);
         this.socket.close();
     }

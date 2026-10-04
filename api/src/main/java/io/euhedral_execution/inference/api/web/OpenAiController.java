@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.api.openai.ChatRequestMapper;
 import io.euhedral_execution.inference.api.openai.ModelList;
 import io.euhedral_execution.inference.api.responses.ResponsesMapper;
 import io.euhedral_execution.inference.api.responses.ResponsesRequest;
+import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -80,13 +81,14 @@ public class OpenAiController {
     /// Hands the request to the workers and returns its deferred response, releasing this thread: the workers
     /// plan the request and resolve it to a JSON body, an `SseEmitter` for `stream=true`, or an OpenAI error.
     @PostMapping(path = "/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public DeferredResult<Object> chatCompletions(@RequestBody ChatCompletionRequest request) {
-        return this.generations.submit(this.chatRequests.planAsync(request));
+    public DeferredResult<Object> chatCompletions(
+            @RequestBody ChatCompletionRequest request, HttpServletRequest servlet) {
+        return this.generations.submit(this.chatRequests.planAsync(request), ServletClientLink.of(servlet));
     }
 
     /// The Responses API over the same generation: a `response` body or its event stream.
     @PostMapping(path = "/responses", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public DeferredResult<Object> responses(@RequestBody ResponsesRequest request) {
-        return this.generations.submit(this.responses.planAsync(request));
+    public DeferredResult<Object> responses(@RequestBody ResponsesRequest request, HttpServletRequest servlet) {
+        return this.generations.submit(this.responses.planAsync(request), ServletClientLink.of(servlet));
     }
 }

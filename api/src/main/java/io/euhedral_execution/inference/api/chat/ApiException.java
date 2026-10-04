@@ -108,6 +108,16 @@ public final class ApiException extends RuntimeException {
                 "invalid_structured_output");
     }
 
+    /// The client closed its connection; nobody reads this, but it completes the request.
+    public static ApiException clientClosed() {
+        return new ApiException(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "service_unavailable_error",
+                "The client closed the connection.",
+                null,
+                "client_closed");
+    }
+
     public static ApiException timeout() {
         return new ApiException(
                 HttpStatus.SERVICE_UNAVAILABLE,
