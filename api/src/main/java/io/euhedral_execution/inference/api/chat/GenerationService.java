@@ -85,6 +85,8 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
         volatile boolean abandoned;
         volatile ChatGeneration generation;
         java.util.concurrent.atomic.AtomicBoolean streaming;
+        /// Completes once the container has finished the request's response.
+        CompletableFuture<Void> responded;
 
         Admission(
                 ConversationPlanner.Planned planned,
@@ -121,7 +123,9 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
         var admission = new AtomicReference<Admission>();
         // A stream's response continues past this result, as its emitter; its link closes with the emitter.
         var streaming = new java.util.concurrent.atomic.AtomicBoolean();
+        var responded = new CompletableFuture<Void>();
         result.onCompletion(() -> {
+            responded.complete(null);
             if (!streaming.get()) link.close();
         });
         result.onTimeout(() -> {
@@ -151,6 +155,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
             }
             Admission admitted = new Admission(planned, result, link, api, arrived);
             admitted.streaming = streaming;
+            admitted.responded = responded;
             admission.set(admitted);
             admit(admitted);
         });
@@ -310,6 +315,19 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
             } catch (RuntimeException completed) {
                 // The container already ended the request.
             }
+        }
+        // Setting a result only schedules its dispatch; the web server stops after this returns, and would close the
+        // connections before the refusals are written.
+        try {
+            CompletableFuture.allOf(refused.stream()
+                            .map(admission -> admission.responded)
+                            .toArray(CompletableFuture[]::new))
+                    .get(10, TimeUnit.SECONDS);
+        } catch (TimeoutException | ExecutionException late) {
+            LOG.warn("Refusals of queued requests were not written within 10s");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return;
         }
         ChatGeneration job = active == null ? null : active.generation;
         LOG.info(
