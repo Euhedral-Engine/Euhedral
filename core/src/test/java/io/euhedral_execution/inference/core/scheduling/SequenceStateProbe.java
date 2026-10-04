@@ -41,6 +41,24 @@ public final class SequenceStateProbe {
         return digests;
     }
 
+    /// Digests of the MTP cache's pages that are full below `rows` rows, or an empty list when the sequence has no
+    /// MTP cache.
+    public static List<String> mtpDigests(
+            ExecutionGpu gpu, QwenSequenceState sequence, QwenLayerType[] layerTypes, int rows) {
+        var attention = (AttentionSequenceStates) sequence.kvCacheState();
+        AttentionKvState mtp;
+        try {
+            mtp = attention.forLayer(layerTypes.length);
+        } catch (IllegalArgumentException none) {
+            return List.of();
+        }
+        List<String> digests = new ArrayList<>();
+        List<Long> pages = mtp.pageAddresses();
+        for (int page = 0; page < rows / AttentionKvState.PAGE_TOKENS; page++)
+            digests.add("mtp page " + page + " " + digest(gpu, pages.get(page), 2 * mtp.planePageBytes()));
+        return digests;
+    }
+
     private static String digest(ExecutionGpu gpu, long address, long bytes) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment host = arena.allocate(bytes);
