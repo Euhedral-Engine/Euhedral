@@ -54,11 +54,11 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     boolean submitted;
 
     protected StageFrame(StageGraph graph, int stage) {
-        super(0L);
+        super(StageGraph.FRAME_ID_HASH);
         this.graph = graph;
         this.stage = stage;
         this.inDegree = graph.topology().inDegree(stage);
-        randomizeHash(graph.routingSeed());
+        randomizeHash(graph.nextRoutingSeed());
     }
 
     /// Submits this stage's device work. The quantum's stream is selected on the calling thread.
