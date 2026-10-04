@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
 import java.util.List;
+import java.util.concurrent.CompletionException;
 import java.util.function.Consumer;
 
 /// End-to-end target: a real [InferenceEngine] running Qwen sessions through Euhedral and CUDA.
@@ -56,7 +57,17 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             throws Exception {
         try (var session = this.engine.createSession(generation)) {
             timing.markEntry();
-            List<Integer> tokens = session.generate(prompt, maxNewTokens, DISCARD, null, timing);
+            // The asynchronous form, as the server drives it: the workers run the generation in a closed loop
+            // and no other thread is woken until it completes.
+            List<Integer> tokens;
+            try {
+                tokens = session.generateAsync(prompt, maxNewTokens, DISCARD, null, timing)
+                        .join();
+            } catch (CompletionException failure) {
+                if (failure.getCause() instanceof Exception cause) throw cause;
+                if (failure.getCause() instanceof Error error) throw error;
+                throw failure;
+            }
             timing.markReturn();
             return tokens;
         }
