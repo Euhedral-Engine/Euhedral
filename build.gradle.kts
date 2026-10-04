@@ -76,6 +76,7 @@ subprojects {
             include("**/SpeculativeDecodeCudaIntegrationTest.class")
             include("**/CapturedQuantaCudaIntegrationTest.class")
             include("**/PrefillPartitionCudaIntegrationTest.class")
+            include("**/PrefixCacheCudaIntegrationTest.class")
             include("**/TeacherForcedQualityCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
