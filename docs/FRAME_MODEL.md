@@ -247,6 +247,40 @@ quantum that does not succeed leaves its sequence terminal, so no partial update
   device work retired, or the device was poisoned and that storage stays owned. A poisoned device also
   keeps the graphs' storage, the sessions' pinned rows, and queued staging when the runtime closes.
 
+## Host work on the workers
+
+Every piece of host work a request needs runs as frames on the lattice's workers; no other thread computes for it.
+
+- **Tokenization** (`PromptTokenization`): one frame splits the prompt into pre-tokens (control tokens, NFC, the split
+  expression), then publishes one frame per two pre-tokens of BPE; the last to finish joins the chunks in order. Each frame
+  takes a consecutive routing seed (`FrameSeeds`), so the chunks spread across workers. Encoding equals the tokenizer's own.
+- **Generation** advances in continuations of quantum retirement: the worker that publishes a quantum's outcome selects
+  the token, hands its text to the caller's callback, and admits the next quantum. The callback runs before that admission,
+  so a cancellation from it (a stop sequence, an invalid tool call) stops the generation before another quantum starts.
+- **The server** (`ChatCompletionService`): a container thread turns a request into a `DeferredResult` and returns.
+  Rendering and validation run as one frame (`EuhedralInferenceRuntime.onWorker`), encoding as tokenization frames. One
+  generation runs; a bounded list waits, and the worker that finishes a generation starts the next. Stop-sequence matching
+  and tool-call parsing run in the text callback. Network writes are queued per request (`SerialTasks`) and run on workers
+  one at a time in output order: a write that blocks holds only its worker, and the other workers take the remaining
+  work meanwhile.
+- **Host jobs have their own routing seeds** (`FrameSeeds.forHostWork`). A stage graph's seeds decide which workers, and
+  therefore which lanes, its stages run on. When tokenization drew from the graphs' sequence, every graph built after
+  it got other seeds: on nvfp4-compressed at 32K the verify step took 34.1 ms instead of 33.7 ms (CUDA graphs off), and
+  placement depended on how many prompts had been encoded before a graph was built.
+- **Waking a thread outside the lattice per token is expensive.** When a blocked caller drained each token's text from a
+  queue, the wake-up sat between a VERIFY's retirement and the next admission: the median gap after a 4-row VERIFY was
+  276 us, 229 us when nothing outside the workers was woken. The benchmark therefore drives `generateAsync`, as the server
+  does; the blocking `generate` remains for tests and tools.
+
+Measured on Qwen3.8 27B with the chat corpus, one fork of four prompts per length:
+
+| Prompt | Tokenization |
+|---|---|
+| 2048 tokens | 3.5-3.7 ms |
+| 4096 tokens | 6.6-10.5 ms |
+| 16384 tokens | 29-37 ms |
+| 32768 tokens | 50-57 ms |
+
 ## Measured behaviour
 
 Nsight Systems, union of kernel intervals (programmatic dependent launch overlaps adjacent kernels): decode keeps the GPU busy 94%
