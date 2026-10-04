@@ -1,7 +1,6 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
@@ -11,18 +10,6 @@ import java.util.function.Consumer;
 /// Production borrows the single `InferenceEngine`; tests substitute a scripted backend to exercise HTTP
 /// behavior without CUDA. Implementations never expose engine internals to HTTP code.
 public interface InferenceBackend {
-
-    /// Validated offered names and whether calls are required or may be parallel this turn.
-    record ToolConstraint(List<String> toolNames, boolean requiresCall, boolean parallel) {
-        public ToolConstraint {
-            toolNames = List.copyOf(toolNames);
-            if (toolNames.isEmpty()) throw new IllegalArgumentException("constrained generation needs offered tools");
-        }
-
-        public ToolConstraint(List<String> toolNames, boolean requiresCall) {
-            this(toolNames, requiresCall, true);
-        }
-    }
 
     /// Public model ID accepted in requests and listed by `/v1/models`.
     String modelId();
@@ -59,11 +46,19 @@ public interface InferenceBackend {
     CompletableFuture<EncodedPrompt> encodePrompt(String prompt);
 
     /// How a generation's output is shaped. With `reasoning` the prompt opened the model's think block, so the
-    /// output is reasoning up to `</think>` and the answer after it. A non-null `tools` constrains the answer to a
-    /// JSON tool-call envelope for those offered names; a backend must enforce it while sampling.
-    record OutputSpec(boolean reasoning, ToolConstraint tools) {
+    /// output is reasoning up to `</think>` and the answer after it. A non-null `grammar` (llguidance Lark)
+    /// constrains the answer; a backend must enforce it while sampling.
+    record OutputSpec(boolean reasoning, String grammar) {
         public static final OutputSpec TEXT = new OutputSpec(false, null);
     }
+
+    /// Compiles an answer grammar (llguidance Lark) without generating; throws
+    /// [io.euhedral_execution.inference.core.guidance.GrammarException] when it cannot be enforced. A compiled
+    /// grammar is kept for the generation that uses it.
+    void checkGrammar(String grammar);
+
+    /// Compiles a JSON Schema on its own, so a refusal names the schema's problem.
+    void checkJsonSchema(String schema);
 
     /// Opens one request-owned generation. The caller must close it on every path.
     ///

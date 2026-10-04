@@ -11,9 +11,9 @@ import java.util.regex.Pattern;
 /// The functions one request offers and how the model may call them, validated at admission.
 ///
 /// `NONE` omits the definitions from the prompt, as if no tools were sent, so the model is never told it
-/// can call and its output is plain text. `REQUIRED` and `FUNCTION` constrain sampling to a JSON call;
-/// the parser rejects a malformed or incomplete envelope. `FUNCTION` also
-/// restricts every call in the response to `function`. Without `parallel`,
+/// can call and its output is plain text. `AUTO` constrains sampling to a JSON call or a JSON answer,
+/// `REQUIRED` and `FUNCTION` to a call ([OutputGrammar#tools]); the parser rejects a malformed or incomplete
+/// envelope. `FUNCTION` also restricts every call in the response to `function`. Without `parallel`,
 /// decoding ends once the first call is complete.
 public record ToolCalling(List<FunctionTool> tools, Choice choice, String function, boolean parallel) {
     static final ToolCalling DISABLED = new ToolCalling(List.of(), Choice.NONE, null, true);
@@ -114,12 +114,15 @@ public record ToolCalling(List<FunctionTool> tools, Choice choice, String functi
         if (description != null && !(description instanceof String))
             throw OpenAiException.invalidRequest(
                     "Function 'description' must be a string.", functionPath + ".description");
-        // Strict mode promises full schema-conformant arguments, beyond JSON syntax constraints.
+        // Strict arguments are generated under the full schema, which the mapper has llguidance check.
         Object strict = function.get("strict");
         if (strict != null && !(strict instanceof Boolean))
             throw OpenAiException.invalidRequest("Function 'strict' must be a boolean.", functionPath + ".strict");
-        if (Boolean.TRUE.equals(strict)) throw OpenAiException.unsupportedParameter(functionPath + ".strict");
-        return new FunctionTool(name, (String) description, parameters(function.get("parameters"), functionPath));
+        return new FunctionTool(
+                name,
+                (String) description,
+                parameters(function.get("parameters"), functionPath),
+                Boolean.TRUE.equals(strict));
     }
 
     /// Checks only what the call format depends on; the rest of the JSON Schema passes through verbatim.

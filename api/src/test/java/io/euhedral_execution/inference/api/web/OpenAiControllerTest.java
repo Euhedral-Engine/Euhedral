@@ -200,7 +200,6 @@ class OpenAiControllerTest {
                 "\"frequency_penalty\":0.5",
                 "\"presence_penalty\":1",
                 "\"repeat_penalty\":1.1",
-                "\"response_format\":{\"type\":\"json_object\"}",
                 "\"logit_bias\":{\"1\":5}",
                 "\"audio\":{\"voice\":\"alloy\"}")) {
             String name = field.substring(1, field.indexOf('"', 1));

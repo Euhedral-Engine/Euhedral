@@ -27,6 +27,7 @@ public record ChatCompletionRequest(
         @JsonProperty("parallel_tool_calls") Boolean parallelToolCalls,
         @JsonProperty("reasoning_effort") Object reasoningEffort,
         @JsonProperty("chat_template_kwargs") Object chatTemplateKwargs,
+        @JsonProperty("response_format") Object responseFormat,
         @JsonAnySetter Map<String, Object> otherFields) {
 
     public ChatCompletionRequest {

@@ -91,6 +91,17 @@ public final class OpenAiException extends RuntimeException {
                 "invalid_tool_call");
     }
 
+    /// The model's output under a JSON response format is not a JSON document; never expected, since the
+    /// grammar admits only documents, but never returned as a success either.
+    public static OpenAiException invalidStructuredOutput() {
+        return new OpenAiException(
+                HttpStatus.INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The model's output is not valid JSON for the requested response format.",
+                null,
+                "invalid_structured_output");
+    }
+
     public static OpenAiException timeout() {
         return new OpenAiException(
                 HttpStatus.SERVICE_UNAVAILABLE,

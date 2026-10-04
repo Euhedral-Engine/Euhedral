@@ -10,12 +10,23 @@ import java.util.Objects;
 import java.util.Set;
 
 /// One validated OpenAI function tool. `description` and `parameters` are null when the request omits
-/// them; `parameters` keeps the request's JSON Schema object, key order included.
-public record FunctionTool(String name, String description, Map<String, Object> parameters) {
+/// them; `parameters` keeps the request's JSON Schema object, key order included. A `strict` tool's arguments
+/// are generated under its schema; the others' only as a JSON object.
+public record FunctionTool(String name, String description, Map<String, Object> parameters, boolean strict) {
 
     public FunctionTool {
         Objects.requireNonNull(name, "name");
         if (parameters != null) parameters = Collections.unmodifiableMap(new LinkedHashMap<>(parameters));
+    }
+
+    public FunctionTool(String name, String description, Map<String, Object> parameters) {
+        this(name, description, parameters, false);
+    }
+
+    /// The schema arguments follow when strict: `parameters`, or an empty object when there are none.
+    Map<String, Object> parametersOrEmpty() {
+        if (this.parameters != null) return this.parameters;
+        return Map.of("type", "object", "properties", Map.of(), "additionalProperties", false);
     }
 
     /// JSON types the schema declares for a parameter through `type`, `anyOf`/`oneOf` branch types, or an

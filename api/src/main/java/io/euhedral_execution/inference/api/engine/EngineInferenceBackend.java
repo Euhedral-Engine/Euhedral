@@ -2,9 +2,10 @@ package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.core.InferenceEngine;
+import io.euhedral_execution.inference.core.guidance.GrammarCompiler;
+import io.euhedral_execution.inference.core.guidance.Llguidance;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
-import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.ReasoningConstraint;
 import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
@@ -15,12 +16,14 @@ import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 
 /// Borrows the Spring-owned `InferenceEngine`; the engine bean remains the terminal owner of model,
-/// GPU, lattice, and runtime. Each generation wraps one engine-tracked `QwenGenerationSession`.
-public final class EngineInferenceBackend implements InferenceBackend {
+/// GPU, lattice, and runtime. Each generation wraps one engine-tracked `QwenGenerationSession`. Constrained
+/// answers use llguidance, loaded from beside the CUDA library and compiled against the checkpoint vocabulary.
+public final class EngineInferenceBackend implements InferenceBackend, AutoCloseable {
     private final InferenceEngine engine;
     private final String modelId;
     /// Each task is one frame on the engine's lattice.
     private final Executor workers;
+    private final GrammarCompiler grammars;
 
     public EngineInferenceBackend(InferenceEngine engine, String modelId, QwenChatTemplate chatTemplate) {
         this.engine = Objects.requireNonNull(engine, "engine");
@@ -34,6 +37,25 @@ public final class EngineInferenceBackend implements InferenceBackend {
             if (engine.tokenizer().controlTokenId(token).isEmpty())
                 throw new IllegalStateException("tokenizer lacks chat-template control token " + token);
         }
+        this.grammars = GrammarCompiler.forTokenizer(
+                Llguidance.load(Llguidance.besideLibrary(engine.config().cudaLibraryPath())),
+                engine.tokenizer(),
+                engine.modelConfig().vocabSize());
+    }
+
+    @Override
+    public void checkGrammar(String grammar) {
+        this.grammars.check(grammar);
+    }
+
+    @Override
+    public void checkJsonSchema(String schema) {
+        this.grammars.checkJsonSchema(schema);
+    }
+
+    @Override
+    public void close() {
+        this.grammars.close();
     }
 
     @Override
@@ -69,18 +91,20 @@ public final class EngineInferenceBackend implements InferenceBackend {
         if (this.engine.isClosed()) throw new InferenceUnavailableException("inference engine is shutting down");
         try {
             QwenTokenizer tokenizer = this.engine.tokenizer();
-            ToolConstraint tools = output.tools();
-            JsonEnvelopeConstraint envelope = tools == null
-                    ? null
-                    : new JsonEnvelopeConstraint(tokenizer, tools.toolNames(), tools.requiresCall(), tools.parallel());
+            TokenConstraint answer = output.grammar() == null ? null : this.grammars.constraint(output.grammar());
             // Free reasoning needs no constraint, so a greedy request keeps speculative decoding.
-            TokenConstraint constraint = output.reasoning() && envelope != null
-                    ? new ReasoningConstraint(tokenizer, Integer.MAX_VALUE, envelope)
-                    : envelope;
+            TokenConstraint constraint = output.reasoning() && answer != null
+                    ? new ReasoningConstraint(tokenizer, Integer.MAX_VALUE, answer)
+                    : answer;
             int thinkEnd = output.reasoning()
                     ? tokenizer.controlTokenId(QwenChatTemplate.THINK_END).orElseThrow()
                     : -1;
-            return new SessionGeneration(this.engine.createSession(config), tokenizer, constraint, thinkEnd);
+            try {
+                return new SessionGeneration(this.engine.createSession(config), tokenizer, constraint, thinkEnd);
+            } catch (RuntimeException | Error failure) {
+                if (constraint != null) constraint.close();
+                throw failure;
+            }
         } catch (IllegalStateException closed) {
             // createSession's only state failure is closed admission; anything else is a real fault.
             if (this.engine.isClosed()) throw new InferenceUnavailableException("inference engine is shutting down");
@@ -123,9 +147,14 @@ public final class EngineInferenceBackend implements InferenceBackend {
             return this.session.isCancelled();
         }
 
+        /// The session's close waits for its generation to end, after which nothing uses the constraint.
         @Override
         public void close() {
-            this.session.close();
+            try {
+                this.session.close();
+            } finally {
+                if (this.constraint != null) this.constraint.close();
+            }
         }
     }
 }
