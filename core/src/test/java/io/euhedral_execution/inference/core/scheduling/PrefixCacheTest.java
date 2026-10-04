@@ -190,6 +190,46 @@ class PrefixCacheTest {
     }
 
     @Test
+    void aCaptureHoldsTheSequenceSoACancellationCannotReleaseItsStateUnderTheCopies() throws Exception {
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        QwenSequenceState source = sequence(1024, 4);
+        var released = new java.util.concurrent.atomic.AtomicBoolean();
+        // Cancelled while the capture's copies run, as a client that leaves mid-prefill does.
+        PrefixCache.Frames cancelling = new PrefixCache.Frames() {
+            @Override
+            public <T> CompletableFuture<T> run(Supplier<T> work) {
+                source.cancel();
+                if (source.terminalState() != QwenSequenceState.TerminalState.ACTIVE) released.set(true);
+                return INLINE.run(work);
+            }
+        };
+        PrefixNode node =
+                cache.capture(cancelling, source, cache.root(), tokens, 1024).get();
+        assertFalse(released.get(), "the sequence's state was released while the capture copied it");
+        assertEquals(1024, node.position(), "the copies finished before the release, so the node is whole");
+        assertFalse(source.isExecutionClaimed());
+        assertEquals(QwenSequenceState.TerminalState.CANCELLED, source.terminalState(), "released after the copies");
+    }
+
+    @Test
+    void aSequenceCancelledBeforeTheCaptureIsNotCaptured() throws Exception {
+        PrefixCache cache = cache(8L << 20, 1024);
+        QwenSequenceState source = sequence(1024, 4);
+        source.cancel();
+        assertSame(
+                cache.root(),
+                cache.capture(
+                                INLINE,
+                                source,
+                                cache.root(),
+                                IntStream.range(0, 1100).toArray(),
+                                1024)
+                        .get());
+        assertEquals(0, cache.stats().captured());
+    }
+
+    @Test
     void aCancellationRequestedWhileTheLeaseIsFreeStopsTheRestoreWithoutAnError() throws Exception {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();

@@ -66,7 +66,11 @@ the bytes back and the generation goes on. A restore allocates the sequence's st
 chain's KV pages and the last node's GDN state in, and publishes the position; the pages of a chain are copied
 ancestor first.
 
-A cancelled generation takes no checkpoint at its end, and one cancelled while restoring ends with the sequence released.
+A capture holds the sequence's execution lease while it copies, as a restore does, so a cancellation that arrives
+mid-capture only flags the sequence and its buffers are released after the copies; a sequence already cancelled is not
+captured. (Without the lease, a client that left during prefill released the buffers under the copy, and the process
+crashed in `cuMemcpyDtoH`.) A cancelled generation takes no checkpoint at its end, and one cancelled while restoring
+ends with the sequence released.
 
 ## Speculative prompts
 
