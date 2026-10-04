@@ -483,10 +483,25 @@ public final class InferenceEngine implements AutoCloseable {
         QwenModel loadModel(
                 Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContextTokens)
                 throws IOException {
-            var plan = ResidencyPlanner.plan(artifact, profile, memoryInfo(gpu).freeBytes(), maxContextTokens);
+            int positions = artifact.config().maxPositionEmbeddings();
+            if (maxContextTokens > positions)
+                throw new IllegalArgumentException("a context of " + maxContextTokens + " tokens is longer than the "
+                        + positions + " positions the model supports; set a smaller max context");
+            long free = memoryInfo(gpu).freeBytes();
+            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens);
             if (!plan.fits())
-                throw new IOException("a context of " + maxContextTokens + " tokens does not fit on this GPU; set a "
+                throw new IOException("a context of " + maxContextTokens + " tokens does not fit in the "
+                        + (free >> 20) + " MiB free on this GPU, even with the weights in host memory; set a "
                         + "smaller max context");
+            long hostBytes = 0;
+            for (var tensor : artifact.tensors())
+                if (plan.hostBacked().contains(tensor.name())) hostBytes += tensor.byteSize();
+            LOG.info(
+                    "Context {} tokens: {} MiB of the {} MiB free on the GPU, {} MiB of weights in host memory",
+                    maxContextTokens,
+                    plan.deviceBytes() >> 20,
+                    free >> 20,
+                    hostBytes >> 20);
             return QwenModel.load(path, artifact, gpu, profile.speculative(), plan.hostBacked());
         }
 

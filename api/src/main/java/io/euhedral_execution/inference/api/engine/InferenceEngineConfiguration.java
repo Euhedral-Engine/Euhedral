@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.api.chat.SamplingDefaults;
 import io.euhedral_execution.inference.api.metrics.EngineMetrics;
 import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.core.InferenceEngine;
+import io.euhedral_execution.inference.core.guidance.Llguidance;
 import java.io.IOException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,20 +23,41 @@ import org.springframework.context.annotation.Configuration;
 public class InferenceEngineConfiguration {
     private static final Logger LOG = LoggerFactory.getLogger(InferenceEngineConfiguration.class);
 
-    /// Loaded before the engine so an unsupported template fails fast without touching the GPU.
+    /// Loaded before the engine so an unsupported template fails fast without touching the GPU. The first bean to
+    /// read the settings' files, so it checks all of them first.
     @Bean
-    QwenChatTemplate qwenChatTemplate(InferenceProperties properties) throws IOException {
-        return QwenChatTemplate.load(properties.tokenizerDirectory());
+    QwenChatTemplate qwenChatTemplate(InferenceProperties properties) {
+        SetupCheck.require(properties);
+        try {
+            return QwenChatTemplate.load(properties.tokenizerDirectory());
+        } catch (IOException | RuntimeException failure) {
+            throw new EngineStartupException("Reading the chat template", failure);
+        }
     }
 
     @Bean
-    SamplingDefaults samplingDefaults(InferenceProperties properties) throws IOException {
-        return SamplingDefaults.load(properties.tokenizerDirectory());
+    SamplingDefaults samplingDefaults(InferenceProperties properties) {
+        try {
+            return SamplingDefaults.load(properties.tokenizerDirectory());
+        } catch (IOException | RuntimeException failure) {
+            throw new EngineStartupException("Reading generation_config.json", failure);
+        }
     }
 
-    /// Depends on the template bean only to order checkpoint validation before the GPU load.
+    /// Loaded before the engine, so a library that does not load fails without the weights' load before it.
+    @Bean
+    Llguidance llguidance(InferenceProperties properties, QwenChatTemplate chatTemplate) {
+        try {
+            return Llguidance.load(Llguidance.besideLibrary(properties.cudaLibraryPath()));
+        } catch (RuntimeException failure) {
+            throw new EngineStartupException("Loading the constrained-decoding library", failure);
+        }
+    }
+
+    /// Depends on the template and library beans only to order their validation before the GPU load.
     @Bean(destroyMethod = "close")
-    InferenceEngine inferenceEngine(InferenceProperties properties, QwenChatTemplate chatTemplate) throws IOException {
+    InferenceEngine inferenceEngine(
+            InferenceProperties properties, QwenChatTemplate chatTemplate, Llguidance llguidance) {
         LOG.info("Loading inference engine for model {}", properties.modelId());
         try {
             return InferenceEngine.load(properties.toInferenceConfig());
@@ -46,7 +68,9 @@ public class InferenceEngineConfiguration {
             } catch (RuntimeException | Error cleanup) {
                 failure.addSuppressed(cleanup);
             }
-            throw failure;
+            throw new EngineStartupException("Loading the inference engine", failure);
+        } catch (IOException | RuntimeException failure) {
+            throw new EngineStartupException("Loading the inference engine", failure);
         }
     }
 
@@ -55,8 +79,13 @@ public class InferenceEngineConfiguration {
             InferenceEngine engine,
             InferenceProperties properties,
             QwenChatTemplate chatTemplate,
+            Llguidance llguidance,
             ServerMetrics metrics) {
-        return new EngineInferenceBackend(engine, properties.modelId(), chatTemplate, metrics);
+        try {
+            return new EngineInferenceBackend(engine, properties.modelId(), chatTemplate, llguidance, metrics);
+        } catch (RuntimeException failure) {
+            throw new EngineStartupException("Preparing the tokenizer for chat and grammars", failure);
+        }
     }
 
     @Bean
