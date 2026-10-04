@@ -21,6 +21,8 @@ euhedral:
     # worker-cpus: 2,3            (processor IDs or inclusive ranges, e.g. 2-5,8)
     # model-id: qwen3.8-27b       (the name clients send as "model")
     # max-context-tokens: 32768   (optional; longest prompt plus completion; longer contexts hold weights in host memory)
+    # prefix-cache-bytes: 4294967296   (optional; pinned host memory that keeps earlier prompts' state for reuse; 0 disables)
+    # prefix-cache-checkpoint-tokens: 2048   (optional; prompt tokens between stored checkpoints; a multiple of 512)
     shutdown-timeout: 10s
   api:
     default-max-tokens: 4096
