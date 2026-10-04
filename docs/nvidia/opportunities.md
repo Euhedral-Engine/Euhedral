@@ -81,6 +81,11 @@ the rest is about 150 us of fixed cost per kernel. A 192 × 128 tile and a store
 
 ### 4. CUDA graphs for decode and verify quanta
 
+**Built:** [../CUDA_GRAPHS.md](../CUDA_GRAPHS.md). Decode, verification and draft quanta replay captured graphs with
+programmatic edges at every position. Production decode is MTP: a replayed 3-row Q3 verification measured 19.02 ms at 4K
+(18.93 ms with programmatic edges) and a one-row draft 0.69 ms, and the host boundaries of a speculative step total about
+0.5 ms, so the bound is a few percent rather than the 10% estimated below for one-row decode.
+
 **Evidence**
 - 772 launches per decode token. GPU busy is 16.85 of 18.76 ms at 1K (about 10% gaps). MTP steps
   have 0.8–1.2 ms of host gaps.

@@ -302,7 +302,8 @@ FP16/MMA and BF16-output tolerance.
 Decode and VERIFY quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
 (`euhedral_cuda_pdl_select`): every kernel registered for it begins with `griddepcontrol.wait`
 (`native/src/common/pdl.cuh`), so it cannot read a predecessor's output early. It won 12 of 12 paired forks
-(about +1%) at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches.
+(about +1%) at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches. Quanta replayed from
+captured CUDA graphs ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)) carry programmatic edges at every position instead.
 
 `QwenExecutionPlan.reference(weights)` is the unfused oracle used by tests; staged plans (`prefix`,
 `embeddingOnly`, operator slices) are also reference-only.
