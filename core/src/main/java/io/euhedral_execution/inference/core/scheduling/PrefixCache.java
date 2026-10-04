@@ -73,7 +73,7 @@ public final class PrefixCache implements AutoCloseable {
     private final AtomicLong captured = new AtomicLong();
     private final AtomicLong skipped = new AtomicLong();
     private final AtomicLong failed = new AtomicLong();
-    private boolean closed;
+    private volatile boolean closed;
 
     /// Pins `bytes` of host memory as the arena of a new cache. With `mtp` the sequences it serves carry the MTP
     /// layer's cache, which checkpoints of speculative prompts keep. Throws when the memory cannot be pinned.
@@ -160,7 +160,8 @@ public final class PrefixCache implements AutoCloseable {
             int[] tokens,
             int position,
             long seedRowAddress) {
-        if (!(sequence.recurrentState() instanceof GdnSequenceStates gdn)
+        if (this.closed
+                || !(sequence.recurrentState() instanceof GdnSequenceStates gdn)
                 || !(sequence.kvCacheState() instanceof AttentionSequenceStates attention)
                 || attention.forLayer(this.layout.kvLayers()[0]).length() < position)
             return CompletableFuture.completedFuture(parent);
@@ -169,6 +170,8 @@ public final class PrefixCache implements AutoCloseable {
                 && (parent == this.tree.root() || parent.hasMtp())
                 && attention.forLayer(this.layout.mtpLayer()).length() >= position - 1;
         PrefixNode existing = this.tree.find(parent, tokens, position, mtp);
+        // A node with MTP state holds everything a plain one does, and plain lookups accept it.
+        if (existing == null && !mtp) existing = this.tree.find(parent, tokens, position, true);
         if (existing != null) return CompletableFuture.completedFuture(existing);
         PrefixNode node;
         try {
@@ -210,12 +213,17 @@ public final class PrefixCache implements AutoCloseable {
     public CompletableFuture<Boolean> restore(
             Frames frames, QwenExecutionPlan plan, QwenSequenceState sequence, Hit hit, boolean mtp) {
         int position = hit.position();
+        if (this.closed) return CompletableFuture.failedFuture(new IllegalStateException("the prefix cache is closed"));
+        if (cancelled(sequence)) return CompletableFuture.completedFuture(false);
         QwenSequenceState.ExecutionLease lease;
         List<PrefixLayout.Copy> copies;
         try {
             lease = sequence.claimExecution(0);
         } catch (RuntimeException failure) {
-            return CompletableFuture.failedFuture(failure);
+            // A cancellation that landed after the check above is the same outcome, not an error.
+            return cancelled(sequence)
+                    ? CompletableFuture.completedFuture(false)
+                    : CompletableFuture.failedFuture(failure);
         }
         try {
             QwenExecutionContext.attachSequenceState(plan, sequence, lease, this.gpu);
@@ -257,6 +265,11 @@ public final class PrefixCache implements AutoCloseable {
         });
     }
 
+    private static boolean cancelled(QwenSequenceState sequence) {
+        return sequence.cancellationRequested()
+                || sequence.terminalState() == QwenSequenceState.TerminalState.CANCELLED;
+    }
+
     public Stats stats() {
         return new Stats(
                 this.lookups.get(),
@@ -289,6 +302,8 @@ public final class PrefixCache implements AutoCloseable {
                 bytes += copies.get(from++).bytes();
             List<PrefixLayout.Copy> piece = copies.subList(start, from);
             done = done.thenCompose(ignored -> frames.run(() -> {
+                // The arena is freed by close(): a frame that runs after it must not touch it.
+                if (this.closed) throw new IllegalStateException("the prefix cache is closed");
                 for (PrefixLayout.Copy copy : piece) {
                     MemorySegment host = this.arena.asSlice(copy.hostOffset(), copy.bytes());
                     if (toDevice) this.gpu.copyHostToDevice(copy.deviceAddress(), host, copy.bytes());
