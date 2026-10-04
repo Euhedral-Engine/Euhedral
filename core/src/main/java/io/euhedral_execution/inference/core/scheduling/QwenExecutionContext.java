@@ -464,15 +464,25 @@ public final class QwenExecutionContext implements StageQuantum {
     }
 
     private void initializeSequenceState(ExecutionGpu gpu) {
-        if (!this.plan.hasFirstLayer()) return;
-        Object current = this.sequence.recurrentState();
-        Object currentKv = this.sequence.kvCacheState();
-        QwenConfig config = this.plan.weights().config();
+        attachSequenceState(this.plan, this.sequence, this.lease, gpu);
+    }
+
+    /// Gives `sequence` the persistent state a first quantum allocates (GDN buffers and KV pages), or checks
+    /// the state it already has. Runs under `lease`.
+    static void attachSequenceState(
+            QwenExecutionPlan plan,
+            QwenSequenceState sequence,
+            QwenSequenceState.ExecutionLease lease,
+            ExecutionGpu gpu) {
+        if (!plan.hasFirstLayer()) return;
+        Object current = sequence.recurrentState();
+        Object currentKv = sequence.kvCacheState();
+        QwenConfig config = plan.weights().config();
         if (current == null) {
             AutoCloseable createdRecurrent = null;
             AutoCloseable createdKv = null;
             try {
-                if (this.plan.weights().layers().length > 1) {
+                if (plan.weights().layers().length > 1) {
                     createdRecurrent = GdnSequenceStates.allocate(
                             gpu,
                             config.layerTypes(),
@@ -485,7 +495,7 @@ public final class QwenExecutionContext implements StageQuantum {
                             gpu,
                             config.layerTypes(),
                             config.numKeyValueHeads() * config.attentionHeadDim(),
-                            this.plan.weights().mtp() != null);
+                            plan.weights().mtp() != null);
                 } else {
                     createdRecurrent = QwenGdnSequenceState.allocate(
                             gpu,
@@ -495,14 +505,14 @@ public final class QwenExecutionContext implements StageQuantum {
                             config.linearValueHeadDim(),
                             config.linearConvKernelDim());
                 }
-                this.sequence.setRecurrentState(this.lease, createdRecurrent);
-                if (createdKv != null) this.sequence.setKvCacheState(this.lease, createdKv);
+                sequence.setRecurrentState(lease, createdRecurrent);
+                if (createdKv != null) sequence.setKvCacheState(lease, createdKv);
             } catch (RuntimeException | Error attachmentFailure) {
                 closeCreatedState(createdKv, attachmentFailure);
                 closeCreatedState(createdRecurrent, attachmentFailure);
                 throw attachmentFailure;
             }
-        } else if (this.plan.weights().layers().length > 1) {
+        } else if (plan.weights().layers().length > 1) {
             if (!(current instanceof GdnSequenceStates)) {
                 throw new IllegalStateException("sequence already owns incompatible full-model GDN state");
             }

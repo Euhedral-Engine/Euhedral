@@ -1,0 +1,253 @@
+package io.euhedral_execution.inference.core.scheduling;
+
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
+import io.euhedral_execution.inference.core.prefix.HostExtents;
+import io.euhedral_execution.inference.core.prefix.PrefixNode;
+import io.euhedral_execution.inference.core.prefix.PrefixTree;
+import java.lang.foreign.MemorySegment;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
+
+/// Sequence state kept across requests, in one pinned host arena: checkpoints of the KV pages and GDN state
+/// that prefill produced, found again by the token prefix they cover.
+///
+/// A checkpoint sits on the prefill chunk grid, because prefill state depends on how the prompt was split
+/// into chunks: a sequence restored at a multiple of [#CHUNK_TOKENS] prefills the rest in the chunks a cold
+/// run would use, and ends up with the state a cold run has. Checkpoints are taken every `intervalTokens`
+/// and at the last chunk boundary before a prompt ends (see [#wantsCheckpoint]).
+///
+/// Capture and restore move the state in frames of at most [#PIECE_BYTES] of copies each, so no worker holds
+/// a long copy. A capture reserves its bytes first (evicting the least recently used nodes), copies, then
+/// publishes; a failed copy gives the bytes back. A restore pins the chain it reads until the copies ran.
+public final class PrefixCache implements AutoCloseable {
+    /// The prefill chunk the cache's checkpoints are aligned to; sessions that use the cache prefill in it.
+    public static final int CHUNK_TOKENS = QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS;
+
+    /// The most bytes of copies one frame runs.
+    static final long PIECE_BYTES = 16L << 20;
+
+    /// Runs a piece of host work as one frame and completes with its result.
+    public interface Frames {
+        <T> CompletableFuture<T> run(Supplier<T> work);
+    }
+
+    /// A pinned match: its chain stays in the cache until [#release].
+    public record Hit(PrefixTree.Match match) {
+        public int position() {
+            return this.match.position();
+        }
+
+        /// Where later captures of the same sequence attach: the deepest matched node.
+        public PrefixNode cursor() {
+            return this.match.leaf();
+        }
+    }
+
+    public record Stats(
+            long lookups,
+            long hits,
+            long reusedTokens,
+            long captured,
+            long skipped,
+            long failed,
+            long evictions,
+            long usedBytes,
+            long totalBytes) {}
+
+    private final ExecutionGpu gpu;
+    private final PrefixLayout layout;
+    private final HostExtents extents;
+    private final PrefixTree tree;
+    private final MemorySegment arena;
+    private final Runnable release;
+    private final int intervalTokens;
+    private final AtomicLong lookups = new AtomicLong();
+    private final AtomicLong hits = new AtomicLong();
+    private final AtomicLong reusedTokens = new AtomicLong();
+    private final AtomicLong captured = new AtomicLong();
+    private final AtomicLong skipped = new AtomicLong();
+    private final AtomicLong failed = new AtomicLong();
+    private boolean closed;
+
+    /// Pins `bytes` of host memory as the arena of a new cache. Throws when the memory cannot be pinned.
+    public static PrefixCache create(ExecutionGpu gpu, QwenConfig config, long bytes, int intervalTokens) {
+        if (bytes <= 0) throw new IllegalArgumentException("bytes must be positive");
+        long address = gpu.allocateHostWeights(bytes);
+        MemorySegment arena = MemorySegment.ofAddress(address).reinterpret(bytes);
+        return new PrefixCache(gpu, config, arena, () -> gpu.freeHostWeights(address), intervalTokens);
+    }
+
+    PrefixCache(ExecutionGpu gpu, QwenConfig config, MemorySegment arena, Runnable release, int intervalTokens) {
+        if (intervalTokens <= 0 || intervalTokens % CHUNK_TOKENS != 0)
+            throw new IllegalArgumentException(
+                    "the checkpoint interval must be a positive multiple of " + CHUNK_TOKENS);
+        this.gpu = Objects.requireNonNull(gpu, "gpu");
+        this.layout = PrefixLayout.of(config);
+        this.arena = Objects.requireNonNull(arena, "arena");
+        this.release = Objects.requireNonNull(release, "release");
+        this.extents = new HostExtents(arena.byteSize());
+        this.tree = new PrefixTree(this.extents);
+        this.intervalTokens = intervalTokens;
+    }
+
+    public int intervalTokens() {
+        return this.intervalTokens;
+    }
+
+    public PrefixNode root() {
+        return this.tree.root();
+    }
+
+    /// Whether to store the state after the prefill chunk that ended at `end` of a prompt of `promptLength`
+    /// tokens: on the checkpoint interval, and at the last chunk boundary before the prompt ends, where the
+    /// next chunk is the final one. The latter is what lets a follow-up that extends the prompt, or repeats
+    /// it, skip all but the last chunk.
+    public boolean wantsCheckpoint(int end, int promptLength) {
+        if (end % this.intervalTokens == 0) return true;
+        return end < promptLength && promptLength - end <= CHUNK_TOKENS;
+    }
+
+    /// The longest stored prefix of `prompt` that leaves a token to prefill, pinned; null on a miss.
+    public Hit lookup(int[] prompt, boolean needsMtp) {
+        this.lookups.incrementAndGet();
+        PrefixTree.Match match = this.tree.lookup(prompt, needsMtp);
+        if (match == null) return null;
+        this.hits.incrementAndGet();
+        this.reusedTokens.addAndGet(match.position());
+        return new Hit(match);
+    }
+
+    public void release(Hit hit) {
+        this.tree.release(hit.match());
+    }
+
+    /// Saves the state of `sequence` at `position` as a node under `parent`, whose tokens are `tokens`, and
+    /// completes with the node the next capture of the sequence attaches to: the new or existing node, or
+    /// `parent` when the sequence does not hold `position` rows, the cache is full, or a copy failed. Never
+    /// fails.
+    public CompletableFuture<PrefixNode> capture(
+            Frames frames, QwenSequenceState sequence, PrefixNode parent, int[] tokens, int position) {
+        PrefixNode existing = this.tree.find(parent, tokens, position);
+        if (existing != null) return CompletableFuture.completedFuture(existing);
+        if (!(sequence.recurrentState() instanceof GdnSequenceStates gdn)
+                || !(sequence.kvCacheState() instanceof AttentionSequenceStates attention)
+                || attention.forLayer(this.layout.kvLayers()[0]).length() < position)
+            return CompletableFuture.completedFuture(parent);
+        PrefixNode node;
+        try {
+            node = this.tree.reserve(
+                    parent, tokens, position, false, this.layout.extentBytes(parent.position(), position, false));
+        } catch (RuntimeException invalid) {
+            this.failed.incrementAndGet();
+            return CompletableFuture.completedFuture(parent);
+        }
+        if (node == null) {
+            this.skipped.incrementAndGet();
+            return CompletableFuture.completedFuture(parent);
+        }
+        PrefixNode reserved = node;
+        List<PrefixLayout.Copy> copies = this.layout.captureCopies(reserved, gdn, attention);
+        return runCopies(frames, copies, false).handle((done, failure) -> {
+            if (failure != null) {
+                this.tree.abort(reserved);
+                this.failed.incrementAndGet();
+                return parent;
+            }
+            this.tree.publish(reserved);
+            this.captured.incrementAndGet();
+            return reserved;
+        });
+    }
+
+    /// Gives `sequence`, a fresh one, the state at `hit`'s position: allocates it, loads the chain's KV pages
+    /// and the last node's GDN state, and publishes the position. Completes with true when restored, and with
+    /// false when the sequence was cancelled meanwhile; it fails on any other error, leaving the sequence
+    /// failed for the caller to close.
+    public CompletableFuture<Boolean> restore(
+            Frames frames, QwenExecutionPlan plan, QwenSequenceState sequence, Hit hit) {
+        int position = hit.position();
+        QwenSequenceState.ExecutionLease lease;
+        List<PrefixLayout.Copy> copies;
+        try {
+            lease = sequence.claimExecution(0);
+        } catch (RuntimeException failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+        try {
+            QwenExecutionContext.attachSequenceState(plan, sequence, lease, this.gpu);
+            var attention = (AttentionSequenceStates) sequence.kvCacheState();
+            var gdn = (GdnSequenceStates) sequence.recurrentState();
+            for (int layer : this.layout.kvLayers()) attention.forLayer(layer).prepareAppend(0, position);
+            copies = this.layout.restoreCopies(hit.match().chain(), gdn, attention);
+        } catch (RuntimeException | Error failure) {
+            sequence.markFailed(lease, failure);
+            return CompletableFuture.failedFuture(failure);
+        }
+        return runCopies(frames, copies, true).handle((done, failure) -> {
+            if (failure != null) {
+                sequence.markFailed(lease, failure);
+                throw new CompletionException(failure);
+            }
+            try {
+                var attention = (AttentionSequenceStates) sequence.kvCacheState();
+                for (int layer : this.layout.kvLayers()) {
+                    AttentionKvState state = attention.forLayer(layer);
+                    state.appendSubmitted(position);
+                    state.commitSubmitted();
+                }
+                return !sequence.releaseExecutionAndCheckCancellation(lease, position);
+            } catch (RuntimeException | Error publication) {
+                sequence.markFailed(lease, publication);
+                throw new CompletionException(publication);
+            }
+        });
+    }
+
+    public Stats stats() {
+        return new Stats(
+                this.lookups.get(),
+                this.hits.get(),
+                this.reusedTokens.get(),
+                this.captured.get(),
+                this.skipped.get(),
+                this.failed.get(),
+                this.tree.evictions(),
+                this.extents.usedBytes(),
+                this.extents.totalBytes());
+    }
+
+    @Override
+    public synchronized void close() {
+        if (this.closed) return;
+        this.closed = true;
+        this.release.run();
+    }
+
+    /// Runs `copies` in frames of at most [#PIECE_BYTES], one after another. `toDevice` selects the direction.
+    private CompletableFuture<Void> runCopies(Frames frames, List<PrefixLayout.Copy> copies, boolean toDevice) {
+        CompletableFuture<Void> done = CompletableFuture.completedFuture(null);
+        int from = 0;
+        while (from < copies.size()) {
+            int start = from;
+            long bytes = 0;
+            while (from < copies.size()
+                    && (from == start || bytes + copies.get(from).bytes() <= PIECE_BYTES))
+                bytes += copies.get(from++).bytes();
+            List<PrefixLayout.Copy> piece = copies.subList(start, from);
+            done = done.thenCompose(ignored -> frames.run(() -> {
+                for (PrefixLayout.Copy copy : piece) {
+                    MemorySegment host = this.arena.asSlice(copy.hostOffset(), copy.bytes());
+                    if (toDevice) this.gpu.copyHostToDevice(copy.deviceAddress(), host, copy.bytes());
+                    else this.gpu.copyDeviceToHost(host, copy.deviceAddress(), copy.bytes());
+                }
+                return null;
+            }));
+        }
+        return done;
+    }
+}
