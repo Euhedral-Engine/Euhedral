@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.api.chat;
 
-import java.io.IOException;
 import java.math.BigInteger;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -28,9 +27,9 @@ final class ToolCallParser {
 
     /// Receives parsed output in generation order.
     interface Output {
-        void content(String text) throws IOException;
+        void content(String text);
 
-        void toolCall(String name, String arguments) throws IOException;
+        void toolCall(String name, String arguments);
     }
 
     /// The model's output claims to be a tool call but is not one this request can accept.
@@ -66,14 +65,14 @@ final class ToolCallParser {
         return this.calls;
     }
 
-    void accept(String chunk, Output output) throws IOException, MalformedToolCallException {
+    void accept(String chunk, Output output) throws MalformedToolCallException {
         this.buffer.append(chunk);
         drain(output);
     }
 
     /// Releases held-back text once generation has ended. After a stop token an unfinished call is
     /// malformed; after an exhausted budget it is truncated output and is dropped.
-    void finish(boolean stopTokenReached, Output output) throws IOException, MalformedToolCallException {
+    void finish(boolean stopTokenReached, Output output) throws MalformedToolCallException {
         drain(output);
         if (this.state == State.CONTENT) {
             if (!this.buffer.isEmpty()) output.content(this.buffer.toString());
@@ -83,7 +82,7 @@ final class ToolCallParser {
         this.buffer.setLength(0);
     }
 
-    private void drain(Output output) throws IOException, MalformedToolCallException {
+    private void drain(Output output) throws MalformedToolCallException {
         while (true) {
             switch (this.state) {
                 case CONTENT -> {
@@ -162,7 +161,7 @@ final class ToolCallParser {
         return 0;
     }
 
-    private void parseBlock(String block, Output output) throws IOException, MalformedToolCallException {
+    private void parseBlock(String block, Output output) throws MalformedToolCallException {
         int position = skipWhitespace(block, 0);
         if (!block.startsWith(FUNCTION_START, position)) throw malformed("a tool call has no <function=...> tag");
         int nameEnd = block.indexOf('>', position);

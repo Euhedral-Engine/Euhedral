@@ -3,7 +3,6 @@ package io.euhedral_execution.inference.api.chat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -121,12 +120,12 @@ class ToolCallParserTest {
         final List<String> arguments = new ArrayList<>();
 
         @Override
-        public void content(String text) throws IOException {
+        public void content(String text) {
             this.content.add(text);
         }
 
         @Override
-        public void toolCall(String name, String arguments) throws IOException {
+        public void toolCall(String name, String arguments) {
             this.arguments.add(arguments);
         }
     }

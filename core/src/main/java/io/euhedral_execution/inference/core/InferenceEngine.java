@@ -26,11 +26,13 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /// High-level owner of model, CUDA backend, Euhedral lattice, and all sessions it creates.
 /// Close sessions early when finished; engine close also closes every tracked session.
@@ -228,15 +230,14 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// Encodes `prompt` as a new session encodes its first prompt (with the model special tokens), on the
     /// lattice's workers. A fresh session generating from these IDs runs exactly that prompt.
-    public int[] tokenizePrompt(String prompt) throws InterruptedException {
-        try {
-            return this.runtime.tokenize(this.tokenizer, prompt, true).get();
-        } catch (java.util.concurrent.ExecutionException failure) {
-            Throwable cause = failure.getCause();
-            if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
-            if (cause instanceof Error error) throw error;
-            throw new IllegalStateException("prompt tokenization failed", cause);
-        }
+    public CompletableFuture<int[]> tokenizePromptAsync(String prompt) {
+        return this.runtime.tokenize(this.tokenizer, prompt, true);
+    }
+
+    /// Runs `work` as one frame on the lattice's workers: prompt-side host work (rendering, validation) of a
+    /// client that must not do it on its own threads. The future completes on that worker.
+    public <T> CompletableFuture<T> onWorker(Supplier<T> work) {
+        return this.runtime.onWorker(work);
     }
 
     public QwenConfig modelConfig() {

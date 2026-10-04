@@ -1,10 +1,12 @@
 package io.euhedral_execution.inference.core.scheduling;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.scheduling.frames.QwenStageFrame;
+import io.euhedral_execution.inference.core.scheduling.graph.FrameSeeds;
 import io.euhedral_execution.inference.core.scheduling.graph.LanePool;
 import io.euhedral_execution.inference.core.scheduling.graph.QwenExecutionSource;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
@@ -15,7 +17,9 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /// Admits Qwen quanta into reusable frame graphs and owns the Euhedral sources that run them.
 ///
@@ -231,6 +235,67 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         QwenExecutionSource source = tasks();
         source.admit();
         return PromptTokenization.start(tokenizer, text, modelSpecialTokens, source::publish, source::terminated);
+    }
+
+    /// Runs `work` as one frame on the lattice's workers; the future completes on that worker.
+    public <T> CompletableFuture<T> onWorker(Supplier<T> work) {
+        Objects.requireNonNull(work, "work");
+        QwenExecutionSource source = tasks();
+        source.admit();
+        CompletableFuture<T> result = new CompletableFuture<>();
+        try {
+            source.publish(new HostTask<>(work, result, source));
+        } catch (RuntimeException | Error failure) {
+            source.terminated();
+            result.completeExceptionally(failure);
+        }
+        return result;
+    }
+
+    /// One piece of host work for [#onWorker].
+    private static final class HostTask<T> extends AbstractFrame {
+        private final Supplier<T> work;
+        private final CompletableFuture<T> result;
+        private final QwenExecutionSource source;
+        private final AtomicBoolean finished = new AtomicBoolean();
+
+        HostTask(Supplier<T> work, CompletableFuture<T> result, QwenExecutionSource source) {
+            super(FrameSeeds.ID_HASH);
+            randomizeHash(new FrameSeeds().next());
+            this.work = work;
+            this.result = result;
+            this.source = source;
+        }
+
+        @Override
+        public void execute() {
+            T value;
+            try {
+                value = this.work.get();
+            } catch (RuntimeException | Error failure) {
+                finish(null, failure);
+                return;
+            }
+            finish(value, null);
+        }
+
+        @Override
+        public void doFinally() {}
+
+        @Override
+        public void doFinallyWithError(Throwable rejection) {
+            finish(null, new IllegalStateException("the lattice rejected a host task", rejection));
+        }
+
+        private void finish(T value, Throwable failure) {
+            if (!this.finished.compareAndSet(false, true)) return;
+            try {
+                this.source.terminated();
+            } finally {
+                if (failure != null) this.result.completeExceptionally(failure);
+                else this.result.complete(value);
+            }
+        }
     }
 
     private QwenExecutionSource tasks() {

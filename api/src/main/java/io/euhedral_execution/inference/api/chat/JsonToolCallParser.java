@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.api.chat;
 
-import java.io.IOException;
 import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.List;
@@ -50,14 +49,13 @@ final class JsonToolCallParser {
         return this.calls;
     }
 
-    void accept(String chunk, ToolCallParser.Output output)
-            throws IOException, ToolCallParser.MalformedToolCallException {
+    void accept(String chunk, ToolCallParser.Output output) throws ToolCallParser.MalformedToolCallException {
         this.buffer.append(chunk);
         drain(output);
     }
 
     void finish(boolean stopTokenReached, ToolCallParser.Output output)
-            throws IOException, ToolCallParser.MalformedToolCallException {
+            throws ToolCallParser.MalformedToolCallException {
         drain(output);
         if (this.state == State.CONTENT) {
             for (int index = 0; index < this.buffer.length(); index++)
@@ -71,7 +69,7 @@ final class JsonToolCallParser {
         this.buffer.setLength(0);
     }
 
-    private void drain(ToolCallParser.Output output) throws IOException, ToolCallParser.MalformedToolCallException {
+    private void drain(ToolCallParser.Output output) throws ToolCallParser.MalformedToolCallException {
         while (true) {
             switch (this.state) {
                 case CONTENT -> {
@@ -139,7 +137,7 @@ final class JsonToolCallParser {
     }
 
     private void validateAndDeliver(String text, ToolCallParser.Output output)
-            throws IOException, ToolCallParser.MalformedToolCallException {
+            throws ToolCallParser.MalformedToolCallException {
         Object decoded;
         try {
             decoded = JSON.readValue(text, Object.class);

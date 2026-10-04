@@ -14,7 +14,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 /// Coordinates prompt and decode quanta for one persistent Qwen sequence.
@@ -41,7 +40,10 @@ public final class QwenGenerationSession implements AutoCloseable {
     private final AtomicBoolean generationActive = new AtomicBoolean();
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
-    private final ReentrantLock generationLock = new ReentrantLock();
+    /// The current or latest generation; completes after its cleanup.
+    private volatile CompletableFuture<List<Integer>> activeGeneration;
+    /// The thread draining the blocking form's text, while it does.
+    private volatile Thread drainingThread;
     private Consumer<? super QwenGenerationSession> closeListener;
 
     private IncrementalDecoder decoder;
@@ -149,6 +151,92 @@ public final class QwenGenerationSession implements AutoCloseable {
         return !this.promptPrefilled;
     }
 
+    /// Starts a generation without blocking: the future completes, on a lattice worker, with the IDs this
+    /// call sampled. Encoding (for a text prompt), every quantum and token selection run on the lattice's
+    /// workers as continuations of quantum retirement. `text` receives newly decoded, non-empty text on those
+    /// workers, one call at a time and in order, before the next quantum is admitted, so a [#cancel] from it
+    /// stops the generation before another quantum runs. It must not block: queue blocking work (a network
+    /// write) as further work for the workers. The session runs one generation at a time; a failed or cancelled
+    /// generation leaves it cancelled.
+    public CompletableFuture<List<Integer>> generateAsync(
+            String prompt,
+            int maxNewTokens,
+            Consumer<String> text,
+            JsonEnvelopeConstraint constraint,
+            GenerationTimingListener timing) {
+        Objects.requireNonNull(prompt, "prompt");
+        return begin(prompt, null, maxNewTokens, text, constraint, timing, null);
+    }
+
+    /// As [#generateAsync(String, int, Consumer, JsonEnvelopeConstraint, GenerationTimingListener)] from a prompt
+    /// already encoded as that method would encode it: with the model special tokens for the session's first
+    /// prompt ([QwenTokenizer#encodeWithModelSpecialTokens]), as plain text ([QwenTokenizer#encodeText]) after it.
+    public CompletableFuture<List<Integer>> generateAsync(
+            int[] promptTokenIds, int maxNewTokens, Consumer<String> text, JsonEnvelopeConstraint constraint) {
+        Objects.requireNonNull(promptTokenIds, "promptTokenIds");
+        return begin(null, promptTokenIds.clone(), maxNewTokens, text, constraint, null, null);
+    }
+
+    private CompletableFuture<List<Integer>> begin(
+            String prompt,
+            int[] encoded,
+            int maxNewTokens,
+            Consumer<String> text,
+            JsonEnvelopeConstraint constraint,
+            GenerationTimingListener timing,
+            Emission heldBy) {
+        Objects.requireNonNull(text, "text");
+        if (maxNewTokens < 0) throw new IllegalArgumentException("maxNewTokens must not be negative");
+        if (!this.generationActive.compareAndSet(false, true)) {
+            throw new IllegalStateException("a generation is already active for this Qwen session");
+        }
+        CompletableFuture<List<Integer>> finished = new CompletableFuture<>();
+        this.activeGeneration = finished;
+        CompletableFuture<List<Integer>> done;
+        try {
+            ensureUsable();
+            if (this.decoderFinished) {
+                this.decoder = this.tokenizer.newIncrementalDecoder();
+                this.decoderFinished = false;
+            }
+            CompletableFuture<int[]> promptTokenIds = encoded != null
+                    ? CompletableFuture.completedFuture(encoded)
+                    : this.runtime.tokenize(this.tokenizer, prompt, !this.promptPrefilled);
+            done = promptTokenIds.thenCompose(ids -> {
+                if (ids.length == 0) throw new IllegalArgumentException("prompt must encode to at least one token");
+                if (timing != null) timing.promptEncoded(System.nanoTime(), ids.length);
+                return startGeneration(ids, maxNewTokens, constraint, timing, text);
+            });
+        } catch (RuntimeException | Error failure) {
+            this.generationActive.set(false);
+            finished.completeExceptionally(failure);
+            throw failure;
+        }
+        done.whenComplete((tokens, failure) -> {
+            if (failure != null && this.sequence.terminalState() == QwenSequenceState.TerminalState.ACTIVE)
+                requestCancellation();
+            if (heldBy == null) end(finished, tokens, failure);
+            else {
+                // The blocking form's caller still hands out text: the generation stays active until it drained.
+                heldBy.end(tokens, failure);
+                heldBy.drained.whenComplete((ignored, unused) -> end(finished, tokens, failure));
+            }
+        });
+        return finished;
+    }
+
+    private void end(CompletableFuture<List<Integer>> finished, List<Integer> tokens, Throwable failure) {
+        try {
+            this.generationActive.set(false);
+            if (this.closed.get()) completeClose();
+        } finally {
+            if (failure != null) finished.completeExceptionally(failure);
+            else finished.complete(tokens);
+        }
+    }
+
+    /// The blocking form: generates on the lattice's workers as [#generateAsync] does, and hands the text to
+    /// `output` on the calling thread, concurrently with later quanta. Returns after the generation finished.
     private List<Integer> generate(
             String prompt,
             int[] encoded,
@@ -158,60 +246,15 @@ public final class QwenGenerationSession implements AutoCloseable {
             GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
         Objects.requireNonNull(output, "output");
-        if (maxNewTokens < 0) throw new IllegalArgumentException("maxNewTokens must not be negative");
-        if (!this.generationActive.compareAndSet(false, true)) {
-            throw new IllegalStateException("a generation is already active for this Qwen session");
-        }
-        if (!this.generationLock.tryLock()) {
-            this.generationActive.set(false);
-            throw new IllegalStateException("the Qwen session is changing lifecycle state");
-        }
-
+        Emission emission = new Emission();
+        begin(prompt, encoded, maxNewTokens, emission::text, constraint, timing, emission);
+        this.drainingThread = Thread.currentThread();
         try {
-            ensureUsable();
-            if (this.decoderFinished) {
-                this.decoder = this.tokenizer.newIncrementalDecoder();
-                this.decoderFinished = false;
-            }
-            int[] promptTokenIds = encoded != null ? encoded : tokenize(prompt);
-            if (promptTokenIds.length == 0) {
-                throw new IllegalArgumentException("prompt must encode to at least one token");
-            }
-            if (timing != null) timing.promptEncoded(System.nanoTime(), promptTokenIds.length);
-
-            try {
-                return generateLocked(promptTokenIds, maxNewTokens, output, constraint, timing);
-            } catch (InterruptedException | ExecutionException | RuntimeException | Error failure) {
-                if (this.sequence.terminalState() == QwenSequenceState.TerminalState.ACTIVE) {
-                    try {
-                        requestCancellation();
-                    } catch (RuntimeException | Error cleanupFailure) {
-                        if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
-                    }
-                }
-                throw failure;
-            }
+            return emission.drain(output, this::requestCancellation);
         } finally {
-            this.generationActive.set(false);
-            try {
-                if (this.closed.get()) completeClose();
-            } finally {
-                this.generationLock.unlock();
-            }
-        }
-    }
-
-    /// Encodes the prompt on the lattice's workers (EuhedralInferenceRuntime#tokenize).
-    private int[] tokenize(String prompt) throws InterruptedException {
-        try {
-            return this.runtime
-                    .tokenize(this.tokenizer, prompt, !this.promptPrefilled)
-                    .get();
-        } catch (ExecutionException failure) {
-            Throwable cause = failure.getCause();
-            if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
-            if (cause instanceof Error error) throw error;
-            throw new IllegalStateException("prompt tokenization failed", cause);
+            this.drainingThread = null;
+            // Ends the generation on this thread, so it returns once another may start.
+            emission.drained.complete(null);
         }
     }
 
@@ -249,9 +292,9 @@ public final class QwenGenerationSession implements AutoCloseable {
         return this.closed.get();
     }
 
-    /// Allows the owning engine to reject reentrant shutdown from an output callback.
+    /// Allows the owning engine to reject reentrant shutdown from the blocking form's output callback.
     public boolean isGeneratingOnCurrentThread() {
-        return this.generationLock.isHeldByCurrentThread();
+        return this.generationActive.get() && Thread.currentThread() == this.drainingThread;
     }
 
     QwenSequenceState sequenceState() {
@@ -259,21 +302,24 @@ public final class QwenGenerationSession implements AutoCloseable {
     }
 
     /// Completes the sequence, releasing its persistent KV and GDN state.
-    /// Closing during generation requests cancellation and waits for the in-flight quantum to detach.
+    /// Closing during generation requests cancellation and waits until the generation ended, so it must not
+    /// be called from that generation's text callback. From the blocking form's output callback it returns at
+    /// once instead, and the generation completes the close when it ends.
     @Override
     public void close() {
         boolean firstClose = this.closed.compareAndSet(false, true);
-        if (firstClose && this.generationActive.get()) requestCancellation();
-        if (this.generationActive.get() && this.generationLock.isHeldByCurrentThread()) return;
-        this.generationLock.lock();
-        try {
-            completeClose();
-        } finally {
-            this.generationLock.unlock();
+        if (this.generationActive.get()) {
+            if (firstClose) requestCancellation();
+            if (Thread.currentThread() == this.drainingThread) return;
+            CompletableFuture<List<Integer>> active = this.activeGeneration;
+            if (active != null) active.handle((tokens, failure) -> null).join();
         }
+        completeClose();
     }
 
-    private void completeClose() {
+    /// Releases the sequence and host state; runs again after a failed attempt, and once a generation that
+    /// was active at close ends.
+    private synchronized void completeClose() {
         this.sequence.complete();
         // The sequence completes only once no quantum holds its lease, and a quantum releases the lease
         // after its retirement boundary, so no copy into the host row can still be queued.
@@ -285,35 +331,12 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
     }
 
-    /// Runs one call as a chain of continuations on the lattice's workers and emits its text on the calling
-    /// thread. Each quantum's outcome callback runs on the worker whose retirement frame completes it: it
-    /// selects the next token and admits the next quantum, so the calling thread is never woken between
-    /// quanta. Decoded text goes to a nonblocking queue that the calling thread drains into `output`, so a
-    /// slow client never holds a worker. The call returns only after the chain finished, whatever happened.
-    private List<Integer> generateLocked(
-            int[] promptTokenIds,
-            int maxNewTokens,
-            Consumer<String> output,
-            JsonEnvelopeConstraint constraint,
-            GenerationTimingListener timing)
-            throws InterruptedException, ExecutionException {
-        Emission emission = new Emission();
-        CompletableFuture<List<Integer>> done;
-        try {
-            done = startGeneration(promptTokenIds, maxNewTokens, constraint, timing, emission);
-        } catch (RuntimeException | Error failure) {
-            done = CompletableFuture.failedFuture(failure);
-        }
-        done.whenComplete((tokens, failure) -> emission.end());
-        return emission.drain(output, done, this::requestCancellation);
-    }
-
     private CompletableFuture<List<Integer>> startGeneration(
             int[] promptTokenIds,
             int maxNewTokens,
             JsonEnvelopeConstraint constraint,
             GenerationTimingListener timing,
-            Emission emission) {
+            Consumer<String> text) {
         if (isStopRequested()) return CompletableFuture.completedFuture(List.of());
         // A greedy, unconstrained call selects each token on the device and reads back only its ID.
         this.hostLogits.selectOnDevice(this.sampler.greedy() && constraint == null);
@@ -323,9 +346,9 @@ public final class QwenGenerationSession implements AutoCloseable {
                 && !this.promptPrefilled
                 && this.sequence.currentTokenPosition() == 0
                 && maxNewTokens > 0) {
-            return generateSpeculative(promptTokenIds, maxNewTokens, emission, timing);
+            return generateSpeculative(promptTokenIds, maxNewTokens, text, timing);
         }
-        Chain chain = new Chain(promptTokenIds, maxNewTokens, constraint, timing, emission);
+        Chain chain = new Chain(promptTokenIds, maxNewTokens, constraint, timing, text);
         chain.prefillNext();
         return chain.result;
     }
@@ -337,7 +360,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         private final int maxNewTokens;
         private final JsonEnvelopeConstraint constraint;
         private final GenerationTimingListener timing;
-        private final Emission emission;
+        private final Consumer<String> text;
         private final List<Integer> callTokenIds = new ArrayList<>();
         private final CompletableFuture<List<Integer>> result = new CompletableFuture<>();
         private int offset;
@@ -350,12 +373,12 @@ public final class QwenGenerationSession implements AutoCloseable {
                 int maxNewTokens,
                 JsonEnvelopeConstraint constraint,
                 GenerationTimingListener timing,
-                Emission emission) {
+                Consumer<String> text) {
             this.promptTokenIds = promptTokenIds;
             this.maxNewTokens = maxNewTokens;
             this.constraint = constraint;
             this.timing = timing;
-            this.emission = emission;
+            this.text = text;
         }
 
         void prefillNext() {
@@ -392,7 +415,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         private void afterPrefill() {
             QwenGenerationSession.this.promptPrefilled = true;
             if (this.maxNewTokens == 0) {
-                finishDecoder(this.emission);
+                finishDecoder(this.text);
                 this.result.complete(List.of());
                 return;
             }
@@ -420,7 +443,7 @@ public final class QwenGenerationSession implements AutoCloseable {
             }
             boolean anotherTokenAllowed = this.generated + 1 < this.maxNewTokens;
             record(tokenId);
-            this.emission.text(QwenGenerationSession.this.decoder.append(tokenId));
+            emit(this.text, QwenGenerationSession.this.decoder.append(tokenId));
             // Cancellation makes the session terminal; do not admit another quantum to preserve history.
             if (isStopRequested()) {
                 finish();
@@ -457,13 +480,13 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
 
         private void finish() {
-            if (this.endedNormally && !isStopRequested()) finishDecoder(this.emission);
+            if (this.endedNormally && !isStopRequested()) finishDecoder(this.text);
             this.result.complete(List.copyOf(this.callTokenIds));
         }
     }
 
     private CompletableFuture<List<Integer>> generateSpeculative(
-            int[] promptTokenIds, int maxNewTokens, Emission emission, GenerationTimingListener timing) {
+            int[] promptTokenIds, int maxNewTokens, Consumer<String> text, GenerationTimingListener timing) {
         if (this.speculative == null)
             this.speculative = new QwenSpeculativeDecoder(
                     this.runtime,
@@ -482,12 +505,12 @@ public final class QwenGenerationSession implements AutoCloseable {
                                 this.generatedTokenIds.add(token);
                             }
                             // As in ordinary decode, a generation terminator is returned but never decoded into text.
-                            if (!this.tokenizer.isGenerationEosToken(token)) emission.text(this.decoder.append(token));
+                            if (!this.tokenizer.isGenerationEosToken(token)) emit(text, this.decoder.append(token));
                         },
                         timing)
                 .thenApply(tokens -> {
                     this.promptPrefilled = true;
-                    if (!isStopRequested()) finishDecoder(emission);
+                    if (!isStopRequested()) finishDecoder(text);
                     return tokens;
                 });
     }
@@ -582,19 +605,25 @@ public final class QwenGenerationSession implements AutoCloseable {
     private static final class Emission {
         private static final Object END = new Object();
         private final LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+        /// Completed by the caller after the last text; the generation ends then.
+        final CompletableFuture<Void> drained = new CompletableFuture<>();
+        private List<Integer> tokens;
+        private Throwable failure;
 
         void text(String text) {
             if (!text.isEmpty()) this.queue.add(text);
         }
 
-        void end() {
+        /// The quanta are done; the queue publishes the result to the draining thread.
+        void end(List<Integer> tokens, Throwable failure) {
+            this.tokens = tokens;
+            this.failure = failure;
             this.queue.add(END);
         }
 
         /// Hands every text to `output` until the generation ended, then returns its tokens. When `output`
         /// throws or the calling thread is interrupted, `cancel` stops the generation, which is still awaited.
-        List<Integer> drain(Consumer<String> output, CompletableFuture<List<Integer>> done, Runnable cancel)
-                throws InterruptedException, ExecutionException {
+        List<Integer> drain(Consumer<String> output, Runnable cancel) throws InterruptedException, ExecutionException {
             Throwable outputFailure = null;
             boolean interrupted = false;
             while (true) {
@@ -621,15 +650,15 @@ public final class QwenGenerationSession implements AutoCloseable {
             }
             if (outputFailure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
             if (outputFailure instanceof Error error) throw error;
-            try {
-                return done.join();
-            } catch (java.util.concurrent.CompletionException failure) {
-                Throwable cause = failure.getCause();
-                if (cause instanceof ExecutionException executionFailure) throw executionFailure;
-                if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
-                if (cause instanceof Error error) throw error;
-                throw new ExecutionException(cause);
-            }
+            if (this.failure == null) return this.tokens;
+            Throwable cause = this.failure instanceof java.util.concurrent.CompletionException wrapped
+                            && wrapped.getCause() != null
+                    ? wrapped.getCause()
+                    : this.failure;
+            if (cause instanceof ExecutionException executionFailure) throw executionFailure;
+            if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (cause instanceof Error error) throw error;
+            throw new ExecutionException(cause);
         }
     }
 
@@ -650,11 +679,15 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
     }
 
-    private void finishDecoder(Emission emission) {
+    private void finishDecoder(Consumer<String> text) {
         if (this.decoderFinished) return;
         String remaining = this.decoder.finish();
         this.decoderFinished = true;
-        emission.text(remaining);
+        emit(text, remaining);
+    }
+
+    private static void emit(Consumer<String> text, String decoded) {
+        if (!decoded.isEmpty()) text.accept(decoded);
     }
 
     private void ensureUsable() {

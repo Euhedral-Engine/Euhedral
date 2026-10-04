@@ -4,21 +4,33 @@ import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.api.engine.InferenceUnavailableException;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
-/// Test backend that follows `QwenGenerationSession`'s callback contract without CUDA: text is emitted on the
-/// generating thread between "quanta", cancellation stops the next quantum, and generations record their
-/// inputs and lifecycle so tests can assert cancellation and cleanup.
+/// Test backend that follows the engine's asynchronous contract without CUDA: a small pool stands in for the
+/// lattice's workers, which encode prompts and run generations; text is emitted on a worker between
+/// "quanta", cancellation stops the next quantum, and generations record their inputs and lifecycle so tests
+/// can assert cancellation and cleanup.
 final class ScriptedInferenceBackend implements InferenceBackend {
     static final String MODEL_ID = "euhedral-test-model";
 
     final List<ScriptedGeneration> generations = new CopyOnWriteArrayList<>();
+    private final AtomicInteger workerIds = new AtomicInteger();
+    /// Stands in for the lattice's workers.
+    final ExecutorService workers = Executors.newFixedThreadPool(4, task -> {
+        Thread thread = new Thread(task, "scripted-worker-" + this.workerIds.incrementAndGet());
+        thread.setDaemon(true);
+        return thread;
+    });
     volatile boolean available = true;
     volatile Script script = tokens(List.of("Hello", ", ", "world"), true);
     volatile int contextLength = 4096;
@@ -70,6 +82,16 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         return this.generations.getFirst();
     }
 
+    /// The first generation, once a worker opened it: requests are planned and admitted asynchronously.
+    ScriptedGeneration awaitFirst() throws InterruptedException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+        while (this.generations.isEmpty()) {
+            if (System.nanoTime() > deadline) throw new AssertionError("no generation was opened");
+            Thread.sleep(1);
+        }
+        return this.generations.getFirst();
+    }
+
     @Override
     public String modelId() {
         return MODEL_ID;
@@ -94,15 +116,24 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     final AtomicInteger encoded = new AtomicInteger();
 
     @Override
-    public EncodedPrompt encodePrompt(String prompt) {
-        this.encoded.incrementAndGet();
-        return new EncodedPrompt(prompt, new int[countPromptTokens(prompt)]);
+    public Executor workers() {
+        return this.workers;
+    }
+
+    @Override
+    public CompletableFuture<EncodedPrompt> encodePrompt(String prompt) {
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    this.encoded.incrementAndGet();
+                    return new EncodedPrompt(prompt, new int[countPromptTokens(prompt)]);
+                },
+                this.workers);
     }
 
     @Override
     public Generation openGeneration(GenerationConfig config, ToolConstraint constraint) {
         if (!this.available) throw new InferenceUnavailableException("inference engine is shutting down");
-        var generation = new ScriptedGeneration(config, this.script);
+        var generation = new ScriptedGeneration(config, this.script, this.workers);
         generation.constraint = constraint;
         this.generations.add(generation);
         return generation;
@@ -122,21 +153,31 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         volatile int maxNewTokens;
         volatile String generatingThread;
 
-        private ScriptedGeneration(GenerationConfig config, Script script) {
+        private final Executor workers;
+
+        private ScriptedGeneration(GenerationConfig config, Script script, Executor workers) {
             this.config = config;
             this.script = script;
+            this.workers = workers;
         }
 
         @Override
-        public Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
-                throws InterruptedException, ExecutionException {
+        public CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
             if (this.closeCount.get() > 0) throw new IllegalStateException("Qwen generation session is closed");
             if (this.cancelled.get()) throw new IllegalStateException("Qwen generation session is cancelled");
             this.prompt = prompt.text();
             this.maxNewTokens = maxNewTokens;
-            this.generatingThread = Thread.currentThread().getName();
-            this.started.countDown();
-            return this.script.run(this, maxNewTokens, output);
+            return CompletableFuture.supplyAsync(
+                    () -> {
+                        this.generatingThread = Thread.currentThread().getName();
+                        this.started.countDown();
+                        try {
+                            return this.script.run(this, maxNewTokens, text);
+                        } catch (InterruptedException | ExecutionException failure) {
+                            throw new java.util.concurrent.CompletionException(failure);
+                        }
+                    },
+                    this.workers);
         }
 
         void emit(Consumer<String> output, String text) {

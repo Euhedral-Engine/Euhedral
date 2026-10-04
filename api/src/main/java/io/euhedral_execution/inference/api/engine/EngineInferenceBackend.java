@@ -6,9 +6,9 @@ import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
-import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 
 /// Borrows the Spring-owned `InferenceEngine`; the engine bean remains the terminal owner of model,
@@ -16,10 +16,16 @@ import java.util.function.Consumer;
 public final class EngineInferenceBackend implements InferenceBackend {
     private final InferenceEngine engine;
     private final String modelId;
+    /// Each task is one frame on the engine's lattice.
+    private final Executor workers;
 
     public EngineInferenceBackend(InferenceEngine engine, String modelId, QwenChatTemplate chatTemplate) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.modelId = Objects.requireNonNull(modelId, "modelId");
+        this.workers = task -> engine.onWorker(() -> {
+            task.run();
+            return null;
+        });
         // The formatter emits these as control tokens; plain-text encoding would silently corrupt prompts.
         for (String token : chatTemplate.controlTokens()) {
             if (engine.tokenizer().controlTokenId(token).isEmpty())
@@ -45,9 +51,14 @@ public final class EngineInferenceBackend implements InferenceBackend {
     }
 
     @Override
-    public EncodedPrompt encodePrompt(String prompt) throws InterruptedException {
+    public Executor workers() {
+        return this.workers;
+    }
+
+    @Override
+    public CompletableFuture<EncodedPrompt> encodePrompt(String prompt) {
         // Every generation runs on a fresh session, whose first prompt carries the model special tokens.
-        return new EncodedPrompt(prompt, this.engine.tokenizePrompt(prompt));
+        return this.engine.tokenizePromptAsync(prompt).thenApply(ids -> new EncodedPrompt(prompt, ids));
     }
 
     @Override
@@ -74,13 +85,14 @@ public final class EngineInferenceBackend implements InferenceBackend {
             implements Generation {
 
         @Override
-        public Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
-                throws InterruptedException, ExecutionException {
+        public CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
             if (!this.session.expectsFirstPrompt())
                 throw new IllegalStateException("an encoded prompt needs a fresh session");
-            List<Integer> tokenIds = this.session.generate(prompt.tokenIds(), maxNewTokens, output, this.constraint);
-            boolean stopToken = !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast());
-            return new Result(tokenIds.size(), stopToken);
+            return this.session
+                    .generateAsync(prompt.tokenIds(), maxNewTokens, text, this.constraint)
+                    .thenApply(tokenIds -> new Result(
+                            tokenIds.size(),
+                            !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast())));
         }
 
         @Override

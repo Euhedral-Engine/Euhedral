@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
 import org.springframework.stereotype.Component;
@@ -75,17 +76,35 @@ public class ChatRequestMapper {
         this.apiProperties = apiProperties;
     }
 
-    public ChatCompletionPlan plan(ChatCompletionRequest request) {
+    /// A request validated up to its rendered prompt, before the prompt is encoded.
+    public record Rendered(
+            ChatCompletionRequest request, boolean stream, boolean includeUsage, ToolCalling tools, String prompt) {}
+
+    /// Validates and plans a request on the backend's workers: rendering and validation run as worker tasks,
+    /// encoding as the backend's tokenization frames. The future fails with an [OpenAiException] for an invalid
+    /// request.
+    public CompletableFuture<ChatCompletionPlan> planAsync(ChatCompletionRequest request) {
+        return CompletableFuture.supplyAsync(() -> render(request), this.backend.workers())
+                .thenCompose(rendered ->
+                        this.backend.encodePrompt(rendered.prompt()).thenApply(prompt -> plan(rendered, prompt)));
+    }
+
+    /// Validates everything the request states and renders its prompt.
+    public Rendered render(ChatCompletionRequest request) {
         if (request == null) throw OpenAiException.invalidRequest("Request body is required.", null);
         checkOtherFields(request.otherFields(), NEUTRAL_VALUES, "");
         boolean stream = Boolean.TRUE.equals(request.stream());
         boolean includeUsage = streamOptionsIncludeUsage(request, stream);
         requireServedModel(request.model());
         ToolCalling tools = ToolCalling.fromRequest(request.tools(), request.toolChoice(), request.parallelToolCalls());
+        return new Rendered(request, stream, includeUsage, tools, renderPrompt(request.messages(), tools));
+    }
 
-        InferenceBackend.EncodedPrompt prompt = encode(renderPrompt(request.messages(), tools));
-        int promptTokens = prompt.tokenCount();
-        int maxTokens = resolveMaxTokens(request, promptTokens);
+    /// Completes the plan of a rendered request with its encoded prompt: the completion budget against the
+    /// model context.
+    public ChatCompletionPlan plan(Rendered rendered, InferenceBackend.EncodedPrompt prompt) {
+        ChatCompletionRequest request = rendered.request();
+        int maxTokens = resolveMaxTokens(request, prompt.tokenCount());
         return new ChatCompletionPlan(
                 "chatcmpl-" + UUID.randomUUID().toString().replace("-", ""),
                 Instant.now().getEpochSecond(),
@@ -94,18 +113,9 @@ public class ChatRequestMapper {
                 maxTokens,
                 sampling(request),
                 stops(request.stop()),
-                stream,
-                includeUsage,
-                tools);
-    }
-
-    private InferenceBackend.EncodedPrompt encode(String prompt) {
-        try {
-            return this.backend.encodePrompt(prompt);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("prompt encoding was interrupted", interrupted);
-        }
+                rendered.stream(),
+                rendered.includeUsage(),
+                rendered.tools());
     }
 
     private void requireServedModel(String model) {
