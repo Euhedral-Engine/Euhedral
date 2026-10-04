@@ -10,7 +10,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -283,6 +285,11 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
     }
 
+    /// Runs one call as a chain of continuations on the lattice's workers and emits its text on the calling
+    /// thread. Each quantum's outcome callback runs on the worker whose retirement frame completes it: it
+    /// selects the next token and admits the next quantum, so the calling thread is never woken between
+    /// quanta. Decoded text goes to a nonblocking queue that the calling thread drains into `output`, so a
+    /// slow client never holds a worker. The call returns only after the chain finished, whatever happened.
     private List<Integer> generateLocked(
             int[] promptTokenIds,
             int maxNewTokens,
@@ -290,8 +297,24 @@ public final class QwenGenerationSession implements AutoCloseable {
             JsonEnvelopeConstraint constraint,
             GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
-        List<Integer> callTokenIds = new ArrayList<>();
-        if (isStopRequested()) return List.of();
+        Emission emission = new Emission();
+        CompletableFuture<List<Integer>> done;
+        try {
+            done = startGeneration(promptTokenIds, maxNewTokens, constraint, timing, emission);
+        } catch (RuntimeException | Error failure) {
+            done = CompletableFuture.failedFuture(failure);
+        }
+        done.whenComplete((tokens, failure) -> emission.end());
+        return emission.drain(output, done, this::requestCancellation);
+    }
+
+    private CompletableFuture<List<Integer>> startGeneration(
+            int[] promptTokenIds,
+            int maxNewTokens,
+            JsonEnvelopeConstraint constraint,
+            GenerationTimingListener timing,
+            Emission emission) {
+        if (isStopRequested()) return CompletableFuture.completedFuture(List.of());
         // A greedy, unconstrained call selects each token on the device and reads back only its ID.
         this.hostLogits.selectOnDevice(this.sampler.greedy() && constraint == null);
         if (this.speculativeDepth > 0
@@ -300,77 +323,147 @@ public final class QwenGenerationSession implements AutoCloseable {
                 && !this.promptPrefilled
                 && this.sequence.currentTokenPosition() == 0
                 && maxNewTokens > 0) {
-            return generateSpeculative(promptTokenIds, maxNewTokens, output, timing);
+            return generateSpeculative(promptTokenIds, maxNewTokens, emission, timing);
         }
-
-        OptionalInt nextToken = OptionalInt.empty();
-        for (int offset = 0; offset < promptTokenIds.length; offset += this.prefillChunkTokens) {
-            if (isStopRequested()) return List.of();
-            int end = Math.min(offset + this.prefillChunkTokens, promptTokenIds.length);
-            long started = timing == null ? 0L : System.nanoTime();
-            boolean samples = end == promptTokenIds.length && maxNewTokens > 0;
-            QwenExecutionContext prefill = new QwenExecutionContext(
-                    this.plan,
-                    this.sequence,
-                    QwenExecutionContext.ExecutionKind.PREFILL,
-                    this.sequence.currentTokenPosition(),
-                    Arrays.copyOfRange(promptTokenIds, offset, end),
-                    samples ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
-                    samples ? this.hostLogits : null);
-            nextToken = executeAndSelect(prefill, samples, constraint, timing, started, true);
-            if (isStopRequested()) return List.of();
-        }
-        this.promptPrefilled = true;
-        if (maxNewTokens == 0) {
-            finishDecoder(output);
-            return List.of();
-        }
-
-        boolean endedNormally = false;
-        for (int generated = 0; generated < maxNewTokens; generated++) {
-            if (isStopRequested() || nextToken.isEmpty()) break;
-            int tokenId = nextToken.getAsInt();
-            if (isStopRequested()) break;
-            if (this.tokenizer.isGenerationEosToken(tokenId)) {
-                callTokenIds.add(tokenId);
-                synchronized (this.generatedTokenIds) {
-                    this.generatedTokenIds.add(tokenId);
-                }
-                // EOS terminates the generation and is not a model input quantum.
-                endedNormally = true;
-                break;
-            }
-            if (isStopRequested()) break;
-            boolean anotherTokenAllowed = generated + 1 < maxNewTokens;
-            callTokenIds.add(tokenId);
-            synchronized (this.generatedTokenIds) {
-                this.generatedTokenIds.add(tokenId);
-            }
-            emit(output, this.decoder.append(tokenId));
-            // Cancellation makes the session terminal; do not admit another quantum to preserve history.
-            if (isStopRequested()) break;
-            long started = timing == null ? 0L : System.nanoTime();
-            QwenExecutionContext decode = new QwenExecutionContext(
-                    this.plan,
-                    this.sequence,
-                    QwenExecutionContext.ExecutionKind.DECODE,
-                    this.sequence.currentTokenPosition(),
-                    new int[] {tokenId},
-                    anotherTokenAllowed ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
-                    anotherTokenAllowed ? this.hostLogits : null);
-            // Commit the final non-terminal token for continuation without sampling beyond the limit.
-            nextToken = executeAndSelect(decode, anotherTokenAllowed, constraint, timing, started, false);
-            if (!anotherTokenAllowed) endedNormally = !isStopRequested();
-            if (isStopRequested()) break;
-            if (!anotherTokenAllowed) break;
-        }
-        if (endedNormally && !isStopRequested()) finishDecoder(output);
-        return List.copyOf(callTokenIds);
+        Chain chain = new Chain(promptTokenIds, maxNewTokens, constraint, timing, emission);
+        chain.prefillNext();
+        return chain.result;
     }
 
-    private List<Integer> generateSpeculative(
-            int[] promptTokenIds, int maxNewTokens, Consumer<String> output, GenerationTimingListener timing)
-            throws InterruptedException, ExecutionException {
+    /// One-row decode as continuations: the prefill chunks, then one decode quantum per token, each started
+    /// by the previous quantum's outcome. The steps are the blocking loop's, in its order.
+    private final class Chain {
+        private final int[] promptTokenIds;
+        private final int maxNewTokens;
+        private final JsonEnvelopeConstraint constraint;
+        private final GenerationTimingListener timing;
+        private final Emission emission;
+        private final List<Integer> callTokenIds = new ArrayList<>();
+        private final CompletableFuture<List<Integer>> result = new CompletableFuture<>();
+        private int offset;
+        private OptionalInt nextToken = OptionalInt.empty();
+        private int generated;
+        private boolean endedNormally;
+
+        Chain(
+                int[] promptTokenIds,
+                int maxNewTokens,
+                JsonEnvelopeConstraint constraint,
+                GenerationTimingListener timing,
+                Emission emission) {
+            this.promptTokenIds = promptTokenIds;
+            this.maxNewTokens = maxNewTokens;
+            this.constraint = constraint;
+            this.timing = timing;
+            this.emission = emission;
+        }
+
+        void prefillNext() {
+            if (this.offset >= this.promptTokenIds.length) {
+                afterPrefill();
+                return;
+            }
+            if (isStopRequested()) {
+                this.result.complete(List.of());
+                return;
+            }
+            int end = Math.min(this.offset + QwenGenerationSession.this.prefillChunkTokens, this.promptTokenIds.length);
+            long started = this.timing == null ? 0L : System.nanoTime();
+            boolean samples = end == this.promptTokenIds.length && this.maxNewTokens > 0;
+            QwenExecutionContext prefill = new QwenExecutionContext(
+                    QwenGenerationSession.this.plan,
+                    QwenGenerationSession.this.sequence,
+                    QwenExecutionContext.ExecutionKind.PREFILL,
+                    QwenGenerationSession.this.sequence.currentTokenPosition(),
+                    Arrays.copyOfRange(this.promptTokenIds, this.offset, end),
+                    samples ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                    samples ? QwenGenerationSession.this.hostLogits : null);
+            executeAndSelect(prefill, samples, this.constraint, this.timing, started, true, this.result, next -> {
+                this.nextToken = next;
+                if (isStopRequested()) {
+                    this.result.complete(List.of());
+                    return;
+                }
+                this.offset = end;
+                prefillNext();
+            });
+        }
+
+        private void afterPrefill() {
+            QwenGenerationSession.this.promptPrefilled = true;
+            if (this.maxNewTokens == 0) {
+                finishDecoder(this.emission);
+                this.result.complete(List.of());
+                return;
+            }
+            decodeNext();
+        }
+
+        /// One iteration of the decode loop: commit the selected token, and sample the next unless the
+        /// budget is spent.
+        private void decodeNext() {
+            if (this.generated >= this.maxNewTokens || isStopRequested() || this.nextToken.isEmpty()) {
+                finish();
+                return;
+            }
+            int tokenId = this.nextToken.getAsInt();
+            if (QwenGenerationSession.this.tokenizer.isGenerationEosToken(tokenId)) {
+                record(tokenId);
+                // EOS terminates the generation and is not a model input quantum.
+                this.endedNormally = true;
+                finish();
+                return;
+            }
+            if (isStopRequested()) {
+                finish();
+                return;
+            }
+            boolean anotherTokenAllowed = this.generated + 1 < this.maxNewTokens;
+            record(tokenId);
+            this.emission.text(QwenGenerationSession.this.decoder.append(tokenId));
+            // Cancellation makes the session terminal; do not admit another quantum to preserve history.
+            if (isStopRequested()) {
+                finish();
+                return;
+            }
+            long started = this.timing == null ? 0L : System.nanoTime();
+            QwenExecutionContext decode = new QwenExecutionContext(
+                    QwenGenerationSession.this.plan,
+                    QwenGenerationSession.this.sequence,
+                    QwenExecutionContext.ExecutionKind.DECODE,
+                    QwenGenerationSession.this.sequence.currentTokenPosition(),
+                    new int[] {tokenId},
+                    anotherTokenAllowed ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                    anotherTokenAllowed ? QwenGenerationSession.this.hostLogits : null);
+            // Commit the final non-terminal token for continuation without sampling beyond the limit.
+            executeAndSelect(
+                    decode, anotherTokenAllowed, this.constraint, this.timing, started, false, this.result, next -> {
+                        this.nextToken = next;
+                        if (!anotherTokenAllowed) this.endedNormally = !isStopRequested();
+                        if (isStopRequested() || !anotherTokenAllowed) {
+                            finish();
+                            return;
+                        }
+                        this.generated++;
+                        decodeNext();
+                    });
+        }
+
+        private void record(int tokenId) {
+            this.callTokenIds.add(tokenId);
+            synchronized (QwenGenerationSession.this.generatedTokenIds) {
+                QwenGenerationSession.this.generatedTokenIds.add(tokenId);
+            }
+        }
+
+        private void finish() {
+            if (this.endedNormally && !isStopRequested()) finishDecoder(this.emission);
+            this.result.complete(List.copyOf(this.callTokenIds));
+        }
+    }
+
+    private CompletableFuture<List<Integer>> generateSpeculative(
+            int[] promptTokenIds, int maxNewTokens, Emission emission, GenerationTimingListener timing) {
         if (this.speculative == null)
             this.speculative = new QwenSpeculativeDecoder(
                     this.runtime,
@@ -380,38 +473,73 @@ public final class QwenGenerationSession implements AutoCloseable {
                     this.tokenizer::isGenerationEosToken,
                     this.speculativeDepth,
                     this.prefillChunkTokens);
-        List<Integer> tokens = this.speculative.generate(
-                promptTokenIds,
-                maxNewTokens,
-                token -> {
-                    synchronized (this.generatedTokenIds) {
-                        this.generatedTokenIds.add(token);
-                    }
-                    // As in ordinary decode, a generation terminator is returned but never decoded into text.
-                    if (!this.tokenizer.isGenerationEosToken(token)) emit(output, this.decoder.append(token));
-                },
-                timing);
-        this.promptPrefilled = true;
-        if (!isStopRequested()) finishDecoder(output);
-        return tokens;
+        return this.speculative
+                .generateAsync(
+                        promptTokenIds,
+                        maxNewTokens,
+                        token -> {
+                            synchronized (this.generatedTokenIds) {
+                                this.generatedTokenIds.add(token);
+                            }
+                            // As in ordinary decode, a generation terminator is returned but never decoded into text.
+                            if (!this.tokenizer.isGenerationEosToken(token)) emission.text(this.decoder.append(token));
+                        },
+                        timing)
+                .thenApply(tokens -> {
+                    this.promptPrefilled = true;
+                    if (!isStopRequested()) finishDecoder(emission);
+                    return tokens;
+                });
     }
 
-    private OptionalInt executeAndSelect(
+    /// Admits `context` and, once its outcome is published, selects its next token (when `selectToken`) and
+    /// passes it to `next` on the worker that retired the quantum. A failure completes `result` instead.
+    private void executeAndSelect(
             QwenExecutionContext context,
             boolean selectToken,
             JsonEnvelopeConstraint constraint,
             GenerationTimingListener timing,
             long startedNanos,
+            boolean prefill,
+            CompletableFuture<List<Integer>> result,
+            Consumer<OptionalInt> next) {
+        CompletableFuture<QwenExecutionContext.Outcome> outcome;
+        try {
+            outcome = this.runtime.submit(context);
+        } catch (RuntimeException | Error failure) {
+            result.completeExceptionally(failure);
+            return;
+        }
+        outcome.whenComplete((completed, failure) -> {
+            OptionalInt selected;
+            try {
+                selected = select(context, completed, failure, selectToken, constraint, timing, startedNanos, prefill);
+            } catch (Throwable selectionFailure) {
+                result.completeExceptionally(selectionFailure);
+                return;
+            }
+            try {
+                next.accept(selected);
+            } catch (Throwable continuationFailure) {
+                result.completeExceptionally(continuationFailure);
+            }
+        });
+    }
+
+    private OptionalInt select(
+            QwenExecutionContext context,
+            QwenExecutionContext.Outcome outcome,
+            Throwable outcomeFailure,
+            boolean selectToken,
+            JsonEnvelopeConstraint constraint,
+            GenerationTimingListener timing,
+            long startedNanos,
             boolean prefill)
-            throws InterruptedException, ExecutionException {
+            throws ExecutionException {
         QwenDeviceLogits logits = null;
         Throwable executionFailure = null;
         try {
-            List<QwenExecutionContext.Outcome> outcomes = this.runtime.execute(List.of(context));
-            if (outcomes.size() != 1) {
-                throw new IllegalStateException("runtime returned an unexpected number of quantum outcomes");
-            }
-            QwenExecutionContext.Outcome outcome = outcomes.getFirst();
+            if (outcomeFailure != null) throw new ExecutionException(outcomeFailure);
             if (outcome.status() == QwenExecutionContext.Status.CANCELLED) {
                 this.cancelled.set(true);
                 return OptionalInt.empty();
@@ -434,7 +562,7 @@ public final class QwenGenerationSession implements AutoCloseable {
             if (timing != null)
                 reportQuantum(timing, context, prefill, startedNanos, executedNanos, true, System.nanoTime(), selected);
             return OptionalInt.of(selected);
-        } catch (InterruptedException | ExecutionException | RuntimeException | Error failure) {
+        } catch (ExecutionException | RuntimeException | Error failure) {
             executionFailure = failure;
             throw failure;
         } finally {
@@ -446,6 +574,61 @@ public final class QwenGenerationSession implements AutoCloseable {
                     if (executionFailure != null) executionFailure.addSuppressed(cleanupFailure);
                     else throw cleanupFailure;
                 }
+            }
+        }
+    }
+
+    /// Decoded text on its way from the generating workers to the calling thread. Workers never block on it.
+    private static final class Emission {
+        private static final Object END = new Object();
+        private final LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+
+        void text(String text) {
+            if (!text.isEmpty()) this.queue.add(text);
+        }
+
+        void end() {
+            this.queue.add(END);
+        }
+
+        /// Hands every text to `output` until the generation ended, then returns its tokens. When `output`
+        /// throws or the calling thread is interrupted, `cancel` stops the generation, which is still awaited.
+        List<Integer> drain(Consumer<String> output, CompletableFuture<List<Integer>> done, Runnable cancel)
+                throws InterruptedException, ExecutionException {
+            Throwable outputFailure = null;
+            boolean interrupted = false;
+            while (true) {
+                Object item;
+                try {
+                    item = this.queue.take();
+                } catch (InterruptedException interruption) {
+                    if (!interrupted) cancel.run();
+                    interrupted = true;
+                    continue;
+                }
+                if (item == END) break;
+                if (outputFailure != null || interrupted) continue;
+                try {
+                    output.accept((String) item);
+                } catch (RuntimeException | Error failure) {
+                    outputFailure = failure;
+                    cancel.run();
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+                throw new InterruptedException("generation was interrupted");
+            }
+            if (outputFailure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (outputFailure instanceof Error error) throw error;
+            try {
+                return done.join();
+            } catch (java.util.concurrent.CompletionException failure) {
+                Throwable cause = failure.getCause();
+                if (cause instanceof ExecutionException executionFailure) throw executionFailure;
+                if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+                if (cause instanceof Error error) throw error;
+                throw new ExecutionException(cause);
             }
         }
     }
@@ -467,15 +650,11 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
     }
 
-    private void finishDecoder(Consumer<String> output) {
+    private void finishDecoder(Emission emission) {
         if (this.decoderFinished) return;
         String remaining = this.decoder.finish();
         this.decoderFinished = true;
-        emit(output, remaining);
-    }
-
-    private static void emit(Consumer<String> output, String text) {
-        if (!text.isEmpty()) output.accept(text);
+        emission.text(remaining);
     }
 
     private void ensureUsable() {

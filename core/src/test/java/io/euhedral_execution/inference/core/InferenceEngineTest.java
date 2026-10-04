@@ -489,12 +489,16 @@ class InferenceEngineTest {
         }
     }
 
-    /// Records timing events as strings with their timestamps, in call order.
+    /// Records timing boundaries as strings with their timestamps, in call order, and the output texts with the
+    /// threads that received them. Boundaries come from the workers that advance the generation; outputs from
+    /// the calling thread, concurrently.
     static final class RecordingTiming implements GenerationTimingListener {
-        final List<String> events = new java.util.ArrayList<>();
-        final List<Long> times = new java.util.ArrayList<>();
+        final List<String> events = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        final List<Long> times = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        final List<String> outputs = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        final java.util.Set<Thread> outputThreads = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-        private void add(String event, long... nanos) {
+        private synchronized void add(String event, long... nanos) {
             events.add(event);
             for (long time : nanos) times.add(time);
         }
@@ -522,7 +526,8 @@ class InferenceEngineTest {
         }
 
         void output(String text) {
-            add("output:" + text, System.nanoTime());
+            outputs.add(text);
+            outputThreads.add(Thread.currentThread());
         }
     }
 
@@ -532,26 +537,17 @@ class InferenceEngineTest {
     }
 
     @Test
-    void timingBoundariesFollowPrefillSelectionOutputAndCommitOrder() throws Exception {
+    void timingBoundariesFollowPrefillSelectionAndCommitOrderWhileOutputReachesTheCaller() throws Exception {
         var bootstrap = new FakeBootstrap();
         bootstrap.gpu.selectTokens(1, 2, 3);
         try (var engine = InferenceEngine.load(config(), bootstrap);
                 var session = engine.createSession(GenerationConfig.greedy(1L))) {
             var timing = new RecordingTiming();
             assertEquals(List.of(1, 2, 3), session.generate("!!!!!", 3, timing::output, null, timing));
-            assertEquals(
-                    List.of(
-                            "encoded:5",
-                            "prefill:5",
-                            "first:1",
-                            "output:A",
-                            "decode:2",
-                            "output:B",
-                            "decode:3",
-                            "output:C",
-                            "commit"),
-                    timing.events);
+            assertEquals(List.of("encoded:5", "prefill:5", "first:1", "decode:2", "decode:3", "commit"), timing.events);
             assertNonDecreasing(timing.times);
+            assertEquals(List.of("A", "B", "C"), timing.outputs, "text arrives in generation order");
+            assertEquals(java.util.Set.of(Thread.currentThread()), timing.outputThreads, "output runs on the caller");
         }
     }
 
