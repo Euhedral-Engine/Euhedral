@@ -77,4 +77,4 @@ A client that disconnects cancels its generation before the next quantum, as for
 - `GET /v1/models` with an `anthropic-version` header lists the model in Anthropic's format.
 
 Errors use Anthropic's object, `{"type": "error", "error": {"type": "invalid_request_error", "message": ...}}`, with
-`not_found_error`, `request_too_large`, `overloaded_error` (503: shutting down or at capacity) and `api_error`.
+`not_found_error`, `request_too_large`, `overloaded_error` (status 529, as Anthropic's API uses it: at capacity or shutting down) and `api_error`.

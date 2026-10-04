@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.api.anthropic;
 import io.euhedral_execution.inference.api.chat.ApiException;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import org.springframework.http.HttpStatusCode;
 
 /// Anthropic's error object: `{"type": "error", "error": {"type", "message"}}`, the type named after the status.
 public final class AnthropicErrors {
@@ -16,6 +17,12 @@ public final class AnthropicErrors {
         body.put("type", "error");
         body.put("error", error);
         return body;
+    }
+
+    /// Anthropic answers an overloaded API with 529, and its clients treat that status as overloaded and retry; the
+    /// server's 503 (at capacity, shutting down) is that condition.
+    public static HttpStatusCode status(ApiException failure) {
+        return failure.status().value() == 503 ? HttpStatusCode.valueOf(529) : failure.status();
     }
 
     static String type(int status) {

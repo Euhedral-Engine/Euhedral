@@ -25,10 +25,9 @@ public class ApiErrorHandler {
 
     @ExceptionHandler(ApiException.class)
     ResponseEntity<Object> api(ApiException exception, HttpServletRequest request) {
-        Object body = request.getRequestURI().startsWith("/v1/messages")
-                ? AnthropicErrors.body(exception)
-                : OpenAiError.of(exception);
-        return body(exception.status(), body);
+        if (request.getRequestURI().startsWith("/v1/messages"))
+            return body(AnthropicErrors.status(exception), AnthropicErrors.body(exception));
+        return body(exception.status(), OpenAiError.of(exception));
     }
 
     @ExceptionHandler(InferenceUnavailableException.class)

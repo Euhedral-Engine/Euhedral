@@ -3,11 +3,13 @@ package io.euhedral_execution.inference.api.web;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,6 +33,21 @@ class GenerationCapacityTest {
     @Autowired
     private ScriptedInferenceBackend backend;
 
+    @Autowired
+    private MeterRegistry registry;
+
+    /// The previous test's generation may still hold the slot for a moment after its session closed.
+    @BeforeEach
+    void freeSlot() throws InterruptedException {
+        var active = this.registry.get("euhedral.generations.active").gauge();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (active.value() > 0) {
+            if (System.nanoTime() > deadline) throw new AssertionError("the generation slot was never released");
+            Thread.sleep(5);
+        }
+        this.backend.reset();
+    }
+
     @Test
     void saturatedServerRejectsWith503WithoutOpeningASession() throws Exception {
         this.backend.script = ScriptedInferenceBackend.endless(20);
@@ -49,5 +66,27 @@ class GenerationCapacityTest {
         }
         var running = this.backend.generations.getFirst();
         assertTrue(running.closed.await(10, TimeUnit.SECONDS));
+    }
+
+    /// Anthropic's clients read 529 as overloaded and retry it.
+    @Test
+    void messagesAreRefusedWithAnthropicsOverloadedStatus() throws Exception {
+        this.backend.script = ScriptedInferenceBackend.endless(20);
+        try (var busy = SseTestClient.post(this.port, "/v1/chat/completions", BODY);
+                var client = HttpClient.newHttpClient()) {
+            busy.readUntil(line -> line.contains("\"tok0 \""));
+            var response = client.send(
+                    HttpRequest.newBuilder(URI.create("http://localhost:" + this.port + "/v1/messages"))
+                            .header("Content-Type", "application/json")
+                            .POST(
+                                    HttpRequest.BodyPublishers.ofString(
+                                            "{\"model\":\"" + ScriptedInferenceBackend.MODEL_ID
+                                                    + "\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}"))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(529, response.statusCode());
+            assertTrue(response.body().contains("\"type\":\"overloaded_error\""), response.body());
+        }
+        assertTrue(this.backend.generations.getFirst().closed.await(10, TimeUnit.SECONDS));
     }
 }
