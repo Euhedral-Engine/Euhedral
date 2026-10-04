@@ -4,8 +4,8 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.IncrementalDecoder;
-import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -130,30 +130,29 @@ public final class QwenGenerationSession implements AutoCloseable {
     /// The first prompt uses configured model special tokens; continuation prompts encode only their text.
     /// The output callback receives only newly decoded text and is never called for empty chunks.
     /// A sampled generation terminator is included in the returned IDs but is not sent through decode.
-    public List<Integer> generate(
-            String prompt, int maxNewTokens, Consumer<String> output, JsonEnvelopeConstraint constraint)
+    public List<Integer> generate(String prompt, int maxNewTokens, Consumer<String> output, TokenConstraint constraint)
             throws InterruptedException, ExecutionException {
         return generate(prompt, maxNewTokens, output, constraint, null);
     }
 
-    /// Generates as [#generate(String, int, Consumer, JsonEnvelopeConstraint)] while reporting
+    /// Generates as [#generate(String, int, Consumer, TokenConstraint)] while reporting
     /// execution boundaries to an optional timing listener. A null listener records nothing.
     public List<Integer> generate(
             String prompt,
             int maxNewTokens,
             Consumer<String> output,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
         Objects.requireNonNull(prompt, "prompt");
         return generate(prompt, null, maxNewTokens, output, constraint, timing);
     }
 
-    /// Generates as [#generate(String, int, Consumer, JsonEnvelopeConstraint)] from a prompt already encoded
+    /// Generates as [#generate(String, int, Consumer, TokenConstraint)] from a prompt already encoded
     /// as that method would encode it: with the model special tokens for the session's first prompt
     /// ([QwenTokenizer#encodeWithModelSpecialTokens]), as plain text ([QwenTokenizer#encodeText]) after it.
     public List<Integer> generate(
-            int[] promptTokenIds, int maxNewTokens, Consumer<String> output, JsonEnvelopeConstraint constraint)
+            int[] promptTokenIds, int maxNewTokens, Consumer<String> output, TokenConstraint constraint)
             throws InterruptedException, ExecutionException {
         Objects.requireNonNull(promptTokenIds, "promptTokenIds");
         return generate(null, promptTokenIds.clone(), maxNewTokens, output, constraint, null);
@@ -175,17 +174,17 @@ public final class QwenGenerationSession implements AutoCloseable {
             String prompt,
             int maxNewTokens,
             Consumer<String> text,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing) {
         Objects.requireNonNull(prompt, "prompt");
         return begin(prompt, null, maxNewTokens, text, constraint, timing, null);
     }
 
-    /// As [#generateAsync(String, int, Consumer, JsonEnvelopeConstraint, GenerationTimingListener)] from a prompt
+    /// As [#generateAsync(String, int, Consumer, TokenConstraint, GenerationTimingListener)] from a prompt
     /// already encoded as that method would encode it: with the model special tokens for the session's first
     /// prompt ([QwenTokenizer#encodeWithModelSpecialTokens]), as plain text ([QwenTokenizer#encodeText]) after it.
     public CompletableFuture<List<Integer>> generateAsync(
-            int[] promptTokenIds, int maxNewTokens, Consumer<String> text, JsonEnvelopeConstraint constraint) {
+            int[] promptTokenIds, int maxNewTokens, Consumer<String> text, TokenConstraint constraint) {
         Objects.requireNonNull(promptTokenIds, "promptTokenIds");
         return begin(null, promptTokenIds.clone(), maxNewTokens, text, constraint, null, null);
     }
@@ -195,7 +194,7 @@ public final class QwenGenerationSession implements AutoCloseable {
             int[] encoded,
             int maxNewTokens,
             Consumer<String> text,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing,
             Emission heldBy) {
         Objects.requireNonNull(text, "text");
@@ -255,7 +254,7 @@ public final class QwenGenerationSession implements AutoCloseable {
             int[] encoded,
             int maxNewTokens,
             Consumer<String> output,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
         Objects.requireNonNull(output, "output");
@@ -347,7 +346,7 @@ public final class QwenGenerationSession implements AutoCloseable {
     private CompletableFuture<List<Integer>> startGeneration(
             int[] promptTokenIds,
             int maxNewTokens,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing,
             Consumer<String> text) {
         if (isStopRequested()) return CompletableFuture.completedFuture(List.of());
@@ -373,7 +372,7 @@ public final class QwenGenerationSession implements AutoCloseable {
     private final class Chain {
         private final int[] promptTokenIds;
         private final int maxNewTokens;
-        private final JsonEnvelopeConstraint constraint;
+        private final TokenConstraint constraint;
         private final GenerationTimingListener timing;
         private final Consumer<String> text;
         private final List<Integer> callTokenIds = new ArrayList<>();
@@ -390,7 +389,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         Chain(
                 int[] promptTokenIds,
                 int maxNewTokens,
-                JsonEnvelopeConstraint constraint,
+                TokenConstraint constraint,
                 GenerationTimingListener timing,
                 Consumer<String> text) {
             this.promptTokenIds = promptTokenIds;
@@ -633,7 +632,7 @@ public final class QwenGenerationSession implements AutoCloseable {
     private void executeAndSelect(
             QwenExecutionContext context,
             boolean selectToken,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing,
             long startedNanos,
             boolean prefill,
@@ -667,7 +666,7 @@ public final class QwenGenerationSession implements AutoCloseable {
             QwenExecutionContext.Outcome outcome,
             Throwable outcomeFailure,
             boolean selectToken,
-            JsonEnvelopeConstraint constraint,
+            TokenConstraint constraint,
             GenerationTimingListener timing,
             long startedNanos,
             boolean prefill)
