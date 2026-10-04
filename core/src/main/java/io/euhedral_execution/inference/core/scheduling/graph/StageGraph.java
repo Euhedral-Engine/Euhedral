@@ -1,11 +1,11 @@
 package io.euhedral_execution.inference.core.scheduling.graph;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.hashing.HasherApi;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.util.ArrayDeque;
 import java.util.LinkedHashMap;
 import java.util.Objects;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -73,7 +73,13 @@ public final class StageGraph implements AutoCloseable {
     private final boolean spread;
     private final QwenExecutionSource source;
     private final Recycler recycler;
-    private final long routingSeed = ThreadLocalRandom.current().nextLong();
+    /// Every frame of every graph shares this id hash and mixes it with its own seed: consecutive seeds from a
+    /// base drawn per graph (xxHash64 mixing makes neighbouring seeds unrelated). Frames that may run in parallel
+    /// therefore route to different workers, while each frame keeps its hash across quanta.
+    static final long FRAME_ID_HASH = HasherApi.mix(HasherApi.BASE_SEED);
+
+    private static final AtomicLong GENERATION = new AtomicLong(1);
+    private long nextSeed = HasherApi.mix(HasherApi.BASE_SEED + GENERATION.getAndIncrement());
     private final StageFrame[] stages;
     private final StageFrame[] roots;
     private final Retirement retirement;
@@ -323,8 +329,9 @@ public final class StageGraph implements AutoCloseable {
         return this.stages[stage];
     }
 
-    long routingSeed() {
-        return this.routingSeed;
+    /// The routing seed of the next frame built for this graph.
+    long nextRoutingSeed() {
+        return this.nextSeed++;
     }
 
     boolean overlapLaunches() {
@@ -756,9 +763,9 @@ public final class StageGraph implements AutoCloseable {
         private final StageGraph graph;
 
         Replay(StageGraph graph) {
-            super(0L);
+            super(FRAME_ID_HASH);
             this.graph = graph;
-            randomizeHash(graph.routingSeed);
+            randomizeHash(graph.nextRoutingSeed());
         }
 
         @Override
@@ -820,9 +827,9 @@ public final class StageGraph implements AutoCloseable {
         private long ticket;
 
         Retirement(StageGraph graph) {
-            super(0L);
+            super(FRAME_ID_HASH);
             this.graph = graph;
-            randomizeHash(graph.routingSeed);
+            randomizeHash(graph.nextRoutingSeed());
         }
 
         void reset() {
@@ -869,11 +876,11 @@ public final class StageGraph implements AutoCloseable {
         private long ticket;
 
         RetiredEdge(StageGraph graph, StageFrame producer, StageFrame consumer) {
-            super(0L);
+            super(FRAME_ID_HASH);
             this.graph = graph;
             this.producer = producer;
             this.consumer = consumer;
-            randomizeHash(graph.routingSeed);
+            randomizeHash(graph.nextRoutingSeed());
         }
 
         /// Arms the boundary on the lane the producer submitted to.
