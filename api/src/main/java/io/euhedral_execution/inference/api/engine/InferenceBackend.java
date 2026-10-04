@@ -2,7 +2,8 @@ package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 
 /// The API layer's narrow view of the loaded model.
@@ -49,9 +50,13 @@ public interface InferenceBackend {
         }
     }
 
-    /// Encodes a rendered prompt for [#openGeneration]: the plan counts its tokens and the generation runs them,
-    /// so a prompt is tokenized once.
-    EncodedPrompt encodePrompt(String prompt) throws InterruptedException;
+    /// Runs request work as tasks on the backend's workers (the lattice's frames). Every piece of a request's
+    /// work runs there; a task may block, and the other workers take over the rest of the work meanwhile.
+    Executor workers();
+
+    /// Encodes a rendered prompt for [#openGeneration] on the workers: the plan counts its tokens and the
+    /// generation runs them, so a prompt is tokenized once.
+    CompletableFuture<EncodedPrompt> encodePrompt(String prompt);
 
     /// Opens one request-owned generation. The caller must close it on every path.
     ///
@@ -67,10 +72,10 @@ public interface InferenceBackend {
     /// callback; `close` releases the sequence and waits for an in-flight quantum to detach.
     interface Generation extends AutoCloseable {
 
-        /// Runs prefill and decode on the calling thread. `output` receives newly decoded, non-empty text
-        /// on that same thread between quanta.
-        Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
-                throws InterruptedException, ExecutionException;
+        /// Starts prefill and decode on the workers and returns at once. `text` receives newly decoded,
+        /// non-empty text on a worker, one call at a time and in order, and must not block; the future
+        /// completes on a worker after the last text.
+        CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text);
 
         void cancel();
 

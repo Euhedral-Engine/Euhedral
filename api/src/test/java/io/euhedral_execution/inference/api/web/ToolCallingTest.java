@@ -766,13 +766,39 @@ class ToolCallingTest {
         return this.mvc.perform(asyncDispatch(started));
     }
 
+    /// Rejections before planning (malformed JSON) are synchronous; the rest arrive through the deferred result.
     private ResultActions rejected(String body, int status) throws Exception {
-        return this.mvc
+        MvcResult started = this.mvc
                 .perform(post("/v1/chat/completions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().is(status))
+                .andReturn();
+        ResultActions response =
+                started.getRequest().isAsyncStarted() ? this.mvc.perform(asyncDispatch(started)) : actions(started);
+        return response.andExpect(status().is(status))
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
                 .andExpect(jsonPath("$.error.message").isString());
+    }
+
+    private static ResultActions actions(MvcResult result) {
+        return new ResultActions() {
+            @Override
+            public ResultActions andExpect(org.springframework.test.web.servlet.ResultMatcher matcher)
+                    throws Exception {
+                matcher.match(result);
+                return this;
+            }
+
+            @Override
+            public ResultActions andDo(org.springframework.test.web.servlet.ResultHandler handler) throws Exception {
+                handler.handle(result);
+                return this;
+            }
+
+            @Override
+            public MvcResult andReturn() {
+                return result;
+            }
+        };
     }
 }

@@ -85,7 +85,7 @@ class OpenAiControllerTest {
         String expectedPrompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
         assertEquals(expectedPrompt, generation.prompt);
         assertEquals(1, generation.closeCount.get(), "request session must be closed exactly once");
-        assertTrue(generation.generatingThread.startsWith("euhedral-generation-"), generation.generatingThread);
+        assertTrue(generation.generatingThread.startsWith("scripted-worker-"), generation.generatingThread);
     }
 
     @Test
@@ -309,7 +309,7 @@ class OpenAiControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"model\":\"" + MODEL + "\",\"max_tokens\":3000," + HELLO + "}"))
                 .andReturn();
-        var generation = this.backend.only();
+        var generation = this.backend.awaitFirst();
         assertTrue(generation.started.await(10, TimeUnit.SECONDS));
         var async = (MockAsyncContext) started.getRequest().getAsyncContext();
         for (AsyncListener listener : async.getListeners())
@@ -342,13 +342,39 @@ class OpenAiControllerTest {
         return this.mvc.perform(asyncDispatch(started));
     }
 
+    /// Rejections before planning (malformed JSON) are synchronous; the rest arrive through the deferred result.
     private ResultActions rejected(String body, int status) throws Exception {
-        return this.mvc
+        MvcResult started = this.mvc
                 .perform(post("/v1/chat/completions")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
-                .andExpect(status().is(status))
+                .andReturn();
+        ResultActions response =
+                started.getRequest().isAsyncStarted() ? this.mvc.perform(asyncDispatch(started)) : actions(started);
+        return response.andExpect(status().is(status))
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
                 .andExpect(jsonPath("$.error.message").isString());
+    }
+
+    private static ResultActions actions(MvcResult result) {
+        return new ResultActions() {
+            @Override
+            public ResultActions andExpect(org.springframework.test.web.servlet.ResultMatcher matcher)
+                    throws Exception {
+                matcher.match(result);
+                return this;
+            }
+
+            @Override
+            public ResultActions andDo(org.springframework.test.web.servlet.ResultHandler handler) throws Exception {
+                handler.handle(result);
+                return this;
+            }
+
+            @Override
+            public MvcResult andReturn() {
+                return result;
+            }
+        };
     }
 }

@@ -25,7 +25,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.StringJoiner;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
@@ -329,7 +328,12 @@ class ChatCompletionsCudaIntegrationTest {
         }
 
         @Override
-        public EncodedPrompt encodePrompt(String prompt) throws InterruptedException {
+        public java.util.concurrent.Executor workers() {
+            return this.delegate.workers();
+        }
+
+        @Override
+        public java.util.concurrent.CompletableFuture<EncodedPrompt> encodePrompt(String prompt) {
             return this.delegate.encodePrompt(prompt);
         }
 
@@ -339,11 +343,12 @@ class ChatCompletionsCudaIntegrationTest {
             this.opened.incrementAndGet();
             return new Generation() {
                 @Override
-                public Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
-                        throws InterruptedException, ExecutionException {
-                    Result result = generation.generate(prompt, maxNewTokens, output);
-                    TrackingBackend.this.lastCompletionTokens.set(result.completionTokens());
-                    return result;
+                public java.util.concurrent.CompletableFuture<Result> generate(
+                        EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
+                    return generation.generate(prompt, maxNewTokens, text).thenApply(result -> {
+                        TrackingBackend.this.lastCompletionTokens.set(result.completionTokens());
+                        return result;
+                    });
                 }
 
                 @Override

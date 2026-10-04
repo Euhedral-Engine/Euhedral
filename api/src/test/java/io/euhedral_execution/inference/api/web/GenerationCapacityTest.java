@@ -14,8 +14,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
-/// With one generation slot and no queue, a second concurrent request is refused without opening a session
-/// leak: its session is closed and the client receives an OpenAI 503.
+/// With one generation slot and no queue, a second concurrent request is refused before it opens a session,
+/// and the client receives an OpenAI 503.
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -32,7 +32,7 @@ class GenerationCapacityTest {
     private ScriptedInferenceBackend backend;
 
     @Test
-    void saturatedServerRejectsWith503AndReleasesTheSession() throws Exception {
+    void saturatedServerRejectsWith503WithoutOpeningASession() throws Exception {
         this.backend.script = ScriptedInferenceBackend.endless(20);
         try (var busy = SseTestClient.post(this.port, "/v1/chat/completions", BODY);
                 var client = HttpClient.newHttpClient()) {
@@ -45,9 +45,7 @@ class GenerationCapacityTest {
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(503, response.statusCode());
             assertTrue(response.body().contains("\"type\":\"service_unavailable_error\""), response.body());
-            var rejected = this.backend.generations.get(1);
-            assertEquals(1, rejected.closeCount.get(), "rejected session must be closed");
-            assertEquals(0, rejected.emitted.get());
+            assertEquals(1, this.backend.generations.size(), "a rejected request opens no session");
         }
         var running = this.backend.generations.getFirst();
         assertTrue(running.closed.await(10, TimeUnit.SECONDS));

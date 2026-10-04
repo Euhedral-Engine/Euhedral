@@ -2,21 +2,22 @@ package io.euhedral_execution.inference.api.chat;
 
 import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
+import io.euhedral_execution.inference.api.engine.InferenceUnavailableException;
 import io.euhedral_execution.inference.api.openai.ChatCompletionChunk;
+import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
 import io.euhedral_execution.inference.api.openai.ChatCompletionResponse;
 import io.euhedral_execution.inference.api.openai.OpenAiException;
 import io.euhedral_execution.inference.api.openai.ToolCall;
 import io.euhedral_execution.inference.api.openai.Usage;
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
@@ -26,60 +27,144 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.context.request.async.DeferredResult;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-/// Runs planned completions on a bounded generation executor so servlet threads return immediately.
+/// Runs chat completions entirely on the backend's workers; container threads only hand requests over.
 ///
-/// Both response modes use Spring MVC async handling: JSON through `DeferredResult`, streaming through
-/// `SseEmitter`. The blocking core API runs on this service's own threads. Because this service depends on
-/// the backend, Spring destroys it before the engine: queued work is discarded and running work interrupted
-/// before the engine closes.
+/// A request becomes a `DeferredResult` at once. On the workers it is planned (rendered, encoded, validated),
+/// admitted, and generated; its result is a JSON body or, for `stream=true`, an `SseEmitter` whose chunks the
+/// workers write. One generation runs at a time and at most `maxQueuedGenerations` wait; a finished
+/// generation starts the next on a worker. Validation and capacity failures reach the client as HTTP errors,
+/// because a stream's emitter becomes the result only once its request was planned and admitted. Because this
+/// service depends on the backend, Spring destroys it before the engine: waiting requests are refused and the
+/// running generation is stopped before the engine closes.
 @Service
 public class ChatCompletionService implements DisposableBean {
     private static final Logger LOG = LoggerFactory.getLogger(ChatCompletionService.class);
     private static final MediaType JSON = MediaType.APPLICATION_JSON;
 
     private final InferenceBackend backend;
+    private final ChatRequestMapper requestMapper;
     private final long requestTimeoutMillis;
-    private final ThreadPoolExecutor executor;
+    private final int maxQueued;
+    private final ArrayDeque<Admission> waiting = new ArrayDeque<>();
+    private Admission running;
+    private boolean closed;
 
-    public ChatCompletionService(InferenceBackend backend, ApiProperties properties) {
+    public ChatCompletionService(InferenceBackend backend, ChatRequestMapper requestMapper, ApiProperties properties) {
         this.backend = backend;
+        this.requestMapper = requestMapper;
         this.requestTimeoutMillis = properties.requestTimeout().toMillis();
-        BlockingQueue<Runnable> queue = properties.maxQueuedGenerations() == 0
-                ? new SynchronousQueue<>()
-                : new ArrayBlockingQueue<>(properties.maxQueuedGenerations());
-        var threadIds = new AtomicInteger();
-        this.executor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, queue, task -> {
-            Thread thread = new Thread(task, "euhedral-generation-" + threadIds.incrementAndGet());
-            thread.setDaemon(true);
-            return thread;
-        });
+        this.maxQueued = properties.maxQueuedGenerations();
     }
 
-    /// Non-streaming completion. The servlet thread is released while generation runs.
-    public DeferredResult<ResponseEntity<ChatCompletionResponse>> complete(ChatCompletionPlan plan) {
-        var result = new DeferredResult<ResponseEntity<ChatCompletionResponse>>(this.requestTimeoutMillis);
-        var job = new ChatGeneration(plan, open(plan), new JsonSink(plan, result));
+    /// One planned request waiting for, or holding, the generation slot.
+    private final class Admission {
+        final ChatCompletionPlan plan;
+        final DeferredResult<Object> result;
+        volatile boolean abandoned;
+        volatile ChatGeneration generation;
+
+        Admission(ChatCompletionPlan plan, DeferredResult<Object> result) {
+            this.plan = plan;
+            this.result = result;
+        }
+
+        void abandon() {
+            this.abandoned = true;
+            ChatGeneration job = this.generation;
+            if (job != null) job.abandon();
+        }
+    }
+
+    /// Hands the request to the workers and returns its deferred response: a JSON body, an SSE stream, or an
+    /// OpenAI error.
+    public DeferredResult<Object> complete(ChatCompletionRequest request) {
+        var result = new DeferredResult<Object>(this.requestTimeoutMillis);
+        var admission = new AtomicReference<Admission>();
         result.onTimeout(() -> {
-            job.abandon();
+            Admission admitted = admission.get();
+            if (admitted != null) admitted.abandon();
             result.setErrorResult(OpenAiException.timeout());
         });
-        result.onError(failure -> job.abandon());
-        submit(job);
+        result.onError(failure -> {
+            Admission admitted = admission.get();
+            if (admitted != null) admitted.abandon();
+        });
+        this.requestMapper.planAsync(request).whenComplete((plan, failure) -> {
+            if (failure != null) {
+                result.setErrorResult(openAi(failure));
+                return;
+            }
+            Admission admitted = new Admission(plan, result);
+            admission.set(admitted);
+            admit(admitted);
+        });
         return result;
     }
 
-    /// Streaming completion as OpenAI `chat.completion.chunk` server-sent events.
-    public SseEmitter stream(ChatCompletionPlan plan) {
-        var emitter = new SseEmitter(this.requestTimeoutMillis);
-        var sink = new StreamSink(plan, emitter);
-        var job = new ChatGeneration(plan, open(plan), sink);
-        emitter.onTimeout(() -> {
-            job.abandon();
-            sink.fail(OpenAiException.timeout());
-        });
-        emitter.onError(failure -> job.abandon());
-        submit(job);
-        return emitter;
+    private void admit(Admission admission) {
+        synchronized (this) {
+            if (this.closed) {
+                admission.result.setErrorResult(OpenAiException.unavailable("The server is shutting down."));
+                return;
+            }
+            if (this.running != null) {
+                if (this.waiting.size() < this.maxQueued) this.waiting.add(admission);
+                else
+                    admission.result.setErrorResult(
+                            OpenAiException.unavailable("The server is at generation capacity; retry later."));
+                return;
+            }
+            this.running = admission;
+        }
+        start(admission);
+    }
+
+    /// Runs on a worker with the slot held; releasing the slot starts the next admission.
+    private void start(Admission admission) {
+        if (admission.abandoned || admission.result.isSetOrExpired()) {
+            release(admission);
+            return;
+        }
+        InferenceBackend.Generation generation;
+        try {
+            generation = open(admission.plan);
+        } catch (RuntimeException | Error failure) {
+            admission.result.setErrorResult(openAi(failure));
+            release(admission);
+            return;
+        }
+        ChatCompletionPlan plan = admission.plan;
+        CompletionSink sink;
+        if (plan.stream()) {
+            var emitter = new SseEmitter(this.requestTimeoutMillis);
+            sink = new StreamSink(plan, emitter);
+            emitter.onTimeout(() -> {
+                admission.abandon();
+                sink.fail(OpenAiException.timeout());
+            });
+            emitter.onError(failure -> admission.abandon());
+            // The stream's headers: no caching, and no proxy buffering (nginx), so chunks reach the client as
+            // they are produced.
+            admission.result.setResult(ResponseEntity.ok()
+                    .header("Cache-Control", "no-cache")
+                    .header("X-Accel-Buffering", "no")
+                    .body(emitter));
+        } else sink = new JsonSink(plan, admission.result);
+        var job = new ChatGeneration(
+                plan, generation, sink, new SerialTasks(this.backend.workers()), () -> release(admission));
+        admission.generation = job;
+        if (admission.abandoned) job.abandon();
+        job.start();
+    }
+
+    private void release(Admission admission) {
+        Admission next;
+        synchronized (this) {
+            if (this.running != admission) return;
+            next = this.waiting.poll();
+            this.running = next;
+        }
+        if (next != null) this.backend.workers().execute(() -> start(next));
     }
 
     private InferenceBackend.Generation open(ChatCompletionPlan plan) {
@@ -91,33 +176,47 @@ public class ChatCompletionService implements DisposableBean {
         return this.backend.openGeneration(plan.sampling(), constraint);
     }
 
-    private void submit(ChatGeneration job) {
-        try {
-            this.executor.execute(job);
-        } catch (RejectedExecutionException saturated) {
-            OpenAiException busy = OpenAiException.unavailable("The server is at generation capacity; retry later.");
-            job.discard(busy);
-            throw busy;
-        }
+    /// The OpenAI error for a failed planning or start.
+    private OpenAiException openAi(Throwable failure) {
+        Throwable cause =
+                failure instanceof CompletionException && failure.getCause() != null ? failure.getCause() : failure;
+        if (cause instanceof OpenAiException openAi) return openAi;
+        if (cause instanceof InferenceUnavailableException unavailable)
+            return OpenAiException.unavailable("The inference engine is unavailable: " + unavailable.getMessage());
+        LOG.error("Chat completion request failed", cause);
+        return OpenAiException.serverError();
     }
 
     @Override
     public void destroy() throws InterruptedException {
         // Graceful web shutdown has already drained what it could; stop the rest before the engine closes.
-        List<Runnable> queued = this.executor.shutdownNow();
-        for (Runnable task : queued)
-            ((ChatGeneration) task).discard(OpenAiException.unavailable("The server is shutting down."));
-        if (!this.executor.awaitTermination(30, TimeUnit.SECONDS))
-            LOG.warn("Generation threads did not stop within 30s; engine shutdown will cancel their sessions");
+        List<Admission> refused;
+        Admission active;
+        synchronized (this) {
+            this.closed = true;
+            refused = List.copyOf(this.waiting);
+            this.waiting.clear();
+            active = this.running;
+        }
+        for (Admission admission : refused)
+            admission.result.setErrorResult(OpenAiException.unavailable("The server is shutting down."));
+        ChatGeneration job = active == null ? null : active.generation;
+        if (job == null) return;
+        job.shutDown();
+        try {
+            job.responded().get(30, TimeUnit.SECONDS);
+        } catch (TimeoutException | ExecutionException late) {
+            LOG.warn("The running generation did not stop within 30s; engine shutdown will cancel its session");
+        }
     }
 
     private static final class JsonSink implements CompletionSink {
         private final ChatCompletionPlan plan;
-        private final DeferredResult<ResponseEntity<ChatCompletionResponse>> result;
+        private final DeferredResult<Object> result;
         private final StringBuilder content = new StringBuilder();
         private final List<ToolCall> toolCalls = new ArrayList<>();
 
-        private JsonSink(ChatCompletionPlan plan, DeferredResult<ResponseEntity<ChatCompletionResponse>> result) {
+        private JsonSink(ChatCompletionPlan plan, DeferredResult<Object> result) {
             this.plan = plan;
             this.result = result;
         }

@@ -1,13 +1,10 @@
 package io.euhedral_execution.inference.api.web;
 
-import io.euhedral_execution.inference.api.chat.ChatCompletionPlan;
 import io.euhedral_execution.inference.api.chat.ChatCompletionService;
-import io.euhedral_execution.inference.api.chat.ChatRequestMapper;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
 import io.euhedral_execution.inference.api.openai.ModelList;
 import io.euhedral_execution.inference.api.openai.OpenAiException;
-import jakarta.servlet.http.HttpServletResponse;
 import java.time.Instant;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -16,6 +13,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.context.request.async.DeferredResult;
 
 /// OpenAI-compatible surface rooted at `/v1`, so clients use `http://host:port/v1` as their base URL.
 ///
@@ -25,14 +23,11 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/v1")
 public class OpenAiController {
     private final InferenceBackend backend;
-    private final ChatRequestMapper requestMapper;
     private final ChatCompletionService completions;
     private final long createdAt = Instant.now().getEpochSecond();
 
-    public OpenAiController(
-            InferenceBackend backend, ChatRequestMapper requestMapper, ChatCompletionService completions) {
+    public OpenAiController(InferenceBackend backend, ChatCompletionService completions) {
         this.backend = backend;
-        this.requestMapper = requestMapper;
         this.completions = completions;
     }
 
@@ -47,15 +42,10 @@ public class OpenAiController {
         return ModelList.Model.of(model, this.createdAt);
     }
 
-    /// Returns a `DeferredResult` for JSON or an `SseEmitter` for `stream=true`; both release this thread.
-    /// Validation errors are raised here, before any response byte is committed.
+    /// Hands the request to the workers and returns its deferred response, releasing this thread: the workers
+    /// plan the request and resolve it to a JSON body, an `SseEmitter` for `stream=true`, or an OpenAI error.
     @PostMapping(path = "/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public Object chatCompletions(@RequestBody ChatCompletionRequest request, HttpServletResponse response) {
-        ChatCompletionPlan plan = this.requestMapper.plan(request);
-        if (!plan.stream()) return this.completions.complete(plan);
-        response.setHeader("Cache-Control", "no-cache");
-        // Disables proxy buffering (nginx) so chunks reach the client as they are produced.
-        response.setHeader("X-Accel-Buffering", "no");
-        return this.completions.stream(plan);
+    public DeferredResult<Object> chatCompletions(@RequestBody ChatCompletionRequest request) {
+        return this.completions.complete(request);
     }
 }
