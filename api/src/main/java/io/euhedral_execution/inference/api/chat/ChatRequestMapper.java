@@ -83,21 +83,29 @@ public class ChatRequestMapper {
         requireServedModel(request.model());
         ToolCalling tools = ToolCalling.fromRequest(request.tools(), request.toolChoice(), request.parallelToolCalls());
 
-        String prompt = renderPrompt(request.messages(), tools);
-        int promptTokens = this.backend.countPromptTokens(prompt);
+        InferenceBackend.EncodedPrompt prompt = encode(renderPrompt(request.messages(), tools));
+        int promptTokens = prompt.tokenCount();
         int maxTokens = resolveMaxTokens(request, promptTokens);
         return new ChatCompletionPlan(
                 "chatcmpl-" + UUID.randomUUID().toString().replace("-", ""),
                 Instant.now().getEpochSecond(),
                 this.backend.modelId(),
                 prompt,
-                promptTokens,
                 maxTokens,
                 sampling(request),
                 stops(request.stop()),
                 stream,
                 includeUsage,
                 tools);
+    }
+
+    private InferenceBackend.EncodedPrompt encode(String prompt) {
+        try {
+            return this.backend.encodePrompt(prompt);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("prompt encoding was interrupted", interrupted);
+        }
     }
 
     private void requireServedModel(String model) {

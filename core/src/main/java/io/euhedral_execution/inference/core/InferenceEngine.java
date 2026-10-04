@@ -226,6 +226,19 @@ public final class InferenceEngine implements AutoCloseable {
         return this.tokenizer;
     }
 
+    /// Encodes `prompt` as a new session encodes its first prompt (with the model special tokens), on the
+    /// lattice's workers. A fresh session generating from these IDs runs exactly that prompt.
+    public int[] tokenizePrompt(String prompt) throws InterruptedException {
+        try {
+            return this.runtime.tokenize(this.tokenizer, prompt, true).get();
+        } catch (java.util.concurrent.ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (cause instanceof Error error) throw error;
+            throw new IllegalStateException("prompt tokenization failed", cause);
+        }
+    }
+
     public QwenConfig modelConfig() {
         return this.model.weights().config();
     }

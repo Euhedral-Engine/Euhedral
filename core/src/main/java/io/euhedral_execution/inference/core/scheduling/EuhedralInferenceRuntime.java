@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.scheduling.frames.QwenStageFrame;
 import io.euhedral_execution.inference.core.scheduling.graph.LanePool;
 import io.euhedral_execution.inference.core.scheduling.graph.QwenExecutionSource;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
+import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -37,6 +38,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     private final ExecutionGpu gpu;
     private final ConcurrentHashMap<QwenExecutionPlan, GraphPool> pools = new ConcurrentHashMap<>();
     private final Object closeLock = new Object();
+    /// Host work that is not a quantum's stage (prompt tokenization), attached on first use.
+    private QwenExecutionSource tasks;
     private boolean closed;
     /// Device lanes shared by every graph, opened with the first graph.
     private LanePool lanes;
@@ -222,6 +225,28 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
     }
 
+    /// Tokenizes `text` on the lattice's workers (PromptTokenization), with the BOS/EOS tokens of
+    /// tokenizer_config.json when `modelSpecialTokens`. The future completes on a worker.
+    public CompletableFuture<int[]> tokenize(QwenTokenizer tokenizer, String text, boolean modelSpecialTokens) {
+        QwenExecutionSource source = tasks();
+        source.admit();
+        return PromptTokenization.start(tokenizer, text, modelSpecialTokens, source::publish, source::terminated);
+    }
+
+    private QwenExecutionSource tasks() {
+        QwenExecutionSource source;
+        synchronized (this.closeLock) {
+            ensureOpen();
+            source = this.tasks;
+            if (source != null) return source;
+            source = new QwenExecutionSource();
+            this.tasks = source;
+        }
+        // Attached once; a close from here on completes it.
+        this.lattice.addUpstream(source);
+        return source;
+    }
+
     /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when its
     /// lanes were proven idle instead.
     private void releaseStaging(GpuStream home) {
@@ -251,11 +276,21 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// Euhedral, and releases their streams.
     @Override
     public void close() {
+        QwenExecutionSource tasks;
         synchronized (this.closeLock) {
             if (this.closed) return;
             this.closed = true;
+            tasks = this.tasks;
         }
         RuntimeException failure = null;
+        if (tasks != null) {
+            try {
+                tasks.completeGracefully();
+                tasks.awaitTermination();
+            } catch (RuntimeException completionFailure) {
+                failure = completionFailure;
+            }
+        }
         for (GraphPool pool : this.pools.values()) {
             try {
                 pool.completeSources();

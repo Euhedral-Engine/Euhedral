@@ -90,6 +90,7 @@ class OpenAiControllerTest {
 
     @Test
     void usageCountsPromptTokensWithTheBackendTokenizer() throws Exception {
+        int encodedBefore = this.backend.encoded.get();
         var result = completion("{\"model\":\"" + MODEL + "\"," + HELLO + "}")
                 .andExpect(status().isOk())
                 .andReturn();
@@ -97,6 +98,10 @@ class OpenAiControllerTest {
         String body = result.getResponse().getContentAsString();
         assertTrue(body.contains("\"prompt_tokens\":" + promptTokens), body);
         assertTrue(body.contains("\"total_tokens\":" + (promptTokens + 4)), body);
+        assertEquals(
+                1,
+                this.backend.encoded.get() - encodedBefore,
+                "the request encoded its prompt once, for usage and generation");
     }
 
     @Test

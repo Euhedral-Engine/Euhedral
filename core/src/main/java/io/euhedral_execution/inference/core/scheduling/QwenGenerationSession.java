@@ -129,6 +129,32 @@ public final class QwenGenerationSession implements AutoCloseable {
             GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
         Objects.requireNonNull(prompt, "prompt");
+        return generate(prompt, null, maxNewTokens, output, constraint, timing);
+    }
+
+    /// Generates as [#generate(String, int, Consumer, JsonEnvelopeConstraint)] from a prompt already encoded
+    /// as that method would encode it: with the model special tokens for the session's first prompt
+    /// ([QwenTokenizer#encodeWithModelSpecialTokens]), as plain text ([QwenTokenizer#encodeText]) after it.
+    public List<Integer> generate(
+            int[] promptTokenIds, int maxNewTokens, Consumer<String> output, JsonEnvelopeConstraint constraint)
+            throws InterruptedException, ExecutionException {
+        Objects.requireNonNull(promptTokenIds, "promptTokenIds");
+        return generate(null, promptTokenIds.clone(), maxNewTokens, output, constraint, null);
+    }
+
+    /// Whether the session's next prompt is its first, which carries the model special tokens.
+    public boolean expectsFirstPrompt() {
+        return !this.promptPrefilled;
+    }
+
+    private List<Integer> generate(
+            String prompt,
+            int[] encoded,
+            int maxNewTokens,
+            Consumer<String> output,
+            JsonEnvelopeConstraint constraint,
+            GenerationTimingListener timing)
+            throws InterruptedException, ExecutionException {
         Objects.requireNonNull(output, "output");
         if (maxNewTokens < 0) throw new IllegalArgumentException("maxNewTokens must not be negative");
         if (!this.generationActive.compareAndSet(false, true)) {
@@ -145,9 +171,7 @@ public final class QwenGenerationSession implements AutoCloseable {
                 this.decoder = this.tokenizer.newIncrementalDecoder();
                 this.decoderFinished = false;
             }
-            int[] promptTokenIds = this.promptPrefilled
-                    ? this.tokenizer.encodeText(prompt)
-                    : this.tokenizer.encodeWithModelSpecialTokens(prompt);
+            int[] promptTokenIds = encoded != null ? encoded : tokenize(prompt);
             if (promptTokenIds.length == 0) {
                 throw new IllegalArgumentException("prompt must encode to at least one token");
             }
@@ -172,6 +196,20 @@ public final class QwenGenerationSession implements AutoCloseable {
             } finally {
                 this.generationLock.unlock();
             }
+        }
+    }
+
+    /// Encodes the prompt on the lattice's workers (EuhedralInferenceRuntime#tokenize).
+    private int[] tokenize(String prompt) throws InterruptedException {
+        try {
+            return this.runtime
+                    .tokenize(this.tokenizer, prompt, !this.promptPrefilled)
+                    .get();
+        } catch (ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (cause instanceof Error error) throw error;
+            throw new IllegalStateException("prompt tokenization failed", cause);
         }
     }
 

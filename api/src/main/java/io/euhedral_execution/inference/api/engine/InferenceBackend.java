@@ -32,8 +32,26 @@ public interface InferenceBackend {
     /// Maximum sequence length in tokens (prompt plus completion).
     int contextLength();
 
-    /// Counts prompt tokens exactly as a new generation will encode the prompt.
-    int countPromptTokens(String prompt);
+    /// A rendered prompt and its token IDs, encoded once, exactly as a new generation encodes a first prompt.
+    record EncodedPrompt(String text, int[] tokenIds) {
+        public EncodedPrompt {
+            java.util.Objects.requireNonNull(text, "text");
+            tokenIds = tokenIds.clone();
+        }
+
+        @Override
+        public int[] tokenIds() {
+            return this.tokenIds.clone();
+        }
+
+        public int tokenCount() {
+            return this.tokenIds.length;
+        }
+    }
+
+    /// Encodes a rendered prompt for [#openGeneration]: the plan counts its tokens and the generation runs them,
+    /// so a prompt is tokenized once.
+    EncodedPrompt encodePrompt(String prompt) throws InterruptedException;
 
     /// Opens one request-owned generation. The caller must close it on every path.
     ///
@@ -51,7 +69,7 @@ public interface InferenceBackend {
 
         /// Runs prefill and decode on the calling thread. `output` receives newly decoded, non-empty text
         /// on that same thread between quanta.
-        Result generate(String prompt, int maxNewTokens, Consumer<String> output)
+        Result generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> output)
                 throws InterruptedException, ExecutionException;
 
         void cancel();
