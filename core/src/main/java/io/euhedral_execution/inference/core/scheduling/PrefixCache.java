@@ -160,8 +160,35 @@ public final class PrefixCache implements AutoCloseable {
             int[] tokens,
             int position,
             long seedRowAddress) {
-        if (this.closed
-                || !(sequence.recurrentState() instanceof GdnSequenceStates gdn)
+        if (this.closed) return CompletableFuture.completedFuture(parent);
+        // The copies read the sequence's buffers between quanta. Holding its lease for them keeps a cancellation
+        // from releasing those buffers mid-copy: cancel() then only flags the sequence, and the release after the
+        // copies frees them. A sequence already cancelled, terminal or executing is not captured.
+        long at = sequence.currentTokenPosition();
+        QwenSequenceState.ExecutionLease lease;
+        try {
+            lease = sequence.claimExecution(at);
+        } catch (RuntimeException cancelledOrBusy) {
+            return CompletableFuture.completedFuture(parent);
+        }
+        CompletableFuture<PrefixNode> captured;
+        try {
+            captured = captureHeld(frames, sequence, parent, tokens, position, seedRowAddress);
+        } catch (RuntimeException | Error failure) {
+            sequence.releaseExecution(lease, at);
+            throw failure;
+        }
+        return captured.whenComplete((node, failure) -> sequence.releaseExecution(lease, at));
+    }
+
+    private CompletableFuture<PrefixNode> captureHeld(
+            Frames frames,
+            QwenSequenceState sequence,
+            PrefixNode parent,
+            int[] tokens,
+            int position,
+            long seedRowAddress) {
+        if (!(sequence.recurrentState() instanceof GdnSequenceStates gdn)
                 || !(sequence.kvCacheState() instanceof AttentionSequenceStates attention)
                 || attention.forLayer(this.layout.kvLayers()[0]).length() < position)
             return CompletableFuture.completedFuture(parent);
