@@ -52,9 +52,10 @@ every full KV page; qwen3_8_27b_q3):
 
 A sequence restored at a multiple of 512 prefills the rest in the chunks a cold run uses, so it ends with the state a
 cold run has, buffer for buffer (`PrefixCacheCudaIntegrationTest`), and the tokens it samples are the cold run's. A
-checkpoint at any other position would continue in other chunks. That rules out two checkpoints that look natural, the
-state at the end of a prompt and the state at the end of a generation: decode state is not prefill state either. They are
-not stored.
+checkpoint at any other position would continue in other chunks. That rules out the two checkpoints that look natural,
+the state at the end of a prompt and the state at the end of a generation, whenever they fall off the chunk grid: the
+prompt's end is stored only when its length is a multiple of the interval, and the state after a generation (decode
+state is not prefill state either) never is. The last chunk boundary before the prompt's end stands in for the first.
 
 ## Capture and restore
 
@@ -74,6 +75,12 @@ that ended at `p`, its catch-up has appended row `p - 1`, which pairs the base h
 `p`, a token that belongs to whichever prompt resumes from there. A checkpoint therefore stores MTP rows below `p - 1` and
 the hidden row, and a restore recomputes row `p - 1` with the resuming prompt's next token before it prefills. Rows
 before `p - 1` do not depend on what follows.
+
+The recomputed row is the one place a restored sequence is not a cold run's: it is computed in a one-row quantum where a
+cold run computed it inside a chunk's catch-up, and its bits differ. Compared after a 5000-token prompt restored at 4608
+(`PrefixCacheCudaIntegrationTest`, 419 buffers: the base state and the 19 full MTP pages), the one buffer that differs is
+the MTP page holding row 4607. The row only seeds drafts, so it can change which drafts a verification accepts; the tokens
+are the verifier's, and equal the cold run's.
 
 A prompt that does not speculate (sampling, a constrained output) stores checkpoints without MTP state; a speculating
 prompt restores through nodes that have it and stops at the first that does not. A span stored both ways keeps both
@@ -112,7 +119,7 @@ prefixes evicts; the interval and the size are settings for that reason.
 
 ## Rejected
 
-- Checkpoints at the end of a prompt and of a generation, at any position: not exact (above).
+- Checkpoints at the end of a prompt and of a generation at positions off the chunk grid: not exact (above).
 - A hash of the token prefix as the key: the tree compares tokens, which is exact and needs no hash to collide.
 - Keeping the last sequence on the device: the device holds the weights, one sequence's KV and its working set; a second
   sequence would come out of the context length or the weights' residency.

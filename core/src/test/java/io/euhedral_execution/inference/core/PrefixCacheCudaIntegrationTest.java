@@ -203,6 +203,52 @@ class PrefixCacheCudaIntegrationTest {
         }
     }
 
+    @Test
+    @Timeout(3600)
+    void aSpeculativeRestoreLeavesTheMtpCacheAsAColdRunDoes() throws Exception {
+        var bootstrap = new RecordingBootstrap();
+        try (InferenceEngine engine = InferenceEngine.load(
+                config(
+                        "euhedral.qwen.nvfp4-artifact",
+                        "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl",
+                        CACHE_BYTES),
+                bootstrap)) {
+            assumeTrue(
+                    engine.profile() != null && engine.profile().speculative(), "needs an artifact with the MTP layer");
+            int[] prompt = prompt(engine, "Lima", 5000);
+            List<String> cold = mtpAndBaseDigests(engine, bootstrap.gpu, prompt);
+            List<String> warm = mtpAndBaseDigests(engine, bootstrap.gpu, prompt);
+            assertEquals(1, engine.prefixCacheStats().hits());
+            assertEquals(4608, engine.prefixCacheStats().reusedTokens());
+            // The base state and every MTP page are the cold run's, except the page that holds MTP row 4607: a
+            // restore at 4608 recomputes that row in a one-row quantum, where the cold run computed it inside a
+            // chunk's catch-up. It differs in low bits, which can change a draft but never a token.
+            String recomputed = "mtp page " + (4607 / 256) + " ";
+            assertEquals(without(cold, recomputed), without(warm, recomputed));
+            assertEquals(cold.size(), warm.size());
+        }
+    }
+
+    private static List<String> without(List<String> digests, String prefix) {
+        return digests.stream().filter(digest -> !digest.startsWith(prefix)).toList();
+    }
+
+    /// The digests of the base state and of the MTP cache after a one-token speculative generation.
+    private static List<String> mtpAndBaseDigests(InferenceEngine engine, ExecutionGpu gpu, int[] prompt)
+            throws Exception {
+        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+            session.generate(prompt, 1, text -> {}, null);
+            var sequence = EngineExecutionFixture.sequence(session);
+            List<String> digests = new ArrayList<>(SequenceStateProbe.committedDigests(
+                    gpu, sequence, engine.modelConfig().layerTypes()));
+            List<String> mtp = SequenceStateProbe.mtpDigests(
+                    gpu, sequence, engine.modelConfig().layerTypes(), prompt.length);
+            assertTrue(!mtp.isEmpty(), "the speculative sequence has an MTP cache");
+            digests.addAll(mtp);
+            return digests;
+        }
+    }
+
     private static List<Integer> greedy(InferenceEngine engine, int[] prompt, int newTokens) throws Exception {
         try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
             return session.generate(prompt, newTokens, text -> {}, null);
