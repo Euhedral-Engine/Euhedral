@@ -15,6 +15,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /// Coordinates prompt and decode quanta for one persistent Qwen sequence.
@@ -54,8 +55,6 @@ public final class QwenGenerationSession implements AutoCloseable {
     private int speculativeDepth;
     private QwenSpeculativeDecoder speculative;
     private PrefixCache prefixCache;
-    /// Where the next checkpoint of this sequence attaches: the deepest stored node of its prefix.
-    private PrefixNode cursor;
 
     /// Creates a session with a new persistent sequence owned by this instance.
     /// The plan, runtime, GPU, and tokenizer are borrowed and must remain usable until the session is closed.
@@ -383,6 +382,10 @@ public final class QwenGenerationSession implements AutoCloseable {
         private OptionalInt nextToken = OptionalInt.empty();
         private int generated;
         private boolean endedNormally;
+        /// Where this prompt's next checkpoint attaches: the deepest stored node of its prefix. Null unless the
+        /// prompt started a fresh sequence through the cache: the offsets of a continuation prompt are not
+        /// positions of the sequence, so nothing it holds may be stored under its tokens.
+        private PrefixNode cursor;
 
         Chain(
                 int[] promptTokenIds,
@@ -400,7 +403,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         /// Restores the longest stored prefix of the prompt, then prefills what is left.
         void startFromCache(PrefixCache cache) {
             PrefixCache.Hit hit = cache.lookup(this.promptTokenIds, false);
-            QwenGenerationSession.this.cursor = hit == null ? cache.root() : hit.cursor();
+            this.cursor = hit == null ? cache.root() : hit.cursor();
             if (hit == null) {
                 prefillNext();
                 return;
@@ -436,7 +439,8 @@ public final class QwenGenerationSession implements AutoCloseable {
         private void checkpointThen(int end, Runnable next) {
             PrefixCache cache = QwenGenerationSession.this.prefixCache;
             if (cache == null
-                    || end <= QwenGenerationSession.this.cursor.position()
+                    || this.cursor == null
+                    || end <= this.cursor.position()
                     || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) {
                 next.run();
                 return;
@@ -444,12 +448,12 @@ public final class QwenGenerationSession implements AutoCloseable {
             cache.capture(
                             QwenGenerationSession.this.runtime.frames(),
                             QwenGenerationSession.this.sequence,
-                            QwenGenerationSession.this.cursor,
+                            this.cursor,
                             this.promptTokenIds,
                             end)
                     .whenComplete((node, failure) -> {
                         try {
-                            if (failure == null) QwenGenerationSession.this.cursor = node;
+                            if (failure == null) this.cursor = node;
                             next.run();
                         } catch (Throwable continuationFailure) {
                             this.result.completeExceptionally(continuationFailure);
@@ -577,12 +581,13 @@ public final class QwenGenerationSession implements AutoCloseable {
             return runSpeculative(promptTokenIds, maxNewTokens, text, timing, null, 0);
         // A speculative prompt restores only through checkpoints that hold MTP state, and stores them.
         PrefixCache.Hit hit = cache.lookup(promptTokenIds, true);
-        this.cursor = hit == null ? cache.root() : hit.cursor();
+        AtomicReference<PrefixNode> cursor = new AtomicReference<>(hit == null ? cache.root() : hit.cursor());
         QwenSpeculativeDecoder.PrefixHooks hooks = (end, seedRow) -> {
-            if (end <= this.cursor.position() || !cache.wantsCheckpoint(end, promptTokenIds.length))
+            PrefixNode attachedTo = cursor.get();
+            if (end <= attachedTo.position() || !cache.wantsCheckpoint(end, promptTokenIds.length))
                 return CompletableFuture.completedFuture(null);
-            return cache.capture(this.runtime.frames(), this.sequence, this.cursor, promptTokenIds, end, seedRow)
-                    .thenAccept(node -> this.cursor = node);
+            return cache.capture(this.runtime.frames(), this.sequence, attachedTo, promptTokenIds, end, seedRow)
+                    .thenAccept(cursor::set);
         };
         if (hit == null) return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, 0);
         long started = System.nanoTime();

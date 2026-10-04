@@ -280,6 +280,39 @@ class QwenGenerationSessionPrefixCacheTest {
 
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    void aSecondPromptOfOneSessionStoresNothingAndRestoresNothing() throws Exception {
+        Harness h = harness(32L << 20, 1024);
+        try (var session = session(h, 1)) {
+            // The first prompt is short: no checkpoint. The second continues the same sequence, whose positions no
+            // longer match the second prompt's offsets, so a checkpoint keyed by its tokens would be state of
+            // other tokens.
+            session.generate(prompt(100), 1, text -> {}, null);
+            assertEquals(0, h.cache().stats().captured());
+            session.generate(prompt(800), 1, text -> {}, null);
+            assertEquals(0, h.cache().stats().captured(), "nothing is stored from a continuation prompt");
+            assertEquals(0, h.cache().stats().hits());
+        } finally {
+            close(h);
+        }
+    }
+
+    @Test
+    @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    void aCacheAttachedAfterAnUncachedFirstPromptIsNotUsed() throws Exception {
+        Harness h = harness(32L << 20, 512);
+        try (var session =
+                new QwenGenerationSession(tokenizer, h.plan(), h.runtime(), h.gpu(), 5, GenerationConfig.greedy(5))) {
+            session.generate(prompt(100), 1, text -> {}, null);
+            session.usePrefixCache(h.cache());
+            assertEquals(1, session.generate(prompt(800), 1, text -> {}, null).size());
+            assertEquals(0, h.cache().stats().captured());
+        } finally {
+            close(h);
+        }
+    }
+
+    @Test
+    @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void aSessionWithAnotherChunkSizeCannotUseTheCache() throws Exception {
         Harness h = harness(8L << 20, 1024);
         try (var session = new QwenGenerationSession(
