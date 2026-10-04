@@ -100,8 +100,9 @@ public final class AttentionSequenceStates implements AutoCloseable {
 
     void fingerprint(CaptureFingerprint fingerprint) {
         for (AttentionKvState state : this.states) if (state != null) state.fingerprint(fingerprint);
-        fingerprint.add(this.draftSeedRows).add(this.draftSeedCapacity).add(this.draftRecursionHidden);
-        fingerprint.add(this.decodeScratch).add(this.decodeScratchRows);
+        fingerprint.add(this.gpu, this.draftSeedRows).add(this.draftSeedCapacity);
+        fingerprint.add(this.gpu, this.draftRecursionHidden);
+        fingerprint.add(this.gpu, this.decodeScratch).add(this.decodeScratchRows);
     }
 
     public AttentionKvState forLayer(int layerIndex) {
