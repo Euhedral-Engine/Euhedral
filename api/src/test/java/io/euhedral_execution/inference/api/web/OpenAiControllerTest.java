@@ -84,6 +84,8 @@ class OpenAiControllerTest {
         var generation = this.backend.only();
         String expectedPrompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
         assertEquals(expectedPrompt, generation.prompt);
+        // The response's last write may reach the client before the completion closes the session.
+        assertTrue(generation.awaitClosed());
         assertEquals(1, generation.closeCount.get(), "request session must be closed exactly once");
         assertTrue(generation.generatingThread.startsWith("scripted-worker-"), generation.generatingThread);
     }
@@ -124,6 +126,7 @@ class OpenAiControllerTest {
         var generation = this.backend.only();
         assertTrue(generation.isCancelled(), "a matched stop sequence must cancel the session");
         assertEquals(4, generation.emitted.get(), "no quantum may run after the stop sequence completed");
+        assertTrue(generation.awaitClosed());
         assertEquals(1, generation.closeCount.get());
     }
 
@@ -304,6 +307,7 @@ class OpenAiControllerTest {
         completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}")
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.error.type").value("service_unavailable_error"));
+        assertTrue(this.backend.only().awaitClosed());
         assertEquals(1, this.backend.only().closeCount.get());
     }
 
