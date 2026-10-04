@@ -140,6 +140,10 @@ class InferenceEngineTest {
     }
 
     InferenceConfig config() throws Exception {
+        return config(0, 2048);
+    }
+
+    InferenceConfig config(long prefixCacheBytes, int prefixCacheCheckpointTokens) throws Exception {
         Files.writeString(directory.resolve("tokenizer.json"), """
             {"model":{"type":"BPE","vocab":{"!":0,"A":1,"B":2,"C":3,"D":4,"E":5,"F":6},"merges":[]},
              "normalizer":{"type":"NFC"},
@@ -153,7 +157,80 @@ class InferenceEngineTest {
         BitSet cpus = new BitSet();
         cpus.set(SystemInfo.getPCpuSet().nextSetBit(0));
         return new InferenceConfig(
-                directory.resolve("model.edrl"), directory, directory.resolve("lib.so"), cpus, Duration.ofSeconds(10));
+                directory.resolve("model.edrl"),
+                directory,
+                directory.resolve("lib.so"),
+                cpus,
+                InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS,
+                Duration.ofSeconds(10),
+                prefixCacheBytes,
+                prefixCacheCheckpointTokens);
+    }
+
+    @Test
+    void memoryThatCannotBePinnedLeavesTheEngineServingWithoutACache() throws Exception {
+        try (var engine = InferenceEngine.load(config(1 << 20, 512), new FakeBootstrap())) {
+            assertNull(engine.prefixCacheStats());
+            try (var session = engine.createSession(GenerationConfig.greedy(1L))) {
+                assertEquals(java.util.List.of(1), session.generate("!", 1, ignored -> {}));
+            }
+        }
+    }
+
+    @Test
+    void anEngineWithACacheReusesAPromptsPrefixAndFreesTheArenaOnClose() throws Exception {
+        var bootstrap = new PinningBootstrap();
+        String prompt = "!".repeat(700);
+        try (var engine = InferenceEngine.load(config(64L << 20, 512), bootstrap)) {
+            assertEquals(0, engine.prefixCacheStats().lookups());
+            for (int request = 0; request < 2; request++)
+                try (var session = engine.createSession(GenerationConfig.greedy(1L))) {
+                    session.generate(prompt, 1, ignored -> {});
+                }
+            var stats = engine.prefixCacheStats();
+            assertEquals(2, stats.lookups());
+            assertEquals(1, stats.hits());
+            assertEquals(512, stats.reusedTokens());
+            assertEquals(java.util.List.of(), bootstrap.gpu().pinnedFrees);
+        }
+        assertEquals(1, bootstrap.gpu().pinnedFrees.size(), "closing the engine unpinned the arena");
+    }
+
+    static class PinningGpu extends EngineExecutionFixture.SamplingGpu {
+        private final java.util.Map<Long, java.lang.foreign.Arena> arenas =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.List<Long> pinnedFrees = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        PinningGpu() {
+            super(8);
+        }
+
+        @Override
+        public long allocateHostWeights(long byteSize) {
+            var arena = java.lang.foreign.Arena.ofShared();
+            long address = arena.allocate(byteSize, 4096).address();
+            this.arenas.put(address, arena);
+            return address;
+        }
+
+        @Override
+        public void freeHostWeights(long address) {
+            this.pinnedFrees.add(address);
+            this.arenas.remove(address).close();
+        }
+    }
+
+    static class PinningBootstrap extends FakeBootstrap {
+        private final PinningGpu pinning = new PinningGpu();
+
+        PinningGpu gpu() {
+            return this.pinning;
+        }
+
+        @Override
+        ExecutionGpu openGpu(Path path) {
+            return this.pinning;
+        }
     }
 
     @Test

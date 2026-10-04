@@ -223,13 +223,15 @@ environment variable (`EUHEDRAL_INFERENCE_*`, `EUHEDRAL_API_*`); `PORT` sets the
 | `worker-cpus` | required | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`. |
 | `model-id` | required | The name clients send as `model`. |
 | `max-context-tokens` | 32768 | The longest prompt plus completion a request may use. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit; asking for more than the card can hold fails at start with a clear message. |
+| `prefix-cache-bytes` | 4294967296 | Pinned host memory that keeps the state of earlier prompts, so a request that shares a prefix with one of them prefills only what follows it. 0 turns the cache off; memory that cannot be pinned turns it off with a warning. |
+| `prefix-cache-checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints. A multiple of 512. |
 | `shutdown-timeout` | 10s | How long shutdown waits for the engine. |
 | `euhedral.api.default-max-tokens` | 4096 | Completion length when a request sets none. |
 | `euhedral.api.max-queued-generations` | 16 | Requests waiting behind the running generation; more are refused with 503. |
 | `euhedral.api.max-request-bytes` | 1048576 | Request body limit. |
 | `euhedral.api.request-timeout` | 30m | Per-request limit. |
 
-One generation runs at a time; the engine sizes device memory for one sequence. Requests are served entirely on the
+One generation runs at a time; the engine sizes device memory for one sequence. The prefix cache is the only state kept between requests; it is host memory, so it takes nothing from the context length or the device. Requests are served entirely on the
 engine's worker threads: the container thread hands a request over and returns, and rendering, tokenization, every
 quantum and every write to the client run as lattice work (docs/FRAME_MODEL.md, "Host work on the workers").
 

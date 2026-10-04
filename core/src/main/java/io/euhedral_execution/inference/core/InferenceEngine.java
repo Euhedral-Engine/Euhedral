@@ -16,6 +16,7 @@ import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactRe
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.scheduling.PrefixCache;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -33,6 +34,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// High-level owner of model, CUDA backend, Euhedral lattice, and all sessions it creates.
 /// Close sessions early when finished; engine close also closes every tracked session.
@@ -41,6 +44,7 @@ import java.util.function.Supplier;
 /// Initialize the process fabric through load, not a separate low-level lattice factory; advanced
 /// sources may borrow the running fabric but must not initialize or stop it independently.
 public final class InferenceEngine implements AutoCloseable {
+    private static final Logger LOG = LoggerFactory.getLogger(InferenceEngine.class);
     private static final AtomicBoolean LATTICE_OWNED = new AtomicBoolean();
     private static final AtomicReference<ControlPlaneLattice> LAST_CLOSED_LATTICE = new AtomicReference<>();
     private static final AtomicLong SEQUENCE_IDS = new AtomicLong();
@@ -56,6 +60,7 @@ public final class InferenceEngine implements AutoCloseable {
     private final BitSet workerCoreIds;
     private final InferenceRunSnapshot.Model modelIdentity;
     private final InferenceRunSnapshot.RuntimeIdentity runtimeIdentity;
+    private final PrefixCache prefixCache;
     private final List<QwenGenerationSession> sessions = new ArrayList<>();
     private final ReentrantLock shutdownLock = new ReentrantLock();
     private volatile boolean closing;
@@ -73,7 +78,8 @@ public final class InferenceEngine implements AutoCloseable {
             ArtifactProfile profile,
             BitSet workerCoreIds,
             InferenceRunSnapshot.Model modelIdentity,
-            InferenceRunSnapshot.RuntimeIdentity runtimeIdentity) {
+            InferenceRunSnapshot.RuntimeIdentity runtimeIdentity,
+            PrefixCache prefixCache) {
         this.bootstrap = bootstrap;
         this.tokenizer = tokenizer;
         this.gpu = gpu;
@@ -86,6 +92,7 @@ public final class InferenceEngine implements AutoCloseable {
         this.workerCoreIds = workerCoreIds;
         this.modelIdentity = modelIdentity;
         this.runtimeIdentity = runtimeIdentity;
+        this.prefixCache = prefixCache;
     }
 
     /// Loads all model resources and starts the lattice before returning an engine.
@@ -116,6 +123,10 @@ public final class InferenceEngine implements AutoCloseable {
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var modelIdentity = modelIdentity(config.artifactPath(), artifact, model);
+            var runtimeIdentity = runtimeIdentity(config.cudaLibraryPath());
+            // Last, so nothing that can fail follows the pinned arena.
+            PrefixCache prefixCache = openPrefixCache(config, gpu, plan);
             return new InferenceEngine(
                     bootstrap,
                     tokenizer,
@@ -127,8 +138,9 @@ public final class InferenceEngine implements AutoCloseable {
                     config,
                     profile,
                     workerCoreIds,
-                    modelIdentity(config.artifactPath(), artifact, model),
-                    runtimeIdentity(config.cudaLibraryPath()));
+                    modelIdentity,
+                    runtimeIdentity,
+                    prefixCache);
         } catch (IOException | RuntimeException | Error failure) {
             var pending = new StartupFailure(
                     failure,
@@ -143,6 +155,27 @@ public final class InferenceEngine implements AutoCloseable {
                 throw pending;
             }
             throw failure;
+        }
+    }
+
+    /// The cache is an optimisation: when it is off, the plan is not a full model, or its host memory cannot be
+    /// pinned, the engine serves without it.
+    private static PrefixCache openPrefixCache(InferenceConfig config, ExecutionGpu gpu, QwenExecutionPlan plan) {
+        if (config.prefixCacheBytes() == 0 || plan.weights().layers().length <= 1) return null;
+        try {
+            PrefixCache cache = PrefixCache.create(
+                    gpu, plan.weights().config(), config.prefixCacheBytes(), config.prefixCacheCheckpointTokens());
+            LOG.info(
+                    "Prefix cache: {} MiB pinned, a checkpoint every {} tokens",
+                    config.prefixCacheBytes() >> 20,
+                    config.prefixCacheCheckpointTokens());
+            return cache;
+        } catch (RuntimeException | Error unavailable) {
+            LOG.warn(
+                    "Prefix cache disabled: {} bytes of host memory could not be pinned",
+                    config.prefixCacheBytes(),
+                    unavailable);
+            return null;
         }
     }
 
@@ -216,6 +249,7 @@ public final class InferenceEngine implements AutoCloseable {
                 this::releaseSession);
         if (this.profile != null && this.profile.speculativeDepth() > 0 && this.plan.drafts())
             session.enableSpeculativeDecoding(this.profile.speculativeDepth());
+        if (this.prefixCache != null) session.usePrefixCache(this.prefixCache);
         this.sessions.add(session);
         return session;
     }
@@ -271,6 +305,11 @@ public final class InferenceEngine implements AutoCloseable {
     }
 
     /// True as soon as shutdown begins; no further sessions can be admitted.
+    /// Counters of the prefix cache, or null when the engine runs without one.
+    public PrefixCache.Stats prefixCacheStats() {
+        return this.prefixCache == null ? null : this.prefixCache.stats();
+    }
+
     public boolean isClosed() {
         return this.closing;
     }
@@ -359,6 +398,7 @@ public final class InferenceEngine implements AutoCloseable {
             if (failure instanceof RuntimeException exception) throw exception;
             if (failure instanceof Error error) throw error;
             this.runtime.close();
+            if (this.prefixCache != null) this.prefixCache.close();
             // All inference sources have drained before fabric shutdown, even if fabric teardown is asynchronous.
             LAST_CLOSED_LATTICE.set(this.lattice);
             this.lattice.close();

@@ -23,8 +23,8 @@ class InferencePropertiesTest {
         expected.set(2, 6);
         expected.set(8);
         assertEquals(expected, InferenceProperties.parseCpus(" 2-5, 8 ,"));
-        var config =
-                new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m").toInferenceConfig();
+        var config = new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048)
+                .toInferenceConfig();
         assertEquals(BitSet.valueOf(new long[] {1L << 3}), config.workerCpus());
         assertEquals(Duration.ofSeconds(4), config.shutdownTimeout());
     }
@@ -37,10 +37,10 @@ class InferencePropertiesTest {
         assertThrows(IllegalArgumentException.class, () -> InferenceProperties.parseCpus(" , "));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceProperties(null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m"));
+                () -> new InferenceProperties(null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceProperties(PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " "));
+                () -> new InferenceProperties(PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048));
     }
 
     private static InferenceProperties bind(Map<String, String> overrides) {
@@ -66,6 +66,30 @@ class InferencePropertiesTest {
                 bind(Map.of("euhedral.inference.max-context-tokens", "65536"))
                         .toInferenceConfig()
                         .maxContextTokens());
+    }
+
+    @Test
+    void prefixCacheDefaultsOnAndBinds() {
+        assertEquals(4L << 30, bind(Map.of()).toInferenceConfig().prefixCacheBytes());
+        assertEquals(2048, bind(Map.of()).toInferenceConfig().prefixCacheCheckpointTokens());
+        assertEquals(
+                0,
+                bind(Map.of("euhedral.inference.prefix-cache-bytes", "0"))
+                        .toInferenceConfig()
+                        .prefixCacheBytes());
+        assertEquals(
+                4096,
+                bind(Map.of("euhedral.inference.prefix-cache-checkpoint-tokens", "4096"))
+                        .toInferenceConfig()
+                        .prefixCacheCheckpointTokens());
+    }
+
+    @Test
+    void rejectsAnInvalidPrefixCacheAtBindTime() {
+        assertThrows(BindException.class, () -> bind(Map.of("euhedral.inference.prefix-cache-bytes", "-1")));
+        assertThrows(
+                BindException.class, () -> bind(Map.of("euhedral.inference.prefix-cache-checkpoint-tokens", "1000")));
+        assertThrows(BindException.class, () -> bind(Map.of("euhedral.inference.prefix-cache-checkpoint-tokens", "0")));
     }
 
     @Test

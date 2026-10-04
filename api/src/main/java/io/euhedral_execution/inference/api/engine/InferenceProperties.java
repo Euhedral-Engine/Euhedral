@@ -13,7 +13,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /// inclusive ranges such as `2,3,8-11`. `modelId` is the public name clients send as `model`.
 /// `maxContextTokens` is the longest prompt plus completion a request may use (default 32768); the
 /// engine keeps device memory for that much context and holds back weights in pinned host memory when
-/// the GPU cannot fit both.
+/// the GPU cannot fit both. `prefixCacheBytes` is the pinned host memory that keeps the state of earlier prompts,
+/// so a request sharing a prefix with one of them prefills only what follows (default 4 GiB, 0 turns it off);
+/// `prefixCacheCheckpointTokens` is the prompt tokens between stored checkpoints, a multiple of 512.
 @ConfigurationProperties("euhedral.inference")
 public record InferenceProperties(
         Path artifactPath,
@@ -22,7 +24,9 @@ public record InferenceProperties(
         String workerCpus,
         @DefaultValue("32768") int maxContextTokens,
         @DefaultValue("10s") Duration shutdownTimeout,
-        String modelId) {
+        String modelId,
+        @DefaultValue("4294967296") long prefixCacheBytes,
+        @DefaultValue("2048") int prefixCacheCheckpointTokens) {
 
     public InferenceProperties {
         require(artifactPath, "artifact-path");
@@ -35,6 +39,11 @@ public record InferenceProperties(
         parseCpus(workerCpus);
         if (maxContextTokens <= 0)
             throw new IllegalArgumentException("euhedral.inference.max-context-tokens must be positive");
+        if (prefixCacheBytes < 0)
+            throw new IllegalArgumentException("euhedral.inference.prefix-cache-bytes must not be negative");
+        if (prefixCacheCheckpointTokens <= 0 || prefixCacheCheckpointTokens % 512 != 0)
+            throw new IllegalArgumentException(
+                    "euhedral.inference.prefix-cache-checkpoint-tokens must be a positive multiple of 512");
     }
 
     /// Converts to the core record, which performs its own lifetime and CPU-set validation.
@@ -45,7 +54,9 @@ public record InferenceProperties(
                 this.cudaLibraryPath,
                 parseCpus(this.workerCpus),
                 this.maxContextTokens,
-                this.shutdownTimeout);
+                this.shutdownTimeout,
+                this.prefixCacheBytes,
+                this.prefixCacheCheckpointTokens);
     }
 
     static BitSet parseCpus(String specification) {
