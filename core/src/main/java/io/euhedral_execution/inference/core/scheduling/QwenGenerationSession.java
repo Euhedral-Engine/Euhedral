@@ -51,6 +51,8 @@ public final class QwenGenerationSession implements AutoCloseable {
     private IncrementalDecoder decoder;
     private boolean decoderFinished;
     private boolean promptPrefilled;
+    /// Prompt tokens the last generation took from the prefix cache instead of prefilling them.
+    private volatile int restoredPromptTokens;
     /// MTP draft depth for greedy unconstrained generation from a fresh sequence; 0 disables it.
     private int speculativeDepth;
     private QwenSpeculativeDecoder speculative;
@@ -296,6 +298,11 @@ public final class QwenGenerationSession implements AutoCloseable {
         }
     }
 
+    /// Prompt tokens the session's last generation restored from the prefix cache; 0 when it prefilled all of them.
+    public int restoredPromptTokens() {
+        return this.restoredPromptTokens;
+    }
+
     /// Reports whether cancellation has been requested for this session.
     public boolean isCancelled() {
         return this.cancelled.get();
@@ -429,6 +436,7 @@ public final class QwenGenerationSession implements AutoCloseable {
                             if (this.timing != null)
                                 this.timing.prefixRestored(hit.position(), System.nanoTime() - started);
                             this.offset = hit.position();
+                            QwenGenerationSession.this.restoredPromptTokens = hit.position();
                             prefillNext();
                         } catch (Throwable continuationFailure) {
                             this.result.completeExceptionally(continuationFailure);
@@ -597,6 +605,7 @@ public final class QwenGenerationSession implements AutoCloseable {
                 .thenCompose(restored -> {
                     if (!restored || isStopRequested()) return CompletableFuture.completedFuture(List.<Integer>of());
                     if (timing != null) timing.prefixRestored(hit.position(), System.nanoTime() - started);
+                    this.restoredPromptTokens = hit.position();
                     return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, hit.position());
                 });
     }

@@ -240,7 +240,9 @@ class QwenGenerationSessionPrefixCacheTest {
                 }
             };
             try (var second = session(h, 2)) {
+                assertEquals(0, second.restoredPromptTokens());
                 second.generate(text, 1, ignored -> {}, null, listener);
+                assertEquals(restored.get(), second.restoredPromptTokens(), "the session reports what it restored");
             }
             assertTrue(restored.get() >= 512 && restored.get() % 512 == 0, "restored " + restored.get());
             assertEquals(h.cache().stats().reusedTokens(), restored.get());
