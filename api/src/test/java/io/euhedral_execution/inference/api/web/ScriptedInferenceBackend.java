@@ -19,7 +19,9 @@ import java.util.function.Consumer;
 /// Test backend that follows the engine's asynchronous contract without CUDA: a small pool stands in for the
 /// lattice's workers, which encode prompts and run generations; text is emitted on a worker between
 /// "quanta", cancellation stops the next quantum, and generations record their inputs and lifecycle so tests
-/// can assert cancellation and cleanup.
+/// can assert cancellation and cleanup. With `emptyReasoning`, output that opens in the think block begins with
+/// an empty reasoning (`</think>` and a blank line, one token), so scripts of plain answers serve requests with
+/// thinking on.
 final class ScriptedInferenceBackend implements InferenceBackend {
     static final String MODEL_ID = "euhedral-test-model";
 
@@ -34,6 +36,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     volatile boolean available = true;
     volatile Script script = tokens(List.of("Hello", ", ", "world"), true);
     volatile int contextLength = 4096;
+    volatile boolean emptyReasoning;
 
     /// Behavior of the next generations. Implementations must honor `generation.isCancelled()`.
     @FunctionalInterface
@@ -69,10 +72,21 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         };
     }
 
+    /// The model closes its think block at once, then follows `answer`.
+    static Script thinkingNothing(Script answer) {
+        return (generation, maxNewTokens, output) -> {
+            if (generation.isCancelled() || maxNewTokens == 0) return new Result(0, false);
+            generation.emit(output, "</think>\n\n");
+            Result rest = answer.run(generation, maxNewTokens - 1, output);
+            return new Result(rest.completionTokens() + 1, rest.stopTokenReached(), 0);
+        };
+    }
+
     void reset() {
         this.generations.clear();
         this.available = true;
         this.contextLength = 4096;
+        this.emptyReasoning = false;
         this.script = tokens(List.of("Hello", ", ", "world"), true);
     }
 
@@ -131,10 +145,13 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     }
 
     @Override
-    public Generation openGeneration(GenerationConfig config, ToolConstraint constraint) {
+    public Generation openGeneration(GenerationConfig config, OutputSpec output) {
         if (!this.available) throw new InferenceUnavailableException("inference engine is shutting down");
-        var generation = new ScriptedGeneration(config, this.script, this.workers);
-        generation.constraint = constraint;
+        Script script = this.script;
+        if (output.reasoning() && this.emptyReasoning) script = thinkingNothing(script);
+        var generation = new ScriptedGeneration(config, script, this.workers);
+        generation.constraint = output.tools();
+        generation.output = output;
         this.generations.add(generation);
         return generation;
     }
@@ -144,12 +161,15 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         final CountDownLatch started = new CountDownLatch(1);
         final CountDownLatch closed = new CountDownLatch(1);
         final AtomicInteger emitted = new AtomicInteger();
+        /// Chunks emitted before the first one holding `</think>`; -1 until one does.
+        volatile int reasoningChunks = -1;
         final AtomicInteger emittedAfterCancel = new AtomicInteger();
         final AtomicInteger closeCount = new AtomicInteger();
         private final Script script;
         private final AtomicBoolean cancelled = new AtomicBoolean();
         volatile String prompt;
         volatile ToolConstraint constraint;
+        volatile OutputSpec output;
         volatile int maxNewTokens;
         volatile String generatingThread;
 
@@ -172,7 +192,13 @@ final class ScriptedInferenceBackend implements InferenceBackend {
                         this.generatingThread = Thread.currentThread().getName();
                         this.started.countDown();
                         try {
-                            return this.script.run(this, maxNewTokens, text);
+                            Result result = this.script.run(this, maxNewTokens, text);
+                            if (this.output == null || !this.output.reasoning()) return result;
+                            // One token per chunk: the reasoning is what came before `</think>`.
+                            int reasoning = this.reasoningChunks >= 0
+                                    ? this.reasoningChunks
+                                    : result.completionTokens() - (result.stopTokenReached() ? 1 : 0);
+                            return new Result(result.completionTokens(), result.stopTokenReached(), reasoning);
                         } catch (InterruptedException | ExecutionException failure) {
                             throw new java.util.concurrent.CompletionException(failure);
                         }
@@ -182,6 +208,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
 
         void emit(Consumer<String> output, String text) {
             if (this.cancelled.get()) this.emittedAfterCancel.incrementAndGet();
+            if (this.reasoningChunks < 0 && text.contains("</think>")) this.reasoningChunks = this.emitted.get();
             this.emitted.incrementAndGet();
             output.accept(text);
         }

@@ -168,12 +168,13 @@ public class ChatCompletionService implements DisposableBean {
     }
 
     private InferenceBackend.Generation open(ChatCompletionPlan plan) {
-        if (!plan.tools().parsesOutput()) return this.backend.openGeneration(plan.sampling());
-        var constraint = new InferenceBackend.ToolConstraint(
-                plan.tools().callable().stream().map(FunctionTool::name).toList(),
-                plan.tools().choice() != ToolCalling.Choice.AUTO,
-                plan.tools().parallel());
-        return this.backend.openGeneration(plan.sampling(), constraint);
+        InferenceBackend.ToolConstraint tools = plan.tools().parsesOutput()
+                ? new InferenceBackend.ToolConstraint(
+                        plan.tools().callable().stream().map(FunctionTool::name).toList(),
+                        plan.tools().choice() != ToolCalling.Choice.AUTO,
+                        plan.tools().parallel())
+                : null;
+        return this.backend.openGeneration(plan.sampling(), new InferenceBackend.OutputSpec(plan.reasoning(), tools));
     }
 
     /// The OpenAI error for a failed planning or start.
@@ -213,6 +214,7 @@ public class ChatCompletionService implements DisposableBean {
     private static final class JsonSink implements CompletionSink {
         private final ChatCompletionPlan plan;
         private final DeferredResult<Object> result;
+        private final StringBuilder reasoning = new StringBuilder();
         private final StringBuilder content = new StringBuilder();
         private final List<ToolCall> toolCalls = new ArrayList<>();
 
@@ -223,6 +225,11 @@ public class ChatCompletionService implements DisposableBean {
 
         @Override
         public void start() {}
+
+        @Override
+        public void reasoning(String delta) {
+            this.reasoning.append(delta);
+        }
 
         @Override
         public void text(String delta) {
@@ -240,6 +247,7 @@ public class ChatCompletionService implements DisposableBean {
                     this.plan.id(),
                     this.plan.created(),
                     this.plan.model(),
+                    this.reasoning.toString(),
                     this.content.toString(),
                     this.toolCalls,
                     finishReason,
@@ -266,6 +274,11 @@ public class ChatCompletionService implements DisposableBean {
         @Override
         public void start() throws IOException {
             send(ChatCompletionChunk.role(this.plan.id(), this.plan.created(), this.plan.model()));
+        }
+
+        @Override
+        public void reasoning(String delta) throws IOException {
+            send(ChatCompletionChunk.reasoning(this.plan.id(), this.plan.created(), this.plan.model(), delta));
         }
 
         @Override

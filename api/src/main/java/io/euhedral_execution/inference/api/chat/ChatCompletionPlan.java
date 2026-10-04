@@ -5,7 +5,8 @@ import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.List;
 
 /// A validated request, fully resolved before any session is opened.
-/// `promptTokens + maxTokens` never exceeds the model context.
+/// `promptTokens + maxTokens` never exceeds the model context. With `reasoning` the prompt ends inside the
+/// model's think block, so the output begins as reasoning.
 public record ChatCompletionPlan(
         String id,
         long created,
@@ -16,7 +17,8 @@ public record ChatCompletionPlan(
         List<String> stops,
         boolean stream,
         boolean includeUsage,
-        ToolCalling tools) {
+        ToolCalling tools,
+        boolean reasoning) {
 
     public ChatCompletionPlan {
         stops = List.copyOf(stops);

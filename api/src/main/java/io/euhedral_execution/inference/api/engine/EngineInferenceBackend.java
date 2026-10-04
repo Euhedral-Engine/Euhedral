@@ -6,6 +6,9 @@ import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import io.euhedral_execution.inference.core.tokenizer.ReasoningConstraint;
+import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -62,17 +65,22 @@ public final class EngineInferenceBackend implements InferenceBackend {
     }
 
     @Override
-    public Generation openGeneration(GenerationConfig config, ToolConstraint constraint) {
+    public Generation openGeneration(GenerationConfig config, OutputSpec output) {
         if (this.engine.isClosed()) throw new InferenceUnavailableException("inference engine is shutting down");
         try {
-            JsonEnvelopeConstraint grammar = constraint == null
+            QwenTokenizer tokenizer = this.engine.tokenizer();
+            ToolConstraint tools = output.tools();
+            JsonEnvelopeConstraint envelope = tools == null
                     ? null
-                    : new JsonEnvelopeConstraint(
-                            this.engine.tokenizer(),
-                            constraint.toolNames(),
-                            constraint.requiresCall(),
-                            constraint.parallel());
-            return new SessionGeneration(this.engine.createSession(config), this.engine.tokenizer(), grammar);
+                    : new JsonEnvelopeConstraint(tokenizer, tools.toolNames(), tools.requiresCall(), tools.parallel());
+            // Free reasoning needs no constraint, so a greedy request keeps speculative decoding.
+            TokenConstraint constraint = output.reasoning() && envelope != null
+                    ? new ReasoningConstraint(tokenizer, Integer.MAX_VALUE, envelope)
+                    : envelope;
+            int thinkEnd = output.reasoning()
+                    ? tokenizer.controlTokenId(QwenChatTemplate.THINK_END).orElseThrow()
+                    : -1;
+            return new SessionGeneration(this.engine.createSession(config), tokenizer, constraint, thinkEnd);
         } catch (IllegalStateException closed) {
             // createSession's only state failure is closed admission; anything else is a real fault.
             if (this.engine.isClosed()) throw new InferenceUnavailableException("inference engine is shutting down");
@@ -80,8 +88,9 @@ public final class EngineInferenceBackend implements InferenceBackend {
         }
     }
 
+    /// `thinkEnd` is the `</think>` ID when the output opens as reasoning, else -1.
     private record SessionGeneration(
-            QwenGenerationSession session, QwenTokenizer tokenizer, JsonEnvelopeConstraint constraint)
+            QwenGenerationSession session, QwenTokenizer tokenizer, TokenConstraint constraint, int thinkEnd)
             implements Generation {
 
         @Override
@@ -90,9 +99,18 @@ public final class EngineInferenceBackend implements InferenceBackend {
                 throw new IllegalStateException("an encoded prompt needs a fresh session");
             return this.session
                     .generateAsync(prompt.tokenIds(), maxNewTokens, text, this.constraint)
-                    .thenApply(tokenIds -> new Result(
-                            tokenIds.size(),
-                            !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast())));
+                    .thenApply(tokenIds -> {
+                        boolean stopped =
+                                !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast());
+                        return new Result(tokenIds.size(), stopped, reasoningTokens(tokenIds, stopped));
+                    });
+        }
+
+        /// The tokens before `</think>`; all but a terminator when the reasoning never ended.
+        private int reasoningTokens(List<Integer> tokenIds, boolean stopped) {
+            if (this.thinkEnd < 0) return 0;
+            int end = tokenIds.indexOf(this.thinkEnd);
+            return end >= 0 ? end : tokenIds.size() - (stopped ? 1 : 0);
         }
 
         @Override

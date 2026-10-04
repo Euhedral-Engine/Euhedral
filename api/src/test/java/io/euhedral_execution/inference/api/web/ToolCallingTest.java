@@ -84,7 +84,7 @@ class ToolCallingTest {
         String tools = "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\","
                 + "\"properties\":{\"s\":{\"type\":\"string\"},\"x\":{\"type\":\"integer\"}},"
                 + "\"required\":[\"s\"],\"additionalProperties\":false}}}]";
-        String body = completion("{\"model\":\"" + MODEL + "\",\"tools\":" + tools
+        String body = completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tools\":" + tools
                         + ",\"messages\":[{\"role\":\"user\",\"content\":\"Use f.\"}]}")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.choices[0].message.content").value(Matchers.nullValue()))
@@ -116,7 +116,7 @@ class ToolCallingTest {
                 + "],\"additionalProperties\":false}}}]";
         this.backend.script = ScriptedInferenceBackend.tokens(
                 List.of("{\"tool_calls\":[{\"name\":\"f\",\"arguments\":{" + quoted + ":\"safe\"}}]}"), true);
-        completion("{\"model\":\"" + MODEL + "\",\"tools\":" + tools
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tools\":" + tools
                         + ",\"messages\":[{\"role\":\"user\",\"content\":\"Call f.\"}]}")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.choices[0].message.tool_calls[0].function.name")
@@ -182,7 +182,7 @@ class ToolCallingTest {
             boolean incomplete = output.endsWith("\"n\":");
             this.backend.script = ScriptedInferenceBackend.tokens(
                     incomplete ? List.of(output) : List.of(output, "tail1", "tail2"), incomplete);
-            completion("{\"model\":\"" + MODEL + "\",\"tools\":" + tools
+            completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tools\":" + tools
                             + ",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}")
                     .andExpect(status().isInternalServerError())
                     .andExpect(jsonPath("$.error.type").value("server_error"))
@@ -432,10 +432,11 @@ class ToolCallingTest {
         }
         assertTrue(this.backend.generations.isEmpty(), "rejected requests must not open sessions");
         // Without tools, "auto" and "none" request no behavior.
-        completion("{\"model\":\"" + MODEL + "\",\"tool_choice\":\"auto\"" + hi + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tool_choice\":\"auto\"" + hi + "}")
                 .andExpect(status().isOk());
         this.backend.reset();
-        completion("{\"model\":\"" + MODEL + "\",\"tool_choice\":\"none\",\"tools\":[]" + hi + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tool_choice\":\"none\",\"tools\":[]"
+                        + hi + "}")
                 .andExpect(status().isOk());
     }
 
@@ -560,14 +561,17 @@ class ToolCallingTest {
                         "unrecognized_argument",
                         "tools[0].function.extra"))) {
             var result = rejected(
-                            "{\"model\":\"" + MODEL + "\",\"tools\":" + invalid.tools() + hi + "}", invalid.status())
+                            "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tools\":" + invalid.tools()
+                                    + hi + "}",
+                            invalid.status())
                     .andExpect(jsonPath("$.error.type").value("invalid_request_error"))
                     .andExpect(jsonPath("$.error.param").value(invalid.param()));
             if (invalid.code() != null)
                 result.andExpect(jsonPath("$.error.code").value(invalid.code()));
         }
         // Explicitly non-strict definitions and schemas without `type` are accepted as sent.
-        completion("{\"model\":\"" + MODEL + "\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+        completion("{\"model\":\"" + MODEL
+                        + "\",\"reasoning_effort\":\"none\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
                         + "\"strict\":false,\"parameters\":{\"properties\":{}}}}]" + hi + "}")
                 .andExpect(status().isOk());
         assertEquals(1, this.backend.generations.size(), "rejected requests must not open sessions");
@@ -575,7 +579,8 @@ class ToolCallingTest {
 
     @Test
     void oversizedToolSchemaIsRejectedBeforePromptConstruction() throws Exception {
-        String body = "{\"model\":\"" + MODEL + "\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],"
+        String body = "{\"model\":\"" + MODEL
+                + "\",\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],"
                 + "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\""
                 + "x".repeat(1_048_576) + "\"}}]}";
         rejected(body, 413)
@@ -594,8 +599,8 @@ class ToolCallingTest {
             JsonNode golden = goldenToolCase(name);
             JsonNode tools = golden.get("tools");
             String body = tools.isNull()
-                    ? "{\"model\":\"" + MODEL + "\",\"messages\":" + JSON.writeValueAsString(openAiMessages(golden))
-                            + "}"
+                    ? "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"messages\":"
+                            + JSON.writeValueAsString(openAiMessages(golden)) + "}"
                     : request(tools, openAiMessages(golden), "");
             completion(body).andExpect(status().isOk());
             String prompt = this.backend.only().prompt;
@@ -712,15 +717,19 @@ class ToolCallingTest {
                         user + ",{\"role\":\"function\",\"name\":\"f\",\"content\":\"r\"}",
                         "messages[1].role",
                         "unsupported_parameter"))) {
-            var rejection = rejected("{\"model\":\"" + MODEL + "\",\"messages\":[" + invalid.messages() + "]}", 400)
+            var rejection = rejected(
+                            "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"messages\":["
+                                    + invalid.messages() + "]}",
+                            400)
                     .andExpect(jsonPath("$.error.param").value(invalid.param()));
             if (invalid.code() != null)
                 rejection.andExpect(jsonPath("$.error.code").value(invalid.code()));
         }
         assertTrue(this.backend.generations.isEmpty(), "rejected requests must not open sessions");
         // Empty arguments render no parameters, exactly like "{}".
-        completion("{\"model\":\"" + MODEL + "\",\"messages\":[" + user + ",{\"role\":\"assistant\",\"tool_calls\":["
-                        + call.replace("\"{}\"", "\"\"") + "]}," + result + "]}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"messages\":[" + user
+                        + ",{\"role\":\"assistant\",\"tool_calls\":[" + call.replace("\"{}\"", "\"\"") + "]}," + result
+                        + "]}")
                 .andExpect(status().isOk());
         assertTrue(this.backend.only().prompt.contains("<tool_call>\n<function=f>\n</function>\n</tool_call>"));
     }
@@ -739,8 +748,8 @@ class ToolCallingTest {
     }
 
     private static String request(JsonNode tools, JsonNode messages, String extra) {
-        return "{\"model\":\"" + MODEL + "\",\"tools\":" + JSON.writeValueAsString(tools) + ",\"messages\":"
-                + JSON.writeValueAsString(messages) + extra + "}";
+        return "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"tools\":" + JSON.writeValueAsString(tools)
+                + ",\"messages\":" + JSON.writeValueAsString(messages) + extra + "}";
     }
 
     private static JsonNode goldenToolCase(String name) throws IOException {

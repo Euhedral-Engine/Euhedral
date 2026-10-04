@@ -58,15 +58,21 @@ public interface InferenceBackend {
     /// generation runs them, so a prompt is tokenized once.
     CompletableFuture<EncodedPrompt> encodePrompt(String prompt);
 
+    /// How a generation's output is shaped. With `reasoning` the prompt opened the model's think block, so the
+    /// output is reasoning up to `</think>` and the answer after it. A non-null `tools` constrains the answer to a
+    /// JSON tool-call envelope for those offered names; a backend must enforce it while sampling.
+    record OutputSpec(boolean reasoning, ToolConstraint tools) {
+        public static final OutputSpec TEXT = new OutputSpec(false, null);
+    }
+
     /// Opens one request-owned generation. The caller must close it on every path.
     ///
     /// @throws InferenceUnavailableException when the engine is closing or closed
     default Generation openGeneration(GenerationConfig config) {
-        return openGeneration(config, null);
+        return openGeneration(config, OutputSpec.TEXT);
     }
 
-    /// A non-null constraint is enforced while sampling; a backend must not ignore it.
-    Generation openGeneration(GenerationConfig config, ToolConstraint constraint);
+    Generation openGeneration(GenerationConfig config, OutputSpec output);
 
     /// One request's sequence state. `cancel` may be called from any thread, including the output
     /// callback; `close` releases the sequence and waits for an in-flight quantum to detach.
@@ -86,6 +92,11 @@ public interface InferenceBackend {
         void close();
     }
 
-    /// `completionTokens` counts every sampled token, including a terminating stop token.
-    record Result(int completionTokens, boolean stopTokenReached) {}
+    /// `completionTokens` counts every sampled token, including a terminating stop token; `reasoningTokens` counts
+    /// those of the reasoning, before `</think>`.
+    record Result(int completionTokens, boolean stopTokenReached, int reasoningTokens) {
+        public Result(int completionTokens, boolean stopTokenReached) {
+            this(completionTokens, stopTokenReached, 0);
+        }
+    }
 }

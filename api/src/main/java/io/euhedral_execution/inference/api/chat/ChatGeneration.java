@@ -19,10 +19,12 @@ import org.slf4j.LoggerFactory;
 /// sink's network writes are tasks on the request's [SerialTasks] instead, so they run on workers one at a
 /// time in output order and a write that blocks its worker never holds up the quanta. When the generation
 /// ends, the completion closes the session, queues the response's last write and reports the end to
-/// `finished`, so the next request starts while this one's last writes drain. `abandon` is the only cross-thread entry
-/// point: the container calls it on disconnect or timeout,
+/// `finished`, so the next request starts while this one's last writes drain. Output that opens in the model's
+/// think block is split at `</think>` first: reasoning goes to the sink as it is decoded, and only the answer
+/// meets stop sequences and tool-call parsing. When the generation
+/// `abandon` is the only cross-thread entry point: the container calls it on disconnect or timeout,
 /// and it cancels the session so no further quantum starts.
-final class ChatGeneration implements ToolCallParser.Output {
+final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.Output {
     private static final Logger LOG = LoggerFactory.getLogger(ChatGeneration.class);
 
     private final ChatCompletionPlan plan;
@@ -31,6 +33,8 @@ final class ChatGeneration implements ToolCallParser.Output {
     private final SerialTasks delivery;
     private final Runnable finished;
     private final StopSequenceFilter stopFilter;
+    // Null when the output does not open in the think block.
+    private final ReasoningSplitter reasoning;
     // Null when the request offers no callable tools: output is then plain text, byte for byte.
     private final JsonToolCallParser toolParser;
     // Set by container threads and failed writes; read everywhere.
@@ -55,6 +59,7 @@ final class ChatGeneration implements ToolCallParser.Output {
         this.delivery = delivery;
         this.finished = finished;
         this.stopFilter = new StopSequenceFilter(plan.stops());
+        this.reasoning = plan.reasoning() ? new ReasoningSplitter() : null;
         this.toolParser = plan.tools().parsesOutput() ? new JsonToolCallParser(plan.tools()) : null;
     }
 
@@ -112,6 +117,7 @@ final class ChatGeneration implements ToolCallParser.Output {
             // flush below, which may itself match a stop sequence and cancel.
             boolean endedByRequest = this.stopFilter.matched() || this.callLimitReached;
             boolean engineCancelled = !endedByRequest && owned.isCancelled();
+            if (this.reasoning != null && !engineCancelled) this.reasoning.finish(this);
             if (!this.callLimitReached && !engineCancelled) {
                 String remaining = this.stopFilter.finish();
                 if (this.toolParser == null) content(remaining);
@@ -125,7 +131,10 @@ final class ChatGeneration implements ToolCallParser.Output {
                 return;
             }
             String finishReason = finishReason(result);
-            Usage usage = Usage.of(this.plan.promptTokens(), result.completionTokens());
+            Usage usage = Usage.of(
+                    this.plan.promptTokens(),
+                    result.completionTokens(),
+                    this.plan.reasoning() ? result.reasoningTokens() : null);
             this.delivered = true;
             write(() -> this.sink.finish(finishReason, usage));
         } catch (ToolCallParser.MalformedToolCallException malformed) {
@@ -150,6 +159,20 @@ final class ChatGeneration implements ToolCallParser.Output {
     /// One decoded text, on the worker that retired its quantum and before the next quantum is admitted.
     private void onText(String text) {
         if (this.abandoned.get() || this.malformedToolCall != null || this.stopFilter.matched()) return;
+        if (this.reasoning == null) answer(text);
+        else this.reasoning.accept(text, this);
+    }
+
+    /// Reasoning text, which stop sequences and tool-call parsing do not see.
+    @Override
+    public void reasoning(String text) {
+        write(() -> this.sink.reasoning(text));
+    }
+
+    /// Answer text: everything without a think block, else what follows `</think>`.
+    @Override
+    public void answer(String text) {
+        if (this.malformedToolCall != null || this.stopFilter.matched()) return;
         try {
             // Match stops on raw output before parsing a JSON tool-call envelope.
             String visible = this.stopFilter.accept(text);
