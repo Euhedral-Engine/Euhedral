@@ -26,7 +26,7 @@ class InferenceRunSnapshotTest {
         };
         return new InferenceRunSnapshot(
                 InferenceRunSnapshot.SCHEMA_VERSION,
-                new InferenceRunSnapshot.Configuration(List.of(0, 1, 8, 9), 32768, "q3-compressed", 2),
+                new InferenceRunSnapshot.Configuration(List.of(0, 1, 8, 9), 32768, "q3-compressed", 2, 4294967296L),
                 List.of(0, 1),
                 new InferenceRunSnapshot.Model(
                         "/models/model.edrl", 12859040768L, 2, InferenceRunSnapshot.Dimensions.of(config(layers))),
@@ -45,8 +45,8 @@ class InferenceRunSnapshotTest {
 
     @Test
     void serializesAStableJsonContract() {
-        String expected = "{\"schemaVersion\":3,"
-                + "\"configuration\":{\"workerProcessorIds\":[0,1,8,9],\"maxContextTokens\":32768,\"artifact\":\"q3-compressed\",\"speculativeDepth\":2},"
+        String expected = "{\"schemaVersion\":4,"
+                + "\"configuration\":{\"workerProcessorIds\":[0,1,8,9],\"maxContextTokens\":32768,\"artifact\":\"q3-compressed\",\"speculativeDepth\":2,\"prefixCacheBytes\":4294967296},"
                 + "\"workerCoreIds\":[0,1],"
                 + "\"model\":{\"artifactPath\":\"/models/model.edrl\",\"artifactBytes\":12859040768,"
                 + "\"artifactFormatVersion\":2,\"dimensions\":{\"vocabSize\":248320,\"hiddenSize\":5120,"

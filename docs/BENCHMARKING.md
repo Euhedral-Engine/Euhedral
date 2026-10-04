@@ -101,6 +101,7 @@ against the working directory, which is the repository root under `./gradlew :be
 | ----- | ------- | ------- |
 | `artifact`, `tokenizer`, `cudaLibrary` | required | Model artifact, tokenizer directory, native library. |
 | `maxContextTokens` | `32768` | Longest sequence (prompt plus generation) the engine keeps device memory for; scenarios that need more positions are rejected. Recorded in the run snapshot. |
+| `prefixCacheBytes` | `0` | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 runs without one. Iterations of a scenario repeat its prompt, so with a cache every iteration after the first restores stored state: use it to measure the restore, never in a comparison of the engine's speed. Recorded in the run snapshot. |
 | `cpus` | `all` | `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges (`"2-5,8"`). |
 | `excludeCpus`, `excludeCores` | `[]` | Processor IDs or Euhedral core IDs removed from the selection. |
 | `scenarios` | default suite | Strings: `prefill:P`, `first-token:P`, `prompt-to-n:P:N`, `decode:P:N`. |
@@ -227,8 +228,8 @@ below is illustrative; its values are not a measurement.
   "timings": {"tokenization": 0, "prefill": 0, "firstTokenSample": 0, "timeToFirstToken": 0, "decode": 0,
               "decodeQuantaSum": 0, "finalCommit": 0, "timeToLastToken": 0, "endToEnd": 0},
   "throughput": {"prefillTokensPerSecond": 0.0, "decodeTokensPerSecond": 0.0, "endToEndOutputTokensPerSecond": 0.0},
-  "engine": {"schemaVersion": 3, "configuration": {"workerProcessorIds": [0, 1], "maxContextTokens": 32768,
-             "artifact": "qwen3_8_27b_q3.edrl", "speculativeDepth": 2},
+  "engine": {"schemaVersion": 4, "configuration": {"workerProcessorIds": [0, 1], "maxContextTokens": 32768,
+             "artifact": "qwen3_8_27b_q3.edrl", "speculativeDepth": 2, "prefixCacheBytes": 0},
              "workerCoreIds": [0], "model": {}, "generation": {}, "runtime": {}},
   "gpuMemory": {"beforeFreeBytes": 0, "afterFreeBytes": 0, "totalBytes": 0}
 }

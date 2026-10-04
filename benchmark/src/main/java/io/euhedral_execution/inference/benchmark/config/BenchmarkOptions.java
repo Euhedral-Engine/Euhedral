@@ -19,6 +19,8 @@ import java.util.Objects;
 /// every other field has the default documented in `docs/BENCHMARKING.md`. Unknown fields are
 /// rejected. Relative paths resolve against the working directory.
 ///
+/// - `prefixCacheBytes`: pinned host memory for the prefix cache, 0 (the default) for none. Iterations repeat
+///   their prompt, so a cache would answer every one after the first from stored state.
 /// - `cpus`: `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges such as `2-5,8`.
 /// - `maxContextTokens`: the longest sequence (prompt plus generation) the engine keeps device memory for.
 /// - `output`: a `.json` path writes one document; any other path writes JSONL. Null selects a
@@ -33,6 +35,7 @@ public record BenchmarkOptions(
         Path cudaLibrary,
 
         @JsonProperty("maxContextTokens") Integer maxContextTokens,
+        @JsonProperty("prefixCacheBytes") Long prefixCacheBytes,
         @JsonProperty("cpus") String cpus,
         @JsonProperty("excludeCpus") List<Integer> excludeCpus,
         @JsonProperty("excludeCores") List<Integer> excludeCores,
@@ -55,6 +58,7 @@ public record BenchmarkOptions(
         Objects.requireNonNull(tokenizer, "tokenizer");
         Objects.requireNonNull(cudaLibrary, "cudaLibrary");
         maxContextTokens = maxContextTokens == null ? InferenceConfig.DEFAULT_MAX_CONTEXT_TOKENS : maxContextTokens;
+        prefixCacheBytes = prefixCacheBytes == null ? 0L : prefixCacheBytes;
         cpus = cpus == null ? "all" : cpus.strip();
         excludeCpus = excludeCpus == null ? List.of() : List.copyOf(excludeCpus);
         excludeCores = excludeCores == null ? List.of() : List.copyOf(excludeCores);
@@ -75,6 +79,7 @@ public record BenchmarkOptions(
         for (int id : excludeCpus) if (id < 0) throw new IllegalArgumentException("excludeCpus must not be negative");
         for (int id : excludeCores) if (id < 0) throw new IllegalArgumentException("excludeCores must not be negative");
         if (maxContextTokens <= 0) throw new IllegalArgumentException("maxContextTokens must be positive");
+        if (prefixCacheBytes < 0) throw new IllegalArgumentException("prefixCacheBytes must not be negative");
         if (scenarios.isEmpty()) throw new IllegalArgumentException("no scenarios selected");
         if (warmup < 0) throw new IllegalArgumentException("warmup must not be negative");
         if (iterations <= 0) throw new IllegalArgumentException("iterations must be positive");
@@ -133,6 +138,7 @@ public record BenchmarkOptions(
                 options.tokenizer(),
                 options.cudaLibrary(),
                 options.maxContextTokens(),
+                options.prefixCacheBytes(),
                 options.cpus(),
                 options.excludeCpus(),
                 options.excludeCores(),
