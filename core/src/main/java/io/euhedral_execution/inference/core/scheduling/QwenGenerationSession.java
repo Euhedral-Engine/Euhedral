@@ -230,8 +230,10 @@ public final class QwenGenerationSession implements AutoCloseable {
             if (heldBy == null) end(finished, tokens, failure);
             else {
                 // The blocking form's caller still hands out text: the generation stays active until it drained.
-                heldBy.end(tokens, failure);
+                // The end is registered before the caller can see the last text, so the caller's own completion
+                // of `drained` ends the generation and `generate` returns only once another may start.
                 heldBy.drained.whenComplete((ignored, unused) -> end(finished, tokens, failure));
+                heldBy.end(tokens, failure);
             }
         });
         return finished;
