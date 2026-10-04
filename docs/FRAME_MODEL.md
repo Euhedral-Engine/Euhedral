@@ -263,6 +263,11 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   and tool-call parsing run in the text callback. Network writes are queued per request (`SerialTasks`) and run on workers
   one at a time in output order: a write that blocks holds only its worker, and the other workers take the remaining
   work meanwhile.
+- **The prefix cache** ([PREFIX_CACHE.md](PREFIX_CACHE.md)) captures and restores sequence state between quanta, as
+  frames: each frame runs at most 16 MiB of copies between the pinned arena and the sequence's buffers, one after
+  another, with no stream selected, so a worker is never held for a whole checkpoint. The worker that retires a prefill
+  chunk publishes its checkpoint, then admits the next chunk; a restore runs before the first quantum is admitted.
+  A 16384-token restore takes 23 ms and a checkpoint's capture about 5 ms.
 - **Host jobs have their own routing seeds** (`FrameSeeds.forHostWork`). A stage graph's seeds decide which workers, and
   therefore which lanes, its stages run on. When tokenization drew from the graphs' sequence, every graph built after
   it got other seeds: on nvfp4-compressed at 32K the verify step took 34.1 ms instead of 33.7 ms (CUDA graphs off), and
