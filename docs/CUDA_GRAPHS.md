@@ -20,7 +20,11 @@ not change with its position. The host keeps its copy of the position to validat
 - the split counts that size decode attention (48-key splits below 2048 keys, 32-key splits from 2048, at most 64 each): below
   2048 keys the key changes every 48 positions, from 2048 it is constant;
 - a fingerprint of the workspace storage and of every sequence-owned device address (KV page tables, decode scratch, draft seed
-  rows, GDN states and their speculative checkpoints, the host logits' buffers), plus the pending ReplaySSM rows.
+  rows, GDN states and their speculative checkpoints, the host logits' buffers), plus the pending ReplaySSM rows. Each
+  address enters with its allocation's identity (`GpuMemory.allocationId`): a new session can receive a closed session's
+  addresses for allocations of other sizes, and a graph recorded against the old ones then launched kernels on freed memory
+  (SIGSEGV in `cudaGraphLaunch`). Graphs therefore never outlive the session whose state they captured; each session records
+  its own. Reusing them across sessions would need the sessions to reuse the same allocations (a sequence-state pool).
 
 A quantum whose KV reservation would allocate pages or upload a page table (every 256 positions) has no key and runs stage by
 stage; so do prefill quanta and quanta under exact numerics. Views that stage host-backed weights are captured: their transfers

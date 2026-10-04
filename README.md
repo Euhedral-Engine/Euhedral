@@ -229,7 +229,9 @@ environment variable (`EUHEDRAL_INFERENCE_*`, `EUHEDRAL_API_*`); `PORT` sets the
 | `euhedral.api.max-request-bytes` | 1048576 | Request body limit. |
 | `euhedral.api.request-timeout` | 30m | Per-request limit. |
 
-One generation runs at a time; the engine sizes device memory for one sequence.
+One generation runs at a time; the engine sizes device memory for one sequence. Requests are served entirely on the
+engine's worker threads: the container thread hands a request over and returns, and rendering, tokenization, every
+quantum and every write to the client run as lattice work (docs/FRAME_MODEL.md, "Host work on the workers").
 
 ## Building and testing
 
