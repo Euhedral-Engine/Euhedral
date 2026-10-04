@@ -98,8 +98,10 @@ public final class TokenSampler {
                 return drawFrom(this.candidateIds, found, this.config.topP() < 1.0f);
             }
         }
-        for (int tokenId = 0; tokenId < logits.length; tokenId++)
-            if (!allowed.test(tokenId)) logits[tokenId] = Float.NEGATIVE_INFINITY;
+        if (allowed instanceof TokenFilter filter) filter.maskDisallowed(logits);
+        else
+            for (int tokenId = 0; tokenId < logits.length; tokenId++)
+                if (!allowed.test(tokenId)) logits[tokenId] = Float.NEGATIVE_INFINITY;
         return selectToken(logits);
     }
 
