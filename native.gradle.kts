@@ -10,6 +10,7 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.zip.ZipFile
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.gradle.api.tasks.Exec
 import org.gradle.api.tasks.bundling.Zip
 import org.tukaani.xz.XZInputStream
@@ -194,6 +195,79 @@ fun binaryImports(data: ByteArray, windows: Boolean): Set<String> {
     }.toSet()
 }
 
+// llguidance (constrained decoding) is built from its pinned crates.io release with cargo-zigbuild, which links
+// with the pinned Zig, and is installed beside each CUDA product. Its default features add a Rayon thread pool;
+// they are off so that every computation stays on the engine's workers.
+val llguidance = manifest["llguidance"] as Map<*, *>
+val llguidanceVersion = llguidance["version"] as String
+val llguidanceRoot = layout.buildDirectory.dir("llguidance")
+val llguidanceSource = tasks.register("llguidanceSource") {
+    group = "build"
+    description = "Fetch and verify the pinned llguidance crate."
+    val sha = llguidance["sha256"] as String
+    val destination = llguidanceRoot.map { it.dir("src") }
+    inputs.property("version", llguidanceVersion)
+    inputs.property("sha256", sha)
+    outputs.dir(destination)
+    doLast {
+        val cache = gradle.gradleUserHomeDir.toPath().resolve("caches/euhedral-llguidance")
+        Files.createDirectories(cache)
+        val crate = cache.resolve("llguidance-$llguidanceVersion.crate")
+        if (!(Files.isRegularFile(crate) && checksum(crate) == sha)) {
+            val temporary = Files.createTempFile(cache, "llguidance-", ".download")
+            try {
+                val connection = URI("https://static.crates.io/crates/llguidance/llguidance-$llguidanceVersion.crate")
+                    .toURL().openConnection().apply { connectTimeout = 30000; readTimeout = 120000 }
+                connection.getInputStream().use { source ->
+                    Files.newOutputStream(temporary).use { source.copyTo(it) }
+                }
+                check(checksum(temporary) == sha) { "llguidance download checksum mismatch" }
+                Files.move(temporary, crate, StandardCopyOption.REPLACE_EXISTING)
+            } finally { Files.deleteIfExists(temporary) }
+        }
+        val root = destination.get().asFile.toPath()
+        delete(root.toFile())
+        TarArchiveInputStream(GzipCompressorInputStream(Files.newInputStream(crate))).use { tar ->
+            while (true) {
+                val entry = tar.nextEntry ?: break
+                val relative = entry.name.substringAfter('/')
+                if (relative.isEmpty() || entry.isDirectory) continue
+                val target = root.resolve(relative).normalize()
+                check(target.startsWith(root)) { "llguidance crate entry escapes the source: ${entry.name}" }
+                Files.createDirectories(target.parent)
+                Files.copy(tar, target, StandardCopyOption.REPLACE_EXISTING)
+            }
+        }
+    }
+}
+
+val llguidanceTasks = products.associate { product ->
+    val id = product["id"] as String
+    val rustTarget = product["rustTarget"] as String
+    val filename = product["llguidanceFilename"] as String
+    val targetDirectory = llguidanceRoot.map { it.dir("target") }
+    // cargo-zigbuild accepts a glibc suffix on the triple; the output directory omits it.
+    val built = targetDirectory.map { it.file("${rustTarget.substringBefore(".2.")}/release/$filename") }
+    val task = tasks.register<Exec>("llguidanceBuild${taskSuffix(id)}") {
+        group = "build"
+        description = "Build llguidance $llguidanceVersion for $id with cargo-zigbuild."
+        dependsOn(llguidanceSource)
+        workingDir(llguidanceRoot.map { it.dir("src") })
+        val cargo = providers.environmentVariable("CARGO").orNull ?: "cargo"
+        commandLine(cargo, "zigbuild", "--release", "--locked", "--lib", "--no-default-features",
+            "--features", (llguidance["features"] as List<*>).joinToString(","), "--target", rustTarget)
+        environment("CARGO_TARGET_DIR", targetDirectory.get().asFile.absolutePath)
+        providers.environmentVariable("ZIG").orNull?.let { environment("CARGO_ZIGBUILD_ZIG_PATH", it) }
+        inputs.dir(llguidanceRoot.map { it.dir("src") })
+        inputs.property("target", rustTarget)
+        inputs.property("features", llguidance["features"].toString())
+        outputs.file(built)
+    }
+    id to (task to built)
+}
+extra["euhedral.llguidance.tasks"] = llguidanceTasks.mapValues { it.value.first }
+extra["euhedral.llguidance.files"] = llguidanceTasks.mapValues { it.value.second }
+
 val nativeTasks = products.associate { product ->
     val id = product["id"] as String
     val windows = product["hostOs"] == "windows"
@@ -287,6 +361,9 @@ val nativeTasks = products.associate { product ->
         group = "build"
         description = "Cross-build the $id CUDA runtime product with pinned Zig."
         dependsOn(driverImport ?: verifyInputs)
+        val (llguidanceTask, llguidanceFile) = llguidanceTasks.getValue(id)
+        dependsOn(llguidanceTask)
+        inputs.file(llguidanceFile)
         workingDir(rootProject.file("native"))
         val zig = providers.environmentVariable("ZIG").orNull
         val launcher = listOf(zig ?: "zig")
@@ -305,6 +382,12 @@ val nativeTasks = products.associate { product ->
         outputs.dir(nativeRoot.map { it.dir(id) })
         // Zig installs but never removes: clear the CUDA tree so a deleted source leaves no stale copy.
         doFirst { delete(nativeRoot.get().dir("$id/share/euhedral_cuda")) }
+        // The constrained-decoding library sits beside the CUDA library, where the engine looks for it.
+        doLast {
+            val source = llguidanceFile.get().asFile
+            Files.copy(source.toPath(), nativeRoot.get().dir("$id/lib").file(source.name).asFile.toPath(),
+                StandardCopyOption.REPLACE_EXISTING)
+        }
         doFirst {
             val required = if (windows) listOf("cuda.lib", "cudart.lib", "nvrtc.lib")
                 else listOf("libcuda.so", "libcudart.so", "libnvrtc.so")
@@ -347,7 +430,8 @@ tasks.register<Zip>("nativePackage") {
         val product = products.single { it["id"] == id }
         from(nativeRoot.map { it.dir(id) }) {
             into(id)
-            include("lib/${product["filename"]}", "share/euhedral_cuda/**/*.cu", "share/euhedral_cuda/**/*.cuh")
+            include("lib/${product["filename"]}", "lib/${product["llguidanceFilename"]}",
+                "share/euhedral_cuda/**/*.cu", "share/euhedral_cuda/**/*.cuh")
         }
     }
 }
@@ -380,6 +464,11 @@ tasks.register("nativeVerify") {
                 (product["hostOs"] != "windows" || names.none { it.endsWith(".so") }) &&
                 (product["hostOs"] != "linux" || names.none { it.endsWith(".dll") })) {
                 "CUDA imports do not match target ${product["id"]}"
+            }
+            val llguidanceBinary = prefix.file("lib/${product["llguidanceFilename"]}").asFile
+            check(llguidanceBinary.isFile) { "Missing llguidance for ${product["id"]}: $llguidanceBinary" }
+            check(llguidanceBinary.inputStream().use { it.readNBytes(2) }.contentEquals(signature)) {
+                "Wrong llguidance binary format for ${product["id"]}"
             }
         }
     }

@@ -2,6 +2,9 @@ import org.gradle.api.plugins.JavaPluginExtension
 
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.testing.Test
+import org.gradle.api.file.RegularFile
+import org.gradle.api.provider.Provider
+import org.gradle.api.tasks.TaskProvider
 import org.gradle.jvm.toolchain.JavaLanguageVersion
 
 plugins {
@@ -15,6 +18,10 @@ val hostProductId = extra["euhedral.native.host.id"] as String
 val hostLibraryFilename = extra["euhedral.native.host.filename"] as String
 val hostIncludeDirectory = extra["euhedral.native.host.include"] as String
 val hostRuntimeDirectory = extra["euhedral.native.host.runtime"] as String
+@Suppress("UNCHECKED_CAST")
+val llguidanceTasks = extra["euhedral.llguidance.tasks"] as Map<String, TaskProvider<*>>
+@Suppress("UNCHECKED_CAST")
+val llguidanceFiles = extra["euhedral.llguidance.files"] as Map<String, Provider<RegularFile>>
 
 // Common Java configuration applied to every subproject that applies the `java` plugin.
 subprojects {
@@ -46,6 +53,13 @@ subprojects {
             exclude("**/CapturedQuantaCudaIntegrationTest.class")
             exclude("**/TeacherForcedQualityCudaIntegrationTest.class")
             useJUnitPlatform()
+            // Constrained decoding is CPU work; its tests load the host's llguidance build.
+            llguidanceTasks[hostProductId]?.let { build ->
+                dependsOn(build)
+                systemProperty(
+                        "euhedral.llguidance.library",
+                        llguidanceFiles.getValue(hostProductId).get().asFile.absolutePath)
+            }
         }
         val testSourceSet = the<SourceSetContainer>()["test"]
         tasks.register<Test>("cudaIntegrationTest") {

@@ -8,7 +8,9 @@
       "filename": "libeuhedral_cuda.so",
       "driverLibrary": "cuda",
       "cudaPlatform": "linux-x86_64",
-      "hostOs": "linux"
+      "hostOs": "linux",
+      "rustTarget": "x86_64-unknown-linux-gnu.2.28",
+      "llguidanceFilename": "libllguidance.so"
     },
     {
       "id": "windows-x64",
@@ -16,9 +18,20 @@
       "filename": "euhedral_cuda.dll",
       "driverLibrary": "cuda",
       "cudaPlatform": "windows-x86_64",
-      "hostOs": "windows"
+      "hostOs": "windows",
+      "rustTarget": "x86_64-pc-windows-gnu",
+      "llguidanceFilename": "llguidance.dll"
     }
   ],
+  "llguidance": {
+    "version": "1.9.1",
+    "sha256": "04ede1356c8ee73a0d29ef573dbeb2123a1667cfc3ebfc7e2c41346a6e92c3c8",
+    "features": [
+      "lark",
+      "referencing",
+      "ahash"
+    ]
+  },
   "redistributables": {
     "linux-x86_64": {
       "crt": {

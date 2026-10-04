@@ -87,6 +87,8 @@ class NativeProductsTest(unittest.TestCase):
         expected = {
             f"{product['id']}/lib/{product['filename']}" for product in products
         } | {
+            f"{product['id']}/lib/{product['llguidanceFilename']}" for product in products
+        } | {
             f"{product['id']}/share/euhedral_cuda/{source}"
             for product in products for source in sources
         }
