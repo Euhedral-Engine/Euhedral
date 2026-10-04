@@ -78,3 +78,27 @@ the retirement callback, callback to worker, retirement.
 | DRAFT | 75 | 15 | 170 | 610 | 1 | 11 |
 
 The host stays well ahead of the device inside a quantum; the boundaries between a step's three quanta cost about 0.5 ms.
+
+### Coverage
+
+At a 4K prompt with 128 generated tokens per request (chat corpus, a new sequence per request), about 85% of verifications
+and one-row drafts replay; the rest are the first and recording quanta of each key (a new sequence fingerprints new addresses)
+and quanta at a page boundary. Drafts of 2 to 4 rows replay ordered.
+
+### End to end
+
+Decode tok/s with capture, chat corpus, 128 generated tokens, one fork of four prompts:
+
+| Artifact | 4K | 16K | 32K |
+|---|---|---|---|
+| `q3` (depth 2) | 120.1 | 116.8 | 108.8 |
+| `nvfp4-compressed` (depth 3) | 81.5 | 81.0 | 76.8 |
+
+Prefill is not captured; 2048-token prefill measured 1972 tok/s (`q3`) and 3852 tok/s (`nvfp4-compressed`).
+
+## Rejected
+
+- **Recording on first sight.** A key's first quantum allocates lazily inside its stages (decode scratch, speculative GDN
+  buffers, logits selections); a capture of it would hold one-time work, and its key changes with the new addresses anyway.
+- **Capture per token with a graph update before launch.** Submitting a 3-row verification takes about 4.5 ms of host time
+  while the device runs 18 ms; capturing first and launching after would leave the device idle for that time every quantum.
