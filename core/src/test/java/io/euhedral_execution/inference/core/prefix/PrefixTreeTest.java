@@ -102,11 +102,23 @@ class PrefixTreeTest {
         var tree = new PrefixTree(new HostExtents(16 * BLOCK));
         int[] stored = tokens(0, 3000);
         PrefixNode a = add(tree, tree.root(), stored, 2048, BLOCK);
-        assertSame(a, tree.find(tree.root(), stored, 2048));
-        assertNull(tree.find(tree.root(), stored, 1024));
+        assertSame(a, tree.find(tree.root(), stored, 2048, false));
+        assertNull(tree.find(tree.root(), stored, 1024, false));
         int[] other = tokens(0, 3000);
         other[10] = -1;
-        assertNull(tree.find(tree.root(), other, 2048));
+        assertNull(tree.find(tree.root(), other, 2048, false));
+    }
+
+    @Test
+    void aNodeWithAndWithoutMtpStateCanCoexistForTheSameSpan() {
+        var tree = new PrefixTree(new HostExtents(16 * BLOCK));
+        int[] stored = tokens(0, 3000);
+        PrefixNode plain = add(tree, tree.root(), stored, 2048, BLOCK);
+        PrefixNode withMtp = tree.reserve(tree.root(), stored, 2048, true, BLOCK);
+        tree.publish(withMtp);
+        assertSame(plain, tree.find(tree.root(), stored, 2048, false));
+        assertSame(withMtp, tree.find(tree.root(), stored, 2048, true));
+        assertSame(withMtp, tree.lookup(tokens(0, 3000), true).leaf());
     }
 
     @Test
@@ -151,8 +163,8 @@ class PrefixTreeTest {
         add(tree, tree.root(), tokens(10_000, 3000), 2048, BLOCK);
         PrefixNode more = tree.reserve(tree.root(), tokens(20_000, 3000), 2048, false, BLOCK);
         assertNotNull(more, "the childless node made room");
-        assertNull(tree.find(a, stored, 4096), "the child went, not the parent it hung from");
-        assertSame(a, tree.find(tree.root(), stored, 2048));
+        assertNull(tree.find(a, stored, 4096, false), "the child went, not the parent it hung from");
+        assertSame(a, tree.find(tree.root(), stored, 2048, false));
     }
 
     @Test
@@ -162,7 +174,7 @@ class PrefixTreeTest {
         add(tree, tree.root(), stored, 2048, BLOCK);
         var match = tree.lookup(tokens(0, 3000), false);
         assertNull(tree.reserve(tree.root(), tokens(10_000, 3000), 2048, false, BLOCK), "nothing evictable");
-        assertSame(match.leaf(), tree.find(tree.root(), stored, 2048));
+        assertSame(match.leaf(), tree.find(tree.root(), stored, 2048, false));
         tree.release(match);
         assertNotNull(tree.reserve(tree.root(), tokens(10_000, 3000), 2048, false, BLOCK));
     }
@@ -175,7 +187,7 @@ class PrefixTreeTest {
         PrefixNode b = tree.reserve(a, stored, 4096, false, BLOCK);
         assertNotNull(b);
         assertNull(tree.reserve(a, stored, 4352, false, BLOCK), "the only evictable node is the pinned parent");
-        assertSame(a, tree.find(tree.root(), stored, 2048));
+        assertSame(a, tree.find(tree.root(), stored, 2048, false));
         tree.abort(b);
         assertNotNull(tree.reserve(a, stored, 4352, false, BLOCK), "its pin was released with the abort");
     }
