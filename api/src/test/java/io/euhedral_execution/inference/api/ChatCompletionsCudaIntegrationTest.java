@@ -109,7 +109,8 @@ class ChatCompletionsCudaIntegrationTest {
     @Order(2)
     void chatCompletionReturnsARealAssistantAnswer() throws Exception {
         DeviceBytes before = deviceBytes();
-        var response = post("{\"model\":\"" + MODEL + "\",\"temperature\":0,\"max_tokens\":24,\"messages\":["
+        var response = post("{\"model\":\"" + MODEL
+                + "\",\"reasoning_effort\":\"none\",\"temperature\":0,\"max_tokens\":24,\"messages\":["
                 + "{\"role\":\"system\",\"content\":\"Answer with a single word.\"},"
                 + "{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}");
         assertEquals(200, response.statusCode(), response.body());
@@ -140,9 +141,11 @@ class ChatCompletionsCudaIntegrationTest {
         DeviceBytes before = deviceBytes();
         var request = HttpRequest.newBuilder(uri("/v1/chat/completions"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"" + MODEL + "\",\"stream\":true,"
-                        + "\"stream_options\":{\"include_usage\":true},\"temperature\":0,\"max_tokens\":32,"
-                        + "\"messages\":[{\"role\":\"user\",\"content\":\"Count from one to ten in words.\"}]}"))
+                .POST(
+                        HttpRequest.BodyPublishers.ofString(
+                                "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"stream\":true,"
+                                        + "\"stream_options\":{\"include_usage\":true},\"temperature\":0,\"max_tokens\":32,"
+                                        + "\"messages\":[{\"role\":\"user\",\"content\":\"Count from one to ten in words.\"}]}"))
                 .build();
         List<String> data = new ArrayList<>();
         try (var client = HttpClient.newHttpClient()) {
@@ -199,8 +202,9 @@ class ChatCompletionsCudaIntegrationTest {
     void clientAbortCancelsGenerationAndClosesTheSession() throws Exception {
         DeviceBytes before = deviceBytes();
         int maxTokens = 2000;
-        String body = "{\"model\":\"" + MODEL + "\",\"stream\":true,\"max_tokens\":" + maxTokens
-                + ",\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse.\"}]}";
+        String body =
+                "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"max_tokens\":" + maxTokens
+                        + ",\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse.\"}]}";
         this.tracking.resetCounts();
         try (var socket = new Socket("localhost", this.port)) {
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
@@ -227,6 +231,54 @@ class ChatCompletionsCudaIntegrationTest {
         assertTrue(
                 this.tracking.lastCompletionTokens.get() < maxTokens,
                 "generation ran to its limit after the client left");
+        assertSessionsReleased(before);
+    }
+
+    @Test
+    @Order(5)
+    void reasoningPrecedesTheAnswerAndIsReportedSeparately() throws Exception {
+        DeviceBytes before = deviceBytes();
+        var response = post("{\"model\":\"" + MODEL
+                + "\",\"reasoning_effort\":\"low\",\"temperature\":0,\"max_tokens\":2048,\"messages\":["
+                + "{\"role\":\"user\",\"content\":\"What is 17 times 23? Reply with the number only.\"}]}");
+        assertEquals(200, response.statusCode(), response.body());
+        JsonNode completion = JSON.readTree(response.body());
+        System.out.println("Reasoning completion: " + completion);
+        JsonNode message = completion.at("/choices/0/message");
+        String reasoning = message.get("reasoning_content").asString();
+        String content = message.get("content").asString();
+        assertFalse(reasoning.isBlank());
+        assertTrue(content.contains("391"), content);
+        assertFalse(content.contains("</think>") || reasoning.contains("</think>"), completion.toString());
+        assertEquals("stop", completion.at("/choices/0/finish_reason").asString());
+        int reasoningTokens = completion
+                .at("/usage/completion_tokens_details/reasoning_tokens")
+                .asInt();
+        assertTrue(reasoningTokens > 0
+                && reasoningTokens < completion.at("/usage/completion_tokens").asInt());
+        assertSessionsReleased(before);
+    }
+
+    @Test
+    @Order(6)
+    void reasoningThenARequiredToolCall() throws Exception {
+        DeviceBytes before = deviceBytes();
+        var response = post("{\"model\":\"" + MODEL
+                + "\",\"reasoning_effort\":\"low\",\"temperature\":0,\"max_tokens\":2048,\"tool_choice\":\"required\","
+                + "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":"
+                + "\"Current weather for a city.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":"
+                + "{\"type\":\"string\"}},\"required\":[\"city\"]}}}],"
+                + "\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Oslo right now?\"}]}");
+        assertEquals(200, response.statusCode(), response.body());
+        JsonNode completion = JSON.readTree(response.body());
+        System.out.println("Reasoning tool call: " + completion);
+        JsonNode message = completion.at("/choices/0/message");
+        assertFalse(message.get("reasoning_content").asString().isBlank());
+        assertEquals("get_weather", message.at("/tool_calls/0/function/name").asString());
+        JsonNode arguments =
+                JSON.readTree(message.at("/tool_calls/0/function/arguments").asString());
+        assertTrue(arguments.get("city").asString().contains("Oslo"), arguments.toString());
+        assertEquals("tool_calls", completion.at("/choices/0/finish_reason").asString());
         assertSessionsReleased(before);
     }
 
@@ -338,8 +390,8 @@ class ChatCompletionsCudaIntegrationTest {
         }
 
         @Override
-        public Generation openGeneration(GenerationConfig config, ToolConstraint constraint) {
-            Generation generation = this.delegate.openGeneration(config, constraint);
+        public Generation openGeneration(GenerationConfig config, OutputSpec output) {
+            Generation generation = this.delegate.openGeneration(config, output);
             this.opened.incrementAndGet();
             return new Generation() {
                 @Override

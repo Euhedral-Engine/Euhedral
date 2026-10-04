@@ -23,7 +23,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 @Timeout(60)
 class GenerationCapacityTest {
     private static final String BODY = "{\"model\":\"" + ScriptedInferenceBackend.MODEL_ID
-            + "\",\"stream\":true,\"max_tokens\":3000,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
+            + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"max_tokens\":3000,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
 
     @LocalServerPort
     private int port;

@@ -48,7 +48,6 @@ public class ChatRequestMapper {
                     "response_format",
                     value -> value instanceof Map<?, ?> map && map.size() == 1 && "text".equals(map.get("type"))),
             Map.entry("modalities", List.of("text")::equals),
-            Map.entry("reasoning_effort", value -> false),
             Map.entry("audio", value -> false),
             Map.entry("prediction", value -> false),
             Map.entry("web_search_options", value -> false),
@@ -57,8 +56,7 @@ public class ChatRequestMapper {
     private static final Map<String, Predicate<Object>> MESSAGE_NEUTRAL_VALUES = Map.of(
             "refusal", value -> false,
             "function_call", value -> false,
-            "audio", value -> false,
-            "reasoning_content", value -> false);
+            "audio", value -> false);
 
     private final InferenceBackend backend;
     private final QwenChatTemplate chatTemplate;
@@ -78,7 +76,12 @@ public class ChatRequestMapper {
 
     /// A request validated up to its rendered prompt, before the prompt is encoded.
     public record Rendered(
-            ChatCompletionRequest request, boolean stream, boolean includeUsage, ToolCalling tools, String prompt) {}
+            ChatCompletionRequest request,
+            boolean stream,
+            boolean includeUsage,
+            ToolCalling tools,
+            QwenChatTemplate.Thinking thinking,
+            String prompt) {}
 
     /// Validates and plans a request on the backend's workers: rendering and validation run as worker tasks,
     /// encoding as the backend's tokenization frames. The future fails with an [OpenAiException] for an invalid
@@ -97,7 +100,10 @@ public class ChatRequestMapper {
         boolean includeUsage = streamOptionsIncludeUsage(request, stream);
         requireServedModel(request.model());
         ToolCalling tools = ToolCalling.fromRequest(request.tools(), request.toolChoice(), request.parallelToolCalls());
-        return new Rendered(request, stream, includeUsage, tools, renderPrompt(request.messages(), tools));
+        QwenChatTemplate.Thinking thinking =
+                Reasoning.thinking(request.reasoningEffort(), request.chatTemplateKwargs());
+        return new Rendered(
+                request, stream, includeUsage, tools, thinking, renderPrompt(request.messages(), tools, thinking));
     }
 
     /// Completes the plan of a rendered request with its encoded prompt: the completion budget against the
@@ -115,7 +121,8 @@ public class ChatRequestMapper {
                 stops(request.stop()),
                 rendered.stream(),
                 rendered.includeUsage(),
-                rendered.tools());
+                rendered.tools(),
+                rendered.thinking().enabled());
     }
 
     private void requireServedModel(String model) {
@@ -138,7 +145,7 @@ public class ChatRequestMapper {
         return Boolean.TRUE.equals(options.includeUsage());
     }
 
-    private String renderPrompt(List<ChatMessage> messages, ToolCalling tools) {
+    private String renderPrompt(List<ChatMessage> messages, ToolCalling tools, QwenChatTemplate.Thinking thinking) {
         if (messages == null || messages.isEmpty())
             throw OpenAiException.invalidRequest("'messages' must contain at least one message.", "messages");
         List<QwenChatTemplate.Turn> turns = new ArrayList<>(messages.size());
@@ -155,6 +162,12 @@ public class ChatRequestMapper {
             if (role != QwenChatTemplate.Role.TOOL && message.toolCallId() != null)
                 throw OpenAiException.invalidRequest(
                         "Only tool messages may contain 'tool_call_id'.", path + ".tool_call_id");
+            if (role != QwenChatTemplate.Role.ASSISTANT && message.reasoningContent() != null)
+                throw OpenAiException.invalidRequest(
+                        "Only assistant messages may contain 'reasoning_content'.", path + ".reasoning_content");
+            if (message.reasoningContent() != null && !(message.reasoningContent() instanceof String))
+                throw OpenAiException.invalidRequest(
+                        "'reasoning_content' must be a string.", path + ".reasoning_content");
             String content = content(message.content(), role, path);
             if (role == QwenChatTemplate.Role.TOOL) {
                 if (pending == null)
@@ -166,14 +179,15 @@ public class ChatRequestMapper {
             }
             if (pending != null) pending.closeInto(turns);
             List<QwenChatTemplate.ToolCall> calls = toolCalls(message.toolCalls(), path + ".tool_calls");
-            turns.add(new QwenChatTemplate.Turn(role, content, calls));
+            String reasoning = message.reasoningContent() instanceof String text ? text : "";
+            turns.add(new QwenChatTemplate.Turn(role, content, calls, reasoning));
             pending = calls.isEmpty() ? null : new PendingToolResults(message.toolCalls(), path);
         }
         if (pending != null) pending.closeInto(turns);
         try {
             return (tools.parsesOutput()
-                            ? this.chatTemplate.renderJsonTools(turns, tools)
-                            : this.chatTemplate.render(turns, tools.promptTools()))
+                            ? this.chatTemplate.renderJsonTools(turns, tools, thinking)
+                            : this.chatTemplate.render(turns, tools.promptTools(), thinking))
                     + tools.generationPrefix();
         } catch (QwenChatTemplate.InvalidConversationException invalid) {
             throw OpenAiException.invalidRequest(invalid.getMessage(), "messages");

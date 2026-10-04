@@ -49,7 +49,8 @@ class ChatCompletionStreamingTest {
 
     @Test
     void chunkedOversizedToolSchemaIsRejectedWithoutAContentLength() throws Exception {
-        String body = "{\"model\":\"" + MODEL + "\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],"
+        String body = "{\"model\":\"" + MODEL
+                + "\",\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],"
                 + "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\""
                 + "x".repeat(1_048_576) + "\"}}]}";
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
@@ -80,9 +81,10 @@ class ChatCompletionStreamingTest {
         };
         var request = HttpRequest.newBuilder(URI.create("http://localhost:" + this.port + "/v1/chat/completions"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"" + MODEL + "\",\"stream\":true,"
-                        + "\"stream_options\":{\"include_usage\":true},"
-                        + "\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}"))
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"stream\":true,"
+                                + "\"stream_options\":{\"include_usage\":true},"
+                                + "\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}"))
                 .build();
         HttpResponse<java.util.stream.Stream<String>> response;
         try (var client = HttpClient.newHttpClient()) {
@@ -166,7 +168,8 @@ class ChatCompletionStreamingTest {
                 + "\"properties\":{\"n\":{\"type\":\"integer\"}}}}},"
                 + "{\"type\":\"function\",\"function\":{\"name\":\"g\"}}]";
         List<String> data = streamEvents(
-                "{\"model\":\"" + MODEL + "\",\"stream\":true,\"stream_options\":{\"include_usage\":true},"
+                "{\"model\":\"" + MODEL
+                        + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"stream_options\":{\"include_usage\":true},"
                         + "\"tools\":" + tools + ",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
                 event -> {
                     if (event.contains("\"Checking.\"")) textSeen.countDown();
@@ -217,7 +220,8 @@ class ChatCompletionStreamingTest {
         this.backend.script = ScriptedInferenceBackend.tokens(
                 List.of("Answer ST", "{\"tool_calls\":[{\"name\":\"f\",\"arguments\":{}}]}"), true);
         List<String> data = streamEvents(
-                "{\"model\":\"" + MODEL + "\",\"stream\":true,\"stop\":[\"STOP\"],\"tools\":[{\"type\":\"function\","
+                "{\"model\":\"" + MODEL
+                        + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"stop\":[\"STOP\"],\"tools\":[{\"type\":\"function\","
                         + "\"function\":{\"name\":\"f\"}}],\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
                 event -> {});
         List<String> order = new ArrayList<>();
@@ -241,7 +245,8 @@ class ChatCompletionStreamingTest {
         this.backend.script = ScriptedInferenceBackend.tokens(
                 List.of("Sure.", " <tool_call>\n<function=nope>\n</function>\n</tool_call>", "tail"), false);
         List<String> data = streamEvents(
-                "{\"model\":\"" + MODEL + "\",\"stream\":true,\"tools\":[{\"type\":\"function\","
+                "{\"model\":\"" + MODEL
+                        + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"tools\":[{\"type\":\"function\","
                         + "\"function\":{\"name\":\"f\"}}],\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}",
                 event -> {});
         JsonNode error = JSON.readTree(data.getLast());
@@ -295,7 +300,7 @@ class ChatCompletionStreamingTest {
                 this.port,
                 "/v1/chat/completions",
                 "{\"model\":\"" + MODEL
-                        + "\",\"stream\":true,\"max_tokens\":3000,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}")) {
+                        + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"max_tokens\":3000,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}")) {
             client.readUntil(line -> line.contains("\"tok1 \""));
         }
         var generation = this.backend.only();
@@ -318,7 +323,7 @@ class ChatCompletionStreamingTest {
                 this.port,
                 "/v1/chat/completions",
                 "{\"model\":\"" + MODEL
-                        + "\",\"max_tokens\":50,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}")) {
+                        + "\",\"reasoning_effort\":\"none\",\"max_tokens\":50,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}")) {
             generation = awaitGeneration();
             assertTrue(generation.started.await(10, TimeUnit.SECONDS));
         }

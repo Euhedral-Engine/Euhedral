@@ -17,11 +17,12 @@ import tools.jackson.databind.json.JsonMapper;
 ///
 /// The checkpoint's Jinja template is the source of truth, but it relies on Python-specific Jinja
 /// (reverse slicing, `str.startswith`, namespaces) that Java template engines do not reproduce. This class
-/// therefore implements the template's text branches with `add_generation_prompt=true` and
-/// `enable_thinking=false`: system/user/assistant text, the tool-definition system block, assistant
-/// `<tool_call>` XML, and grouped `<tool_response>` turns. It refuses at startup any template that no longer
-/// contains the fragments it reproduces. Golden tests compare its output against the template rendered by
-/// jinja2 (`tools/render_qwen_chat_template_golden.py`).
+/// therefore implements the template's text branches with `add_generation_prompt=true`: system/user/assistant
+/// text, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`) and replayed
+/// `reasoning_content`, the tool-definition system block, assistant `<tool_call>` XML, and grouped
+/// `<tool_response>` turns. It refuses at startup any template that no longer contains the fragments it
+/// reproduces. Golden tests compare its output against the template rendered by jinja2
+/// (`tools/render_qwen_chat_template_golden.py`).
 public final class QwenChatTemplate {
     public static final String IM_START = "<|im_start|>";
     public static final String IM_END = "<|im_end|>";
@@ -47,6 +48,12 @@ public final class QwenChatTemplate {
                     + "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n"
                     + "</IMPORTANT>";
     private static final String TOOL_INSTRUCTIONS = TOOL_INSTRUCTIONS_SOURCE.replace("\\n", "\n");
+    /// The template's `reasoning_instructions` for each effort it names; `medium` has none.
+    private static final String XHIGH_INSTRUCTIONS = "Reasoning effort is set to xhigh. Please think carefully through"
+            + " the task, validate key assumptions, consider plausible alternatives, and prioritize correctness,"
+            + " consistency, and clarity in the final answer.";
+    private static final String LOW_INSTRUCTIONS = "Reasoning effort is set to low. Keep your thinking brief and"
+            + " focused, moving directly to the conclusion without unnecessary elaboration.";
     private static final String JSON_TOOL_INSTRUCTIONS = "\n\nIf a function is needed, reply ONLY with one JSON object"
             + " in this exact form: {\"tool_calls\":[{\"name\":\"function_name\",\"arguments\":{\"parameter\":\"value\"}}]}."
             + " Use valid JSON with arguments as an object, function names from the tools above. Tool results"
@@ -86,6 +93,20 @@ public final class QwenChatTemplate {
             "{{- '\\n</tool_response>' }}",
             "{%- if not loop.last and loop.nextitem.role != \"tool\" %}",
             "{%- if enable_thinking is undefined or enable_thinking is true %}",
+            "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}",
+            "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}",
+            "{%- if resolved_reasoning_effort == 'xhigh' %}",
+            "{%- set reasoning_instructions = '" + XHIGH_INSTRUCTIONS + "' %}",
+            "{%- elif resolved_reasoning_effort == 'low' %}",
+            "{%- set reasoning_instructions = '" + LOW_INSTRUCTIONS + "' %}",
+            "{{- reasoning_instructions + '\\n\\n' }}",
+            "{{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}",
+            "{%- if message.reasoning_content is string %}",
+            "{%- set reasoning_content = reasoning_content|trim %}",
+            "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}",
+            "{{- '<|im_start|>' + message.role + '\\n' + content }}",
+            "{%- if enable_thinking is defined and enable_thinking is false %}",
+            "{{- '<think>\\n' }}",
             "{{- '<|im_start|>assistant\\n' }}",
             "{{- '<think>\\n\\n</think>\\n\\n' }}");
 
@@ -99,18 +120,55 @@ public final class QwenChatTemplate {
     }
 
     /// One turn. `content` is the already-concatenated text of the message's text parts; only assistant
-    /// turns carry `toolCalls`, rendered after the content in list order.
-    public record Turn(Role role, String content, List<ToolCall> toolCalls) {
+    /// turns carry `toolCalls`, rendered after the content in list order, and `reasoning`, the replayed
+    /// `reasoning_content` of an earlier response (empty when the client sent none).
+    public record Turn(Role role, String content, List<ToolCall> toolCalls, String reasoning) {
         public Turn {
             Objects.requireNonNull(role, "role");
             Objects.requireNonNull(content, "content");
+            Objects.requireNonNull(reasoning, "reasoning");
             toolCalls = List.copyOf(toolCalls);
             if (!toolCalls.isEmpty() && role != Role.ASSISTANT)
                 throw new IllegalArgumentException("only assistant turns carry tool calls");
+            if (!reasoning.isEmpty() && role != Role.ASSISTANT)
+                throw new IllegalArgumentException("only assistant turns carry reasoning");
+        }
+
+        public Turn(Role role, String content, List<ToolCall> toolCalls) {
+            this(role, content, toolCalls, "");
         }
 
         public Turn(Role role, String content) {
-            this(role, content, List.of());
+            this(role, content, List.of(), "");
+        }
+    }
+
+    /// The template's thinking variables. `effort` null is `enable_thinking=false`; otherwise thinking is on
+    /// with the template's `reasoning_effort`. `preserveThinking` false drops the think block of assistant
+    /// turns before the last user query, as `preserve_thinking=false` does.
+    public record Thinking(Effort effort, boolean preserveThinking) {
+        /// What the template renders when the caller sets none of its thinking variables.
+        public static final Thinking MODEL_DEFAULT = new Thinking(Effort.XHIGH, true);
+
+        public static final Thinking DISABLED = new Thinking(null, true);
+
+        public boolean enabled() {
+            return this.effort != null;
+        }
+    }
+
+    /// The template's `reasoning_effort` values. Only `xhigh` and `low` add system instructions.
+    public enum Effort {
+        LOW,
+        MEDIUM,
+        XHIGH;
+
+        String instructions() {
+            return switch (this) {
+                case LOW -> LOW_INSTRUCTIONS;
+                case MEDIUM -> "";
+                case XHIGH -> XHIGH_INSTRUCTIONS;
+            };
         }
     }
 
@@ -169,18 +227,18 @@ public final class QwenChatTemplate {
     }
 
     /// Renders the conversation followed by the assistant generation prompt.
-    public String render(List<Turn> turns) {
-        return render(turns, List.of());
+    public String render(List<Turn> turns, Thinking thinking) {
+        return render(turns, List.of(), thinking);
     }
 
     /// Renders the conversation with tool definitions, each a JSON object serialized as the template's
     /// `tool | tojson`. An empty list renders exactly as the template does without tools.
-    public String render(List<Turn> turns, List<Map<String, Object>> tools) {
-        return render(turns, tools, false, "");
+    public String render(List<Turn> turns, List<Map<String, Object>> tools, Thinking thinking) {
+        return render(turns, tools, thinking, false, "");
     }
 
     /// Uses JSON tool-call envelopes instead of unescaped XML parameter values.
-    public String renderJsonTools(List<Turn> turns, ToolCalling calling) {
+    public String renderJsonTools(List<Turn> turns, ToolCalling calling, Thinking thinking) {
         List<Map<String, Object>> tools = calling.promptTools();
         if (tools.isEmpty()) throw new IllegalArgumentException("JSON tool rendering requires offered tools");
         String constraint =
@@ -194,19 +252,27 @@ public final class QwenChatTemplate {
         String callCount = calling.parallel()
                 ? " Multiple calls belong in the same array."
                 : " At most one function call is allowed in tool_calls.";
-        return render(turns, tools, true, callCount + constraint);
+        return render(turns, tools, thinking, true, callCount + constraint);
     }
 
-    private String render(List<Turn> turns, List<Map<String, Object>> tools, boolean jsonTools, String constraint) {
+    private String render(
+            List<Turn> turns,
+            List<Map<String, Object>> tools,
+            Thinking thinking,
+            boolean jsonTools,
+            String constraint) {
         Objects.requireNonNull(turns, "turns");
         Objects.requireNonNull(tools, "tools");
+        Objects.requireNonNull(thinking, "thinking");
         if (turns.isEmpty()) throw new InvalidConversationException("No messages provided.");
         StringBuilder prompt = new StringBuilder();
-        // Thinking is disabled, so reasoning instructions are empty and only a non-empty system prompt renders.
+        String instructions = thinking.enabled() ? thinking.effort().instructions() : "";
         String system =
                 turns.getFirst().role() == Role.SYSTEM ? trim(turns.getFirst().content()) : "";
         if (!tools.isEmpty()) {
-            prompt.append(IM_START).append("system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+            prompt.append(IM_START).append("system\n");
+            if (!instructions.isEmpty()) prompt.append(instructions).append("\n\n");
+            prompt.append("# Tools\n\nYou have access to the following functions:\n\n<tools>");
             for (Map<String, Object> tool : tools)
                 prompt.append('\n').append(escapeControlTokens(PythonJson.dumps(tool)));
             prompt.append("\n</tools>");
@@ -214,14 +280,13 @@ public final class QwenChatTemplate {
             if (!system.isEmpty()) prompt.append("\n\n").append(system);
             if (jsonTools) prompt.append(JSON_TOOL_INSTRUCTIONS).append(constraint);
             prompt.append(IM_END).append('\n');
-        } else if (!system.isEmpty()) {
-            prompt.append(IM_START)
-                    .append("system\n")
-                    .append(system)
-                    .append(IM_END)
-                    .append('\n');
+        } else if (!system.isEmpty() || !instructions.isEmpty()) {
+            prompt.append(IM_START).append("system\n").append(instructions);
+            if (!system.isEmpty() && !instructions.isEmpty()) prompt.append("\n\n");
+            prompt.append(system).append(IM_END).append('\n');
         }
-        if (!hasUserQuery(turns)) throw new InvalidConversationException("No user query found in messages.");
+        int lastQuery = lastUserQuery(turns);
+        if (lastQuery < 0) throw new InvalidConversationException("No user query found in messages.");
         for (int index = 0; index < turns.size(); index++) {
             Turn turn = turns.get(index);
             String content = trim(turn.content());
@@ -235,15 +300,18 @@ public final class QwenChatTemplate {
                             .append(escapeControlTokens(content))
                             .append(IM_END)
                             .append('\n');
-                // Without preserve_thinking the template keeps an empty think block on every assistant turn.
+                // Every assistant turn keeps its think block unless preserve_thinking=false drops those before the
+                // last user query.
                 case ASSISTANT -> {
-                    prompt.append(IM_START)
-                            .append("assistant\n")
-                            .append(THINK_START)
-                            .append("\n\n")
-                            .append(THINK_END)
-                            .append("\n\n")
-                            .append(escapeControlTokens(content));
+                    prompt.append(IM_START).append("assistant\n");
+                    if (thinking.preserveThinking() || index > lastQuery)
+                        prompt.append(THINK_START)
+                                .append('\n')
+                                .append(escapeControlTokens(trim(turn.reasoning())))
+                                .append('\n')
+                                .append(THINK_END)
+                                .append("\n\n");
+                    prompt.append(escapeControlTokens(content));
                     if (jsonTools) appendJsonToolCalls(turn.toolCalls(), !content.isEmpty(), prompt);
                     else appendToolCalls(turn.toolCalls(), !content.isEmpty(), prompt);
                     prompt.append(IM_END).append('\n');
@@ -272,12 +340,9 @@ public final class QwenChatTemplate {
                 }
             }
         }
-        prompt.append(IM_START)
-                .append("assistant\n")
-                .append(THINK_START)
-                .append("\n\n")
-                .append(THINK_END);
-        return prompt.append("\n\n").toString();
+        prompt.append(IM_START).append("assistant\n").append(THINK_START).append('\n');
+        if (!thinking.enabled()) prompt.append('\n').append(THINK_END).append("\n\n");
+        return prompt.toString();
     }
 
     /// String arguments render verbatim; every other JSON value renders as `tojson`.
@@ -333,13 +398,15 @@ public final class QwenChatTemplate {
         return Character.isWhitespace(value) || Character.isSpaceChar(value) || value == '\u0085';
     }
 
-    /// Mirrors the template's search for a user turn that is not a wrapped tool response.
-    private static boolean hasUserQuery(List<Turn> turns) {
-        for (Turn turn : turns) {
+    /// Mirrors the template's search for the last user turn that is not a wrapped tool response; -1 when
+    /// there is none.
+    private static int lastUserQuery(List<Turn> turns) {
+        for (int index = turns.size() - 1; index >= 0; index--) {
+            Turn turn = turns.get(index);
             if (turn.role() != Role.USER) continue;
             String content = trim(turn.content());
-            if (!(content.startsWith("<tool_response>") && content.endsWith("</tool_response>"))) return true;
+            if (!(content.startsWith("<tool_response>") && content.endsWith("</tool_response>"))) return index;
         }
-        return false;
+        return -1;
     }
 }

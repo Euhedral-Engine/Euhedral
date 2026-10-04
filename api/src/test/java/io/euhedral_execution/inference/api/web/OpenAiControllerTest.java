@@ -66,7 +66,7 @@ class OpenAiControllerTest {
 
     @Test
     void nonStreamingCompletionReturnsOneAssistantChoiceWithUsage() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\"," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}")
                 .andExpect(status().isOk())
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
                 .andExpect(jsonPath("$.id").value(Matchers.startsWith("chatcmpl-")))
@@ -91,7 +91,7 @@ class OpenAiControllerTest {
     @Test
     void usageCountsPromptTokensWithTheBackendTokenizer() throws Exception {
         int encodedBefore = this.backend.encoded.get();
-        var result = completion("{\"model\":\"" + MODEL + "\"," + HELLO + "}")
+        var result = completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}")
                 .andExpect(status().isOk())
                 .andReturn();
         int promptTokens = this.backend.countPromptTokens(this.backend.only().prompt);
@@ -106,7 +106,7 @@ class OpenAiControllerTest {
 
     @Test
     void exhaustedBudgetFinishesWithLength() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\",\"max_tokens\":2," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_tokens\":2," + HELLO + "}")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.choices[0].message.content").value("Hello, "))
                 .andExpect(jsonPath("$.choices[0].finish_reason").value("length"))
@@ -117,7 +117,7 @@ class OpenAiControllerTest {
     @Test
     void stopSequenceTruncatesTextAndCancelsFurtherDecoding() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(List.of("one ", "tw", "o STO", "P three", " four"), true);
-        completion("{\"model\":\"" + MODEL + "\",\"stop\":[\"STOP\"]," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"stop\":[\"STOP\"]," + HELLO + "}")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.choices[0].message.content").value("one two "))
                 .andExpect(jsonPath("$.choices[0].finish_reason").value("stop"));
@@ -129,7 +129,8 @@ class OpenAiControllerTest {
 
     @Test
     void samplingMapsOntoGenerationConfigWithCheckpointDefaults() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\",\"seed\":42," + HELLO + "}").andExpect(status().isOk());
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"seed\":42," + HELLO + "}")
+                .andExpect(status().isOk());
         var defaults = this.backend.only().config;
         assertEquals(1.0f, defaults.temperature());
         assertEquals(20, defaults.topK());
@@ -138,34 +139,41 @@ class OpenAiControllerTest {
         assertFalse(defaults.greedy());
 
         this.backend.reset();
-        completion("{\"model\":\"" + MODEL + "\",\"temperature\":0.7,\"top_p\":0.5," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"temperature\":0.7,\"top_p\":0.5,"
+                        + HELLO + "}")
                 .andExpect(status().isOk());
         var explicit = this.backend.only().config;
         assertEquals(0.7f, explicit.temperature());
         assertEquals(0.5f, explicit.topP());
 
         this.backend.reset();
-        completion("{\"model\":\"" + MODEL + "\",\"temperature\":0," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"temperature\":0," + HELLO + "}")
                 .andExpect(status().isOk());
         assertTrue(this.backend.only().config.greedy(), "temperature 0 selects argmax");
     }
 
     @Test
     void maxCompletionTokensAndMaxTokensMustAgree() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\",\"max_completion_tokens\":3," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_completion_tokens\":3," + HELLO
+                        + "}")
                 .andExpect(status().isOk());
         assertEquals(3, this.backend.only().maxNewTokens);
-        rejected("{\"model\":\"" + MODEL + "\",\"max_tokens\":2,\"max_completion_tokens\":3," + HELLO + "}", 400)
+        rejected(
+                        "{\"model\":\"" + MODEL
+                                + "\",\"reasoning_effort\":\"none\",\"max_tokens\":2,\"max_completion_tokens\":3,"
+                                + HELLO + "}",
+                        400)
                 .andExpect(jsonPath("$.error.param").value("max_tokens"));
-        rejected("{\"model\":\"" + MODEL + "\",\"max_tokens\":0," + HELLO + "}", 400);
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_tokens\":0," + HELLO + "}", 400);
     }
 
     @Test
     void contextLimitIsEnforcedBeforeGeneration() throws Exception {
         this.backend.contextLength = 80;
-        rejected("{\"model\":\"" + MODEL + "\",\"max_tokens\":50," + HELLO + "}", 400)
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_tokens\":50," + HELLO + "}", 400)
                 .andExpect(jsonPath("$.error.code").value("context_length_exceeded"));
-        completion("{\"model\":\"" + MODEL + "\"," + HELLO + "}").andExpect(status().isOk());
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}")
+                .andExpect(status().isOk());
         assertEquals(80 - this.backend.countPromptTokens(this.backend.only().prompt), this.backend.only().maxNewTokens);
     }
 
@@ -190,30 +198,33 @@ class OpenAiControllerTest {
                 "\"presence_penalty\":1",
                 "\"repeat_penalty\":1.1",
                 "\"response_format\":{\"type\":\"json_object\"}",
-                "\"reasoning_effort\":\"low\"",
                 "\"logit_bias\":{\"1\":5}",
                 "\"audio\":{\"voice\":\"alloy\"}")) {
             String name = field.substring(1, field.indexOf('"', 1));
-            rejected("{\"model\":\"" + MODEL + "\"," + field + "," + HELLO + "}", 400)
+            rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + field + "," + HELLO + "}", 400)
                     .andExpect(jsonPath("$.error.code").value("unsupported_parameter"))
                     .andExpect(jsonPath("$.error.param").value(name));
         }
-        rejected("{\"model\":\"" + MODEL + "\",\"bogus\":1," + HELLO + "}", 400)
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"bogus\":1," + HELLO + "}", 400)
                 .andExpect(jsonPath("$.error.code").value("unrecognized_argument"))
                 .andExpect(jsonPath("$.error.param").value("bogus"));
         rejected(
-                        "{\"model\":\"" + MODEL + "\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
+                        "{\"model\":\"" + MODEL
+                                + "\",\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
                                 + "\"image_url\",\"image_url\":{\"url\":\"http://x\"}}]}]}",
                         400)
                 .andExpect(jsonPath("$.error.code").value("unsupported_parameter"));
-        rejected("{\"model\":\"" + MODEL + "\",\"messages\":[{\"role\":\"tool\",\"content\":\"x\"}]}", 400)
+        rejected(
+                        "{\"model\":\"" + MODEL
+                                + "\",\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"tool\",\"content\":\"x\"}]}",
+                        400)
                 .andExpect(jsonPath("$.error.param").value("messages[0].role"));
         assertTrue(this.backend.generations.isEmpty(), "rejected requests must not open sessions");
     }
 
     @Test
     void neutralRepeatPenaltyFromPiIsAccepted() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\",\"repeat_penalty\":1.0," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"repeat_penalty\":1.0," + HELLO + "}")
                 .andExpect(status().isOk());
         assertEquals(1, this.backend.generations.size());
         assertEquals(20, this.backend.only().config.topK(), "neutral penalty must not change sampling");
@@ -222,14 +233,15 @@ class OpenAiControllerTest {
 
     @Test
     void nullRepeatPenaltyIsEquivalentToOmission() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\",\"repeat_penalty\":null," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"repeat_penalty\":null," + HELLO + "}")
                 .andExpect(status().isOk());
         assertEquals(1, this.backend.generations.size());
     }
 
     @Test
     void neutralValuesAndMetadataAreAccepted() throws Exception {
-        completion("{\"model\":\"" + MODEL + "\",\"n\":1,\"logprobs\":false,\"frequency_penalty\":0,"
+        completion("{\"model\":\"" + MODEL
+                        + "\",\"reasoning_effort\":\"none\",\"n\":1,\"logprobs\":false,\"frequency_penalty\":0,"
                         + "\"presence_penalty\":0.0,\"tools\":[],\"response_format\":{\"type\":\"text\"},"
                         + "\"user\":\"u-1\",\"metadata\":{\"k\":\"v\"},\"store\":false,"
                         + "\"messages\":[{\"role\":\"developer\",\"content\":\"Be brief.\"},"
@@ -241,14 +253,23 @@ class OpenAiControllerTest {
     @Test
     void malformedRequestsGetOpenAiErrors() throws Exception {
         rejected("{\"model\":", 400).andExpect(jsonPath("$.error.type").value("invalid_request_error"));
-        rejected("{\"model\":\"" + MODEL + "\",\"temperature\":\"hot\"," + HELLO + "}", 400);
-        rejected("{\"model\":\"" + MODEL + "\",\"temperature\":3," + HELLO + "}", 400)
+        rejected(
+                "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"temperature\":\"hot\"," + HELLO + "}",
+                400);
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"temperature\":3," + HELLO + "}", 400)
                 .andExpect(jsonPath("$.error.param").value("temperature"));
-        rejected("{\"model\":\"" + MODEL + "\",\"messages\":[]}", 400)
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"messages\":[]}", 400)
                 .andExpect(jsonPath("$.error.param").value("messages"));
-        rejected("{\"model\":\"" + MODEL + "\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}", 400)
+        rejected(
+                        "{\"model\":\"" + MODEL
+                                + "\",\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}",
+                        400)
                 .andExpect(jsonPath("$.error.message").value("No user query found in messages."));
-        rejected("{\"model\":\"" + MODEL + "\",\"stream_options\":{\"include_usage\":true}," + HELLO + "}", 400)
+        rejected(
+                        "{\"model\":\"" + MODEL
+                                + "\",\"reasoning_effort\":\"none\",\"stream_options\":{\"include_usage\":true},"
+                                + HELLO + "}",
+                        400)
                 .andExpect(jsonPath("$.error.param").value("stream_options"));
         this.mvc
                 .perform(post("/v1/chat/completions")
@@ -265,7 +286,7 @@ class OpenAiControllerTest {
     @Test
     void unavailableEngineIs503() throws Exception {
         this.backend.available = false;
-        rejected("{\"model\":\"" + MODEL + "\"," + HELLO + "}", 503)
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}", 503)
                 .andExpect(jsonPath("$.error.code").value("engine_unavailable"));
         this.mvc
                 .perform(get("/health"))
@@ -280,7 +301,7 @@ class OpenAiControllerTest {
             generation.cancel(); // what InferenceEngine.close does to live sessions
             return new InferenceBackend.Result(1, false);
         };
-        completion("{\"model\":\"" + MODEL + "\"," + HELLO + "}")
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}")
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.error.type").value("service_unavailable_error"));
         assertEquals(1, this.backend.only().closeCount.get());
@@ -291,7 +312,7 @@ class OpenAiControllerTest {
         this.backend.script = (generation, max, output) -> {
             throw new ExecutionException(new IllegalStateException("device 0x7f00deadbeef lattice shard 3 failed"));
         };
-        var result = completion("{\"model\":\"" + MODEL + "\"," + HELLO + "}")
+        var result = completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + HELLO + "}")
                 .andExpect(status().isInternalServerError())
                 .andExpect(jsonPath("$.error.type").value("server_error"))
                 .andReturn();
@@ -307,7 +328,8 @@ class OpenAiControllerTest {
         MvcResult started = this.mvc
                 .perform(post("/v1/chat/completions")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"model\":\"" + MODEL + "\",\"max_tokens\":3000," + HELLO + "}"))
+                        .content("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"max_tokens\":3000,"
+                                + HELLO + "}"))
                 .andReturn();
         var generation = this.backend.awaitFirst();
         assertTrue(generation.started.await(10, TimeUnit.SECONDS));

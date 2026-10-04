@@ -11,6 +11,7 @@ final class StopSequenceFilter {
     private final List<String> stops;
     private final StringBuilder pending = new StringBuilder();
     private boolean matched;
+    private String matchedStop;
 
     StopSequenceFilter(List<String> stops) {
         this.stops = List.copyOf(stops);
@@ -23,6 +24,8 @@ final class StopSequenceFilter {
         this.pending.append(chunk);
         int match = earliestMatch();
         if (match >= 0) {
+            for (String stop : this.stops)
+                if (this.matchedStop == null && this.pending.indexOf(stop, match) == match) this.matchedStop = stop;
             this.matched = true;
             String emitted = this.pending.substring(0, match);
             this.pending.setLength(0);
@@ -43,6 +46,11 @@ final class StopSequenceFilter {
 
     boolean matched() {
         return this.matched;
+    }
+
+    /// The stop string that matched (the first listed of those matching at the earliest position), or null.
+    String matchedStop() {
+        return this.matchedStop;
     }
 
     private int earliestMatch() {

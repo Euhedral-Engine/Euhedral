@@ -2,8 +2,9 @@
 
 Renders with jinja2 the way Hugging Face `apply_chat_template` does: an immutable sandbox with
 `trim_blocks`/`lstrip_blocks`, the `loopcontrols` extension, `raise_exception`, and a `tojson` filter that
-calls `json.dumps(ensure_ascii=False)` with default separators. Every case uses `add_generation_prompt=True`
-and `enable_thinking=False`, the only mode the Java formatter reproduces.
+calls `json.dumps(ensure_ascii=False)` with default separators. Every case uses `add_generation_prompt=True`.
+`cases`, `tool_cases` and `errors` render with `enable_thinking=False`; each `thinking_cases` entry names the thinking
+variables it sets (`enable_thinking`, `reasoning_effort`, `preserve_thinking`) and leaves the others undefined.
 
 Usage: python render_qwen_chat_template_golden.py TEMPLATE.jinja OUTPUT.json  (requires jinja2 >= 3.1)
 """
@@ -30,8 +31,10 @@ def compile_template(source):
     return env.from_string(source)
 
 
-def render(template, messages, tools=None):
-    return template.render(messages=messages, tools=tools, add_generation_prompt=True, enable_thinking=False)
+def render(template, messages, tools=None, thinking=None):
+    if thinking is None:
+        thinking = {"enable_thinking": False}
+    return template.render(messages=messages, tools=tools, add_generation_prompt=True, **thinking)
 
 
 CASES = [
@@ -186,6 +189,49 @@ TOOL_CASES = [
     ),
 ]
 
+REPLAYED_REASONING = [
+    {"role": "system", "content": "Be careful."},
+    {"role": "user", "content": "First question?"},
+    {"role": "assistant", "reasoning_content": "\n  Think about the first.\n", "content": "First answer."},
+    {"role": "user", "content": "Second question?"},
+    {
+        "role": "assistant",
+        "reasoning_content": "Plan a lookup.",
+        "content": "",
+        "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Oslo"}}}],
+    },
+    {"role": "tool", "tool_call_id": "t1", "content": "cold"},
+]
+
+# (name, tools, messages, thinking variables)
+THINKING_CASES = [
+    ("default_user_only", None, [{"role": "user", "content": "Hello"}], {}),
+    ("enabled_explicit", None, [{"role": "user", "content": "Hello"}], {"enable_thinking": True}),
+    ("xhigh_with_system", None, CASES[1][1], {"reasoning_effort": "xhigh"}),
+    ("medium_user_only", None, [{"role": "user", "content": "Hello"}], {"reasoning_effort": "medium"}),
+    ("medium_with_system", None, CASES[1][1], {"reasoning_effort": "medium"}),
+    ("low_with_system", None, CASES[1][1], {"reasoning_effort": "low"}),
+    ("low_blank_system", None, CASES[2][1], {"reasoning_effort": "low"}),
+    ("disabled_with_effort", None, CASES[1][1], {"enable_thinking": False, "reasoning_effort": "low"}),
+    ("default_multi_turn", None, CASES[3][1], {}),
+    ("replayed_reasoning", [WEATHER], REPLAYED_REASONING, {}),
+    ("replayed_reasoning_not_preserved", [WEATHER], REPLAYED_REASONING, {"preserve_thinking": False}),
+    (
+        "not_preserved_after_last_query",
+        None,
+        [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "reasoning_content": "r1", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "reasoning_content": "r2", "content": "d"},
+        ],
+        {"preserve_thinking": False, "reasoning_effort": "low"},
+    ),
+    ("tools_low", [WEATHER, NO_PARAMS], TOOL_CASES[1][2], {"reasoning_effort": "low"}),
+    ("tools_medium", [WEATHER], TOOL_CASES[0][2], {"reasoning_effort": "medium"}),
+    ("tools_default_blank_system", [NO_PARAMS], TOOL_CASES[2][2], {}),
+]
+
 PYTHON_JSON = [
     "plain",
     "quote\" back\\ slash/ nl\n cr\r tab\t bs\b ff\f nul\u0000 us\u001f del\u007f nbsp\u00a0 ls\u2028 emoji\U0001f600",
@@ -224,6 +270,11 @@ def main():
         "tool_cases": [
             {"name": name, "tools": tools, "messages": messages, "expected": render(template, messages, tools)}
             for name, tools, messages in TOOL_CASES
+        ],
+        "thinking_cases": [
+            {"name": name, "tools": tools, "messages": messages, "thinking": thinking,
+             "expected": render(template, messages, tools, thinking)}
+            for name, tools, messages, thinking in THINKING_CASES
         ],
         "python_json": [{"value": value, "expected": _tojson(value)} for value in PYTHON_JSON],
     }
