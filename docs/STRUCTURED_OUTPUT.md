@@ -18,6 +18,9 @@ terminator only once the document is complete. Nothing is generated freely and r
   schema that cannot be enforced is refused, never approximated.
 - `text` (or omitted): free text.
 
+Responses takes the same formats as `text.format` ([RESPONSES_API.md](RESPONSES_API.md)), and Messages a
+`json_schema` format as `output_config.format` ([ANTHROPIC_API.md](ANTHROPIC_API.md)); both are enforced the same way.
+
 The prompt is not changed: tell the model in your messages what the document should contain. A model that is not
 asked for JSON still produces valid JSON, but its content suffers.
 

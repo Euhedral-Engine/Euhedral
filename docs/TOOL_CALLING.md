@@ -1,7 +1,10 @@
 # Tool calling
 
 `/v1/chat/completions` accepts OpenAI-style function `tools`, `tool_choice` (`auto`, `none`, `required`, or a
-named function), `parallel_tool_calls`, function `strict`, and assistant/tool-message replay.
+named function), `parallel_tool_calls`, function `strict`, and assistant/tool-message replay. This page uses its names.
+The other APIs spell the same controls their own way and generate calls the same way: Responses (`function` tools,
+`function_call` and `function_call_output` items, [RESPONSES_API.md](RESPONSES_API.md)) and Messages (`input_schema`,
+`tool_choice` `any`, `disable_parallel_tool_use`, `tool_use` and `tool_result` blocks, [ANTHROPIC_API.md](ANTHROPIC_API.md)).
 
 ## How a call is generated
 
@@ -31,7 +34,8 @@ template's tool definitions (`# Tools ... <tools>`), followed by instructions fo
   bounds, `multipleOf`, item and property counts). A schema with a keyword it cannot enforce, or one no value can
   satisfy, is refused with 400 and the reason, naming `tools[i].function.parameters`. A strict function without
   `parameters` takes exactly `{}`.
-- **Not strict** (the default): the arguments are any JSON object. After generation the server still checks
+- **Not strict** (the default, except in Responses, where `strict` defaults to true as that API defines it): the
+  arguments are any JSON object. After generation the server still checks
   top-level argument types, required names, and `additionalProperties: false`, and fails the request when they do not
   hold.
 

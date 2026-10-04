@@ -1,8 +1,9 @@
 # Euhedral-Inference
 
-An OpenAI-compatible inference server for **Qwen3.8-27B** (text) on a single NVIDIA Blackwell GPU, written in Java 25
-with a small native CUDA layer. It runs the whole model on one consumer card (developed on an RTX 5070 Ti with 16 GB),
-decodes with MTP speculative decoding, and serves 32K to 64K tokens of context from that 16 GB.
+An inference server for **Qwen3.8-27B** (text) on a single NVIDIA Blackwell GPU, written in Java 25 with a small native
+CUDA layer. It runs the whole model on one consumer card (developed on an RTX 5070 Ti with 16 GB), decodes with MTP
+speculative decoding, serves 32K to 64K tokens of context from that 16 GB, and speaks the OpenAI Chat Completions, OpenAI
+Responses and Anthropic Messages APIs, with reasoning, tool calling, schema-constrained output and a prefix cache.
 
 You choose a weight file; the engine chooses everything else. There are no kernel, precision, or scheduling options.
 
@@ -180,8 +181,46 @@ for chunk in reply:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-The API serves `/v1/models` and `/v1/chat/completions` (JSON or SSE streaming) with OpenAI-style function calling
-([docs/TOOL_CALLING.md](docs/TOOL_CALLING.md)). `/health` reports whether the engine has loaded.
+Anthropic's client works against the same server:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://localhost:1738", api_key="unused")
+message = client.messages.create(
+    model="qwen", max_tokens=512, messages=[{"role": "user", "content": "Name three prime numbers."}]
+)
+print(message.content[-1].text)
+```
+
+## The API
+
+| Endpoint | |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions, JSON or server-sent events |
+| `POST /v1/responses` | OpenAI Responses, stateless ([docs/RESPONSES_API.md](docs/RESPONSES_API.md)) |
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic Messages ([docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md)) |
+| `GET /v1/models`, `GET /v1/models/{id}` | The served model, in OpenAI's or (with `anthropic-version`) Anthropic's format |
+| `GET /health` | Readiness ([docs/OPERATIONS.md](docs/OPERATIONS.md)) |
+| `GET /metrics` | Prometheus metrics ([docs/OPERATIONS.md](docs/OPERATIONS.md#metrics)) |
+
+All three request formats run on one pipeline, so they behave alike:
+
+- **Reasoning**: the model thinks before it answers (Chat Completions and Responses by default, Messages when asked,
+  as each API defines it); the reasoning comes back separately (`reasoning_content`, a `reasoning` item, a `thinking`
+  block), and its effort is selectable ([docs/REASONING.md](docs/REASONING.md)).
+- **Tool calling**: OpenAI and Anthropic tool definitions, single and parallel calls, tool results; `strict` tools get
+  arguments constrained to their schema. The server returns calls; the client runs them (an MCP client sits in the
+  client, not in the server) ([docs/TOOL_CALLING.md](docs/TOOL_CALLING.md)).
+- **Structured output**: `json_object` and `json_schema`, enforced token by token with llguidance; a schema that cannot
+  be enforced exactly is refused instead of approximated ([docs/STRUCTURED_OUTPUT.md](docs/STRUCTURED_OUTPUT.md)).
+- **Prefix cache**: a request that repeats an earlier prompt's start prefills only what follows it, whichever API sent
+  either; responses report the cached tokens ([docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md)).
+- **Cancellation**: a client that disconnects stops its generation before the next quantum, whether it was waiting,
+  prefilling or decoding.
+
+A field that would change the output and is not implemented is refused with 400, never ignored.
+[docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md) classifies every field of every request.
 
 ## Docker
 
@@ -237,6 +276,10 @@ Stop any serving container before the GPU suites. The native layer is described 
 the benchmark harness in [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ## More
+
+- [docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md), [docs/ANTHROPIC_API.md](docs/ANTHROPIC_API.md), [docs/RESPONSES_API.md](docs/RESPONSES_API.md): the request formats, field by field.
+- [docs/REASONING.md](docs/REASONING.md), [docs/TOOL_CALLING.md](docs/TOOL_CALLING.md), [docs/STRUCTURED_OUTPUT.md](docs/STRUCTURED_OUTPUT.md): reasoning, tools and constrained output.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): settings, startup, health, shutdown and metrics.
 
 - [docs/FRAME_MODEL.md](docs/FRAME_MODEL.md): how a forward pass is scheduled across device lanes.
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): the state kept between requests, its checkpoints and measured restore times.
