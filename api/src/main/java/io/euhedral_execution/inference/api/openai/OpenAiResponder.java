@@ -140,6 +140,15 @@ record OpenAiResponder(long created, String model, boolean includeUsage) impleme
             }
         }
 
+        @Override
+        public void keepAlive() throws IOException {
+            try {
+                this.emitter.send(SseEmitter.event().comment("keep-alive"));
+            } catch (IllegalStateException alreadyCompleted) {
+                throw new IOException("stream already completed", alreadyCompleted);
+            }
+        }
+
         /// Headers are already committed, so errors are reported in-band as an OpenAI error event.
         @Override
         public void fail(ApiException error) {

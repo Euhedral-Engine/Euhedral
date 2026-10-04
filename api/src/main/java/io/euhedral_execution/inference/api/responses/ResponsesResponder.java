@@ -261,6 +261,15 @@ record ResponsesResponder(long created, String model, boolean includeEncrypted, 
             }
         }
 
+        @Override
+        public void keepAlive() throws IOException {
+            try {
+                this.emitter.send(SseEmitter.event().comment("keep-alive"));
+            } catch (IllegalStateException alreadyCompleted) {
+                throw new IOException("stream already completed", alreadyCompleted);
+            }
+        }
+
         /// Headers are already committed, so a failure is an in-band `error` event.
         @Override
         public void fail(ApiException error) {

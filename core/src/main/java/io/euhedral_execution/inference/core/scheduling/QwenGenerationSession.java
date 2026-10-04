@@ -187,8 +187,19 @@ public final class QwenGenerationSession implements AutoCloseable {
     /// prompt ([QwenTokenizer#encodeWithModelSpecialTokens]), as plain text ([QwenTokenizer#encodeText]) after it.
     public CompletableFuture<List<Integer>> generateAsync(
             int[] promptTokenIds, int maxNewTokens, Consumer<String> text, TokenConstraint constraint) {
+        return generateAsync(promptTokenIds, maxNewTokens, text, constraint, null);
+    }
+
+    /// As [#generateAsync(int[], int, Consumer, TokenConstraint)], reporting execution boundaries to an optional
+    /// timing listener on the workers that retire them.
+    public CompletableFuture<List<Integer>> generateAsync(
+            int[] promptTokenIds,
+            int maxNewTokens,
+            Consumer<String> text,
+            TokenConstraint constraint,
+            GenerationTimingListener timing) {
         Objects.requireNonNull(promptTokenIds, "promptTokenIds");
-        return begin(null, promptTokenIds.clone(), maxNewTokens, text, constraint, null, null);
+        return begin(null, promptTokenIds.clone(), maxNewTokens, text, constraint, timing, null);
     }
 
     private CompletableFuture<List<Integer>> begin(

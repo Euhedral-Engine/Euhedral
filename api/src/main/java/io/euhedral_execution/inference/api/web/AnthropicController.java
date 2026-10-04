@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.api.anthropic.MessagesRequest;
 import io.euhedral_execution.inference.api.chat.ApiException;
 import io.euhedral_execution.inference.api.chat.GenerationService;
 import io.euhedral_execution.inference.api.engine.ApiProperties;
+import jakarta.servlet.http.HttpServletRequest;
 import java.util.Map;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -31,8 +32,8 @@ public class AnthropicController {
     }
 
     @PostMapping(path = "/messages", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public DeferredResult<Object> messages(@RequestBody MessagesRequest request) {
-        return this.generations.submit(this.messages.planAsync(request));
+    public DeferredResult<Object> messages(@RequestBody MessagesRequest request, HttpServletRequest servlet) {
+        return this.generations.submit(this.messages.planAsync(request), ServletClientLink.of(servlet));
     }
 
     /// `{"input_tokens": N}`: the rendered prompt's tokens, encoded on the workers without generating.

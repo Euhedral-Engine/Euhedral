@@ -25,6 +25,7 @@ import org.springframework.context.annotation.Import;
 @EnableConfigurationProperties(ApiProperties.class)
 @Import({
     OpenAiController.class,
+    WebConfiguration.class,
     AnthropicController.class,
     MessagesMapper.class,
     ResponsesMapper.class,

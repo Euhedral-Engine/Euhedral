@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.guidance.GrammarCompiler;
 import io.euhedral_execution.inference.core.guidance.Llguidance;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.scheduling.GenerationTimingListener;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.ReasoningConstraint;
@@ -113,17 +114,37 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
         }
     }
 
+    /// Reports each retired prefill quantum; nothing else.
+    private record PrefillProgress(Runnable prefilled) implements GenerationTimingListener {
+        @Override
+        public void promptEncoded(long nanos, int promptTokens) {}
+
+        @Override
+        public void prefillQuantum(long startNanos, long executedNanos, int tokens) {
+            this.prefilled.run();
+        }
+
+        @Override
+        public void firstTokenSelected(long nanos, int tokenId) {}
+
+        @Override
+        public void decodeQuantum(
+                long startNanos, long executedNanos, long selectedNanos, boolean sampled, int selectedTokenId) {}
+    }
+
     /// `thinkEnd` is the `</think>` ID when the output opens as reasoning, else -1.
     private record SessionGeneration(
             QwenGenerationSession session, QwenTokenizer tokenizer, TokenConstraint constraint, int thinkEnd)
             implements Generation {
 
         @Override
-        public CompletableFuture<Result> generate(EncodedPrompt prompt, int maxNewTokens, Consumer<String> text) {
+        public CompletableFuture<Result> generate(
+                EncodedPrompt prompt, int maxNewTokens, Consumer<String> text, Runnable prefilled) {
             if (!this.session.expectsFirstPrompt())
                 throw new IllegalStateException("an encoded prompt needs a fresh session");
             return this.session
-                    .generateAsync(prompt.tokenIds(), maxNewTokens, text, this.constraint)
+                    .generateAsync(
+                            prompt.tokenIds(), maxNewTokens, text, this.constraint, new PrefillProgress(prefilled))
                     .thenApply(tokenIds -> {
                         boolean stopped =
                                 !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast());

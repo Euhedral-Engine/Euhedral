@@ -263,6 +263,14 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   and tool-call parsing run in the text callback. Network writes are queued per request (`SerialTasks`) and run on workers
   one at a time in output order: a write that blocks holds only its worker, and the other workers take the remaining
   work meanwhile.
+- **Clients that leave** stop their generation before its next quantum, without a thread watching them. Tomcat does
+  not watch an asynchronous request's connection once its body is read, so the probes ride on the generation: after
+  every prefill quantum and every decoded text a probe task is queued behind the request's writes. A JSON request's
+  connection is read without blocking (a servlet `ReadListener` makes `available()` read the socket; a closed
+  connection reports data). A stream is watched by its writes, and while its prompt is prefilled it writes a
+  keep-alive (an SSE comment, or Anthropic's `ping`) from the second prefill quantum on. The same tasks probe the queued
+  requests, which give up their places. Measured on `q3`: a JSON client that left closed its session 9 ms later, and a
+  stream abandoned 1 s into a 13 s prefill let the next request run 0.45 s later.
 - **The prefix cache** ([PREFIX_CACHE.md](PREFIX_CACHE.md)) captures and restores sequence state between quanta, as
   frames: each frame runs at most 16 MiB of copies between the pinned arena and the sequence's buffers, one after
   another, with no stream selected, so a worker is never held for a whole checkpoint. The worker that retires a prefill
