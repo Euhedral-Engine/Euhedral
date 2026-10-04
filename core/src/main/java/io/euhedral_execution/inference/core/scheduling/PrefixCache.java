@@ -57,7 +57,11 @@ public final class PrefixCache implements AutoCloseable {
             long failed,
             long evictions,
             long usedBytes,
-            long totalBytes) {}
+            long totalBytes,
+            int nodes,
+            long captureNanos,
+            long restores,
+            long restoreNanos) {}
 
     private final ExecutionGpu gpu;
     private final PrefixLayout layout;
@@ -68,6 +72,9 @@ public final class PrefixCache implements AutoCloseable {
     private final int intervalTokens;
     private final int hidden;
     private final AtomicLong lookups = new AtomicLong();
+    private final AtomicLong captureNanos = new AtomicLong();
+    private final AtomicLong restores = new AtomicLong();
+    private final AtomicLong restoreNanos = new AtomicLong();
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong reusedTokens = new AtomicLong();
     private final AtomicLong captured = new AtomicLong();
@@ -172,13 +179,17 @@ public final class PrefixCache implements AutoCloseable {
             return CompletableFuture.completedFuture(parent);
         }
         CompletableFuture<PrefixNode> captured;
+        long started = System.nanoTime();
         try {
             captured = captureHeld(frames, sequence, parent, tokens, position, seedRowAddress);
         } catch (RuntimeException | Error failure) {
             sequence.releaseExecution(lease, at);
             throw failure;
         }
-        return captured.whenComplete((node, failure) -> sequence.releaseExecution(lease, at));
+        return captured.whenComplete((node, failure) -> {
+            sequence.releaseExecution(lease, at);
+            if (node != parent) this.captureNanos.addAndGet(System.nanoTime() - started);
+        });
     }
 
     private CompletableFuture<PrefixNode> captureHeld(
@@ -267,11 +278,14 @@ public final class PrefixCache implements AutoCloseable {
             sequence.markFailed(lease, failure);
             return CompletableFuture.failedFuture(failure);
         }
+        long started = System.nanoTime();
         return runCopies(frames, copies, true).handle((done, failure) -> {
             if (failure != null) {
                 sequence.markFailed(lease, failure);
                 throw new CompletionException(failure);
             }
+            this.restores.incrementAndGet();
+            this.restoreNanos.addAndGet(System.nanoTime() - started);
             try {
                 var attention = (AttentionSequenceStates) sequence.kvCacheState();
                 for (int layer : this.layout.kvLayers()) {
@@ -307,7 +321,11 @@ public final class PrefixCache implements AutoCloseable {
                 this.failed.get(),
                 this.tree.evictions(),
                 this.extents.usedBytes(),
-                this.extents.totalBytes());
+                this.extents.totalBytes(),
+                this.tree.size(),
+                this.captureNanos.get(),
+                this.restores.get(),
+                this.restoreNanos.get());
     }
 
     @Override
