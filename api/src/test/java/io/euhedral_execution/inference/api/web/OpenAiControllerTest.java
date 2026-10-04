@@ -153,6 +153,27 @@ class OpenAiControllerTest {
         completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"temperature\":0," + HELLO + "}")
                 .andExpect(status().isOk());
         assertTrue(this.backend.only().config.greedy(), "temperature 0 selects argmax");
+
+        this.backend.reset();
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"top_k\":5," + HELLO + "}")
+                .andExpect(status().isOk());
+        assertEquals(5, this.backend.only().config.topK(), "top_k reaches the sampler");
+        this.backend.reset();
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"top_k\":-1," + HELLO + "}")
+                .andExpect(status().isOk());
+        assertEquals(0, this.backend.only().config.topK(), "-1 turns top-k off");
+        rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"top_k\":-2," + HELLO + "}", 400)
+                .andExpect(jsonPath("$.error.param").value("top_k"));
+    }
+
+    @Test
+    void neutralSamplingExtrasAndCacheMetadataAreAccepted() throws Exception {
+        completion("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"top_logprobs\":0,\"min_p\":0,"
+                        + "\"repetition_penalty\":1.0,\"prompt_cache_retention\":\"24h\"," + HELLO + "}")
+                .andExpect(status().isOk());
+        for (String field : List.of("\"min_p\":0.05", "\"repetition_penalty\":1.1"))
+            rejected("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + field + "," + HELLO + "}", 400)
+                    .andExpect(jsonPath("$.error.code").value("unsupported_parameter"));
     }
 
     @Test
