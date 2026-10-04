@@ -13,8 +13,25 @@ public final class FrameSeeds {
     public static final long ID_HASH = HasherApi.mix(HasherApi.BASE_SEED);
 
     private static final AtomicLong GENERATION = new AtomicLong(1);
+    /// Host jobs (tokenization, host tasks) draw from their own sequence, so the stage graphs' routing, and
+    /// with it their lane placement, does not depend on how much host work ran before a graph was built.
+    private static final AtomicLong HOST_GENERATION = new AtomicLong(1);
 
-    private long next = HasherApi.mix(HasherApi.BASE_SEED + GENERATION.getAndIncrement());
+    private long next;
+
+    /// Seeds for one stage graph.
+    public FrameSeeds() {
+        this.next = HasherApi.mix(HasherApi.BASE_SEED + GENERATION.getAndIncrement());
+    }
+
+    private FrameSeeds(long base) {
+        this.next = base;
+    }
+
+    /// Seeds for one host job, from a sequence disjoint from the graphs'.
+    public static FrameSeeds forHostWork() {
+        return new FrameSeeds(HasherApi.mix(HasherApi.BASE_SEED - HOST_GENERATION.getAndIncrement()));
+    }
 
     /// The seed of the group's next frame. Not thread-safe: one builder hands out a group's seeds.
     public long next() {

@@ -261,7 +261,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
         HostTask(Supplier<T> work, CompletableFuture<T> result, QwenExecutionSource source) {
             super(FrameSeeds.ID_HASH);
-            randomizeHash(new FrameSeeds().next());
+            randomizeHash(FrameSeeds.forHostWork().next());
             this.work = work;
             this.result = result;
             this.source = source;
