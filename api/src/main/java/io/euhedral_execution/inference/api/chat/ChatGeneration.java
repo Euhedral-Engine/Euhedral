@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.chat;
 
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
+import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,6 +34,10 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     private final SerialTasks delivery;
     private final Runnable finished;
     private final Client client;
+    private final Telemetry telemetry;
+    private long startedNanos;
+    // Set by the first decoded text; read when the generation ends.
+    private volatile long firstTokenNanos;
     // A probe of the client's connection is queued and has not run yet.
     private final AtomicBoolean probing = new AtomicBoolean();
     private final StopSequenceFilter stopFilter;
@@ -60,8 +65,10 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             CompletionSink sink,
             SerialTasks delivery,
             Runnable finished,
-            Client client) {
+            Client client,
+            Telemetry telemetry) {
         this.client = client;
+        this.telemetry = telemetry;
         this.plan = plan;
         this.generation = generation;
         this.sink = sink;
@@ -81,13 +88,17 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
         static final Client NONE = new Client(ClientLink.NONE, () -> {}, () -> {});
     }
 
+    /// Where the generation reports how it ended: its surface `api` and when the request arrived. Null records
+    /// nothing.
+    record Telemetry(ServerMetrics metrics, String api, long arrivedNanos) {}
+
     ChatGeneration(
             GenerationPlan plan,
             InferenceBackend.Generation generation,
             CompletionSink sink,
             SerialTasks delivery,
             Runnable finished) {
-        this(plan, generation, sink, delivery, finished, Client.NONE);
+        this(plan, generation, sink, delivery, finished, Client.NONE, null);
     }
 
     /// The client disconnected or timed out: stop generating. Safe from any thread and after completion.
@@ -112,6 +123,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
 
     /// Starts the generation on the workers and returns.
     void start() {
+        this.startedNanos = System.nanoTime();
         CompletableFuture<InferenceBackend.Result> result;
         try {
             result = this.abandoned.get()
@@ -127,7 +139,11 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     /// The generation ended: close the session, release the request's slot and queue the response's end.
     private void complete(InferenceBackend.Result result, Throwable failure) {
         try (InferenceBackend.Generation owned = this.generation) {
-            if (this.abandoned.get()) return;
+            if (this.abandoned.get()) {
+                report(ServerMetrics.Outcome.CANCELLED, null);
+                this.delivered = true;
+                return;
+            }
             if (failure != null) {
                 Throwable cause =
                         failure instanceof java.util.concurrent.CompletionException ? failure.getCause() : failure;
@@ -174,6 +190,20 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
             this.delivered = true;
             startSink();
             write(() -> this.sink.finish(finish));
+            report(ServerMetrics.Outcome.SUCCESS, null);
+            if (this.telemetry != null) {
+                this.telemetry
+                        .metrics()
+                        .generation(
+                                this.telemetry.api(),
+                                finish,
+                                this.telemetry.arrivedNanos(),
+                                this.startedNanos,
+                                this.firstTokenNanos,
+                                System.nanoTime());
+                if (this.toolParser != null)
+                    this.telemetry.metrics().toolCalls(this.telemetry.api(), this.toolParser.calls());
+            }
         } catch (ToolCallParser.MalformedToolCallException malformed) {
             LOG.warn("Generation {} failed: {}", this.plan.id(), malformed.getMessage());
             deliverFailure(ApiException.invalidToolCall(malformed.getMessage()));
@@ -195,6 +225,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
 
     /// One decoded text, on the worker that retired its quantum and before the next quantum is admitted.
     private void onText(String text) {
+        if (this.firstTokenNanos == 0) this.firstTokenNanos = System.nanoTime();
         probe();
         if (this.abandoned.get() || this.malformedToolCall != null || this.stopFilter.matched()) return;
         startSink();
@@ -290,8 +321,23 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
         write(() -> this.sink.start(cached));
     }
 
+    private void report(ServerMetrics.Outcome outcome, String constraintFailure) {
+        if (this.telemetry == null) return;
+        this.telemetry.metrics().request(this.telemetry.api(), outcome);
+        if (constraintFailure != null) this.telemetry.metrics().constrainedFailure(constraintFailure);
+    }
+
     private void deliverFailure(ApiException error) {
-        if (this.abandoned.get() || this.delivered) return;
+        if (this.abandoned.get()) {
+            if (!this.delivered) report(ServerMetrics.Outcome.CANCELLED, null);
+            this.delivered = true;
+            return;
+        }
+        if (this.delivered) return;
+        String code = error.code();
+        report(
+                error.status().value() == 503 ? ServerMetrics.Outcome.REJECTED : ServerMetrics.Outcome.FAILED,
+                "invalid_tool_call".equals(code) || "invalid_structured_output".equals(code) ? code : null);
         this.delivered = true;
         this.delivery.execute(() -> {
             if (!this.abandoned.get()) this.sink.fail(error);

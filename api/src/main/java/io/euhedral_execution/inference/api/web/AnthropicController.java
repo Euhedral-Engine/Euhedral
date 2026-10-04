@@ -33,7 +33,7 @@ public class AnthropicController {
 
     @PostMapping(path = "/messages", consumes = MediaType.APPLICATION_JSON_VALUE)
     public DeferredResult<Object> messages(@RequestBody MessagesRequest request, HttpServletRequest servlet) {
-        return this.generations.submit(this.messages.planAsync(request), ServletClientLink.of(servlet));
+        return this.generations.submit("messages", this.messages.planAsync(request), ServletClientLink.of(servlet));
     }
 
     /// `{"input_tokens": N}`: the rendered prompt's tokens, encoded on the workers without generating.

@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
+import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.guidance.GrammarCompiler;
 import io.euhedral_execution.inference.core.guidance.Llguidance;
@@ -26,7 +27,11 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
     private final Executor workers;
     private final GrammarCompiler grammars;
 
-    public EngineInferenceBackend(InferenceEngine engine, String modelId, QwenChatTemplate chatTemplate) {
+    private final ServerMetrics metrics;
+
+    public EngineInferenceBackend(
+            InferenceEngine engine, String modelId, QwenChatTemplate chatTemplate, ServerMetrics metrics) {
+        this.metrics = metrics;
         this.engine = Objects.requireNonNull(engine, "engine");
         this.modelId = Objects.requireNonNull(modelId, "modelId");
         this.workers = task -> engine.onWorker(() -> {
@@ -102,7 +107,8 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
                     ? tokenizer.controlTokenId(QwenChatTemplate.THINK_END).orElseThrow()
                     : -1;
             try {
-                return new SessionGeneration(this.engine.createSession(config), tokenizer, constraint, thinkEnd);
+                return new SessionGeneration(
+                        this.engine.createSession(config), tokenizer, constraint, thinkEnd, this.metrics);
             } catch (RuntimeException | Error failure) {
                 if (constraint != null) constraint.close();
                 throw failure;
@@ -114,8 +120,8 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
         }
     }
 
-    /// Reports each retired prefill quantum; nothing else.
-    private record PrefillProgress(Runnable prefilled) implements GenerationTimingListener {
+    /// Reports each retired prefill quantum to the request, and each speculative verification to the metrics.
+    private record Progress(Runnable prefilled, ServerMetrics metrics) implements GenerationTimingListener {
         @Override
         public void promptEncoded(long nanos, int promptTokens) {}
 
@@ -130,11 +136,20 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
         @Override
         public void decodeQuantum(
                 long startNanos, long executedNanos, long selectedNanos, boolean sampled, int selectedTokenId) {}
+
+        @Override
+        public void speculativeStep(long startNanos, long executedNanos, int outputs, int acceptedDrafts) {
+            if (this.metrics != null) this.metrics.speculativeStep(acceptedDrafts);
+        }
     }
 
     /// `thinkEnd` is the `</think>` ID when the output opens as reasoning, else -1.
     private record SessionGeneration(
-            QwenGenerationSession session, QwenTokenizer tokenizer, TokenConstraint constraint, int thinkEnd)
+            QwenGenerationSession session,
+            QwenTokenizer tokenizer,
+            TokenConstraint constraint,
+            int thinkEnd,
+            ServerMetrics metrics)
             implements Generation {
 
         @Override
@@ -144,7 +159,11 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
                 throw new IllegalStateException("an encoded prompt needs a fresh session");
             return this.session
                     .generateAsync(
-                            prompt.tokenIds(), maxNewTokens, text, this.constraint, new PrefillProgress(prefilled))
+                            prompt.tokenIds(),
+                            maxNewTokens,
+                            text,
+                            this.constraint,
+                            new Progress(prefilled, this.metrics))
                     .thenApply(tokenIds -> {
                         boolean stopped =
                                 !tokenIds.isEmpty() && this.tokenizer.isGenerationEosToken(tokenIds.getLast());

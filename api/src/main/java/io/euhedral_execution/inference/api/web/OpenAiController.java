@@ -83,12 +83,13 @@ public class OpenAiController {
     @PostMapping(path = "/chat/completions", consumes = MediaType.APPLICATION_JSON_VALUE)
     public DeferredResult<Object> chatCompletions(
             @RequestBody ChatCompletionRequest request, HttpServletRequest servlet) {
-        return this.generations.submit(this.chatRequests.planAsync(request), ServletClientLink.of(servlet));
+        return this.generations.submit(
+                "chat_completions", this.chatRequests.planAsync(request), ServletClientLink.of(servlet));
     }
 
     /// The Responses API over the same generation: a `response` body or its event stream.
     @PostMapping(path = "/responses", consumes = MediaType.APPLICATION_JSON_VALUE)
     public DeferredResult<Object> responses(@RequestBody ResponsesRequest request, HttpServletRequest servlet) {
-        return this.generations.submit(this.responses.planAsync(request), ServletClientLink.of(servlet));
+        return this.generations.submit("responses", this.responses.planAsync(request), ServletClientLink.of(servlet));
     }
 }

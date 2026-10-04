@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.api.chat;
 
 import io.euhedral_execution.inference.api.engine.ApiProperties;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
+import io.euhedral_execution.inference.api.metrics.ServerMetrics;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -38,10 +39,22 @@ public class GenerationService implements DisposableBean {
     private Admission running;
     private boolean closed;
 
-    public GenerationService(InferenceBackend backend, ApiProperties properties) {
+    private final ServerMetrics metrics;
+
+    public GenerationService(InferenceBackend backend, ApiProperties properties, ServerMetrics metrics) {
         this.backend = backend;
         this.requestTimeoutMillis = properties.requestTimeout().toMillis();
         this.maxQueued = properties.maxQueuedGenerations();
+        this.metrics = metrics;
+        metrics.bindQueue(this::activeCount, this::queuedCount);
+    }
+
+    private synchronized int activeCount() {
+        return this.running == null ? 0 : 1;
+    }
+
+    private synchronized int queuedCount() {
+        return this.waiting.size();
     }
 
     /// Writes one surface's responses: a JSON body or the events of a stream.
@@ -56,14 +69,23 @@ public class GenerationService implements DisposableBean {
         final ConversationPlanner.Planned planned;
         final DeferredResult<Object> result;
         final ClientLink link;
+        final String api;
+        final long arrivedNanos;
         volatile boolean abandoned;
         volatile ChatGeneration generation;
         java.util.concurrent.atomic.AtomicBoolean streaming;
 
-        Admission(ConversationPlanner.Planned planned, DeferredResult<Object> result, ClientLink link) {
+        Admission(
+                ConversationPlanner.Planned planned,
+                DeferredResult<Object> result,
+                ClientLink link,
+                String api,
+                long arrivedNanos) {
             this.planned = planned;
             this.result = result;
             this.link = link;
+            this.api = api;
+            this.arrivedNanos = arrivedNanos;
         }
 
         /// The client is gone: stop the generation, or give up the place in the queue.
@@ -78,15 +100,12 @@ public class GenerationService implements DisposableBean {
         }
     }
 
-    /// Hands a request being planned to the workers and returns its deferred response: a body, a stream, or an
-    /// [ApiException] for the surface's error handler.
-    public DeferredResult<Object> submit(CompletableFuture<ConversationPlanner.Planned> planning) {
-        return submit(planning, ClientLink.NONE);
-    }
-
-    /// As [#submit(CompletableFuture)], watching the client through `link` while the request waits and generates.
-    /// The link is closed when the request completes.
-    public DeferredResult<Object> submit(CompletableFuture<ConversationPlanner.Planned> planning, ClientLink link) {
+    /// Hands a request of the `api` surface being planned to the workers and returns its deferred response: a body,
+    /// a stream, or an [ApiException] for the surface's error handler. The client is watched through `link` while
+    /// the request waits and generates; the link is closed when the request completes.
+    public DeferredResult<Object> submit(
+            String api, CompletableFuture<ConversationPlanner.Planned> planning, ClientLink link) {
+        long arrived = System.nanoTime();
         var result = new DeferredResult<Object>(this.requestTimeoutMillis);
         var admission = new AtomicReference<Admission>();
         // A stream's response continues past this result, as its emitter; its link closes with the emitter.
@@ -97,6 +116,8 @@ public class GenerationService implements DisposableBean {
         result.onTimeout(() -> {
             Admission admitted = admission.get();
             if (admitted != null) admitted.abandon();
+            if (admitted == null || admitted.generation == null)
+                this.metrics.request(api, ServerMetrics.Outcome.CANCELLED);
             result.setErrorResult(ApiException.timeout());
         });
         result.onError(failure -> {
@@ -105,10 +126,19 @@ public class GenerationService implements DisposableBean {
         });
         planning.whenComplete((planned, failure) -> {
             if (failure != null) {
-                result.setErrorResult(apiException(failure));
+                ApiException refused = apiException(failure);
+                if ("unsupported_schema".equals(refused.code())) this.metrics.schemaRejected(api);
+                this.metrics.request(
+                        api,
+                        refused.status().is4xxClientError()
+                                ? ServerMetrics.Outcome.INVALID
+                                : refused.status().value() == 503
+                                        ? ServerMetrics.Outcome.REJECTED
+                                        : ServerMetrics.Outcome.FAILED);
+                result.setErrorResult(refused);
                 return;
             }
-            Admission admitted = new Admission(planned, result, link);
+            Admission admitted = new Admission(planned, result, link, api, arrived);
             admitted.streaming = streaming;
             admission.set(admitted);
             admit(admitted);
@@ -119,14 +149,17 @@ public class GenerationService implements DisposableBean {
     private void admit(Admission admission) {
         synchronized (this) {
             if (this.closed) {
+                this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
                 admission.result.setErrorResult(ApiException.unavailable("The server is shutting down."));
                 return;
             }
             if (this.running != null) {
                 if (this.waiting.size() < this.maxQueued) this.waiting.add(admission);
-                else
+                else {
+                    this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
                     admission.result.setErrorResult(
                             ApiException.unavailable("The server is at generation capacity; retry later."));
+                }
                 return;
             }
             this.running = admission;
@@ -137,6 +170,7 @@ public class GenerationService implements DisposableBean {
     /// Runs on a worker with the slot held; releasing the slot starts the next admission.
     private void start(Admission admission) {
         if (admission.abandoned || admission.result.isSetOrExpired()) {
+            this.metrics.request(admission.api, ServerMetrics.Outcome.CANCELLED);
             release(admission);
             return;
         }
@@ -147,7 +181,11 @@ public class GenerationService implements DisposableBean {
                     plan.sampling(),
                     new InferenceBackend.OutputSpec(plan.reasoning(), plan.reasoningBudget(), plan.grammar()));
         } catch (RuntimeException | Error failure) {
-            admission.result.setErrorResult(apiException(failure));
+            ApiException refused = apiException(failure);
+            this.metrics.request(
+                    admission.api,
+                    refused.status().value() == 503 ? ServerMetrics.Outcome.REJECTED : ServerMetrics.Outcome.FAILED);
+            admission.result.setErrorResult(refused);
             release(admission);
             return;
         }
@@ -184,7 +222,8 @@ public class GenerationService implements DisposableBean {
                 sink,
                 new SerialTasks(this.backend.workers()),
                 () -> release(admission),
-                new ChatGeneration.Client(admission.link, clientGone, this::probeWaiting));
+                new ChatGeneration.Client(admission.link, clientGone, this::probeWaiting),
+                new ChatGeneration.Telemetry(this.metrics, admission.api, admission.arrivedNanos));
         admission.generation = job;
         if (admission.abandoned) job.abandon();
         job.start();
@@ -199,6 +238,7 @@ public class GenerationService implements DisposableBean {
         }
         for (Admission admission : gone) {
             admission.abandoned = true;
+            this.metrics.request(admission.api, ServerMetrics.Outcome.CANCELLED);
             admission.result.setErrorResult(ApiException.clientClosed());
         }
     }
@@ -228,8 +268,10 @@ public class GenerationService implements DisposableBean {
             this.waiting.clear();
             active = this.running;
         }
-        for (Admission admission : refused)
+        for (Admission admission : refused) {
+            this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
             admission.result.setErrorResult(ApiException.unavailable("The server is shutting down."));
+        }
         ChatGeneration job = active == null ? null : active.generation;
         if (job == null) return;
         job.shutDown();
