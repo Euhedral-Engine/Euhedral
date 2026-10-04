@@ -1,6 +1,6 @@
 package io.euhedral_execution.inference.core;
 
-import io.euhedral_execution.hardware_utils.SystemInfo;
+import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import java.util.BitSet;
 import java.util.Map;
 import java.util.Objects;

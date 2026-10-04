@@ -1,5 +1,5 @@
 [versions]
-euhedral-execution = "0.1.0"
+euhedral-execution = "0.2.0"
 junit = "5.11.4"
 junit-platform = "1.11.4"
 slf4j = "2.0.16"

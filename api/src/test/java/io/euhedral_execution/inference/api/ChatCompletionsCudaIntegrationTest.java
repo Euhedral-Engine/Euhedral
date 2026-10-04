@@ -5,7 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import io.euhedral_execution.hardware_utils.SystemInfo;
+import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.api.engine.EngineInferenceBackend;
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.core.InferenceEngine;

@@ -2,7 +2,7 @@ package io.euhedral_execution.inference.core;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import io.euhedral_execution.hardware_utils.SystemInfo;
+import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
 import io.euhedral_execution.inference.core.model_loader.EngineModelFixture;

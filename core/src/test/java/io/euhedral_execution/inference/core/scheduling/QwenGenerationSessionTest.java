@@ -13,7 +13,7 @@ import io.euhedral_execution.core.control_plane.ControlPlaneLattice;
 import io.euhedral_execution.core.control_plane.ControlPlaneShard;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
-import io.euhedral_execution.hardware_utils.SystemInfo;
+import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.JsonEnvelopeConstraint;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
