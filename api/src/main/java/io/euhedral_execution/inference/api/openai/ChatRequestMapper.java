@@ -34,17 +34,25 @@ public class ChatRequestMapper {
     private static final JsonMapper JSON = JsonMapper.shared();
 
     /// Accepted and ignored: these never influence the generated tokens.
-    private static final Set<String> IGNORED_METADATA =
-            Set.of("user", "metadata", "store", "service_tier", "safety_identifier", "prompt_cache_key");
+    private static final Set<String> IGNORED_METADATA = Set.of(
+            "user",
+            "metadata",
+            "store",
+            "service_tier",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention");
 
     /// Behavioral features that are not implemented; accepted only when the value requests no behavior.
     private static final Map<String, Predicate<Object>> NEUTRAL_VALUES = Map.ofEntries(
             Map.entry("n", value -> value instanceof Number number && number.doubleValue() == 1.0),
             Map.entry("logprobs", Boolean.FALSE::equals),
-            Map.entry("top_logprobs", value -> false),
+            Map.entry("top_logprobs", ChatRequestMapper::isZero),
             Map.entry("frequency_penalty", ChatRequestMapper::isZero),
             Map.entry("presence_penalty", ChatRequestMapper::isZero),
             Map.entry("repeat_penalty", value -> value instanceof Number number && number.doubleValue() == 1.0),
+            Map.entry("repetition_penalty", value -> value instanceof Number number && number.doubleValue() == 1.0),
+            Map.entry("min_p", ChatRequestMapper::isZero),
             Map.entry("logit_bias", value -> value instanceof Map<?, ?> map && map.isEmpty()),
             Map.entry("functions", value -> value instanceof List<?> list && list.isEmpty()),
             Map.entry("function_call", "none"::equals),
@@ -303,7 +311,14 @@ public class ChatRequestMapper {
                 ? request.seed()
                 : ThreadLocalRandom.current().nextLong();
         boolean greedy = temperature == 0.0f || topP == 0.0f;
-        return new GenerationConfig(temperature, this.samplingDefaults.topK(), greedy ? 1.0f : topP, seed, greedy);
+        int topK = this.samplingDefaults.topK();
+        if (request.topK() != null) {
+            // As vLLM spells it: 0 or -1 turns top-k off.
+            if (request.topK() < -1)
+                throw ApiException.invalidRequest("'top_k' must be at least 1, or 0 or -1 for no limit.", "top_k");
+            topK = Math.max(0, request.topK());
+        }
+        return new GenerationConfig(temperature, topK, greedy ? 1.0f : topP, seed, greedy);
     }
 
     private static List<String> stops(Object stop) {

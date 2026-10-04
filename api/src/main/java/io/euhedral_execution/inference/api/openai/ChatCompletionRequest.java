@@ -20,6 +20,7 @@ public record ChatCompletionRequest(
         @JsonProperty("max_completion_tokens") Integer maxCompletionTokens,
         Double temperature,
         @JsonProperty("top_p") Double topP,
+        @JsonProperty("top_k") Integer topK,
         Long seed,
         Object stop,
         Object tools,
