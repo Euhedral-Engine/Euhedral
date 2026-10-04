@@ -2,7 +2,10 @@ package io.euhedral_execution.inference.api.web;
 
 import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.api.engine.InferenceUnavailableException;
+import io.euhedral_execution.inference.core.guidance.GrammarCompiler;
+import io.euhedral_execution.inference.core.guidance.Llguidance;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -144,13 +147,31 @@ final class ScriptedInferenceBackend implements InferenceBackend {
                 this.workers);
     }
 
+    /// Real llguidance over a byte vocabulary: whether a grammar or schema compiles does not depend on the
+    /// vocabulary, so requests are refused as the engine refuses them.
+    private static final GrammarCompiler GRAMMARS = new GrammarCompiler(
+            Llguidance.load(Path.of(System.getProperty("euhedral.llguidance.library"))),
+            257,
+            id -> id < 256 ? new byte[] {(byte) id} : new byte[] {(byte) 0xff, '<', 'e', 'o', 's', '>'},
+            new int[] {256});
+
+    @Override
+    public void checkGrammar(String grammar) {
+        GRAMMARS.check(grammar);
+    }
+
+    @Override
+    public void checkJsonSchema(String schema) {
+        GRAMMARS.checkJsonSchema(schema);
+    }
+
     @Override
     public Generation openGeneration(GenerationConfig config, OutputSpec output) {
         if (!this.available) throw new InferenceUnavailableException("inference engine is shutting down");
         Script script = this.script;
         if (output.reasoning() && this.emptyReasoning) script = thinkingNothing(script);
         var generation = new ScriptedGeneration(config, script, this.workers);
-        generation.constraint = output.tools();
+        generation.grammar = output.grammar();
         generation.output = output;
         this.generations.add(generation);
         return generation;
@@ -168,7 +189,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         private final Script script;
         private final AtomicBoolean cancelled = new AtomicBoolean();
         volatile String prompt;
-        volatile ToolConstraint constraint;
+        volatile String grammar;
         volatile OutputSpec output;
         volatile int maxNewTokens;
         volatile String generatingThread;

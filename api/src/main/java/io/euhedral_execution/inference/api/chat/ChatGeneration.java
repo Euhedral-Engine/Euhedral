@@ -26,6 +26,10 @@ import org.slf4j.LoggerFactory;
 /// and it cancels the session so no further quantum starts.
 final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.Output {
     private static final Logger LOG = LoggerFactory.getLogger(ChatGeneration.class);
+    private static final tools.jackson.databind.json.JsonMapper JSON = tools.jackson.databind.json.JsonMapper.builder()
+            .enable(tools.jackson.core.StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+            .enable(tools.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .build();
 
     private final ChatCompletionPlan plan;
     private final InferenceBackend.Generation generation;
@@ -37,6 +41,8 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     private final ReasoningSplitter reasoning;
     // Null when the request offers no callable tools: output is then plain text, byte for byte.
     private final JsonToolCallParser toolParser;
+    // The answer of a JSON response format without tools, checked once whole.
+    private final StringBuilder jsonAnswer;
     // Set by container threads and failed writes; read everywhere.
     private final AtomicBoolean abandoned = new AtomicBoolean();
     private final AtomicBoolean shutdown = new AtomicBoolean();
@@ -60,7 +66,10 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
         this.finished = finished;
         this.stopFilter = new StopSequenceFilter(plan.stops());
         this.reasoning = plan.reasoning() ? new ReasoningSplitter() : null;
-        this.toolParser = plan.tools().parsesOutput() ? new JsonToolCallParser(plan.tools()) : null;
+        this.toolParser = plan.tools().parsesOutput()
+                ? new JsonToolCallParser(plan.tools(), plan.format().json())
+                : null;
+        this.jsonAnswer = plan.format().json() && this.toolParser == null ? new StringBuilder() : null;
     }
 
     /// The client disconnected or timed out: stop generating. Safe from any thread and after completion.
@@ -130,6 +139,12 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                 deliverFailure(OpenAiException.unavailable("Generation was interrupted by engine shutdown."));
                 return;
             }
+            // The grammar admits only valid documents; a finished one that does not parse is never returned.
+            if (this.jsonAnswer != null && result.stopTokenReached() && !isJson(this.jsonAnswer.toString())) {
+                LOG.error("Chat completion {} produced invalid JSON under its response format", this.plan.id());
+                deliverFailure(OpenAiException.invalidStructuredOutput());
+                return;
+            }
             String finishReason = finishReason(result);
             Usage usage = Usage.of(
                     this.plan.promptTokens(),
@@ -189,7 +204,18 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     /// Assistant text after raw output has passed stop-sequence filtering.
     @Override
     public void content(String text) {
-        if (!text.isEmpty()) write(() -> this.sink.text(text));
+        if (text.isEmpty()) return;
+        if (this.jsonAnswer != null) this.jsonAnswer.append(text);
+        write(() -> this.sink.text(text));
+    }
+
+    private static boolean isJson(String text) {
+        try {
+            JSON.readTree(text);
+            return true;
+        } catch (tools.jackson.core.JacksonException invalid) {
+            return false;
+        }
     }
 
     /// A complete call after raw output has passed stop-sequence filtering.

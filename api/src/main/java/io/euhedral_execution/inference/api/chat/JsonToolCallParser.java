@@ -29,6 +29,8 @@ final class JsonToolCallParser {
     private final Map<String, FunctionTool> callable = new HashMap<>();
     private final boolean parallel;
     private final boolean requiresCall;
+    // A direct answer is a JSON document of the response format rather than a JSON string.
+    private final boolean structuredContent;
     private final StringBuilder buffer = new StringBuilder();
     private State state = State.CONTENT;
     private int scanned;
@@ -38,6 +40,11 @@ final class JsonToolCallParser {
     private int calls;
 
     JsonToolCallParser(ToolCalling tools) {
+        this(tools, false);
+    }
+
+    JsonToolCallParser(ToolCalling tools, boolean structuredContent) {
+        this.structuredContent = structuredContent;
         for (FunctionTool tool : tools.callable()) this.callable.put(tool.name(), tool);
         this.parallel = tools.parallel();
         this.requiresCall =
@@ -146,9 +153,10 @@ final class JsonToolCallParser {
         }
         if (decoded instanceof Map<?, ?> content
                 && content.keySet().equals(Set.of("content"))
-                && content.get("content") instanceof String answer) {
+                && (this.structuredContent || content.get("content") instanceof String)) {
             if (this.requiresCall) throw malformed("the model did not make the required function call");
-            output.content(answer);
+            Object answer = content.get("content");
+            output.content(this.structuredContent ? JSON.writeValueAsString(answer) : (String) answer);
             return;
         }
         if (!(decoded instanceof Map<?, ?> root)
@@ -203,13 +211,14 @@ final class JsonToolCallParser {
     /// A JSON envelope can contain whitespace between its structural tokens, including across chunks.
     /// Returns 1 for a complete opening, 0 for an incomplete possible opening, -1 otherwise.
     private int openingAt(int start) {
-        int tool = openingFor(start, KEY, '[');
-        int content = openingFor(start, CONTENT_KEY, '"');
+        int tool = openingFor(start, KEY, "[");
+        // A structured answer is any JSON document; a plain one is a string.
+        int content = openingFor(start, CONTENT_KEY, this.structuredContent ? "\"{[-0123456789tfn" : "\"");
         if (tool == 1 || content == 1) return 1;
         return tool == 0 || content == 0 ? 0 : -1;
     }
 
-    private int openingFor(int start, String key, char valueStart) {
+    private int openingFor(int start, String key, String valueStarts) {
         int index = start + 1;
         while (index < this.buffer.length() && jsonSpace(this.buffer.charAt(index))) index++;
         for (int offset = 0; offset < key.length(); offset++) {
@@ -221,7 +230,7 @@ final class JsonToolCallParser {
         if (this.buffer.charAt(index++) != ':') return -1;
         while (index < this.buffer.length() && jsonSpace(this.buffer.charAt(index))) index++;
         if (index == this.buffer.length()) return 0;
-        return this.buffer.charAt(index) == valueStart ? 1 : -1;
+        return valueStarts.indexOf(this.buffer.charAt(index)) >= 0 ? 1 : -1;
     }
 
     private static boolean jsonSpace(char value) {

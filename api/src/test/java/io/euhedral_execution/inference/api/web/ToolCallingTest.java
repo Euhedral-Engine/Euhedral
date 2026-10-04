@@ -60,7 +60,7 @@ class ToolCallingTest {
         assertTrue(this.backend.only().prompt.contains("If a function is needed, reply ONLY with one JSON object"));
         assertTrue(this.backend.only().prompt.contains("get_weather"));
         assertTrue(!this.backend.only().prompt.contains("<tool_call>"));
-        assertTrue(this.backend.only().constraint != null, "offered tools must constrain production sampling");
+        assertTrue(this.backend.only().grammar != null, "offered tools must constrain production sampling");
     }
 
     @Test
@@ -278,8 +278,10 @@ class ToolCallingTest {
                 .andExpect(jsonPath("$.choices[0].message.tool_calls[0].function.name")
                         .value("get_weather"));
         assertTrue(this.backend.only().prompt.contains("must call get_weather"));
-        assertEquals(List.of("get_weather"), this.backend.only().constraint.toolNames());
-        assertTrue(this.backend.only().constraint.requiresCall());
+        String grammar = this.backend.only().grammar;
+        assertTrue(grammar.contains("\\\"name\\\":\\\"get_weather\\\""), grammar);
+        assertEquals(2, grammar.split("arguments_").length - 1, "only the named function is callable");
+        assertTrue(grammar.contains("body: calls\n"), "a named choice offers no direct answer");
         assertTrue(this.backend.only().prompt.endsWith("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
@@ -297,7 +299,7 @@ class ToolCallingTest {
                 .andExpect(jsonPath("$.choices[0].finish_reason").value("tool_calls"));
         String prompt = this.backend.only().prompt;
         assertTrue(prompt.contains("MUST call one of the offered functions"));
-        assertTrue(this.backend.only().constraint.requiresCall());
+        assertTrue(this.backend.only().grammar.contains("body: calls\n"), "a required call offers no direct answer");
         assertTrue(prompt.endsWith("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 
         this.backend.reset();
@@ -345,7 +347,9 @@ class ToolCallingTest {
                 .andExpect(jsonPath("$.choices[0].message.tool_calls.length()").value(1))
                 .andExpect(jsonPath("$.choices[0].finish_reason").value("tool_calls"));
         var generation = this.backend.only();
-        assertTrue(!generation.constraint.parallel(), "the request's single-call limit must reach the sampler");
+        assertTrue(
+                !generation.grammar.contains("(\",\" call)*"),
+                "the request's single-call limit must reach the sampler");
         assertTrue(generation.isCancelled(), "decoding must stop once the single allowed call is complete");
         assertEquals(1, generation.emitted.get(), "no quantum may run after the single allowed call");
         // The response's last write may reach the client before the completion closes the session.
@@ -550,9 +554,15 @@ class ToolCallingTest {
                         null,
                         "tools[0].function.parameters.type"),
                 new Case(
-                        "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"strict\":true}}]",
+                        "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"strict\":true,\"parameters\":"
+                                + "{\"type\":\"object\",\"properties\":{\"a\":{\"not\":{}}}}}}]",
                         400,
-                        "unsupported_parameter",
+                        null,
+                        "tools[0].function.parameters"),
+                new Case(
+                        "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"strict\":1}}]",
+                        400,
+                        null,
                         "tools[0].function.strict"),
                 new Case(
                         "[{\"type\":\"function\",\"function\":{\"name\":\"f\"},\"extra\":1}]",

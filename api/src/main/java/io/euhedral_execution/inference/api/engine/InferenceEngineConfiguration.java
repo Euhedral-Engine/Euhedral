@@ -48,7 +48,7 @@ public class InferenceEngineConfiguration {
         }
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     EngineInferenceBackend inferenceBackend(
             InferenceEngine engine, InferenceProperties properties, QwenChatTemplate chatTemplate) {
         return new EngineInferenceBackend(engine, properties.modelId(), chatTemplate);

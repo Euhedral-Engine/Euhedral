@@ -282,6 +282,64 @@ class ChatCompletionsCudaIntegrationTest {
         assertSessionsReleased(before);
     }
 
+    @Test
+    @Order(7)
+    void aJsonSchemaResponseIsAValidDocument() throws Exception {
+        DeviceBytes before = deviceBytes();
+        for (String sampling : List.of("\"temperature\":0", "\"temperature\":1,\"seed\":7")) {
+            var response = post("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\"," + sampling
+                    + ",\"max_tokens\":256,\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{"
+                    + "\"name\":\"city\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{"
+                    + "\"city\":{\"type\":\"string\"},\"country\":{\"type\":\"string\"},"
+                    + "\"population_millions\":{\"type\":\"number\",\"minimum\":0},"
+                    + "\"continent\":{\"enum\":[\"Europe\",\"Asia\",\"Africa\",\"America\",\"Oceania\"]}},"
+                    + "\"required\":[\"city\",\"country\",\"population_millions\",\"continent\"],"
+                    + "\"additionalProperties\":false}}},\"messages\":[{\"role\":\"user\",\"content\":"
+                    + "\"Describe the capital of Norway as JSON.\"}]}");
+            assertEquals(200, response.statusCode(), response.body());
+            JsonNode completion = JSON.readTree(response.body());
+            System.out.println("Structured completion (" + sampling + "): " + completion);
+            assertEquals("stop", completion.at("/choices/0/finish_reason").asString());
+            JsonNode city =
+                    JSON.readTree(completion.at("/choices/0/message/content").asString());
+            assertEquals(
+                    java.util.Set.of("city", "country", "population_millions", "continent"),
+                    new java.util.HashSet<>(city.propertyNames()));
+            assertTrue(city.get("population_millions").isNumber()
+                    && city.get("population_millions").asDouble() >= 0);
+            assertEquals("Europe", city.get("continent").asString());
+        }
+        assertSessionsReleased(before);
+    }
+
+    @Test
+    @Order(8)
+    void aStrictToolCallFollowsItsSchemaAfterReasoning() throws Exception {
+        DeviceBytes before = deviceBytes();
+        var response = post("{\"model\":\"" + MODEL
+                + "\",\"reasoning_effort\":\"low\",\"temperature\":0,\"max_tokens\":2048,\"tool_choice\":\"required\","
+                + "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"set_alarm\",\"strict\":true,"
+                + "\"description\":\"Sets an alarm.\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+                + "\"hour\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":23},"
+                + "\"minute\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":59},"
+                + "\"days\":{\"type\":\"array\",\"items\":{\"enum\":[\"mon\",\"tue\",\"wed\",\"thu\",\"fri\","
+                + "\"sat\",\"sun\"]},\"maxItems\":7}},\"required\":[\"hour\",\"minute\",\"days\"],"
+                + "\"additionalProperties\":false}}}],\"messages\":[{\"role\":\"user\",\"content\":"
+                + "\"Wake me at half past six on weekdays.\"}]}");
+        assertEquals(200, response.statusCode(), response.body());
+        JsonNode completion = JSON.readTree(response.body());
+        System.out.println("Strict tool call: " + completion);
+        JsonNode arguments = JSON.readTree(completion
+                .at("/choices/0/message/tool_calls/0/function/arguments")
+                .asString());
+        assertEquals(java.util.Set.of("hour", "minute", "days"), new java.util.HashSet<>(arguments.propertyNames()));
+        assertEquals(6, arguments.get("hour").asInt());
+        assertEquals(30, arguments.get("minute").asInt());
+        for (JsonNode day : arguments.get("days"))
+            assertTrue(List.of("mon", "tue", "wed", "thu", "fri", "sat", "sun").contains(day.asString()));
+        assertSessionsReleased(before);
+    }
+
     /// The engine's device bytes and the part its execution graphs retain between quanta.
     private record DeviceBytes(long allocated, long retainedWorkspace) {}
 
@@ -387,6 +445,16 @@ class ChatCompletionsCudaIntegrationTest {
         @Override
         public java.util.concurrent.CompletableFuture<EncodedPrompt> encodePrompt(String prompt) {
             return this.delegate.encodePrompt(prompt);
+        }
+
+        @Override
+        public void checkGrammar(String grammar) {
+            this.delegate.checkGrammar(grammar);
+        }
+
+        @Override
+        public void checkJsonSchema(String schema) {
+            this.delegate.checkJsonSchema(schema);
         }
 
         @Override

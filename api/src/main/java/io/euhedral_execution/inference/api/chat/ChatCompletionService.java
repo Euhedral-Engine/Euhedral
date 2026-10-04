@@ -168,13 +168,8 @@ public class ChatCompletionService implements DisposableBean {
     }
 
     private InferenceBackend.Generation open(ChatCompletionPlan plan) {
-        InferenceBackend.ToolConstraint tools = plan.tools().parsesOutput()
-                ? new InferenceBackend.ToolConstraint(
-                        plan.tools().callable().stream().map(FunctionTool::name).toList(),
-                        plan.tools().choice() != ToolCalling.Choice.AUTO,
-                        plan.tools().parallel())
-                : null;
-        return this.backend.openGeneration(plan.sampling(), new InferenceBackend.OutputSpec(plan.reasoning(), tools));
+        return this.backend.openGeneration(
+                plan.sampling(), new InferenceBackend.OutputSpec(plan.reasoning(), plan.grammar()));
     }
 
     /// The OpenAI error for a failed planning or start.

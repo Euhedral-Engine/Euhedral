@@ -60,6 +60,11 @@ public final class QwenChatTemplate {
             + " arrive as a JSON tool_results array in call order."
             + " If no function is needed, reply ONLY with {\"content\":\"answer\"}, putting the full answer"
             + " in the JSON string. Never emit markdown, XML, or text outside the JSON object.";
+    /// The same, when a direct answer must be a JSON document of the response format.
+    private static final String JSON_TOOL_INSTRUCTIONS_STRUCTURED = JSON_TOOL_INSTRUCTIONS.replace(
+            "{\"content\":\"answer\"}, putting the full answer in the JSON string",
+            "{\"content\":RESPONSE}, where RESPONSE is your full answer as the JSON value the response format"
+                    + " requires");
 
     /// Exact Jinja source fragments whose behavior `render` reproduces. `\n` is the Jinja escape.
     private static final List<String> REQUIRED_FRAGMENTS = List.of(
@@ -234,11 +239,12 @@ public final class QwenChatTemplate {
     /// Renders the conversation with tool definitions, each a JSON object serialized as the template's
     /// `tool | tojson`. An empty list renders exactly as the template does without tools.
     public String render(List<Turn> turns, List<Map<String, Object>> tools, Thinking thinking) {
-        return render(turns, tools, thinking, false, "");
+        return render(turns, tools, thinking, 0, "");
     }
 
-    /// Uses JSON tool-call envelopes instead of unescaped XML parameter values.
-    public String renderJsonTools(List<Turn> turns, ToolCalling calling, Thinking thinking) {
+    /// Uses JSON tool-call envelopes instead of unescaped XML parameter values. With `structuredAnswer` a direct
+    /// answer is a JSON document rather than a JSON string.
+    public String renderJsonTools(List<Turn> turns, ToolCalling calling, boolean structuredAnswer, Thinking thinking) {
         List<Map<String, Object>> tools = calling.promptTools();
         if (tools.isEmpty()) throw new IllegalArgumentException("JSON tool rendering requires offered tools");
         String constraint =
@@ -252,15 +258,17 @@ public final class QwenChatTemplate {
         String callCount = calling.parallel()
                 ? " Multiple calls belong in the same array."
                 : " At most one function call is allowed in tool_calls.";
-        return render(turns, tools, thinking, true, callCount + constraint);
+        return render(turns, tools, thinking, structuredAnswer ? 2 : 1, callCount + constraint);
     }
 
+    public String renderJsonTools(List<Turn> turns, ToolCalling calling, Thinking thinking) {
+        return renderJsonTools(turns, calling, false, thinking);
+    }
+
+    /// `jsonMode` 0 renders the template's XML calls, 1 JSON envelopes, 2 envelopes with a JSON-document answer.
     private String render(
-            List<Turn> turns,
-            List<Map<String, Object>> tools,
-            Thinking thinking,
-            boolean jsonTools,
-            String constraint) {
+            List<Turn> turns, List<Map<String, Object>> tools, Thinking thinking, int jsonMode, String constraint) {
+        boolean jsonTools = jsonMode > 0;
         Objects.requireNonNull(turns, "turns");
         Objects.requireNonNull(tools, "tools");
         Objects.requireNonNull(thinking, "thinking");
@@ -278,7 +286,9 @@ public final class QwenChatTemplate {
             prompt.append("\n</tools>");
             if (!jsonTools) prompt.append(TOOL_INSTRUCTIONS);
             if (!system.isEmpty()) prompt.append("\n\n").append(system);
-            if (jsonTools) prompt.append(JSON_TOOL_INSTRUCTIONS).append(constraint);
+            if (jsonTools)
+                prompt.append(jsonMode == 2 ? JSON_TOOL_INSTRUCTIONS_STRUCTURED : JSON_TOOL_INSTRUCTIONS)
+                        .append(constraint);
             prompt.append(IM_END).append('\n');
         } else if (!system.isEmpty() || !instructions.isEmpty()) {
             prompt.append(IM_START).append("system\n").append(instructions);

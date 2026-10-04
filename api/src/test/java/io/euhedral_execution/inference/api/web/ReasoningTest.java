@@ -62,7 +62,7 @@ class ReasoningTest {
         assertTrue(prompt.startsWith("<|im_start|>system\n" + XHIGH), prompt);
         assertTrue(prompt.endsWith("<|im_start|>assistant\n<think>\n"), prompt);
         assertTrue(this.backend.only().output.reasoning());
-        assertNull(this.backend.only().constraint, "free reasoning needs no sampling constraint");
+        assertNull(this.backend.only().grammar, "free reasoning needs no sampling constraint");
     }
 
     @Test
@@ -209,7 +209,8 @@ class ReasoningTest {
         assertEquals("tool_calls", response.at("/choices/0/finish_reason").asString());
         var generation = this.backend.only();
         assertTrue(generation.output.reasoning());
-        assertNotNull(generation.constraint, "the answer after the reasoning is constrained");
+        assertNotNull(generation.grammar, "the answer after the reasoning is constrained");
+        assertTrue(generation.grammar.startsWith("start: GAP? body"), "the answer may follow a blank line");
         assertTrue(generation.prompt.startsWith("<|im_start|>system\n" + XHIGH), generation.prompt);
         assertTrue(generation.prompt.contains("in the final answer.\n\n# Tools"), generation.prompt);
     }

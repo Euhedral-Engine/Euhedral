@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.api.engine.InferenceBackend;
 import io.euhedral_execution.inference.api.openai.ChatCompletionRequest;
 import io.euhedral_execution.inference.api.openai.ChatMessage;
 import io.euhedral_execution.inference.api.openai.OpenAiException;
+import io.euhedral_execution.inference.core.guidance.GrammarException;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -44,9 +45,6 @@ public class ChatRequestMapper {
             Map.entry("logit_bias", value -> value instanceof Map<?, ?> map && map.isEmpty()),
             Map.entry("functions", value -> value instanceof List<?> list && list.isEmpty()),
             Map.entry("function_call", "none"::equals),
-            Map.entry(
-                    "response_format",
-                    value -> value instanceof Map<?, ?> map && map.size() == 1 && "text".equals(map.get("type"))),
             Map.entry("modalities", List.of("text")::equals),
             Map.entry("audio", value -> false),
             Map.entry("prediction", value -> false),
@@ -81,6 +79,8 @@ public class ChatRequestMapper {
             boolean includeUsage,
             ToolCalling tools,
             QwenChatTemplate.Thinking thinking,
+            ResponseFormat format,
+            String grammar,
             String prompt) {}
 
     /// Validates and plans a request on the backend's workers: rendering and validation run as worker tasks,
@@ -102,8 +102,22 @@ public class ChatRequestMapper {
         ToolCalling tools = ToolCalling.fromRequest(request.tools(), request.toolChoice(), request.parallelToolCalls());
         QwenChatTemplate.Thinking thinking =
                 Reasoning.thinking(request.reasoningEffort(), request.chatTemplateKwargs());
+        ResponseFormat format = ResponseFormat.fromRequest(request.responseFormat());
+        if (format.json() && request.stop() != null)
+            throw OpenAiException.invalidRequest(
+                    "'stop' cannot be combined with a JSON 'response_format': a stop inside the JSON would end it"
+                            + " invalid.",
+                    "stop");
+        String grammar = grammar(tools, format, thinking.enabled());
         return new Rendered(
-                request, stream, includeUsage, tools, thinking, renderPrompt(request.messages(), tools, thinking));
+                request,
+                stream,
+                includeUsage,
+                tools,
+                thinking,
+                format,
+                grammar,
+                renderPrompt(request.messages(), tools, format, thinking));
     }
 
     /// Completes the plan of a rendered request with its encoded prompt: the completion budget against the
@@ -122,7 +136,9 @@ public class ChatRequestMapper {
                 rendered.stream(),
                 rendered.includeUsage(),
                 rendered.tools(),
-                rendered.thinking().enabled());
+                rendered.thinking().enabled(),
+                rendered.format(),
+                rendered.grammar());
     }
 
     private void requireServedModel(String model) {
@@ -145,7 +161,42 @@ public class ChatRequestMapper {
         return Boolean.TRUE.equals(options.includeUsage());
     }
 
-    private String renderPrompt(List<ChatMessage> messages, ToolCalling tools, QwenChatTemplate.Thinking thinking) {
+    /// The answer's grammar, or null for free text. Each schema is first compiled on its own, so a refusal names
+    /// the request field it came from.
+    private String grammar(ToolCalling tools, ResponseFormat format, boolean reasoning) {
+        if (format.kind() == ResponseFormat.Kind.JSON_SCHEMA)
+            checkSchema(format.schema(), "response_format.json_schema.schema");
+        String grammar;
+        if (tools.parsesOutput()) {
+            List<FunctionTool> callable = tools.callable();
+            for (FunctionTool tool : callable) {
+                if (!tool.strict()) continue;
+                int index = tools.tools().indexOf(tool);
+                checkSchema(tool.parametersOrEmpty(), "tools[" + index + "].function.parameters");
+            }
+            grammar = OutputGrammar.tools(tools, format.answerSchema(), reasoning);
+        } else if (format.json()) {
+            grammar = OutputGrammar.json(format.answerSchema(), reasoning);
+        } else return null;
+        try {
+            this.backend.checkGrammar(grammar);
+        } catch (GrammarException refused) {
+            throw OpenAiException.invalidRequest(
+                    "The requested output cannot be enforced: " + refused.getMessage(), "response_format");
+        }
+        return grammar;
+    }
+
+    private void checkSchema(Map<String, Object> schema, String param) {
+        try {
+            this.backend.checkJsonSchema(OutputGrammar.schemaText(schema));
+        } catch (GrammarException refused) {
+            throw OpenAiException.invalidRequest("The JSON Schema cannot be enforced: " + refused.getMessage(), param);
+        }
+    }
+
+    private String renderPrompt(
+            List<ChatMessage> messages, ToolCalling tools, ResponseFormat format, QwenChatTemplate.Thinking thinking) {
         if (messages == null || messages.isEmpty())
             throw OpenAiException.invalidRequest("'messages' must contain at least one message.", "messages");
         List<QwenChatTemplate.Turn> turns = new ArrayList<>(messages.size());
@@ -186,7 +237,7 @@ public class ChatRequestMapper {
         if (pending != null) pending.closeInto(turns);
         try {
             return (tools.parsesOutput()
-                            ? this.chatTemplate.renderJsonTools(turns, tools, thinking)
+                            ? this.chatTemplate.renderJsonTools(turns, tools, format.json(), thinking)
                             : this.chatTemplate.render(turns, tools.promptTools(), thinking))
                     + tools.generationPrefix();
         } catch (QwenChatTemplate.InvalidConversationException invalid) {
