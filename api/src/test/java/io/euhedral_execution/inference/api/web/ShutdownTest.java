@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.api.web;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -57,7 +58,7 @@ class ShutdownTest {
             running.readUntil(line -> line.contains("\"tok0 \""));
             CompletableFuture<HttpResponse<String>> queued =
                     client.sendAsync(json(20), HttpResponse.BodyHandlers.ofString());
-            Thread.sleep(200);
+            awaitQueued();
             CompletableFuture<Void> shutdown = CompletableFuture.runAsync(this.context::close);
 
             List<String> stream = running.readUntil(line -> line.contains("[DONE]"));
@@ -80,7 +81,7 @@ class ShutdownTest {
             running.readUntil(line -> line.contains("\"tok0 \""));
             CompletableFuture<HttpResponse<String>> queued =
                     client.sendAsync(json(3000), HttpResponse.BodyHandlers.ofString());
-            Thread.sleep(200);
+            awaitQueued();
             CompletableFuture<Void> shutdown = CompletableFuture.runAsync(this.context::close);
 
             List<String> stream = running.readUntil(line -> line.contains("\"error\""));
@@ -92,6 +93,20 @@ class ShutdownTest {
         }
         assertEquals(1, this.backend.generations.size(), "the queued request opened no session");
         assertTrue(this.backend.generations.getFirst().awaitClosed());
+    }
+
+    /// Until the second request waits behind the first. A connection the server has not yet accepted when the
+    /// shutdown begins is reset instead of answered.
+    private void awaitQueued() throws InterruptedException {
+        var queued = this.context
+                .getBean(MeterRegistry.class)
+                .get("euhedral.generations.queued")
+                .gauge();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        while (queued.value() < 1) {
+            if (System.nanoTime() > deadline) throw new AssertionError("the second request was never queued");
+            Thread.sleep(5);
+        }
     }
 
     private HttpRequest json(int maxTokens) {

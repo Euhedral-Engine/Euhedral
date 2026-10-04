@@ -73,7 +73,7 @@ class SetupCheckTest {
                                 + "no file at "),
                 problems.get(0));
         assertTrue(problems.get(1).contains("has no tokenizer.json, generation_config.json"), problems.get(1));
-        assertTrue(problems.get(2).contains("share/euhedral_cuda"), problems.get(2));
+        assertTrue(problems.get(2).contains(Path.of("share", "euhedral_cuda").toString()), problems.get(2));
         assertTrue(problems.get(3).startsWith("euhedral.inference.cuda-library-path"), problems.get(3));
         assertTrue(problems.get(3).contains(System.mapLibraryName("llguidance")), problems.get(3));
         assertTrue(problems.get(4).startsWith("EUHEDRAL_CUDA_INCLUDE_DIR: "), problems.get(4));
