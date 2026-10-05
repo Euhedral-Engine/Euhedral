@@ -387,6 +387,14 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_graph_destroy(uint64_t exec);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_notify(
         uint64_t stream, void (*callback)(uint64_t, int), uint64_t token);
 
+/// The Flash-Next (qwen4_exp) kernels (src/qwen4): one table, one launcher. `words` holds the arguments, each 8 bytes wide
+/// in the array and `sizes[i]` (4 or 8) bytes wide in the kernel's signature; both are checked against the compiled kernel.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_qwen4_kernel_count(void);
+EUHEDRAL_CUDA_EXPORT const char* euhedral_cuda_qwen4_kernel_name(int index);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_qwen4_launch(int32_t kernel, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+        uint32_t block_x, uint32_t block_y, uint32_t block_z, uint32_t shared_bytes,
+        const uint64_t* words, const uint8_t* sizes, int32_t count);
+
 #ifdef __cplusplus
 }
 #endif

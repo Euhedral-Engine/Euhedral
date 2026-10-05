@@ -135,6 +135,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle dflashSelectBf16;
     private final MethodHandle argmaxBf16;
     private final MethodHandle zeroDeviceMemory;
+    private final MethodHandle qwen4Launch;
+    private final MethodHandle qwen4KernelCount;
+    private final MethodHandle qwen4KernelName;
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
     private final MethodHandle attentionCausalNvfp4;
@@ -512,6 +515,30 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, i32, p, p));
             this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
+            this.qwen4Launch = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_qwen4_launch",
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_INT));
+            this.qwen4KernelCount = bind(
+                    linker, symbols, "euhedral_cuda_qwen4_kernel_count", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+            this.qwen4KernelName = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_qwen4_kernel_name",
+                    FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
             this.attentionQkNormRopeBf16 =
                     bind(linker, symbols, "euhedral_cuda_attention_qk_norm_rope_bf16", ATTENTION_QK_NORM_ROPE_BF16);
             this.attentionKvAppendNvfp4 =
@@ -2667,6 +2694,68 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 rank,
                 at(tokens),
                 at(scores));
+    }
+
+    /// Argument staging of [#launchQwen4]: off-heap word and size arrays, one pair per launching thread.
+    private final ThreadLocal<MemorySegment[]> qwen4Staging = ThreadLocal.withInitial(() -> {
+        Arena staging = Arena.ofAuto();
+        return new MemorySegment[] {
+            staging.allocate(8L * Qwen4KernelArguments.MAX, 8), staging.allocate(Qwen4KernelArguments.MAX, 8)
+        };
+    });
+
+    @Override
+    public void launchQwen4(
+            Qwen4Kernel kernel,
+            int gridX,
+            int gridY,
+            int gridZ,
+            int blockX,
+            int blockY,
+            int blockZ,
+            int sharedBytes,
+            Qwen4KernelArguments arguments) {
+        ensureOpen();
+        Objects.requireNonNull(kernel, "kernel");
+        if (gridX <= 0 || gridY <= 0 || gridZ <= 0 || blockX <= 0 || blockY <= 0 || blockZ <= 0 || sharedBytes < 0)
+            throw new IllegalArgumentException("invalid launch geometry for " + kernel);
+        MemorySegment[] staging = this.qwen4Staging.get();
+        MemorySegment.copy(arguments.words(), 0, staging[0], ValueLayout.JAVA_LONG, 0, arguments.count());
+        MemorySegment.copy(arguments.sizes(), 0, staging[1], ValueLayout.JAVA_BYTE, 0, arguments.count());
+        int status;
+        try {
+            status = (int) this.qwen4Launch.invokeExact(
+                    kernel.ordinal(),
+                    gridX,
+                    gridY,
+                    gridZ,
+                    blockX,
+                    blockY,
+                    blockZ,
+                    sharedBytes,
+                    staging[0],
+                    staging[1],
+                    arguments.count());
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("Flash-Next kernel " + kernel + " invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException("Flash-Next kernel " + kernel, status);
+    }
+
+    /// The native launcher's kernel names, in table order (a test compares them with [Qwen4Kernel]).
+    public java.util.List<String> qwen4KernelNames() {
+        ensureOpen();
+        try {
+            int count = (int) this.qwen4KernelCount.invokeExact();
+            java.util.List<String> names = new java.util.ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                MemorySegment name = (MemorySegment) this.qwen4KernelName.invokeExact(i);
+                names.add(name.reinterpret(256).getString(0));
+            }
+            return names;
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("Flash-Next kernel table query failed", throwable);
+        }
     }
 
     @Override
