@@ -86,7 +86,7 @@ public final class FileExpertStore implements HostExpertStore {
                         this.banks[bank],
                         expert,
                         MemorySegment.ofAddress(address).reinterpret(size));
-            } catch (IOException | RuntimeException | Error failure) {
+            } catch (IOException | InterruptedException | RuntimeException | Error failure) {
                 this.arena.giveBack();
                 throw failure;
             }
