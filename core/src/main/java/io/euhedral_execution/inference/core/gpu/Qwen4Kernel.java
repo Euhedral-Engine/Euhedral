@@ -23,7 +23,11 @@ public enum Qwen4Kernel {
     QSA_SELECT("euhedral_q4_qsa_select"),
     QSA_ATTENTION("euhedral_q4_qsa_attention"),
     QSA_MERGE("euhedral_q4_qsa_merge"),
-    QSA_KV_APPEND("euhedral_q4_qsa_kv_append");
+    QSA_KV_APPEND("euhedral_q4_qsa_kv_append"),
+    ROUTER_BF16("euhedral_q4_router_bf16"),
+    SWIGLU_BF16("euhedral_q4_swiglu_bf16"),
+    MOE_FINISH_BF16("euhedral_q4_moe_finish_bf16"),
+    EMBEDDING_BF16("euhedral_q4_embedding_bf16");
 
     private final String symbol;
 

@@ -232,4 +232,51 @@ final class Qwen4Reference {
         }
         return output;
     }
+
+    /// The router's selection of one row: experts by descending probability (lower expert first on ties) and their
+    /// BF16 weights after renormalization.
+    record Routing(int[] ids, short[] weights) {}
+
+    static Routing router(short[] logits, int row, int experts, int k) {
+        double maximum = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < experts; i++) maximum = Math.max(maximum, bf(logits[row * experts + i]));
+        float[] p = new float[experts];
+        double sum = 0;
+        for (int i = 0; i < experts; i++) {
+            p[i] = (float) Math.exp(bf(logits[row * experts + i]) - maximum);
+            sum += p[i];
+        }
+        for (int i = 0; i < experts; i++) p[i] = (float) (p[i] / sum);
+        int[] ids = new int[k];
+        float[] values = new float[k];
+        boolean[] taken = new boolean[experts];
+        for (int t = 0; t < k; t++) {
+            int best = -1;
+            for (int i = 0; i < experts; i++) if (!taken[i] && (best < 0 || p[i] > p[best])) best = i;
+            taken[best] = true;
+            ids[t] = best;
+            values[t] = p[best];
+        }
+        double total = 0;
+        for (float v : values) total += v;
+        short[] weights = new short[k];
+        for (int t = 0; t < k; t++) weights[t] = bits((float) (values[t] / total));
+        return new Routing(ids, weights);
+    }
+
+    static short[] swiGlu(short[] gate, short[] up) {
+        short[] out = new short[gate.length];
+        for (int i = 0; i < out.length; i++) out[i] = bits(r(silu(bf(gate[i]))) * bf(up[i]));
+        return out;
+    }
+
+    static short[] moeFinish(short[] routed, short[] shared, short[] gate, int rows, int width) {
+        short[] out = new short[rows * width];
+        for (int row = 0; row < rows; row++) {
+            float scale = r(sigmoid(bf(gate[row])));
+            for (int d = 0; d < width; d++)
+                out[row * width + d] = bits(bf(routed[row * width + d]) + r(scale * bf(shared[row * width + d])));
+        }
+        return out;
+    }
 }

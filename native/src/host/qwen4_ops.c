@@ -50,6 +50,10 @@ static const Qwen4KernelEntry kernels[] = {
     {"euhedral_q4_qsa_attention", 28224},
     {"euhedral_q4_qsa_merge", 0},
     {"euhedral_q4_qsa_kv_append", 0},
+    {"euhedral_q4_router_bf16", 0},
+    {"euhedral_q4_swiglu_bf16", 0},
+    {"euhedral_q4_moe_finish_bf16", 0},
+    {"euhedral_q4_embedding_bf16", 0},
 };
 #define KERNEL_COUNT ((int)(sizeof(kernels) / sizeof(kernels[0])))
 

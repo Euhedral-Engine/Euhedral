@@ -262,6 +262,36 @@ class Qwen4OperatorCudaIntegrationTest {
     }
 
     @Test
+    void theEmbeddingGatherCopiesTheChosenRows() {
+        SplittableRandom rng = new SplittableRandom(18);
+        int vocabulary = 300, width = 2560, rows = 9;
+        short[] table = random(rng, vocabulary * width, 1.0);
+        int[] ids = new int[rows];
+        for (int i = 0; i < rows; i++) ids[i] = rng.nextInt(vocabulary);
+        try (CudaGpuMemory gpu = open();
+                Arena arena = Arena.ofConfined()) {
+            long ta = upload(gpu, arena, table);
+            long ia = gpu.allocate(rows * 4L);
+            MemorySegment host = arena.allocate(rows * 4L, 16);
+            MemorySegment.copy(ids, 0, host, ValueLayout.JAVA_INT, 0, rows);
+            gpu.copyHostToDevice(ia, host, rows * 4L);
+            long oa = gpu.allocate((long) rows * width * 2);
+            try {
+                Qwen4Ops.embedding(gpu, ta, ia, oa, rows, width, vocabulary);
+                short[] actual = download(gpu, arena, oa, rows * width);
+                for (int r = 0; r < rows; r++)
+                    assertArrayEquals(
+                            Arrays.copyOfRange(table, ids[r] * width, (ids[r] + 1) * width),
+                            Arrays.copyOfRange(actual, r * width, (r + 1) * width));
+            } finally {
+                gpu.free(oa);
+                gpu.free(ia);
+                gpu.free(ta);
+            }
+        }
+    }
+
+    @Test
     void ngramRecordsExpandToTheNvfp4Values() {
         SplittableRandom rng = new SplittableRandom(15);
         int width = 160, recordBytes = 96, count = 37;
