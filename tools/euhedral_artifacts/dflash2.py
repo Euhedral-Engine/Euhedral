@@ -27,7 +27,8 @@ Objects (BF16, contiguous, unless the projections are quantized):
     dflash2/selector/predecessor, successor     [vocabulary, rank]
 
 `projections="nvfp4"` stores the five projections of each layer (query, key_value, output, gate_up, down: the
-checkpoint's 35 q/k/v/o/gate/up/down matrices) as plain NVFP4; everything else stays BF16.
+checkpoint's 35 q/k/v/o/gate/up/down matrices) as plain NVFP4; everything else stays BF16. `"nvfp4-all"` also stores the
+feature fusion `fc` and the convolutions' kernel projections as NVFP4.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ from euhedral_artifacts.sources import SourceStore, concat_matrix, read_json, so
 
 PREFIX = "dflash2/"
 CONFIG_VERSION = 1
-PROJECTIONS = ("bf16", "nvfp4")
+PROJECTIONS = ("bf16", "nvfp4", "nvfp4-all")
 EXPECTED = {
     "num_hidden_layers": 5,
     "hidden_size": 5120,
@@ -121,7 +122,7 @@ def _raw(store: SourceStore, name: str, source: str, shape: tuple[int, ...]) -> 
 
 
 def _matrix(name: str, matrix, projections: str) -> ObjectPlan:
-    if projections == "nvfp4":
+    if projections in ("nvfp4", "nvfp4-all"):
         return ObjectPlan(name, matrix.shape, "BF16", "NVFP4", "row-split-k128-v1", nvfp4_offsets(matrix.shape)[2],
                           lambda output, offset, source=matrix: quantize_nvfp4_matrix(output, offset, source))
 
@@ -150,7 +151,8 @@ def build_plans(store: SourceStore, config: dict[str, Any], projections: str = "
     plans = [
         ObjectPlan(PREFIX + "config", (len(words),), "INT32", "I32", "contiguous-le-v1", 4 * len(words),
                    lambda output, offset: (output.seek(offset), output.write(words.tobytes()))),
-        _raw(store, PREFIX + "fc", "fc.weight", (hidden, taps * hidden)),
+        _matrix(PREFIX + "fc", source_matrix(store, "fc.weight", (hidden, taps * hidden)),
+                "nvfp4" if projections == "nvfp4-all" else "bf16"),
         _raw(store, PREFIX + "hidden_norm", "hidden_norm.weight", (hidden,)),
         _raw(store, PREFIX + "final_norm", "norm.weight", (hidden,)),
     ]
@@ -183,8 +185,9 @@ def build_plans(store: SourceStore, config: dict[str, Any], projections: str = "
         for conv in ("attention_conv", "mlp_conv"):
             plans += [
                 _raw(store, f"{target}{conv}/base", f"{source}{conv}.base_kernel", (2, kernel, hidden)),
-                _raw(store, f"{target}{conv}/projection", f"{source}{conv}.kernel_projection.weight",
-                     (2 * kernel * hidden // group, hidden)),
+                _matrix(f"{target}{conv}/projection",
+                        matrix(f"{conv}.kernel_projection.weight", 2 * kernel * hidden // group, hidden),
+                        "nvfp4" if projections == "nvfp4-all" else "bf16"),
             ]
     plans += [
         _raw(store, PREFIX + "selector/hidden_projection", "candidate_selector.hidden_projection.weight",
