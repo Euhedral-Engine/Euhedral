@@ -17,9 +17,19 @@
 namespace q4qsa {
 
 constexpr int D = 256, KT = 16, STRIDE = D + 8;
-constexpr unsigned kRawBytes = KT * 144;  // one 16-token plane of cache rows
-constexpr unsigned kStages = 3;           // raw tiles in flight per warp
-constexpr unsigned kWarpSharedBytes = KT * STRIDE * 2 + kStages * 2 * kRawBytes;  // expanded tile + raw K and V stages
+constexpr unsigned kRawBytes = KT * 144;  // 16 cache rows of one plane
+constexpr unsigned kStages = 2;           // raw K tiles and raw V tiles in flight
+constexpr unsigned kTileBytes = KT * STRIDE * 2;  // one expanded FP16 V tile
+// Shared memory of one unit's CTA: raw K stages, raw V stages, two expanded V tiles, two score slots (a lane's
+// 2 x 4 scores), the mbarriers.
+constexpr unsigned kRawOffset = 0;
+constexpr unsigned kValueRawOffset = kStages * kRawBytes;
+constexpr unsigned kTilesOffset = 2 * kStages * kRawBytes;
+constexpr unsigned kScoresOffset = kTilesOffset + 2 * kTileBytes;
+constexpr unsigned kBarrierOffset = kScoresOffset + 2 * 32 * 32;
+constexpr unsigned kUnitSharedBytes = kBarrierOffset + 8 * 8;
+// mbarrier slots: scores full [0, 2), scores empty [2, 4), V full [4, 6), V empty [6, 8); 32 arrivals each.
+enum { kScoresFull = 0, kScoresEmpty = 2, kValuesFull = 4, kValuesEmpty = 6 };
 
 static __device__ __forceinline__ void mma16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -55,23 +65,24 @@ static __device__ __forceinline__ unsigned int token_of(
     return 4u * nb + (t - 4u * count);
 }
 
-// The cache row this lane copies for the 16 virtual keys at `base`: lane l < 16 the K row of key l, lane l >= 16 the V
-// row of key l - 16 (null past `end`). Computed one tile ahead of its use, so the loads of the selected block ids and
-// of the page table run while the warp computes.
-static __device__ __forceinline__ const unsigned char* tile_source(const unsigned char* const* key_pages,
-        const unsigned char* const* value_pages, const int* ids, unsigned int count, unsigned int nb, unsigned int base,
-        unsigned int end, unsigned int head, unsigned int heads, unsigned int lane) {
+// The cache row of one plane that this lane copies for the 16 virtual keys at `base`: key lane % 16 (null past
+// `end`). Computed a tile ahead of its use, so the loads of the selected block ids and of the page table run while
+// the warp computes.
+static __device__ __forceinline__ const unsigned char* tile_source(const unsigned char* const* pages, const int* ids,
+        unsigned int count, unsigned int nb, unsigned int base, unsigned int end, unsigned int head,
+        unsigned int heads, unsigned int lane) {
     const unsigned int key = lane & 15u;
     if (base + key >= end) return nullptr;
-    return cache_row((lane >> 4) == 0u ? key_pages : value_pages, token_of(ids, count, nb, base + key), head, heads);
+    return cache_row(pages, token_of(ids, count, nb, base + key), head, heads);
 }
 
-// Starts the copy of this lane's 144-byte row (nine 16-byte chunks) into the raw tile buffer.
+// Starts the copy of this lane's part of its key's 144-byte row (nine 16-byte chunks; lanes 16 to 31 take the last
+// four) into the raw tile buffer.
 static __device__ __forceinline__ void issue_tile(unsigned char* raw, const unsigned char* source, unsigned int lane) {
     if (source == nullptr) return;
-    unsigned char* destination = raw + (lane >> 4) * kRawBytes + (lane & 15u) * 144u;
-#pragma unroll
-    for (int j = 0; j < 9; j++) cp_async16_ca(destination + 16 * j, source + 16 * j);
+    const unsigned int first = (lane >> 4) != 0u ? 5u : 0u, last = (lane >> 4) != 0u ? 9u : 5u;
+    unsigned char* destination = raw + (lane & 15u) * 144u;
+    for (unsigned int j = first; j < last; j++) cp_async16_ca(destination + 16u * j, source + 16u * j);
 }
 
 // Expands the 16 raw rows of one plane into FP16 rows of `tile` (exact products, nvfp4_pipe.cuh); keys at or past
@@ -123,17 +134,22 @@ static __device__ __forceinline__ void write_row(float (&values)[8], unsigned in
 }  // namespace q4qsa
 
 // Sparse attention of `rows` query rows (chunk rows at positions start + row) over their selected tokens.
-// One warp owns one (row, KV head, key split) unit and runs a flash-attention loop over 16-key tiles: the group of
-// query heads of the KV head (at most 16) is the m16 dimension, so each tile is expanded once for the whole group.
-// Scores and probabilities are FP16 operands on tensor cores with FP32 accumulation, the online softmax is FP32.
+// A CTA of three warps owns one (row, KV head, key split) unit and runs a flash-attention loop over 16-key tiles; the
+// group of query heads of the KV head (at most 16) is the m16 dimension, so each key is read once for the whole
+// group. The warps hand tiles to each other through shared memory (mbarriers), so that each keeps a small live set:
+//   warp 0  scores: S = Q K^T, the B fragments built straight from the raw K codes, Q in registers;
+//   warp 1  values: raw V rows expanded to FP16 tiles in shared memory;
+//   warp 2  online softmax and O += P V, the output rows in registers.
+// Raw tiles arrive by cp.async, three in flight. Scores and probabilities are FP16 operands on tensor cores with
+// FP32 accumulation, the online softmax is FP32.
 //   q          BF16 queries (norm + RoPE applied), head h of row r at q + r * q_row_stride + h * q_head_stride
 //   gate       BF16 gate values, the same layout from the gate base pointer
 //   ids/counts per-row selected block ids ([row][budget]) and their counts; ids == null: every block of the row
 //   splits == 1: the finished rows are written to core (may be null) and gated, [rows][query_heads * 256];
 //   splits  > 1: unnormalized partial (256 values, max, sum) per (row, head, split) to `partial`,
 //                [row][head][split][258] floats, for euhedral_q4_qsa_merge.
-//   grid ceil(rows * key_heads * splits / warps), block 32 * warps; dynamic shared memory kWarpSharedBytes per warp.
-extern "C" __global__ __launch_bounds__(128) void euhedral_q4_qsa_attention(
+//   grid rows * key_heads * splits, block 96; dynamic shared memory kUnitSharedBytes.
+extern "C" __global__ __launch_bounds__(96) void euhedral_q4_qsa_attention(
         const unsigned short* __restrict__ q, const unsigned short* __restrict__ gate,
         const unsigned char* const* key_pages, const unsigned char* const* value_pages, const int* __restrict__ ids,
         const int* __restrict__ counts, float* __restrict__ partial, unsigned short* __restrict__ core,
@@ -143,12 +159,17 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q4_qsa_attention(
     using namespace q4qsa;
     extern __shared__ __align__(16) unsigned char shared[];
     __shared__ __align__(16) unsigned pairs[256];
-    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    unsigned char* key_raw = shared + kRawOffset;
+    unsigned char* value_raw = shared + kValueRawOffset;
+    __half* tiles_shared = reinterpret_cast<__half*>(shared + kTilesOffset);
+    float4* scores_shared = reinterpret_cast<float4*>(shared + kScoresOffset);  // [slot][lane][2]
+    unsigned long long* barriers = reinterpret_cast<unsigned long long*>(shared + kBarrierOffset);
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned int g = lane >> 2, tig = lane & 3u;
     for (unsigned int i = threadIdx.x; i < 256u; i += blockDim.x) pairs[i] = nvfp4pipe::e2m1_pair_bits(i);
-    __syncthreads();
-    const unsigned long long unit = (unsigned long long)blockIdx.x * warps + warp;
-    if (unit >= (unsigned long long)rows * key_heads * splits) return;
+    if (threadIdx.x == 0)
+        for (int i = 0; i < 8; i++) nvfp4pipe::mbarrier_init(&barriers[i], 32);
+    const unsigned long long unit = blockIdx.x;
     const unsigned int split = (unsigned int)(unit % splits);
     const unsigned int kh = (unsigned int)((unit / splits) % key_heads);
     const unsigned int row = (unsigned int)(unit / ((unsigned long long)splits * key_heads));
@@ -162,30 +183,24 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q4_qsa_attention(
     const unsigned int begin = split * span, end = min(n, begin + span);
     const unsigned int tiles = begin < end ? (end - begin + KT - 1) / KT : 0u;
 
-    unsigned char* mine = shared + (unsigned long long)warp * kWarpSharedBytes;
-    __half* tile = reinterpret_cast<__half*>(mine);
-    unsigned char* raw = mine + KT * STRIDE * 2;  // [stage][K, V][16][144]
-
-    float o[32][4];
-#pragma unroll
-    for (int j = 0; j < 32; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
-    float m0 = -__int_as_float(0x7f800000), m1 = m0, l0 = 0.0f, l1 = 0.0f;
-
-    // The first two tiles' copies overlap the query rotation below; `ahead` is the source of the tile after them.
-    const unsigned char* ahead = nullptr;
-    {
-        const unsigned char* first = tile_source(key_pages, value_pages, row_ids, count, nb, begin, end, kh, key_heads, lane);
-        const unsigned char* second =
-                tile_source(key_pages, value_pages, row_ids, count, nb, begin + KT, end, kh, key_heads, lane);
-        ahead = tile_source(key_pages, value_pages, row_ids, count, nb, begin + 2 * KT, end, kh, key_heads, lane);
-        if (tiles > 0) issue_tile(raw, first, lane);
-        nvfp4pipe::cp_async_commit();
-        if (tiles > 1) issue_tile(raw + 2 * kRawBytes, second, lane);
-        nvfp4pipe::cp_async_commit();
-    }
-    // Rotated queries as FP16 A fragments: rows are the query heads of the group (rows >= group are zero).
+    // Prologue: the first raw tiles are requested (warps 0 and 1) and the rotated queries become FP16 A fragments
+    // (warp 0, through the first expanded tile's memory); then everyone waits, so that warp 1 may write that memory.
     unsigned qa[16][4];
-    {
+    const unsigned char* ahead = nullptr;
+    if (warp < 2u) {
+        const unsigned char* const* pages = warp == 0u ? key_pages : value_pages;
+        unsigned char* raw = warp == 0u ? key_raw : value_raw;
+#pragma unroll
+        for (unsigned int stage = 0; stage + 1 < kStages; stage++) {
+            const unsigned char* source =
+                    tile_source(pages, row_ids, count, nb, begin + stage * KT, end, kh, key_heads, lane);
+            if (stage < tiles) issue_tile(raw + stage * kRawBytes, source, lane);
+            nvfp4pipe::cp_async_commit();
+        }
+        ahead = tile_source(pages, row_ids, count, nb, begin + (kStages - 1) * KT, end, kh, key_heads, lane);
+    }
+    if (warp == 0u) {
+        __half* staging = tiles_shared;
         for (unsigned int h = 0; h < 16u; h++) {
             float values[8];
             if (h < group) {
@@ -199,129 +214,176 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q4_qsa_attention(
                 for (int r = 0; r < 8; r++) values[r] = 0.0f;
             }
 #pragma unroll
-            for (int r = 0; r < 8; r++) tile[h * STRIDE + lane + 32 * r] = __float2half_rn(values[r]);
+            for (int r = 0; r < 8; r++) staging[h * STRIDE + lane + 32 * r] = __float2half_rn(values[r]);
         }
         __syncwarp();
 #pragma unroll
-        for (int k = 0; k < 16; k++) ldsm_x4(qa[k], tile + (lane & 15u) * STRIDE + k * 16 + (lane >> 4) * 8);
+        for (int k = 0; k < 16; k++) ldsm_x4(qa[k], staging + (lane & 15u) * STRIDE + k * 16 + (lane >> 4) * 8);
         __syncwarp();
     }
+    __syncthreads();
 
-    for (unsigned int index = 0; index < tiles; index++) {
-        const unsigned int base = begin + index * KT;
-        if (index + 2u < tiles) issue_tile(raw + ((index + 2u) % kStages) * 2u * kRawBytes, ahead, lane);
-        nvfp4pipe::cp_async_commit();
-        ahead = tile_source(key_pages, value_pages, row_ids, count, nb, base + 3 * KT, end, kh, key_heads, lane);
-        nvfp4pipe::cp_async_wait<2>();
-        __syncwarp();
-        const unsigned char* current = raw + (index % kStages) * 2u * kRawBytes;
-        const unsigned int valid = end - base;  // keys of this tile before `end`
-        expand_tile(tile, current, pairs, valid, lane);
-        __syncwarp();
-        // S = Q K^T: the 16 x 16 scores of the group's heads against the tile's keys.
-        float s[2][4];
+    if (warp == 0u) {
+        // Scores: for every tile, S[head][key] from the K codes of the tile's two groups of eight keys.
+        for (unsigned int index = 0; index < tiles; index++) {
+            const unsigned int slot = index & 1u;
+            const unsigned int base = begin + index * KT;
+            if (index + kStages - 1 < tiles) issue_tile(key_raw + ((index + kStages - 1) % kStages) * kRawBytes, ahead, lane);
+            nvfp4pipe::cp_async_commit();
+            ahead = tile_source(key_pages, row_ids, count, nb, base + kStages * KT, end, kh, key_heads, lane);
+            nvfp4pipe::cp_async_wait<kStages - 1>();
+            __syncwarp();
+            const unsigned char* stage = key_raw + (index % kStages) * kRawBytes;
+            // B fragments of k16 step k: lane (key g, quad lane tig) holds the dimensions 16 k + 2 tig, + 1 (code
+            // byte 8 k + tig) and 16 k + 8 + 2 tig, + 1 (byte 8 k + 4 + tig) of its key, whose scale is group k.
+            const unsigned char* row0 = stage + g * 144u;
+            const unsigned char* row1 = stage + (8u + g) * 144u;
+            const uint4 scale_bytes0 = *reinterpret_cast<const uint4*>(row0 + 128);
+            const uint4 scale_bytes1 = *reinterpret_cast<const uint4*>(row1 + 128);
+            const unsigned scale_words0[4] = {scale_bytes0.x, scale_bytes0.y, scale_bytes0.z, scale_bytes0.w};
+            const unsigned scale_words1[4] = {scale_bytes1.x, scale_bytes1.y, scale_bytes1.z, scale_bytes1.w};
+            float s[2][4];
 #pragma unroll
-        for (int i = 0; i < 2; i++) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
+            for (int i = 0; i < 2; i++) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
 #pragma unroll
-        for (int k = 0; k < 16; k++) {
-            unsigned b[4];
-            ldsm_x4(b, tile + ((lane & 7u) + ((lane >> 4) << 3)) * STRIDE + k * 16 + ((lane >> 3) & 1u) * 8);
-            mma16816(s[0], qa[k], b[0], b[1]);
-            mma16816(s[1], qa[k], b[2], b[3]);
-        }
-        // Mask, scale (1/sqrt(256)) and the online softmax of rows g (heads) and g + 8; a quad of lanes shares a row.
-        float mx0 = m0, mx1 = m1;
-#pragma unroll
-        for (int i = 0; i < 2; i++)
-#pragma unroll
-            for (int e = 0; e < 2; e++) {
-                const bool ok = 8u * i + 2u * tig + e < valid;
-                s[i][e] = ok ? s[i][e] * 0.0625f : -__int_as_float(0x7f800000);
-                s[i][2 + e] = ok ? s[i][2 + e] * 0.0625f : -__int_as_float(0x7f800000);
-                mx0 = fmaxf(mx0, s[i][e]);
-                mx1 = fmaxf(mx1, s[i][2 + e]);
+            for (int k = 0; k < 16; k++) {
+                const uint2 codes0 = *reinterpret_cast<const uint2*>(row0 + 8 * k);
+                const uint2 codes1 = *reinterpret_cast<const uint2*>(row1 + 8 * k);
+                const unsigned scale0 = nvfp4pipe::scale_pair((scale_words0[k >> 2] >> (8 * (k & 3))) & 0xFFu);
+                const unsigned scale1 = nvfp4pipe::scale_pair((scale_words1[k >> 2] >> (8 * (k & 3))) & 0xFFu);
+                mma16816(s[0], qa[k], nvfp4pipe::half2_multiply(pairs[(codes0.x >> (8 * tig)) & 0xFFu], scale0),
+                        nvfp4pipe::half2_multiply(pairs[(codes0.y >> (8 * tig)) & 0xFFu], scale0));
+                mma16816(s[1], qa[k], nvfp4pipe::half2_multiply(pairs[(codes1.x >> (8 * tig)) & 0xFFu], scale1),
+                        nvfp4pipe::half2_multiply(pairs[(codes1.y >> (8 * tig)) & 0xFFu], scale1));
             }
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
-        const float c0 = isfinite(m0) ? expf(m0 - mx0) : 0.0f, c1 = isfinite(m1) ? expf(m1 - mx1) : 0.0f;
-        float sum0 = 0.0f, sum1 = 0.0f;
-        unsigned pa[4];  // P as the A fragment of one k16 step over the tile's 16 keys
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const float p00 = isfinite(s[i][0]) ? expf(s[i][0] - mx0) : 0.0f;
-            const float p01 = isfinite(s[i][1]) ? expf(s[i][1] - mx0) : 0.0f;
-            const float p10 = isfinite(s[i][2]) ? expf(s[i][2] - mx1) : 0.0f;
-            const float p11 = isfinite(s[i][3]) ? expf(s[i][3] - mx1) : 0.0f;
-            sum0 += p00 + p01;
-            sum1 += p10 + p11;
-            pa[2 * i] = pack_half2(p00, p01);
-            pa[2 * i + 1] = pack_half2(p10, p11);
+            if (index >= 2u) nvfp4pipe::mbarrier_wait(&barriers[kScoresEmpty + slot], ((index >> 1) - 1u) & 1u);
+            scores_shared[(slot * 32u + lane) * 2u] = make_float4(s[0][0], s[0][1], s[0][2], s[0][3]);
+            scores_shared[(slot * 32u + lane) * 2u + 1u] = make_float4(s[1][0], s[1][1], s[1][2], s[1][3]);
+            nvfp4pipe::mbarrier_arrive(&barriers[kScoresFull + slot]);
+            __syncwarp();
         }
-        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
-        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
-        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
-        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
-        l0 = l0 * c0 + sum0;
-        l1 = l1 * c1 + sum1;
-        m0 = mx0;
-        m1 = mx1;
+        nvfp4pipe::cp_async_wait<0>();
+    } else if (warp == 1u) {
+        // Values: every tile's raw V rows into FP16 rows of the slot's tile.
+        for (unsigned int index = 0; index < tiles; index++) {
+            const unsigned int slot = index & 1u;
+            const unsigned int base = begin + index * KT;
+            if (index + kStages - 1 < tiles) issue_tile(value_raw + ((index + kStages - 1) % kStages) * kRawBytes, ahead, lane);
+            nvfp4pipe::cp_async_commit();
+            ahead = tile_source(value_pages, row_ids, count, nb, base + kStages * KT, end, kh, key_heads, lane);
+            nvfp4pipe::cp_async_wait<kStages - 1>();
+            __syncwarp();
+            if (index >= 2u) nvfp4pipe::mbarrier_wait(&barriers[kValuesEmpty + slot], ((index >> 1) - 1u) & 1u);
+            expand_tile(tiles_shared + slot * KT * STRIDE, value_raw + (index % kStages) * kRawBytes, pairs, end - base, lane);
+            nvfp4pipe::mbarrier_arrive(&barriers[kValuesFull + slot]);
+            __syncwarp();
+        }
+        nvfp4pipe::cp_async_wait<0>();
+    } else {
+        float o[32][4];
+#pragma unroll
+        for (int j = 0; j < 32; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+        float m0 = -__int_as_float(0x7f800000), m1 = m0, l0 = 0.0f, l1 = 0.0f;
+        for (unsigned int index = 0; index < tiles; index++) {
+            const unsigned int slot = index & 1u;
+            const unsigned int valid = end - (begin + index * KT);  // keys of this tile before `end`
+            nvfp4pipe::mbarrier_wait(&barriers[kScoresFull + slot], (index >> 1) & 1u);
+            const float4 first = scores_shared[(slot * 32u + lane) * 2u], second = scores_shared[(slot * 32u + lane) * 2u + 1u];
+            if (index + 2u < tiles) nvfp4pipe::mbarrier_arrive(&barriers[kScoresEmpty + slot]);
+            float s[2][4] = {{first.x, first.y, first.z, first.w}, {second.x, second.y, second.z, second.w}};
+            // Mask, scale (1/sqrt(256)) and the online softmax of rows g (heads) and g + 8; a quad of lanes shares a row.
+            float mx0 = m0, mx1 = m1;
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const bool ok = 8u * i + 2u * tig + e < valid;
+                    s[i][e] = ok ? s[i][e] * 0.0625f : -__int_as_float(0x7f800000);
+                    s[i][2 + e] = ok ? s[i][2 + e] * 0.0625f : -__int_as_float(0x7f800000);
+                    mx0 = fmaxf(mx0, s[i][e]);
+                    mx1 = fmaxf(mx1, s[i][2 + e]);
+                }
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+            const float c0 = isfinite(m0) ? __expf(m0 - mx0) : 0.0f, c1 = isfinite(m1) ? __expf(m1 - mx1) : 0.0f;
+            float sum0 = 0.0f, sum1 = 0.0f;
+            unsigned pa[4];  // P as the A fragment of one k16 step over the tile's 16 keys
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const float p00 = isfinite(s[i][0]) ? __expf(s[i][0] - mx0) : 0.0f;
+                const float p01 = isfinite(s[i][1]) ? __expf(s[i][1] - mx0) : 0.0f;
+                const float p10 = isfinite(s[i][2]) ? __expf(s[i][2] - mx1) : 0.0f;
+                const float p11 = isfinite(s[i][3]) ? __expf(s[i][3] - mx1) : 0.0f;
+                sum0 += p00 + p01;
+                sum1 += p10 + p11;
+                pa[2 * i] = pack_half2(p00, p01);
+                pa[2 * i + 1] = pack_half2(p10, p11);
+            }
+            sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
+            sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
+            sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
+            sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
+            l0 = l0 * c0 + sum0;
+            l1 = l1 * c1 + sum1;
+            m0 = mx0;
+            m1 = mx1;
+#pragma unroll
+            for (int j = 0; j < 32; j++) {
+                o[j][0] *= c0;
+                o[j][1] *= c0;
+                o[j][2] *= c1;
+                o[j][3] *= c1;
+            }
+            nvfp4pipe::mbarrier_wait(&barriers[kValuesFull + slot], (index >> 1) & 1u);
+            // O += P V over the 256 dimensions: V^T fragments by transposed ldmatrix.
+            const __half* values = tiles_shared + slot * KT * STRIDE;
+#pragma unroll
+            for (int jp = 0; jp < 16; jp++) {
+                unsigned b[4];
+                ldsm_x4_t(b, values + ((lane & 7u) + (((lane >> 3) & 1u) << 3)) * STRIDE + jp * 16 + (lane >> 4) * 8);
+                mma16816(o[2 * jp], pa, b[0], b[1]);
+                mma16816(o[2 * jp + 1], pa, b[2], b[3]);
+            }
+            __syncwarp();
+            if (index + 2u < tiles) nvfp4pipe::mbarrier_arrive(&barriers[kValuesEmpty + slot]);
+        }
+
+        if (splits > 1u) {
+#pragma unroll
+            for (int half = 0; half < 2; half++) {
+                const unsigned int h = g + 8u * half;
+                if (h >= group) continue;
+                float* destination = partial
+                        + (((unsigned long long)row * query_heads + (kh * group + h)) * splits + split) * 258u;
+#pragma unroll
+                for (int j = 0; j < 32; j++)
+                    *reinterpret_cast<float2*>(destination + 8 * j + 2 * tig) = make_float2(o[j][2 * half], o[j][2 * half + 1]);
+                if (tig == 0) {
+                    destination[256] = half == 0 ? m0 : m1;
+                    destination[257] = half == 0 ? l0 : l1;
+                }
+            }
+            return;
+        }
+        // One split: normalize the rows through shared memory (the expanded tiles are free: every tile has been
+        // consumed) and finish them one head at a time.
+        const float inverse0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, inverse1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+        float* rows_buffer = reinterpret_cast<float*>(tiles_shared);  // 16 x 256 floats
 #pragma unroll
         for (int j = 0; j < 32; j++) {
-            o[j][0] *= c0;
-            o[j][1] *= c0;
-            o[j][2] *= c1;
-            o[j][3] *= c1;
+            const unsigned int column = 8u * j + 2u * tig;
+            *reinterpret_cast<float2*>(rows_buffer + g * D + column) = make_float2(o[j][0] * inverse0, o[j][1] * inverse0);
+            *reinterpret_cast<float2*>(rows_buffer + (g + 8u) * D + column) = make_float2(o[j][2] * inverse1, o[j][3] * inverse1);
         }
-        __syncwarp();  // every lane has read the keys: the tile buffer takes the values
-        expand_tile(tile, current + kRawBytes, pairs, valid, lane);
         __syncwarp();
-        // O += P V over the 256 dimensions: V^T fragments by transposed ldmatrix.
+        for (unsigned int h = 0; h < group; h++) {
+            float values[8];
 #pragma unroll
-        for (int jp = 0; jp < 16; jp++) {
-            unsigned b[4];
-            ldsm_x4_t(b, tile + ((lane & 7u) + (((lane >> 3) & 1u) << 3)) * STRIDE + jp * 16 + (lane >> 4) * 8);
-            mma16816(o[2 * jp], pa, b[0], b[1]);
-            mma16816(o[2 * jp + 1], pa, b[2], b[3]);
+            for (int r = 0; r < 8; r++) values[r] = rows_buffer[h * D + lane + 32 * r];
+            write_row(values, lane, row, kh * group + h, query_heads, gate, gate_row_stride, gate_head_stride, core, gated);
         }
-        __syncwarp();  // the buffers are free for the next tile's copies and expansion
-    }
-    nvfp4pipe::cp_async_wait<0>();
-    __syncwarp();
-
-    if (splits > 1u) {
-#pragma unroll
-        for (int half = 0; half < 2; half++) {
-            const unsigned int h = g + 8u * half;
-            if (h >= group) continue;
-            float* destination = partial
-                    + (((unsigned long long)row * query_heads + (kh * group + h)) * splits + split) * 258u;
-#pragma unroll
-            for (int j = 0; j < 32; j++)
-                *reinterpret_cast<float2*>(destination + 8 * j + 2 * tig) = make_float2(o[j][2 * half], o[j][2 * half + 1]);
-            if (tig == 0) {
-                destination[256] = half == 0 ? m0 : m1;
-                destination[257] = half == 0 ? l0 : l1;
-            }
-        }
-        return;
-    }
-    // One split: normalize the rows through shared memory and finish them one head at a time.
-    const float inverse0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, inverse1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
-    float* rows_buffer = reinterpret_cast<float*>(mine);  // 16 x 256 floats
-#pragma unroll
-    for (int j = 0; j < 32; j++) {
-        const unsigned int column = 8u * j + 2u * tig;
-        *reinterpret_cast<float2*>(rows_buffer + g * D + column) = make_float2(o[j][0] * inverse0, o[j][1] * inverse0);
-        *reinterpret_cast<float2*>(rows_buffer + (g + 8u) * D + column) = make_float2(o[j][2] * inverse1, o[j][3] * inverse1);
-    }
-    __syncwarp();
-    for (unsigned int h = 0; h < group; h++) {
-        float values[8];
-#pragma unroll
-        for (int r = 0; r < 8; r++) values[r] = rows_buffer[h * D + lane + 32 * r];
-        write_row(values, lane, row, kh * group + h, query_heads, gate, gate_row_stride, gate_head_stride, core, gated);
     }
 }
 
