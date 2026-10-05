@@ -16,6 +16,6 @@ public enum WeightLayout {
     /// NVFP4 rows that are each self-contained, for gathers: a row's E2M1 codes (K/2 bytes) are followed by
     /// its E4M3 block scales (K/16 bytes), with no padding between rows, and the FP32 global scale follows
     /// the last row at the next 256-byte boundary
-    ([io.euhedral_execution.inference.core.model_loader.qwen4.NgramLayout]).
+    /// ([io.euhedral_execution.inference.core.model_loader.qwen4.NgramLayout]).
     ROW_INTERLEAVED_NVFP4_V1
 }
