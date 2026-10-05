@@ -179,4 +179,57 @@ final class Qwen4Reference {
             }
         return next;
     }
+
+    /// The GDN convolution: silu(bf16(depthwise causal conv)) over (history ++ x).
+    static short[] gdnConv(short[] x, short[] history, short[] weights, int rows, int channels, int taps) {
+        int historyRows = taps - 1;
+        short[] output = new short[rows * channels];
+        for (int t = 0; t < rows; t++)
+            for (int c = 0; c < channels; c++) {
+                double sum = 0;
+                for (int i = 0; i < taps; i++) {
+                    int source = t - historyRows + i;
+                    float value = source >= 0
+                            ? bf(x[source * channels + c])
+                            : bf(history[(historyRows + source) * channels + c]);
+                    sum += (double) bf(weights[c * taps + i]) * value;
+                }
+                output[t * channels + c] = bits(silu(r(sum)));
+            }
+        return output;
+    }
+
+    /// alpha = exp(g) and beta = bf16(sigmoid(b)) per (row, head).
+    record Control(float[] alpha, float[] beta) {}
+
+    static Control gdnControl(short[] a, short[] b, short[] aLog, short[] dtBias, int rows, int heads) {
+        float[] alpha = new float[rows * heads], beta = new float[rows * heads];
+        for (int i = 0; i < rows * heads; i++) {
+            int head = i % heads;
+            double shifted = (double) bf(a[i]) + bf(dtBias[head]);
+            double softplus = shifted > 20 ? shifted : Math.log1p(Math.exp(shifted));
+            alpha[i] = (float) Math.exp(-Math.exp(bf(aLog[head])) * softplus);
+            beta[i] = r(sigmoid(bf(b[i])));
+        }
+        return new Control(alpha, beta);
+    }
+
+    /// Qwen4ExpTextRMSNormGated with the three BF16 roundings.
+    static short[] gdnGatedNorm(
+            short[] core, short[] z, short[] weight, int rows, int heads, int headDim, float epsilon, boolean sigmoid) {
+        short[] output = new short[rows * heads * headDim];
+        for (int vector = 0; vector < rows * heads; vector++) {
+            int base = vector * headDim;
+            double sum = 0;
+            for (int i = 0; i < headDim; i++) sum += (double) bf(core[base + i]) * bf(core[base + i]);
+            float inverse = (float) (1.0 / Math.sqrt(sum / headDim + epsilon));
+            for (int i = 0; i < headDim; i++) {
+                float normalized = r(bf(core[base + i]) * inverse);
+                float weighted = r(bf(weight[i]) * normalized);
+                float gate = bf(z[base + i]);
+                output[base + i] = bits(weighted * (sigmoid ? sigmoid(gate) : silu(gate)));
+            }
+        }
+        return output;
+    }
 }

@@ -3,3 +3,4 @@
 #include "qwen4/linear.cuh"
 #include "qwen4/hc.cuh"
 #include "qwen4/ple.cuh"
+#include "qwen4/gdn.cuh"
