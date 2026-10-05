@@ -535,6 +535,10 @@ class ExpertCacheTest {
             });
             only.start();
             await(() -> rig.cache.stats().snapshot().misses() == 1);
+            // The miss is counted when the slot is reserved, before the record is read and the transfer started. An
+            // interrupt in between (reading the record from a file is interruptible) abandons the load, which is
+            // another case; wait until the loader has started its transfer and parked on it.
+            await(() -> only.getState() == Thread.State.WAITING || only.getState() == Thread.State.TIMED_WAITING);
             only.interrupt();
             only.join(10_000);
             assertTrue(interruptedSeen.get());
