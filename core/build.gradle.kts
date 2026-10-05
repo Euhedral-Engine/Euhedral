@@ -40,6 +40,9 @@ val latticeTest = tasks.register<Test>("latticeTest") {
 tasks.named<Test>("test") {
     exclude(latticeTestClasses)
     finalizedBy(latticeTest)
+    // The converted Flash-Next artifact (tools/convert_flash_next.py); tests that need it skip when it is absent.
+    for (name in listOf("artifact", "verify"))
+        providers.gradleProperty("euhedral.qwen4.$name").orNull?.let { systemProperty("euhedral.qwen4.$name", it) }
 }
 
 tasks.named("check") {

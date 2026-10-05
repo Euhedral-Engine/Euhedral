@@ -5,13 +5,14 @@ import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 
-final class ArtifactFileAccess {
+public final class ArtifactFileAccess {
 
     private static final long MAX_BYTE_BUFFER_CHUNK = 1L << 30;
 
     private ArtifactFileAccess() {}
 
-    static void readFully(FileChannel channel, long offset, ByteBuffer destination, String field) throws IOException {
+    public static void readFully(FileChannel channel, long offset, ByteBuffer destination, String field)
+            throws IOException {
         long position = offset;
         while (destination.hasRemaining()) {
             int read = channel.read(destination, position);
@@ -25,7 +26,7 @@ final class ArtifactFileAccess {
         }
     }
 
-    static void readFully(FileChannel channel, long offset, MemorySegment destination, String field)
+    public static void readFully(FileChannel channel, long offset, MemorySegment destination, String field)
             throws IOException {
         if (offset < 0) {
             throw new QwenArtifactFormatException(field + " offset is negative");

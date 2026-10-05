@@ -12,5 +12,10 @@ public enum WeightLayout {
     /// ([io.euhedral_execution.inference.core.model_loader.artifact.Nvfp4Layout]): 4.25 instead of 4.5 bits
     /// per weight. Not lossless with respect to [#ROW_SPLIT_K128_V1]: the converter chooses each block's
     /// scale from the table.
-    ROW_SPLIT_K128_SD4_V1
+    ROW_SPLIT_K128_SD4_V1,
+    /// NVFP4 rows that are each self-contained, for gathers: a row's E2M1 codes (K/2 bytes) are followed by
+    /// its E4M3 block scales (K/16 bytes), with no padding between rows, and the FP32 global scale follows
+    /// the last row at the next 256-byte boundary
+    ([io.euhedral_execution.inference.core.model_loader.qwen4.NgramLayout]).
+    ROW_INTERLEAVED_NVFP4_V1
 }

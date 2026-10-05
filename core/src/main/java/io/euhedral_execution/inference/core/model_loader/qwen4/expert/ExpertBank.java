@@ -107,7 +107,8 @@ public final class ExpertBank {
 
     private int checked(int expert) {
         if (expert < 0 || expert >= this.offsets.length)
-            throw new IndexOutOfBoundsException("expert " + expert + " of " + this.name + " (" + this.offsets.length + ")");
+            throw new IndexOutOfBoundsException(
+                    "expert " + expert + " of " + this.name + " (" + this.offsets.length + ")");
         return expert;
     }
 }
