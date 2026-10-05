@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 import torch
 
+from . import UPSTREAM_REVISION
 from .artifact import DEFAULT_ARTIFACT, DEFAULT_TOKENIZER, Artifact
 from .cases import CASES, build, fp32_chunk_check, run_case, text_tokens
 from .model import assert_config_matches, load_hf_text_config, make_config, ngram_tables_from_metadata
@@ -113,6 +115,40 @@ def cmd_generate(args) -> int:
     return 0
 
 
+def cmd_greedy(args) -> int:
+    """Greedy continuations of several prompts, with every step's top-5 logits, as JSON (the engine's end-to-end gate)."""
+    import json
+    from tokenizers import Tokenizer
+    from transformers.cache_utils import DynamicCache
+    from .instrument import Capture
+    from .record import Recorder
+    art, fn = build(args.artifact, args.device)
+    tokenizer = Tokenizer.from_file(str(DEFAULT_TOKENIZER))
+    prompts = json.loads(args.prompts.read_text(encoding="utf-8"))
+    results = []
+    for text in prompts:
+        ids = tokenizer.encode(text).ids
+        cache = DynamicCache(config=fn.cfg)
+        Capture(fn, Recorder(Path(tempfile.mkdtemp())), (), args.kv_format, model_level=True).attach_cache(cache)
+        steps = []
+        with torch.no_grad():
+            feed = torch.tensor(ids, dtype=torch.long, device=args.device)
+            for _ in range(args.steps):
+                hidden = fn.model(input_ids=feed[None], past_key_values=cache, use_cache=True).last_hidden_state
+                logits = fn.logits(hidden[:, -1])[0]
+                top = torch.topk(logits.float(), 5)
+                token = int(top.indices[0])
+                steps.append({"token": token, "top5": [int(i) for i in top.indices],
+                              "top5_logits": [float(v) for v in top.values]})
+                feed = torch.tensor([token], dtype=torch.long, device=args.device)
+        results.append({"prompt": text, "prompt_ids": ids, "steps": steps,
+                        "text": tokenizer.decode([s["token"] for s in steps])})
+        print(f"{text[:40]!r}: {results[-1]['text'][:60]!r}", flush=True)
+    args.out.write_text(json.dumps({"upstream_revision": UPSTREAM_REVISION, "kv_format": args.kv_format,
+                                    "results": results}, indent=1) + "\n", encoding="utf-8")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Python reference harness for Qwen3.8-Flash-Next")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -146,5 +182,12 @@ def main(argv: list[str]) -> int:
     p.add_argument("--prompt-ids", nargs="+")
     p.add_argument("--prompt")
     p.set_defaults(func=cmd_generate)
+    p = sub.add_parser("greedy", help="greedy continuations of several prompts with every step's top-5 (JSON)")
+    common(p)
+    p.add_argument("--prompts", type=Path, required=True, help="JSON list of prompt strings")
+    p.add_argument("--steps", type=int, default=16)
+    p.add_argument("--kv-format", choices=("bf16", "nvfp4"), default="nvfp4")
+    p.add_argument("--out", type=Path, required=True)
+    p.set_defaults(func=cmd_greedy)
     args = parser.parse_args(argv)
     return args.func(args)

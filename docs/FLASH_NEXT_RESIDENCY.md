@@ -13,8 +13,9 @@ artifact -> Qwen4ArtifactReader / Qwen4Validator -> Qwen4ResidencyPlanner -> Qwe
                                                       +- expert cache budget -> +- ExpertCache <- HostExpertStore <- artifact file
 ```
 
-`Qwen4Storage.load(InferenceConfig)` runs this from the engine's own configuration (artifact path, maximum context). It runs no
-model: `InferenceEngine.load` refuses a `qwen4_exp` artifact up front with the same message that names `Qwen4Storage`.
+`Qwen4Storage.load(InferenceConfig)` runs this from the engine's own configuration (artifact path, maximum context);
+`InferenceEngine.load` does it for a `qwen4_exp` artifact and runs the model over the result
+([FLASH_NEXT_EXECUTION.md](FLASH_NEXT_EXECUTION.md)).
 
 ## Storage classes
 

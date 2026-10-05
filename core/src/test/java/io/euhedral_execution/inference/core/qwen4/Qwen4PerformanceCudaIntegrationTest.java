@@ -56,6 +56,57 @@ class Qwen4PerformanceCudaIntegrationTest {
 
     private final List<String> report = new ArrayList<>();
 
+    /// Per-layer use of the expert cache, accumulated over the MoE blocks a run executed.
+    private static final class LayerStats implements Qwen4Executor.ExpertTrace {
+        final long[] blocks = new long[48], unique = new long[48], hits = new long[48], misses = new long[48],
+                evictions = new long[48], bytes = new long[48], waitNanos = new long[48];
+        final long[] uniqueMax = new long[48];
+
+        @Override
+        public void layer(
+                int layer,
+                int rows,
+                int uniqueExperts,
+                int waves,
+                io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats.Snapshot before,
+                io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats.Snapshot after) {
+            blocks[layer]++;
+            unique[layer] += uniqueExperts;
+            uniqueMax[layer] = Math.max(uniqueMax[layer], uniqueExperts);
+            hits[layer] += after.hits() - before.hits();
+            misses[layer] += after.misses() - before.misses();
+            evictions[layer] += after.evictions() - before.evictions();
+            bytes[layer] += after.transferBytes() - before.transferBytes();
+            waitNanos[layer] += after.loadWaitNanos() - before.loadWaitNanos();
+        }
+
+        String summary(String title) {
+            StringBuilder text = new StringBuilder(title + ": layer unique-experts/block (max) hit-rate misses/block MB/block\n");
+            long totalHits = 0, totalMisses = 0, totalUnique = 0, totalBlocks = 0;
+            for (int l = 0; l < 48; l++) {
+                if (blocks[l] == 0) continue;
+                long requests = hits[l] + misses[l];
+                text.append(String.format(
+                        "  L%02d %6.1f (%d) %5.1f%% %6.1f %7.1f%n",
+                        l,
+                        (double) unique[l] / blocks[l],
+                        uniqueMax[l],
+                        100.0 * hits[l] / Math.max(1, requests),
+                        (double) misses[l] / blocks[l],
+                        bytes[l] / 1e6 / blocks[l]));
+                totalHits += hits[l];
+                totalMisses += misses[l];
+                totalUnique += unique[l];
+                totalBlocks += blocks[l];
+            }
+            text.append(String.format(
+                    "  all: %.1f unique experts/block, hit rate %.1f%%%n",
+                    (double) totalUnique / Math.max(1, totalBlocks),
+                    100.0 * totalHits / Math.max(1, totalHits + totalMisses)));
+            return text.toString();
+        }
+    }
+
     private void line(String text) {
         System.out.println(text);
         this.report.add(text);
@@ -105,6 +156,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                         .toArray()) {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         var before = model.expertCache().stats().snapshot();
+                        LayerStats layers = new LayerStats();
+                        if (target == 4096) executor.trace(layers);
                         long start = System.nanoTime();
                         int at = 0;
                         while (at < target) {
@@ -141,6 +194,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                         int[] token = new int[1];
                         var before = model.expertCache().stats().snapshot();
                         var counters = executor.moeCounters();
+                        LayerStats decodeLayers = new LayerStats();
+                        if (context == 4096) executor.trace(decodeLayers);
                         int steps = 32;
                         long start = System.nanoTime();
                         for (int i = 0; i < steps; i++) {
@@ -150,6 +205,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                             MemorySegment.copy(readback.segment(), ValueLayout.JAVA_SHORT, 0, logits, 0, 16);
                         }
                         double seconds = (System.nanoTime() - start) / 1e9;
+                        executor.trace(null);
+                        if (context == 4096) line(decodeLayers.summary("expert cache, decode at 4096 context"));
                         var after = executor.moeCounters();
                         line(String.format(
                                 "decode at %d context: %.1f ms/token, %.1f tokens/s; %s; route wait %.2f ms + acquire %.2f ms per token",

@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.NgramStore;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4LayerType;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.List;
@@ -47,6 +48,19 @@ public final class Qwen4Executor implements AutoCloseable {
         public long rows;
     }
 
+    /// What a layer's MoE block asked of the expert cache, for the real routing of real inference: the distinct experts
+    /// its tokens named, the waves it ran in and the cache's counters before and after it.
+    @FunctionalInterface
+    public interface ExpertTrace {
+        void layer(
+                int layer,
+                int rows,
+                int uniqueExperts,
+                int waves,
+                ExpertCacheStats.Snapshot before,
+                ExpertCacheStats.Snapshot after);
+    }
+
     /// Test hook: the residual state after each layer, read after the device finished it.
     public interface Observer {
         void layerFinished(int layer, long stateAddress, int rows) throws InterruptedException;
@@ -85,6 +99,7 @@ public final class Qwen4Executor implements AutoCloseable {
     private final long moeScratchAddress;
     private final List<Long> allocations = new ArrayList<>();
     private Timings timings;
+    private ExpertTrace trace;
     private Observer observer;
     private Observer midObserver;
     private boolean closed;
@@ -197,6 +212,11 @@ public final class Qwen4Executor implements AutoCloseable {
 
     public Qwen4MoeLayer.Counters moeCounters() {
         return this.moe.counters();
+    }
+
+    /// Reports every MoE block's use of the expert cache to `trace` (null stops it).
+    public void trace(ExpertTrace trace) {
+        this.trace = trace;
     }
 
     /// Starts (or with null stops) timing the components of every step.
@@ -419,6 +439,7 @@ public final class Qwen4Executor implements AutoCloseable {
             this.midObserver.layerFinished(layer, this.state, rows);
         }
         long begin = this.timings == null ? 0 : System.nanoTime();
+        var before = this.trace == null ? null : this.model.expertCache().stats().snapshot();
         this.moe.run(
                 this.weights.moe(layer),
                 this.model.bankOrdinal("text/layers/" + layer + "/moe/experts"),
@@ -430,6 +451,14 @@ public final class Qwen4Executor implements AutoCloseable {
             Qwen4Streams.awaitCompletion(this.stream);
             this.timings.nanos[Timings.MOE] += System.nanoTime() - begin;
         }
+        if (this.trace != null)
+            this.trace.layer(
+                    layer,
+                    rows,
+                    this.moe.lastUniqueExperts(),
+                    this.moe.lastWaves(),
+                    before,
+                    this.model.expertCache().stats().snapshot());
         segment(
                 Timings.RESIDUAL,
                 () -> this.hyperConnection.inject(this.gpu, this.state, this.blockOutput, hc, this.state, rows));

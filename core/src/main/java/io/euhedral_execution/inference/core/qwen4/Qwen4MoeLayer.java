@@ -85,6 +85,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     private final long marker;
     /// Threads that lease a wave's experts together, so the cache's misses transfer concurrently.
     private final ExecutorService acquirers;
+    private int lastUnique;
+    private int lastWaves;
     private long routeWaitNanos;
     private long acquireNanos;
     private long waves;
@@ -220,6 +222,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         MemorySegment.copy(this.routeIds.segment(), INT, 0, this.ids, 0, pairs);
         MemorySegment.copy(this.routeWeights.segment(), SHORT, 0, this.weights, 0, pairs);
         this.wave.plan(rows, this.ids, this.weights);
+        this.lastUnique = this.wave.activeExperts();
+        this.lastWaves = this.wave.waveCount();
 
         for (int w = 0; w < this.wave.waveCount(); w++) runWave(bank, w, input, rows, scratch);
 
@@ -324,6 +328,15 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     /// Host time spent waiting for the routing (which includes the layer's earlier device work) and leasing experts
     /// from the cache (transfers of misses), the waves run and the experts leased since the layer was built.
     public record Counters(long routeWaitNanos, long acquireNanos, long waves, long leased) {}
+
+    /// Distinct experts the latest block routed to, and the waves it ran in.
+    public int lastUniqueExperts() {
+        return this.lastUnique;
+    }
+
+    public int lastWaves() {
+        return this.lastWaves;
+    }
 
     public Counters counters() {
         return new Counters(this.routeWaitNanos, this.acquireNanos, this.waves, this.leased);
