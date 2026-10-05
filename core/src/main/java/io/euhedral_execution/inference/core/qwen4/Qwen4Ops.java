@@ -257,6 +257,31 @@ public final class Qwen4Ops {
                         .int32(history));
     }
 
+    /// `output[r] = table[ids[r]]`: embedding rows of `width` BF16 values from a table of `vocabulary` rows that is in
+    /// device memory or mapped host memory; `ids` are int32 token ids on the device.
+    public static void embedding(
+            ExecutionGpu gpu, long table, long ids, long output, int rows, int width, int vocabulary) {
+        requirePositive(rows, width, vocabulary);
+        if (width % 8 != 0) throw new IllegalArgumentException("embedding rows are multiples of 8 values");
+        requireAligned(16, table, output);
+        gpu.launchQwen4(
+                Qwen4Kernel.EMBEDDING_BF16,
+                rows,
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                arguments()
+                        .pointer(table)
+                        .pointer(ids)
+                        .pointer(output)
+                        .int32(rows)
+                        .int32(width)
+                        .int32(vocabulary));
+    }
+
     private static int ceilDiv(int value, int divisor) {
         return (value + divisor - 1) / divisor;
     }

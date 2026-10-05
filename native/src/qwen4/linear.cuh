@@ -44,3 +44,17 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q4_linear_bf16(
         if (lane == 0 && (unsigned int)r < active) output[(unsigned long long)(row0 + r) * n + column] = q4::bfr(total);
     }
 }
+
+// Embedding rows: out[r] = table[ids[r]] for rows of `width` BF16 values (a multiple of 8, 16-byte aligned rows).
+// The table may be device memory or host memory mapped into the device's address space.
+//   grid rows, block 256.
+extern "C" __global__ __launch_bounds__(256) void euhedral_q4_embedding_bf16(
+        const unsigned short* __restrict__ table, const int* __restrict__ ids, unsigned short* __restrict__ output,
+        unsigned int rows, unsigned int width, unsigned int vocabulary) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int token = (unsigned int)ids[row];
+    const uint4* source = reinterpret_cast<const uint4*>(table + (unsigned long long)min(token, vocabulary - 1u) * width);
+    uint4* destination = reinterpret_cast<uint4*>(output + (unsigned long long)row * width);
+    for (unsigned int i = threadIdx.x; i < (width >> 3); i += blockDim.x) destination[i] = source[i];
+}
