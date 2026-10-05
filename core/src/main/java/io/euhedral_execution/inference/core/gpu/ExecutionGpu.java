@@ -559,6 +559,7 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("DFlash2 block queries and keys are not implemented by this GPU");
     }
 
+    /// `scratch` holds 8 × heads × 130 FP32 values per row (each key split's partial outputs, maximum and sum).
     public void dflashAttentionBf16(
             long query,
             long blockKeys,
@@ -566,6 +567,7 @@ public abstract class ExecutionGpu implements GpuMemory {
             long ringKeys,
             long ringValues,
             long output,
+            long scratch,
             int rows,
             long position,
             int window,

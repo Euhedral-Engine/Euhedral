@@ -132,6 +132,7 @@ public final class DFlash2Frame extends QwenStageFrame {
                                 state.ringKeys(instruction.layerIndex()),
                                 state.ringValues(instruction.layerIndex()),
                                 output(context, instruction, 0),
+                                output(context, instruction, 1),
                                 rows,
                                 context.workspace().positionAddress(),
                                 config.slidingWindow(),

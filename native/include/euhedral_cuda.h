@@ -335,10 +335,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_block_qk_bf16(
         const void* device_query, const void* device_kv, const void* device_query_norm, const void* device_key_norm,
         void* device_query_out, void* device_key_out, uint32_t rows, const void* device_position, uint32_t heads,
         uint32_t key_value_heads, uint32_t head_dim, float epsilon, float theta);
+/* `device_scratch` holds 8 x heads x 130 FP32 values per row (each key split's partial outputs, maximum and sum). */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_attention_bf16(
         const void* device_query, const void* device_block_keys, const void* device_kv, const void* device_ring_keys,
-        const void* device_ring_values, void* device_output, uint32_t rows, const void* device_position,
-        uint32_t window, uint32_t heads, uint32_t key_value_heads, uint32_t head_dim);
+        const void* device_ring_values, void* device_output, void* device_scratch, uint32_t rows,
+        const void* device_position, uint32_t window, uint32_t heads, uint32_t key_value_heads, uint32_t head_dim);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_swiglu_bf16(
         const void* device_gate_up, void* device_output, uint32_t rows, uint32_t intermediate);
 /* Scratch of euhedral_cuda_dflash_topk_bf16 for `rows` rows (each row's splits' partial top 16). */

@@ -163,7 +163,14 @@ class DFlash2KernelTest(unittest.TestCase):
         self.assertEqual(0.0, np.abs(keys[(start + rows) % window]).max(), "other slots untouched")
 
     def test_block_attention_sees_the_window_of_context_keys_and_every_block_key(self):
-        rows, heads, kv_heads, window, start = 8, 8, 2, 64, 100
+        # A sliding window whose oldest keys the later rows mask, a context shorter than the window, and a full
+        # 2048-key window (the longest key splits).
+        for rows, heads, kv_heads, window, start in ((8, 8, 2, 64, 100), (8, 8, 2, 64, 10), (8, 32, 8, 2048, 5000),
+                                                     (3, 8, 2, 2048, 3000)):
+            with self.subTest(window=window, start=start, rows=rows):
+                self.check_block_attention(rows, heads, kv_heads, window, start)
+
+    def check_block_attention(self, rows, heads, kv_heads, window, start):
         width = kv_heads * 128
         query = self.random_bf16(rows, heads * 128)
         block_keys = self.random_bf16(rows, width)
@@ -171,12 +178,15 @@ class DFlash2KernelTest(unittest.TestCase):
         ring_k, ring_v = self.random_bf16(window, width), self.random_bf16(window, width)
         pointers = [self.put(a) for a in (query, block_keys, kv, ring_k, ring_v)]
         out = self.gpu.zeros(2 * rows * heads * 128)
+        partial = self.gpu.zeros(4 * rows * 8 * heads * 130)
         position = self.gpu.upload(np.array([start], dtype=np.uint64).tobytes())
-        shared = (4 * (2048 + 16) + 4 * 128 + 8) * 4
-        self.gpu.launch('euhedral_dflash_attention_bf16', (rows, kv_heads),
-                        [C.c_uint64(p) for p in pointers] + [C.c_uint64(out), C.c_uint64(position), C.c_uint(rows),
+        shared = 32 * 276 * 4 + 2 * 32 * 280 * 2 + 16 * 136 * 2 + 64 * 4
+        self.gpu.launch('euhedral_dflash_attention_tc_bf16', (kv_heads, 8),
+                        [C.c_uint64(p) for p in pointers] + [C.c_uint64(partial), C.c_uint64(position), C.c_uint(rows),
                                                               C.c_uint(window), C.c_uint(heads), C.c_uint(kv_heads)],
-                        block=256, shared=shared)
+                        block=128, shared=shared)
+        self.gpu.launch('euhedral_dflash_attention_merge_bf16', (rows, heads),
+                        [C.c_uint64(partial), C.c_uint64(out), C.c_uint(heads)], block=128)
         got = self.get_bf16(out, (rows, heads, 128))
         group = heads // kv_heads
         for i in range(rows):
@@ -192,6 +202,8 @@ class DFlash2KernelTest(unittest.TestCase):
                 weights = np.exp(scores - scores.max())
                 expected = (weights / weights.sum()) @ values.astype(np.float64)
                 np.testing.assert_allclose(got[i, h], expected, atol=0.02, rtol=0.02, err_msg=f"row {i} head {h}")
+        for p in pointers + [out, partial, position]:
+            self.gpu.free(p)
 
     def test_swiglu_rounds_the_activation_before_the_up_product(self):
         rows, inter = 4, 1024

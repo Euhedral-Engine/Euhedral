@@ -109,6 +109,7 @@ public final class QwenExecutionPlan {
         DRAFT_TOPK_VALUES,
         DRAFT_TOPK_INDICES,
         DRAFT_TOPK_SCRATCH,
+        DRAFT_ATTENTION_PARTIAL,
         DRAFT_SELECTOR,
         DRAFT_PROPOSAL,
         DRAFT_SCORES
@@ -1470,7 +1471,7 @@ public final class QwenExecutionPlan {
                                 List.of(rotated),
                                 List.of(),
                                 List.of(Buffer.DRAFT_QUERY_ROPE, Buffer.DRAFT_KEY_ROPE, Buffer.DRAFT_KV),
-                                List.of(Buffer.ATTENTION_CONTEXT),
+                                List.of(Buffer.ATTENTION_CONTEXT, Buffer.DRAFT_ATTENTION_PARTIAL),
                                 c.queryWidth(),
                                 c.queryWidth());
                         return addNode(
@@ -1608,6 +1609,8 @@ public final class QwenExecutionPlan {
                 spec(Buffer.DRAFT_QUERY_ROPE, c.queryWidth(), ElementType.BF16),
                 spec(Buffer.DRAFT_KEY_ROPE, c.keyValueWidth(), ElementType.BF16),
                 spec(Buffer.ATTENTION_CONTEXT, c.queryWidth(), ElementType.BF16),
+                // Per row: 8 key splits × query heads × (128 partial outputs, maximum, sum).
+                spec(Buffer.DRAFT_ATTENTION_PARTIAL, 8 * c.attentionHeads() * 130, ElementType.FP32),
                 spec(Buffer.MIXER_DELTA, hidden, ElementType.BF16),
                 spec(Buffer.FFN_DELTA, hidden, ElementType.BF16),
                 spec(Buffer.GATE_UP, 2 * c.intermediateSize(), ElementType.BF16),
