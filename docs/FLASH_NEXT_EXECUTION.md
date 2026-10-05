@@ -64,3 +64,21 @@ shard's global scale), through a pinned staging buffer; `euhedral_q4_ngram_expan
 2560-wide embedding. The table never reaches the device whole. The key and value projections are NVFP4; the gate is
 `sigmoid(signed sqrt(key . query / sqrt(2560)))` per stream; the dilated depthwise convolution (4 taps, dilation 3) runs over
 the normalized gated values with nine rows of history, which a sequence carries as `[9][10240]` BF16.
+
+## Sparse attention (QSA)
+
+Every fourth layer (12 in all) is a sparse-attention layer: grouped-query attention (24 query heads, 2 KV heads of 256, partial
+RoPE of 64 values, per-head Q/K RMSNorm, a sigmoid output gate) over a *selected* part of the history. An indexer chooses the
+part: a BF16 projection gives four indexer queries and one raw key of 128 values per token; keys are pooled in blocks of four
+tokens (mean of the raw keys, `k_layernorm`, RoPE at the block's first position), a query scores every complete block it sees
+with `sum over heads of relu(q . key) / sqrt(128)`, and the top 512 blocks (2,048 tokens) plus the incomplete trailing block
+are attended. While the history holds at most 512 blocks every block is selected and attention is dense over the visible
+tokens; beyond that the selection is purely score-ranked, so a query whose own block is not among the best 512 does not attend
+to itself (upstream's behavior, reproduced).
+
+The sequence keeps the NVFP4 key/value pages (576 bytes per token) and one pooled BF16 key per block (64 bytes per token); the up
+to three raw keys of an incomplete block are carried between chunks, so a block key is computed once, when it completes, and any
+chunking of a sequence gives the same result. Selection scores a tile of rows at a time (at most 16 MiB of FP32 scores) and
+selects with a digit search over the scores; ties go to the lower block. The attention kernel reads the selected blocks and the
+tail directly from the pages: no dense matrix and no expanded token list. Arithmetic, tolerances and timings:
+[FLASH_NEXT_QSA.md](FLASH_NEXT_QSA.md).
