@@ -94,6 +94,20 @@ public final class Qwen4Weights {
                 of(p + "norm"));
     }
 
+    public Qwen4QsaLayer.Weights qsa(int layer) {
+        String p = layer(layer) + "attention/";
+        return new Qwen4QsaLayer.Weights(
+                of(p + "q_proj"),
+                of(p + "k_proj"),
+                of(p + "v_proj"),
+                of(p + "o_proj"),
+                of(p + "q_norm"),
+                of(p + "k_norm"),
+                of(p + "indexer/index_qk_proj"),
+                of(p + "indexer/q_layernorm"),
+                of(p + "indexer/k_layernorm"));
+    }
+
     public Qwen4MoeLayer.Weights moe(int layer) {
         String p = layer(layer) + "moe/";
         return new Qwen4MoeLayer.Weights(
