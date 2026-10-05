@@ -21,7 +21,7 @@ public final class Qwen4QsaOps {
     /// Blocks a scores launch covers per CTA.
     static final int SCORE_BLOCKS_PER_CTA = 64;
     /// Dynamic shared bytes of one attention warp (q4qsa::kWarpSharedBytes).
-    static final int ATTENTION_WARP_SHARED_BYTES = 17_664;
+    static final int ATTENTION_WARP_SHARED_BYTES = 22_272;
     /// The most warps an attention CTA may have (the native table's shared-memory limit).
     static final int ATTENTION_MAX_WARPS = 4;
     /// Floats of one (row, head, split) partial: 256 values, the running maximum and the running

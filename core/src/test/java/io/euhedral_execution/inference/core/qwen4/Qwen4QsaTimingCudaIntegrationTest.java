@@ -17,7 +17,17 @@ import org.junit.jupiter.api.Test;
 /// with the environment variable EUHEDRAL_QWEN4_TIMING=1.
 class Qwen4QsaTimingCudaIntegrationTest {
 
-    private static final int[] HISTORIES = {1024, 8192, 32768, 131072, 261632};
+    private static final int[] HISTORIES = histories();
+
+    /// 512-token multiples; EUHEDRAL_QWEN4_TIMING_HISTORIES overrides the default list (comma separated).
+    private static int[] histories() {
+        String configured = System.getenv("EUHEDRAL_QWEN4_TIMING_HISTORIES");
+        if (configured == null) return new int[] {1024, 8192, 32768, 131072, 261632};
+        return java.util.Arrays.stream(configured.split(","))
+                .mapToInt(Integer::parseInt)
+                .toArray();
+    }
+
     private static final int[] ROWS = {1, 64, 512};
 
     private static double timeMs(CudaGpuMemory gpu, GpuStream stream, int reps, Runnable launches) {
