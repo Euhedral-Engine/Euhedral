@@ -68,8 +68,8 @@ The response is `chat.completion` with one choice. `message.reasoning_content` c
 
 ## Other differences
 
-- Speculative decoding (MTP) runs only for greedy requests without a grammar; sampled or constrained requests decode
-  one token per step.
+- Speculative decoding (MTP or DFlash2, as the artifact selects) runs only for greedy requests without a grammar; sampled
+  or constrained requests decode one token per step.
 - Authentication is not implemented: any API key is accepted. Put the server behind a proxy that authenticates if it is
   reachable by others.
 - A request body is limited to `euhedral.api.max-request-bytes` (1 MiB, 413 beyond) and a request to
