@@ -277,6 +277,9 @@ public final class QwenExecutionPlan {
     private final QwenExecutionPlan owner;
     private final QwenExecutionPlan smallPrefill;
     private final QwenExecutionPlan decode;
+    /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded by the
+    /// prefetch of a DFlash2 block (null when no weight is host-backed).
+    private final QwenExecutionPlan decodePreloaded;
     private final QwenExecutionPlan regionPrefill;
     private final WeightStaging staging;
     /// The MTP draft view; null without loaded MTP weights and draft head.
@@ -284,6 +287,8 @@ public final class QwenExecutionPlan {
     /// The DFlash2 views, null without the loaded drafter: its block (DRAFT) and its context rows (DRAFT_CONTEXT).
     private final QwenExecutionPlan dflashBlock;
     private final QwenExecutionPlan dflashContext;
+    /// Whether this view copies the decode view's first ring slots ahead of the next verification.
+    private final boolean prefetchesRing;
 
     /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
     static final List<Map.Entry<Buffer, Buffer>> REGION_STORAGE = List.of(
@@ -577,7 +582,18 @@ public final class QwenExecutionPlan {
 
     private QwenExecutionPlan(
             QwenWeights weights, PlanData data, QwenExecutionPlan owner, boolean reuseStorage, WeightStaging staging) {
+        this(weights, data, owner, reuseStorage, staging, false);
+    }
+
+    private QwenExecutionPlan(
+            QwenWeights weights,
+            PlanData data,
+            QwenExecutionPlan owner,
+            boolean reuseStorage,
+            WeightStaging staging,
+            boolean prefetchesRing) {
         this.owner = owner == null ? this : owner;
+        this.prefetchesRing = prefetchesRing;
         this.staging = owner == null ? staging : owner.staging;
         this.weights = weights;
         this.instructions = List.copyOf(data.instructions());
@@ -610,6 +626,7 @@ public final class QwenExecutionPlan {
         if (owner != null || !data.fullModel()) {
             this.smallPrefill = null;
             this.decode = null;
+            this.decodePreloaded = null;
             this.regionPrefill = null;
             this.mtpDraft = null;
             this.dflashBlock = null;
@@ -626,14 +643,32 @@ public final class QwenExecutionPlan {
                 ? new QwenExecutionPlan(weights, staged(mtpDraft(weights), this.staging), this, false)
                 : null;
         DFlash2Weights drafter = weights.dflash2();
+        // A DFlash2 block leaves the host-backed transfer lane idle for milliseconds before every verification, so it
+        // copies the decode view's first ring slots, and a verification that finds them loaded skips their transfers.
+        List<TensorHandle> firstUses = this.staging == null
+                ? List.of()
+                : firstHostBackedUses(prefillView(data, PrefillView.SMALL), this.staging.slots());
         this.dflashBlock = drafter == null
                 ? null
-                : new QwenExecutionPlan(weights, staged(dflash2Block(weights, drafter), this.staging), this, false);
+                : firstUses.isEmpty()
+                        ? new QwenExecutionPlan(
+                                weights, staged(dflash2Block(weights, drafter), this.staging), this, false)
+                        : new QwenExecutionPlan(
+                                weights,
+                                withPrefetch(staged(dflash2Block(weights, drafter), this.staging), firstUses),
+                                this,
+                                false,
+                                null,
+                                true);
         this.dflashContext = drafter == null
                 ? null
                 : new QwenExecutionPlan(weights, staged(dflash2Context(drafter), this.staging), this, false);
         this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
         this.decode = prefillPlan(weights, data, PrefillView.SMALL, this);
+        this.decodePreloaded = this.dflashBlock != null && this.dflashBlock.prefetchesRing
+                ? new QwenExecutionPlan(
+                        weights, staged(prefillView(data, PrefillView.SMALL), this.staging, true), this, false)
+                : null;
         this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
     }
 
@@ -652,11 +687,71 @@ public final class QwenExecutionPlan {
         return this.instructions.stream().anyMatch(i -> i.kind() == Kind.WEIGHT_TRANSFER);
     }
 
+    /// Whether this view (a DFlash2 block) leaves the decode view's first ring slots loaded when it completes.
+    boolean prefetchesRing() {
+        return this.prefetchesRing;
+    }
+
+    /// The view to run when the ring holds what [#prefetchesRing] loads: the decode view without the transfers of
+    /// its first slots, or this view when it has no such variant.
+    QwenExecutionPlan preloadedVariant() {
+        QwenExecutionPlan family = this.owner;
+        return this == family.decode && family.decodePreloaded != null ? family.decodePreloaded : this;
+    }
+
+    /// The host-backed weights of `data`'s first `slots` staging uses, in use order: the weights its staged view
+    /// copies into slots 0 .. slots - 1 before any slot is reused.
+    private static List<TensorHandle> firstHostBackedUses(PlanData data, int slots) {
+        List<TensorHandle> uses = new ArrayList<>();
+        for (Instruction instruction : data.instructions()) {
+            for (TensorHandle weight : instruction.weights) {
+                if (weight.hostBacked() && uses.size() < slots) uses.add(weight);
+            }
+        }
+        return List.copyOf(uses);
+    }
+
+    /// `data` with leaf transfers that copy `uses` into staging slots 0, 1, ... (the decode view's first slots).
+    private PlanData withPrefetch(PlanData data, List<TensorHandle> uses) {
+        List<Instruction> result = new ArrayList<>(data.instructions());
+        for (int use = 0; use < uses.size(); use++) {
+            TensorHandle weight = uses.get(use);
+            TensorHandle transfer = new TensorHandle(
+                    weight.name(),
+                    weight.shape(),
+                    weight.dataType(),
+                    weight.format(),
+                    weight.layout(),
+                    this.staging.slotAddress(use),
+                    weight.byteSize(),
+                    weight.hostAddress());
+            result.add(new Instruction(
+                    result.size(),
+                    Kind.WEIGHT_TRANSFER,
+                    List.of(),
+                    List.of(transfer),
+                    List.of(),
+                    List.of(),
+                    0,
+                    0,
+                    -1,
+                    -1));
+        }
+        return new PlanData(
+                List.copyOf(result), data.projectionWidths(), data.bufferSpecs(), data.firstLayer(), data.fullModel());
+    }
+
     /// Rewrites a view so that each use of a host-backed weight reads a staging slot. Use `u` takes slot
     /// `u mod slots`; its transfer follows the use that last read the slot (use `u - slots`), or starts
     /// the quantum, and precedes the consumer. Transfers are leaves apart from those two edges, so each
     /// copy starts as soon as its slot is free.
     static PlanData staged(PlanData data, WeightStaging staging) {
+        return staged(data, staging, false);
+    }
+
+    /// [#staged(PlanData, WeightStaging)], with `preloaded` leaving out the transfers of the first `slots` uses: the
+    /// quantum runs only after a prefetch loaded them into slots 0 .. slots - 1 ([#prefetchesRing]).
+    static PlanData staged(PlanData data, WeightStaging staging, boolean preloaded) {
         List<Instruction> source = data.instructions();
         boolean hostBacked = source.stream().flatMap(i -> i.weights.stream()).anyMatch(TensorHandle::hostBacked);
         if (!hostBacked) return data;
@@ -711,7 +806,7 @@ public final class QwenExecutionPlan {
                     -1,
                     useLayers.get(use)));
         };
-        for (int use = 0; use < Math.min(slots, useWeights.size()); use++) emitTransfer.accept(use);
+        if (!preloaded) for (int use = 0; use < Math.min(slots, useWeights.size()); use++) emitTransfer.accept(use);
         int use = 0;
         for (Instruction instruction : source) {
             List<Integer> dependencies = new ArrayList<>(remapDependencies(instruction.dependencies(), remapped));
@@ -722,7 +817,7 @@ public final class QwenExecutionPlan {
                     weights.add(weight);
                     continue;
                 }
-                dependencies.add(transferIds[use]);
+                if (!preloaded || use >= slots) dependencies.add(transferIds[use]);
                 weights.add(new TensorHandle(
                         weight.name(),
                         weight.shape(),
