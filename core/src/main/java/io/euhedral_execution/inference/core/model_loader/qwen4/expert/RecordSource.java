@@ -9,8 +9,10 @@ import java.lang.foreign.MemorySegment;
 public interface RecordSource extends AutoCloseable {
 
     /// Fills `destination`, which is exactly `bank.recordBytes(expert)` bytes, with the record. May be called
-    /// from many threads at once.
-    void read(ExpertBank bank, int expert, MemorySegment destination) throws IOException;
+    /// from many threads at once, and must stay usable when a read is interrupted.
+    ///
+    /// @throws InterruptedException when the reading thread was interrupted; the source is unaffected
+    void read(ExpertBank bank, int expert, MemorySegment destination) throws IOException, InterruptedException;
 
     /// Bytes this source has read from the artifact file.
     long bytesRead();

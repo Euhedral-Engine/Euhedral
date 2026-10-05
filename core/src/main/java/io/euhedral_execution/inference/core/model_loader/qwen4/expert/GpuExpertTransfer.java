@@ -82,6 +82,7 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         boolean touchedStream = false;
         boolean armed = false;
         try {
+            if (this.closed.get()) throw new IllegalStateException("the expert transfer is closed");
             this.permits.acquire();
             permitted = true;
             Pending pending = new Pending(record, done);
@@ -166,6 +167,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         if (!drained)
             throw new IllegalStateException("expert transfers are still in flight; the copy stream is kept open");
         this.finished = true;
+        // A start that was already waiting for a permit wakes, finds the transfer closed and fails.
+        this.permits.release(this.maxInFlight);
         this.retired.offer(this.stop);
         try {
             this.completionThread.join();
