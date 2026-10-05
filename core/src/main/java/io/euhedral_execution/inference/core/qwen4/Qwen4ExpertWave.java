@@ -24,7 +24,7 @@ import java.nio.ByteOrder;
 /// | section | content | bytes |
 /// |---|---|---|
 /// | slots | device address of each expert record of the wave, written by the caller | 8 E |
-/// | items | per work item: slot index, first pair, pair count (1..8), 0 | 16 I |
+/// | items | per work item: slot index, first pair, pair count (1..16), 0 | 16 I |
 /// | pairs | per pair: row (int), BF16 routing weight (int, low 16 bits) | 8 P |
 /// | row offsets | `rows + 1` offsets into the row lists | 4 (T + 1) |
 /// | row pairs | for each row the wave's pair indices, ascending expert order | 4 P |
@@ -33,8 +33,8 @@ import java.nio.ByteOrder;
 /// `maxRows`.
 public final class Qwen4ExpertWave {
 
-    /// Pairs per work item: the token columns of one MMA.
-    public static final int ITEM_PAIRS = 8;
+    /// Pairs per work item: the token columns of two MMA tiles.
+    public static final int ITEM_PAIRS = 16;
 
     private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);

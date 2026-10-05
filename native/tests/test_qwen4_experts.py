@@ -1,16 +1,14 @@
 """Flash-Next routed-expert kernels (native/src/qwen4/experts.cuh) against a float64 reference of the exactly expanded
 NVFP4 weights, and their row-exactness: a (token, expert) pair gives the same bits whatever work items it is in.
 
-Set EUHEDRAL_EXPERT_BENCH=1 to print kernel times (weights rotated over many slots so they come from DRAM).
+Kernel times are in bench_qwen4_experts.py.
 """
 
 import contextlib
 import ctypes as C
-import os
 from pathlib import Path
 import struct
 import sys
-import time
 import unittest
 
 try:
@@ -123,9 +121,9 @@ class ExpertKernelTest(unittest.TestCase):
             gpu.launch(NAMES[0], (INTER // 32, len(items)),
                        [C.c_uint64(d_slots), C.c_uint64(d_items), C.c_uint64(d_pairs), C.c_uint64(d_x),
                         C.c_uint64(d_act), C.c_uint(GATE_UP_OFFSET), C.c_uint(HIDDEN), C.c_uint(INTER)], block=128)
-            gpu.launch(NAMES[1], (HIDDEN // 256, len(items)),
+            gpu.launch(NAMES[1], (HIDDEN // 128, len(items)),
                        [C.c_uint64(d_slots), C.c_uint64(d_items), C.c_uint64(d_pairs), C.c_uint64(d_act),
-                        C.c_uint64(d_weighted), C.c_uint(DOWN_OFFSET), C.c_uint(INTER), C.c_uint(HIDDEN)], block=256)
+                        C.c_uint64(d_weighted), C.c_uint(DOWN_OFFSET), C.c_uint(INTER), C.c_uint(HIDDEN)], block=128)
         act = np.frombuffer(gpu.download(d_act, n * INTER * 2), "<u2").reshape(n, INTER)
         weighted = np.frombuffer(gpu.download(d_weighted, n * HIDDEN * 2), "<u2").reshape(n, HIDDEN)
         return act, weighted
@@ -141,7 +139,7 @@ class ExpertKernelTest(unittest.TestCase):
         self.assertLess(different, 0.02, f"{what}: {different:.4f} of the elements differ")
 
     @staticmethod
-    def groups(counts, size=8):
+    def groups(counts, size=16):
         """Items of up to `size` pairs for experts holding `counts` pairs each, pairs numbered consecutively."""
         items, begin = [], 0
         for slot, count in enumerate(counts):
@@ -154,9 +152,9 @@ class ExpertKernelTest(unittest.TestCase):
 
     def test_matches_the_reference(self):
         rng = self.rng
-        counts = [1, 5, 8, 9, 17, 3]
-        slot_index = [0, 1, 2, 1, 0, 2]
-        tokens = 24
+        counts = [1, 5, 8, 9, 17, 3, 16, 33]
+        slot_index = [0, 1, 2, 1, 0, 2, 1, 0]
+        tokens = 40
         x_bits = bf16_bits(rng.standard_normal((tokens, HIDDEN)).astype(np.float32))
         pairs = []
         for count in counts:
@@ -186,18 +184,18 @@ class ExpertKernelTest(unittest.TestCase):
         results = {}
         with contextlib.ExitStack() as stack:
             slab = self.upload_slots(stack, self.records)
-            for size in (8, 5, 3, 1):
+            for size in (16, 8, 5, 3, 1):
                 items = self.groups([count], size)
                 results[size] = self.run_wave(stack, slab, [1], items, pairs, x_bits, tokens)
-            # the same pairs in reverse order, one item of 7 and the rest 8
+            # the same pairs in reverse order, one item of 7 and the rest 16
             reversed_pairs = pairs[::-1]
-            items = [(0, 0, 7)] + [(0, b, min(8, count - b)) for b in range(7, count, 8)]
+            items = [(0, 0, 7)] + [(0, b, min(16, count - b)) for b in range(7, count, 16)]
             reverse = self.run_wave(stack, slab, [1], items, reversed_pairs, x_bits, tokens)
-        for size in (5, 3, 1):
+        for size in (8, 5, 3, 1):
             for i in range(2):
-                self.assertTrue(np.array_equal(results[8][i], results[size][i]), f"size {size}, output {i}")
+                self.assertTrue(np.array_equal(results[16][i], results[size][i]), f"size {size}, output {i}")
         for i in range(2):
-            self.assertTrue(np.array_equal(results[8][i], reverse[i][::-1]), f"reversed, output {i}")
+            self.assertTrue(np.array_equal(results[16][i], reverse[i][::-1]), f"reversed, output {i}")
 
     def test_combine_adds_in_the_listed_order(self):
         rng = self.rng
@@ -224,29 +222,6 @@ class ExpertKernelTest(unittest.TestCase):
                     total = bf16(total + from_bits(weighted[p]))
                 expected = bf16_bits(total) if (l or zero_first) else start[t]
                 self.assertTrue(np.array_equal(got[t], expected), f"zero_first {zero_first}, token {t}")
-
-    @unittest.skipUnless(os.environ.get("EUHEDRAL_EXPERT_BENCH"), "set EUHEDRAL_EXPERT_BENCH=1")
-    def test_bench(self):
-        rng = self.rng
-        slots = 96
-        for experts, per_expert in ((10, 1), (10, 8), (64, 1), (64, 10), (64, 40), (32, 100)):
-            tokens = 512
-            x_bits = bf16_bits(rng.standard_normal((tokens, HIDDEN)).astype(np.float32))
-            counts = [per_expert] * experts
-            pairs = [(int(t), 0x3e00) for c in counts for t in sorted(rng.choice(tokens, c, replace=False))]
-            items = self.groups(counts)
-            with contextlib.ExitStack() as stack:
-                slab = self.upload_slots(stack, self.records, copies=slots // 3)
-                best = 1e9
-                for trial in range(5):
-                    order = list(range(trial * experts % slots, trial * experts % slots + experts))
-                    order = [o % slots for o in order]
-                    start = time.perf_counter()
-                    self.run_wave(stack, slab, order, items, pairs, x_bits, tokens, repeat=1)
-                    best = min(best, time.perf_counter() - start)
-                bytes_read = experts * RECORD
-                print(f"experts {experts} pairs/expert {per_expert}: items {len(items)} total(host sync) "
-                      f"{best * 1e6:.0f} us, record bytes {bytes_read / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ public final class Qwen4ExpertOps {
     /// Output columns per CTA of the gate_up kernel and rows per CTA of the down kernel.
     private static final int GATE_UP_COLUMNS = 32;
 
-    private static final int DOWN_ROWS = 256;
+    private static final int DOWN_ROWS = 128;
     private static final int COMBINE_THREADS = 256;
 
     private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
@@ -134,7 +134,7 @@ public final class Qwen4ExpertOps {
                 geometry.hidden() / DOWN_ROWS,
                 itemCount,
                 1,
-                256,
+                128,
                 1,
                 1,
                 0,
