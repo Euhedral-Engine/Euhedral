@@ -50,7 +50,7 @@ from euhedral_artifacts.sources import SourceStore, concat_matrix, read_json, so
 
 PREFIX = "dflash2/"
 CONFIG_VERSION = 1
-PROJECTIONS = ("bf16", "nvfp4", "nvfp4-all")
+PROJECTIONS = ("bf16", "nvfp4", "nvfp4-fc", "nvfp4-all")
 EXPECTED = {
     "num_hidden_layers": 5,
     "hidden_size": 5120,
@@ -122,7 +122,7 @@ def _raw(store: SourceStore, name: str, source: str, shape: tuple[int, ...]) -> 
 
 
 def _matrix(name: str, matrix, projections: str) -> ObjectPlan:
-    if projections in ("nvfp4", "nvfp4-all"):
+    if projections in ("nvfp4", "nvfp4-fc", "nvfp4-all"):
         return ObjectPlan(name, matrix.shape, "BF16", "NVFP4", "row-split-k128-v1", nvfp4_offsets(matrix.shape)[2],
                           lambda output, offset, source=matrix: quantize_nvfp4_matrix(output, offset, source))
 
@@ -152,7 +152,7 @@ def build_plans(store: SourceStore, config: dict[str, Any], projections: str = "
         ObjectPlan(PREFIX + "config", (len(words),), "INT32", "I32", "contiguous-le-v1", 4 * len(words),
                    lambda output, offset: (output.seek(offset), output.write(words.tobytes()))),
         _matrix(PREFIX + "fc", source_matrix(store, "fc.weight", (hidden, taps * hidden)),
-                "nvfp4" if projections == "nvfp4-all" else "bf16"),
+                "nvfp4" if projections in ("nvfp4-fc", "nvfp4-all") else "bf16"),
         _raw(store, PREFIX + "hidden_norm", "hidden_norm.weight", (hidden,)),
         _raw(store, PREFIX + "final_norm", "norm.weight", (hidden,)),
     ]

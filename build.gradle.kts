@@ -115,7 +115,7 @@ subprojects {
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed_dflash2_bf16.edrl")
                             .get())
             // Optional DFlash2 reference fixtures (tools/dflash2_reference.py) and the fixtures the engine writes.
-            for (name in listOf("fixtures", "dump", "report", "verified"))
+            for (name in listOf("fixtures", "dump", "report", "verified", "prompt-tokens"))
                 providers.gradleProperty("euhedral.dflash2.$name").orNull?.let { systemProperty("euhedral.dflash2.$name", it) }
             // Optional compressed Q3 artifact (tools/convert_checkpoint.py --quantization q3 --compressed).
             systemProperty(
