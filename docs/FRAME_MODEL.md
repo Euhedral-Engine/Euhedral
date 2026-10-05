@@ -280,6 +280,13 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   therefore which lanes, its stages run on. When tokenization drew from the graphs' sequence, every graph built after
   it got other seeds: on nvfp4-compressed at 32K the verify step took 34.1 ms instead of 33.7 ms (CUDA graphs off), and
   placement depended on how many prompts had been encoded before a graph was built.
+- **Workers idle on fixed timing** (`InferenceEngine.fragmentConfig`): a worker with nothing to run parks 15 us and looks
+  again. Speculative steps that are not replayed from a captured graph submit one frame per stage, and every frame waits for
+  a worker that is awake. Rejected: the lattice's adaptive idle timing, which derives each worker's park (up to 0.8 ms) and
+  its choice to idle from that worker's own history of frame costs. nvfp4-compressed through the API, 32K prompt, 256
+  tokens, six requests in a row: with 4 worker CPUs 83.9-86.6 tok/s against 101.1-101.8 with fixed timing; with 32 worker
+  CPUs three requests at 101-103 and then 77.7-77.9, as long prefills had left fewer workers awake, against 101.5-102.9
+  throughout. Idle CPU with no request is the same with either: 0.4 cores for 4 workers, 3.6-4.3 for 32.
 - **Waking a thread outside the lattice per token is expensive.** When a blocked caller drained each token's text from a
   queue, the wake-up sat between a VERIFY's retirement and the next admission: the median gap after a 4-row VERIFY was
   276 us, 229 us when nothing outside the workers was woken. The benchmark therefore drives `generateAsync`, as the server

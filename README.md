@@ -59,8 +59,7 @@ after the first token. Prefill and time to first token (TTFT) include the whole 
 
 The 4K, 16K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
 and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are
-chat prompts. The 4K and 16K rows share a process; every other row is its process's first request, because on the NVFP4 artifacts
-a later long request currently decodes slower ([docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md), "Open").
+chat prompts.
 
 | Artifact | File | Device memory in use at 32K / 64K | Host-backed weights at 32K / 64K | Longest context run |
 |---|---|---|---|---|
