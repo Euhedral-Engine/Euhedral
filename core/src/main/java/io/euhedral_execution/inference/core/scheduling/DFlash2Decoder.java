@@ -201,7 +201,10 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                         if (this.timing != null) this.timing.prefillQuantum(started, executed, end - offset);
                         long contextStarted = System.nanoTime();
                         return context(offset, chunk).thenCompose(done -> {
-                            DFlash2Decoder.this.statistics.promptContextNanos += System.nanoTime() - contextStarted;
+                            long contextDone = System.nanoTime();
+                            DFlash2Decoder.this.statistics.promptContextNanos += contextDone - contextStarted;
+                            if (this.timing != null)
+                                this.timing.draftQuantum("prompt-context", contextStarted, contextDone);
                             CompletableFuture<Void> stored = this.hooks == null
                                     ? CompletableFuture.completedFuture(null)
                                     : this.hooks.afterChunk(end);
@@ -241,7 +244,9 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                                     QwenLogitsRequirement.ALL_TOKENS)
                             .withProposal(DFlash2Decoder.this.proposal))
                     .thenCompose(ignored -> {
-                        long drafted = System.nanoTime() - drafting;
+                        long draftedAt = System.nanoTime();
+                        long drafted = draftedAt - drafting;
+                        if (this.timing != null) this.timing.draftQuantum("block", drafting, draftedAt);
                         if (this.firstBlock) DFlash2Decoder.this.statistics.firstBlockNanos += drafted;
                         else DFlash2Decoder.this.statistics.blockNanos += drafted;
                         this.firstBlock = false;
@@ -301,7 +306,9 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                         int[] contextRows = Arrays.copyOf(rows, acceptance.committedRows());
                         long contextStarted = System.nanoTime();
                         return context(position, contextRows).thenCompose(done -> {
-                            DFlash2Decoder.this.statistics.contextNanos += System.nanoTime() - contextStarted;
+                            long contextDone = System.nanoTime();
+                            DFlash2Decoder.this.statistics.contextNanos += contextDone - contextStarted;
+                            if (this.timing != null) this.timing.draftQuantum("context", contextStarted, contextDone);
                             return step(next);
                         });
                     });

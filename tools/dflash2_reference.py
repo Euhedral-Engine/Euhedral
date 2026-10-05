@@ -15,8 +15,10 @@ Inputs, one of:
 The block is `anchor + 7 mask tokens` at positions P .. P + 7, and the context rows sit at P - rows .. P - 1, which is
 how upstream `dflash_generate` calls the draft model after a prefill of P tokens.
 
-`--embedding` and `--lm-head` replace the target's BF16 embedding rows and output head with the values the engine
-uses (its quantized tensors expanded to BF16), so a comparison isolates the drafter's own arithmetic.
+`--embedding` replaces the target's BF16 embedding rows with the rows the engine embedded (the engine's dump), and
+`--lm-head-artifact` the output head with the artifact's NVFP4 head expanded exactly (FP32 weights, FP32 products, one
+BF16 rounding of the logits, as the engine's kernels compute them), so a comparison isolates the drafter's own
+arithmetic.
 
 Output: DIR/manifest.json lists every tensor (dtype, shape, file); each tensor is raw little-endian bytes.
 Needs PyTorch, transformers 5.15 and safetensors (upstream's pins), plus the upstream source tree (--dflash-src).
@@ -73,6 +75,38 @@ def read_raw(path: Path, shape: list[int]) -> torch.Tensor:
     if tensor.numel() != expected:
         raise SystemExit(f"{path}: {tensor.numel()} BF16 values, expected {shape}")
     return tensor.reshape(shape)
+
+
+def artifact_head(artifact: Path, vocabulary: int, hidden: int) -> torch.Tensor:
+    """The artifact's NVFP4 `text/output_head` (plain or SD4 scales) expanded to FP32."""
+    import numpy as np
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from euhedral_artifacts import edrl, nvfp4
+
+    with artifact.open("rb") as handle:
+        _, _, objects = edrl.read_table(handle)
+        entry = next(obj for obj in objects if obj["name"] == "text/output_head")
+        if entry["format"] != edrl.FORMAT_ORDINAL["NVFP4"] or tuple(entry["shape"]) != (vocabulary, hidden):
+            raise SystemExit("the artifact's output head is not an NVFP4 [vocab, hidden] tensor")
+        handle.seek(entry["offset"])
+        payload = np.frombuffer(handle.read(entry["bytes"]), dtype=np.uint8)
+    codes = payload[: vocabulary * hidden // 2].reshape(vocabulary, hidden // 2)
+    if entry["layout"] == edrl.LAYOUT_ORDINAL["row-split-k128-sd4-v1"]:
+        index_offset, table_offset, _ = nvfp4.nvfp4_sd4_offsets((vocabulary, hidden))
+        indices = payload[index_offset: index_offset + vocabulary * hidden // 32].reshape(vocabulary, hidden // 32)
+        table = payload[table_offset: table_offset + 16]
+        scales = nvfp4.expand_nvfp4_sd4(indices, table)
+        global_scale = np.frombuffer(payload[table_offset + 16: table_offset + 20].tobytes(), "<f4")[0]
+    else:
+        scale_offset, global_offset, _ = nvfp4.nvfp4_offsets((vocabulary, hidden))
+        scales = payload[scale_offset: scale_offset + vocabulary * hidden // 16].reshape(vocabulary, hidden // 16)
+        global_scale = np.frombuffer(payload[global_offset: global_offset + 4].tobytes(), "<f4")[0]
+    rows = []
+    for begin in range(0, vocabulary, 16384):
+        end = min(vocabulary, begin + 16384)
+        rows.append(torch.from_numpy(nvfp4.dequantize_nvfp4_rows(codes[begin:end], scales[begin:end], global_scale)))
+    return torch.cat(rows)
 
 
 class Recorder:
@@ -188,7 +222,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--start", type=int, default=24, help="synthetic: anchor position")
     parser.add_argument("--anchor", type=int, default=785, help="synthetic: anchor token")
     parser.add_argument("--embedding", type=Path, help="BF16 [8, 5120] noise embedding rows to use instead")
-    parser.add_argument("--lm-head", type=Path, help="BF16 [vocab, 5120] output head to use instead")
+    parser.add_argument("--lm-head-artifact", type=Path, help="use this artifact's NVFP4 output head instead")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--out", type=Path, required=True)
@@ -224,14 +258,24 @@ def main(argv: list[str]) -> int:
         noise = read_raw(args.embedding, [block_size, hidden])
     else:
         noise = read_safetensor(args.target, "model.language_model.embed_tokens.weight", block)
-    if args.lm_head is not None:
-        head_weight = read_raw(args.lm_head, [config.vocab_size, hidden])
+    if args.lm_head_artifact is not None:
+        weight = artifact_head(args.lm_head_artifact, config.vocab_size, hidden)
+        head = torch.nn.Linear(hidden, config.vocab_size, bias=False, dtype=torch.float32, device=args.device)
+        with torch.no_grad():
+            head.weight.copy_(weight)
+        del weight
+        exact = head
+
+        def engine_head(rows):
+            return exact(rows.float()).to(dtype)
+
+        head = engine_head
     else:
         head_weight = read_safetensor(args.target, "lm_head.weight")
-    head = torch.nn.Linear(hidden, config.vocab_size, bias=False, dtype=dtype, device=args.device)
-    with torch.no_grad():
-        head.weight.copy_(head_weight.to(dtype))
-    del head_weight
+        head = torch.nn.Linear(hidden, config.vocab_size, bias=False, dtype=dtype, device=args.device)
+        with torch.no_grad():
+            head.weight.copy_(head_weight.to(dtype))
+        del head_weight
 
     recorder = Recorder()
     recorder.add("taps", target_hidden)
@@ -273,7 +317,7 @@ def main(argv: list[str]) -> int:
         "torch": torch.__version__,
         "draft": str(args.draft),
         "embedding": str(args.embedding) if args.embedding else "target BF16",
-        "lm_head": str(args.lm_head) if args.lm_head else "target BF16",
+        "lm_head": str(args.lm_head_artifact) if args.lm_head_artifact else "target BF16",
     })
     print("proposal", proposal[0].tolist())
     return 0

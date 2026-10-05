@@ -91,6 +91,8 @@ public final class QwenSpeculativeDecoder implements SpeculativeDecoding {
     private final boolean[] inShortlist;
     private final MtpCheckpoint checkpoint;
     private Statistics statistics;
+    /// The current generation's timing listener, or null.
+    private GenerationTimingListener timing;
 
     /// The MTP strategy at `depth` drafts per verification.
     public static SpeculativeDecoding.Factory factory(int depth) {
@@ -196,6 +198,7 @@ public final class QwenSpeculativeDecoder implements SpeculativeDecoding {
         if (startPosition < 0 || startPosition >= prompt.length)
             throw new IllegalArgumentException("startPosition must lie within the prompt");
         this.statistics = new Statistics(this.depth);
+        this.timing = timing;
         return new Run(prompt, maxNewTokens, onToken, timing, hooks, startPosition).start();
     }
 
@@ -355,13 +358,18 @@ public final class QwenSpeculativeDecoder implements SpeculativeDecoding {
         long started = System.nanoTime();
         boolean prompt = this.statistics.outputTokens == 0;
         return catchUpPiece(position, tokens, draft, seeds, 0).thenCompose(ignored -> {
-            if (!prompt) this.statistics.catchUpNanos += System.nanoTime() - started;
+            long caughtUp = System.nanoTime();
+            if (!prompt) this.statistics.catchUpNanos += caughtUp - started;
+            if (this.timing != null)
+                this.timing.draftQuantum(prompt ? "prompt-catch-up" : "catch-up", started, caughtUp);
             if (!draft) return CompletableFuture.completedFuture(null);
             int[] drafts = new int[this.depth];
             drafts[0] = this.draftTokens[this.draftLogits.selectedToken()];
             long recursion = System.nanoTime();
             return recurse(position + tokens.length, drafts, 1, states).thenApply(done -> {
-                if (!prompt) this.statistics.recursionNanos += System.nanoTime() - recursion;
+                long recursed = System.nanoTime();
+                if (!prompt) this.statistics.recursionNanos += recursed - recursion;
+                if (this.timing != null && this.depth > 1) this.timing.draftQuantum("recursion", recursion, recursed);
                 return drafts;
             });
         });

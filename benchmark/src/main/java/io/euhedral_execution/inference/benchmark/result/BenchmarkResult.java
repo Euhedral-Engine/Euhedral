@@ -201,12 +201,36 @@ public record BenchmarkResult(
             long verifyNanos,
             long draftNanos,
             int rejectionsInShortlist,
-            int rejectionsOutsideShortlist) {
+            int rejectionsOutsideShortlist,
+            java.util.Map<String, DraftPhase> draftPhases) {
         public Speculative(
                 int verifications, long[] acceptedDrafts, int committedTokens, long verifyNanos, long draftNanos) {
-            this(verifications, acceptedDrafts, committedTokens, verifyNanos, draftNanos, 0, 0);
+            this(verifications, acceptedDrafts, committedTokens, verifyNanos, draftNanos, 0, 0, java.util.Map.of());
+        }
+
+        public Speculative(
+                int verifications,
+                long[] acceptedDrafts,
+                int committedTokens,
+                long verifyNanos,
+                long draftNanos,
+                int rejectionsInShortlist,
+                int rejectionsOutsideShortlist) {
+            this(
+                    verifications,
+                    acceptedDrafts,
+                    committedTokens,
+                    verifyNanos,
+                    draftNanos,
+                    rejectionsInShortlist,
+                    rejectionsOutsideShortlist,
+                    java.util.Map.of());
         }
     }
+
+    /// The drafting quanta of one phase of the speculative strategy: how many ran and their summed wall time
+    /// (admission to retirement).
+    public record DraftPhase(long quanta, long nanos) {}
 
     /// Nanosecond durations. Null means the boundary was not reached. `prefixRestore` is the time spent restoring a
     /// cached prompt prefix before prefill (null: none); `timeToFirstToken` includes it.

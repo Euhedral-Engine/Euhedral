@@ -21,6 +21,8 @@ import java.util.Objects;
 ///
 /// - `prefixCacheBytes`: pinned host memory for the prefix cache, 0 (the default) for none. Iterations repeat
 ///   their prompt, so a cache would answer every one after the first from stored state.
+/// - `speculation`: `artifact` (the default) decodes greedy generations with the speculative strategy the artifact
+///   selects, as the server does; `off` decodes them one token per quantum, the ordinary-decoding control arm.
 /// - `cpus`: `all`, `one-per-core`, `performance`, `performance-one-per-core`, or IDs/ranges such as `2-5,8`.
 /// - `maxContextTokens`: the longest sequence (prompt plus generation) the engine keeps device memory for.
 /// - `output`: a `.json` path writes one document; any other path writes JSONL. Null selects a
@@ -49,7 +51,8 @@ public record BenchmarkOptions(
         @JsonProperty("append") Boolean append,
         @JsonProperty("gpuMemory") Boolean gpuMemory,
         @JsonProperty("shutdownTimeoutSeconds") Long shutdownTimeoutSeconds,
-        @JsonProperty("promptCorpus") String promptCorpus) {
+        @JsonProperty("promptCorpus") String promptCorpus,
+        @JsonProperty("speculation") String speculation) {
 
     static final ObjectMapper JSON = new ObjectMapper();
 
@@ -72,6 +75,9 @@ public record BenchmarkOptions(
         gpuMemory = gpuMemory != null && gpuMemory;
         shutdownTimeoutSeconds = shutdownTimeoutSeconds == null ? 10L : shutdownTimeoutSeconds;
         promptCorpus = promptCorpus == null ? "words" : promptCorpus.strip();
+        speculation = speculation == null ? "artifact" : speculation.strip();
+        if (!speculation.equals("artifact") && !speculation.equals("off"))
+            throw new IllegalArgumentException("speculation must be \"artifact\" or \"off\"");
         if (!promptCorpus.equals("words") && !promptCorpus.equals("chat"))
             throw new IllegalArgumentException("promptCorpus must be \"words\" or \"chat\"");
 
@@ -152,7 +158,8 @@ public record BenchmarkOptions(
                 options.append(),
                 options.gpuMemory(),
                 options.shutdownTimeoutSeconds(),
-                options.promptCorpus());
+                options.promptCorpus(),
+                options.speculation());
     }
 
     public boolean json() {

@@ -85,7 +85,8 @@ public final class Metrics {
                     verify,
                     draft,
                     inShortlist,
-                    outsideShortlist);
+                    outsideShortlist,
+                    draftPhases(timing));
             sampledDecode = committed;
             lastSampled = timing.stepCount - 1;
             // The window starts at the first token: the last prompt chunk's MTP catch-up, which drafts
@@ -195,5 +196,12 @@ public final class Metrics {
                     .append(failure.getMessage());
         }
         return reason.toString();
+    }
+
+    private static java.util.Map<String, BenchmarkResult.DraftPhase> draftPhases(IterationTiming timing) {
+        java.util.Map<String, BenchmarkResult.DraftPhase> phases = new java.util.TreeMap<>();
+        timing.draftPhases.forEach(
+                (phase, totals) -> phases.put(phase, new BenchmarkResult.DraftPhase(totals[0], totals[1])));
+        return phases;
     }
 }

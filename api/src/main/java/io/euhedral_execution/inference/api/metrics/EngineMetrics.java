@@ -31,6 +31,11 @@ public final class EngineMetrics implements MeterBinder {
                         "artifact",
                         engine.profile() == null ? "unknown" : engine.profile().artifactName())
                 .tag(
+                        "speculation",
+                        engine.profile() == null
+                                ? "none"
+                                : engine.profile().speculation().name().toLowerCase(java.util.Locale.ROOT))
+                .tag(
                         "speculative_depth",
                         engine.profile() == null
                                 ? "0"

@@ -17,9 +17,11 @@ public final class EngineTarget implements BenchmarkRunner.Target {
     private static final Consumer<String> DISCARD = ignored -> {};
 
     private final InferenceEngine engine;
+    private final boolean speculate;
 
-    private EngineTarget(InferenceEngine engine) {
+    private EngineTarget(InferenceEngine engine, boolean speculate) {
         this.engine = engine;
+        this.speculate = speculate;
     }
 
     public static BenchmarkRunner.TargetFactory factory(
@@ -29,7 +31,8 @@ public final class EngineTarget implements BenchmarkRunner.Target {
             BitSet workerCpus,
             int maxContextTokens,
             long prefixCacheBytes,
-            Duration shutdown) {
+            Duration shutdown,
+            boolean speculate) {
         return () -> {
             try {
                 var engine = InferenceEngine.load(new InferenceConfig(
@@ -43,7 +46,7 @@ public final class EngineTarget implements BenchmarkRunner.Target {
                         InferenceConfig.DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS));
                 System.out.println("loaded: " + engine.allocatedDeviceBytes() + " device bytes, "
                         + engine.hostBackedWeightBytes() + " host-backed weight bytes");
-                return new EngineTarget(engine);
+                return new EngineTarget(engine, speculate);
             } catch (InferenceEngine.StartupFailure failure) {
                 try {
                     failure.close();
@@ -64,6 +67,8 @@ public final class EngineTarget implements BenchmarkRunner.Target {
     public List<Integer> generate(String prompt, int maxNewTokens, GenerationConfig generation, IterationTiming timing)
             throws Exception {
         try (var session = this.engine.createSession(generation)) {
+            // The control arm decodes one token per quantum whatever drafter the artifact carries.
+            if (!this.speculate) session.useSpeculativeDecoding(null);
             timing.markEntry();
             // The asynchronous form, as the server drives it: the workers run the generation in a closed loop
             // and no other thread is woken until it completes.
