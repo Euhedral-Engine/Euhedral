@@ -17,7 +17,7 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
-static CUfunction linear, linear_rows, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk_partial, topk_merge,
+static CUfunction linear, linear_rows, linear_split, linear_rows_split, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk_partial, topk_merge,
         select_path;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
@@ -28,22 +28,23 @@ static void initialize(void) {
     init_status = euhedral_cuda_load_kernel(
             (const void*)&once, "dflash/kernels.cu", "euhedral_dflash_linear_bf16", &module, &linear);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
-    const char* const names[] = {"euhedral_dflash_linear_rows_bf16", "euhedral_dflash_rms_norm_bf16",
+    const char* const names[] = {"euhedral_dflash_linear_rows_bf16", "euhedral_dflash_linear_split_bf16",
+            "euhedral_dflash_linear_rows_split_bf16", "euhedral_dflash_rms_norm_bf16",
             "euhedral_dflash_conv_bf16", "euhedral_dflash_context_kv_bf16", "euhedral_dflash_block_qk_bf16",
             "euhedral_dflash_attention_bf16", "euhedral_dflash_swiglu_bf16", "euhedral_dflash_topk_partial_bf16",
             "euhedral_dflash_topk_merge_bf16", "euhedral_dflash_select_bf16"};
-    CUfunction* const functions[] = {&linear_rows, &rms_norm, &conv, &context_kv, &block_qk, &attention, &swiglu,
+    CUfunction* const functions[] = {&linear_rows, &linear_split, &linear_rows_split, &rms_norm, &conv, &context_kv, &block_qk, &attention, &swiglu,
             &topk_partial, &topk_merge, &select_path};
-    for (int index = 0; index < 10; index++) {
+    for (int index = 0; index < 12; index++) {
         CUresult status = cuModuleGetFunction(functions[index], module, names[index]);
         if (status != CUDA_SUCCESS) {
             init_status = (int)status;
             return;
         }
     }
-    CUfunction all[] = {linear, linear_rows, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk_partial,
+    CUfunction all[] = {linear, linear_rows, linear_split, linear_rows_split, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk_partial,
             topk_merge, select_path};
-    for (int index = 0; index < 11; index++) euhedral_cuda_pdl_register(all[index]);
+    for (int index = 0; index < 13; index++) euhedral_cuda_pdl_register(all[index]);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -74,12 +75,14 @@ static int launch(CUfunction function, uint32_t gx, uint32_t gy, uint32_t block,
 }
 
 #define EUHEDRAL_DFLASH_TOPK_SPLITS 64u
+/* Outputs up to this wide (the convolution kernel and selector projections) split K over a CTA's four warps. */
+#define LINEAR_SPLIT_MAX_OUTPUTS 1536u
 #define PTR(name, value) CUdeviceptr name = (CUdeviceptr)(uintptr_t)(value)
 
 int euhedral_cuda_dflash_linear_bf16(
         const void* input, const void* weights, void* output, uint32_t rows, uint32_t in_features, uint32_t out_features) {
     if (input == NULL || weights == NULL || output == NULL || rows == 0 || in_features == 0 || in_features % 32 != 0
-            || out_features == 0 || out_features % 32 != 0)
+            || out_features == 0 || out_features % (out_features <= LINEAR_SPLIT_MAX_OUTPUTS ? 8 : 32) != 0)
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     int status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
@@ -88,7 +91,12 @@ int euhedral_cuda_dflash_linear_bf16(
     PTR(y, output);
     void* parameters[] = {&x, &w, &y, &rows, &in_features, &out_features};
     /* Up to 16 rows (a draft block, a verification's context rows) stream the weights once per 16 rows; more rows
-     * (prefill contexts) reuse each weight load over 64 rows. Both give each row the same bits. */
+     * (prefill contexts) reuse each weight load over 64 rows. Both give each row the same bits: outputs up to
+     * LINEAR_SPLIT_MAX_OUTPUTS wide split K in four in both, wider ones in neither. */
+    if (out_features <= LINEAR_SPLIT_MAX_OUTPUTS) {
+        if (rows <= 16) return launch(linear_split, out_features / 8, 1, 128, 0, parameters);
+        return launch(linear_rows_split, out_features / 8, (rows + 63) / 64, 128, 0, parameters);
+    }
     if (rows <= 16) return launch(linear, out_features / 32, 1, 128, 0, parameters);
     return launch(linear_rows, out_features / 32, (rows + 63) / 64, 128, 0, parameters);
 }
