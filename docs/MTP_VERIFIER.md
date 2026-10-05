@@ -65,12 +65,27 @@ MTP layer:
 | `nvfp4` (1 GiB host) | 1024 | 75.3 | **81.7** | 80.7 | 77.0 |
 | `nvfp4` (1 GiB host) | 4096 | 69.2 | **74.3** | 73.5 | 71.8 |
 
-**Depth policy.** Q3 runs MTP2 (it ties MTP3 at 1024 tokens; the smaller depth wins the tie) and NVFP4 runs MTP3
-(`ArtifactProfile.speculativeDepth`).
+With the tensor-core NVFP4 decode kernels ([NVFP4_NATIVE.md](NVFP4_NATIVE.md), "Decode kernels"), an NVFP4 verification of
+8 rows costs little more than one row in its linears, and the depth moves. Benchmark decode tok/s (chat corpus, 256 generated
+tokens, `nvfp4-compressed`, one run per cell; 64K repeated):
+
+| Depth | 4K | 16K | 32K | 64K |
+|---|---|---|---|---|
+| MTP3 | 113.8 | 103.9 | 104.4 | 80.8 / 81.5 |
+| **MTP4** | 114.5 | 106.3 | 109.5 | 79.2 |
+| MTP5 | 115.9 | 104.5 | 113.0 | 73.5 / 73.9 |
+
+At 64K every verified row adds its attention over the whole cache (about 1.5 ms per row in a 34 ms verification) and the
+drafts' catch-up grows, so the deeper arms fall behind there.
+
+**Depth policy.** Q3 runs MTP2 (it ties MTP3 at 1024 tokens; the smaller depth wins the tie) and NVFP4 runs MTP4
+(`ArtifactProfile.speculativeDepth`): the best or within 1.4% of it up to 16K, 3.5% behind MTP5 at 32K and 2.5% behind MTP3
+at 64K.
 
 **Rejected depths:**
 - Q3 MTP3: 98.4 and 88.2 tok/s in the screen above, behind MTP2 at both contexts.
-- NVFP4 MTP4 and MTP5: 80.7 / 77.0 at 1024 tokens and 73.5 / 71.8 at 4096, behind MTP3.
+- NVFP4 MTP3: 4.6% behind MTP4 at 32K.
+- NVFP4 MTP5: 7% behind MTP4 at 64K.
 - MTP1 on Q3: a 2-row verification took longer than a 3-row one: the Q3 2-row twins are slower than the 3-row ones (gate/up
   8.45 ms at M=2 against 7.44 ms at M=3; codegen), and MTP1 is never the best depth.
 
@@ -265,7 +280,7 @@ VERIFY(rows P..P+d) ──▶ commit a+1 rows (KV frontier; GDN checkpoint/repla
 
 ## Findings
 
-1. **Depth:** Q3 runs MTP2 (it wins or ties every context in the in-process screen, and is the smaller choice); NVFP4 runs MTP3.
+1. **Depth:** Q3 runs MTP2 (it wins or ties every context in the in-process screen, and is the smaller choice); NVFP4 runs MTP4 on the tensor-core decode kernels (section "Depth policy").
 2. **Verifier cost at 16K:** the `q3` verification keeps the GPU busy 25.25 ms (linears 17.53, attention 6.09) and the `nvfp4`
    verification 36.02 ms (linears 25.91, attention 8.22). Norms are flat in the row count.
 3. **Exact verification against the M=1 bandwidth floor:** linears 1.06-1.07× at M=3 and 1.28-1.31× at M=4 (synthetic, cold

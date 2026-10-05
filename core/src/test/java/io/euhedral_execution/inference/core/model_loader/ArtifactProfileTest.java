@@ -49,8 +49,8 @@ class ArtifactProfileTest {
     void speculativeDepthFollowsTheQuantization() {
         assertEquals(2, new ArtifactProfile(Quantization.Q3, false, true).speculativeDepth());
         assertEquals(2, new ArtifactProfile(Quantization.Q3, true, true).speculativeDepth());
-        assertEquals(3, new ArtifactProfile(Quantization.NVFP4, false, true).speculativeDepth());
-        assertEquals(3, new ArtifactProfile(Quantization.NVFP4, true, true).speculativeDepth());
+        assertEquals(4, new ArtifactProfile(Quantization.NVFP4, false, true).speculativeDepth());
+        assertEquals(4, new ArtifactProfile(Quantization.NVFP4, true, true).speculativeDepth());
         assertEquals(0, new ArtifactProfile(Quantization.NVFP4, false, false).speculativeDepth());
     }
 
@@ -68,7 +68,7 @@ class ArtifactProfileTest {
         tensors.add(tensor("dflash2/config", WeightFormat.I32, WeightLayout.CONTIGUOUS_LE_V1));
         var profile = ArtifactProfile.of(new QwenArtifact(null, null, tensors.toArray(TensorDescriptor[]::new)));
         assertEquals(ArtifactProfile.Speculation.DFLASH2, profile.speculation());
-        assertEquals(5, profile.speculativeDepth());
+        assertEquals(6, profile.speculativeDepth());
         assertEquals("nvfp4-compressed-dflash2", profile.artifactName());
         assertTrue(QwenCompactWeightLoader.uploads("dflash2/fc", ArtifactProfile.Speculation.DFLASH2));
         assertFalse(QwenCompactWeightLoader.uploads("dflash2/config", ArtifactProfile.Speculation.DFLASH2));

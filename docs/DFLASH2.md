@@ -41,8 +41,8 @@ One step is three quanta on the existing runtime, chained as continuations (`DFl
    output head over rows 1..7, top-16 (`euhedral_dflash_topk_bf16`), selector projection and walk
    (`euhedral_dflash_select_bf16`); the 7 tokens, their candidates and scores are copied to pinned host memory before the
    quantum retires. The base position does not move.
-2. **VERIFY** of the anchor and the first 5 drafts: the existing row-exact verification (6 rows on the one-row kernels'
-   twins), with acceptance on retirement. It taps every row. The depth is `ArtifactProfile.speculativeDepth()` (section 6).
+2. **VERIFY** of the anchor and the first 6 drafts: the existing row-exact verification (7 rows, every row bit for bit a
+   one-row decode), with acceptance on retirement. It taps every row. The depth is `ArtifactProfile.speculativeDepth()` (section 6).
 3. **DRAFT_CONTEXT** (the context view, `dflash2Context`) over the committed rows' taps: `fc`, `hidden_norm`, then per layer the
    key/value projection and `euhedral_dflash_context_kv_bf16` into the ring.
 
