@@ -17,11 +17,9 @@ import java.util.Arrays;
 import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
 
-/// The sparse attention kernel and its split merge against a double-precision reference over the decoded
-/// NVFP4
-/// cache: the dense causal prefix (every block selected), random selections of 512 blocks, rows that drop
-/// their own
-/// block, and key splits including empty ones.
+/// The sparse attention kernel and its split merge against a double-precision reference over the
+/// decoded NVFP4 cache: the dense causal prefix (every block selected), random selections of 512
+/// blocks, rows that drop their own block, and key splits including empty ones.
 class Qwen4QsaAttentionCudaIntegrationTest {
 
     private static final int QUERY_HEADS = 24, KEY_HEADS = 2, GROUP = 12, ROW = QUERY_HEADS * 256;

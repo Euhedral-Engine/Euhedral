@@ -19,9 +19,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.SplittableRandom;
 
-/// Device helpers of the QSA GPU tests: opening the GPU, uploads and downloads of arrays, the decoded
-/// contents of a
-/// sequence's KV pages.
+/// Device helpers of the QSA GPU tests: opening the GPU, uploads and downloads of arrays, the
+/// decoded contents of a sequence's KV pages.
 final class Qwen4QsaTestSupport {
 
     private Qwen4QsaTestSupport() {}
@@ -88,9 +87,9 @@ final class Qwen4QsaTestSupport {
         return values;
     }
 
-    /// The effective (unrotated, dequantized) K or V rows of one KV head of the first `tokens` positions
-    /// held by a
-    /// state's page table (`table`: the device table of page addresses), `[token][256]`.
+    /// The effective (unrotated, dequantized) K or V rows of one KV head of the first `tokens`
+    /// positions held by a state's page table (`table`: the device table of page addresses),
+    /// `[token][256]`.
     static double[][] decodeCache(CudaGpuMemory gpu, Arena arena, long table, int tokens, int heads, int head) {
         int pages = (tokens + AttentionKvState.PAGE_TOKENS - 1) / AttentionKvState.PAGE_TOKENS;
         MemorySegment addresses = arena.allocate((long) pages * Long.BYTES, 8);
@@ -107,6 +106,43 @@ final class Qwen4QsaTestSupport {
             }
         }
         return rows;
+    }
+
+    /// As [#decodeCache] for the listed tokens only (their pages are read, other rows are null).
+    static double[][] decodeTokens(
+            CudaGpuMemory gpu, Arena arena, long table, int tokens, int heads, int head, boolean[] wanted) {
+        int pages = (tokens + AttentionKvState.PAGE_TOKENS - 1) / AttentionKvState.PAGE_TOKENS;
+        MemorySegment addresses = arena.allocate((long) pages * Long.BYTES, 8);
+        gpu.copyDeviceToHost(addresses, table, (long) pages * Long.BYTES);
+        double[][] rows = new double[tokens][];
+        long pageBytes = (long) AttentionKvState.PAGE_TOKENS * heads * AttentionKvState.HEAD_ROW_BYTES;
+        MemorySegment page = arena.allocate(pageBytes, 16);
+        byte[] bytes = new byte[Math.toIntExact(pageBytes)];
+        for (int index = 0; index < pages; index++) {
+            int first = index * AttentionKvState.PAGE_TOKENS,
+                    last = Math.min(tokens, first + AttentionKvState.PAGE_TOKENS);
+            boolean any = false;
+            for (int t = first; t < last && !any; t++) any = wanted[t];
+            if (!any) continue;
+            gpu.copyDeviceToHost(page, addresses.getAtIndex(ValueLayout.JAVA_LONG, index), pageBytes);
+            MemorySegment.copy(page, ValueLayout.JAVA_BYTE, 0, bytes, 0, bytes.length);
+            for (int t = first; t < last; t++)
+                if (wanted[t]) {
+                    int offset = ((t % AttentionKvState.PAGE_TOKENS) * heads + head) * AttentionKvState.HEAD_ROW_BYTES;
+                    rows[t] = Qwen4QsaReference.decodeRow(bytes, offset);
+                }
+        }
+        return rows;
+    }
+
+    /// Rows of magnitude 0.5 to 1 with random signs: cheap to make, enough for timing and scale
+    /// tests.
+    static void fillRandom(MemorySegment segment, SplittableRandom rng, int rows, int width) {
+        for (long i = 0; i < (long) rows * width; i++) {
+            int r = rng.nextInt();
+            short bits = (short) (0x3f00 | (r & 0x7f) | ((r >>> 8) & 0x8000));
+            segment.setAtIndex(ValueLayout.JAVA_SHORT, i, bits);
+        }
     }
 
     static Path artifactPath() {

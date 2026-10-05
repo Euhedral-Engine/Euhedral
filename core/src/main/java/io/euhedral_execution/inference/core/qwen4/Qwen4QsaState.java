@@ -4,25 +4,21 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.scheduling.AttentionKvState;
 import java.util.Objects;
 
-/// What one QSA layer keeps of one sequence: the NVFP4 key/value pages (an [AttentionKvState], reserved
-/// lazily page
-/// by page), the pooled indexer key of every complete block of four tokens (BF16, 128 values, normalized
-/// and rotated)
-/// and the raw indexer keys of the up to three tokens of the incomplete trailing block.
+/// What one QSA layer keeps of one sequence: the NVFP4 key/value pages (an [AttentionKvState],
+/// reserved lazily page by page), the pooled indexer key of every complete block of four tokens
+/// (BF16, 128 values, normalized and rotated) and the raw indexer keys of the up to three tokens of
+/// the incomplete trailing block.
 ///
 /// A chunk follows the KV state's protocol: [#beginChunk] reserves the pages and names the start
-/// position, the
-/// layer's kernels run on the owning quantum's stream, [#submitted] marks the rows readable by later
-/// stages of the
-/// quantum, and [#commit] publishes them once the quantum retired ([#discard] drops them instead). The
-/// raw tail
-/// is double buffered: a chunk reads the committed tail and writes the other one, which commit makes the
-/// committed
-/// tail, so a discarded chunk leaves the committed state intact. Block keys and cache rows at or past the
-/// committed length are overwritten by the next chunk, so they need no undoing.
+/// position, the layer's kernels run on the owning quantum's stream, [#submitted] marks the rows
+/// readable by later stages of the quantum, and [#commit] publishes them once the quantum retired
+/// ([#discard] drops them instead). The raw tail is double buffered: a chunk reads the committed
+/// tail and writes the other one, which commit makes the committed tail, so a discarded chunk
+/// leaves the committed state intact. Block keys and cache rows at or past the committed length are
+/// overwritten by the next chunk, so they need no undoing.
 ///
-/// Bytes per token: 576 of KV in whole 256-token pages, and 64 of indexer keys (256 per block of four
-/// tokens).
+/// Bytes per token: 576 of KV in whole 256-token pages, and 64 of indexer keys (256 per block of
+/// four tokens).
 public final class Qwen4QsaState implements AutoCloseable {
 
     /// Raw keys kept of the incomplete block.
@@ -40,9 +36,9 @@ public final class Qwen4QsaState implements AutoCloseable {
     private int pendingRows;
     private boolean closed;
 
-    /// A state for sequences of up to `maxTokens` positions of a layer with `keyValueWidth` K (and V)
-    /// values per
-    /// token. The indexer block keys are allocated whole; the KV pages as the sequence grows.
+    /// A state for sequences of up to `maxTokens` positions of a layer with `keyValueWidth` K (and
+    /// V) values per token. The indexer block keys are allocated whole; the KV pages as the
+    /// sequence grows.
     public Qwen4QsaState(ExecutionGpu gpu, int keyValueWidth, int maxTokens) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (maxTokens <= 0) throw new IllegalArgumentException("maxTokens must be positive");
@@ -96,7 +92,8 @@ public final class Qwen4QsaState implements AutoCloseable {
         return start;
     }
 
-    /// Records that the chunk's cache writes are queued, so later stages of the quantum may read them.
+    /// Records that the chunk's cache writes are queued, so later stages of the quantum may read
+    /// them.
     public void submitted() {
         ensureOpen();
         if (this.pendingRows == 0) throw new IllegalStateException("no chunk in flight");
