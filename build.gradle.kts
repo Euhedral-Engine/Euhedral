@@ -94,6 +94,7 @@ subprojects {
             include("**/PrefixCacheCudaIntegrationTest.class")
             include("**/TeacherForcedQualityCudaIntegrationTest.class")
             include("**/DFlash2*CudaIntegrationTest.class")
+            include("**/Qwen4*CudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -107,6 +108,12 @@ subprojects {
                     "euhedral.qwen.nvfp4-artifact",
                     providers.gradleProperty("euhedral.qwen.nvfp4-artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl")
+                            .get())
+            // Optional Qwen3.8-Flash-Next artifact (qwen4_exp).
+            systemProperty(
+                    "euhedral.qwen4.artifact",
+                    providers.gradleProperty("euhedral.qwen4.artifact")
+                            .orElse("/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl")
                             .get())
             // Optional DFlash2 artifact (tools/convert_checkpoint.py --extend ... --dflash2 ...).
             systemProperty(
