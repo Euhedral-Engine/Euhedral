@@ -17,10 +17,13 @@ import io.euhedral_execution.inference.core.model_loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.scheduling.DFlash2Decoder;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.scheduling.GenerationSession;
 import io.euhedral_execution.inference.core.scheduling.PrefixCache;
+import io.euhedral_execution.inference.core.scheduling.Qwen4GenerationSession;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -65,7 +68,10 @@ public final class InferenceEngine implements AutoCloseable {
     private final InferenceRunSnapshot.Model modelIdentity;
     private final InferenceRunSnapshot.RuntimeIdentity runtimeIdentity;
     private final PrefixCache prefixCache;
-    private final List<QwenGenerationSession> sessions = new ArrayList<>();
+    /// The Flash-Next runtime when the artifact is a `qwen4_exp` model, else null: the dense fields above are then
+    /// null.
+    private final Qwen4Runtime qwen4;
+    private final List<GenerationSession> sessions = new ArrayList<>();
     private final ReentrantLock shutdownLock = new ReentrantLock();
     private volatile boolean closing;
     private boolean resourcesClosed;
@@ -83,7 +89,8 @@ public final class InferenceEngine implements AutoCloseable {
             BitSet workerCoreIds,
             InferenceRunSnapshot.Model modelIdentity,
             InferenceRunSnapshot.RuntimeIdentity runtimeIdentity,
-            PrefixCache prefixCache) {
+            PrefixCache prefixCache,
+            Qwen4Runtime qwen4) {
         this.bootstrap = bootstrap;
         this.tokenizer = tokenizer;
         this.gpu = gpu;
@@ -97,6 +104,7 @@ public final class InferenceEngine implements AutoCloseable {
         this.modelIdentity = modelIdentity;
         this.runtimeIdentity = runtimeIdentity;
         this.prefixCache = prefixCache;
+        this.qwen4 = qwen4;
     }
 
     /// Loads all model resources and starts the lattice before returning an engine.
@@ -109,9 +117,7 @@ public final class InferenceEngine implements AutoCloseable {
     static InferenceEngine load(InferenceConfig config, Bootstrap bootstrap) throws IOException {
         Objects.requireNonNull(config, "config");
         if (bootstrap.architecture(config.artifactPath()) == ModelArchitecture.QWEN4_EXP)
-            throw new UnsupportedOperationException("the artifact is a " + ModelArchitecture.QWEN4_EXP
-                    + " (Flash-Next) model: its storage loads with Qwen4Storage.load, and text generation for it is "
-                    + "not implemented yet");
+            return loadQwen4(config, bootstrap);
         // Euhedral silently drops unavailable CPUs; fail before claiming the lattice or loading anything.
         ProcessorTopology topology = bootstrap.processorTopology();
         topology.requireAvailable(config.workerCpus());
@@ -148,7 +154,8 @@ public final class InferenceEngine implements AutoCloseable {
                     workerCoreIds,
                     modelIdentity,
                     runtimeIdentity,
-                    prefixCache);
+                    prefixCache,
+                    null);
         } catch (IOException | RuntimeException | Error failure) {
             var pending = new StartupFailure(
                     failure,
@@ -164,6 +171,72 @@ public final class InferenceEngine implements AutoCloseable {
             }
             throw failure;
         }
+    }
+
+    /// Loads a Flash-Next (`qwen4_exp`) artifact as a text model. The residency is derived from the artifact and the
+    /// maximum context alone; generation runs on the model's own worker, not on the dense engine's lattice.
+    private static InferenceEngine loadQwen4(InferenceConfig config, Bootstrap bootstrap) throws IOException {
+        if (!LATTICE_OWNED.compareAndSet(false, true))
+            throw new IllegalStateException("an inference engine already owns the GPU");
+        Qwen4Runtime runtime = null;
+        try {
+            QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
+            runtime = Qwen4Runtime.load(config);
+            var modelIdentity = qwen4Identity(config.artifactPath(), runtime.config());
+            var runtimeIdentity = runtimeIdentity(config.cudaLibraryPath());
+            return new InferenceEngine(
+                    bootstrap,
+                    tokenizer,
+                    runtime.gpu(),
+                    null,
+                    null,
+                    null,
+                    null,
+                    config,
+                    null,
+                    new BitSet(),
+                    modelIdentity,
+                    runtimeIdentity,
+                    null,
+                    runtime);
+        } catch (IOException | RuntimeException | Error failure) {
+            try {
+                if (runtime != null) runtime.close();
+            } catch (RuntimeException | Error cleanup) {
+                failure.addSuppressed(cleanup);
+            } finally {
+                LATTICE_OWNED.set(false);
+            }
+            throw failure;
+        }
+    }
+
+    private static InferenceRunSnapshot.Model qwen4Identity(Path path, Qwen4Config config) {
+        Long bytes;
+        try {
+            bytes = Files.size(path);
+        } catch (IOException | SecurityException unreadable) {
+            bytes = null;
+        }
+        return new InferenceRunSnapshot.Model(
+                path.toString(),
+                bytes,
+                3,
+                new InferenceRunSnapshot.Dimensions(
+                        config.text().vocabSize(),
+                        config.text().hiddenSize(),
+                        config.text().numLayers(),
+                        config.sparseAttentionLayers(),
+                        config.gdnLayers(),
+                        config.attention().numHeads(),
+                        config.attention().numKvHeads(),
+                        config.attention().headDim(),
+                        config.moe().intermediateSize(),
+                        config.gdn().numKeyHeads(),
+                        config.gdn().numValueHeads(),
+                        config.gdn().keyHeadDim(),
+                        config.gdn().valueHeadDim(),
+                        config.text().maxPositionEmbeddings()));
     }
 
     /// The cache is an optimisation: when it is off, the plan is not a full model, or its host memory cannot be
@@ -236,8 +309,25 @@ public final class InferenceEngine implements AutoCloseable {
         }
     }
 
-    /// Creates independent sequence/sampler/decoder state borrowing this engine's shared runtime.
+    /// Creates a session over whichever model this engine runs: the dense session or the Flash-Next one.
+    public synchronized GenerationSession createGenerationSession(GenerationConfig config) {
+        if (this.qwen4 == null) return createSession(config);
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        this.gpu.ensureHealthy();
+        var session = this.qwen4.createSession(
+                this.tokenizer,
+                Objects.requireNonNull(config, "config"),
+                Qwen4GenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS,
+                this::releaseGenerationSession);
+        this.sessions.add(session);
+        return session;
+    }
+
+    /// Creates independent sequence/sampler/decoder state borrowing this engine's shared runtime. Dense models only;
+    /// [#createGenerationSession] serves both.
     public synchronized QwenGenerationSession createSession(GenerationConfig config) {
+        if (this.qwen4 != null)
+            throw new UnsupportedOperationException("a Flash-Next engine opens sessions with createGenerationSession");
         return createSession(config, QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS);
     }
 
@@ -270,6 +360,10 @@ public final class InferenceEngine implements AutoCloseable {
         this.sessions.remove(session);
     }
 
+    private synchronized void releaseGenerationSession(GenerationSession session) {
+        this.sessions.remove(session);
+    }
+
     public QwenTokenizer tokenizer() {
         return this.tokenizer;
     }
@@ -277,17 +371,36 @@ public final class InferenceEngine implements AutoCloseable {
     /// Encodes `prompt` as a new session encodes its first prompt (with the model special tokens), on the
     /// lattice's workers. A fresh session generating from these IDs runs exactly that prompt.
     public CompletableFuture<int[]> tokenizePromptAsync(String prompt) {
+        if (this.qwen4 != null) return this.qwen4.onWorker(() -> this.tokenizer.encodeWithModelSpecialTokens(prompt));
         return this.runtime.tokenize(this.tokenizer, prompt, true);
     }
 
     /// Runs `work` as one frame on the lattice's workers: prompt-side host work (rendering, validation) of a
     /// client that must not do it on its own threads. The future completes on that worker.
     public <T> CompletableFuture<T> onWorker(Supplier<T> work) {
+        if (this.qwen4 != null) return this.qwen4.onWorker(work);
         return this.runtime.onWorker(work);
     }
 
+    /// The dense model's configuration; a Flash-Next engine has none (see [#vocabularySize], [#maxPositionEmbeddings]).
     public QwenConfig modelConfig() {
+        if (this.qwen4 != null)
+            throw new UnsupportedOperationException("a Flash-Next model has no dense configuration");
         return this.model.weights().config();
+    }
+
+    /// Entries of the model's output vocabulary.
+    public int vocabularySize() {
+        return this.qwen4 != null
+                ? this.qwen4.config().text().vocabSize()
+                : this.model.weights().config().vocabSize();
+    }
+
+    /// The longest sequence the model was trained for.
+    public int maxPositionEmbeddings() {
+        return this.qwen4 != null
+                ? this.qwen4.config().text().maxPositionEmbeddings()
+                : this.model.weights().config().maxPositionEmbeddings();
     }
 
     /// Returns the configuration this engine was loaded with; its worker IDs are the engine's workers.
@@ -339,6 +452,7 @@ public final class InferenceEngine implements AutoCloseable {
     /// Bytes of model weights this engine keeps in pinned host memory instead of on the device.
     public synchronized long hostBackedWeightBytes() {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
+        if (this.qwen4 != null) return this.qwen4.storage().model().telemetry().fixedHostBackedBytes();
         long bytes = 0;
         for (var handle : this.model.weights().runtimeObjects().values())
             if (handle.hostBacked()) bytes += handle.byteSize();
@@ -371,6 +485,7 @@ public final class InferenceEngine implements AutoCloseable {
     /// sessions or tokens, and is released when the engine closes.
     public synchronized long retainedWorkspaceBytes() {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
+        if (this.qwen4 != null) return this.gpu.retainedScratchBytes();
         return this.runtime.retainedWorkspaceBytes() + this.gpu.retainedScratchBytes();
     }
 
@@ -379,10 +494,10 @@ public final class InferenceEngine implements AutoCloseable {
     /// If cleanup throws, admission stays closed and a later close retries unreleased resources.
     @Override
     public void close() {
-        List<QwenGenerationSession> owned;
+        List<GenerationSession> owned;
         synchronized (this) {
             for (var session : this.sessions) {
-                if (session.isGeneratingOnCurrentThread())
+                if (session instanceof QwenGenerationSession dense && dense.isGeneratingOnCurrentThread())
                     throw new IllegalStateException("cannot close the engine from its generation callback");
             }
             this.closing = true;
@@ -414,13 +529,18 @@ public final class InferenceEngine implements AutoCloseable {
             // Fail closed: never unload resources after an unproven session shutdown.
             if (failure instanceof RuntimeException exception) throw exception;
             if (failure instanceof Error error) throw error;
-            this.runtime.close();
-            if (this.prefixCache != null) this.prefixCache.close();
-            // All inference sources have drained before fabric shutdown, even if fabric teardown is asynchronous.
-            LAST_CLOSED_LATTICE.set(this.lattice);
-            this.lattice.close();
-            this.model.close();
-            this.bootstrap.closeGpu(this.gpu);
+            if (this.qwen4 != null) {
+                // The runtime releases the executor, the model and the GPU, in that order.
+                this.qwen4.close();
+            } else {
+                this.runtime.close();
+                if (this.prefixCache != null) this.prefixCache.close();
+                // All inference sources have drained before fabric shutdown, even if fabric teardown is asynchronous.
+                LAST_CLOSED_LATTICE.set(this.lattice);
+                this.lattice.close();
+                this.model.close();
+                this.bootstrap.closeGpu(this.gpu);
+            }
             this.resourcesClosed = true;
             synchronized (this) {
                 this.sessions.clear();
