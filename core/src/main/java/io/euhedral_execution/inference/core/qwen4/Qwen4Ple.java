@@ -21,16 +21,14 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.NgramStore;
 /// (host), [State].
 public final class Qwen4Ple {
 
-    /// Where the layer's weights are on the device: NVFP4 projections with their sizes, BF16 norms and convolution.
+    /// The layer's weights: NVFP4 projections, BF16 norms and convolution.
     public record Weights(
-            long keyProj,
-            long keyProjBytes,
-            long valueProj,
-            long valueProjBytes,
-            long normKey,
-            long normQuery,
-            long normConv,
-            long convolution) {}
+            Qwen4Weight keyProj,
+            Qwen4Weight valueProj,
+            Qwen4Weight normKey,
+            Qwen4Weight normQuery,
+            Qwen4Weight normConv,
+            Qwen4Weight convolution) {}
 
     /// What a sequence carries: the convolution history rows and the token context.
     public static final class State {
@@ -166,16 +164,16 @@ public final class Qwen4Ple {
                     this.store.recordBytes());
             gpu.linearNvfp4Bf16(
                     scratch.embedding(),
-                    weights.keyProj(),
+                    weights.keyProj().address(),
                     scratch.key(),
                     rows,
                     this.embedDim,
                     width,
-                    weights.keyProjBytes());
+                    weights.keyProj().bytes());
             Qwen4Ops.groupedRmsNorm(
                     gpu,
                     scratch.key(),
-                    weights.normKey(),
+                    weights.normKey().address(),
                     scratch.keyNormed(),
                     rows,
                     this.streams,
@@ -183,16 +181,16 @@ public final class Qwen4Ple {
                     this.epsilon);
             gpu.linearNvfp4Bf16(
                     scratch.embedding(),
-                    weights.valueProj(),
+                    weights.valueProj().address(),
                     scratch.value(),
                     rows,
                     this.embedDim,
                     this.hidden,
-                    weights.valueProjBytes());
+                    weights.valueProj().bytes());
             Qwen4Ops.groupedRmsNorm(
                     gpu,
                     streamsAddress,
-                    weights.normQuery(),
+                    weights.normQuery().address(),
                     scratch.query(),
                     rows,
                     this.streams,
@@ -210,7 +208,7 @@ public final class Qwen4Ple {
             Qwen4Ops.groupedRmsNorm(
                     gpu,
                     scratch.gated(),
-                    weights.normConv(),
+                    weights.normConv().address(),
                     scratch.gatedNormed(),
                     rows,
                     this.streams,
@@ -221,7 +219,7 @@ public final class Qwen4Ple {
                     scratch.gatedNormed(),
                     scratch.gated(),
                     state.history(),
-                    weights.convolution(),
+                    weights.convolution().address(),
                     output,
                     rows,
                     width,

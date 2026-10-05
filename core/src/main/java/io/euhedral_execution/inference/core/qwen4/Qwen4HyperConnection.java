@@ -18,8 +18,8 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 /// The final mixer of the model has no injection projection: it only mixes.
 public final class Qwen4HyperConnection {
 
-    /// The BF16 weights of one gated residual, as device addresses. `inject` is 0 for the final mixer.
-    public record Weights(long norm, long down, long up, long inject) {}
+    /// The BF16 weights of one gated residual. `inject` is null for the final mixer.
+    public record Weights(Qwen4Weight norm, Qwen4Weight down, Qwen4Weight up, Qwen4Weight inject) {}
 
     /// Device buffers one mix writes, [#scratchBytes] in all: the normalized streams, the low-rank projection, its
     /// activation, the up projection and the raw injection weights.
@@ -71,14 +71,20 @@ public final class Qwen4HyperConnection {
     public void mix(ExecutionGpu gpu, Weights weights, long state, Scratch scratch, long mixed, int rows) {
         int width = stateWidth();
         Qwen4Ops.groupedRmsNorm(
-                gpu, state, weights.norm(), scratch.normed(), rows, this.streams, this.hidden, this.epsilon);
-        Qwen4Ops.linearBf16(gpu, scratch.normed(), weights.down(), scratch.down(), rows, width, this.lowrank);
+                gpu, state, weights.norm().address(), scratch.normed(), rows, this.streams, this.hidden, this.epsilon);
+        Qwen4Ops.linearBf16(gpu, scratch.normed(), weights.down().address(), scratch.down(), rows, width, this.lowrank);
         Qwen4Ops.scaledSilu(gpu, scratch.down(), scratch.activated(), rows * this.lowrank, this.streams);
-        Qwen4Ops.linearBf16(gpu, scratch.activated(), weights.up(), scratch.up(), rows, this.lowrank, width);
+        Qwen4Ops.linearBf16(gpu, scratch.activated(), weights.up().address(), scratch.up(), rows, this.lowrank, width);
         Qwen4Ops.hcMix(gpu, scratch.normed(), scratch.up(), mixed, rows, this.streams, this.hidden);
-        if (weights.inject() != 0)
+        if (weights.inject() != null)
             Qwen4Ops.linearBf16(
-                    gpu, scratch.normed(), weights.inject(), scratch.rawInjection(), rows, width, this.streams);
+                    gpu,
+                    scratch.normed(),
+                    weights.inject().address(),
+                    scratch.rawInjection(),
+                    rows,
+                    width,
+                    this.streams);
     }
 
     /// Injects `block` (rows x hidden) into the states at `state`, writing the new states to `output` (which may be
