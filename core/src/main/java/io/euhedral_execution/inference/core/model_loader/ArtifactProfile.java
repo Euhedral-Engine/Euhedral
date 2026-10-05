@@ -35,14 +35,15 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         return this.speculation != Speculation.NONE;
     }
 
-    /// Drafts per verification. MTP: the depth that measured fastest for the artifact's quantization (a Q3
-    /// verifier step costs more relative to a draft, so its break-even depth is lower). DFlash2: its block of 8
-    /// rows less the anchor.
+    /// Drafts per verification. MTP: the depth that measured fastest for the artifact's quantization
+    /// (a Q3 verifier step costs more relative to a draft, so its break-even depth is lower). DFlash2:
+    /// the first 5 of each block's 7 drafts, because the exact verifier's 7- and 8-row NVFP4 twins
+    /// cost 15-30% more than its 6-row twin, which costs no more than 4 rows (docs/DFLASH2.md).
     public int speculativeDepth() {
         return switch (this.speculation) {
             case NONE -> 0;
             case MTP -> this.quantization == Quantization.Q3 ? 2 : 3;
-            case DFLASH2 -> 7;
+            case DFLASH2 -> 5;
         };
     }
 

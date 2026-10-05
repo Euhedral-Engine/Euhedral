@@ -367,8 +367,9 @@ int euhedral_cuda_gdn_project_control_fp32(
     status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     void* parameters[] = {&input, &a_weight, &b_weight, &a_log, &dt_bias, &alpha, &beta, &rows, &width, &heads};
-    // From eight rows, 8-row x 4-head CTAs share activation and weight loads (bitwise equal).
-    if (rows >= 8u && heads % 4u == 0u)
+    // From 48 rows, 8-row x 4-head CTAs share activation and weight loads (bitwise equal). Below that the per-row
+    // kernel's rows x heads CTAs fill the GPU better: 9.8 against 19.6 us at 8 rows, 23.2 against 21.2 at 48.
+    if (rows >= 48u && heads % 4u == 0u)
         return launch_and_synchronize(gdn_project_control_tiled, (rows + 7u) / 8u * (heads / 4u), 128, parameters);
     return launch_and_synchronize(gdn_project_control, (uint32_t)count, 128, parameters);
 }
