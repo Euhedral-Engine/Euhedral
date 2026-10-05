@@ -31,9 +31,13 @@ public final class QwenExecutionContext implements StageQuantum {
         /// Speculative verification: decode's topology over several rows, each computed bit for bit as
         /// one-row decode at its position (row-exact execution), with logits for every row.
         VERIFY,
-        /// MTP drafting (docs/MTP_CONTRACT.md §2): rows of the MTP layer at MTP positions, writing only
-        /// the MTP layer's cache. The base sequence position does not move.
-        DRAFT
+        /// Drafting, which leaves the base sequence position where it is: rows of the MTP layer at MTP positions,
+        /// writing only the MTP layer's cache (docs/MTP_CONTRACT.md §2), or a DFlash2 block, which proposes the
+        /// tokens after its anchor and writes no state (docs/DFLASH2.md).
+        DRAFT,
+        /// DFlash2 context rows: the drafter's keys and values of committed target rows at their positions, from the
+        /// target's tapped hidden rows, into the drafter's own cache. The base sequence position does not move.
+        DRAFT_CONTEXT
     }
 
     public enum Status {
@@ -77,6 +81,8 @@ public final class QwenExecutionContext implements StageQuantum {
     /// Base quanta of a speculative session also keep every row's post-final-norm hidden for drafting.
     private boolean seedsDraft;
     private long leasePosition;
+    /// A DFlash2 block's host copy of its proposal, queued by its selector stage.
+    private DFlash2Proposal proposal;
 
     public QwenExecutionContext(
             QwenExecutionPlan plan,
@@ -197,13 +203,29 @@ public final class QwenExecutionContext implements StageQuantum {
 
     /// Keeps every row's post-final-norm hidden in the sequence's draft seed rows.
     public QwenExecutionContext seedingDraft() {
-        if (this.kind == ExecutionKind.DRAFT) throw new IllegalStateException("drafting does not seed itself");
+        if (drafting()) throw new IllegalStateException("drafting does not seed itself");
         this.seedsDraft = true;
         return this;
     }
 
     public boolean seedsDraft() {
         return this.seedsDraft;
+    }
+
+    /// Binds the host copy that a DFlash2 block quantum's proposal is queued into before it retires.
+    public QwenExecutionContext withProposal(DFlash2Proposal proposal) {
+        if (this.kind != ExecutionKind.DRAFT) throw new IllegalStateException("only a draft block proposes tokens");
+        this.proposal = Objects.requireNonNull(proposal, "proposal");
+        return this;
+    }
+
+    public DFlash2Proposal proposal() {
+        return this.proposal;
+    }
+
+    /// Whether this quantum leaves the base sequence position where it is (MTP rows, DFlash2 blocks and context).
+    boolean drafting() {
+        return this.kind == ExecutionKind.DRAFT || this.kind == ExecutionKind.DRAFT_CONTEXT;
     }
 
     /// The acceptance rule of a VERIFY quantum; null commits every row (tests may force a count).
@@ -232,7 +254,7 @@ public final class QwenExecutionContext implements StageQuantum {
     /// Rows whose state this quantum commits: all rows, or a verification's accepted prefix. Resolved on
     /// first use after the device work retired, from the verified rows' greedy selections.
     public int committedRowCount() {
-        if (this.kind == ExecutionKind.DRAFT) return this.draftCommittedRows;
+        if (drafting()) return this.draftCommittedRows;
         if (this.forcedCommittedRows > 0) return this.forcedCommittedRows;
         if (this.acceptance == null) return this.tokenIds.length;
         if (!this.acceptance.resolved()) this.acceptance.resolve(this.hostLogits.selectedTokens());
@@ -303,13 +325,16 @@ public final class QwenExecutionContext implements StageQuantum {
         if (!this.plan.hasFirstLayer()) return null;
         if (!(this.sequence.kvCacheState() instanceof AttentionSequenceStates attention)
                 || !(this.sequence.recurrentState() instanceof GdnSequenceStates recurrent)) return null;
-        if (!attention.reserves(this.startPosition, this.tokenIds.length, this.kind == ExecutionKind.DRAFT))
+        // A DFlash2 quantum appends to no paged cache; its ring is fixed.
+        boolean dflash = drafting() && this.plan.draftsWithDFlash2();
+        if (!dflash && !attention.reserves(this.startPosition, this.tokenIds.length, this.kind == ExecutionKind.DRAFT))
             return null;
         CaptureFingerprint fingerprint = new CaptureFingerprint();
         this.workspace.fingerprint(fingerprint);
         attention.fingerprint(fingerprint);
         recurrent.fingerprint(fingerprint);
         if (this.hostLogits != null) this.hostLogits.fingerprint(fingerprint);
+        if (this.proposal != null) this.proposal.fingerprint(fingerprint);
         QwenConfig config = this.plan.weights().config();
         return new CaptureKey(new long[] {
             this.kind.ordinal(),
@@ -417,8 +442,7 @@ public final class QwenExecutionContext implements StageQuantum {
             beforeClaim.run();
             try {
                 // Drafting runs at MTP positions and leaves the base position where it is.
-                this.leasePosition =
-                        this.kind == ExecutionKind.DRAFT ? this.sequence.currentTokenPosition() : this.startPosition;
+                this.leasePosition = drafting() ? this.sequence.currentTokenPosition() : this.startPosition;
                 this.lease = this.sequence.claimExecution(this.leasePosition);
             } catch (IllegalStateException claimFailure) {
                 if (this.sequence.terminalState() == QwenSequenceState.TerminalState.CANCELLED) {
@@ -542,7 +566,10 @@ public final class QwenExecutionContext implements StageQuantum {
         }
         if (deviceFailure != null) fail(deviceFailure);
         ExecutionGpu gpu = this.gpu;
-        if (this.hostLogits == null && this.failure.get() == null && !this.sequence.cancellationRequested()) {
+        if (this.hostLogits == null
+                && this.proposal == null
+                && this.failure.get() == null
+                && !this.sequence.cancellationRequested()) {
             try {
                 retainLogits(gpu);
             } catch (Throwable retentionFailure) {
@@ -595,10 +622,7 @@ public final class QwenExecutionContext implements StageQuantum {
                 completed = new Outcome(Status.CANCELLED, null);
             } else {
                 boolean cancelled = this.sequence.releaseExecutionAndCheckCancellation(
-                        this.lease,
-                        this.kind == ExecutionKind.DRAFT
-                                ? this.leasePosition
-                                : this.startPosition + committedRowCount());
+                        this.lease, drafting() ? this.leasePosition : this.startPosition + committedRowCount());
                 completed = new Outcome(cancelled ? Status.CANCELLED : Status.SUCCESS, null);
             }
         } catch (Throwable cleanupFailure) {
@@ -611,6 +635,7 @@ public final class QwenExecutionContext implements StageQuantum {
         this.lease = null;
         // The row was copied before the retirement boundary; only a successful quantum exposes it.
         if (this.hostLogits != null) this.hostLogits.retired(completed.status() == Status.SUCCESS);
+        if (this.proposal != null) this.proposal.retired(completed.status() == Status.SUCCESS);
         this.pendingOutcome = completed;
     }
 

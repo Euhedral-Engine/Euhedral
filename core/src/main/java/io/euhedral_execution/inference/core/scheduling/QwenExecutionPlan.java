@@ -3,8 +3,10 @@ package io.euhedral_execution.inference.core.scheduling;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.artifact.CompactTensorLayout;
+import io.euhedral_execution.inference.core.model_loader.config.DFlash2Config;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.DFlash2Weights;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompactAttentionWeights;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompactDenseFfnWeights;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompactGatedDeltaNetWeights;
@@ -49,7 +51,23 @@ public final class QwenExecutionPlan {
         MTP_STEM,
         /// Copies a host-backed weight into its staging slot. Its weight's `hostAddress` is the source
         /// and its `deviceAddress` the slot.
-        WEIGHT_TRANSFER
+        WEIGHT_TRANSFER,
+        /// Copies the target's hidden rows after one tapped layer into the sequence's DFlash2 tap rows (slot
+        /// `outputBufferIndex`), in quanta that seed drafting; a no-op otherwise.
+        DFLASH_TAP,
+        /// DFlash2 drafter operators (docs/DFLASH2.md). A linear with no input buffer reads the sequence's tap rows.
+        DFLASH_LINEAR,
+        DFLASH_RMS_NORM,
+        /// The dynamic convolution's prepare (`outputBufferIndex` 0) or finish (1) kernel.
+        DFLASH_CONV,
+        DFLASH_CONTEXT_KV,
+        DFLASH_BLOCK_QK,
+        DFLASH_ATTENTION,
+        DFLASH_SWIGLU,
+        /// The target's output head over the block's proposal rows (every row but the anchor).
+        DFLASH_LM_HEAD,
+        DFLASH_TOPK,
+        DFLASH_SELECT
     }
 
     public enum Buffer {
@@ -78,7 +96,21 @@ public final class QwenExecutionPlan {
         SLICE_PROJECTION,
         /// MTP stem scratch: one normalized half, then the packed [embedding; hidden] rows.
         MTP_NORMED,
-        MTP_PACKED
+        MTP_PACKED,
+        /// DFlash2 drafter buffers.
+        DRAFT_FUSED,
+        DRAFT_CONTEXT,
+        DRAFT_DYNAMIC,
+        DRAFT_CONVOLVED,
+        DRAFT_QUERY,
+        DRAFT_KV,
+        DRAFT_QUERY_ROPE,
+        DRAFT_KEY_ROPE,
+        DRAFT_TOPK_VALUES,
+        DRAFT_TOPK_INDICES,
+        DRAFT_SELECTOR,
+        DRAFT_PROPOSAL,
+        DRAFT_SCORES
     }
 
     public enum ElementType {
@@ -248,6 +280,9 @@ public final class QwenExecutionPlan {
     private final WeightStaging staging;
     /// The MTP draft view; null without loaded MTP weights and draft head.
     private final QwenExecutionPlan mtpDraft;
+    /// The DFlash2 views, null without the loaded drafter: its block (DRAFT) and its context rows (DRAFT_CONTEXT).
+    private final QwenExecutionPlan dflashBlock;
+    private final QwenExecutionPlan dflashContext;
 
     /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
     static final List<Map.Entry<Buffer, Buffer>> REGION_STORAGE = List.of(
@@ -355,9 +390,14 @@ public final class QwenExecutionPlan {
         // Decode runs its own instance of the small topology: rounded residual add + RMSNorm and the
         // joint GDN A/B projection + control are single region launches, as in short prefill quanta.
         if (kind == QwenExecutionContext.ExecutionKind.DRAFT) {
-            if (family.mtpDraft == null)
-                throw new IllegalStateException("the model has no loaded MTP layer and draft head");
-            return family.mtpDraft;
+            if (family.mtpDraft != null) return family.mtpDraft;
+            if (family.dflashBlock != null) return family.dflashBlock;
+            throw new IllegalStateException("the model has no loaded drafter");
+        }
+        if (kind == QwenExecutionContext.ExecutionKind.DRAFT_CONTEXT) {
+            if (family.dflashContext == null)
+                throw new IllegalStateException("the model has no loaded DFlash2 drafter");
+            return family.dflashContext;
         }
         if (kind == QwenExecutionContext.ExecutionKind.DECODE || kind == QwenExecutionContext.ExecutionKind.VERIFY)
             return family.decode;
@@ -370,6 +410,11 @@ public final class QwenExecutionPlan {
     /// Whether this plan's family can draft with MTP.
     public boolean drafts() {
         return this.owner.mtpDraft != null;
+    }
+
+    /// Whether this plan's family can draft with DFlash2.
+    public boolean draftsWithDFlash2() {
+        return this.owner.dflashBlock != null;
     }
 
     /// Rows of the draft head: the draft view's logits width.
@@ -566,6 +611,8 @@ public final class QwenExecutionPlan {
             this.decode = null;
             this.regionPrefill = null;
             this.mtpDraft = null;
+            this.dflashBlock = null;
+            this.dflashContext = null;
             return;
         }
         // Drafting needs the MTP attention split like a base layer's, which only a speculative load does.
@@ -577,6 +624,13 @@ public final class QwenExecutionPlan {
                         && weights.runtimeObjects().containsKey(DRAFT_HEAD)
                 ? new QwenExecutionPlan(weights, staged(mtpDraft(weights), this.staging), this, false)
                 : null;
+        DFlash2Weights drafter = weights.dflash2();
+        this.dflashBlock = drafter == null
+                ? null
+                : new QwenExecutionPlan(weights, staged(dflash2Block(weights, drafter), this.staging), this, false);
+        this.dflashContext = drafter == null
+                ? null
+                : new QwenExecutionPlan(weights, staged(dflash2Context(drafter), this.staging), this, false);
         this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
         this.decode = prefillPlan(weights, data, PrefillView.SMALL, this);
         this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
@@ -1174,6 +1228,353 @@ public final class QwenExecutionPlan {
         return new PlanData(List.copyOf(nodes), List.of(), buffers, true);
     }
 
+    /// The DFlash2 tap slot of target layer `layer`'s output, or -1.
+    private static int tapSlot(DFlash2Weights drafter, int layer) {
+        if (drafter == null) return -1;
+        int[] layers = drafter.config().targetLayers();
+        for (int slot = 0; slot < layers.length; slot++) if (layers[slot] == layer) return slot;
+        return -1;
+    }
+
+    /// The DFlash2 context view (DRAFT_CONTEXT, docs/DFLASH2.md): the feature fusion of the sequence's tap rows, the
+    /// hidden norm, then each draft layer's key/value projection, key norm and RoPE into the drafter's ring.
+    private static PlanData dflash2Context(DFlash2Weights drafter) {
+        DFlash2Config c = drafter.config();
+        int hidden = c.hiddenSize();
+        int kv = 2 * c.keyValueWidth();
+        List<Instruction> nodes = new ArrayList<>();
+        int fused = addNode(
+                nodes,
+                Kind.DFLASH_LINEAR,
+                -1,
+                List.of(),
+                List.of(drafter.fc()),
+                List.of(),
+                List.of(Buffer.DRAFT_FUSED),
+                c.tapWidth(),
+                hidden);
+        int context = addNode(
+                nodes,
+                Kind.DFLASH_RMS_NORM,
+                -1,
+                List.of(fused),
+                List.of(drafter.hiddenNorm()),
+                List.of(Buffer.DRAFT_FUSED),
+                List.of(Buffer.DRAFT_CONTEXT),
+                hidden,
+                hidden);
+        DFlash2Weights.Layer[] layers = drafter.layers();
+        for (int layer = 0; layer < layers.length; layer++) {
+            int projected = addNode(
+                    nodes,
+                    Kind.DFLASH_LINEAR,
+                    layer,
+                    List.of(context),
+                    List.of(layers[layer].keyValue()),
+                    List.of(Buffer.DRAFT_CONTEXT),
+                    List.of(Buffer.DRAFT_KV),
+                    hidden,
+                    kv);
+            addNode(
+                    nodes,
+                    Kind.DFLASH_CONTEXT_KV,
+                    layer,
+                    List.of(projected),
+                    List.of(layers[layer].keyNorm()),
+                    List.of(Buffer.DRAFT_KV),
+                    List.of(),
+                    kv,
+                    kv);
+        }
+        List<BufferSpec> buffers = List.of(
+                spec(Buffer.DRAFT_FUSED, hidden, ElementType.BF16),
+                spec(Buffer.DRAFT_CONTEXT, hidden, ElementType.BF16),
+                spec(Buffer.DRAFT_KV, kv, ElementType.BF16));
+        return new PlanData(List.copyOf(nodes), List.of(), buffers, true, false);
+    }
+
+    /// The DFlash2 block view (DRAFT, docs/DFLASH2.md): the anchor and mask tokens' embedding, the draft layers over
+    /// all rows of the block at once, the final norm, the target's output head over the proposal rows, their top
+    /// candidates, and the selector's path.
+    private static PlanData dflash2Block(QwenWeights weights, DFlash2Weights drafter) {
+        DFlash2Config c = drafter.config();
+        QwenConfig target = weights.config();
+        int hidden = c.hiddenSize();
+        int kv = 2 * c.keyValueWidth();
+        TensorHandle embedding = validateEmbedding(weights.tokenEmbedding(), target.vocabSize(), hidden);
+        TensorHandle outputHead =
+                validateQuantized(weights.lmHead(), target.vocabSize(), hidden, WeightFormat.Q3_G64_FP16);
+        List<Instruction> nodes = new ArrayList<>();
+        int residual = addNode(
+                nodes,
+                Kind.EMBEDDING,
+                -1,
+                List.of(),
+                List.of(embedding),
+                List.of(),
+                List.of(Buffer.HIDDEN_STATE),
+                0,
+                hidden);
+        DFlash2Weights.Layer[] layers = drafter.layers();
+        for (int layerIndex = 0; layerIndex < layers.length; layerIndex++) {
+            final int index = layerIndex;
+            DFlash2Weights.Layer layer = layers[index];
+            int normed = addNode(
+                    nodes,
+                    Kind.DFLASH_RMS_NORM,
+                    index,
+                    List.of(residual),
+                    List.of(layer.inputNorm()),
+                    List.of(Buffer.HIDDEN_STATE),
+                    List.of(Buffer.INPUT_NORMALIZED),
+                    hidden,
+                    hidden);
+            int delta = convolved(
+                    nodes,
+                    index,
+                    normed,
+                    layer.attentionConvProjection(),
+                    layer.attentionConvBase(),
+                    c,
+                    convolvedInput -> {
+                        int query = addNode(
+                                nodes,
+                                Kind.DFLASH_LINEAR,
+                                index,
+                                List.of(convolvedInput),
+                                List.of(layer.query()),
+                                List.of(Buffer.DRAFT_CONVOLVED),
+                                List.of(Buffer.DRAFT_QUERY),
+                                hidden,
+                                c.queryWidth());
+                        int keyValue = addNode(
+                                nodes,
+                                Kind.DFLASH_LINEAR,
+                                index,
+                                List.of(convolvedInput),
+                                List.of(layer.keyValue()),
+                                List.of(Buffer.DRAFT_CONVOLVED),
+                                List.of(Buffer.DRAFT_KV),
+                                hidden,
+                                kv);
+                        int rotated = addNode(
+                                nodes,
+                                Kind.DFLASH_BLOCK_QK,
+                                index,
+                                List.of(query, keyValue),
+                                List.of(layer.queryNorm(), layer.keyNorm()),
+                                List.of(Buffer.DRAFT_QUERY, Buffer.DRAFT_KV),
+                                List.of(Buffer.DRAFT_QUERY_ROPE, Buffer.DRAFT_KEY_ROPE),
+                                c.queryWidth(),
+                                c.queryWidth());
+                        int attended = addNode(
+                                nodes,
+                                Kind.DFLASH_ATTENTION,
+                                index,
+                                List.of(rotated),
+                                List.of(),
+                                List.of(Buffer.DRAFT_QUERY_ROPE, Buffer.DRAFT_KEY_ROPE, Buffer.DRAFT_KV),
+                                List.of(Buffer.ATTENTION_CONTEXT),
+                                c.queryWidth(),
+                                c.queryWidth());
+                        return addNode(
+                                nodes,
+                                Kind.DFLASH_LINEAR,
+                                index,
+                                List.of(attended),
+                                List.of(layer.output()),
+                                List.of(Buffer.ATTENTION_CONTEXT),
+                                List.of(Buffer.MIXER_DELTA),
+                                c.queryWidth(),
+                                hidden);
+                    });
+            residual = addNode(
+                    nodes,
+                    Kind.RESIDUAL_ADD,
+                    index,
+                    List.of(residual, delta),
+                    List.of(),
+                    List.of(Buffer.HIDDEN_STATE, Buffer.FFN_DELTA),
+                    List.of(Buffer.HIDDEN_STATE),
+                    hidden,
+                    hidden);
+            int postNormed = addNode(
+                    nodes,
+                    Kind.DFLASH_RMS_NORM,
+                    index,
+                    List.of(residual),
+                    List.of(layer.postAttentionNorm()),
+                    List.of(Buffer.HIDDEN_STATE),
+                    List.of(Buffer.INPUT_NORMALIZED),
+                    hidden,
+                    hidden);
+            int mlpDelta = convolved(
+                    nodes, index, postNormed, layer.mlpConvProjection(), layer.mlpConvBase(), c, convolvedInput -> {
+                        int gateUp = addNode(
+                                nodes,
+                                Kind.DFLASH_LINEAR,
+                                index,
+                                List.of(convolvedInput),
+                                List.of(layer.gateUp()),
+                                List.of(Buffer.DRAFT_CONVOLVED),
+                                List.of(Buffer.GATE_UP),
+                                hidden,
+                                2 * c.intermediateSize());
+                        int activated = addNode(
+                                nodes,
+                                Kind.DFLASH_SWIGLU,
+                                index,
+                                List.of(gateUp),
+                                List.of(),
+                                List.of(Buffer.GATE_UP),
+                                List.of(Buffer.SWIGLU),
+                                2 * c.intermediateSize(),
+                                c.intermediateSize());
+                        return addNode(
+                                nodes,
+                                Kind.DFLASH_LINEAR,
+                                index,
+                                List.of(activated),
+                                List.of(layer.down()),
+                                List.of(Buffer.SWIGLU),
+                                List.of(Buffer.MIXER_DELTA),
+                                c.intermediateSize(),
+                                hidden);
+                    });
+            residual = addNode(
+                    nodes,
+                    Kind.RESIDUAL_ADD,
+                    index,
+                    List.of(residual, mlpDelta),
+                    List.of(),
+                    List.of(Buffer.HIDDEN_STATE, Buffer.FFN_DELTA),
+                    List.of(Buffer.HIDDEN_STATE),
+                    hidden,
+                    hidden);
+        }
+        int finalNormed = addNode(
+                nodes,
+                Kind.DFLASH_RMS_NORM,
+                -1,
+                List.of(residual),
+                List.of(drafter.finalNorm()),
+                List.of(Buffer.HIDDEN_STATE),
+                List.of(Buffer.FINAL_NORMALIZED),
+                hidden,
+                hidden);
+        int logits = addNode(
+                nodes,
+                Kind.DFLASH_LM_HEAD,
+                -1,
+                List.of(finalNormed),
+                List.of(outputHead),
+                List.of(Buffer.FINAL_NORMALIZED),
+                List.of(Buffer.LOGITS),
+                hidden,
+                target.vocabSize());
+        int top = addNode(
+                nodes,
+                Kind.DFLASH_TOPK,
+                -1,
+                List.of(logits),
+                List.of(),
+                List.of(Buffer.LOGITS),
+                List.of(Buffer.DRAFT_TOPK_VALUES, Buffer.DRAFT_TOPK_INDICES),
+                target.vocabSize(),
+                c.selectorTopK());
+        int projected = addNode(
+                nodes,
+                Kind.DFLASH_LINEAR,
+                -1,
+                List.of(finalNormed),
+                List.of(drafter.selectorProjection()),
+                List.of(Buffer.FINAL_NORMALIZED),
+                List.of(Buffer.DRAFT_SELECTOR),
+                hidden,
+                c.selectorRank());
+        addNode(
+                nodes,
+                Kind.DFLASH_SELECT,
+                -1,
+                List.of(top, projected),
+                List.of(drafter.predecessorCodebook(), drafter.successorCodebook()),
+                List.of(Buffer.DRAFT_SELECTOR, Buffer.DRAFT_TOPK_VALUES, Buffer.DRAFT_TOPK_INDICES),
+                List.of(Buffer.DRAFT_PROPOSAL, Buffer.DRAFT_SCORES),
+                c.selectorRank(),
+                c.selectorTopK());
+        List<BufferSpec> buffers = List.of(
+                spec(Buffer.HIDDEN_STATE, hidden, ElementType.BF16),
+                spec(Buffer.INPUT_NORMALIZED, hidden, ElementType.BF16),
+                spec(Buffer.DRAFT_DYNAMIC, c.convProjectionWidth(), ElementType.BF16),
+                spec(Buffer.DRAFT_CONVOLVED, hidden, ElementType.BF16),
+                spec(Buffer.DRAFT_QUERY, c.queryWidth(), ElementType.BF16),
+                spec(Buffer.DRAFT_KV, kv, ElementType.BF16),
+                spec(Buffer.DRAFT_QUERY_ROPE, c.queryWidth(), ElementType.BF16),
+                spec(Buffer.DRAFT_KEY_ROPE, c.keyValueWidth(), ElementType.BF16),
+                spec(Buffer.ATTENTION_CONTEXT, c.queryWidth(), ElementType.BF16),
+                spec(Buffer.MIXER_DELTA, hidden, ElementType.BF16),
+                spec(Buffer.FFN_DELTA, hidden, ElementType.BF16),
+                spec(Buffer.GATE_UP, 2 * c.intermediateSize(), ElementType.BF16),
+                spec(Buffer.SWIGLU, c.intermediateSize(), ElementType.BF16),
+                spec(Buffer.FINAL_NORMALIZED, hidden, ElementType.BF16),
+                spec(Buffer.LOGITS, target.vocabSize(), ElementType.BF16),
+                spec(Buffer.DRAFT_TOPK_VALUES, c.selectorTopK(), ElementType.BF16),
+                spec(Buffer.DRAFT_TOPK_INDICES, c.selectorTopK(), ElementType.FP32),
+                spec(Buffer.DRAFT_SELECTOR, c.selectorRank(), ElementType.BF16),
+                spec(Buffer.DRAFT_PROPOSAL, 1, ElementType.FP32),
+                spec(Buffer.DRAFT_SCORES, c.selectorTopK(), ElementType.FP32));
+        return new PlanData(List.copyOf(nodes), List.of(), buffers, true, false);
+    }
+
+    /// A dynamic convolution around `body`: the kernel projection of the normalized rows, the prepare convolution
+    /// into DRAFT_CONVOLVED, `body` (reading it, writing MIXER_DELTA), then the finish convolution into FFN_DELTA.
+    /// Returns the finish stage.
+    private static int convolved(
+            List<Instruction> nodes,
+            int layer,
+            int normed,
+            TensorHandle projection,
+            TensorHandle base,
+            DFlash2Config c,
+            java.util.function.IntUnaryOperator body) {
+        int hidden = c.hiddenSize();
+        int dynamic = addNode(
+                nodes,
+                Kind.DFLASH_LINEAR,
+                layer,
+                List.of(normed),
+                List.of(projection),
+                List.of(Buffer.INPUT_NORMALIZED),
+                List.of(Buffer.DRAFT_DYNAMIC),
+                hidden,
+                c.convProjectionWidth());
+        nodes.add(new Instruction(
+                nodes.size(),
+                Kind.DFLASH_CONV,
+                List.of(normed, dynamic),
+                List.of(base),
+                List.of(Buffer.INPUT_NORMALIZED, Buffer.DRAFT_DYNAMIC),
+                List.of(Buffer.DRAFT_CONVOLVED),
+                hidden,
+                hidden,
+                0,
+                layer));
+        int prepared = nodes.size() - 1;
+        int inner = body.applyAsInt(prepared);
+        nodes.add(new Instruction(
+                nodes.size(),
+                Kind.DFLASH_CONV,
+                List.of(inner, dynamic),
+                List.of(base),
+                List.of(Buffer.MIXER_DELTA, Buffer.DRAFT_DYNAMIC),
+                List.of(Buffer.FFN_DELTA),
+                hidden,
+                hidden,
+                1,
+                layer));
+        return nodes.size() - 1;
+    }
+
     private static PlanData fullModel(QwenWeights weights, TensorHandle embedding) {
         QwenConfig config = weights.config();
         QwenLayerType[] layerTypes = config.layerTypes();
@@ -1258,6 +1659,21 @@ public final class QwenExecutionPlan {
                     List.of(Buffer.INPUT_NORMALIZED),
                     hidden,
                     hidden);
+            // The previous layer's output feeds a DFlash2 tap. The tap follows this layer's input norm, which the
+            // prefill and decode views fuse with the residual that produced it, and reads only that residual.
+            int tap = layerIndex == 0 ? -1 : tapSlot(weights.dflash2(), layerIndex - 1);
+            if (tap >= 0)
+                nodes.add(new Instruction(
+                        nodes.size(),
+                        Kind.DFLASH_TAP,
+                        List.of(precedingLayer),
+                        List.of(),
+                        List.of(Buffer.FINAL_HIDDEN_STATE),
+                        List.of(),
+                        hidden,
+                        hidden,
+                        tap,
+                        layerIndex - 1));
 
             int mixerProjectionId;
             if (layerTypes[layerIndex] == QwenLayerType.GATED_DELTA_NET) {

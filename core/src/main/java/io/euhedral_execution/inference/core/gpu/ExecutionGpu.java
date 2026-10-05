@@ -511,6 +511,92 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("BF16 SwiGLU is not implemented by this GPU");
     }
 
+    // DFlash2 drafter operators (native/src/dflash/kernels.cu). `position` addresses the quantum's uint64 start
+    // position in device memory.
+
+    public void dflashLinearBf16(long input, long weights, long output, int rows, int inFeatures, int outFeatures) {
+        throw new UnsupportedOperationException("DFlash2 BF16 linear is not implemented by this GPU");
+    }
+
+    public void dflashRmsNormBf16(long input, long weight, long output, int rows, int width, float epsilon) {
+        throw new UnsupportedOperationException("DFlash2 RMSNorm is not implemented by this GPU");
+    }
+
+    public void dflashConvBf16(
+            long input, long dynamic, long base, long output, int rows, int width, int group, int taps, int part) {
+        throw new UnsupportedOperationException("DFlash2 dynamic convolution is not implemented by this GPU");
+    }
+
+    public void dflashContextKvBf16(
+            long kv,
+            long keyNorm,
+            long ringKeys,
+            long ringValues,
+            int rows,
+            long position,
+            int window,
+            int keyValueHeads,
+            int headDim,
+            float epsilon,
+            float theta) {
+        throw new UnsupportedOperationException("DFlash2 context keys are not implemented by this GPU");
+    }
+
+    public void dflashBlockQkBf16(
+            long query,
+            long kv,
+            long queryNorm,
+            long keyNorm,
+            long queryOut,
+            long keyOut,
+            int rows,
+            long position,
+            int heads,
+            int keyValueHeads,
+            int headDim,
+            float epsilon,
+            float theta) {
+        throw new UnsupportedOperationException("DFlash2 block queries and keys are not implemented by this GPU");
+    }
+
+    public void dflashAttentionBf16(
+            long query,
+            long blockKeys,
+            long kv,
+            long ringKeys,
+            long ringValues,
+            long output,
+            int rows,
+            long position,
+            int window,
+            int heads,
+            int keyValueHeads,
+            int headDim) {
+        throw new UnsupportedOperationException("DFlash2 attention is not implemented by this GPU");
+    }
+
+    public void dflashSwiGluBf16(long gateUp, long output, int rows, int intermediate) {
+        throw new UnsupportedOperationException("DFlash2 SwiGLU is not implemented by this GPU");
+    }
+
+    public void dflashTopKBf16(long logits, int rows, int vocabulary, long values, long indices) {
+        throw new UnsupportedOperationException("DFlash2 top-k is not implemented by this GPU");
+    }
+
+    public void dflashSelectBf16(
+            long hidden,
+            long values,
+            long indices,
+            long predecessor,
+            long successor,
+            long anchor,
+            int positions,
+            int rank,
+            long tokens,
+            long scores) {
+        throw new UnsupportedOperationException("DFlash2 selector is not implemented by this GPU");
+    }
+
     public void zeroDeviceMemory(long address, long byteSize) {
         throw new UnsupportedOperationException("device memory zeroing is not implemented by this GPU");
     }

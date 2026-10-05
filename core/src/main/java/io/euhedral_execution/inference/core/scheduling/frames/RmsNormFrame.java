@@ -16,7 +16,7 @@ public final class RmsNormFrame extends QwenStageFrame {
     protected void perform(QwenExecutionContext context, QwenExecutionPlan.Instruction instruction) {
         boolean finalNorm = instruction.outputBuffers().contains(QwenExecutionPlan.Buffer.FINAL_NORMALIZED);
         int rows = finalNorm ? context.logitsRowCount() : context.inputTokenCount();
-        if (finalNorm && context.seedsDraft()) {
+        if (finalNorm && context.seedsDraft() && context.plan().drafts()) {
             // Speculative drafting reads every row's post-final-norm hidden (docs/MTP_CONTRACT.md §2).
             var states = (io.euhedral_execution.inference.core.scheduling.AttentionSequenceStates)
                     context.sequenceState().kvCacheState();
