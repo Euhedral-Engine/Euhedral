@@ -107,7 +107,7 @@ bytes and slots, hits, misses, evictions, transfer bytes, transfer time, wait ti
 `NgramStore` holds the 128 shards on the host and addresses rows by hash head and entry: a head covers `heads_vocab_sizes[head]` rows from
 `heads_offsets[head]`, a global row is `shard x 2,500,012 + local row`, and a row is 90 contiguous bytes. `gather` copies chosen rows into
 host memory; `stage` copies only those rows through a pinned upload buffer to the device. The tables never enter the expert cache and are
-never copied to the device whole. N-gram execution is not implemented.
+never copied to the device whole. Execution gathers the rows as 96-byte records ([FLASH_NEXT_EXECUTION.md](FLASH_NEXT_EXECUTION.md)).
 
 ## Measurements
 
