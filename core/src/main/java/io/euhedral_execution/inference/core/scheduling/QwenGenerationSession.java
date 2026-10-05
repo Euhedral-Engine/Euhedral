@@ -23,7 +23,7 @@ import java.util.function.Consumer;
 /// The tokenizer, plan, runtime, and GPU are borrowed. The session owns its sequence, one sampler, and
 /// the pinned host row into which each sampling quantum copies its final logits before it retires; each
 /// completed prompt-to-output stream is flushed before the decoder is replaced for a later prompt.
-public final class QwenGenerationSession implements AutoCloseable {
+public final class QwenGenerationSession implements GenerationSession {
 
     /// Default prompt tokens per prefill quantum. Bounds per-quantum GPU workspace while the
     /// persistent sequence retains KV and GDN state.
@@ -168,6 +168,7 @@ public final class QwenGenerationSession implements AutoCloseable {
     }
 
     /// Whether the session's next prompt is its first, which carries the model special tokens.
+    @Override
     public boolean expectsFirstPrompt() {
         return !this.promptPrefilled;
     }
@@ -199,6 +200,7 @@ public final class QwenGenerationSession implements AutoCloseable {
 
     /// As [#generateAsync(int[], int, Consumer, TokenConstraint)], reporting execution boundaries to an optional
     /// timing listener on the workers that retire them.
+    @Override
     public CompletableFuture<List<Integer>> generateAsync(
             int[] promptTokenIds,
             int maxNewTokens,
@@ -299,17 +301,20 @@ public final class QwenGenerationSession implements AutoCloseable {
 
     /// Requests cancellation of the current quantum or prevents the next one from starting.
     /// A cancelled session cannot accept another prompt and remains owned until closed.
+    @Override
     public void cancel() {
         if (this.closed.get()) return;
         requestCancellation();
     }
 
     /// Returns the authoritative token position retained by the session's sequence state.
+    @Override
     public long currentTokenPosition() {
         return this.sequence.currentTokenPosition();
     }
 
     /// Returns an immutable snapshot of tokens sampled by all prompts in this session.
+    @Override
     public List<Integer> generatedTokenIds() {
         synchronized (this.generatedTokenIds) {
             return List.copyOf(this.generatedTokenIds);
@@ -317,16 +322,19 @@ public final class QwenGenerationSession implements AutoCloseable {
     }
 
     /// Prompt tokens the session's last generation restored from the prefix cache; 0 when it prefilled all of them.
+    @Override
     public int restoredPromptTokens() {
         return this.restoredPromptTokens;
     }
 
     /// Reports whether cancellation has been requested for this session.
+    @Override
     public boolean isCancelled() {
         return this.cancelled.get();
     }
 
     /// Reports whether the caller has closed this session.
+    @Override
     public boolean isClosed() {
         return this.closed.get();
     }

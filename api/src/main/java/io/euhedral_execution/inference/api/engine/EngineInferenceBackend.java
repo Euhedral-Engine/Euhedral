@@ -6,8 +6,8 @@ import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.guidance.GrammarCompiler;
 import io.euhedral_execution.inference.core.guidance.Llguidance;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.scheduling.GenerationSession;
 import io.euhedral_execution.inference.core.scheduling.GenerationTimingListener;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.ReasoningConstraint;
 import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
@@ -18,7 +18,7 @@ import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 
 /// Borrows the Spring-owned `InferenceEngine`; the engine bean remains the terminal owner of model,
-/// GPU, lattice, and runtime. Each generation wraps one engine-tracked `QwenGenerationSession`. Constrained
+/// GPU, lattice, and runtime. Each generation wraps one engine-tracked `GenerationSession`. Constrained
 /// answers use llguidance, loaded from beside the CUDA library and compiled against the checkpoint vocabulary.
 public final class EngineInferenceBackend implements InferenceBackend, AutoCloseable {
     private final InferenceEngine engine;
@@ -47,8 +47,7 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
             if (engine.tokenizer().controlTokenId(token).isEmpty())
                 throw new IllegalStateException("tokenizer lacks chat-template control token " + token);
         }
-        this.grammars = GrammarCompiler.forTokenizer(
-                llguidance, engine.tokenizer(), engine.modelConfig().vocabSize());
+        this.grammars = GrammarCompiler.forTokenizer(llguidance, engine.tokenizer(), engine.vocabularySize());
     }
 
     @Override
@@ -78,9 +77,7 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
 
     @Override
     public int contextLength() {
-        return Math.min(
-                this.engine.config().maxContextTokens(),
-                this.engine.modelConfig().maxPositionEmbeddings());
+        return Math.min(this.engine.config().maxContextTokens(), this.engine.maxPositionEmbeddings());
     }
 
     @Override
@@ -110,7 +107,7 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
                     : -1;
             try {
                 return new SessionGeneration(
-                        this.engine.createSession(config), tokenizer, constraint, thinkEnd, this.metrics);
+                        this.engine.createGenerationSession(config), tokenizer, constraint, thinkEnd, this.metrics);
             } catch (RuntimeException | Error failure) {
                 if (constraint != null) constraint.close();
                 throw failure;
@@ -147,7 +144,7 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
 
     /// `thinkEnd` is the `</think>` ID when the output opens as reasoning, else -1.
     private record SessionGeneration(
-            QwenGenerationSession session,
+            GenerationSession session,
             QwenTokenizer tokenizer,
             TokenConstraint constraint,
             int thinkEnd,
