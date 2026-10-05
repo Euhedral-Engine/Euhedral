@@ -105,6 +105,11 @@ public final class AttentionSequenceStates implements AutoCloseable {
         fingerprint.add(this.gpu, this.decodeScratch).add(this.decodeScratchRows);
     }
 
+    /// Layer slots: the model's layers, plus the MTP layer's when the sequence has it.
+    public int layerCount() {
+        return this.states.length;
+    }
+
     public AttentionKvState forLayer(int layerIndex) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
         if (layerIndex < 0 || layerIndex >= this.states.length || this.states[layerIndex] == null) {

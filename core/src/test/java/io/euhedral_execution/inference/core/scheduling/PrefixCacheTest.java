@@ -37,7 +37,7 @@ class PrefixCacheTest {
 
     private PrefixCache cache(long bytes, int interval) {
         Arena arena = Arena.ofShared();
-        return new PrefixCache(this.gpu, CONFIG, false, arena.allocate(bytes), arena::close, interval);
+        return new PrefixCache(this.gpu, CONFIG, arena.allocate(bytes), arena::close, interval);
     }
 
     private QwenExecutionPlan plan() {
@@ -75,7 +75,7 @@ class PrefixCacheTest {
         assertEquals(1024, node.position());
         assertEquals(1, cache.stats().captured());
 
-        var hit = cache.lookup(tokens, false);
+        var hit = cache.lookup(tokens);
         assertNotNull(hit);
         assertEquals(1024, hit.position());
         assertSame(node, hit.cursor());
@@ -112,7 +112,7 @@ class PrefixCacheTest {
                 cache.capture(INLINE, source, cache.root(), tokens, 512).get();
         PrefixNode second = cache.capture(INLINE, source, first, tokens, 1280).get();
         assertSame(first, second.parent());
-        var hit = cache.lookup(tokens, false);
+        var hit = cache.lookup(tokens);
         assertEquals(1280, hit.position());
         var target = new QwenSequenceState(2);
         assertTrue(cache.restore(INLINE, plan(), target, hit).get());
@@ -143,7 +143,7 @@ class PrefixCacheTest {
         assertSame(parent, result, "the cursor stays where it was");
         assertEquals(1, cache.stats().skipped());
         assertEquals(0, cache.stats().captured());
-        assertNull(cache.lookup(tokens, false));
+        assertNull(cache.lookup(tokens));
     }
 
     @Test
@@ -172,7 +172,7 @@ class PrefixCacheTest {
         assertSame(cache.root(), result);
         assertEquals(1, cache.stats().failed());
         assertEquals(0, cache.stats().usedBytes());
-        assertNull(cache.lookup(tokens, false));
+        assertNull(cache.lookup(tokens));
     }
 
     @Test
@@ -180,7 +180,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
-        var hit = cache.lookup(tokens, false);
+        var hit = cache.lookup(tokens);
         var target = new QwenSequenceState(3);
         target.cancel();
         assertFalse(cache.restore(INLINE, plan(), target, hit).get(), "cancelled: no restore, and no failure");
@@ -234,7 +234,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
-        var hit = cache.lookup(tokens, false);
+        var hit = cache.lookup(tokens);
         var target = new QwenSequenceState(3);
         // Cancelled once the restore's copies began: the sequence held the lease, so cancel() only flags it.
         PrefixCache.Frames cancelling = new PrefixCache.Frames() {
@@ -255,7 +255,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
-        var hit = cache.lookup(tokens, false);
+        var hit = cache.lookup(tokens);
         var target = new QwenSequenceState(3);
         PrefixCache.Frames failing = new PrefixCache.Frames() {
             @Override
@@ -287,7 +287,7 @@ class PrefixCacheTest {
     void closeFreesTheArena() {
         var released = new AtomicBoolean();
         Arena arena = Arena.ofShared();
-        var cache = new PrefixCache(this.gpu, CONFIG, false, arena.allocate(1 << 20), () -> released.set(true), 512);
+        var cache = new PrefixCache(this.gpu, CONFIG, arena.allocate(1 << 20), () -> released.set(true), 512);
         cache.close();
         cache.close();
         assertTrue(released.get());
@@ -298,14 +298,14 @@ class PrefixCacheTest {
         Arena arena = Arena.ofShared();
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new PrefixCache(this.gpu, CONFIG, false, arena.allocate(1 << 20), arena::close, 1000));
+                () -> new PrefixCache(this.gpu, CONFIG, arena.allocate(1 << 20), arena::close, 1000));
     }
 
     // --- MTP state
 
     private PrefixCache mtpCache(long bytes) {
         Arena arena = Arena.ofShared();
-        return new PrefixCache(this.gpu, CONFIG, true, arena.allocate(bytes), arena::close, 512);
+        return new PrefixCache(this.gpu, CONFIG, arena.allocate(bytes), arena::close, 512);
     }
 
     /// A sequence as a speculative prefill leaves it: `rows` base rows, `mtpRows` MTP rows, recognizable bytes.
@@ -352,6 +352,12 @@ class PrefixCacheTest {
                         this.gpu, CONFIG.layerTypes(), CONFIG.numKeyValueHeads() * CONFIG.attentionHeadDim(), true));
     }
 
+    private static MtpCheckpoint mtp(long seedRow) {
+        var checkpoint = new MtpCheckpoint(CONFIG);
+        checkpoint.seedRow(seedRow);
+        return checkpoint;
+    }
+
     private long seedRow(int seed) {
         long address = this.gpu.allocate(CONFIG.hiddenSize() * 2L);
         this.gpu.fill(address, CONFIG.hiddenSize() * 2, seed);
@@ -364,17 +370,18 @@ class PrefixCacheTest {
         int[] tokens = IntStream.range(0, 1100).toArray();
         QwenSequenceState source = sequenceWithMtp(1024, 1023, 4);
         long seed = seedRow(9);
-        PrefixNode node =
-                cache.capture(INLINE, source, cache.root(), tokens, 1024, seed).get();
-        assertTrue(node.hasMtp());
+        PrefixNode node = cache.capture(INLINE, source, cache.root(), tokens, 1024, mtp(seed))
+                .get();
+        assertEquals(MtpCheckpoint.KIND, node.speculation());
 
-        var hit = cache.lookup(tokens, true);
+        var hit = cache.lookup(tokens, new MtpCheckpoint(CONFIG));
         assertNotNull(hit);
         var target = new QwenSequenceState(2);
         var lease = target.claimExecution(0);
         attachMtpStates(target, lease);
         target.releaseExecution(lease, 0);
-        assertTrue(cache.restore(INLINE, plan(), target, hit, true).get());
+        assertTrue(cache.restore(INLINE, plan(), target, hit, new MtpCheckpoint(CONFIG))
+                .get());
         cache.release(hit);
         var sourceMtp = ((AttentionSequenceStates) source.kvCacheState()).forLayer(CONFIG.numHiddenLayers());
         var restoredStates = (AttentionSequenceStates) target.kvCacheState();
@@ -392,13 +399,12 @@ class PrefixCacheTest {
     }
 
     @Test
-    void aCacheWithoutMtpIgnoresTheSeedRowAndStoresPlainNodes() throws Exception {
+    void aSequenceWithoutTheMtpCacheIsStoredWithoutMtpState() throws Exception {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
-        PrefixNode node = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024, seedRow(9))
+        PrefixNode node = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024, mtp(seedRow(9)))
                 .get();
-        assertFalse(node.hasMtp());
-        assertFalse(cache.supportsMtp());
+        assertNull(node.speculation());
     }
 
     @Test
@@ -406,11 +412,11 @@ class PrefixCacheTest {
         PrefixCache cache = mtpCache(8L << 20);
         int[] tokens = IntStream.range(0, 1100).toArray();
         QwenSequenceState lagging = sequenceWithMtp(1024, 700, 4);
-        PrefixNode node = cache.capture(INLINE, lagging, cache.root(), tokens, 1024, seedRow(9))
+        PrefixNode node = cache.capture(INLINE, lagging, cache.root(), tokens, 1024, mtp(seedRow(9)))
                 .get();
-        assertFalse(node.hasMtp(), "rows [0, 1023) of the MTP cache are not all there");
-        assertNull(cache.lookup(tokens, true));
-        assertNotNull(cache.lookup(tokens, false));
+        assertNull(node.speculation(), "rows [0, 1023) of the MTP cache are not all there");
+        assertNull(cache.lookup(tokens, new MtpCheckpoint(CONFIG)));
+        assertNotNull(cache.lookup(tokens));
     }
 
     @Test
@@ -420,12 +426,14 @@ class PrefixCacheTest {
         PrefixNode plain = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024)
                 .get();
         PrefixNode withMtp = cache.capture(
-                        INLINE, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, seedRow(9))
+                        INLINE, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, mtp(seedRow(9)))
                 .get();
-        assertFalse(plain.hasMtp());
-        assertTrue(withMtp.hasMtp());
+        assertNull(plain.speculation());
+        assertEquals(MtpCheckpoint.KIND, withMtp.speculation());
         assertEquals(2, cache.stats().captured());
-        assertEquals(withMtp.position(), cache.lookup(tokens, true).position());
+        assertEquals(
+                withMtp.position(),
+                cache.lookup(tokens, new MtpCheckpoint(CONFIG)).position());
     }
 
     @Test
@@ -433,7 +441,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
-        var hit = cache.lookup(tokens, false);
+        var hit = cache.lookup(tokens);
         cache.close();
         assertSame(
                 cache.root(),
@@ -451,7 +459,7 @@ class PrefixCacheTest {
     void aFrameThatRunsAfterCloseCopiesNothing() throws Exception {
         // Freed native memory stays addressable from Java, so only the cache's own check can stop the copy.
         Arena arena = Arena.ofShared();
-        PrefixCache cache = new PrefixCache(this.gpu, CONFIG, false, arena.allocate(8L << 20), () -> {}, 1024);
+        PrefixCache cache = new PrefixCache(this.gpu, CONFIG, arena.allocate(8L << 20), () -> {}, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         QwenSequenceState source = sequence(1024, 4);
         PrefixCache.Frames closing = new PrefixCache.Frames() {
@@ -472,7 +480,7 @@ class PrefixCacheTest {
         PrefixCache cache = mtpCache(16L << 20);
         int[] tokens = IntStream.range(0, 1100).toArray();
         PrefixNode withMtp = cache.capture(
-                        INLINE, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, seedRow(9))
+                        INLINE, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, mtp(seedRow(9)))
                 .get();
         PrefixNode reused = cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024)
                 .get();

@@ -11,19 +11,20 @@ public final class PrefixNode {
     private final int startPosition;
     private final int position;
     private final int[] tokens;
-    private final boolean mtp;
+    /// The kind of speculative state the node also holds, or null.
+    private final String speculation;
     long extentOffset = -1;
     long extentBytes;
     final List<PrefixNode> children = new ArrayList<>();
     int pins;
     long lastUse;
 
-    PrefixNode(PrefixNode parent, int startPosition, int position, int[] tokens, boolean mtp) {
+    PrefixNode(PrefixNode parent, int startPosition, int position, int[] tokens, String speculation) {
         this.parent = parent;
         this.startPosition = startPosition;
         this.position = position;
         this.tokens = tokens;
-        this.mtp = mtp;
+        this.speculation = speculation;
     }
 
     public PrefixNode parent() {
@@ -43,9 +44,10 @@ public final class PrefixNode {
         return this.tokens;
     }
 
-    /// Whether the node holds the MTP layer's state, usable only with an unbroken chain of such ancestors.
-    public boolean hasMtp() {
-        return this.mtp;
+    /// The kind of speculative decoding state the node holds beside the base state ([#speculation]'s owner
+    /// defines it), or null. It is usable only with an unbroken chain of ancestors of the same kind.
+    public String speculation() {
+        return this.speculation;
     }
 
     public long extentOffset() {
