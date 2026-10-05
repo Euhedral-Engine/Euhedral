@@ -41,6 +41,7 @@ class Qwen4QsaLayerCudaIntegrationTest {
         if (configured != null) roots.add(Path.of(configured));
         String home = System.getProperty("user.home");
         roots.add(Path.of(home, "fixtures", "flash-next-qsa-nvfp4"));
+        roots.add(Path.of(home, "fixtures", "flash-next-nvfp4kv"));
         roots.add(Path.of(home, "fixtures", "flash-next"));
         return roots;
     }
@@ -106,6 +107,12 @@ class Qwen4QsaLayerCudaIntegrationTest {
     @Test
     void shortFixtureMatchesUpstream() throws IOException {
         runFixture("layer_qsa_short");
+    }
+
+    /// Layer 3 of the model case `short` (real activations of a real prompt, not synthetic rows).
+    @Test
+    void modelCaseMatchesUpstream() throws IOException {
+        runFixture("short");
     }
 
     @Test

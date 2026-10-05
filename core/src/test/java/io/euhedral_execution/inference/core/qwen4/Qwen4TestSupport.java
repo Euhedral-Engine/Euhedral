@@ -37,6 +37,14 @@ final class Qwen4TestSupport {
                 "euhedral.qwen4.fixtures", System.getProperty("user.home") + "/fixtures/flash-next"));
     }
 
+    /// Fixtures of the model cases recorded through the NVFP4 KV codec (`--kv-format nvfp4`), which is what the
+    /// engine's
+    /// cache stores: the BF16-cache fixtures differ from the engine's attention by the codec's error.
+    static Path modelFixtureRoot() {
+        return Path.of(System.getProperty(
+                "euhedral.qwen4.model-fixtures", System.getProperty("user.home") + "/fixtures/flash-next-nvfp4kv"));
+    }
+
     static boolean hasArtifact() {
         return Files.isRegularFile(artifactPath());
     }

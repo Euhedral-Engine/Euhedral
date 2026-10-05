@@ -141,6 +141,9 @@ subprojects {
             // Speculative decoding tests: artifact (defaults to the NVFP4 artifact), prompt length, rows.
             for (name in listOf("artifact", "prefix", "rows", "tokens", "host-mib"))
                 providers.gradleProperty("euhedral.speculative.$name").orNull?.let { systemProperty("euhedral.speculative.$name", it) }
+            // Flash-Next fixture roots (tools/flash_next_reference.py) and test switches.
+            for (name in listOf("fixtures", "model-fixtures", "verbose"))
+                providers.gradleProperty("euhedral.qwen4.$name").orNull?.let { systemProperty("euhedral.qwen4.$name", it) }
             jvmArgs("--enable-native-access=ALL-UNNAMED")
             // Each class loads the model and may start the process-wide Euhedral lattice singleton.
             forkEvery = 1
