@@ -36,6 +36,7 @@ class Qwen4MoeFixtureCudaIntegrationTest {
             ExpertBank bank,
             int slots,
             ReferenceFixtures fixture,
+            int layerIndex,
             int chunks,
             Qwen4TestSupport.Report report,
             double bound)
@@ -48,10 +49,10 @@ class Qwen4MoeFixtureCudaIntegrationTest {
             GpuStream stream = gpu.openStream();
             var geometry = Qwen4ExpertOps.Geometry.of(bank);
             var layer = new Qwen4MoeLayer(gpu, stream, cache, geometry, 512, 10, 640, 64, Math.min(slots, 32));
-            var moeWeights = weights_for(weights);
+            var moeWeights = weights_for(weights, layerIndex);
             try {
                 for (int chunk = 0; chunk < chunks; chunk++) {
-                    String at = "c" + chunk + "/L0/moe/";
+                    String at = "c" + chunk + "/L" + layerIndex + "/moe/";
                     short[] input = fixture.bf16(at + "in");
                     int rows = input.length / 2560;
                     long inputAddress = upload(gpu, arena, input);
@@ -104,8 +105,9 @@ class Qwen4MoeFixtureCudaIntegrationTest {
         return all;
     }
 
-    private static Qwen4MoeLayer.Weights weights_for(Qwen4TestSupport.Weights weights) throws Exception {
-        String p = "text/layers/0/moe/";
+    private static Qwen4MoeLayer.Weights weights_for(Qwen4TestSupport.Weights weights, int layerIndex)
+            throws Exception {
+        String p = "text/layers/" + layerIndex + "/moe/";
         return new Qwen4MoeLayer.Weights(
                 weights.weight(p + "router"),
                 weights.weight(p + "shared_expert/gate_proj"),
@@ -171,11 +173,48 @@ class Qwen4MoeFixtureCudaIntegrationTest {
             for (boolean exact : new boolean[] {true, false}) {
                 gpu.selectExactNumerics(exact);
                 double bound = exact ? 3e-3 : 2e-2;
-                short[] minimal = runBlock(gpu, arena, weights, bank, 20, fixture, chunks, report, bound);
-                short[] roomy = runBlock(gpu, arena, weights, bank, 520, fixture, chunks, report, bound);
+                short[] minimal = runBlock(gpu, arena, weights, bank, 20, fixture, 0, chunks, report, bound);
+                short[] roomy = runBlock(gpu, arena, weights, bank, 520, fixture, 0, chunks, report, bound);
                 assertArrayEquals(minimal, roomy, "the cache's contents changed the result");
             }
             gpu.selectExactNumerics(false);
+        }
+        report.finish();
+    }
+
+    /// A QSA layer's MoE block (layer 3 of the model case `short`) on the reference's own input: the block alone agrees
+    /// with the reference far better than the whole layer does when the attention block's small error reaches the
+    /// router (the reason deep layers of the model comparison show a few percent).
+    @Test
+    void aMoeBlockOfAnAttentionLayerOnTheReferenceInput() throws Exception {
+        Path directory = Qwen4TestSupport.modelFixtureRoot().resolve("short");
+        assumeTrue(Qwen4TestSupport.hasArtifact() && ReferenceFixtures.exists(directory), "no artifact or fixtures");
+        ReferenceFixtures fixture = new ReferenceFixtures(directory);
+        Qwen4TestSupport.Report report = new Qwen4TestSupport.Report("layer 3 MoE block, case short");
+        try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu();
+                Arena arena = Arena.ofConfined();
+                Qwen4TestSupport.Weights weights = new Qwen4TestSupport.Weights(gpu)) {
+            ExpertBank bank =
+                    weights.artifact().bank("text/layers/3/moe/experts").orElseThrow();
+            gpu.selectExactNumerics(true);
+            runBlock(gpu, arena, weights, bank, 520, fixture, 3, 4, report, 3e-3);
+            gpu.selectExactNumerics(false);
+        }
+        report.finish();
+    }
+
+    @Test
+    void theMoeBlockOfLayerZeroOnTheEosCase() throws Exception {
+        Path directory = Qwen4TestSupport.modelFixtureRoot().resolve("eos");
+        assumeTrue(Qwen4TestSupport.hasArtifact() && ReferenceFixtures.exists(directory), "no artifact or fixtures");
+        ReferenceFixtures fixture = new ReferenceFixtures(directory);
+        Qwen4TestSupport.Report report = new Qwen4TestSupport.Report("layer 0 MoE block, case eos");
+        try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu();
+                Arena arena = Arena.ofConfined();
+                Qwen4TestSupport.Weights weights = new Qwen4TestSupport.Weights(gpu)) {
+            ExpertBank bank =
+                    weights.artifact().bank("text/layers/0/moe/experts").orElseThrow();
+            runBlock(gpu, arena, weights, bank, 520, fixture, 0, 3, report, 3e-2);
         }
         report.finish();
     }
