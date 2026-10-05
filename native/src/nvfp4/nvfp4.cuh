@@ -79,144 +79,97 @@ static __device__ __forceinline__ float scale(const float* table, unsigned int b
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Single-row decode: each lane owns 32 contiguous K values of a 1024-value slice (16 code bytes, one
-// 16-byte load, and two block scales), each warp owns kRows rows and reuses its 32 activations for
-// all of them. Code values come from a 16-entry shared table, one entry per bank. Each 16-value
-// block forms an FP32 dot product scaled once by its block scale; the global scale is applied last.
-// Requirements (checked by host dispatch): one row, in_features a multiple of 1024, out_features a
-// multiple of 4 * kRows, 16-byte aligned input and weights.
-static constexpr int kDecodeRows = 4;
-
-template <bool kSd4 = false>
-static __device__ __forceinline__ void decode(
-        const unsigned short* input, const unsigned char* weights, unsigned short* output,
-        unsigned int in_features, unsigned int out_features) {
-    __shared__ float table[16];
-    __shared__ float scale_table[16];  // SD4: the decoded scale table
-    if (threadIdx.x < 16u) table[threadIdx.x] = e2m1_value(threadIdx.x);
-    if (kSd4 && threadIdx.x < 16u)
-        scale_table[threadIdx.x] = e4m3_to_float(LayoutT<true>(weights, in_features, out_features).table.lookup(threadIdx.x));
-    __syncthreads();
-    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kDecodeRows;
-    const LayoutT<kSd4> w(weights, in_features, out_features);
-    const unsigned int slices = in_features / 1024u;
-    float sums[kDecodeRows] = {};
-    euhedral_pdl_begin();
-    for (unsigned int slice = 0; slice < slices; slice++) {
-        uint4 codes[kDecodeRows];
-        unsigned int scale_pair[kDecodeRows];
-        #pragma unroll
-        for (int r = 0; r < kDecodeRows; r++) {
-            const unsigned long long row = first_row + r;
-            codes[r] = reinterpret_cast<const uint4*>(w.codes + row * w.row_bytes)[slice * 32u + lane];
-            scale_pair[r] = w.scale_bits(row, slice * 32u + lane);
-        }
-        float x[32];
-        const uint4* activation = reinterpret_cast<const uint4*>(input + slice * 1024u + 32u * lane);
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const uint4 v = activation[i];
-            const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
-                x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
-            }
-        }
-        #pragma unroll
-        for (int r = 0; r < kDecodeRows; r++) {
-            const unsigned int words[4] = {codes[r].x, codes[r].y, codes[r].z, codes[r].w};
-            float block[2] = {0.0f, 0.0f};
-            #pragma unroll
-            for (int j = 0; j < 32; j++) {
-                const float value = table[(words[j >> 3] >> ((j & 7) * 4)) & 15u];
-                block[j >> 4] = fmaf(x[j], value, block[j >> 4]);
-            }
-            sums[r] = fmaf(block[0], scale<kSd4>(scale_table, scale_pair[r], 0), sums[r]);
-            sums[r] = fmaf(block[1], scale<kSd4>(scale_table, scale_pair[r], 1), sums[r]);
-        }
-    }
-    #pragma unroll
-    for (int r = 0; r < kDecodeRows; r++) {
-        #pragma unroll
-        for (int distance = 16; distance; distance >>= 1) sums[r] += __shfl_xor_sync(0xffffffffu, sums[r], distance);
-    }
-    float mine = sums[0];
-    #pragma unroll
-    for (int r = 1; r < kDecodeRows; r++) mine = lane == (unsigned int)r ? sums[r] : mine;
-    if (lane < (unsigned int)kDecodeRows) q3::write_bf16(output, 0, first_row + lane, out_features, mine * w.global);
-}
-
-// Multi-row decode for speculative verification: M activation rows against each weight row. Every
-// token row repeats decode()'s exact FMA sequence (same blocks, same order, same warp reduction), so
-// row t's output is bit for bit what decode() gives for that row alone; the weights stream once.
-template <int M, bool kSd4 = false>
+// Decode: 1 to 8 BF16 token rows on BF16 tensor cores (mma.m16n8k16, FP32 accumulation). A weight
+// (e2m1 code times its E4M3 block scale) has at most 6 significant bits, so it is exact in BF16 and
+// each product with a BF16 activation is exact in FP32; the tensor core sums 16 of them per step. Weight rows are the MMA's 16 M
+// rows and token rows its 8 N columns, so a token row's result never depends on the other tokens:
+// every row of an M-row call is bit for bit the one-row call on it, which speculative verification
+// relies on. A CTA owns 16 * R output rows; its W warps split K into 128-value chunks (chunk c on
+// warp c mod W) and are summed in warp order. Lane (g, q) loads 16 code bytes of rows g and g + 8
+// and 32 activations of token g at K offset 32 q of a chunk; a 256-entry shared table turns a code
+// byte into two BF16 values. The tile (R, W) is a function of the shape alone (host dispatch), so
+// one-row and multi-row calls on a tensor always agree. Requirements (checked by host dispatch):
+// in_features a multiple of 128, out_features a multiple of 16 * R, 16-byte aligned input and
+// weights, blockDim.x = 32 * W.
+template <int M, bool kSd4, int R, int W>
 static __device__ __forceinline__ void decode_rows(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
         unsigned int in_features, unsigned int out_features) {
-    __shared__ float table[16];
-    __shared__ float scale_table[16];  // SD4: the decoded scale table
-    if (threadIdx.x < 16u) table[threadIdx.x] = e2m1_value(threadIdx.x);
+    __shared__ unsigned int pair_table[256];   // byte -> two E2M1 values as BF16x2 (low nibble in the low half)
+    __shared__ float scale_table[16];
+    __shared__ float partial[W][16 * R][8];
+    for (unsigned int i = threadIdx.x; i < 256u; i += blockDim.x) {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(e2m1_value(i & 15u), e2m1_value(i >> 4));
+        pair_table[i] = *reinterpret_cast<const unsigned int*>(&v);
+    }
     if (kSd4 && threadIdx.x < 16u)
         scale_table[threadIdx.x] = e4m3_to_float(LayoutT<true>(weights, in_features, out_features).table.lookup(threadIdx.x));
     __syncthreads();
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    const unsigned int first_row = (blockIdx.x * (blockDim.x >> 5) + warp) * kDecodeRows;
+    const unsigned int g = lane >> 2, q = lane & 3u;
+    const unsigned int row0 = blockIdx.x * 16u * R;
     const LayoutT<kSd4> w(weights, in_features, out_features);
-    const unsigned int slices = in_features / 1024u;
-    float sums[M][kDecodeRows] = {};
+    const unsigned int chunks = in_features / 128u;
+    float acc[R][4];
+    #pragma unroll
+    for (int r = 0; r < R; r++) acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = 0.0f;
     euhedral_pdl_begin();
-    for (unsigned int slice = 0; slice < slices; slice++) {
-        uint4 codes[kDecodeRows];
-        unsigned int scale_pair[kDecodeRows];
+    const unsigned short* x = input + (unsigned long long)g * in_features;
+    #pragma unroll 2
+    for (unsigned int c = warp; c < chunks; c += (unsigned int)W) {
+        const unsigned int k0 = c * 128u + 32u * q;
+        uint4 xa[4];
         #pragma unroll
-        for (int r = 0; r < kDecodeRows; r++) {
-            const unsigned long long row = first_row + r;
-            codes[r] = reinterpret_cast<const uint4*>(w.codes + row * w.row_bytes)[slice * 32u + lane];
-            scale_pair[r] = w.scale_bits(row, slice * 32u + lane);
-        }
+        for (int i = 0; i < 4; i++)
+            xa[i] = (int)g < M ? reinterpret_cast<const uint4*>(x + k0)[i] : make_uint4(0, 0, 0, 0);
+        const unsigned int xs[16] = {xa[0].x, xa[0].y, xa[0].z, xa[0].w, xa[1].x, xa[1].y, xa[1].z, xa[1].w,
+                                     xa[2].x, xa[2].y, xa[2].z, xa[2].w, xa[3].x, xa[3].y, xa[3].z, xa[3].w};
         #pragma unroll
-        for (int t = 0; t < M; t++) {
-            float x[32];
-            const uint4* activation = reinterpret_cast<const uint4*>(
-                    input + (unsigned long long)t * in_features + slice * 1024u + 32u * lane);
+        for (int r = 0; r < R; r++) {
+            const unsigned int rg = row0 + 16u * r + g, rh = rg + 8u;
+            const uint4 cg = *reinterpret_cast<const uint4*>(w.codes + (unsigned long long)rg * w.row_bytes + k0 / 2u);
+            const uint4 ch = *reinterpret_cast<const uint4*>(w.codes + (unsigned long long)rh * w.row_bytes + k0 / 2u);
+            const unsigned int sg = w.scale_bits(rg, k0 / 32u), sh = w.scale_bits(rh, k0 / 32u);
+            const unsigned int wg[4] = {cg.x, cg.y, cg.z, cg.w}, wh[4] = {ch.x, ch.y, ch.z, ch.w};
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const uint4 v = activation[i];
-                const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+            for (int half = 0; half < 2; half++) {
+                const float fg = scale<kSd4>(scale_table, sg, half), fh = scale<kSd4>(scale_table, sh, half);
+                const __nv_bfloat162 bg = __floats2bfloat162_rn(fg, fg), bh = __floats2bfloat162_rn(fh, fh);
                 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
-                    x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+                for (int s = half * 4; s < half * 4 + 4; s++) {
+                    const unsigned int word_g = wg[s >> 1], word_h = wh[s >> 1];
+                    const unsigned int shift = (s & 1) * 16u;
+                    unsigned int pg0 = pair_table[(word_g >> shift) & 0xffu], pg1 = pair_table[(word_g >> (shift + 8u)) & 0xffu];
+                    unsigned int ph0 = pair_table[(word_h >> shift) & 0xffu], ph1 = pair_table[(word_h >> (shift + 8u)) & 0xffu];
+                    __nv_bfloat162 vg0 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&pg0), bg);
+                    __nv_bfloat162 vg1 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&pg1), bg);
+                    __nv_bfloat162 vh0 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&ph0), bh);
+                    __nv_bfloat162 vh1 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&ph1), bh);
+                    const unsigned int a0 = *reinterpret_cast<unsigned int*>(&vg0), a1 = *reinterpret_cast<unsigned int*>(&vh0);
+                    const unsigned int a2 = *reinterpret_cast<unsigned int*>(&vg1), a3 = *reinterpret_cast<unsigned int*>(&vh1);
+                    asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                            "{%0,%1,%2,%3};\n"
+                            : "+f"(acc[r][0]), "+f"(acc[r][1]), "+f"(acc[r][2]), "+f"(acc[r][3])
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xs[2 * s]), "r"(xs[2 * s + 1]));
                 }
-            }
-            #pragma unroll
-            for (int r = 0; r < kDecodeRows; r++) {
-                const unsigned int words[4] = {codes[r].x, codes[r].y, codes[r].z, codes[r].w};
-                float block[2] = {0.0f, 0.0f};
-                #pragma unroll
-                for (int j = 0; j < 32; j++) {
-                    const float value = table[(words[j >> 3] >> ((j & 7) * 4)) & 15u];
-                    block[j >> 4] = fmaf(x[j], value, block[j >> 4]);
-                }
-                sums[t][r] = fmaf(block[0], scale<kSd4>(scale_table, scale_pair[r], 0), sums[t][r]);
-                sums[t][r] = fmaf(block[1], scale<kSd4>(scale_table, scale_pair[r], 1), sums[t][r]);
             }
         }
     }
     #pragma unroll
-    for (int t = 0; t < M; t++) {
+    for (int r = 0; r < R; r++) {
+        partial[warp][16 * r + g][2 * q] = acc[r][0];
+        partial[warp][16 * r + g][2 * q + 1] = acc[r][1];
+        partial[warp][16 * r + g + 8][2 * q] = acc[r][2];
+        partial[warp][16 * r + g + 8][2 * q + 1] = acc[r][3];
+    }
+    __syncthreads();
+    for (unsigned int index = threadIdx.x; index < 16u * R * (unsigned int)M; index += blockDim.x) {
+        const unsigned int r = index % (16u * R), t = index / (16u * R);
+        float sum = partial[0][r][t];
         #pragma unroll
-        for (int r = 0; r < kDecodeRows; r++) {
-            #pragma unroll
-            for (int distance = 16; distance; distance >>= 1) sums[t][r] += __shfl_xor_sync(0xffffffffu, sums[t][r], distance);
-        }
-        float mine = sums[t][0];
-        #pragma unroll
-        for (int r = 1; r < kDecodeRows; r++) mine = lane == (unsigned int)r ? sums[t][r] : mine;
-        if (lane < (unsigned int)kDecodeRows)
-            q3::write_bf16(output + (unsigned long long)t * out_features, 0, first_row + lane, out_features, mine * w.global);
+        for (int v = 1; v < W; v++) sum += partial[v][r][t];
+        q3::write_bf16(output + (unsigned long long)t * out_features, 0, row0 + r, out_features, sum * w.global);
     }
 }
 }  // namespace nvfp4

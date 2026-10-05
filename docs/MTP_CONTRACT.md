@@ -178,10 +178,13 @@ attention and GDN kernels also accumulate in a different order from the decode k
 **Decision: row-exact verification.** A VERIFY quantum selects row-exact execution (`euhedral_cuda_row_exact_select`). Every
 operator whose kernel depends on the row count then runs each row through its one-row path:
 - attention, q/k norm and RoPE, residual norms and the GDN recurrence, row by row;
-- NVFP4, Q3, Q4 and Q5 linears through multi-row twins of the one-row GEMV kernels
-  (`nvfp4::decode_rows<M>`, `q3::contiguous_decode_rows<M>`, `q45::contiguous_decode_rows<B, M>`,
-  for M = 2 to 8). Each repeats the one-row FMA sequence for every token row while streaming the
-  weights once, so every row is bitwise identical to one-row decode.
+- Q3, Q4 and Q5 linears through multi-row twins of the one-row GEMV kernels
+  (`q3::contiguous_decode_rows<M>`, `q45::contiguous_decode_rows<B, M>`, for M = 2 to 8). Each
+  repeats the one-row FMA sequence for every token row while streaming the weights once, so every
+  row is bitwise identical to one-row decode.
+- NVFP4 linears through the tensor-core decode kernels (`nvfp4::decode_rows<M>`, M = 1 to 8), whose
+  token rows are independent MMA columns with exact products, so every row is bitwise identical to
+  one-row decode ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
 
 Row-exact execution declines the block-scaled MXFP8 route and the native FP4 route, whose activation quantization and tile
 accumulation differ from the GEMV. There is no second numerics mode for verification: a verifier on native FP4 kernels would

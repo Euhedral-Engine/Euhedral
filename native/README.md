@@ -20,7 +20,7 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 | `rms_norm_bf16.c` | Standalone BF16 RMSNorm. |
 | `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |
 | `q45_linear.c` | Q4/Q5 decode (one row and the 2 to 8 row twins). |
-| `nvfp4_linear.c` | NVFP4 decode (plain and SD4 scale-table layouts, one row and 2 to 8 rows) and the native FP4 tensor-core route. |
+| `nvfp4_linear.c` | NVFP4 decode (plain and SD4 scale-table layouts, 1 to 8 rows on BF16 tensor cores) and the native FP4 tensor-core route. |
 | `dflash.c` | The DFlash2 drafter's operators (docs/DFLASH2.md). |
 | `q3_mx.c` | The block-scaled MXFP8 route for Q3/Q4/Q5 linears and the paired gate/up SwiGLU region. |
 | `reference.c`, `.h` | The scalar numerical references (Q3, Q4/Q5, NVFP4 plain and SD4): the oracle exact numerics select, and the fallback for shapes no kernel takes. |
@@ -44,7 +44,7 @@ root the host loads; its headers are that module's leaves and strategies:
 | `linear/` | BF16-to-FP32 linear. |
 | `q3/`, `q45/` | Q3 and Q4/Q5 weight formats: layout, numerics, the one-row contiguous decode kernel and its 2 to 8 row twins; `q3/p2e2.cuh` holds the lossless P2E2 decode and expansion kernels. |
 | `q3_mx/` | Prefill on block-scaled MXFP8 tensor cores for Q3, Q4 and Q5 linears and the paired gate/up SwiGLU region (`sm_12xa`). |
-| `nvfp4/` | NVFP4 weights (plain and SD4 scale tables): scale-table helpers, the decode kernel and its 2 to 8 row twins. |
+| `nvfp4/` | NVFP4 weights (plain and SD4 scale tables): scale-table helpers, the tensor-core decode kernels for 1 to 8 rows. |
 | `nvfp4_native/` | Native FP4 tensor-core route: activation quantization, the 128x128 linear, the paired gate/up SwiGLU tile and the skinny kernels up to 64 rows (`sm_12xa`). |
 | `reference/` | Scalar references (Q3, Q4/Q5, NVFP4 plain and SD4). |
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
@@ -86,7 +86,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 | `test_q3_conversion.py` | The device-level Q3 scale-conversion contract. |
 | `test_q3_mx.py` | The MXFP8 route: activation quantizer, Q3/Q4/Q5 linears, split-K and the gate/up kernel against FP64 (`sm_12x`). |
 | `test_q3_p2e2.py` | P2E2 decode, expansion and embedding bit for bit against the row-split routes. |
-| `test_nvfp4.py` | NVFP4 decode and row twins, the scalar reference, and the SD4 kernels against the plain kernels. |
+| `test_nvfp4.py` | NVFP4 decode at both tiles (rows bitwise one-row), the scalar reference, and the SD4 kernels against the plain kernels. |
 | `test_nvfp4_native.py` | The native FP4 route: quantizer, linear, paired gate/up and skinny kernels against FP64, determinism, SD4 (`sm_12x`). |
 | `test_attention_nvfp4.py` | NVFP4 KV format and attention against a mathematical oracle, the GQA decode kernel and the row twins bit for bit. |
 | `test_gdn_convolution.py`, `test_gdn_recurrence.py` | GDN convolution and recurrence against the frozen reference kernels. |

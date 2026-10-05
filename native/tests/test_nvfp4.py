@@ -76,6 +76,10 @@ def sd4_tensor(rng, rows, k):
     return bytes(sd4), bytes(plain)
 
 
+# Decode tiles (nvfp4/kernels.cu): output rows per CTA and threads per CTA.
+TILES = {"w8": (16, 256), "w4": (32, 128)}
+
+
 @unittest.skipIf(UNAVAILABLE is not None, UNAVAILABLE or "")
 class Nvfp4KernelTest(unittest.TestCase):
     @classmethod
@@ -87,12 +91,12 @@ class Nvfp4KernelTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.gpu.close()
 
-    def run_kernel(self, name, grid, x, weights, outputs, args, rows):
+    def run_kernel(self, name, grid, x, weights, outputs, args, rows, block=128):
         with contextlib.ExitStack() as stack:
             dx = self.gpu.upload(to_bf16_bytes(x)); stack.callback(self.gpu.free, dx)
             dw = self.gpu.upload(weights); stack.callback(self.gpu.free, dw)
             dy = self.gpu.zeros(rows * outputs * 2, fill=0xA5); stack.callback(self.gpu.free, dy)
-            self.gpu.launch(name, grid, [C.c_uint64(dx), C.c_uint64(dw), C.c_uint64(dy), *args])
+            self.gpu.launch(name, grid, [C.c_uint64(dx), C.c_uint64(dw), C.c_uint64(dy), *args], block=block)
             return from_bf16_bytes(self.gpu.download(dy, rows * outputs * 2), (rows, outputs))
 
     def assert_close(self, actual, expected, scale):
@@ -100,27 +104,34 @@ class Nvfp4KernelTest(unittest.TestCase):
         bound = np.abs(expected) * 2.0**-7 + scale * 1e-3
         self.assertTrue((error <= bound).all(), f"max error {error.max()} at {np.unravel_index(error.argmax(), error.shape)}")
 
+    def decode(self, tile, x, weights, n, suffix=""):
+        """Decode kernel of `tile` (w8: 16 rows per CTA, 8 warps; w4: 32 rows per CTA, 4 warps) on x's rows."""
+        rows, k = x.shape
+        per_cta, block = TILES[tile]
+        return self.run_kernel(f"euhedral_nvfp4_decode_rows{rows}_{tile}{suffix}", n // per_cta, x, weights, n,
+                               [C.c_uint(k), C.c_uint(n)], rows, block)
+
     def test_decode_matches_the_reference(self):
-        for k, n in ((1024, 16), (5120, 48), (17408, 32)):
-            with self.subTest(k=k, n=n):
-                weights, dense = tensor(self.rng, n, k)
-                x = bf16(self.rng.standard_normal((1, k)).astype(np.float32))
-                expected = (x.astype(np.float64) @ dense.astype(np.float64).T)
-                actual = self.run_kernel("euhedral_nvfp4_decode", n // 16, x, weights, n, [C.c_uint(k), C.c_uint(n)], 1)
-                self.assert_close(actual, expected, np.abs(expected).max())
+        for tile in TILES:
+            for k, n in ((640, 32), (1024, 64), (5120, 96), (17408, 32)):
+                with self.subTest(tile=tile, k=k, n=n):
+                    weights, dense = tensor(self.rng, n, k)
+                    x = bf16(self.rng.standard_normal((1, k)).astype(np.float32))
+                    expected = (x.astype(np.float64) @ dense.astype(np.float64).T)
+                    self.assert_close(self.decode(tile, x, weights, n), expected, np.abs(expected).max())
 
     def test_multi_row_decode_is_bitwise_one_row_decode(self):
-        k, n = 5120, 48
-        weights, _ = tensor(self.rng, n, k)
-        for rows in (2, 3, 4, 8):
-            with self.subTest(rows=rows):
-                x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
-                together = self.run_kernel(f"euhedral_nvfp4_decode_rows{rows}", n // 16, x, weights, n,
-                                           [C.c_uint(k), C.c_uint(n)], rows)
-                for row in range(rows):
-                    alone = self.run_kernel("euhedral_nvfp4_decode", n // 16, x[row:row + 1], weights, n,
-                                            [C.c_uint(k), C.c_uint(n)], 1)
-                    self.assertTrue(np.array_equal(together[row].view(np.uint32), alone[0].view(np.uint32)), f"row {row}")
+        for tile in TILES:
+            for k, n in ((5120, 64), (17408, 32)):
+                weights, _ = tensor(self.rng, n, k)
+                for rows in range(2, 9):
+                    with self.subTest(tile=tile, k=k, rows=rows):
+                        x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                        together = self.decode(tile, x, weights, n)
+                        for row in range(rows):
+                            alone = self.decode(tile, x[row:row + 1], weights, n)
+                            self.assertTrue(np.array_equal(together[row].view(np.uint32), alone[0].view(np.uint32)),
+                                            f"row {row}")
 
     def test_scalar_reference_matches_the_float64_dequantization(self):
         for rows, k, n in ((1, 1024, 16), (3, 2048, 24), (9, 5120, 40)):
@@ -139,13 +150,11 @@ class Nvfp4KernelTest(unittest.TestCase):
     def test_sd4_kernels_are_bitwise_the_plain_kernels_on_the_expanded_tensor(self):
         for k, n in ((1024, 64), (5120, 128), (17408, 64)):
             sd4, plain = sd4_tensor(self.rng, n, k)
-            shape = [C.c_uint(k), C.c_uint(n)]
-            for rows in range(1, 9):
-                with self.subTest(kernel="decode", k=k, rows=rows):
-                    x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
-                    name = "euhedral_nvfp4_decode" if rows == 1 else f"euhedral_nvfp4_decode_rows{rows}"
-                    self.assert_bitwise(self.run_kernel(name + "_sd4", n // 16, x, sd4, n, shape, rows),
-                                        self.run_kernel(name, n // 16, x, plain, n, shape, rows))
+            for tile in TILES:
+                for rows in range(1, 9):
+                    with self.subTest(kernel="decode", tile=tile, k=k, rows=rows):
+                        x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                        self.assert_bitwise(self.decode(tile, x, sd4, n, "_sd4"), self.decode(tile, x, plain, n))
             for rows in (1, 3):
                 with self.subTest(kernel="reference", k=k, rows=rows):
                     x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))

@@ -1737,9 +1737,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (status != 0) throw new GpuMemoryException(q3Operation("P2E2 Q3 embedding", status), status);
     }
 
-    /// Rows from which an NVFP4 linear runs on native FP4 tensor cores: one row stays on the GEMV, which
-    /// streams weights as fast and keeps BF16 activations (docs/NVFP4_NATIVE.md).
-    static final int NVFP4_NATIVE_MIN_ROWS = 2;
+    /// Rows from which an NVFP4 linear runs on native FP4 tensor cores: up to 8 rows stay on the decode kernels,
+    /// which stream weights as fast, keep BF16 activations and are row-exact (docs/NVFP4_NATIVE.md).
+    static final int NVFP4_NATIVE_MIN_ROWS = 9;
     /// The paired gate/up region exists only in region views, from 64 rows.
     static final int NVFP4_NATIVE_REGION_MIN_ROWS = 64;
 
