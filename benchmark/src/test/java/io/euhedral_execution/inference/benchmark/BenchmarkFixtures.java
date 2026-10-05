@@ -156,6 +156,7 @@ public final class BenchmarkFixtures {
                 null,
                 true,
                 null,
+                null,
                 null);
     }
 }

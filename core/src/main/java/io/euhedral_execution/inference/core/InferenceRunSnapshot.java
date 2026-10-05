@@ -25,7 +25,7 @@ public record InferenceRunSnapshot(
         GenerationConfig generation,
         RuntimeIdentity runtime) {
     /// Version 3 replaced the tuning axes with `configuration`: the engine derives its policy from the artifact.
-    public static final int SCHEMA_VERSION = 4;
+    public static final int SCHEMA_VERSION = 5;
     /// Explicit value for identity the runtime does not expose.
     public static final String UNAVAILABLE = "unavailable";
 
@@ -49,15 +49,27 @@ public record InferenceRunSnapshot(
 
     /// The inputs the engine was loaded with and the policy it derived from the artifact.
     /// `artifact` is [ArtifactProfile#artifactName()], null when no artifact was profiled.
-    /// `prefixCacheBytes` is the pinned host memory configured for the prefix cache (0 when off).
+    /// `prefixCacheBytes` is the pinned host memory configured for the prefix cache (0 when off). `speculation` is
+    /// the speculative strategy the artifact selects (`none`, `mtp`, `dflash2`), drafting `speculativeDepth` tokens
+    /// per verification.
     public record Configuration(
             List<Integer> workerProcessorIds,
             int maxContextTokens,
             String artifact,
             int speculativeDepth,
-            long prefixCacheBytes) {
+            long prefixCacheBytes,
+            String speculation) {
         public Configuration {
             workerProcessorIds = List.copyOf(workerProcessorIds);
+        }
+
+        public Configuration(
+                List<Integer> workerProcessorIds,
+                int maxContextTokens,
+                String artifact,
+                int speculativeDepth,
+                long prefixCacheBytes) {
+            this(workerProcessorIds, maxContextTokens, artifact, speculativeDepth, prefixCacheBytes, "none");
         }
 
         public static Configuration of(InferenceConfig config, ArtifactProfile profile) {
@@ -66,7 +78,8 @@ public record InferenceRunSnapshot(
                     config.maxContextTokens(),
                     profile == null ? null : profile.artifactName(),
                     profile == null ? 0 : profile.speculativeDepth(),
-                    config.prefixCacheBytes());
+                    config.prefixCacheBytes(),
+                    profile == null ? "none" : profile.speculation().name().toLowerCase(java.util.Locale.ROOT));
         }
     }
 

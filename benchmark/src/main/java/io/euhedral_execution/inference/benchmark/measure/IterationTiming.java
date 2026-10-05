@@ -122,6 +122,16 @@ public final class IterationTiming implements GenerationTimingListener {
         this.stepAccepted[this.stepCount++] = acceptedDrafts;
     }
 
+    /// Drafting quanta by phase: count and summed nanoseconds.
+    final java.util.Map<String, long[]> draftPhases = new java.util.TreeMap<>();
+
+    @Override
+    public void draftQuantum(String phase, long startNanos, long executedNanos) {
+        long[] totals = this.draftPhases.computeIfAbsent(phase, ignored -> new long[2]);
+        totals[0]++;
+        totals[1] += executedNanos - startNanos;
+    }
+
     @Override
     public void decodeQuantum(
             long startNanos, long executedNanos, long selectedNanos, boolean sampled, int selectedTokenId) {

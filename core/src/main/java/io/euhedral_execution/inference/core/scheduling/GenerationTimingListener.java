@@ -46,4 +46,10 @@ public interface GenerationTimingListener {
     default void speculativeStep(long startNanos, long executedNanos, int outputs, int acceptedDrafts, int rejection) {
         speculativeStep(startNanos, executedNanos, outputs, acceptedDrafts);
     }
+
+    /// Speculative decoding: one drafting quantum, admitted at `startNanos` and retired at `executedNanos`. `phase`
+    /// names its part of the strategy: for DFlash2 `block` (the draft block: draft layers, output head, top-k and
+    /// selector), `context` (the drafter's keys and values of a verification's committed rows) and `prompt-context`
+    /// (of a prefill chunk's rows); for MTP `catch-up`, `prompt-catch-up` and `recursion`.
+    default void draftQuantum(String phase, long startNanos, long executedNanos) {}
 }

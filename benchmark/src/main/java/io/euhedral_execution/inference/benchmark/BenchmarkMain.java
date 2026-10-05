@@ -116,7 +116,8 @@ public final class BenchmarkMain {
                 prepared.workers().processorIds(),
                 options.maxContextTokens(),
                 options.prefixCacheBytes(),
-                options.shutdownTimeout());
+                options.shutdownTimeout(),
+                options.speculation().equals("artifact"));
         // Load before creating the output, so a refused load leaves no empty result file.
         BenchmarkRunner.Target target;
         try {
