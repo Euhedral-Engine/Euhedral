@@ -25,6 +25,12 @@ The engine reads what an artifact is from the file and picks the fastest validat
 FP8 and FP4 tensor-core prefill, the attention implementation, the speculative-decoding depth and which weights stay in
 host memory. All of that is automatic.
 
+Any artifact can also carry the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`): the converter appends it with
+`--extend ARTIFACT --dflash2 DIR`, and an artifact that holds it speculates with DFlash2 instead of MTP, with the same
+exact verification ([docs/DFLASH2.md](docs/DFLASH2.md)). On the NVFP4 artifact it decodes 83.2 tok/s at 4K, 76.9 at 16K, 79.9
+at 32K and 62.9 at 64K tokens of context (chat corpus); its larger drafter leaves less of the 16 GB for the target, and the
+four artifacts above draft with MTP.
+
 ## Performance
 
 RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display, Linux, one run per row after one warmup. Greedy
@@ -287,6 +293,7 @@ the benchmark harness in [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - [docs/FRAME_MODEL.md](docs/FRAME_MODEL.md): how a forward pass is scheduled across device lanes.
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): the state kept between requests, its checkpoints and measured restore times.
 - [docs/MTP_SPECULATIVE.md](docs/MTP_SPECULATIVE.md), [docs/MTP_CONTRACT.md](docs/MTP_CONTRACT.md), [docs/MTP_VERIFIER.md](docs/MTP_VERIFIER.md): speculative decoding and its exactness contract.
+- [docs/DFLASH2.md](docs/DFLASH2.md): the DFlash2 drafter, its artifact, checkpoints, validation and measurements.
 - [docs/PREFILL_MX.md](docs/PREFILL_MX.md), [docs/NVFP4_NATIVE.md](docs/NVFP4_NATIVE.md), [docs/ATTENTION_DECODE.md](docs/ATTENTION_DECODE.md): the prefill, FP4 and attention kernels.
 - [docs/COMPACT_Q3_REFERENCE.md](docs/COMPACT_Q3_REFERENCE.md), [docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md), [docs/NVFP4_COMPRESSED.md](docs/NVFP4_COMPRESSED.md), [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md): the artifact formats and memory budgets.
 - [docs/nvidia/](docs/nvidia/README.md): measurements of this GPU's hardware.
