@@ -7,6 +7,12 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLeas
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.StreamFence;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /// The sparse MoE block of a Flash-Next layer (Qwen4ExpTextSparseMoeBlock): a router chooses ten of 512 experts per
 /// token, a shared expert runs for every token, and
@@ -54,6 +60,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
             long routed,
             long experts) {}
 
+    /// Concurrent leases of one wave: enough to keep the cache's copy stream and its record reads busy.
+    private static final int ACQUIRE_THREADS = 8;
     private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED;
     private static final ValueLayout.OfShort SHORT = ValueLayout.JAVA_SHORT_UNALIGNED;
 
@@ -75,6 +83,12 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     private final short[] weights;
     private final ExpertLease[] leases;
     private final long marker;
+    /// Threads that lease a wave's experts together, so the cache's misses transfer concurrently.
+    private final ExecutorService acquirers;
+    private long routeWaitNanos;
+    private long acquireNanos;
+    private long waves;
+    private long leased;
     private boolean closed;
 
     /// @param maxRows the most rows of a chunk
@@ -120,6 +134,11 @@ public final class Qwen4MoeLayer implements AutoCloseable {
             throw failure;
         }
         this.marker = stream.openMarker();
+        this.acquirers = Executors.newFixedThreadPool(Math.min(ACQUIRE_THREADS, maxWaveExperts), runnable -> {
+            Thread thread = new Thread(runnable, "qwen4-expert-acquire");
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     /// Device bytes of the scratch for `rows` rows.
@@ -193,7 +212,9 @@ public final class Qwen4MoeLayer implements AutoCloseable {
                     sharedExpert(weights, input, rows, scratch);
                 },
                 false);
+        long waitBegin = System.nanoTime();
         Qwen4Streams.awaitCompletion(this.stream);
+        this.routeWaitNanos += System.nanoTime() - waitBegin;
 
         int pairs = rows * this.topK;
         MemorySegment.copy(this.routeIds.segment(), INT, 0, this.ids, 0, pairs);
@@ -233,15 +254,35 @@ public final class Qwen4MoeLayer implements AutoCloseable {
 
     private void runWave(int bank, int w, long input, int rows, Scratch scratch) throws InterruptedException {
         int count = this.wave.waveExpertCount(w);
-        int acquired = 0;
         try {
             MemorySegment descriptor = this.hostDescriptors[w].segment();
             this.wave.fill(w, descriptor);
+            long acquireBegin = System.nanoTime();
+            List<Future<ExpertLease>> pending = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                ExpertLease lease = this.cache.acquire(bank, this.wave.waveExpert(w, i));
-                this.leases[acquired++] = lease;
-                this.wave.setSlot(descriptor, i, lease.deviceAddress());
+                int expert = this.wave.waveExpert(w, i);
+                pending.add(this.acquirers.submit(() -> this.cache.acquire(bank, expert)));
             }
+            Throwable failure = null;
+            for (int i = 0; i < count; i++) {
+                try {
+                    this.leases[i] = pending.get(i).get();
+                } catch (ExecutionException failed) {
+                    if (failure == null) failure = failed.getCause();
+                } catch (InterruptedException interrupted) {
+                    // Every request is still waited for, so no lease is left behind; the interrupt is rethrown below.
+                    if (failure == null) failure = interrupted;
+                    i--;
+                }
+            }
+            this.acquireNanos += System.nanoTime() - acquireBegin;
+            this.leased += count;
+            if (failure != null) {
+                if (failure instanceof InterruptedException interrupted) throw interrupted;
+                if (failure instanceof RuntimeException runtime) throw runtime;
+                throw new IllegalStateException("leasing the experts of a wave failed", failure);
+            }
+            for (int i = 0; i < count; i++) this.wave.setSlot(descriptor, i, this.leases[i].deviceAddress());
             long deviceDescriptor = this.deviceDescriptors[w];
             boolean first = w == 0;
             this.stream.submit(
@@ -263,7 +304,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
             this.stream.mark(this.marker);
         } finally {
             StreamFence fence = new StreamFence(this.stream, this.marker);
-            for (int i = 0; i < acquired; i++) {
+            for (int i = 0; i < count; i++) {
+                if (this.leases[i] == null) continue;
                 this.leases[i].close(fence);
                 this.leases[i] = null;
             }
@@ -279,11 +321,20 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         this.routeWeights.close();
     }
 
+    /// Host time spent waiting for the routing (which includes the layer's earlier device work) and leasing experts
+    /// from the cache (transfers of misses), the waves run and the experts leased since the layer was built.
+    public record Counters(long routeWaitNanos, long acquireNanos, long waves, long leased) {}
+
+    public Counters counters() {
+        return new Counters(this.routeWaitNanos, this.acquireNanos, this.waves, this.leased);
+    }
+
     /// Releases the buffers. The stream must have retired every block's work.
     @Override
     public void close() {
         if (this.closed) return;
         this.closed = true;
+        this.acquirers.shutdown();
         this.stream.closeMarker(this.marker);
         release();
     }

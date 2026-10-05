@@ -35,6 +35,18 @@ public final class Qwen4Executor implements AutoCloseable {
         void queue(long logitsAddress);
     }
 
+    /// Wall time per component of the steps run while [#timings] is set: each component is followed by a wait for the
+    /// device, so the parts add up to a slower step than an untimed one (diagnostics, never production).
+    public static final class Timings {
+        public static final int EMBEDDING = 0, PLE = 1, RESIDUAL = 2, GDN = 3, QSA = 4, MOE = 5, HEAD = 6;
+        public static final String[] NAMES = {
+            "embedding", "per-layer embedding", "gated residual", "GDN", "QSA", "MoE", "output head"
+        };
+        public final long[] nanos = new long[NAMES.length];
+        public long steps;
+        public long rows;
+    }
+
     /// Test hook: the residual state after each layer, read after the device finished it.
     public interface Observer {
         void layerFinished(int layer, long stateAddress, int rows) throws InterruptedException;
@@ -72,6 +84,7 @@ public final class Qwen4Executor implements AutoCloseable {
     private final long layerScratchAddress;
     private final long moeScratchAddress;
     private final List<Long> allocations = new ArrayList<>();
+    private Timings timings;
     private Observer observer;
     private Observer midObserver;
     private boolean closed;
@@ -182,6 +195,25 @@ public final class Qwen4Executor implements AutoCloseable {
         return this.config.attention().numKvHeads() * this.config.attention().headDim();
     }
 
+    public Qwen4MoeLayer.Counters moeCounters() {
+        return this.moe.counters();
+    }
+
+    /// Starts (or with null stops) timing the components of every step.
+    public void timings(Timings timings) {
+        this.timings = timings;
+    }
+
+    /// Runs `work` on the stream; with timings on, waits for it and charges its time to `component`.
+    private void segment(int component, Runnable work) throws InterruptedException {
+        long begin = this.timings == null ? 0 : System.nanoTime();
+        this.stream.submit(work, false);
+        if (this.timings != null) {
+            Qwen4Streams.awaitCompletion(this.stream);
+            this.timings.nanos[component] += System.nanoTime() - begin;
+        }
+    }
+
     /// Takes the residual state of each layer's end for the observer (tests); null stops it.
     void observe(Observer observer) {
         this.observer = observer;
@@ -257,20 +289,18 @@ public final class Qwen4Executor implements AutoCloseable {
         try {
             for (int i = 0; i < rows; i++)
                 this.tokenUpload.segment().set(ValueLayout.JAVA_INT_UNALIGNED, 4L * i, tokens[offset + i]);
-            this.stream.submit(
-                    () -> {
-                        this.gpu.copyUploadToDevice(this.tokensDevice, this.tokenUpload);
-                        Qwen4Ops.embedding(
-                                this.gpu,
-                                this.embedding.address(),
-                                this.tokensDevice,
-                                this.embedded,
-                                rows,
-                                this.hidden,
-                                this.vocabulary);
-                        Qwen4Ops.repeatStreams(this.gpu, this.embedded, this.state, rows, this.streams, this.hidden);
-                    },
-                    false);
+            segment(Timings.EMBEDDING, () -> {
+                this.gpu.copyUploadToDevice(this.tokensDevice, this.tokenUpload);
+                Qwen4Ops.embedding(
+                        this.gpu,
+                        this.embedding.address(),
+                        this.tokensDevice,
+                        this.embedded,
+                        rows,
+                        this.hidden,
+                        this.vocabulary);
+                Qwen4Ops.repeatStreams(this.gpu, this.embedded, this.state, rows, this.streams, this.hidden);
+            });
             for (int layer = 0; layer < this.sparse.length; layer++) {
                 runLayer(sequence, layer, tokens, offset, rows, staged, opened);
                 if (this.observer != null) {
@@ -279,33 +309,34 @@ public final class Qwen4Executor implements AutoCloseable {
                 }
             }
             if (sink != null) {
-                this.stream.submit(
-                        () -> {
-                            long last =
-                                    this.state + (long) (rows - 1) * this.hyperConnection.stateWidth() * Short.BYTES;
-                            this.hyperConnection.mix(
-                                    this.gpu,
-                                    this.weights.finalMixer(),
-                                    last,
-                                    this.hyperConnection.scratch(this.hcScratchAddress, 1),
-                                    this.finalMixed,
-                                    1);
-                            Qwen4Ops.linearBf16(
-                                    this.gpu,
-                                    this.finalMixed,
-                                    this.head.address(),
-                                    this.logits,
-                                    1,
-                                    this.hidden,
-                                    this.vocabulary);
-                            sink.queue(this.logits);
-                        },
-                        false);
+                segment(Timings.HEAD, () -> {
+                    long last = this.state + (long) (rows - 1) * this.hyperConnection.stateWidth() * Short.BYTES;
+                    this.hyperConnection.mix(
+                            this.gpu,
+                            this.weights.finalMixer(),
+                            last,
+                            this.hyperConnection.scratch(this.hcScratchAddress, 1),
+                            this.finalMixed,
+                            1);
+                    Qwen4Ops.linearBf16(
+                            this.gpu,
+                            this.finalMixed,
+                            this.head.address(),
+                            this.logits,
+                            1,
+                            this.hidden,
+                            this.vocabulary);
+                    sink.queue(this.logits);
+                });
             }
             Qwen4Streams.awaitCompletion(this.stream);
             for (Qwen4QsaState attention : opened) attention.commit();
             opened.clear();
             sequence.advance(rows);
+            if (this.timings != null) {
+                this.timings.steps++;
+                this.timings.rows += rows;
+            }
             finished = true;
         } finally {
             if (!finished) {
@@ -331,59 +362,63 @@ public final class Qwen4Executor implements AutoCloseable {
             List<ExecutionGpu.UploadBuffer> staged,
             List<Qwen4QsaState> opened)
             throws InterruptedException {
-        long hcAddress = this.hcScratchAddress;
-        var hc = this.hyperConnection.scratch(hcAddress, rows);
-        long start = sequence.position();
-        this.stream.submit(
-                () -> {
-                    if (layer == this.pleLayer) {
-                        var scratch = this.ple.scratch(this.layerScratchAddress, rows);
-                        staged.add(this.ple.apply(
-                                this.gpu,
-                                this.weights.ple(layer),
-                                sequence.ple(),
-                                tokens,
-                                offset,
-                                rows,
-                                this.state,
-                                scratch,
-                                this.pleOutput));
-                        this.gpu.residualAddBf16(
-                                this.state, this.pleOutput, this.state, rows, this.hyperConnection.stateWidth());
-                    }
-                    this.hyperConnection.mix(
-                            this.gpu, this.weights.attentionResidual(layer), this.state, hc, this.mixed, rows);
-                    if (this.sparse[layer]) {
-                        Qwen4QsaState attention = sequence.qsa(layer);
-                        opened.add(attention);
-                        this.qsa.run(
-                                this.gpu,
-                                this.weights.qsa(layer),
-                                attention,
-                                this.mixed,
-                                rows,
-                                this.blockOutput,
-                                this.qsa.scratch(this.layerScratchAddress, rows),
-                                0);
-                    } else {
-                        this.gdn.run(
-                                this.gpu,
-                                this.weights.gdn(layer),
-                                sequence.gdn(layer),
-                                this.mixed,
-                                rows,
-                                this.gdn.scratch(this.layerScratchAddress, rows),
-                                this.blockOutput);
-                    }
-                    this.hyperConnection.inject(this.gpu, this.state, this.blockOutput, hc, this.state, rows);
-                    this.hyperConnection.mix(
-                            this.gpu, this.weights.moeResidual(layer), this.state, hc, this.mixed, rows);
-                },
-                false);
+        var hc = this.hyperConnection.scratch(this.hcScratchAddress, rows);
+        if (layer == this.pleLayer) {
+            segment(Timings.PLE, () -> {
+                var scratch = this.ple.scratch(this.layerScratchAddress, rows);
+                staged.add(this.ple.apply(
+                        this.gpu,
+                        this.weights.ple(layer),
+                        sequence.ple(),
+                        tokens,
+                        offset,
+                        rows,
+                        this.state,
+                        scratch,
+                        this.pleOutput));
+                this.gpu.residualAddBf16(
+                        this.state, this.pleOutput, this.state, rows, this.hyperConnection.stateWidth());
+            });
+        }
+        segment(
+                Timings.RESIDUAL,
+                () -> this.hyperConnection.mix(
+                        this.gpu, this.weights.attentionResidual(layer), this.state, hc, this.mixed, rows));
+        if (this.sparse[layer]) {
+            Qwen4QsaState attention = sequence.qsa(layer);
+            opened.add(attention);
+            segment(
+                    Timings.QSA,
+                    () -> this.qsa.run(
+                            this.gpu,
+                            this.weights.qsa(layer),
+                            attention,
+                            this.mixed,
+                            rows,
+                            this.blockOutput,
+                            this.qsa.scratch(this.layerScratchAddress, rows),
+                            0));
+        } else {
+            segment(
+                    Timings.GDN,
+                    () -> this.gdn.run(
+                            this.gpu,
+                            this.weights.gdn(layer),
+                            sequence.gdn(layer),
+                            this.mixed,
+                            rows,
+                            this.gdn.scratch(this.layerScratchAddress, rows),
+                            this.blockOutput));
+        }
+        segment(Timings.RESIDUAL, () -> {
+            this.hyperConnection.inject(this.gpu, this.state, this.blockOutput, hc, this.state, rows);
+            this.hyperConnection.mix(this.gpu, this.weights.moeResidual(layer), this.state, hc, this.mixed, rows);
+        });
         if (this.midObserver != null) {
             Qwen4Streams.awaitCompletion(this.stream);
             this.midObserver.layerFinished(layer, this.state, rows);
         }
+        long begin = this.timings == null ? 0 : System.nanoTime();
         this.moe.run(
                 this.weights.moe(layer),
                 this.model.bankOrdinal("text/layers/" + layer + "/moe/experts"),
@@ -391,8 +426,13 @@ public final class Qwen4Executor implements AutoCloseable {
                 rows,
                 this.moe.scratch(this.moeScratchAddress, rows),
                 this.blockOutput);
-        this.stream.submit(
-                () -> this.hyperConnection.inject(this.gpu, this.state, this.blockOutput, hc, this.state, rows), false);
+        if (this.timings != null) {
+            Qwen4Streams.awaitCompletion(this.stream);
+            this.timings.nanos[Timings.MOE] += System.nanoTime() - begin;
+        }
+        segment(
+                Timings.RESIDUAL,
+                () -> this.hyperConnection.inject(this.gpu, this.state, this.blockOutput, hc, this.state, rows));
     }
 
     @Override
