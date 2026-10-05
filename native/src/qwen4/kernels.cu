@@ -8,3 +8,4 @@
 #include "qwen4/qsa_index.cuh"
 #include "qwen4/qsa_attention.cuh"
 #include "qwen4/moe.cuh"
+#include "qwen4/experts.cuh"
