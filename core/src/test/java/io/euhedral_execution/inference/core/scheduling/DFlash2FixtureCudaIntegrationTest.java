@@ -52,9 +52,17 @@ class DFlash2FixtureCudaIntegrationTest {
         String reference = System.getProperty("euhedral.dflash2.fixtures", "");
         QwenTokenizer tokenizer = QwenTokenizer.load(
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
-        int[] prompt = tokenizer.encodeWithModelSpecialTokens("<|im_start|>user\nWrite a Java method that reverses a"
-                + " singly linked list, with a short explanation.<|im_end|>\n<|im_start|>assistant\n"
-                + "<think>\n\n</think>\n\n");
+        // -Peuhedral.dflash2.prompt-tokens takes that many tokens of docs/FRAME_MODEL.md instead of a chat prompt: past
+        // 2048 the drafter's window and its ring's wraparound are in play.
+        int promptTokens = Integer.getInteger("euhedral.dflash2.prompt-tokens", 0);
+        int[] prompt = promptTokens > 0
+                ? Arrays.copyOf(
+                        tokenizer.encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                                .resolve("docs/FRAME_MODEL.md"))),
+                        promptTokens)
+                : tokenizer.encodeWithModelSpecialTokens("<|im_start|>user\nWrite a Java method that reverses a"
+                        + " singly linked list, with a short explanation.<|im_end|>\n<|im_start|>assistant\n"
+                        + "<think>\n\n</think>\n\n");
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
                 QwenModel model = DFlash2SpeculativeDecodeCudaIntegrationTest.load(artifact, gpu, 4096);
                 var lattice = new PullingLattice()) {
@@ -66,31 +74,42 @@ class DFlash2FixtureCudaIntegrationTest {
             try (var logits = new QwenHostLogits(gpu, model.weights().config().vocabSize());
                     var proposal = new DFlash2Proposal(gpu, config.blockSize() - 1, config.selectorTopK())) {
                 logits.selectOnDevice(true);
-                SpeculativeDecodeCudaIntegrationTest.execute(
-                        runtime,
-                        new QwenExecutionContext(
-                                        plan,
-                                        sequence,
-                                        QwenExecutionContext.ExecutionKind.PREFILL,
-                                        0,
-                                        prompt,
-                                        QwenLogitsRequirement.LAST_TOKEN,
-                                        logits)
-                                .seedingDraft());
-                int anchor = logits.selectedToken();
-                var state = ((AttentionSequenceStates) sequence.kvCacheState()).dflash2(config);
-                recorder.copy("taps", state.taps(prompt.length), prompt.length, config.tapWidth(), "bf16", 0, 0);
-                DFlash2Frame.observe(recorder);
-                try {
+                // Prefill in the engine's 512-row chunks, each followed by its context quantum, as DFlash2Decoder
+                // runs a prompt; the taps of every chunk are kept for the reference.
+                byte[] taps = new byte[0];
+                for (int offset = 0; offset < prompt.length; offset += 512) {
+                    int end = Math.min(prompt.length, offset + 512);
+                    boolean last = end == prompt.length;
+                    int[] chunk = Arrays.copyOfRange(prompt, offset, end);
+                    SpeculativeDecodeCudaIntegrationTest.execute(
+                            runtime,
+                            new QwenExecutionContext(
+                                            plan,
+                                            sequence,
+                                            QwenExecutionContext.ExecutionKind.PREFILL,
+                                            offset,
+                                            chunk,
+                                            last ? QwenLogitsRequirement.LAST_TOKEN : QwenLogitsRequirement.NONE,
+                                            last ? logits : null)
+                                    .seedingDraft());
+                    var drafter = ((AttentionSequenceStates) sequence.kvCacheState()).dflash2(config);
+                    recorder.copy("taps", drafter.taps(chunk.length), chunk.length, config.tapWidth(), "bf16", 0, 0);
+                    taps = Recorder.concat(taps, recorder.data.remove("taps"));
+                    // Only the last chunk's context stages are recorded (the reference's names cover one call).
+                    if (last) DFlash2Frame.observe(recorder);
                     SpeculativeDecodeCudaIntegrationTest.execute(
                             runtime,
                             new QwenExecutionContext(
                                     plan,
                                     sequence,
                                     QwenExecutionContext.ExecutionKind.DRAFT_CONTEXT,
-                                    0,
-                                    prompt,
+                                    offset,
+                                    chunk,
                                     QwenLogitsRequirement.NONE));
+                }
+                recorder.put("taps", taps, prompt.length, config.tapWidth(), "bf16");
+                int anchor = logits.selectedToken();
+                try {
                     int[] block = new int[config.blockSize()];
                     Arrays.fill(block, config.maskToken());
                     block[0] = anchor;
@@ -182,9 +201,12 @@ class DFlash2FixtureCudaIntegrationTest {
                     QwenExecutionPlan.Buffer buffer =
                             instruction.outputBuffers().getFirst();
                     switch (buffer) {
-                        case DRAFT_FUSED -> copy("fc", out, rows, width, "bf16", 0, 0);
+                        case DRAFT_FUSED -> {
+                            if (rows == this.contextRows) copy("fc", out, rows, width, "bf16", 0, 0);
+                        }
                         case DRAFT_KV -> {
                             String part = block ? "block" : "context";
+                            if (!block && rows != this.contextRows) return;
                             copy(prefix + "k_" + part, out, rows, kv, 2 * kv, "bf16", 0, 0);
                             copy(prefix + "v_" + part, out, rows, kv, 2 * kv, "bf16", 0, kv);
                         }
@@ -214,8 +236,9 @@ class DFlash2FixtureCudaIntegrationTest {
                 }
                 case DFLASH_RMS_NORM -> {
                     long in = workspace.address(instruction.inputBuffers().getFirst());
-                    if (!block) copy("context", out, rows, width, "bf16", 0, 0);
-                    else if (layer < 0) {
+                    if (!block) {
+                        if (rows == this.contextRows) copy("context", out, rows, width, "bf16", 0, 0);
+                    } else if (layer < 0) {
                         copy("layer" + (this.config.layers() - 1) + "/out", in, rows, width, "bf16", 0, 0);
                         copy("final_hidden", out, rows, width, "bf16", 0, 0);
                     } else if (occurrence(prefix + "norm") == 1) {
@@ -240,6 +263,8 @@ class DFlash2FixtureCudaIntegrationTest {
                     copy(prefix + "attention", out, rows, width, "bf16", 0, 0);
                     var state =
                             ((AttentionSequenceStates) context.sequenceState().kvCacheState()).dflash2();
+                    // The ring holds the last window of positions only; earlier ones the reference keeps are gone.
+                    if (this.contextRows > this.config.slidingWindow()) return;
                     long keys = workspace.address(QwenExecutionPlan.Buffer.DRAFT_KEY_ROPE);
                     long values = workspace.address(QwenExecutionPlan.Buffer.DRAFT_KV);
                     copy("ring", state.ringKeys(layer), this.contextRows, kv, "bf16", 0, 0);
@@ -281,13 +306,13 @@ class DFlash2FixtureCudaIntegrationTest {
             }
         }
 
-        private void put(String name, byte[] bytes, int rows, int width, String type) {
+        void put(String name, byte[] bytes, int rows, int width, String type) {
             this.data.put(name, bytes);
             this.shapes.put(name, new long[] {rows, width});
             this.types.put(name, type);
         }
 
-        private static byte[] concat(byte[] a, byte[] b) {
+        static byte[] concat(byte[] a, byte[] b) {
             byte[] all = Arrays.copyOf(a, a.length + b.length);
             System.arraycopy(b, 0, all, a.length, b.length);
             return all;
