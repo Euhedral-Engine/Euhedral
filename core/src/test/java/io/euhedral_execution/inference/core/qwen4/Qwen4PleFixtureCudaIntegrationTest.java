@@ -59,14 +59,12 @@ class Qwen4PleFixtureCudaIntegrationTest {
                         Qwen4TestSupport.epsilon(weights.artifact()));
                 String p = "text/layers/" + config.ple().layers()[0] + "/ple/";
                 var pleWeights = new Qwen4Ple.Weights(
-                        weights.address(p + "key_proj"),
-                        weights.bytes(p + "key_proj"),
-                        weights.address(p + "value_proj"),
-                        weights.bytes(p + "value_proj"),
-                        weights.address(p + "norm_key"),
-                        weights.address(p + "norm_query"),
-                        weights.address(p + "norm_conv"),
-                        weights.address(p + "conv1d"));
+                        weights.weight(p + "key_proj"),
+                        weights.weight(p + "value_proj"),
+                        weights.weight(p + "norm_key"),
+                        weights.weight(p + "norm_query"),
+                        weights.weight(p + "norm_conv"),
+                        weights.weight(p + "conv1d"));
                 long historyAddress = gpu.allocate(ple.historyBytes());
                 gpu.zeroDeviceMemory(historyAddress, ple.historyBytes());
                 var state = ple.newState(historyAddress);

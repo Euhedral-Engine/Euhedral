@@ -85,6 +85,11 @@ final class Qwen4TestSupport {
             return get(name).byteSize();
         }
 
+        Qwen4Weight weight(String name) throws IOException {
+            TensorHandle handle = get(name);
+            return Qwen4Weight.of(handle.deviceAddress(), handle.byteSize());
+        }
+
         @Override
         public void close() {
             for (TensorHandle handle : this.loaded.values()) this.gpu.free(handle.deviceAddress());
@@ -135,12 +140,12 @@ final class Qwen4TestSupport {
 
     static Qwen4HyperConnection.Weights hcWeights(Qwen4TestSupport.Weights weights, String prefix) throws Exception {
         return new Qwen4HyperConnection.Weights(
-                weights.address(prefix + "/hc_norm"),
-                weights.address(prefix + "/input_mix_down"),
-                weights.address(prefix + "/input_mix_up"),
+                weights.weight(prefix + "/hc_norm"),
+                weights.weight(prefix + "/input_mix_down"),
+                weights.weight(prefix + "/input_mix_up"),
                 weights.artifact().tensor(prefix + "/block_inject").isPresent()
-                        ? weights.address(prefix + "/block_inject")
-                        : 0);
+                        ? weights.weight(prefix + "/block_inject")
+                        : null);
     }
 
     /// The injection weights the reference reports (2 * sigmoid(raw / streams)) from the engine's raw projection.

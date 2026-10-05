@@ -195,7 +195,11 @@ class Qwen4OperatorCudaIntegrationTest {
                     var scratch = connection.scratch(scratchAddress, rows);
                     connection.mix(
                             gpu,
-                            new Qwen4HyperConnection.Weights(weightsNorm, weightsDown, weightsUp, weightsInject),
+                            new Qwen4HyperConnection.Weights(
+                                    Qwen4Weight.of(weightsNorm, 0),
+                                    Qwen4Weight.of(weightsDown, 0),
+                                    Qwen4Weight.of(weightsUp, 0),
+                                    Qwen4Weight.of(weightsInject, 0)),
                             stateAddress,
                             scratch,
                             mixedAddress,
