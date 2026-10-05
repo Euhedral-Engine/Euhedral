@@ -51,6 +51,9 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     private final int laneCount;
     /// Held by the quantum that stages weights, from its admission until its last stage submitted.
     private final java.util.concurrent.Semaphore stagingHold = new java.util.concurrent.Semaphore(1);
+    /// Whether the staging ring holds the decode view's first slots ([QwenExecutionPlan#prefetchesRing]).
+    /// Read and written only under `stagingHold`.
+    private boolean ringPreloaded;
     /// Recorded on the releasing quantum's home lane once its lanes joined; the next staging quantum's
     /// preparation awaits it, so its first copies follow every earlier read of the ring.
     private long stagingIdle;
@@ -173,6 +176,18 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             throw new IllegalArgumentException("quantum belongs to another execution plan");
         }
         context.claim();
+        boolean staging = view.stagesWeights();
+        if (staging) {
+            // Blocks only this admitting thread, until the previous staging quantum has submitted its
+            // last stage; its device work is ordered by `stagingIdle`, not waited for here. A decode view
+            // that finds its first slots prefetched runs without their transfers.
+            this.stagingHold.acquireUninterruptibly();
+            if (this.ringPreloaded) view = view.preloadedVariant();
+            this.ringPreloaded = false;
+            boolean prefetches = view.prefetchesRing();
+            context.holdStaging(
+                    home -> releaseStaging(home, prefetches && home != null && !context.hasFailureOrCancellation()));
+        }
         GraphPool pool;
         PooledGraph pooled;
         try {
@@ -180,6 +195,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             pool = pool(view);
             pooled = pool.acquire();
         } catch (RuntimeException | Error failure) {
+            context.lanesJoined(null);
             context.fail(failure);
             context.finish();
             throw failure;
@@ -189,20 +205,15 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             graph.source().admit();
         } catch (RuntimeException | Error failure) {
             pool.recycle(pooled);
+            context.lanesJoined(null);
             context.fail(failure);
             context.finish();
             throw failure;
         }
         boolean started = false;
-        if (view.stagesWeights()) {
-            // Blocks only this admitting thread, until the previous staging quantum has submitted its
-            // last stage; its device work is ordered by `stagingIdle`, not waited for here.
-            this.stagingHold.acquireUninterruptibly();
-            context.holdStaging(this::releaseStaging);
-        }
         try {
             GpuStream stream = graph.stream();
-            if (view.stagesWeights()) stream.await(this.stagingIdle);
+            if (staging) stream.await(this.stagingIdle);
             try {
                 stream.submit(() -> context.begin(this.gpu, stream, terminalConsumer, pooled.storage()), false);
             } catch (RuntimeException | Error failure) {
@@ -323,10 +334,12 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when its
-    /// lanes were proven idle instead.
-    private void releaseStaging(GpuStream home) {
+    /// lanes were proven idle instead. `preloaded`: every stage of a prefetching quantum ran, so the ring
+    /// holds the decode view's first slots once `stagingIdle` is reached.
+    private void releaseStaging(GpuStream home, boolean preloaded) {
         try {
             if (home != null) home.mark(this.stagingIdle);
+            this.ringPreloaded = preloaded;
         } finally {
             this.stagingHold.release();
         }
