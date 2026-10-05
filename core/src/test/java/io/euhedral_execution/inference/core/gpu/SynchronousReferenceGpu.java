@@ -391,6 +391,20 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
     }
 
     @Override
+    public void launchQwen4(
+            Qwen4Kernel kernel,
+            int gridX,
+            int gridY,
+            int gridZ,
+            int blockX,
+            int blockY,
+            int blockZ,
+            int sharedBytes,
+            Qwen4KernelArguments arguments) {
+        this.delegate.launchQwen4(kernel, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedBytes, arguments);
+    }
+
+    @Override
     public void zeroDeviceMemory(long address, long byteSize) {
         this.delegate.zeroDeviceMemory(address, byteSize);
     }

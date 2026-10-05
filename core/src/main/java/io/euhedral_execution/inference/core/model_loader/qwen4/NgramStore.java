@@ -269,6 +269,54 @@ public final class NgramStore implements AutoCloseable {
         return upload;
     }
 
+    /// Bytes of one staged record: the row, zero padding to a multiple of four, then the row's shard's FP32 global
+    /// scale in
+    /// the last four bytes. A kernel decodes a record on its own.
+    public int recordBytes() {
+        return (this.rowBytes + 4 + 3) / 4 * 4;
+    }
+
+    /// Like [#gather], but each row becomes a [#recordBytes] record that carries its shard's global scale.
+    public void gatherRecords(long[] globalRows, int count, MemorySegment destination) {
+        ensureOpen();
+        if (count < 0 || count > globalRows.length) throw new IllegalArgumentException("count");
+        int recordBytes = recordBytes();
+        if (destination.byteSize() < (long) count * recordBytes)
+            throw new IllegalArgumentException("destination holds " + destination.byteSize() + " bytes");
+        for (int i = 0; i < count; i++) {
+            long row = checked(globalRows[i]);
+            long at = (long) i * recordBytes;
+            MemorySegment.copy(row(row), 0, destination, at, this.rowBytes);
+            destination
+                    .asSlice(at + this.rowBytes, recordBytes - 4 - this.rowBytes)
+                    .fill((byte) 0);
+            destination.set(
+                    ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN),
+                    at + recordBytes - 4,
+                    this.globalScales[(int) (row / this.config.shardRows())]);
+        }
+        this.gathers.increment();
+        this.rowsGathered.add(count);
+    }
+
+    /// [#gatherRecords] into pinned memory and a queued copy to `deviceAddress` on the selected stream. The caller
+    /// closes the returned buffer once the copy has retired.
+    public ExecutionGpu.UploadBuffer stageRecords(ExecutionGpu gpu, long[] globalRows, int count, long deviceAddress) {
+        ensureOpen();
+        if (count <= 0) throw new IllegalArgumentException("count must be positive");
+        long bytes = (long) count * recordBytes();
+        ExecutionGpu.UploadBuffer upload = gpu.allocateUploadBuffer(bytes);
+        try {
+            gatherRecords(globalRows, count, upload.segment());
+            gpu.copyUploadToDevice(deviceAddress, upload);
+        } catch (Throwable failure) {
+            upload.close();
+            throw failure;
+        }
+        this.bytesStaged.add(bytes);
+        return upload;
+    }
+
     public Stats stats() {
         return new Stats(
                 this.gathers.sum(),
