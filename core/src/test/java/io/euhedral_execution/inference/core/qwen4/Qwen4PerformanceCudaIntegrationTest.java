@@ -1,0 +1,206 @@
+package io.euhedral_execution.inference.core.qwen4;
+
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
+import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.Test;
+
+/// First performance record of ordinary Flash-Next generation: load time, prefill of 512, 4K and 16K tokens, decode at
+/// short, 4K, 16K and 32K context, expert-cache behavior and the time per component. Measurements, not assertions;
+/// opt-in because it takes minutes: `EUHEDRAL_QWEN4_PERF=1`; `EUHEDRAL_QWEN4_PERF_MAX` bounds the contexts (default
+/// 4096).
+/// The prompt is the repository's own documentation, tokenized with the model's tokenizer.
+class Qwen4PerformanceCudaIntegrationTest {
+
+    private static final int MAX = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_PERF_MAX", "4096"));
+    private static final int CONTEXT = Math.max(MAX, 4096) + 256;
+
+    private static int[] corpus(int tokens) throws IOException {
+        Path tokenizerDirectory =
+                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
+        assumeTrue(Files.isRegularFile(tokenizerDirectory.resolve("tokenizer.json")), "no tokenizer");
+        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+        StringBuilder text = new StringBuilder();
+        try (Stream<Path> docs = Files.list(SpeculativeRoot.docs())) {
+            for (Path doc :
+                    docs.filter(p -> p.toString().endsWith(".md")).sorted().toList())
+                text.append(Files.readString(doc)).append("\n\n");
+        }
+        int[] ids = tokenizer.encodeText(text.toString());
+        int[] out = new int[tokens];
+        for (int i = 0; i < tokens; i++) out[i] = ids[i % ids.length];
+        return out;
+    }
+
+    /// The repository's docs directory, found from the working directory of the test JVM.
+    private static final class SpeculativeRoot {
+        static Path docs() {
+            Path at = Path.of("").toAbsolutePath();
+            while (at != null && !Files.isDirectory(at.resolve("docs"))) at = at.getParent();
+            return at.resolve("docs");
+        }
+    }
+
+    private final List<String> report = new ArrayList<>();
+
+    private void line(String text) {
+        System.out.println(text);
+        this.report.add(text);
+    }
+
+    private static String cache(
+            Qwen4Model model, long hits, long misses, long evictions, long bytes, long waitNanos, int tokens) {
+        var now = model.expertCache().stats().snapshot();
+        long dh = now.hits() - hits, dm = now.misses() - misses;
+        return String.format(
+                "hit rate %.1f%%, %.2f misses/token, %.1f MB H2D/token, expert wait %.2f ms/token",
+                100.0 * dh / Math.max(1, dh + dm),
+                (double) dm / tokens,
+                (now.transferBytes() - bytes) / 1e6 / tokens,
+                (now.loadWaitNanos() - waitNanos) / 1e6 / tokens);
+    }
+
+    @Test
+    void firstPerformanceRecord() throws Exception {
+        assumeTrue(
+                System.getenv("EUHEDRAL_QWEN4_PERF") != null || Boolean.getBoolean("euhedral.qwen4.perf"),
+                "set EUHEDRAL_QWEN4_PERF=1 to run the performance record");
+        assumeTrue(Qwen4TestSupport.hasArtifact(), "no artifact");
+        int[] prompt = corpus(CONTEXT);
+        try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu()) {
+            long loadStart = System.nanoTime();
+            try (Qwen4Model model = Qwen4Model.open(
+                            Qwen4TestSupport.artifactPath(),
+                            gpu,
+                            gpu.deviceMemoryInfo().freeBytes(),
+                            HostBudget.system(),
+                            Qwen4Mode.TEXT,
+                            CONTEXT);
+                    Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT)) {
+                line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));
+                line("expert cache: " + model.expertCache().slotCount() + " slots; plan:\n"
+                        + model.plan().report());
+                int vocabulary = executor.vocabularySize();
+                var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
+                Qwen4Executor.LogitsSink sink = address -> gpu.copyDeviceToReadback(readback, address, vocabulary * 2L);
+                // Warm the kernels and the cache with a short run.
+                try (Qwen4Sequence warm = executor.newSequence()) {
+                    executor.step(warm, prompt, 0, 64, sink);
+                }
+                for (int target : Arrays.stream(new int[] {512, 4096, 16384})
+                        .filter(t -> t <= MAX)
+                        .toArray()) {
+                    try (Qwen4Sequence sequence = executor.newSequence()) {
+                        var before = model.expertCache().stats().snapshot();
+                        long start = System.nanoTime();
+                        int at = 0;
+                        while (at < target) {
+                            int rows = Math.min(512, target - at);
+                            executor.step(sequence, prompt, at, rows, at + rows == target ? sink : null);
+                            at += rows;
+                        }
+                        double seconds = (System.nanoTime() - start) / 1e9;
+                        line(String.format(
+                                "prefill %d tokens: %.2f s, %.0f tokens/s; %s",
+                                target,
+                                seconds,
+                                target / seconds,
+                                cache(
+                                        model,
+                                        before.hits(),
+                                        before.misses(),
+                                        before.evictions(),
+                                        before.transferBytes(),
+                                        before.loadWaitNanos(),
+                                        target)));
+                    }
+                }
+                for (int context : Arrays.stream(new int[] {64, 4096, 16384, 32768})
+                        .filter(t -> t <= MAX)
+                        .toArray()) {
+                    try (Qwen4Sequence sequence = executor.newSequence()) {
+                        int at = 0;
+                        while (at < context) {
+                            int rows = Math.min(512, context - at);
+                            executor.step(sequence, prompt, at, rows, null);
+                            at += rows;
+                        }
+                        int[] token = new int[1];
+                        var before = model.expertCache().stats().snapshot();
+                        var counters = executor.moeCounters();
+                        int steps = 32;
+                        long start = System.nanoTime();
+                        for (int i = 0; i < steps; i++) {
+                            token[0] = prompt[(context + i * 97) % prompt.length];
+                            executor.step(sequence, token, 0, 1, sink);
+                            short[] logits = new short[vocabulary];
+                            MemorySegment.copy(readback.segment(), ValueLayout.JAVA_SHORT, 0, logits, 0, 16);
+                        }
+                        double seconds = (System.nanoTime() - start) / 1e9;
+                        var after = executor.moeCounters();
+                        line(String.format(
+                                "decode at %d context: %.1f ms/token, %.1f tokens/s; %s; route wait %.2f ms + acquire %.2f ms per token",
+                                context,
+                                seconds * 1e3 / steps,
+                                steps / seconds,
+                                cache(
+                                        model,
+                                        before.hits(),
+                                        before.misses(),
+                                        before.evictions(),
+                                        before.transferBytes(),
+                                        before.loadWaitNanos(),
+                                        steps),
+                                (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
+                                (after.acquireNanos() - counters.acquireNanos()) / 1e6 / steps));
+                    }
+                }
+                // Component times: decode at 4K and a 512-token prefill chunk, each step followed by a device wait.
+                for (int[] shape : new int[][] {{4096, 1}, {4096, 512}}) {
+                    try (Qwen4Sequence sequence = executor.newSequence()) {
+                        int at = 0;
+                        while (at < shape[0]) {
+                            int rows = Math.min(512, shape[0] - at);
+                            executor.step(sequence, prompt, at, rows, null);
+                            at += rows;
+                        }
+                        var timings = new Qwen4Executor.Timings();
+                        executor.timings(timings);
+                        int steps = shape[1] == 1 ? 16 : 1;
+                        for (int i = 0; i < steps; i++) {
+                            int rows = shape[1];
+                            int[] tokens = Arrays.copyOfRange(prompt, at, at + rows);
+                            executor.step(sequence, tokens, 0, rows, sink);
+                            at += rows;
+                        }
+                        executor.timings(null);
+                        StringBuilder text = new StringBuilder(
+                                String.format("components, %d-row steps at %d context (ms/step):", shape[1], shape[0]));
+                        for (int i = 0; i < Qwen4Executor.Timings.NAMES.length; i++)
+                            text.append(String.format(
+                                    " %s %.2f;", Qwen4Executor.Timings.NAMES[i], timings.nanos[i] / 1e6 / steps));
+                        line(text.toString());
+                    }
+                }
+                var telemetry = model.telemetry();
+                line("device allocated " + gpu.allocatedBytes() / (1 << 20) + " MiB, peak "
+                        + gpu.peakAllocatedBytes() / (1 << 20) + " MiB; " + telemetry);
+                readback.close();
+            }
+        }
+        Files.writeString(Path.of("build", "qwen4-performance.txt"), String.join("\n", this.report) + "\n");
+    }
+}
