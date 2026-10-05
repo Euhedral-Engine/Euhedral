@@ -197,7 +197,7 @@ One to eight BF16 token rows run `nvfp4::decode_rows<M>` (`native/src/nvfp4/nvfp
   (`decode_tile`): `_w8` (16 rows per CTA, 8 warps) for K up to 5120, `_w4` (32 rows per CTA, 4 warps) above. One-row and
   multi-row calls on a tensor therefore share their summation order.
 - Teacher-forced on the SD4 artifact (`TeacherForcedQualityCudaIntegrationTest`, 2048 tokens after 512) the mean NLL is 2.2286
-  nats; the FP32 FMA GEMV it replaced measured 2.2281 on the same tokens (paired dNLL +0.0005 ± 0.0022, KL 0.0036).
+  nats; the FP32 FMA GEMV (rejected below) measured 2.2281 on the same tokens (paired dNLL +0.0005 ± 0.0022, KL 0.0036).
 
 **Operator times** (us; SD4, random weights rotated past L2, CUDA events, 30 launches):
 
@@ -211,6 +211,15 @@ One to eight BF16 token rows run `nvfp4::decode_rows<M>` (`native/src/nvfp4/nvfp
 
 Eight rows cost at most 9% more than one. Through the host entry point (synchronous calls) the decode kernels are as fast as
 the native skinny kernel at 8 rows and 3-6 us faster from 2 to 7, so everything up to 8 rows stays on them.
+
+**Rejected decode variants** (same harness; us at 1 / 8 rows):
+- **Other tiles.** down (K = 17408): 16 rows x 4 warps 71.9 / 105.3, 32 x 8 64.5 / 86.4, 64 x 8 85.2 / 104.3, 64 x 4 71.5 / 106.4,
+  against 63.9 / 71.2 for 32 x 4; gate_up (K = 5120): 32 x 8 120.2 / 120.5 and 32 x 4 125.1 / 125.2 against 115.0 / 120.6 for
+  16 x 8. Short K needs more warps per output row to keep loads in flight; long K amortizes more rows per CTA.
+- **The FP32 FMA GEMV** (each lane's 16-value blocks as FMA chains, the block scale applied once) **and its row twins**, which
+  repeat the one-row FMA sequence per token row: 64.8 / 125.2 on down, 119.2 / 214.0 on gate_up. The twins hold the decoded
+  weights in 223-237 registers whatever the loop order; paired FMAs (`fma.rn.f32x2`, bitwise the same chains) and a
+  weight-first loop order gained a few percent at most.
 
 ## Decode-like row counts
 

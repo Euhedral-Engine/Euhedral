@@ -153,6 +153,11 @@ device ring of `ResidencyPlanner.STAGING_SLOTS` = 4 slots on every use.
   existing cross-lane markers, with no host synchronization.
 - **Concurrency:** a quantum that stages weights holds the ring from admission until its last stage submitted. The next one's
   preparation awaits a marker recorded after the holder's lanes joined.
+- **Prefetch:** a DFlash2 block, which leaves the transfer lane idle for its few milliseconds, also copies the decode view's
+  first `STAGING_SLOTS` uses into slots 0 .. 3. A decode or verification quantum that is admitted while the ring holds them runs
+  the decode view without those transfers (`QwenExecutionPlan.preloadedVariant`); the runtime marks the ring loaded, under its
+  hold, only when every stage of the prefetching quantum ran, and any other staging quantum clears the mark
+  ([DFLASH2.md](DFLASH2.md)).
 
 Greedy tokens are identical to the resident run.
 
@@ -170,8 +175,19 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
 **Rejected:**
 - **One allocation per tensor:** compaction under the loader's page-cache churn failed for a third of them, which fell back to
   4 KiB pages. Copies then split between 26 and 43 GB/s, about 30 GB/s overall, and 2 GiB decoded at 15.0 tok/s.
-- **Deeper rings:** 8 and 16 slots gave 14.5 and 14.2 tok/s against 15.0 for 4 slots (per-tensor allocation).
+- **Deeper rings:** 8 and 16 slots gave 14.5 and 14.2 tok/s against 15.0 for 4 slots (per-tensor allocation). With the arena and
+  DFlash2 speculation, 8 and 12 slots decoded 92.9 and 90.0 tok/s at 32K against 95.7 for 4: the extra slots are device memory
+  that pushes more weights to the host, and the copies are bound by bandwidth, not by how far they run ahead.
 - **The staging DAG without its copies** costs 2% (47.2 against 48.1 tok/s).
+
+## Open
+
+- **A later long request decodes slower than the first one in the process.** `nvfp4-compressed`, 32K context, the 31,906-token
+  chat prompt, 128 generated tokens: 102.4 tok/s when it is the process's first request and 67.8-70.5 after another 32K request
+  or after 4K and 16K requests (102.3 after a single 16K request). The kernels run as fast and replay from the same captured
+  graphs as often (19 capture keys, 21 recordings in both); the GPU idles between dependent kernels of the replayed graphs, 10-16
+  us per edge instead of about 1 us. Q3 artifacts, which stage no weights, do not slow down (`q3` 109.8 tok/s either way), so the
+  staged views are the first suspect.
 
 ## Where it lives
 

@@ -27,39 +27,40 @@ host memory. All of that is automatic.
 
 Any artifact can also carry the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`): the converter appends it with
 `--extend ARTIFACT --dflash2 DIR`, and an artifact that holds it speculates with DFlash2 instead of MTP, with the same
-exact verification ([docs/DFLASH2.md](docs/DFLASH2.md)). On the NVFP4 artifact it decodes 83.2 tok/s at 4K, 76.9 at 16K, 79.9
-at 32K and 62.9 at 64K tokens of context (chat corpus); its larger drafter leaves less of the 16 GB for the target, and the
-four artifacts above draft with MTP.
+exact verification ([docs/DFLASH2.md](docs/DFLASH2.md)). On the NVFP4 artifact it decodes 113.9 tok/s at 4K, 105.8 at 16K,
+102.4 at 32K and 64.8 at 64K tokens of context (chat corpus, 256 generated tokens; MTP on the same target: 114.5, 106.3, 109.5
+and 79.2); its larger drafter leaves less of the 16 GB for the target, and the four artifacts above draft with MTP.
 
 ## Performance
 
 RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display, Linux, one run per row after one warmup. Greedy
-decoding with MTP speculative decoding (two drafted tokens for Q3, three for NVFP4); decode `tok/s` is output tokens per second
+decoding with MTP speculative decoding (two drafted tokens for Q3, four for NVFP4); decode `tok/s` is output tokens per second
 after the first token. Prefill and time to first token (TTFT) include the whole prompt.
 
 | Artifact | Context (prompt tokens) | Prefill tok/s | TTFT | Decode tok/s (MTP) |
 |---|---|---|---|---|
-| `q3` | 4K (3,964) | 1,974 | 2.10 s | 116.9 |
-| | 16K (15,930) | 1,801 | 9.14 s | 118.7 |
-| | 32K (31,906) | 1,636 | 19.9 s | 110.1 |
-| | 64K (59,111) | 1,401 | 43.7 s | 98.0 |
-| `q3-compressed` | 4K | 1,837 | 2.28 s | 95.0 |
-| | 16K | 1,693 | 9.63 s | 97.0 |
-| | 32K | 1,543 | 21.1 s | 91.1 |
-| | 64K | 1,332 | 45.7 s | 82.0 |
-| | 128K (128,000) | 987 | 135 s | 60.7 |
-| `nvfp4` | 4K | 3,874 | 1.13 s | 70.7 |
-| | 16K | 3,254 | 5.19 s | 61.2 |
-| | 32K | 2,762 | 12.0 s | 63.8 |
-| | 64K | 2,145 | 29.0 s | 57.7 |
-| `nvfp4-compressed` | 4K | 3,815 | 1.14 s | 97.6 |
-| | 16K | 3,219 | 5.23 s | 92.6 |
-| | 32K | 2,728 | 12.1 s | 82.6 |
-| | 64K | 2,131 | 29.2 s | 64.0 |
+| `q3` | 4K (3,964) | 1,981 | 2.01 s | 117.8 |
+| | 16K (15,930) | 1,807 | 8.85 s | 119.1 |
+| | 32K (31,906) | 1,640 | 19.5 s | 109.8 |
+| | 64K (59,111) | 1,405 | 42.2 s | 97.9 |
+| `q3-compressed` | 4K | 1,842 | 2.16 s | 95.3 |
+| | 16K | 1,693 | 9.44 s | 96.4 |
+| | 32K | 1,546 | 20.7 s | 90.3 |
+| | 64K | 1,336 | 44.3 s | 81.8 |
+| | 128K (128,000) | 987 | 130 s | 52.3 |
+| `nvfp4` | 4K | 3,857 | 1.04 s | 99.2 |
+| | 16K | 3,251 | 4.93 s | 81.0 |
+| | 32K | 2,740 | 11.7 s | 82.1 |
+| | 64K | 2,129 | 27.9 s | 58.4 |
+| `nvfp4-compressed` | 4K | 3,794 | 1.05 s | 147.8 |
+| | 16K | 3,205 | 5.00 s | 128.9 |
+| | 32K | 2,711 | 11.8 s | 102.4 |
+| | 64K | 2,116 | 28.1 s | 64.7 |
 
 The 4K, 16K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
 and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are
-chat prompts.
+chat prompts. The 4K and 16K rows share a process; every other row is its process's first request, because on the NVFP4 artifacts
+a later long request currently decodes slower ([docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md), "Open").
 
 | Artifact | File | Device memory in use at 32K / 64K | Host-backed weights at 32K / 64K | Longest context run |
 |---|---|---|---|---|
@@ -115,14 +116,16 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest, and the one that fits everywhere:** `q3`: 117 tok/s at 4K and 98 tok/s at 64K, with no host-backed weights. Its
-  error against BF16 is the largest of the four (perplexity 11.05 against 8.39 on the quality text).
+- **Fastest up to 16K, and the highest fidelity:** `nvfp4-compressed` (perplexity 8.87): 148 tok/s at 4K and 129 at 16K. On a 16 GB
+  card it keeps 0.46 to 1.03 GiB of weights in host memory at 32K to 64K of context and streams them in for every token, which
+  slows it to 102 tok/s at 32K and 65 at 64K.
+- **Fastest at long contexts, and the one that fits everywhere:** `q3`: 118 tok/s at 4K, 110 at 32K and 98 at 64K, with no
+  host-backed weights. Its error against BF16 is the largest of the four (perplexity 11.05 against 8.39 on the quality text).
 - **More room instead of speed:** `q3-compressed` returns exactly the `q3` outputs from a file 1.56 GiB smaller, which is what lets it
   hold a 128K context on this card. Its kernels decode the compressed weights as they read them, which costs about a fifth of `q3`'s
   decode speed (95 tok/s at 4K).
-- **Highest fidelity:** the NVFP4 artifacts (perplexity 8.83 and 8.87). On a 16 GB card `nvfp4` keeps 1.2 to 1.8 GiB of weights in host memory at 32K to 64K of
-  context and streams them in for every token; `nvfp4-compressed` needs less than half of that, which makes it faster than `nvfp4` up to 32K
-  of context at a quality cost within the noise of the measurement (table above).
+- `nvfp4` (perplexity 8.83) keeps 1.2 to 1.8 GiB of weights in host memory at 32K to 64K and is slower than `nvfp4-compressed` at
+  every context in the table, at a quality difference within the noise of the measurement.
 - A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.
 
 ## Quick start
