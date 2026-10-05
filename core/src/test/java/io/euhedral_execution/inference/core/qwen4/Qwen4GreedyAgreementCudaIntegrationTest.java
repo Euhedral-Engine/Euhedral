@@ -52,13 +52,15 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
     private record Case(String prompt, int[] promptIds, List<Step> steps) {}
 
     private static List<Case> cases() throws Exception {
-        try (InputStream in = Qwen4GreedyAgreementCudaIntegrationTest.class.getResourceAsStream("/qwen4/greedy-reference.json")) {
+        try (InputStream in =
+                Qwen4GreedyAgreementCudaIntegrationTest.class.getResourceAsStream("/qwen4/greedy-reference.json")) {
             assumeTrue(in != null, "no greedy reference");
             JsonNode root = new ObjectMapper().readTree(in);
             List<Case> cases = new ArrayList<>();
             for (JsonNode result : root.get("results")) {
                 int[] promptIds = new int[result.get("prompt_ids").size()];
-                for (int i = 0; i < promptIds.length; i++) promptIds[i] = result.get("prompt_ids").get(i).asInt();
+                for (int i = 0; i < promptIds.length; i++)
+                    promptIds[i] = result.get("prompt_ids").get(i).asInt();
                 List<Step> steps = new ArrayList<>();
                 for (JsonNode step : result.get("steps")) {
                     int[] top = new int[5];
@@ -102,7 +104,8 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                                         at,
                                         rows,
                                         at + rows == feed.length
-                                                ? address -> gpu.copyDeviceToReadback(readback, address, vocabulary * 2L)
+                                                ? address ->
+                                                        gpu.copyDeviceToReadback(readback, address, vocabulary * 2L)
                                                 : null);
                             }
                             short[] logits = new short[vocabulary];
@@ -167,7 +170,8 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
     @Test
     void freeRunningGenerationThroughTheEngineAgreesUntilAnInterchangeableFlip() throws Exception {
         assumeTrue(Qwen4TestSupport.hasArtifact(), "no artifact");
-        Path tokenizers = Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
+        Path tokenizers =
+                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
         assumeTrue(Files.isRegularFile(tokenizers.resolve("tokenizer.json")), "no tokenizer");
         List<Case> cases = cases();
         BitSet cpus = new BitSet();
@@ -184,18 +188,28 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                 int[] prompt = engine.tokenizePromptAsync(reference.prompt()).get(30, TimeUnit.SECONDS);
                 assertArrayEquals(reference.promptIds(), prompt, "tokenization of " + reference.prompt());
                 GenerationSession session = engine.createGenerationSession(GenerationConfig.greedy(1));
-                List<Integer> tokens = session.generateAsync(prompt, reference.steps().size(), text -> {}, null, null)
+                List<Integer> tokens = session.generateAsync(
+                                prompt, reference.steps().size(), text -> {}, null, null)
                         .get(10, TimeUnit.MINUTES);
                 session.close();
                 int step = 0;
-                while (step < tokens.size() && tokens.get(step) == reference.steps().get(step).token()) step++;
+                while (step < tokens.size()
+                        && tokens.get(step) == reference.steps().get(step).token()) step++;
                 matched += step;
                 total += reference.steps().size();
                 if (step < tokens.size())
                     assertTrue(
                             reference.steps().get(step).margin(tokens.get(step)) < NOISE,
-                            "free-running step " + step + " of '" + reference.prompt().substring(0, Math.min(30, reference.prompt().length()))
-                                    + "': engine " + tokens.get(step) + " vs reference " + reference.steps().get(step).token());
+                            "free-running step " + step + " of '"
+                                    + reference
+                                            .prompt()
+                                            .substring(
+                                                    0,
+                                                    Math.min(
+                                                            30,
+                                                            reference.prompt().length())) + "': engine "
+                                    + tokens.get(step) + " vs reference "
+                                    + reference.steps().get(step).token());
             }
             System.out.println("free-running greedy tokens equal before the first flip: " + matched + " of " + total);
             assertEquals(cases.size(), cases.size());

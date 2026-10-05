@@ -160,3 +160,71 @@ pages the position reaches. The stable parts are the layer kernels' shapes and t
 decode step would therefore split at each MoE block into a graph of the layer's attention part and a graph of its expert part
 whose slot addresses come from a device-side table the host fills; the cache's slot addresses are stable, so the table can be
 written per layer without changing the graph, and fences stay device-ordered either way.
+
+## Engine and API
+
+A Flash-Next artifact is selected by the artifact alone: `InferenceEngine` recognises the `qwen4_exp` architecture, opens the
+storage, planner, expert cache and `Qwen4Executor` (`Qwen4Runtime`), and hands the API a `GenerationSession`. The session
+interface is the part of generation the API needs (prefill chunks, decode steps, cancellation, the sampler's logits); the dense
+model's session and `Qwen4GenerationSession` both implement it, and the API's request handling contains no model-specific
+branches. Prefill chunks and the decode loop run on one generation worker per runtime, so a request's GPU work is serial and
+cancellation takes effect between steps; the runtime's host pool (two threads) serves the host-side work around a step. Chat completions on the real artifact are covered by `Qwen4ChatCompletionsCudaIntegrationTest`.
+
+## End-to-end agreement
+
+`Qwen4GreedyAgreementCudaIntegrationTest` compares the engine's greedy continuation with the reference's, both reading the KV
+cache through the NVFP4 codec (`tools/flash_next_reference/cli.py greedy`, fixture `core/src/test/resources/qwen4/greedy-reference.json`).
+Teacher-forced (the engine fed the reference's tokens) and free-running (the engine fed its own), 72 of 72 positions agree, and the
+engine's tokenisation of every prompt matches the reference tokenizer's. A position where the reference's top two logits are within
+the BF16 noise of the comparison (1.0 logit) is not counted as a disagreement; none of the 72 needed it.
+
+## Measured performance
+
+Measured by `Qwen4PerformanceCudaIntegrationTest` (`EUHEDRAL_QWEN4_PERF=1`, report in `core/build/qwen4-performance.txt`) on a
+16 GB GPU with the artifact on a file-backed expert store (52 MiB pinned host memory), a 5120-token context plan, 3547 of 24576
+expert slots resident (9366 MiB), 4190 MiB of fixed weights, and the step uncaptured. The decode figures are at 64 and at 4096
+tokens of context; 16K and 32K were not measured.
+
+| Phase | Result |
+| --- | --- |
+| Prefill, 512 tokens (one chunk) | 5.3 s, 97 tokens/s |
+| Prefill, 4096 tokens (8 chunks of 512) | 42.8 s, 96 tokens/s |
+| Decode at 64 tokens of context | 99.8 ms/token, 10.0 tokens/s |
+| Decode at 4096 tokens of context | 99.9 ms/token, 10.0 tokens/s |
+| Device memory, allocated / peak | 13,704 MiB / 13,849 MiB |
+
+Expert traffic. Prefill: every chunk of 512 rows touches 314 of 512 experts per layer on average (211 to 429 depending on the
+layer), so the cache never hits (0.0%) and each token moves 29.4 expert misses, 81.5 MB host to device. Decode: 10 experts per layer per
+token, 72.9% hit rate at 4096 tokens of context, 129.8 misses and 359.5 MB per token (75.6% and 324.9 MB at 64 tokens). The
+hit rate rises with depth (33% in layer 0, 93% in layer 47). After the 4096-token prefill and both decodes the cache had served
+29,206 hits, 533,081 misses and 529,534 evictions.
+
+Component time, 1-row step at 4096 tokens of context (ms per step): embedding 0.07, per-layer embedding 0.35, gated residual
+10.62, GDN 4.14, QSA 1.84, MoE 104.50 (of which routing readback 13.7 and expert acquisition 77.8), output head 1.63. A
+512-row step: embedding 0.35, per-layer embedding 719.68, gated residual 115.74, GDN 25.51, QSA 20.07, MoE 4298.18, output head 1.62.
+The per-layer embedding figure of a 512-row step is the n-gram record gather from the mapped file.
+
+## Known bottlenecks
+
+- **Expert transfers.** Every number above is bound by the PCIe copy of experts the cache does not hold: decode moves
+  about 3.6 GB/s into 2.64 MiB slots (360 MB per 100 ms step) and prefill about 7.8 GB/s, with the lease wait serial per layer.
+- **Serial routing.** Each layer reads its routing back, then acquires its experts; the next layer's attention does not start before
+  that. About 91 ms of the 100 ms decode step is routing wait plus acquisition.
+- **Prefill shape.** A 512-row chunk uses most experts of every layer, so the cache is a stream, not a cache; the cost per token is
+  the transfer of the layer's experts divided by the chunk size.
+- **Small launches.** The gated residual (four-stream mix and its low-rank gates) takes 10.6 ms of a decode step as many small
+  launches; the step is uncaptured.
+- **Per-layer embedding.** 720 ms of a 512-row prefill step is the host gather of n-gram records.
+- **Planner workspace.** The planner reserves 130 MiB for the executor's workspace; the executor measures about 260 MiB at 512
+  rows, so the plan's bound is too small by that much (the runtime reserve absorbs it).
+
+## Next optimisation priorities
+
+1. Pipelined expert acquisition: start the next wave's leases while the current wave computes, and prefetch a layer's likely
+   experts from the previous layer's routing.
+2. Larger prefill chunks, so the transfer of a layer's experts is shared by more tokens.
+3. Capture a decode step as graphs split at the MoE blocks (see the dynamic boundaries above), with the slot table written per layer.
+4. A replacement policy that uses the measured per-layer reuse (layer 47 reuses 93% of its experts, layer 0 33%).
+5. Overlap the n-gram record gather with the previous chunk.
+6. Fuse the gated residual's launches; tighten the planner's workspace bound with the measured figure.
+7. Measure 16K and 32K contexts once 1 to 4 have landed.
