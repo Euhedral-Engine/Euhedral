@@ -1,9 +1,9 @@
 # Native Blackwell NVFP4
 
-NVFP4 linears run on Blackwell's block-scaled FP4 tensor cores (`native/src/nvfp4_native`) from two rows: both operands are
+NVFP4 linears run on Blackwell's block-scaled FP4 tensor cores (`native/src/nvfp4_native`) from nine rows: both operands are
 NVFP4, the BF16 activations are quantized to two NVFP4 terms (the value and its quantized residual) and each linear issues one MMA
-per term into the same accumulator. One row runs the BF16-activation GEMV (`native/src/nvfp4`, which also holds the 2 to 8 row
-twins that verification uses). The engine requires a Blackwell GPU, so the native module (compiled for `sm_<major><minor>a`)
+per term into the same accumulator. One to eight rows run the BF16-activation decode kernels (`native/src/nvfp4`, section
+"Decode kernels"), whose rows are bit for bit one-row decode, which verification needs. The engine requires a Blackwell GPU, so the native module (compiled for `sm_<major><minor>a`)
 always loads. There are no options: the route, the two terms and the row thresholds are fixed. Exact numerics (oracle only,
 `CudaGpuMemory.selectExactNumerics`) run the scalar reference (`native/src/reference/kernels.cu`).
 
@@ -110,18 +110,18 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
 
 | Rows | NVFP4 linear (`linearNvfp4Bf16`) | Paired gate/up + SwiGLU (`nvfp4GateUpSwiGluBf16`) |
 |---|---|---|
-| 1 | the BF16-activation GEMV (`euhedral_nvfp4_decode`) | not formed: decode and small views run gate/up as a linear |
-| 2-63 | native skinny kernel when K is a multiple of 256, else the tile when it qualifies | not formed (small views run gate/up as a linear) |
+| 1-8 | the BF16-activation decode kernels (`euhedral_nvfp4_decode_rows<M>_{w8,w4}`) | not formed: decode and small views run gate/up as a linear |
+| 9-63 | native skinny kernel when K is a multiple of 256, else the tile when it qualifies | not formed (small views run gate/up as a linear) |
 | 64 | native skinny kernel (same condition) | native paired tile |
 | 65 and more | native 128 x 128 tile | native paired tile |
 
-- **Thresholds:** `NVFP4_NATIVE_MIN_ROWS` = 2 for linears; `NVFP4_NATIVE_REGION_MIN_ROWS` = 64 for the paired region; the host's
+- **Thresholds:** `NVFP4_NATIVE_MIN_ROWS` = 9 for linears; `NVFP4_NATIVE_REGION_MIN_ROWS` = 64 for the paired region; the host's
   `SKINNY_MAX_ROWS` = 64.
 - The native route needs K to be a multiple of 128, and for the tile kernels a multiple of 256 (512 for SD4 weights) with 16-byte
-  aligned weights and scratch (the GEMV: K a multiple of 1024 and N of 16, as in every model shape).
-  A shape the native route declines runs the decode kernels up to 8 rows, the scalar reference beyond.
+  aligned weights and scratch (the decode kernels: K a multiple of 128 and N of 16).
+  A shape the native route declines runs the scalar reference.
 - Verification quanta run row-exact (every row bit for bit as one-row decode) and never take the native route: they run the
-  GEMV twins (`euhedral_nvfp4_decode_rows<M>`, 2 to 8 rows) as [MTP_CONTRACT.md](MTP_CONTRACT.md) section 6 requires.
+  decode kernels (at most 8 rows) as [MTP_CONTRACT.md](MTP_CONTRACT.md) section 6 requires.
 - Quantized activations, plus FP32 split-K partials for skinny shapes, go into the shared, event-ordered scratch
   (`euhedral_cuda_nvfp4_native_scratch_bytes`).
 
@@ -185,10 +185,36 @@ Rows of 64 and fewer use the skinny kernel; larger rows form quanta of more than
 the two tile kernels take 68% of the kernel time (about 650 TFLOPS), the GDN recurrence 10%, FA2 attention 8%, and quantization
 2.5%.
 
+## Decode kernels
+
+One to eight BF16 token rows run `nvfp4::decode_rows<M>` (`native/src/nvfp4/nvfp4.cuh`) on BF16 tensor cores
+(`mma.m16n8k16`, FP32 accumulation), the weight rows as the MMA's 16 M rows and the token rows as its 8 N columns:
+- A weight (an E2M1 code times its E4M3 block scale) has at most 6 significant bits, so it is exact in BF16 and every product
+  is exact. A 256-entry shared table turns a code byte into two BF16 values; the scale multiplies them with `__hmul2`.
+- A token row's result never depends on the other columns, so every row of an M-row call is bit for bit the one-row call:
+  row exactness holds by construction, at every M, with no per-row FMA sequence.
+- Warps split K into 128-value chunks (chunk c on warp c mod W) and sum in warp order. The tile is a function of the shape
+  (`decode_tile`): `_w8` (16 rows per CTA, 8 warps) for K up to 5120, `_w4` (32 rows per CTA, 4 warps) above. One-row and
+  multi-row calls on a tensor therefore share their summation order.
+- Teacher-forced on the SD4 artifact (`TeacherForcedQualityCudaIntegrationTest`, 2048 tokens after 512) the mean NLL is 2.2286
+  nats; the FP32 FMA GEMV it replaced measured 2.2281 on the same tokens (paired dNLL +0.0005 ± 0.0022, KL 0.0036).
+
+**Operator times** (us; SD4, random weights rotated past L2, CUDA events, 30 launches):
+
+| Shape (K -> N) | M = 1 | 2 | 4 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| down (17408 -> 5120) | 64.1 | 63.6 | 64.3 | 65.3 | 67.2 | 71.0 |
+| gate_up (5120 -> 34816) | 115.0 | | | | | 120.6 |
+| query_key (5120 -> 7168) | 26.5 | | | | | 28.7 |
+| GDN output (6144 -> 5120) | 24.5 | 24.6 | 24.8 | 25.3 | 25.4 | 25.0 |
+| LM head (5120 -> 248320) | 794.7 | | | | | 844.8 |
+
+Eight rows cost at most 9% more than one. Through the host entry point (synchronous calls) the decode kernels are as fast as
+the native skinny kernel at 8 rows and 3-6 us faster from 2 to 7, so everything up to 8 rows stays on them.
+
 ## Decode-like row counts
 
-One-row decode streams every weight once per token, so its floor is bytes over DRAM bandwidth. The
-NVFP4 GEMV already reaches it (gate_up: 100 MB in 0.128 ms, 780 GB/s). A tensor-core tile needs 16
+One-row decode streams every weight once per token, so its floor is bytes over DRAM bandwidth. A tensor-core tile needs 16
 rows, so the question is what extra rows cost.
 
 **Skinny native kernel** (`nvfp4n::skinny_linear`):
@@ -196,7 +222,7 @@ rows, so the question is what extra rows cost.
 - 256-value K tiles, up to 4 `cp.async` stages.
 - K is split when 64-column tiles alone cannot occupy 140 CTAs (two per SM); each split stores FP32 partials, and
   `euhedral_nvfp4n_skinny_finish` sums them in split order and converts once, so the result is deterministic.
-- It takes 2-64 rows. One row stays on the GEMV, which keeps BF16 activations.
+- It takes 9-64 rows; up to 8 rows run the decode kernels, which keep BF16 activations.
 
 **Operator times** (ms; real weights rotated over 4 layers; native includes quantization and split-K finish):
 
@@ -243,7 +269,7 @@ included):
 - Against the BF16-activation result, two terms give a linear output relative RMS error of 0.88% (activation quantization 0.87%).
 
 **Model level** (`RelaxedNumericsDriftCudaIntegrationTest`, NVFP4 artifact, executed objects):
-- Teacher-forced against the exact-numerics oracle. Native changes prefill only, because decode runs the same one-row GEMV in
+- Teacher-forced against the exact-numerics oracle. Native changes prefill only, because decode runs the same decode kernels in
   both arms. "Floor" = native off: only the relaxed-order kernels differ. Exact against exact is bitwise zero.
 
 | Prefix + steps | Arm | Median hidden error | Worst 1/8 window | KL mean | Top-1 | Harness |

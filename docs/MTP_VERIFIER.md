@@ -104,6 +104,10 @@ rows, every row computed exactly as the one-row launch at its position:
 
 ## Exact linear twins
 
+NVFP4 linears run the tensor-core decode kernels at every row count up to 8, whose rows are exact by construction and which
+cost at most 1.09× one row at 8 rows ([NVFP4_NATIVE.md](NVFP4_NATIVE.md), "Decode kernels"). The FP32 FMA twins measured below
+were rejected for NVFP4 for that reason; the Q3, Q4 and Q5 twins keep their design and its M=4 cliff.
+
 Cold-weight operator timing: weight copies rotated past L2, bitwise equal to the one-row GEMV; times are multiples of the one-row
 time on each model shape.
 
@@ -140,8 +144,7 @@ frees those registers costs more than the lost occupancy.
 - **Token loop not unrolled, rotating accumulators:** 1.13× at M=3, 1.47× at M=4, 1.68× at M=5; still 188 registers at M=4.
 - **Loop interchange and next-slice prefetch:** [MTP_SPECULATIVE.md](MTP_SPECULATIVE.md) section 6.
 
-Exact M=3 linears already cost 1.14× one row in the Q3 profile, which is part of why Q3 prefers MTP2. At M=4 the NVFP4 twins
-remain about 1.25× one row in the model.
+Exact M=3 linears already cost 1.14× one row in the Q3 profile, which is part of why Q3 prefers MTP2.
 
 ## Why Q3 artifacts carry an NVFP4 MTP layer
 
@@ -267,7 +270,8 @@ VERIFY(rows P..P+d) ──▶ commit a+1 rows (KV frontier; GDN checkpoint/repla
    verification 36.02 ms (linears 25.91, attention 8.22). Norms are flat in the row count.
 3. **Exact verification against the M=1 bandwidth floor:** linears 1.06-1.07× at M=3 and 1.28-1.31× at M=4 (synthetic, cold
    weights). The M=4 step is register occupancy (223 registers hold the decoded weights that make the twins cheap), and every exact
-   variant that frees them was slower.
+   variant that frees them was slower. This holds for the Q3, Q4 and Q5 twins; NVFP4 linears run the tensor-core decode kernels
+   (at most 1.09× one row at 8 rows).
 4. **Why Q3 accepted less:** its 3-bit MTP projections, not the attention-pack re-quantization and not the base model. With the NVFP4
    MTP layer, Q3 accepts exactly as NVFP4 does at the same depth.
 5. **The shortlist does not limit acceptance.** Only 1.5-8.3% of rejections have their base token outside it, and smaller heads

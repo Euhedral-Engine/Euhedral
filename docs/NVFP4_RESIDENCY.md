@@ -177,7 +177,7 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
 
 - `tools/convert_checkpoint.py --quantization nvfp4`: the NVFP4 artifacts, quantized on the GPU by default (`tools/README.md`).
 - Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory, and `QwenNvfp4CudaLoadIntegrationTest`.
-- Execution: `native/src/nvfp4` (decode GEMV and row twins) and `native/src/nvfp4_native` ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)),
+- Execution: `native/src/nvfp4` (tensor-core decode, 1 to 8 rows) and `native/src/nvfp4_native` ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)),
   `euhedral_cuda_linear_nvfp4_bf16`, `euhedral_cuda_linear_nvfp4_native_bf16` and
   `euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16`, plan and frame dispatch for NVFP4 weights.
 - Residency: `ArtifactProfile`, `ResidencyPlanner`, `HostWeightSelection`, `WeightStaging`, `WeightTransferFrame`, the transfer

@@ -13,7 +13,7 @@
 #include <pthread.h>
 #endif
 
-/* NVFP4 weights (native/src/nvfp4/nvfp4.cuh): one-row decode and its 2 to 8 row twins on BF16 activations, and
+/* NVFP4 weights (native/src/nvfp4/nvfp4.cuh): the 1 to 8 row tensor-core decode on BF16 activations, and
  * (from two rows) the native Blackwell tensor-core route below. Every kernel has an _sd4 twin for
  * row-split-k128-sd4-v1 tensors (table-indexed block scales), told apart by their byte size. Exact numerics and
  * shapes no kernel takes run the scalar reference (reference.c). */
@@ -23,25 +23,23 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
-/* [layout]: 0 plain NVFP4, 1 SD4. */
-static CUfunction decode[2];
-static CUfunction decode_rows[2][EUHEDRAL_DECODE_MAX_ROWS + 1];  /* [layout][M] for 2..8 token rows */
+/* [layout][tile][M]: layout 0 plain NVFP4, 1 SD4; tile 0 _w8, 1 _w4 (decode_tile); 1 to 8 token rows. */
+static CUfunction decode_rows[2][2][EUHEDRAL_DECODE_MAX_ROWS + 1];
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static void initialize(void) {
-    init_status = euhedral_cuda_load_kernel((const void*)&once, "nvfp4/kernels.cu", "euhedral_nvfp4_decode", &module, &decode[0]);
+    init_status = euhedral_cuda_load_kernel((const void*)&once, "nvfp4/kernels.cu", "euhedral_nvfp4_decode_rows1_w8", &module,
+            &decode_rows[0][0][1]);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     for (int layout = 0; layout < 2; ++layout) {
-        const char* suffix = layout ? "_sd4" : "";
-        char name[64];
-        snprintf(name, sizeof(name), "euhedral_nvfp4_decode%s", suffix);
-        if (cuModuleGetFunction(&decode[layout], module, name) != CUDA_SUCCESS) init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-        euhedral_cuda_pdl_register(decode[layout]);
-        for (unsigned int m = 2; m <= EUHEDRAL_DECODE_MAX_ROWS; ++m) {
-            snprintf(name, sizeof(name), "euhedral_nvfp4_decode_rows%u%s", m, suffix);
-            if (cuModuleGetFunction(&decode_rows[layout][m], module, name) != CUDA_SUCCESS)
-                init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-            euhedral_cuda_pdl_register(decode_rows[layout][m]);
+        for (int tile = 0; tile < 2; ++tile) {
+            for (unsigned int m = 1; m <= EUHEDRAL_DECODE_MAX_ROWS; ++m) {
+                char name[64];
+                snprintf(name, sizeof(name), "euhedral_nvfp4_decode_rows%u_%s%s", m, tile ? "w4" : "w8", layout ? "_sd4" : "");
+                if (cuModuleGetFunction(&decode_rows[layout][tile][m], module, name) != CUDA_SUCCESS)
+                    init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+                euhedral_cuda_pdl_register(decode_rows[layout][tile][m]);
+            }
         }
     }
 }
@@ -102,23 +100,31 @@ static int prepare(const void* input, const void* weights, const void* output, u
     return ensure_initialized();
 }
 
-/* Production dispatch for BF16 activations: one row on the decode kernel, 2 to 8 rows (speculative verification
- * and drafting) on its row twins, each row bit for bit as a one-row call. Other row counts run on the native
- * route (euhedral_cuda_linear_nvfp4_native_bf16) or, when it declines, the scalar reference. */
+/* Decode tile of a weight shape (nvfp4/kernels.cu): 1 (_w4, 32 rows per CTA, 4 warps over K) for in_features above
+ * 5120 when out_features allows it, else 0 (_w8, 16 rows per CTA, 8 warps). A function of the shape alone, so
+ * one-row and multi-row calls on a tensor share their summation order. */
+static int decode_tile(uint32_t in_features, uint32_t out_features) {
+    return in_features > 5120u && out_features % 32u == 0;
+}
+
+/* Production dispatch for BF16 activations: 1 to 8 rows (decode, speculative verification and drafting) on the
+ * tensor-core decode kernels, each row bit for bit as a one-row call. Other row counts run on the native route
+ * (euhedral_cuda_linear_nvfp4_native_bf16) or, when it declines, the scalar reference. */
 int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
     int layout;
     int status = prepare(input, weights, output, rows, in_features, out_features, weights_byte_size, &layout);
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    const int qualified = rows <= EUHEDRAL_DECODE_MAX_ROWS && in_features % 1024u == 0 && out_features % 16u == 0;
+    const int qualified = rows <= EUHEDRAL_DECODE_MAX_ROWS && in_features % 128u == 0 && out_features % 16u == 0;
     if (euhedral_cuda_exact_numerics() || !qualified)
         return euhedral_reference_nvfp4(input, weights, output, rows, in_features, out_features, layout);
     CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
     CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
     unsigned int in_arg = in_features, out_arg = out_features;
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
-    return finish(euhedral_launch_kernel(rows == 1u ? decode[layout] : decode_rows[layout][rows], out_features / 16u,
-            1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL));
+    const int tile = decode_tile(in_features, out_features);
+    return finish(euhedral_launch_kernel(decode_rows[layout][tile][rows], out_features / (tile ? 32u : 16u), 1, 1,
+            tile ? 128u : 256u, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL));
 }
 
 /* Native Blackwell NVFP4 (native/src/nvfp4_native, docs/NVFP4_NATIVE.md): the BF16 activations are

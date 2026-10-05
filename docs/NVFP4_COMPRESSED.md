@@ -156,7 +156,7 @@ python3 tools/compare_teacher_forced.py /tmp/nvfp4.bin /tmp/sd4.bin
 ## Kernels
 
 **Every NVFP4 kernel has an `_sd4` twin:**
-- decode for 1 row and for 2-8 rows (`euhedral_nvfp4_decode_sd4`, `euhedral_nvfp4_decode_rows<M>_sd4`);
+- decode for 1 to 8 rows (`euhedral_nvfp4_decode_rows<M>_{w8,w4}_sd4`);
 - the native OMMA linear, gate/up and skinny kernels (`euhedral_nvfp4n_*_sd4`);
 - the scalar reference (`euhedral_nvfp4_reference_sd4`), which exact numerics run.
 
