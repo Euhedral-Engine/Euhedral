@@ -125,3 +125,38 @@ the expert saw, which wave it ran in or what was in the cache. `Qwen4MoeFixtureC
 20-slot minimum cache (every chunk evicts) and with 520 slots and requires identical bits.
 
 Kernel contract and measurements of the expert kernels: [FLASH_NEXT_EXPERTS.md](FLASH_NEXT_EXPERTS.md).
+
+## Executor, sequence state, prefill and decode
+
+`Qwen4Executor` runs a loaded `Qwen4Model` one chunk of up to 512 tokens at a time: the embedding gather (the table may be in
+device memory or host-mapped), the repetition over four streams, 48 layers, then, when logits are wanted, the final mix of the
+last row and the output head. Prefill chunks and decode steps are the same code over different row counts; the output of a step
+is the logits row of its last token, offered to a `LogitsSink` that queues its copy behind the head. The executor owns one stream
+and one workspace (state, mixer, block output, hyper-connection, layer and MoE scratch, about 260 MiB at 512 rows), allocated once.
+A step waits for the device once per MoE block (the routing) and once at its end.
+
+**Sequence state** (`Qwen4Sequence`) is what one sequence carries between steps: the FP32 recurrent state and three rows of
+convolution history of each of the 36 GDN layers (114 MiB, independent of length), the NVFP4 key/value pages and pooled indexer
+keys of each of the 12 attention layers (640 bytes per token, pages reserved as the sequence grows), the per-layer embedding's
+convolution history and n-gram context, and the position. Expert residency is not in it: it belongs to the model's cache, so any
+number of sequences share it and none retains a slot. The residency plan's accounting (`Qwen4SequenceState`) is what a sequence
+actually allocates (`aSequenceHoldsWhatThePlanReserved`). The KV chunk of a step is committed when the step has retired and discarded
+when it failed, so a failed step leaves the sequence where it was; closing releases every buffer.
+
+**Prefill** cuts a prompt into chunks of at most 512 tokens. A chunk's rows run through GDN in order (so the state is the one a
+token-by-token run would reach), through attention with per-row selection, and through the MoE block in expert waves. Any
+chunking gives the same result up to BF16 noise, because the engine's NVFP4 linears switch kernels at nine rows (activations are
+quantized from nine rows on): the logits of one prompt differ by about 7% to 10% relative RMS between chunkings, the reference's own
+chunk-to-chunk difference being 9%, with the same greedy token (`Qwen4InvarianceCudaIntegrationTest`). The expert cache is another
+matter: the experts' kernels are row-exact and independent of what is resident, so a cold cache, a warm cache and the 20-slot
+minimum cache with 10,019 evictions produce identical bits.
+
+**Decode** is a one-row step from the prefilled state; the sampler is the engine's, outside the model.
+
+**Dynamic boundaries.** The step runs uncaptured. For the performance work that follows, the parts that change from step to step
+are: the experts each layer needs (a host decision after the routing readback, and the slot addresses of the leases it obtains),
+the position (kernel arguments of the attention and RoPE kernels, and the block counts that size the selection), and the KV
+pages the position reaches. The stable parts are the layer kernels' shapes and the addresses of every workspace buffer. A captured
+decode step would therefore split at each MoE block into a graph of the layer's attention part and a graph of its expert part
+whose slot addresses come from a device-side table the host fills; the cache's slot addresses are stable, so the table can be
+written per layer without changing the graph, and fences stay device-ordered either way.
