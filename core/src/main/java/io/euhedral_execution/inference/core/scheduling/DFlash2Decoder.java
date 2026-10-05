@@ -70,6 +70,12 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         }
     }
 
+    /// Sees each verified step (tests and quality measurements): the anchor's position, the anchor, the proposal,
+    /// each proposal position's 16 candidates (logit descending, row-major), and the drafts the target accepted.
+    public interface StepListener {
+        void verified(long position, int anchor, int[] proposal, int[] candidates, int acceptedDrafts);
+    }
+
     private final EuhedralInferenceRuntime runtime;
     private final QwenExecutionPlan plan;
     private final QwenSequenceState sequence;
@@ -80,6 +86,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
     private final DFlash2Proposal proposal;
     private final DFlash2Checkpoint checkpoint;
     private Statistics statistics;
+    private StepListener steps;
 
     public static SpeculativeDecoding.Factory factory() {
         return DFlash2Decoder::new;
@@ -113,6 +120,10 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
     public Statistics statistics() {
         return this.statistics;
+    }
+
+    public void observe(StepListener listener) {
+        this.steps = listener;
     }
 
     @Override
@@ -237,11 +248,13 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                         int[] rows = new int[block.length];
                         rows[0] = anchor;
                         System.arraycopy(DFlash2Decoder.this.proposal.tokens(), 0, rows, 1, drafts());
-                        return verify(position, rows);
+                        int[] candidates =
+                                DFlash2Decoder.this.steps == null ? null : DFlash2Decoder.this.proposal.candidates();
+                        return verify(position, rows, candidates);
                     });
         }
 
-        private CompletableFuture<List<Integer>> verify(long position, int[] rows) {
+        private CompletableFuture<List<Integer>> verify(long position, int[] rows, int[] candidates) {
             var acceptance = new SpeculativeAcceptance(
                     rows, DFlash2Decoder.this.endOfGeneration, this.maxNewTokens - this.output.size());
             long started = System.nanoTime();
@@ -261,6 +274,14 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                         statistics.verifyNanos += executed - started;
                         statistics.verifications++;
                         statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
+                        StepListener listener = DFlash2Decoder.this.steps;
+                        if (listener != null)
+                            listener.verified(
+                                    position,
+                                    rows[0],
+                                    Arrays.copyOfRange(rows, 1, rows.length),
+                                    candidates,
+                                    acceptance.acceptedDrafts());
                         int[] committed = acceptance.outputs();
                         if (this.timing != null)
                             this.timing.speculativeStep(

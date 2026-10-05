@@ -191,7 +191,8 @@ public final class DFlash2Frame extends QwenStageFrame {
                                 instruction.inputWidth(),
                                 tokens,
                                 scores);
-                if (context.proposal() != null) context.proposal().queue(tokens, scores);
+                if (context.proposal() != null)
+                    context.proposal().queue(tokens, scores, input(context, instruction, 2));
             }
             default ->
                 throw new IllegalArgumentException(
