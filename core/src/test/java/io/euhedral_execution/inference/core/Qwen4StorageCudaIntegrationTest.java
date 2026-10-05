@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.ComponentGroup;
+import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4ResidencyPlan;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Tensor;
@@ -28,7 +30,8 @@ import java.util.SplittableRandom;
 import java.util.zip.CRC32;
 import org.junit.jupiter.api.Test;
 
-/// The real Flash-Next artifact through the engine's storage load on the real GPU, for several maximum contexts: every
+/// The real Flash-Next artifact through the engine's storage load on the real GPU, for several maximum contexts:
+/// every
 /// component has a location, device memory stays within the plan, experts move through the cache with the artifact's
 /// own bytes, rows come out of the n-gram tables, and closing returns every allocation. No model runs.
 class Qwen4StorageCudaIntegrationTest {
@@ -53,7 +56,7 @@ class Qwen4StorageCudaIntegrationTest {
             Qwen4Storage storage = Qwen4Storage.load(config);
             CudaGpuMemory gpu = (CudaGpuMemory) storage.gpu();
             try {
-                verify(storage, artifact, context);
+                verify(storage.model(), gpu, artifact, context);
             } finally {
                 storage.close();
             }
@@ -62,10 +65,67 @@ class Qwen4StorageCudaIntegrationTest {
         }
     }
 
-    private static void verify(Qwen4Storage storage, Path artifact, int context) throws Exception {
-        Qwen4Model model = storage.model();
-        Qwen4ResidencyPlan plan = storage.plan();
-        CudaGpuMemory gpu = (CudaGpuMemory) storage.gpu();
+    /// A device with far less free memory than the GPU has: fixed objects must leave it, the output head is read in
+    /// place from mapped host memory, and the load still places every object and moves every expert correctly.
+    @Test
+    void placesFixedObjectsOnTheHostWhenTheDeviceIsSmall() throws Exception {
+        Path artifact = artifactPath();
+        assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
+        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
+        try (CudaGpuMemory gpu = new CudaGpuMemory(library)) {
+            long free = Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes());
+            Qwen4Model model = Qwen4Model.open(artifact, gpu, free, HostBudget.system(), Qwen4Mode.TEXT, 262144);
+            try {
+                var plan = model.plan();
+                assertTrue(plan.host().stagedBytes() > 0, plan.report());
+                assertEquals(StorageClass.HOST_MAPPED, plan.storageOf("text/output_head"));
+                assertTrue(model.staging() != null);
+                assertTrue(gpu.allocatedBytes() <= free, "allocated " + gpu.allocatedBytes() + " of " + free);
+                verify(model, gpu, artifact, 262144);
+            } finally {
+                model.close();
+            }
+            assertEquals(0, gpu.allocatedBytes());
+            assertEquals(0, gpu.hostWeightBytes());
+        }
+    }
+
+    /// The MTP layer and its experts load, and their experts move through the same cache, when the mode selects MTP.
+    @Test
+    void selectingMtpLoadsItsLayerAndItsExpertBank() throws Exception {
+        Path artifact = artifactPath();
+        assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
+        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
+        try (CudaGpuMemory gpu = new CudaGpuMemory(library)) {
+            Qwen4Model model = Qwen4Model.open(
+                    artifact,
+                    gpu,
+                    gpu.deviceMemoryInfo().freeBytes(),
+                    HostBudget.system(),
+                    new Qwen4Mode(true, false),
+                    8192);
+            try {
+                assertEquals(49, model.expertBanks().length);
+                assertTrue(model.tensors().containsKey("mtp/fc_embedding"));
+                int mtp = model.bankOrdinal("mtp/layers/0/moe/experts");
+                ExpertBank bank = model.expertBanks()[mtp];
+                try (ExpertLease lease = model.expertCache().acquire(mtp, 511);
+                        Arena arena = Arena.ofConfined()) {
+                    MemorySegment back = arena.allocate(lease.byteSize());
+                    gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
+                    assertArrayEquals(
+                            readFile(artifact, bank.fileOffset(511), (int) bank.recordBytes(511)),
+                            back.toArray(ValueLayout.JAVA_BYTE));
+                }
+            } finally {
+                model.close();
+            }
+            assertEquals(0, gpu.allocatedBytes());
+        }
+    }
+
+    private static void verify(Qwen4Model model, CudaGpuMemory gpu, Path artifact, int context) throws Exception {
+        Qwen4ResidencyPlan plan = model.plan();
         assertTrue(plan.fits(), plan.report());
         assertEquals(context, plan.maxContextTokens());
         System.out.println("context " + context + "\n" + plan.report());
@@ -98,24 +158,21 @@ class Qwen4StorageCudaIntegrationTest {
         System.out.println(model.telemetry());
     }
 
+    /// Every loaded fixed object holds the artifact's bytes where the plan put it (the first 64 MiB of the big ones).
     private static void verifyFixed(Qwen4Model model, CudaGpuMemory gpu, Path artifact) throws IOException {
         int checked = 0;
         for (TensorHandle handle : model.tensors().values()) {
-            if (handle.byteSize() > (64 << 20) && checked > 0) continue;
+            int length = (int) Math.min(handle.byteSize(), 64 << 20);
             byte[] expected = readFile(
                     artifact,
                     model.artifact().tensor(handle.name()).orElseThrow().dataOffset(),
-                    (int) handle.byteSize());
+                    length);
             try (Arena arena = Arena.ofConfined()) {
-                MemorySegment back = arena.allocate(handle.byteSize());
+                MemorySegment back = arena.allocate(length);
                 if (handle.hostBacked() || handle.hostMapped())
                     MemorySegment.copy(
-                            MemorySegment.ofAddress(handle.hostAddress()).reinterpret(handle.byteSize()),
-                            0,
-                            back,
-                            0,
-                            handle.byteSize());
-                else gpu.copyDeviceToHost(back, handle.deviceAddress(), handle.byteSize());
+                            MemorySegment.ofAddress(handle.hostAddress()).reinterpret(length), 0, back, 0, length);
+                else gpu.copyDeviceToHost(back, handle.deviceAddress(), length);
                 assertArrayEquals(expected, back.toArray(ValueLayout.JAVA_BYTE), handle.name());
             }
             checked++;
