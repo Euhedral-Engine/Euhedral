@@ -216,6 +216,13 @@ the native skinny kernel at 8 rows and 3-6 us faster from 2 to 7, so everything 
 - **Other tiles.** down (K = 17408): 16 rows x 4 warps 71.9 / 105.3, 32 x 8 64.5 / 86.4, 64 x 8 85.2 / 104.3, 64 x 4 71.5 / 106.4,
   against 63.9 / 71.2 for 32 x 4; gate_up (K = 5120): 32 x 8 120.2 / 120.5 and 32 x 4 125.1 / 125.2 against 115.0 / 120.6 for
   16 x 8. Short K needs more warps per output row to keep loads in flight; long K amortizes more rows per CTA.
+- **The decode kernels beyond 8 rows** (prefill quanta of 9 to 64 rows): T groups of 8 token rows as the N columns of MMAs
+  that share each decoded weight fragment, rows bit for bit one-row decode. us at 12 / 16 rows, best tile (64 output rows, 8
+  warps): down 90.6 / 93.1, gate_up 132.6 / 138.0, query_key 32.8 / 34.2, against the native skinny route's 76.3 / 76.8,
+  124.2 / 124.7 and 36.0 / 36.2 through the host entry point (about 4 us of call overhead included); 24 and 32 rows
+  fall further behind (down 149.9 / 166.2). Every CTA reads the activations in BF16 and decodes its weights with ALU work,
+  where the native route reads FP4 activations straight into FP4 MMAs. Large prefill quanta would also cap at BF16 MMA's
+  102 TFLOPS (FP32 accumulate) against FP4's 815, so prefill keeps the native route.
 - **The FP32 FMA GEMV** (each lane's 16-value blocks as FMA chains, the block scale applied once) **and its row twins**, which
   repeat the one-row FMA sequence per token row: 64.8 / 125.2 on down, 119.2 / 214.0 on gate_up. The twins hold the decoded
   weights in 223-237 registers whatever the loop order; paired FMAs (`fma.rn.f32x2`, bitwise the same chains) and a
