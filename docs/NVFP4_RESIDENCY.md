@@ -180,15 +180,6 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
   that pushes more weights to the host, and the copies are bound by bandwidth, not by how far they run ahead.
 - **The staging DAG without its copies** costs 2% (47.2 against 48.1 tok/s).
 
-## Open
-
-- **A later long request decodes slower than the first one in the process.** `nvfp4-compressed`, 32K context, the 31,906-token
-  chat prompt, 128 generated tokens: 102.4 tok/s when it is the process's first request and 67.8-70.5 after another 32K request
-  or after 4K and 16K requests (102.3 after a single 16K request). The kernels run as fast and replay from the same captured
-  graphs as often (19 capture keys, 21 recordings in both); the GPU idles between dependent kernels of the replayed graphs, 10-16
-  us per edge instead of about 1 us. Q3 artifacts, which stage no weights, do not slow down (`q3` 109.8 tok/s either way), so the
-  staged views are the first suspect.
-
 ## Where it lives
 
 - `tools/convert_checkpoint.py --quantization nvfp4`: the NVFP4 artifacts, quantized on the GPU by default (`tools/README.md`).

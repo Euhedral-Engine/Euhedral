@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core;
 
+import io.euhedral_execution.core.config.FragmentConfig;
+import io.euhedral_execution.core.config.IdlePolicy;
 import io.euhedral_execution.core.config.LatticeConfig;
 import io.euhedral_execution.core.control_plane.ControlPlaneLattice;
 import io.euhedral_execution.core.control_plane.ControlPlaneShard;
@@ -511,12 +513,31 @@ public final class InferenceEngine implements AutoCloseable {
             return QwenModel.load(path, artifact, gpu, profile.speculation(), plan.hostBacked());
         }
 
+        /// Fragment defaults with fixed idle timing: an idle worker parks for the default 15 us. The adaptive
+        /// timing derives a worker's park (up to 0.8 ms) and its choice to idle from that worker's own history,
+        /// which only work refreshes; after long prefills it left fewer and fewer workers awake, and the
+        /// frame-by-frame quanta of later requests waited on parked workers (docs/FRAME_MODEL.md).
+        static FragmentConfig fragmentConfig() {
+            FragmentConfig defaults = FragmentConfig.ofDefaults();
+            return new FragmentConfig(
+                    defaults.cloneConfig(),
+                    defaults.cacheConfig(),
+                    defaults.observer(),
+                    defaults.maxBatchSize(),
+                    defaults.smtEnabled(),
+                    new IdlePolicy(IdlePolicy.DEFAULT_IDLE_PARK_NS, IdlePolicy.DEFAULT_CONTENTION_HALF_LIFE_NANOS),
+                    defaults.benchmarkMode(),
+                    defaults.metricPrefix(),
+                    defaults.registry());
+        }
+
         ControlPlaneLattice createLattice(InferenceConfig config) {
             return createLattice(config, new DefaultExecutor());
         }
 
         private ControlPlaneLattice createLattice(InferenceConfig config, AbstractExecutor executor) {
-            var shard = ControlPlaneShard.createBaseShard("InferenceShard", new BaseCloneableObject(executor));
+            var shard = ControlPlaneShard.createBaseShard(
+                    "InferenceShard", new BaseCloneableObject(fragmentConfig(), executor));
             var latticeConfig =
                     new LatticeConfig("InferenceLattice", config.workerCpus(), config.shutdownTimeout(), shard);
             long started = System.nanoTime();
