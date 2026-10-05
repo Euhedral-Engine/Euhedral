@@ -66,7 +66,7 @@ class Qwen4ExpertWaveTest {
                     int slot = descriptor.get(INT, at),
                             begin = descriptor.get(INT, at + 4),
                             count = descriptor.get(INT, at + 8);
-                    assertTrue(count >= 1 && count <= 8, "item count " + count);
+                    assertTrue(count >= 1 && count <= Qwen4ExpertWave.ITEM_PAIRS, "item count " + count);
                     assertTrue(slot >= lastItemExpert, "items ascend");
                     lastItemExpert = slot;
                     int expert = plan.waveExpert(wave, slot);
@@ -184,5 +184,18 @@ class Qwen4ExpertWaveTest {
         assertTrue(plan.descriptorBytes() % 16 == 0);
         assertTrue(plan.rowPairsOffset() + 4 * 1024 <= plan.descriptorBytes());
         assertTrue(plan.itemsOffset() >= 8 * 64);
+    }
+
+    @Test
+    void geometryChecksTheRecordLayoutTheKernelsAssume() {
+        Qwen4ExpertOps.Geometry geometry = Qwen4ExpertOps.Geometry.flashNext();
+        assertEquals(2560, geometry.hidden());
+        assertEquals(640, geometry.inter());
+        assertEquals(1_843_456, geometry.downOffset());
+        assertThrows(IllegalArgumentException.class, () -> new Qwen4ExpertOps.Geometry(2560, 600, 0, 1_843_456));
+        assertThrows(IllegalArgumentException.class, () -> new Qwen4ExpertOps.Geometry(2560, 640, 0, 1_843_457));
+        assertThrows(IllegalArgumentException.class, () -> new Qwen4ExpertOps.Geometry(2500, 640, 0, 1_843_456));
+        assertEquals(16 * (640 + 2560) * 2L, Qwen4ExpertOps.Scratch.bytes(16, 640, 2560));
+        assertEquals(1280 * 16L, Qwen4ExpertOps.Scratch.weightedOffset(16, 640));
     }
 }

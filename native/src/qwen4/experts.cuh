@@ -11,11 +11,11 @@
 // depends only on its own activations and on the tile's fixed K order, never on the tokens beside it: the same
 // (token, expert) pair gives the same bits whatever the wave, the work item or the column it sits in.
 //
-// A work item is one expert and up to 8 of its pairs (a pair is a token row and a routing weight). The host builds
+// A work item is one expert and up to 16 of its pairs (a pair is a token row and a routing weight). The host builds
 // the items of a wave in ascending expert order; a kernel's grid is (tiles of output rows, items).
 namespace q4 {
 
-// {slot index in the wave, first pair, pair count (1..8), unused}.
+// {slot index in the wave, first pair, pair count (1..16), unused}.
 struct ExpertItem {
     int expert, begin, count, unused;
 };
@@ -34,9 +34,13 @@ static __device__ __forceinline__ void load_pair_table(unsigned int* table) {
 }
 
 // The MMAs of one 16-row weight fragment over one chunk of 128 K values: the lane's 16 code bytes of rows g and g + 8
-// (`cg`, `ch`), their block scales (`sg`, `sh`: two E4M3 codes each) and the 32 activations of its token (`xs`).
-static __device__ __forceinline__ void mma_chunk(float (&acc)[4], const uint4 cg, const uint4 ch, const unsigned int sg,
-        const unsigned int sh, const unsigned int (&xs)[16], const unsigned int* pair_table) {
+// (`cg`, `ch`), their block scales (`sg`, `sh`: two E4M3 codes each) and the 32 activations of its token in the first
+// column tile (`xs0`) and, with kTwo, of its token in the second (`xs1`). A weight register is decoded once and feeds
+// the MMA of each tile.
+template <bool kTwo>
+static __device__ __forceinline__ void mma_chunk(float (&acc)[2][4], const uint4 cg, const uint4 ch,
+        const unsigned int sg, const unsigned int sh, const unsigned int (&xs0)[16], const unsigned int (&xs1)[16],
+        const unsigned int* pair_table) {
     const unsigned int wg[4] = {cg.x, cg.y, cg.z, cg.w}, wh[4] = {ch.x, ch.y, ch.z, ch.w};
 #pragma unroll
     for (int half = 0; half < 2; half++) {
@@ -58,52 +62,88 @@ static __device__ __forceinline__ void mma_chunk(float (&acc)[4], const uint4 cg
             asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                     "{%0,%1,%2,%3};\n"
-                    : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xs[2 * s]), "r"(xs[2 * s + 1]));
+                    : "+f"(acc[0][0]), "+f"(acc[0][1]), "+f"(acc[0][2]), "+f"(acc[0][3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xs0[2 * s]), "r"(xs0[2 * s + 1]));
+            if (kTwo) {
+                asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                        "{%0,%1,%2,%3};\n"
+                        : "+f"(acc[1][0]), "+f"(acc[1][1]), "+f"(acc[1][2]), "+f"(acc[1][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xs1[2 * s]), "r"(xs1[2 * s + 1]));
+            }
         }
     }
 }
 
-// F weight fragments (16 rows each, row r of fragment f is `rows[f] + r`) of one tensor against the 8 token columns
-// whose activation rows start at `x_row` (null: a column without a token, zeros). The warp handles the chunks
-// kw, kw + W, ... of 128 K values in order; lane (g, q) loads 16 code bytes of rows g and g + 8 and the 32
-// activations of token g at K offset 32 q of a chunk.
-template <int F, int W>
-static __device__ __forceinline__ void tile_mma(float (&acc)[F][4], const nvfp4::Layout& w, const unsigned int (&rows)[F],
-        const unsigned short* x_row, const unsigned int chunks, const unsigned int kw, const unsigned int* pair_table) {
-    const unsigned int q = threadIdx.x & 3u;
+// The 32 activations at `k0` of an activation row (null: a column without a token, zeros) as 16 registers.
+static __device__ __forceinline__ void load_activations(unsigned int (&xs)[16], const unsigned short* x_row,
+        const unsigned int k0) {
+    uint4 xa[4];
 #pragma unroll
-    for (int f = 0; f < F; f++) acc[f][0] = acc[f][1] = acc[f][2] = acc[f][3] = 0.0f;
+    for (int i = 0; i < 4; i++)
+        xa[i] = x_row != nullptr ? reinterpret_cast<const uint4*>(x_row + k0)[i] : make_uint4(0, 0, 0, 0);
+    const unsigned int words[16] = {xa[0].x, xa[0].y, xa[0].z, xa[0].w, xa[1].x, xa[1].y, xa[1].z, xa[1].w,
+                                    xa[2].x, xa[2].y, xa[2].z, xa[2].w, xa[3].x, xa[3].y, xa[3].z, xa[3].w};
+#pragma unroll
+    for (int i = 0; i < 16; i++) xs[i] = words[i];
+}
+
+template <bool kTwo, int F, int W>
+static __device__ __forceinline__ void chunk_loop(float (&acc)[F][2][4], const nvfp4::Layout& w,
+        const unsigned int (&rows)[F], const unsigned short* x_row0, const unsigned short* x_row1,
+        const unsigned int chunks, const unsigned int kw, const unsigned int* pair_table) {
+    const unsigned int g = (threadIdx.x & 31u) >> 2, q = threadIdx.x & 3u;
 #pragma unroll 2
     for (unsigned int c = kw; c < chunks; c += (unsigned int)W) {
         const unsigned int k0 = c * 128u + 32u * q;
-        uint4 xa[4];
-#pragma unroll
-        for (int i = 0; i < 4; i++)
-            xa[i] = x_row != nullptr ? reinterpret_cast<const uint4*>(x_row + k0)[i] : make_uint4(0, 0, 0, 0);
-        const unsigned int xs[16] = {xa[0].x, xa[0].y, xa[0].z, xa[0].w, xa[1].x, xa[1].y, xa[1].z, xa[1].w,
-                                     xa[2].x, xa[2].y, xa[2].z, xa[2].w, xa[3].x, xa[3].y, xa[3].z, xa[3].w};
-        const unsigned int g = (threadIdx.x & 31u) >> 2;
+        unsigned int xs0[16], xs1[16];
+        load_activations(xs0, x_row0, k0);
+        if (kTwo) load_activations(xs1, x_row1, k0);
 #pragma unroll
         for (int f = 0; f < F; f++) {
             const unsigned int rg = rows[f] + g, rh = rg + 8u;
             const uint4 cg = *reinterpret_cast<const uint4*>(w.codes + (unsigned long long)rg * w.row_bytes + k0 / 2u);
             const uint4 ch = *reinterpret_cast<const uint4*>(w.codes + (unsigned long long)rh * w.row_bytes + k0 / 2u);
-            mma_chunk(acc[f], cg, ch, w.scale_bits(rg, k0 / 32u), w.scale_bits(rh, k0 / 32u), xs, pair_table);
+            mma_chunk<kTwo>(acc[f], cg, ch, w.scale_bits(rg, k0 / 32u), w.scale_bits(rh, k0 / 32u), xs0, xs1,
+                    pair_table);
         }
     }
 }
 
-// Writes a warp's accumulators of F fragments to shared memory as partial[row][token].
+// F weight fragments (16 rows each, row r of fragment f is `rows[f] + r`) of one tensor against the token columns of
+// an item: tile 0 holds the item's pairs 0..7 and, when `two`, tile 1 its pairs 8..15 (`x_row0`, `x_row1` start the
+// activation rows of this lane's column g in each tile; null: no token). The warp handles the chunks kw, kw + W, ...
+// of 128 K values in order; lane (g, q) loads 16 code bytes of rows g and g + 8 and the 32 activations of its
+// tokens at K offset 32 q of a chunk. The sum of a (row, token) is a function of the tile (F, W) alone.
+template <int F, int W>
+static __device__ __forceinline__ void tile_mma(float (&acc)[F][2][4], const nvfp4::Layout& w,
+        const unsigned int (&rows)[F], const unsigned short* x_row0, const unsigned short* x_row1, const bool two,
+        const unsigned int chunks, const unsigned int kw, const unsigned int* pair_table) {
+#pragma unroll
+    for (int f = 0; f < F; f++)
+#pragma unroll
+        for (int t = 0; t < 2; t++) acc[f][t][0] = acc[f][t][1] = acc[f][t][2] = acc[f][t][3] = 0.0f;
+    if (two)
+        chunk_loop<true, F, W>(acc, w, rows, x_row0, x_row1, chunks, kw, pair_table);
+    else
+        chunk_loop<false, F, W>(acc, w, rows, x_row0, x_row1, chunks, kw, pair_table);
+}
+
+// Writes a warp's accumulators of F fragments to shared memory as partial[row][token] (16 tokens).
 template <int F>
-static __device__ __forceinline__ void store_partial(float (*partial)[8], const float (&acc)[F][4]) {
+static __device__ __forceinline__ void store_partial(float (*partial)[16], const float (&acc)[F][2][4],
+        const bool two) {
     const unsigned int lane = threadIdx.x & 31u, g = lane >> 2, q = lane & 3u;
 #pragma unroll
     for (int f = 0; f < F; f++) {
-        partial[16 * f + g][2 * q] = acc[f][0];
-        partial[16 * f + g][2 * q + 1] = acc[f][1];
-        partial[16 * f + g + 8][2 * q] = acc[f][2];
-        partial[16 * f + g + 8][2 * q + 1] = acc[f][3];
+#pragma unroll
+        for (int t = 0; t < 2; t++) {
+            if (t == 1 && !two) continue;
+            partial[16 * f + g][8 * t + 2 * q] = acc[f][t][0];
+            partial[16 * f + g][8 * t + 2 * q + 1] = acc[f][t][1];
+            partial[16 * f + g + 8][8 * t + 2 * q] = acc[f][t][2];
+            partial[16 * f + g + 8][8 * t + 2 * q + 1] = acc[f][t][3];
+        }
     }
 }
 
@@ -118,7 +158,7 @@ static __device__ __forceinline__ void gate_up_swiglu(const unsigned long long* 
         const unsigned short* __restrict__ x, unsigned short* __restrict__ act, unsigned int record_offset,
         unsigned int hidden, unsigned int inter) {
     __shared__ unsigned int pair_table[256];
-    __shared__ float partial[RW][W][32 * P][8];
+    __shared__ float partial[RW][W][32 * P][16];
     load_pair_table(pair_table);
     __syncthreads();
     const ExpertItem item = items[blockIdx.y];
@@ -132,14 +172,17 @@ static __device__ __forceinline__ void gate_up_swiglu(const unsigned long long* 
         rows[p] = row0 + 16u * p;
         rows[P + p] = inter + row0 + 16u * p;
     }
-    const unsigned short* x_row =
+    const bool two = item.count > 8;
+    const unsigned short* x_row0 =
             (int)g < item.count ? x + (unsigned long long)pairs[item.begin + g].token * hidden : nullptr;
-    float acc[2 * P][4];
-    tile_mma<2 * P, W>(acc, w, rows, x_row, hidden / 128u, kw, pair_table);
-    store_partial<2 * P>(partial[rw][kw], acc);
+    const unsigned short* x_row1 =
+            (int)g + 8 < item.count ? x + (unsigned long long)pairs[item.begin + 8 + g].token * hidden : nullptr;
+    float acc[2 * P][2][4];
+    tile_mma<2 * P, W>(acc, w, rows, x_row0, x_row1, two, hidden / 128u, kw, pair_table);
+    store_partial<2 * P>(partial[rw][kw], acc, two);
     __syncthreads();
-    for (unsigned int index = kw * 32u + lane; index < 16u * P * 8u; index += 32u * W) {
-        const unsigned int t = index & 7u, r = index >> 3;
+    for (unsigned int index = kw * 32u + lane; index < 16u * P * 16u; index += 32u * W) {
+        const unsigned int t = index & 15u, r = index >> 4;
         if ((int)t >= item.count) continue;
         float gate = partial[rw][0][r][t], up = partial[rw][0][16 * P + r][t];
 #pragma unroll
@@ -162,7 +205,7 @@ static __device__ __forceinline__ void down_weighted(const unsigned long long* _
         const unsigned short* __restrict__ act, unsigned short* __restrict__ weighted, unsigned int record_offset,
         unsigned int inter, unsigned int hidden) {
     __shared__ unsigned int pair_table[256];
-    __shared__ float partial[RW][W][16 * R][8];
+    __shared__ float partial[RW][W][16 * R][16];
     load_pair_table(pair_table);
     __syncthreads();
     const ExpertItem item = items[blockIdx.y];
@@ -173,13 +216,16 @@ static __device__ __forceinline__ void down_weighted(const unsigned long long* _
     unsigned int rows[R];
 #pragma unroll
     for (int f = 0; f < R; f++) rows[f] = row0 + 16u * f;
-    const unsigned short* x_row = (int)g < item.count ? act + (unsigned long long)(item.begin + g) * inter : nullptr;
-    float acc[R][4];
-    tile_mma<R, W>(acc, w, rows, x_row, inter / 128u, kw, pair_table);
-    store_partial<R>(partial[rw][kw], acc);
+    const bool two = item.count > 8;
+    const unsigned short* x_row0 = (int)g < item.count ? act + (unsigned long long)(item.begin + g) * inter : nullptr;
+    const unsigned short* x_row1 =
+            (int)g + 8 < item.count ? act + (unsigned long long)(item.begin + 8 + g) * inter : nullptr;
+    float acc[R][2][4];
+    tile_mma<R, W>(acc, w, rows, x_row0, x_row1, two, inter / 128u, kw, pair_table);
+    store_partial<R>(partial[rw][kw], acc, two);
     __syncthreads();
-    for (unsigned int index = kw * 32u + lane; index < 16u * R * 8u; index += 32u * W) {
-        const unsigned int t = index & 7u, r = index >> 3;
+    for (unsigned int index = kw * 32u + lane; index < 16u * R * 16u; index += 32u * W) {
+        const unsigned int t = index & 15u, r = index >> 4;
         if ((int)t >= item.count) continue;
         float sum = partial[rw][0][r][t];
 #pragma unroll
@@ -205,12 +251,12 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q4_expert_gate_up_swi
 
 // The down projection of every item with the routing weight applied: arguments as above, act [pairs][inter] in and
 // weighted [pairs][hidden] out, the record offset of the expert's down tensor.
-//   grid (hidden / 256, items), block 256.
-extern "C" __global__ __launch_bounds__(256) void euhedral_q4_expert_down_bf16(
+//   grid (hidden / 128, items), block 128.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q4_expert_down_bf16(
         const unsigned long long* __restrict__ slots, const q4::ExpertItem* __restrict__ items,
         const q4::ExpertPair* __restrict__ pairs, const unsigned short* __restrict__ act,
         unsigned short* __restrict__ weighted, unsigned int record_offset, unsigned int inter, unsigned int hidden) {
-    q4::down_weighted<2, 1, 8>(slots, items, pairs, act, weighted, record_offset, inter, hidden);
+    q4::down_weighted<2, 1, 4>(slots, items, pairs, act, weighted, record_offset, inter, hidden);
 }
 
 // out[t][c] = bf16(... bf16(bf16(out[t][c] + weighted[p0][c]) + weighted[p1][c]) ...) over the pairs p0, p1, ... of
@@ -237,13 +283,25 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q4_expert_combine_bf1
 #pragma unroll
         for (int i = 0; i < 8; i++) total[i] = q4::bf((unsigned short)(words[i >> 1] >> (16 * (i & 1))));
     }
-    for (unsigned int i = begin; i < end; i++) {
-        const uint4 packed = *reinterpret_cast<const uint4*>(
-                weighted + (unsigned long long)token_pair[i] * hidden + column);
-        const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+    // The pair lists are walked in batches of 8: the loads of a batch are issued together, the additions run in order.
+    for (unsigned int first = begin; first < end; first += 8u) {
+        const unsigned int n = min(8u, end - first);
+        uint4 rows[8];
 #pragma unroll
-        for (int j = 0; j < 8; j++)
-            total[j] = q4::round_bf(total[j] + q4::bf((unsigned short)(words[j >> 1] >> (16 * (j & 1)))));
+        for (unsigned int j = 0; j < 8u; j++) {
+            if (j < n)
+                rows[j] = *reinterpret_cast<const uint4*>(
+                        weighted + (unsigned long long)token_pair[first + j] * hidden + column);
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < 8u; j++) {
+            if (j < n) {
+                const unsigned int words[4] = {rows[j].x, rows[j].y, rows[j].z, rows[j].w};
+#pragma unroll
+                for (int c = 0; c < 8; c++)
+                    total[c] = q4::round_bf(total[c] + q4::bf((unsigned short)(words[c >> 1] >> (16 * (c & 1)))));
+            }
+        }
     }
     unsigned int result[4];
 #pragma unroll
