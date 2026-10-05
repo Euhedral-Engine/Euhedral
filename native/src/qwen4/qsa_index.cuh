@@ -18,23 +18,43 @@ static __device__ __forceinline__ void mma_bf16_16816(float (&c)[4], unsigned a0
 
 }  // namespace q4
 
+namespace q4 {
+
+static __device__ __forceinline__ void ldsm_x4_b16(unsigned (&r)[4], const void* p) {
+    unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+}  // namespace q4
+
 // Scores of a tile of rows against the pooled block keys on BF16 tensor cores with FP32 accumulation.
 //   q       rotated indexer queries, row row_begin + r at q + (row_begin + r) * q_row_stride, 4 heads of 128 values
 //   keys    pooled, normalized, rotated block keys [block][128]
 //   scores  [tile_rows][score_stride] FP32; entry (r, j) is written for j < nb of row row_begin + r only
-// A warp computes the scores of 4 rows x 4 heads (the 16 rows of an m16n8k16 tile) against 8 blocks per step; the
-// four heads of a row sit in rows 4 r .. 4 r + 3 of the tile, so the relu-sum over heads is a shuffle across the
-// lanes that differ in their row bits.
+// The CTA stages its 64 block keys in shared memory once, for all its warps. A warp computes the scores of 4 rows x
+// 4 heads (the 16 rows of an m16n8k16 tile) against 8 blocks per step, the keys' B fragments by ldmatrix; the four
+// heads of a row sit in rows 4 r .. 4 r + 3 of the tile, so the relu-sum over heads is a shuffle across the lanes
+// that differ in their row bits.
 //   grid (ceil(blocks_total / 64), ceil(tile_rows / 32)), block 256: 8 warps = 32 rows, 8 n-tiles = 64 blocks.
 extern "C" __global__ __launch_bounds__(256) void euhedral_q4_qsa_scores(
         const unsigned short* __restrict__ q, const unsigned short* __restrict__ keys, float* __restrict__ scores,
         unsigned int row_begin, unsigned int tile_rows, unsigned int start, unsigned int q_row_stride,
         unsigned int score_stride, unsigned int blocks_total) {
+    constexpr unsigned int kStride = 136;  // 128 values and 8 of padding: conflict-free ldmatrix rows
+    __shared__ __align__(16) unsigned short key_tile[64 * kStride];
     const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned int g = lane >> 2, tig = lane & 3u;
+    const unsigned int block0 = blockIdx.x * 64u;
+    for (unsigned int i = threadIdx.x; i < 64u * 16u; i += blockDim.x) {
+        const unsigned int key = i >> 4, chunk = i & 15u;
+        uint4 value = make_uint4(0u, 0u, 0u, 0u);
+        if (block0 + key < blocks_total)
+            value = *reinterpret_cast<const uint4*>(keys + (unsigned long long)(block0 + key) * 128u + chunk * 8u);
+        *reinterpret_cast<uint4*>(key_tile + key * kStride + chunk * 8u) = value;
+    }
+    __syncthreads();
     const unsigned int row0 = blockIdx.y * 32u + warp * 4u;  // first tile row of this warp
     if (row0 >= tile_rows) return;
-    const unsigned int block0 = blockIdx.x * 64u;
     // A fragments: tile row m = 4 * lrow + head. Rows g and g + 8 of the fragment are (lrow g >> 2, head g & 3) and
     // (lrow 2 + (g >> 2), head g & 3).
     unsigned a[8][4];
@@ -51,37 +71,39 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q4_qsa_scores(
     // Blocks visible to the rows this lane writes: nb = (start + row + 1) / 4.
     const unsigned int blocksA = (start + row_begin + rowA + 1u) >> 2, blocksB = (start + row_begin + rowB + 1u) >> 2;
     const float inverse_root = 1.0f / 11.313708498984761f;  // 1 / sqrt(128)
-    for (unsigned int n = 0; n < 8u; n++) {
-        const unsigned int key_block = block0 + n * 8u + g;
-        const unsigned short* key = keys + (unsigned long long)key_block * 128u;
-        const bool real = key_block < blocks_total;
-        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned int pair = 0; pair < 4u; pair++) {
+        // Two n-tiles of 8 blocks: ldmatrix x4 gives b0, b1 of the first and of the second.
+        float c[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
 #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
-            const unsigned int dim = ks * 16u + 2u * tig;
-            const unsigned b0 = real ? *reinterpret_cast<const unsigned*>(key + dim) : 0u;
-            const unsigned b1 = real ? *reinterpret_cast<const unsigned*>(key + dim + 8u) : 0u;
-            q4::mma_bf16_16816(c, a[ks][0], a[ks][1], a[ks][2], a[ks][3], b0, b1);
+            unsigned b[4];
+            q4::ldsm_x4_b16(b, key_tile + (pair * 16u + (lane & 7u) + ((lane >> 4) << 3)) * kStride + ks * 16u
+                    + ((lane >> 3) & 1u) * 8u);
+            q4::mma_bf16_16816(c[0], a[ks][0], a[ks][1], a[ks][2], a[ks][3], b[0], b[1]);
+            q4::mma_bf16_16816(c[1], a[ks][0], a[ks][1], a[ks][2], a[ks][3], b[2], b[3]);
         }
-        float sum[4];
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            float v = fmaxf(c[i], 0.0f);
-            v += __shfl_xor_sync(0xffffffffu, v, 4);
-            v += __shfl_xor_sync(0xffffffffu, v, 8);
-            sum[i] = v;
-        }
-        if (head == 0u) {
-            const unsigned int column = block0 + n * 8u + 2u * tig;
-            if (rowA < tile_rows) {
-                float* out = scores + (unsigned long long)rowA * score_stride;
-                if (column < blocksA) out[column] = sum[0] * inverse_root;
-                if (column + 1u < blocksA) out[column + 1u] = sum[1] * inverse_root;
+        for (int half = 0; half < 2; half++) {
+            float sum[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float v = fmaxf(c[half][i], 0.0f);
+                v += __shfl_xor_sync(0xffffffffu, v, 4);
+                v += __shfl_xor_sync(0xffffffffu, v, 8);
+                sum[i] = v;
             }
-            if (rowB < tile_rows) {
-                float* out = scores + (unsigned long long)rowB * score_stride;
-                if (column < blocksB) out[column] = sum[2] * inverse_root;
-                if (column + 1u < blocksB) out[column + 1u] = sum[3] * inverse_root;
+            if (head == 0u) {
+                const unsigned int column = block0 + (2u * pair + half) * 8u + 2u * tig;
+                if (rowA < tile_rows) {
+                    float* out = scores + (unsigned long long)rowA * score_stride;
+                    if (column < blocksA) out[column] = sum[0] * inverse_root;
+                    if (column + 1u < blocksA) out[column + 1u] = sum[1] * inverse_root;
+                }
+                if (rowB < tile_rows) {
+                    float* out = scores + (unsigned long long)rowB * score_stride;
+                    if (column < blocksB) out[column] = sum[2] * inverse_root;
+                    if (column + 1u < blocksB) out[column + 1u] = sum[3] * inverse_root;
+                }
             }
         }
     }

@@ -19,7 +19,8 @@ class Qwen4QsaTimingCudaIntegrationTest {
 
     private static final int[] HISTORIES = histories();
 
-    /// 512-token multiples; EUHEDRAL_QWEN4_TIMING_HISTORIES overrides the default list (comma separated).
+    /// 512-token multiples; EUHEDRAL_QWEN4_TIMING_HISTORIES overrides the default list (comma
+    /// separated).
     private static int[] histories() {
         String configured = System.getenv("EUHEDRAL_QWEN4_TIMING_HISTORIES");
         if (configured == null) return new int[] {1024, 8192, 32768, 131072, 261632};

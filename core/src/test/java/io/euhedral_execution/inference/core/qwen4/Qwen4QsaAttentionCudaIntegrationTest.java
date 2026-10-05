@@ -33,8 +33,7 @@ class Qwen4QsaAttentionCudaIntegrationTest {
             int start,
             int rows,
             String selection,
-            int splits,
-            int warps) {
+            int splits) {
         int tokens = start + rows;
         try (Qwen4QsaState state = new Qwen4QsaState(gpu, KEY_HEADS * 256, tokens)) {
             // K and V rows of every position, appended in chunks of up to 512 rows.
@@ -113,8 +112,7 @@ class Qwen4QsaAttentionCudaIntegrationTest {
                         ROW,
                         256,
                         ROW,
-                        256,
-                        warps);
+                        256);
                 if (splits > 1) Qwen4QsaOps.merge(gpu, partial, gate, core, gated, rows, QUERY_HEADS, splits, ROW, 256);
                 short[] actualCore = downloadShorts(gpu, arena, core, (long) rows * ROW);
                 short[] actualGated = downloadShorts(gpu, arena, gated, (long) rows * ROW);
@@ -173,10 +171,10 @@ class Qwen4QsaAttentionCudaIntegrationTest {
         try (CudaGpuMemory gpu = open();
                 Arena arena = Arena.ofConfined()) {
             for (int splits : new int[] {1, 8}) {
-                double[] a = run(gpu, arena, rng, "5 rows at 32, splits " + splits, 32, 5, "dense", splits, 2);
-                double[] b = run(gpu, arena, rng, "1 row at 0, splits " + splits, 0, 1, "dense", splits, 1);
-                double[] c = run(gpu, arena, rng, "7 rows at 1500, splits " + splits, 1500, 7, "dense", splits, 2);
-                double[] d = run(gpu, arena, rng, "decode at 2000, splits " + splits, 2000, 1, "dense", splits, 4);
+                double[] a = run(gpu, arena, rng, "5 rows at 32, splits " + splits, 32, 5, "dense", splits);
+                double[] b = run(gpu, arena, rng, "1 row at 0, splits " + splits, 0, 1, "dense", splits);
+                double[] c = run(gpu, arena, rng, "7 rows at 1500, splits " + splits, 1500, 7, "dense", splits);
+                double[] d = run(gpu, arena, rng, "decode at 2000, splits " + splits, 2000, 1, "dense", splits);
                 System.out.printf("dense splits %d: rms %.2e %.2e %.2e %.2e%n", splits, a[0], b[0], c[0], d[0]);
             }
         }
@@ -189,19 +187,11 @@ class Qwen4QsaAttentionCudaIntegrationTest {
                 Arena arena = Arena.ofConfined()) {
             for (int splits : new int[] {1, 8, 64}) {
                 double[] a =
-                        run(gpu, arena, rng, "selected 6 rows at 2600, splits " + splits, 2600, 6, "random", splits, 2);
-                double[] b = run(
-                        gpu, arena, rng, "drop-own 8 rows at 2600, splits " + splits, 2600, 8, "drop-own", splits, 2);
+                        run(gpu, arena, rng, "selected 6 rows at 2600, splits " + splits, 2600, 6, "random", splits);
+                double[] b =
+                        run(gpu, arena, rng, "drop-own 8 rows at 2600, splits " + splits, 2600, 8, "drop-own", splits);
                 double[] c = run(
-                        gpu,
-                        arena,
-                        rng,
-                        "crossing the budget at 2040, splits " + splits,
-                        2040,
-                        24,
-                        "random",
-                        splits,
-                        4);
+                        gpu, arena, rng, "crossing the budget at 2040, splits " + splits, 2040, 24, "random", splits);
                 System.out.printf("selected splits %d: rms %.2e %.2e %.2e%n", splits, a[0], b[0], c[0]);
             }
         }

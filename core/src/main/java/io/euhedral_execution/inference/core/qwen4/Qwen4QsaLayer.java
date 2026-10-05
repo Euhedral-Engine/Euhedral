@@ -108,8 +108,6 @@ public final class Qwen4QsaLayer {
             long gated,
             long end) {}
 
-    /// Warps of an attention CTA.
-    private static final int ATTENTION_WARPS = 2;
     /// Units (row, KV head, key split) a decode-sized launch aims for.
     private static final int TARGET_UNITS = 512;
     /// Keys a split holds at least.
@@ -164,6 +162,17 @@ public final class Qwen4QsaLayer {
         return Math.clamp(maxKeys / MIN_SPLIT_KEYS, 1, cap);
     }
 
+    /// Bytes of split partials a call of up to `rows` rows can need: the largest over the sizes
+    /// that split.
+    private long partialBytes(int rows) {
+        long bytes = 0;
+        for (int r = 1; r <= rows && splitsCap(r) > 1; r++)
+            bytes = Math.max(
+                    bytes,
+                    (long) r * this.config.queryHeads() * splitsCap(r) * Qwen4QsaOps.PARTIAL_FLOATS * Float.BYTES);
+        return bytes;
+    }
+
     private int splitsCap(int rows) {
         return Math.clamp(TARGET_UNITS / (rows * this.config.keyHeads()), 1, MAX_SPLITS);
     }
@@ -195,7 +204,7 @@ public final class Qwen4QsaLayer {
         long counts = at;
         at += align((long) rows * Integer.BYTES);
         long partial = at;
-        at += align((long) rows * c.queryHeads() * splitsCap(rows) * Qwen4QsaOps.PARTIAL_FLOATS * Float.BYTES);
+        at += align(partialBytes(rows));
         long gated = at;
         at += align((long) rows * c.queryWidth() * Short.BYTES);
         return new Scratch(qProj, kProj, kNormed, vProj, indexProj, scores, ids, counts, partial, gated, at);
@@ -409,8 +418,7 @@ public final class Qwen4QsaLayer {
                 qWidth,
                 head,
                 qWidth,
-                head,
-                ATTENTION_WARPS);
+                head);
         if (splits > 1)
             Qwen4QsaOps.merge(
                     gpu, s.partial(), gate, coreOutput, s.gated(), rows, c.queryHeads(), splits, qWidth, head);

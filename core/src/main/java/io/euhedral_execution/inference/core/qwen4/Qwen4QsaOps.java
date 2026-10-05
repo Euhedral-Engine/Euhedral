@@ -20,10 +20,8 @@ public final class Qwen4QsaOps {
     static final int SCORE_ROWS_PER_CTA = 32;
     /// Blocks a scores launch covers per CTA.
     static final int SCORE_BLOCKS_PER_CTA = 64;
-    /// Dynamic shared bytes of one attention warp (q4qsa::kWarpSharedBytes).
-    static final int ATTENTION_WARP_SHARED_BYTES = 22_272;
-    /// The most warps an attention CTA may have (the native table's shared-memory limit).
-    static final int ATTENTION_MAX_WARPS = 4;
+    /// Dynamic shared bytes of an attention CTA, one unit of three warps (q4qsa::kUnitSharedBytes).
+    static final int ATTENTION_SHARED_BYTES = 28_224;
     /// Floats of one (row, head, split) partial: 256 values, the running maximum and the running
     /// sum.
     static final int PARTIAL_FLOATS = 258;
@@ -242,24 +240,22 @@ public final class Qwen4QsaOps {
             int queryRowStride,
             int queryHeadStride,
             int gateRowStride,
-            int gateHeadStride,
-            int warps) {
-        requirePositive(rows, queryHeads, keyHeads, splits, warps);
+            int gateHeadStride) {
+        requirePositive(rows, queryHeads, keyHeads, splits);
         if (queryHeads % keyHeads != 0 || queryHeads / keyHeads > 16)
             throw new IllegalArgumentException("a KV head's group of query heads must have at most 16 heads");
-        if (warps > ATTENTION_MAX_WARPS) throw new IllegalArgumentException("at most 4 warps per attention CTA");
         if (splits > 1 && partial == 0) throw new IllegalArgumentException("split attention needs a partial buffer");
         if ((ids == 0) != (counts == 0)) throw new IllegalArgumentException("ids and counts go together");
         long units = (long) rows * keyHeads * splits;
         gpu.launchQwen4(
                 Qwen4Kernel.QSA_ATTENTION,
-                Math.toIntExact(ceilDiv(units, warps)),
+                Math.toIntExact(units),
                 1,
                 1,
-                32 * warps,
+                96,
                 1,
                 1,
-                warps * ATTENTION_WARP_SHARED_BYTES,
+                ATTENTION_SHARED_BYTES,
                 arguments()
                         .pointer(queries)
                         .pointer(gate)
