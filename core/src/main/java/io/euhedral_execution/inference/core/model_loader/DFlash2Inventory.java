@@ -18,8 +18,9 @@ import java.util.Map;
 import java.util.Set;
 
 /// The DFlash2 drafter's objects in an artifact (`dflash2/`, tools/euhedral_artifacts/dflash2.py): which there are,
-/// their shapes, and how they assemble into [DFlash2Weights]. The five projections of each layer are BF16 or NVFP4;
-/// every other object is BF16, and `dflash2/config` (I32) is read on the host only.
+/// their shapes, and how they assemble into [DFlash2Weights]. The matrices that feed DFlash2 linears (each layer's five
+/// projections and two convolution kernel projections, and `fc`) are BF16 or NVFP4; every other object is BF16, and
+/// `dflash2/config` (I32) is read on the host only.
 final class DFlash2Inventory {
     static final String PREFIX = "dflash2/";
     static final String CONFIG = PREFIX + "config";
@@ -55,7 +56,7 @@ final class DFlash2Inventory {
     static Map<String, Entry> expected(DFlash2Config c) {
         long hidden = c.hiddenSize();
         Map<String, Entry> entries = new LinkedHashMap<>();
-        entries.put(PREFIX + "fc", new Entry(new long[] {hidden, c.tapWidth()}, false));
+        entries.put(PREFIX + "fc", new Entry(new long[] {hidden, c.tapWidth()}, true));
         entries.put(PREFIX + "hidden_norm", new Entry(new long[] {hidden}, false));
         entries.put(PREFIX + "final_norm", new Entry(new long[] {hidden}, false));
         for (int layer = 0; layer < c.layers(); layer++) {
@@ -71,7 +72,7 @@ final class DFlash2Inventory {
             entries.put(p + "mlp/down", new Entry(new long[] {hidden, c.intermediateSize()}, true));
             for (String conv : new String[] {"attention_conv", "mlp_conv"}) {
                 entries.put(p + conv + "/base", new Entry(new long[] {2, c.convKernel(), hidden}, false));
-                entries.put(p + conv + "/projection", new Entry(new long[] {c.convProjectionWidth(), hidden}, false));
+                entries.put(p + conv + "/projection", new Entry(new long[] {c.convProjectionWidth(), hidden}, true));
             }
         }
         entries.put(PREFIX + "selector/hidden_projection", new Entry(new long[] {c.selectorRank(), hidden}, false));

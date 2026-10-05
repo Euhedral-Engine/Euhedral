@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Timeout;
 /// verification's anchor position, proposal, candidates and accepted drafts, and each prompt's generated tokens, as
 /// JSON lines in `-Peuhedral.dflash2.report` (tools/dflash2_quality.py compares two reports). Greedy output is exact
 /// whatever the drafter, so two reports hold the same tokens and differ only in their steps.
+/// `-Peuhedral.dflash2.verified` verifies only that many drafts per block (a screen of the verification length).
 class DFlash2QualityCudaIntegrationTest {
 
     static final List<String> PROMPTS = List.of(
@@ -52,8 +53,14 @@ class DFlash2QualityCudaIntegrationTest {
                             + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
                     var sequence = new QwenSequenceState(++id);
                     int promptIndex = index;
-                    try (var decoder =
-                            new DFlash2Decoder(runtime, plan, gpu, sequence, tokenizer::isGenerationEosToken, 512)) {
+                    try (var decoder = new DFlash2Decoder(
+                            runtime,
+                            plan,
+                            gpu,
+                            sequence,
+                            tokenizer::isGenerationEosToken,
+                            512,
+                            Integer.getInteger("euhedral.dflash2.verified", 7))) {
                         decoder.observe((position, anchor, proposal, candidates, accepted) -> {
                             try {
                                 out.write("{\"prompt\":" + promptIndex + ",\"position\":" + position + ",\"anchor\":"

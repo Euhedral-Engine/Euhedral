@@ -85,6 +85,8 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
     private final QwenHostLogits baseLogits;
     private final DFlash2Proposal proposal;
     private final DFlash2Checkpoint checkpoint;
+    /// Drafts each verification checks: the first `verified` of the block's proposal.
+    private final int verified;
     private Statistics statistics;
     private StepListener steps;
 
@@ -99,6 +101,19 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
             QwenSequenceState sequence,
             IntPredicate endOfGeneration,
             int prefillChunk) {
+        this(runtime, plan, gpu, sequence, endOfGeneration, prefillChunk, Integer.MAX_VALUE);
+    }
+
+    /// As the public constructor, verifying only the first `verified` drafts of each block (screens of the
+    /// verification length; the block always proposes all of them).
+    DFlash2Decoder(
+            EuhedralInferenceRuntime runtime,
+            QwenExecutionPlan plan,
+            ExecutionGpu gpu,
+            QwenSequenceState sequence,
+            IntPredicate endOfGeneration,
+            int prefillChunk,
+            int verified) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.plan = Objects.requireNonNull(plan, "plan");
         this.sequence = Objects.requireNonNull(sequence, "sequence");
@@ -111,6 +126,8 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         this.baseLogits.selectOnDevice(true);
         this.proposal = new DFlash2Proposal(gpu, drafts(), this.config.selectorTopK());
         this.checkpoint = new DFlash2Checkpoint(this.config);
+        if (verified < 1) throw new IllegalArgumentException("a verification checks at least one draft");
+        this.verified = Math.min(verified, drafts());
     }
 
     /// Drafts per verification: the block less its anchor.
@@ -250,9 +267,9 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                         if (this.firstBlock) DFlash2Decoder.this.statistics.firstBlockNanos += drafted;
                         else DFlash2Decoder.this.statistics.blockNanos += drafted;
                         this.firstBlock = false;
-                        int[] rows = new int[block.length];
+                        int[] rows = new int[DFlash2Decoder.this.verified + 1];
                         rows[0] = anchor;
-                        System.arraycopy(DFlash2Decoder.this.proposal.tokens(), 0, rows, 1, drafts());
+                        System.arraycopy(DFlash2Decoder.this.proposal.tokens(), 0, rows, 1, rows.length - 1);
                         int[] candidates =
                                 DFlash2Decoder.this.steps == null ? null : DFlash2Decoder.this.proposal.candidates();
                         return verify(position, rows, candidates);

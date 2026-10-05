@@ -108,6 +108,7 @@ against the working directory, which is the repository root under `./gradlew :be
 | `warmup`, `iterations` | `1`, `3` | Warmup and measured iterations per scenario. |
 | `generation` | `{"mode":"greedy","seed":1}` | `sample` mode also takes `temperature`, `topK`, `topP` (0.7, 20, 0.8). |
 | `promptSeed` | `20260925` | Seed for prompt material. |
+| `speculation` | `artifact` | `artifact` decodes greedy generations with the speculative strategy the artifact selects (MTP or DFlash2), as the server does; `off` decodes them one token per quantum, the control arm for speculation. |
 | `output` | `benchmark-results/euhedral-<UTC>.jsonl` | A `.json` path writes one document; any other path writes JSONL. |
 | `overwrite`, `append` | `false` | Required when `output` exists. `append` is JSONL only. |
 | `gpuMemory` | `false` | Record device free/total memory before and after each iteration, outside timing. |

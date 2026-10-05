@@ -48,6 +48,19 @@ python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --c
 For `q3-compressed` the uncompressed Q3 form is built beside the output, transcoded, and removed; every
 transcoded tensor is decoded back and compared byte for byte with its source before the output is published.
 
+## DFlash2
+
+`--dflash2 DIR` adds the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`: `config.json`, `model.safetensors`) to a conversion, and
+`--extend ARTIFACT --dflash2 DIR` appends it to an existing artifact, copying its objects byte for byte. An artifact with the drafter
+speculates with DFlash2 (docs/DFLASH2.md). `--dflash2-projections` stores the drafter's attention and MLP projections as `bf16`
+(the default) or `nvfp4`; `nvfp4-all` also stores the feature fusion and the convolutions' kernel projections as NVFP4.
+
+```bash
+python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.edrl \
+    --dflash2 /mnt/shared/Qwen3.8-27B-DFlash2 --dflash2-projections nvfp4 \
+    --out $OUT/qwen3_8_27b_nvfp4_compressed_dflash2.edrl
+```
+
 ## Layout
 
 - `convert_checkpoint.py`: the command line.
@@ -63,4 +76,8 @@ transcoded tensor is decoded back and compared byte for byte with its source bef
   three CUDA-versus-CPU byte-equality tests run when PyTorch has a CUDA device).
 - `compare_teacher_forced.py`: compares teacher-forced logits reports with one another (NumPy).
 - `compare_reference.py`: compares teacher-forced logits reports with a BF16 reference written by llama.cpp (NumPy).
+- `dflash2_reference.py`: runs the upstream DFlash2 draft model (z-lab/dflash, unmodified; needs PyTorch, transformers 5.15 and the
+  upstream source tree) over fixed inputs and writes every intermediate as fixtures (docs/DFLASH2.md).
+- `dflash2_compare.py`: per-tensor relative error between two DFlash2 fixture directories (NumPy).
+- `dflash2_quality.py`: compares two drafters' quality records (DFlash2QualityCudaIntegrationTest).
 - `render_qwen_chat_template_golden.py`: renders chat-template golden prompts (jinja2).

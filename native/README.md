@@ -21,6 +21,7 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 | `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |
 | `q45_linear.c` | Q4/Q5 decode (one row and the 2 to 8 row twins). |
 | `nvfp4_linear.c` | NVFP4 decode (plain and SD4 scale-table layouts, one row and 2 to 8 rows) and the native FP4 tensor-core route. |
+| `dflash.c` | The DFlash2 drafter's operators (docs/DFLASH2.md). |
 | `q3_mx.c` | The block-scaled MXFP8 route for Q3/Q4/Q5 linears and the paired gate/up SwiGLU region. |
 | `reference.c`, `.h` | The scalar numerical references (Q3, Q4/Q5, NVFP4 plain and SD4): the oracle exact numerics select, and the fallback for shapes no kernel takes. |
 | `qwen_layer_ops.c` | GDN control, convolution, recurrence and gated norm; residual add, residual RMSNorm and SwiGLU; NVFP4 KV append, QK norm/RoPE and attention; greedy argmax; the BF16-to-FP32 linear. |
@@ -49,6 +50,7 @@ root the host loads; its headers are that module's leaves and strategies:
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
 | `attention/` | NVFP4 KV append, QK norm/RoPE, per-head and GQA decode attention with row twins, the 32-row prefill tile and the producer-warp FA2 prefill kernel, and the exact twins and single-warp controls used as test oracles. |
 | `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
+| `dflash/` | The DFlash2 drafter: BF16 tensor-core linear (rows independent of the row count), Qwen3 RMSNorm, grouped dynamic convolution, Q/K norm and RoPE, the context ring append, sliding-window block attention, SwiGLU, top-16 and the candidate selector, each rounding where the published PyTorch model rounds. |
 
 Includes within a folder are relative; includes across folders name the path from the tree root
 (`common/pdl.cuh`, `nvfp4/nvfp4.cuh`), which NVRTC resolves through the installed root.
@@ -78,6 +80,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 
 | Test | Covers |
 | --- | --- |
+| `test_dflash.py` | The DFlash2 operators against NumPy oracles with the reference's rounding points: convolution, top-16 and selector bit for bit, the linear's rows identical at every row count. |
 | `test_q3_kernels.py` | Q3 reference against FP64, contiguous decode against the reference, the 2 to 8 row twins bit for bit one-row. |
 | `test_q45_kernels.py` | Q4/Q5 reference, contiguous decode, row twins, the capped grid. |
 | `test_q3_conversion.py` | The device-level Q3 scale-conversion contract. |
