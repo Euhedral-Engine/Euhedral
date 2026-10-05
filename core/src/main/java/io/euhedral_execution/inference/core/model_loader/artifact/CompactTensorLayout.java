@@ -41,6 +41,8 @@ public final class CompactTensorLayout {
                 yield rowSplitSize(shape, format);
             }
             case ROW_SPLIT_P2E2_V1 -> throw new IllegalArgumentException("P2E2 tensor sizes depend on their codes");
+            case ROW_INTERLEAVED_NVFP4_V1 ->
+                throw new IllegalArgumentException("interleaved NVFP4 rows belong to version 3 artifacts");
             case ROW_SPLIT_K128_SD4_V1 -> {
                 if (dataType != TensorDataType.BF16 || format != WeightFormat.NVFP4) {
                     throw new IllegalArgumentException("SD4 layout requires NVFP4 storage of BF16 source metadata");
