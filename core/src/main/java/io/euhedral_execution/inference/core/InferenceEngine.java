@@ -11,6 +11,7 @@ import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
+import io.euhedral_execution.inference.core.model_loader.ModelArchitecture;
 import io.euhedral_execution.inference.core.model_loader.QwenModel;
 import io.euhedral_execution.inference.core.model_loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
@@ -107,6 +108,10 @@ public final class InferenceEngine implements AutoCloseable {
 
     static InferenceEngine load(InferenceConfig config, Bootstrap bootstrap) throws IOException {
         Objects.requireNonNull(config, "config");
+        if (bootstrap.architecture(config.artifactPath()) == ModelArchitecture.QWEN4_EXP)
+            throw new UnsupportedOperationException("the artifact is a " + ModelArchitecture.QWEN4_EXP
+                    + " (Flash-Next) model: its storage loads with Qwen4Storage.load, and text generation for it is "
+                    + "not implemented yet");
         // Euhedral silently drops unavailable CPUs; fail before claiming the lattice or loading anything.
         ProcessorTopology topology = bootstrap.processorTopology();
         topology.requireAvailable(config.workerCpus());
@@ -476,6 +481,16 @@ public final class InferenceEngine implements AutoCloseable {
     static class Bootstrap {
         ProcessorTopology processorTopology() {
             return ProcessorTopology.system();
+        }
+
+        /// The artifact's architecture when it positively identifies as one other than the dense model; anything
+        /// unreadable is left to [#readArtifact], which reports it.
+        ModelArchitecture architecture(Path path) {
+            try {
+                return ModelArchitecture.detect(path);
+            } catch (IOException | RuntimeException unreadable) {
+                return ModelArchitecture.QWEN38_DENSE;
+            }
         }
 
         QwenArtifact readArtifact(Path path) throws IOException {
