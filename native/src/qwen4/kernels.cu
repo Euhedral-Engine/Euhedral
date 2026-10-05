@@ -4,3 +4,6 @@
 #include "qwen4/hc.cuh"
 #include "qwen4/ple.cuh"
 #include "qwen4/gdn.cuh"
+#include "qwen4/qsa_norm.cuh"
+#include "qwen4/qsa_index.cuh"
+#include "qwen4/qsa_attention.cuh"

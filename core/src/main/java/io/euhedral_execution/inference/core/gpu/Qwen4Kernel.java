@@ -15,7 +15,15 @@ public enum Qwen4Kernel {
     CONV_HISTORY_BF16("euhedral_q4_conv_history_bf16"),
     GDN_CONV_BF16("euhedral_q4_gdn_conv_bf16"),
     GDN_CONTROL_BF16("euhedral_q4_gdn_control_bf16"),
-    GDN_GATED_NORM_BF16("euhedral_q4_gdn_gated_norm_bf16");
+    GDN_GATED_NORM_BF16("euhedral_q4_gdn_gated_norm_bf16"),
+    HEAD_NORM_ROPE_BF16("euhedral_q4_head_norm_rope_bf16"),
+    QSA_POOL_KEYS_BF16("euhedral_q4_qsa_pool_keys_bf16"),
+    QSA_TAIL_BF16("euhedral_q4_qsa_tail_bf16"),
+    QSA_SCORES("euhedral_q4_qsa_scores"),
+    QSA_SELECT("euhedral_q4_qsa_select"),
+    QSA_ATTENTION("euhedral_q4_qsa_attention"),
+    QSA_MERGE("euhedral_q4_qsa_merge"),
+    QSA_KV_APPEND("euhedral_q4_qsa_kv_append");
 
     private final String symbol;
 

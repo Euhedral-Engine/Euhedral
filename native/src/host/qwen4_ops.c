@@ -41,6 +41,15 @@ static const Qwen4KernelEntry kernels[] = {
     {"euhedral_q4_gdn_conv_bf16", 0},
     {"euhedral_q4_gdn_control_bf16", 0},
     {"euhedral_q4_gdn_gated_norm_bf16", 0},
+    {"euhedral_q4_head_norm_rope_bf16", 0},
+    {"euhedral_q4_qsa_pool_keys_bf16", 0},
+    {"euhedral_q4_qsa_tail_bf16", 0},
+    {"euhedral_q4_qsa_scores", 0},
+    {"euhedral_q4_qsa_select", 0},
+    /* Four warps of 17,664 bytes (q4qsa::kWarpSharedBytes). */
+    {"euhedral_q4_qsa_attention", 70656},
+    {"euhedral_q4_qsa_merge", 0},
+    {"euhedral_q4_qsa_kv_append", 0},
 };
 #define KERNEL_COUNT ((int)(sizeof(kernels) / sizeof(kernels[0])))
 
