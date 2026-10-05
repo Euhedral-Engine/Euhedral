@@ -332,137 +332,206 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_block_qk_bf16(
         keyOut[static_cast<uint64_t>(row) * keyValueHeads * 128 + h * 128 + i] = out;
 }
 
+constexpr uint32_t kMaxKeys = 2048 + 16;
+
 // Sliding-window attention of the block's rows (non-causal within the block). Query row i at position start + i
 // sees the context keys at positions max(0, start + i - window + 1) .. start - 1 (ring slots p % window) and every
-// block key. Scores and softmax in FP32 with the 1/sqrt(128) scale, output rounded once. Grid (rows, KV heads), 256
-// threads; the CTA serves the KV head's query heads.
-constexpr uint32_t kMaxKeys = 2048 + 16;
-constexpr uint32_t kGroup = 4;
+// block key. One CTA per (KV head, key split) serves every row of the block: the rows times
+// the group's query heads (up to 32 queries) are the M rows of m16n8k16 MMAs against the split's keys, so each key and
+// value is read once per block instead of once per row. Scores (BF16 products, FP32 sums, the 1/sqrt(128) scale) go
+// to shared memory; each query's softmax over the split leaves P = exp(s - max) as hi + lo BF16 parts, which multiply
+// the values (FP32 sums). Partials per (row, query head, split): 128 outputs, the split's maximum and sum, in
+// `partial` ([row][split][head][130] floats); euhedral_dflash_attention_merge_bf16 combines the splits. Grid
+// (KV heads, kAttentionSplits), 128 threads, kAttentionSharedBytes of dynamic shared memory.
+constexpr uint32_t kAttentionSplits = 8;
+constexpr uint32_t kSplitKeyTiles = ((kMaxKeys + kAttentionSplits - 1) / kAttentionSplits + 15) / 16;  // 17
+constexpr uint32_t kSplitKeys = kSplitKeyTiles * 16;                                                  // 272
+constexpr uint32_t kScoreStride = kSplitKeys + 4;
+constexpr uint32_t kProbabilityStride = kSplitKeys + 8;
+constexpr uint32_t kValueStride = 128 + 8;
+constexpr uint32_t kAttentionQueries = 32;
+constexpr uint32_t kAttentionSharedBytes = kAttentionQueries * kScoreStride * 4 + 2 * kAttentionQueries * kProbabilityStride * 2
+        + 16 * kValueStride * 2 + 2 * kAttentionQueries * 4;
 
-extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_attention_bf16(
+__device__ __forceinline__ uint32_t shared_address(const void* pointer) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+}
+
+extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_attention_tc_bf16(
         const __nv_bfloat16* query,
         const __nv_bfloat16* blockKeys,
         const __nv_bfloat16* kv,
         const __nv_bfloat16* ringKeys,
         const __nv_bfloat16* ringValues,
-        __nv_bfloat16* out,
+        float* partial,
         const uint64_t* position,
         uint32_t rows,
         uint32_t window,
         uint32_t heads,
         uint32_t keyValueHeads) {
     euhedral_pdl_begin();
-    extern __shared__ float shared[];
-    float* scores = shared;                      // [kGroup][kMaxKeys]
-    float* q = shared + kGroup * kMaxKeys;       // [kGroup][128]
-    float* scratch = q + kGroup * 128;           // reductions
-    const uint32_t row = blockIdx.x, kvHead = blockIdx.y;
-    const uint32_t group = heads / keyValueHeads;
-    const uint32_t width = keyValueHeads * 128;
+    extern __shared__ __align__(16) unsigned char attentionShared[];
+    float* scores = reinterpret_cast<float*>(attentionShared);                                   // [32][kScoreStride]
+    __nv_bfloat16* high = reinterpret_cast<__nv_bfloat16*>(scores + kAttentionQueries * kScoreStride);  // [32][stride]
+    __nv_bfloat16* low = high + kAttentionQueries * kProbabilityStride;
+    __nv_bfloat16* values = low + kAttentionQueries * kProbabilityStride;                        // [16][kValueStride]
+    float* maxima = reinterpret_cast<float*>(values + 16 * kValueStride);
+    float* sums = maxima + kAttentionQueries;
+    const uint32_t kvHead = blockIdx.x, split = blockIdx.y;
+    const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, q = lane % 4;
+    const uint32_t group = heads / keyValueHeads, width = keyValueHeads * 128;
+    const uint32_t queries = rows * group;
     const uint64_t start = *position;
-    const uint64_t at = start + row;
-    const uint64_t first = at + 1 >= window ? at + 1 - window : 0;
-    const uint32_t contextKeys = static_cast<uint32_t>(start > first ? start - first : 0);
+    // Row 0 sees the most context keys; row i masks the oldest offset(i) of them.
+    const uint64_t first = start + 1 >= window ? start + 1 - window : 0;
+    const uint32_t contextKeys = static_cast<uint32_t>(start - first);
     const uint32_t keys = contextKeys + rows;
-    for (uint32_t index = threadIdx.x; index < group * 128; index += blockDim.x)
-        q[index] = bf(query[static_cast<uint64_t>(row) * heads * 128 + (kvHead * group) * 128 + index]);
-    __syncthreads();
-    for (uint32_t key = threadIdx.x; key < keys; key += blockDim.x) {
-        const __nv_bfloat16* k = key < contextKeys
-                ? ringKeys + ((first + key) % window) * width + kvHead * 128
-                : blockKeys + static_cast<uint64_t>(key - contextKeys) * width + kvHead * 128;
-        float dot[kGroup] = {0.0f, 0.0f, 0.0f, 0.0f};
-        uint4 row[16];
+    const uint32_t span = (keys + kAttentionSplits - 1) / kAttentionSplits;
+    const uint32_t begin = min(keys, split * span), end = min(keys, begin + span), count = end - begin;
+    auto keyRow = [&](const __nv_bfloat16* ring, const __nv_bfloat16* block, uint32_t blockStride, uint32_t key) {
+        return key < contextKeys ? ring + ((first + key) % window) * width + kvHead * 128
+                                 : block + static_cast<uint64_t>(key - contextKeys) * blockStride + kvHead * 128;
+    };
+    auto oldest = [&](uint32_t row) {
+        const uint64_t at = start + row;
+        const uint64_t rowFirst = at + 1 >= window ? at + 1 - window : 0;
+        return static_cast<uint32_t>(rowFirst - first);
+    };
+    // Scores: warp w takes the 8-key tiles w, w + 4, ...; lane (g, q) loads 16 contiguous bytes per 32-dim chunk of
+    // its queries g, g + 8 (both M tiles) and of key g, fed as logical k 8q + 4s + {0..3} on both operands.
+    uint4 qa[2][2][4];
 #pragma unroll
-        for (uint32_t i = 0; i < 16; i++) row[i] = *reinterpret_cast<const uint4*>(k + 8 * i);
+    for (int t = 0; t < 2; t++)
 #pragma unroll
-        for (uint32_t d = 0; d < 128; d += 8) {
-            const uint4 packed = row[d / 8];
-            const __nv_bfloat16* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
+        for (int h = 0; h < 2; h++) {
+            const uint32_t m = 16 * t + 8 * h + g;
+            const bool valid = m < queries;
+            const __nv_bfloat16* row =
+                    query + static_cast<uint64_t>(valid ? m / group : 0) * heads * 128 + (kvHead * group + (valid ? m % group : 0)) * 128;
 #pragma unroll
-            for (uint32_t e = 0; e < 8; e++) {
-                const float kv_ = bf(values[e]);
-#pragma unroll
-                for (uint32_t h = 0; h < kGroup; h++)
-                    if (h < group) dot[h] = fmaf(q[h * 128 + d + e], kv_, dot[h]);
-            }
+            for (int c = 0; c < 4; c++)
+                qa[t][h][c] = valid ? *reinterpret_cast<const uint4*>(row + 32 * c + 8 * q) : make_uint4(0, 0, 0, 0);
         }
+    const uint32_t keyTiles = (count + 7) / 8;
+    for (uint32_t tile = warp; tile < keyTiles; tile += 4) {
+        const uint32_t local = 8 * tile + g;
+        const bool valid = local < count;
+        const __nv_bfloat16* k = keyRow(ringKeys, blockKeys, width, begin + (valid ? local : 0));
+        uint4 kb[4];
 #pragma unroll
-        for (uint32_t h = 0; h < kGroup; h++)
-            if (h < group) scores[h * kMaxKeys + key] = dot[h] * 0.08838834764831845f;
+        for (int c = 0; c < 4; c++) kb[c] = valid ? *reinterpret_cast<const uint4*>(k + 32 * c + 8 * q) : make_uint4(0, 0, 0, 0);
+        float acc[2][4] = {};
+#pragma unroll
+        for (int c = 0; c < 4; c++)
+#pragma unroll
+            for (int t = 0; t < 2; t++) {
+                const uint32_t step0[4] = {qa[t][0][c].x, qa[t][1][c].x, qa[t][0][c].y, qa[t][1][c].y};
+                mma_bf16(acc[t], step0, kb[c].x, kb[c].y);
+                const uint32_t step1[4] = {qa[t][0][c].z, qa[t][1][c].z, qa[t][0][c].w, qa[t][1][c].w};
+                mma_bf16(acc[t], step1, kb[c].z, kb[c].w);
+            }
+#pragma unroll
+        for (int t = 0; t < 2; t++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const uint32_t m = 16 * t + g + 8 * (e >> 1), key = 8 * tile + 2 * q + (e & 1);
+                const uint32_t global = begin + key;
+                const bool visible = m < queries && key < count && (global >= contextKeys || global >= oldest(m / group));
+                scores[m * kScoreStride + key] = visible ? acc[t][e] * 0.08838834764831845f : -CUDART_INF_F;
+            }
     }
     __syncthreads();
-    // Softmax per query head: one warp per head.
-    const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (warp < group) {
-        float* s = scores + warp * kMaxKeys;
+    // Softmax per query over the split: warp w takes queries 8w .. 8w + 7.
+    const uint32_t padded = (count + 15) / 16 * 16;
+    for (uint32_t m = 8 * warp; m < 8 * warp + 8; m++) {
+        const float* s = scores + m * kScoreStride;
         float maximum = -CUDART_INF_F;
-        for (uint32_t key = lane; key < keys; key += 32) maximum = fmaxf(maximum, s[key]);
-        for (int offset = 16; offset > 0; offset >>= 1)
-            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+        for (uint32_t key = lane; key < count; key += 32) maximum = fmaxf(maximum, s[key]);
+        for (int offset = 16; offset > 0; offset >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
         float sum = 0.0f;
-        for (uint32_t key = lane; key < keys; key += 32) {
-            const float e = expf(s[key] - maximum);
-            s[key] = e;
-            sum += e;
+        for (uint32_t key = lane; key < padded; key += 32) {
+            const float p = key < count && maximum != -CUDART_INF_F ? expf(s[key] - maximum) : 0.0f;
+            const __nv_bfloat16 hi = rn(p);
+            high[m * kProbabilityStride + key] = hi;
+            low[m * kProbabilityStride + key] = rn(p - bf(hi));
+            sum += p;
         }
         for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-        if (lane == 0) scratch[warp] = 1.0f / sum;
-    }
-    __syncthreads();
-    // Output: warp w takes keys w, w + 8, ...; lane l accumulates dimensions 4l .. 4l + 3 of every query head of the
-    // group over its keys from one coalesced value row per key; the 8 warps' partial sums then add in a fixed order.
-    float acc[kGroup][4];
-#pragma unroll
-    for (uint32_t h = 0; h < kGroup; h++) acc[h][0] = acc[h][1] = acc[h][2] = acc[h][3] = 0.0f;
-    const uint32_t warps = blockDim.x / 32;
-    // Keys go in batches of 8 per warp, every batch's value loads issued before its FMAs, so the loads overlap.
-    constexpr uint32_t kBatch = 8;
-    for (uint32_t base = warp * kBatch; base < keys; base += warps * kBatch) {
-        uint2 packed[kBatch];
-#pragma unroll
-        for (uint32_t i = 0; i < kBatch; i++) {
-            const uint32_t key = base + i;
-            if (key >= keys) {
-                packed[i] = make_uint2(0, 0);
-                continue;
-            }
-            const __nv_bfloat16* v = key < contextKeys
-                    ? ringValues + ((first + key) % window) * width + kvHead * 128
-                    : kv + static_cast<uint64_t>(key - contextKeys) * 2 * width + width + kvHead * 128;
-            packed[i] = *reinterpret_cast<const uint2*>(v + 4 * lane);
-        }
-#pragma unroll
-        for (uint32_t i = 0; i < kBatch; i++) {
-            const uint32_t key = base + i;
-            if (key >= keys) break;
-            const __nv_bfloat16* values = reinterpret_cast<const __nv_bfloat16*>(&packed[i]);
-            float x[4];
-#pragma unroll
-            for (uint32_t e = 0; e < 4; e++) x[e] = bf(values[e]);
-#pragma unroll
-            for (uint32_t h = 0; h < kGroup; h++) {
-                if (h >= group) continue;
-                const float p = scores[h * kMaxKeys + key];
-#pragma unroll
-                for (uint32_t e = 0; e < 4; e++) acc[h][e] = fmaf(p, x[e], acc[h][e]);
-            }
+        if (lane == 0) {
+            maxima[m] = maximum;
+            sums[m] = sum;
         }
     }
-    __syncthreads();
-    // Reuse the scores as the warps' partial sums: [warp][head][128].
-    float* partial = scores;
+    // Output: warp w owns dims 32w .. 32w + 31 (four 8-wide N tiles) of all 32 queries; per 16-key tile the values are
+    // staged in shared memory, P (hi and lo) is A and V (transposed by ldmatrix) is B.
+    float o[2][4][4] = {};
+    for (uint32_t tile = 0; tile < padded / 16; tile++) {
+        __syncthreads();
+        for (uint32_t index = threadIdx.x; index < 16 * 16; index += blockDim.x) {
+            const uint32_t local = 16 * tile + index / 16, chunk = index % 16;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (local < count)
+                v = *reinterpret_cast<const uint4*>(keyRow(ringValues, kv + width, 2 * width, begin + local) + 8 * chunk);
+            *reinterpret_cast<uint4*>(values + (index / 16) * kValueStride + 8 * chunk) = v;
+        }
+        __syncthreads();
+        uint32_t a[2][2][4];
 #pragma unroll
-    for (uint32_t h = 0; h < kGroup; h++)
+        for (int t = 0; t < 2; t++)
 #pragma unroll
-        for (uint32_t e = 0; e < 4; e++) partial[(warp * kGroup + h) * 128 + 4 * lane + e] = acc[h][e];
-    __syncthreads();
-    for (uint32_t index = threadIdx.x; index < group * 128; index += blockDim.x) {
-        const uint32_t h = index / 128, d = index % 128;
-        float sum = 0.0f;
-        for (uint32_t w = 0; w < warps; w++) sum += partial[(w * kGroup + h) * 128 + d];
-        out[static_cast<uint64_t>(row) * heads * 128 + (kvHead * group + h) * 128 + d] = rn(sum * scratch[h]);
+            for (int part = 0; part < 2; part++) {
+                const __nv_bfloat16* source = (part ? low : high) + (16 * t + (lane & 15)) * kProbabilityStride + 16 * tile + 8 * (lane >> 4);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a[t][part][0]), "=r"(a[t][part][1]), "=r"(a[t][part][2]), "=r"(a[t][part][3])
+                             : "r"(shared_address(source)));
+            }
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            uint32_t b0, b1;
+            const __nv_bfloat16* source = values + (lane & 15) * kValueStride + 32 * warp + 8 * n;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                         : "=r"(b0), "=r"(b1)
+                         : "r"(shared_address(source)));
+#pragma unroll
+            for (int t = 0; t < 2; t++) {
+                mma_bf16(o[t][n], a[t][0], b0, b1);
+                mma_bf16(o[t][n], a[t][1], b0, b1);
+            }
+        }
     }
+#pragma unroll
+    for (int t = 0; t < 2; t++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const uint32_t m = 16 * t + g + 8 * (e >> 1);
+            if (m >= queries) continue;
+            float* destination = partial + ((static_cast<uint64_t>(m / group) * kAttentionSplits + split) * heads
+                    + kvHead * group + m % group) * 130;
+#pragma unroll
+            for (int n = 0; n < 4; n++) destination[32 * warp + 8 * n + 2 * q + (e & 1)] = o[t][n][e];
+            if (warp == 0 && q == 0 && (e & 1) == 0) {
+                destination[128] = maxima[m];
+                destination[129] = sums[m];
+            }
+        }
+}
+
+// Combines the splits of euhedral_dflash_attention_tc_bf16 in split order. Grid (rows, heads), 128 threads.
+extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_attention_merge_bf16(
+        const float* partial, __nv_bfloat16* out, uint32_t heads) {
+    euhedral_pdl_begin();
+    const uint32_t row = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
+    const float* base = partial + static_cast<uint64_t>(row) * kAttentionSplits * heads * 130 + head * 130;
+    float maximum = -CUDART_INF_F;
+    for (uint32_t split = 0; split < kAttentionSplits; split++) maximum = fmaxf(maximum, base[split * heads * 130 + 128]);
+    float sum = 0.0f, value = 0.0f;
+    for (uint32_t split = 0; split < kAttentionSplits; split++) {
+        const float* p = base + split * heads * 130;
+        const float scale = p[128] == -CUDART_INF_F ? 0.0f : expf(p[128] - maximum);
+        sum = fmaf(p[129], scale, sum);
+        value = fmaf(p[d], scale, value);
+    }
+    out[static_cast<uint64_t>(row) * heads * 128 + head * 128 + d] = rn(value * (1.0f / sum));
 }
 
 // Qwen3MLP's activation: bf16(bf16(silu(gate)) * up); rows hold the gate, then the up projection.

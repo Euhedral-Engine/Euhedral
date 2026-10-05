@@ -497,7 +497,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     linker,
                     symbols,
                     "euhedral_cuda_dflash_attention_bf16",
-                    FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, p, i32, i32, i32, i32));
+                    FunctionDescriptor.of(i32, p, p, p, p, p, p, p, i32, p, i32, i32, i32, i32));
             this.dflashSwiGluBf16 = bind(
                     linker, symbols, "euhedral_cuda_dflash_swiglu_bf16", FunctionDescriptor.of(i32, p, p, i32, i32));
             this.dflashTopKBf16 = bind(
@@ -2602,6 +2602,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             long ringKeys,
             long ringValues,
             long output,
+            long scratch,
             int rows,
             long position,
             int window,
@@ -2618,6 +2619,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 at(ringKeys),
                 at(ringValues),
                 at(output),
+                at(scratch),
                 rows,
                 at(position),
                 window,
