@@ -341,8 +341,11 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_attention_bf16(
         uint32_t window, uint32_t heads, uint32_t key_value_heads, uint32_t head_dim);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_swiglu_bf16(
         const void* device_gate_up, void* device_output, uint32_t rows, uint32_t intermediate);
+/* Scratch of euhedral_cuda_dflash_topk_bf16 for `rows` rows (each row's splits' partial top 16). */
+EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_dflash_topk_scratch_bytes(uint32_t rows);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_topk_bf16(
-        const void* device_logits, uint32_t rows, uint32_t vocabulary, void* device_values, void* device_indices);
+        const void* device_logits, uint32_t rows, uint32_t vocabulary, void* device_values, void* device_indices,
+        void* device_scratch);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_select_bf16(
         const void* device_hidden, const void* device_values, const void* device_indices,
         const void* device_predecessor, const void* device_successor, const void* device_anchor, uint32_t positions,

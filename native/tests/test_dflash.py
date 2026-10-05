@@ -201,8 +201,12 @@ class DFlash2KernelTest(unittest.TestCase):
         logits[1, [5, 77, 100000]] = 50.0  # ties resolve to the lower token
         logits[2, 9] = np.nan
         pl, pv, pi = self.put(logits), self.gpu.zeros(2 * rows * 16), self.gpu.zeros(4 * rows * 16)
-        self.gpu.launch('euhedral_dflash_topk_bf16', rows,
-                        [C.c_uint64(pl), C.c_uint(vocabulary), C.c_uint64(pv), C.c_uint64(pi)], block=256)
+        splits = 64
+        sv, si = self.gpu.zeros(4 * rows * splits * 16), self.gpu.zeros(4 * rows * splits * 16)
+        self.gpu.launch('euhedral_dflash_topk_partial_bf16', (rows, splits),
+                        [C.c_uint64(pl), C.c_uint(vocabulary), C.c_uint64(sv), C.c_uint64(si)], block=256)
+        self.gpu.launch('euhedral_dflash_topk_merge_bf16', rows,
+                        [C.c_uint64(sv), C.c_uint64(si), C.c_uint(splits), C.c_uint64(pv), C.c_uint64(pi)], block=256)
         values = self.get_bf16(pv, (rows, 16))
         indices = np.frombuffer(self.gpu.download(pi, 4 * rows * 16), dtype=np.int32).reshape(rows, 16)
         for row in range(rows):

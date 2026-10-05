@@ -579,7 +579,8 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("DFlash2 SwiGLU is not implemented by this GPU");
     }
 
-    public void dflashTopKBf16(long logits, int rows, int vocabulary, long values, long indices) {
+    /// `scratch` holds 64 × 16 FP32 values and 32-bit tokens per row (the splits' partial candidates).
+    public void dflashTopKBf16(long logits, int rows, int vocabulary, long values, long indices, long scratch) {
         throw new UnsupportedOperationException("DFlash2 top-k is not implemented by this GPU");
     }
 

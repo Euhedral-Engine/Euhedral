@@ -108,6 +108,7 @@ public final class QwenExecutionPlan {
         DRAFT_KEY_ROPE,
         DRAFT_TOPK_VALUES,
         DRAFT_TOPK_INDICES,
+        DRAFT_TOPK_SCRATCH,
         DRAFT_SELECTOR,
         DRAFT_PROPOSAL,
         DRAFT_SCORES
@@ -1479,7 +1480,7 @@ public final class QwenExecutionPlan {
                 List.of(logits),
                 List.of(),
                 List.of(Buffer.LOGITS),
-                List.of(Buffer.DRAFT_TOPK_VALUES, Buffer.DRAFT_TOPK_INDICES),
+                List.of(Buffer.DRAFT_TOPK_VALUES, Buffer.DRAFT_TOPK_INDICES, Buffer.DRAFT_TOPK_SCRATCH),
                 target.vocabSize(),
                 c.selectorTopK());
         int projected = addNode(
@@ -1520,6 +1521,7 @@ public final class QwenExecutionPlan {
                 spec(Buffer.LOGITS, target.vocabSize(), ElementType.BF16),
                 spec(Buffer.DRAFT_TOPK_VALUES, c.selectorTopK(), ElementType.BF16),
                 spec(Buffer.DRAFT_TOPK_INDICES, c.selectorTopK(), ElementType.FP32),
+                spec(Buffer.DRAFT_TOPK_SCRATCH, 2 * 64 * c.selectorTopK(), ElementType.FP32),
                 spec(Buffer.DRAFT_SELECTOR, c.selectorRank(), ElementType.BF16),
                 spec(Buffer.DRAFT_PROPOSAL, 1, ElementType.FP32),
                 spec(Buffer.DRAFT_SCORES, c.selectorTopK(), ElementType.FP32));

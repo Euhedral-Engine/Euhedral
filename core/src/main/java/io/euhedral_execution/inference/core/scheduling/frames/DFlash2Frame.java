@@ -175,7 +175,8 @@ public final class DFlash2Frame extends QwenStageFrame {
                                 rows - 1,
                                 instruction.inputWidth(),
                                 output(context, instruction, 0),
-                                output(context, instruction, 1));
+                                output(context, instruction, 1),
+                                output(context, instruction, 2));
             case DFLASH_SELECT -> {
                 long hidden = input(context, instruction, 0) + (long) instruction.inputWidth() * Short.BYTES;
                 long tokens = output(context, instruction, 0);
