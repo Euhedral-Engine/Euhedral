@@ -53,6 +53,7 @@ subprojects {
             exclude("**/CapturedQuantaCudaIntegrationTest.class")
             exclude("**/TeacherForcedQualityCudaIntegrationTest.class")
             exclude("**/DFlash2*CudaIntegrationTest.class")
+            exclude("**/Qwen4*CudaIntegrationTest.class")
             useJUnitPlatform()
             // Constrained decoding is CPU work; its tests load the host's llguidance build.
             llguidanceTasks[hostProductId]?.let { build ->
