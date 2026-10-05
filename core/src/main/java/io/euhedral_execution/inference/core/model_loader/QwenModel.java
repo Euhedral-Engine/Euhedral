@@ -24,18 +24,22 @@ public final class QwenModel implements AutoCloseable {
 
     /// Loads every object the artifact's text generation executes onto the device.
     public static QwenModel load(Path path, QwenArtifact artifact, GpuMemory gpu) throws IOException {
-        return load(path, artifact, gpu, false, Set.of());
+        return load(path, artifact, gpu, ArtifactProfile.Speculation.NONE, Set.of());
     }
 
     /// Loads the objects named in `hostBacked` into pinned host memory, and allocates a device staging
-    /// ring of [ResidencyPlanner#STAGING_SLOTS] slots, each holding the largest of them. `speculative` also
-    /// loads the MTP layer and draft head. The model owns both.
+    /// ring of [ResidencyPlanner#STAGING_SLOTS] slots, each holding the largest of them. `speculation` also
+    /// loads its drafter. The model owns both.
     public static QwenModel load(
-            Path path, QwenArtifact artifact, GpuMemory gpu, boolean speculative, Set<String> hostBacked)
+            Path path,
+            QwenArtifact artifact,
+            GpuMemory gpu,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked)
             throws IOException {
         return load(
                 gpu,
-                memory -> QwenWeightLoader.load(path, artifact, memory, speculative, hostBacked),
+                memory -> QwenWeightLoader.load(path, artifact, memory, speculation, hostBacked),
                 hostBacked.isEmpty() ? 0 : ResidencyPlanner.STAGING_SLOTS);
     }
 
