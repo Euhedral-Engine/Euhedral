@@ -65,6 +65,15 @@ shard's global scale), through a pinned staging buffer; `euhedral_q4_ngram_expan
 `sigmoid(signed sqrt(key . query / sqrt(2560)))` per stream; the dilated depthwise convolution (4 taps, dilation 3) runs over
 the normalized gated values with nine rows of history, which a sequence carries as `[9][10240]` BF16.
 
+## Gated DeltaNet
+
+A GDN layer (36 of the 48) projects the mixed input to `qkv` (NVFP4, 10,240), `z` (6,144), and the BF16 `a` and `b` (48 each); a
+causal depthwise convolution (4 taps) with SiLU runs over `qkv` and keeps three rows of history; the decay `exp(-exp(A_log) *
+softplus(a + dt_bias))` and `beta = sigmoid(b)` feed the dense engine's delta-rule recurrence (FP32 state `[48][128][128]`, key
+heads shared by three value heads); the output is RMS-normalized per head, gated by `sigmoid(z)` (the dense engine gates by SiLU)
+and projected back. The convolution, control and gated norm are Flash-Next kernels because upstream rounds to BF16 at different
+places and fuses the QKV projection. Rows run in order with the state carried, so any chunking gives one result.
+
 ## Sparse attention (QSA)
 
 Every fourth layer (12 in all) is a sparse-attention layer: grouped-query attention (24 query heads, 2 KV heads of 256, partial
@@ -82,3 +91,37 @@ chunking of a sequence gives the same result. Selection scores a tile of rows at
 selects with a digit search over the scores; ties go to the lower block. The attention kernel reads the selected blocks and the
 tail directly from the pages: no dense matrix and no expanded token list. Arithmetic, tolerances and timings:
 [FLASH_NEXT_QSA.md](FLASH_NEXT_QSA.md).
+
+## Mixture of experts
+
+```
+router logits (BF16 [512]) -> softmax(FP32) -> top 10 (ties: lower expert) -> renormalize -> BF16 weights
+shared expert (NVFP4 MLP, 640) * sigmoid(gate)                                          every token
+routed experts (NVFP4 records in the expert cache), BF16 products, summed in ascending expert order
+out = routed + gated shared
+```
+
+`Qwen4MoeLayer` runs one block. The router and the shared expert are queued on the layer's stream, followed by the copy of the
+routing (ids and weights) to the host. That is the block's one host wait: which experts to bring in is known only on the host.
+
+**Expert waves.** A chunk of 512 tokens names up to 512 distinct experts, more than a minimal cache (20 slots) holds, and the
+expert records may not all be resident. `Qwen4ExpertWave` groups the (token, expert) pairs by expert, orders the experts by id
+and cuts them into waves of at most `min(cache slots, 32)` experts. For each wave the layer leases its experts from the cache,
+writes a descriptor (slot addresses, work items of up to 16 pairs, the pairs, per-row pair lists) into pinned memory, copies it
+to the device, and runs three kernels over it: gate/up with SwiGLU, the down projection with the routing weights, and a
+combine that adds each row's weighted results to the running routed sum in ascending expert order, one BF16 addition at a time
+as upstream's `index_add_` does. No temporary memory scales with the 512 experts' weights: a wave needs its slots (already in the
+cache) and `6,400 * pairs` bytes of activations.
+
+**Lease lifetime.** The kernels of a wave read the slot addresses from the descriptor. After queueing them the layer records a
+marker on its stream and closes every lease with a `StreamFence` on that marker. The cache's copy stream waits for the marker on
+the device before it refills a slot, so the host never waits for the kernels, a lease is held only while a wave is being
+submitted, and no device pointer into a slot is used after the lease. Experts that are hits cost nothing; misses are loaded by
+the cache's own copy stream and the acquirer waits for that copy, not for any compute.
+
+**Exactness.** The expert kernels read NVFP4 weights in place and take BF16 activations at every row count (no FP4 activation
+quantization): the bits of a (token, expert) pair depend only on the token's own activations, never on how many other tokens
+the expert saw, which wave it ran in or what was in the cache. `Qwen4MoeFixtureCudaIntegrationTest` runs layer 0 with the
+20-slot minimum cache (every chunk evicts) and with 520 slots and requires identical bits.
+
+Kernel contract and measurements of the expert kernels: [FLASH_NEXT_EXPERTS.md](FLASH_NEXT_EXPERTS.md).
