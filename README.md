@@ -299,6 +299,7 @@ the benchmark harness in [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - [docs/PREFILL_MX.md](docs/PREFILL_MX.md), [docs/NVFP4_NATIVE.md](docs/NVFP4_NATIVE.md), [docs/ATTENTION_DECODE.md](docs/ATTENTION_DECODE.md): the prefill, FP4 and attention kernels.
 - [docs/COMPACT_Q3_REFERENCE.md](docs/COMPACT_Q3_REFERENCE.md), [docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md), [docs/NVFP4_COMPRESSED.md](docs/NVFP4_COMPRESSED.md), [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md): the artifact formats and memory budgets.
 - [docs/FLASH_NEXT_ARTIFACT.md](docs/FLASH_NEXT_ARTIFACT.md), [docs/FLASH_NEXT_RESIDENCY.md](docs/FLASH_NEXT_RESIDENCY.md): the Qwen3.8-Flash-Next (`qwen4_exp`) artifact, and how its storage is placed and its experts cached.
+- [docs/FLASH_NEXT_EXECUTION.md](docs/FLASH_NEXT_EXECUTION.md), [docs/FLASH_NEXT_QSA.md](docs/FLASH_NEXT_QSA.md), [docs/FLASH_NEXT_EXPERTS.md](docs/FLASH_NEXT_EXPERTS.md), [docs/FLASH_NEXT_REFERENCE.md](docs/FLASH_NEXT_REFERENCE.md): running Flash-Next as a text model (ordinary generation, no speculation, no vision): the four-stream residual, GDN, sparse attention, the expert waves, the sequence state, its validation against the upstream implementation and its first measurements.
 - [docs/nvidia/](docs/nvidia/README.md): measurements of this GPU's hardware.
 
 ---
