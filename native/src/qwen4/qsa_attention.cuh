@@ -17,8 +17,9 @@
 namespace q4qsa {
 
 constexpr int D = 256, KT = 16, STRIDE = D + 8;
-constexpr unsigned kRawBytes = KT * 144;                        // one 16-token plane of cache rows
-constexpr unsigned kWarpSharedBytes = KT * STRIDE * 2 + 4 * kRawBytes;  // expanded tile + double-buffered raw K and V
+constexpr unsigned kRawBytes = KT * 144;  // one 16-token plane of cache rows
+constexpr unsigned kStages = 3;           // raw tiles in flight per warp
+constexpr unsigned kWarpSharedBytes = KT * STRIDE * 2 + kStages * 2 * kRawBytes;  // expanded tile + raw K and V stages
 
 static __device__ __forceinline__ void mma16816(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -32,6 +33,9 @@ static __device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], const void* p) 
 static __device__ __forceinline__ void ldsm_x4_t(unsigned (&r)[4], const void* p) {
     unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+static __device__ __forceinline__ void cp_async16_ca(void* destination, const void* source) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(nvfp4pipe::smem_u32(destination)), "l"(source));
 }
 static __device__ __forceinline__ unsigned pack_half2(float low, float high) {
     __half2 h = __floats2half2_rn(low, high);
@@ -51,22 +55,23 @@ static __device__ __forceinline__ unsigned int token_of(
     return 4u * nb + (t - 4u * count);
 }
 
-// Starts the copy of the raw rows (144 bytes: nine 16-byte chunks) of the 16 virtual keys at `base` of one head into
-// the K plane and the V plane of `raw`.
-static __device__ __forceinline__ void issue_tile(unsigned char* raw, const unsigned char* const* key_pages,
+// The cache row this lane copies for the 16 virtual keys at `base`: lane l < 16 the K row of key l, lane l >= 16 the V
+// row of key l - 16 (null past `end`). Computed one tile ahead of its use, so the loads of the selected block ids and
+// of the page table run while the warp computes.
+static __device__ __forceinline__ const unsigned char* tile_source(const unsigned char* const* key_pages,
         const unsigned char* const* value_pages, const int* ids, unsigned int count, unsigned int nb, unsigned int base,
         unsigned int end, unsigned int head, unsigned int heads, unsigned int lane) {
+    const unsigned int key = lane & 15u;
+    if (base + key >= end) return nullptr;
+    return cache_row((lane >> 4) == 0u ? key_pages : value_pages, token_of(ids, count, nb, base + key), head, heads);
+}
+
+// Starts the copy of this lane's 144-byte row (nine 16-byte chunks) into the raw tile buffer.
+static __device__ __forceinline__ void issue_tile(unsigned char* raw, const unsigned char* source, unsigned int lane) {
+    if (source == nullptr) return;
+    unsigned char* destination = raw + (lane >> 4) * kRawBytes + (lane & 15u) * 144u;
 #pragma unroll
-    for (int j = 0; j < 9; j++) {
-        const unsigned int chunk = lane + 32u * j;  // 0 .. 287: plane, key, chunk
-        const unsigned int plane = chunk >= 144u ? 1u : 0u, within = chunk - plane * 144u;
-        const unsigned int key = within / 9u, offset = within - key * 9u;
-        if (base + key < end) {
-            const unsigned int token = token_of(ids, count, nb, base + key);
-            const unsigned char* source = cache_row(plane == 0u ? key_pages : value_pages, token, head, heads);
-            nvfp4pipe::cp_async16(raw + plane * kRawBytes + key * 144u + offset * 16u, source + offset * 16u);
-        }
-    }
+    for (int j = 0; j < 9; j++) cp_async16_ca(destination + 16 * j, source + 16 * j);
 }
 
 // Expands the 16 raw rows of one plane into FP16 rows of `tile` (exact products, nvfp4_pipe.cuh); keys at or past
@@ -159,16 +164,23 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q4_qsa_attention(
 
     unsigned char* mine = shared + (unsigned long long)warp * kWarpSharedBytes;
     __half* tile = reinterpret_cast<__half*>(mine);
-    unsigned char* raw = mine + KT * STRIDE * 2;  // [buffer][K, V][16][144]
+    unsigned char* raw = mine + KT * STRIDE * 2;  // [stage][K, V][16][144]
 
     float o[32][4];
 #pragma unroll
     for (int j = 0; j < 32; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
     float m0 = -__int_as_float(0x7f800000), m1 = m0, l0 = 0.0f, l1 = 0.0f;
 
-    if (tiles > 0) {
-        // The first tile's copy overlaps the query rotation below.
-        issue_tile(raw, key_pages, value_pages, row_ids, count, nb, begin, end, kh, key_heads, lane);
+    // The first two tiles' copies overlap the query rotation below; `ahead` is the source of the tile after them.
+    const unsigned char* ahead = nullptr;
+    {
+        const unsigned char* first = tile_source(key_pages, value_pages, row_ids, count, nb, begin, end, kh, key_heads, lane);
+        const unsigned char* second =
+                tile_source(key_pages, value_pages, row_ids, count, nb, begin + KT, end, kh, key_heads, lane);
+        ahead = tile_source(key_pages, value_pages, row_ids, count, nb, begin + 2 * KT, end, kh, key_heads, lane);
+        if (tiles > 0) issue_tile(raw, first, lane);
+        nvfp4pipe::cp_async_commit();
+        if (tiles > 1) issue_tile(raw + 2 * kRawBytes, second, lane);
         nvfp4pipe::cp_async_commit();
     }
     // Rotated queries as FP16 A fragments: rows are the query heads of the group (rows >= group are zero).
@@ -197,13 +209,12 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_q4_qsa_attention(
 
     for (unsigned int index = 0; index < tiles; index++) {
         const unsigned int base = begin + index * KT;
-        if (index + 1u < tiles)
-            issue_tile(raw + ((index + 1u) & 1u) * 2u * kRawBytes, key_pages, value_pages, row_ids, count, nb,
-                    base + KT, end, kh, key_heads, lane);
+        if (index + 2u < tiles) issue_tile(raw + ((index + 2u) % kStages) * 2u * kRawBytes, ahead, lane);
         nvfp4pipe::cp_async_commit();
-        nvfp4pipe::cp_async_wait<1>();
+        ahead = tile_source(key_pages, value_pages, row_ids, count, nb, base + 3 * KT, end, kh, key_heads, lane);
+        nvfp4pipe::cp_async_wait<2>();
         __syncwarp();
-        const unsigned char* current = raw + (index & 1u) * 2u * kRawBytes;
+        const unsigned char* current = raw + (index % kStages) * 2u * kRawBytes;
         const unsigned int valid = end - base;  // keys of this tile before `end`
         expand_tile(tile, current, pairs, valid, lane);
         __syncwarp();

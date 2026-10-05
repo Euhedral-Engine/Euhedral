@@ -46,8 +46,8 @@ static const Qwen4KernelEntry kernels[] = {
     {"euhedral_q4_qsa_tail_bf16", 0},
     {"euhedral_q4_qsa_scores", 0},
     {"euhedral_q4_qsa_select", 0},
-    /* Four warps of 17,664 bytes (q4qsa::kWarpSharedBytes). */
-    {"euhedral_q4_qsa_attention", 70656},
+    /* Four warps of 22,272 bytes (q4qsa::kWarpSharedBytes). */
+    {"euhedral_q4_qsa_attention", 89088},
     {"euhedral_q4_qsa_merge", 0},
     {"euhedral_q4_qsa_kv_append", 0},
 };
