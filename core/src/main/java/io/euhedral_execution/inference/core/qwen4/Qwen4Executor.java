@@ -439,7 +439,8 @@ public final class Qwen4Executor implements AutoCloseable {
             this.midObserver.layerFinished(layer, this.state, rows);
         }
         long begin = this.timings == null ? 0 : System.nanoTime();
-        var before = this.trace == null ? null : this.model.expertCache().stats().snapshot();
+        var before =
+                this.trace == null ? null : this.model.expertCache().stats().snapshot();
         this.moe.run(
                 this.weights.moe(layer),
                 this.model.bankOrdinal("text/layers/" + layer + "/moe/experts"),

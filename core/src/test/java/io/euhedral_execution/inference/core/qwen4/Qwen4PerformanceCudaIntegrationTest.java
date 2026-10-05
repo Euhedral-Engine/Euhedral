@@ -26,7 +26,7 @@ import org.junit.jupiter.api.Test;
 class Qwen4PerformanceCudaIntegrationTest {
 
     private static final int MAX = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_PERF_MAX", "4096"));
-    private static final int CONTEXT = Math.max(MAX, 4096) + 256;
+    private static final int CONTEXT = Math.max(MAX, 4096) + 1024;
 
     private static int[] corpus(int tokens) throws IOException {
         Path tokenizerDirectory =
@@ -58,8 +58,13 @@ class Qwen4PerformanceCudaIntegrationTest {
 
     /// Per-layer use of the expert cache, accumulated over the MoE blocks a run executed.
     private static final class LayerStats implements Qwen4Executor.ExpertTrace {
-        final long[] blocks = new long[48], unique = new long[48], hits = new long[48], misses = new long[48],
-                evictions = new long[48], bytes = new long[48], waitNanos = new long[48];
+        final long[] blocks = new long[48],
+                unique = new long[48],
+                hits = new long[48],
+                misses = new long[48],
+                evictions = new long[48],
+                bytes = new long[48],
+                waitNanos = new long[48];
         final long[] uniqueMax = new long[48];
 
         @Override
@@ -81,7 +86,8 @@ class Qwen4PerformanceCudaIntegrationTest {
         }
 
         String summary(String title) {
-            StringBuilder text = new StringBuilder(title + ": layer unique-experts/block (max) hit-rate misses/block MB/block\n");
+            StringBuilder text =
+                    new StringBuilder(title + ": layer unique-experts/block (max) hit-rate misses/block MB/block\n");
             long totalHits = 0, totalMisses = 0, totalUnique = 0, totalBlocks = 0;
             for (int l = 0; l < 48; l++) {
                 if (blocks[l] == 0) continue;
@@ -166,6 +172,9 @@ class Qwen4PerformanceCudaIntegrationTest {
                             at += rows;
                         }
                         double seconds = (System.nanoTime() - start) / 1e9;
+                        executor.trace(null);
+                        if (target == 4096)
+                            line(layers.summary("expert cache, prefill of 4096 tokens in 512-token chunks"));
                         line(String.format(
                                 "prefill %d tokens: %.2f s, %.0f tokens/s; %s",
                                 target,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-import tempfile
 import time
 
 import torch
@@ -120,8 +119,7 @@ def cmd_greedy(args) -> int:
     import json
     from tokenizers import Tokenizer
     from transformers.cache_utils import DynamicCache
-    from .instrument import Capture
-    from .record import Recorder
+    from . import kvcodec
     art, fn = build(args.artifact, args.device)
     tokenizer = Tokenizer.from_file(str(DEFAULT_TOKENIZER))
     prompts = json.loads(args.prompts.read_text(encoding="utf-8"))
@@ -129,7 +127,17 @@ def cmd_greedy(args) -> int:
     for text in prompts:
         ids = tokenizer.encode(text).ids
         cache = DynamicCache(config=fn.cfg)
-        Capture(fn, Recorder(Path(tempfile.mkdtemp())), (), args.kv_format, model_level=True).attach_cache(cache)
+        if args.kv_format == "nvfp4":
+            # The engine's KV codec on every indexed-attention layer's cache, as the fixtures' `--kv-format nvfp4`.
+            for n in fn.layers:
+                if fn.by_index[n].layer_type != "indexed_attention":
+                    continue
+
+                def update(key_states, value_states, *rest, original=cache.layers[n].update, **kwargs):
+                    return original(kvcodec.roundtrip_cache(key_states), kvcodec.roundtrip_cache(value_states),
+                                    *rest, **kwargs)
+
+                cache.layers[n].update = update
         steps = []
         with torch.no_grad():
             feed = torch.tensor(ids, dtype=torch.long, device=args.device)
