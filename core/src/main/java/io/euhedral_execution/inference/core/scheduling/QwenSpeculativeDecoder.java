@@ -26,7 +26,7 @@ import java.util.function.IntPredicate;
 ///
 /// The prompt is prefilled in chunks that seed drafting, each followed by its catch-up. Not thread-safe;
 /// one decoder per sequence.
-public final class QwenSpeculativeDecoder implements AutoCloseable {
+public final class QwenSpeculativeDecoder implements SpeculativeDecoding {
 
     /// Per-generation measurements. `acceptedDrafts[a]` counts verifications that accepted a drafts.
     public static final class Statistics {
@@ -89,7 +89,15 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
     private final int[] draftTokens;
     /// Whether each vocabulary token is in the draft head's shortlist.
     private final boolean[] inShortlist;
+    private final MtpCheckpoint checkpoint;
     private Statistics statistics;
+
+    /// The MTP strategy at `depth` drafts per verification.
+    public static SpeculativeDecoding.Factory factory(int depth) {
+        if (depth < 1 || depth > 7) throw new IllegalArgumentException("depth must be 1 to 7");
+        return (runtime, plan, gpu, sequence, endOfGeneration, prefillChunk) ->
+                new QwenSpeculativeDecoder(runtime, plan, gpu, sequence, endOfGeneration, depth, prefillChunk);
+    }
 
     public QwenSpeculativeDecoder(
             EuhedralInferenceRuntime runtime,
@@ -117,6 +125,13 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         this.inShortlist = new boolean[plan.weights().config().vocabSize()];
         for (int token : this.draftTokens)
             if (token >= 0 && token < this.inShortlist.length) this.inShortlist[token] = true;
+        this.checkpoint = new MtpCheckpoint(plan.weights().config());
+    }
+
+    /// MTP state in a checkpoint at `p`: the MTP cache's rows below `p - 1` and the base hidden row of `p - 1`.
+    @Override
+    public SpeculativeCheckpoint checkpoint() {
+        return this.checkpoint;
     }
 
     /// The draft head's token for each of its rows (`text/draft_head_token_ids`).
@@ -164,17 +179,12 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
         return generateAsync(prompt, maxNewTokens, onToken, timing, null, 0);
     }
 
-    /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk and its MTP
-    /// catch-up, with the address of the base hidden row of the chunk's last position, before the next chunk
-    /// overwrites the draft seed rows. The future completes when the cache is done with the sequence's state.
-    public interface PrefixHooks {
-        CompletableFuture<Void> afterChunk(int end, long lastSeedRowAddress);
-    }
-
     /// As [#generateAsync(int[], int, IntConsumer, GenerationTimingListener)] for a sequence restored from the
     /// prefix cache at `startPosition` (0 for a fresh one): its base state holds `[0, startPosition)`, its MTP
     /// cache `[0, startPosition - 1)`, and its draft seed buffer the hidden row of position `startPosition - 1`.
-    /// `hooks`, when not null, is called after each prefill chunk.
+    /// `hooks`, when not null, is called after each prefill chunk and its MTP catch-up, before the next chunk
+    /// overwrites the draft seed rows.
+    @Override
     public CompletableFuture<List<Integer>> generateAsync(
             int[] prompt,
             int maxNewTokens,
@@ -232,7 +242,8 @@ public final class QwenSpeculativeDecoder implements AutoCloseable {
             if (this.hooks == null) return CompletableFuture.completedFuture(null);
             int hidden = QwenSpeculativeDecoder.this.hidden;
             long seeds = states().draftSeedRows(end - offset, hidden);
-            return this.hooks.afterChunk(end, seeds + (long) (end - offset - 1) * hidden * Short.BYTES);
+            QwenSpeculativeDecoder.this.checkpoint.seedRow(seeds + (long) (end - offset - 1) * hidden * Short.BYTES);
+            return this.hooks.afterChunk(end);
         }
 
         /// Prompt: prefill chunks that seed drafting, each followed by its MTP catch-up.

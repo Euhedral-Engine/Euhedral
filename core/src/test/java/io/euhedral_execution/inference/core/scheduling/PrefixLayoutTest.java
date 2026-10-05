@@ -73,10 +73,10 @@ class PrefixLayoutTest {
                 var attention = attention()) {
             QwenGdnSequenceState g = gdn.forLayer(0);
             long page = 2 * attention.forLayer(1).planePageBytes();
-            assertEquals(g.convolutionBytes() + g.recurrentBytes() + 3 * page, this.layout.extentBytes(0, 768, false));
+            assertEquals(g.convolutionBytes() + g.recurrentBytes() + 3 * page, this.layout.extentBytes(0, 768));
             assertEquals(
                     g.convolutionBytes() + g.recurrentBytes() + 2 * page,
-                    this.layout.extentBytes(512, 1024, false),
+                    this.layout.extentBytes(512, 1024),
                     "pages 2 and 3 of a span that starts at 512");
         }
     }
@@ -91,7 +91,7 @@ class PrefixLayoutTest {
             MemorySegment host = arena.allocate(8L << 20);
             commitRows(attention, 768);
             fillState(gdn, attention, 3);
-            PrefixNode node = tree.reserve(tree.root(), tokens, 768, false, this.layout.extentBytes(0, 768, false));
+            PrefixNode node = tree.reserve(tree.root(), tokens, 768, null, this.layout.extentBytes(0, 768));
             capture(host, node, gdn, attention);
             tree.publish(node);
 
@@ -129,7 +129,7 @@ class PrefixLayoutTest {
             commitRows(attention, 1280);
             int pageBytes = (int) (2 * attention.forLayer(1).planePageBytes());
             fillState(gdn, attention, 5);
-            PrefixNode first = tree.reserve(tree.root(), tokens, 512, false, this.layout.extentBytes(0, 512, false));
+            PrefixNode first = tree.reserve(tree.root(), tokens, 512, null, this.layout.extentBytes(0, 512));
             capture(host, first, gdn, attention);
             tree.publish(first);
             // Pages 0 and 1 (rows 0-511) are the first node's, as filled now.
@@ -139,7 +139,7 @@ class PrefixLayoutTest {
                         this.gpu.bytes(attention.forLayer(1).pageAddresses().get(page), pageBytes);
             // The sequence moves on: every buffer is rewritten, then the second node (pages 2-4) is captured.
             fillState(gdn, attention, 9);
-            PrefixNode second = tree.reserve(first, tokens, 1280, false, this.layout.extentBytes(512, 1280, false));
+            PrefixNode second = tree.reserve(first, tokens, 1280, null, this.layout.extentBytes(512, 1280));
             capture(host, second, gdn, attention);
             tree.publish(second);
 
@@ -171,7 +171,15 @@ class PrefixLayoutTest {
 
     // --- MTP state: the MTP cache's rows [0, position - 1) and the base hidden row of position - 1.
 
-    private final PrefixLayout mtpLayout = PrefixLayout.of(CONFIG, true);
+    private final MtpCheckpoint mtp = new MtpCheckpoint(CONFIG);
+
+    private static QwenSequenceState holding(AttentionSequenceStates attention) {
+        var sequence = new QwenSequenceState(1);
+        var lease = sequence.claimExecution(0);
+        sequence.setKvCacheState(lease, attention);
+        sequence.releaseExecution(lease, 0);
+        return sequence;
+    }
 
     private AttentionSequenceStates attentionWithMtp() {
         return AttentionSequenceStates.allocate(
@@ -193,20 +201,27 @@ class PrefixLayoutTest {
 
     private void captureMtp(
             MemorySegment host, PrefixNode node, GdnSequenceStates gdn, AttentionSequenceStates attention, long seed) {
-        for (var copy : this.mtpLayout.captureCopies(node, gdn, attention, seed))
+        this.mtp.seedRow(seed);
+        var copies = new java.util.ArrayList<>(this.layout.captureCopies(node, gdn, attention));
+        copies.addAll(this.mtp.captureCopies(node, this.layout.speculativeOffset(node), holding(attention)));
+        for (var copy : copies)
             this.gpu.copyDeviceToHost(
                     host.asSlice(copy.hostOffset(), copy.bytes()), copy.deviceAddress(), copy.bytes());
     }
 
     private void restoreMtp(
-            MemorySegment host,
-            List<PrefixNode> chain,
-            GdnSequenceStates gdn,
-            AttentionSequenceStates attention,
-            long seed) {
-        for (var copy : this.mtpLayout.restoreCopies(chain, gdn, attention, seed))
+            MemorySegment host, List<PrefixNode> chain, GdnSequenceStates gdn, AttentionSequenceStates attention) {
+        QwenSequenceState sequence = holding(attention);
+        var copies = new java.util.ArrayList<>(this.layout.restoreCopies(chain, gdn, attention));
+        copies.addAll(this.mtp.restoreCopies(chain, this.layout::speculativeOffset, sequence));
+        for (var copy : copies)
             this.gpu.copyHostToDevice(
                     copy.deviceAddress(), host.asSlice(copy.hostOffset(), copy.bytes()), copy.bytes());
+        this.mtp.restored(sequence, chain.getLast().position());
+    }
+
+    private long restoredSeed(AttentionSequenceStates attention) {
+        return attention.draftSeedRows(1, CONFIG.hiddenSize());
     }
 
     @Test
@@ -215,14 +230,9 @@ class PrefixLayoutTest {
             long page = 2 * attention.forLayer(CONFIG.numHiddenLayers()).planePageBytes();
             long seedRow = (long) CONFIG.hiddenSize() * Short.BYTES;
             // Rows [0, 767) fill 3 pages.
-            assertEquals(
-                    this.layout.extentBytes(0, 768, false) + seedRow + 3 * page,
-                    this.mtpLayout.extentBytes(0, 768, true));
+            assertEquals(seedRow + 3 * page, this.mtp.extentBytes(0, 768));
             // A span from 512 starts one MTP page early (the page of row 511): pages 1, 2 and 3 for rows below 1023.
-            assertEquals(
-                    this.layout.extentBytes(512, 1024, false) + seedRow + 3 * page,
-                    this.mtpLayout.extentBytes(512, 1024, true));
-            assertEquals(this.layout.extentBytes(0, 768, false), this.mtpLayout.extentBytes(0, 768, false));
+            assertEquals(seedRow + 3 * page, this.mtp.extentBytes(512, 1024));
         }
     }
 
@@ -242,14 +252,19 @@ class PrefixLayoutTest {
             fillMtpPages(attention, 40);
             long seed = this.gpu.allocate(256);
             this.gpu.fill(seed, 256, 77);
-            PrefixNode node = tree.reserve(tree.root(), tokens, 768, true, this.mtpLayout.extentBytes(0, 768, true));
+            PrefixNode node = tree.reserve(
+                    tree.root(),
+                    tokens,
+                    768,
+                    MtpCheckpoint.KIND,
+                    this.layout.extentBytes(0, 768) + this.mtp.extentBytes(0, 768));
             captureMtp(host, node, gdn, attention, seed);
             tree.publish(node);
 
             commitRows(attention2, 768);
-            commitMtpRows(attention2, 767);
-            long seed2 = this.gpu.allocate(256);
-            restoreMtp(host, List.of(node), gdn2, attention2, seed2);
+            restoreMtp(host, List.of(node), gdn2, attention2);
+            assertEquals(767, attention2.forLayer(CONFIG.numHiddenLayers()).length());
+            long seed2 = restoredSeed(attention2);
             AttentionKvState a = attention.forLayer(CONFIG.numHiddenLayers());
             AttentionKvState b = attention2.forLayer(CONFIG.numHiddenLayers());
             int pageBytes = (int) (2 * a.planePageBytes());
@@ -280,21 +295,30 @@ class PrefixLayoutTest {
             fillState(gdn, attention, 5);
             fillMtpPages(attention, 100);
             this.gpu.fill(seed, 256, 1);
-            PrefixNode first = tree.reserve(tree.root(), tokens, 512, true, this.mtpLayout.extentBytes(0, 512, true));
+            PrefixNode first = tree.reserve(
+                    tree.root(),
+                    tokens,
+                    512,
+                    MtpCheckpoint.KIND,
+                    this.layout.extentBytes(0, 512) + this.mtp.extentBytes(0, 512));
             captureMtp(host, first, gdn, attention, seed);
             tree.publish(first);
             byte[] firstPage0 = this.gpu.bytes(mtp.pageAddresses().get(0), pageBytes);
             // The sequence moves on: the MTP page that holds row 511 changes (row 511 is re-paired).
             fillMtpPages(attention, 200);
             this.gpu.fill(seed, 256, 2);
-            PrefixNode second = tree.reserve(first, tokens, 1280, true, this.mtpLayout.extentBytes(512, 1280, true));
+            PrefixNode second = tree.reserve(
+                    first,
+                    tokens,
+                    1280,
+                    MtpCheckpoint.KIND,
+                    this.layout.extentBytes(512, 1280) + this.mtp.extentBytes(512, 1280));
             captureMtp(host, second, gdn, attention, seed);
             tree.publish(second);
 
             commitRows(attention2, 1280);
-            commitMtpRows(attention2, 1279);
-            long seed2 = this.gpu.allocate(256);
-            restoreMtp(host, List.of(first, second), gdn2, attention2, seed2);
+            restoreMtp(host, List.of(first, second), gdn2, attention2);
+            long seed2 = restoredSeed(attention2);
             AttentionKvState restored = attention2.forLayer(CONFIG.numHiddenLayers());
             assertArrayEquals(
                     firstPage0,

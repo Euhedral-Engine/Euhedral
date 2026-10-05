@@ -16,7 +16,7 @@ public final class PrefixTree {
     public static final int POSITION_GRANULE = 256;
 
     private final HostExtents extents;
-    private final PrefixNode root = new PrefixNode(null, 0, 0, new int[0], true);
+    private final PrefixNode root = new PrefixNode(null, 0, 0, new int[0], null);
     private final Set<PrefixNode> published = new LinkedHashSet<>();
     private long clock;
     private long evictions;
@@ -40,16 +40,17 @@ public final class PrefixTree {
         }
     }
 
-    /// The longest match of `prompt` that leaves at least one token to prefill, or null. With `needsMtp` only
-    /// nodes that hold MTP state match, so the chain is unbroken.
-    public synchronized Match lookup(int[] prompt, boolean needsMtp) {
+    /// The longest match of `prompt` that leaves at least one token to prefill, or null. With a `speculation`
+    /// kind only nodes that hold that kind of speculative state match, so the chain is unbroken; with null any
+    /// node matches.
+    public synchronized Match lookup(int[] prompt, String speculation) {
         List<PrefixNode> chain = new ArrayList<>();
         PrefixNode node = this.root;
         while (true) {
             PrefixNode best = null;
             for (PrefixNode child : node.children) {
                 if (child.position() >= prompt.length) continue;
-                if (needsMtp && !child.hasMtp()) continue;
+                if (speculation != null && !speculation.equals(child.speculation())) continue;
                 if (best != null && child.position() <= best.position()) continue;
                 if (matches(child, prompt)) best = child;
             }
@@ -69,14 +70,25 @@ public final class PrefixTree {
         for (PrefixNode node : match.chain()) node.pins--;
     }
 
-    /// The published child of `parent` whose span `[parent.position, position)` equals `tokens` and whose MTP
-    /// state matches `mtp`, or null. A span can be stored once with MTP state and once without.
-    public synchronized PrefixNode find(PrefixNode parent, int[] tokens, int position, boolean mtp) {
+    /// The published child of `parent` whose span `[parent.position, position)` equals `tokens` and whose
+    /// speculative state is of the kind `speculation` (null: none), or null. A span can be stored once per kind.
+    public synchronized PrefixNode find(PrefixNode parent, int[] tokens, int position, String speculation) {
         for (PrefixNode child : parent.children)
             if (child.position() == position
-                    && child.hasMtp() == mtp
+                    && java.util.Objects.equals(child.speculation(), speculation)
                     && position <= tokens.length
                     && matches(child, tokens)) {
+                child.lastUse = ++this.clock;
+                return child;
+            }
+        return null;
+    }
+
+    /// The published child of `parent` whose span `[parent.position, position)` equals `tokens`, whatever
+    /// speculative state it holds, or null: every node holds the base state a plain capture would store.
+    public synchronized PrefixNode findAny(PrefixNode parent, int[] tokens, int position) {
+        for (PrefixNode child : parent.children)
+            if (child.position() == position && position <= tokens.length && matches(child, tokens)) {
                 child.lastUse = ++this.clock;
                 return child;
             }
@@ -86,7 +98,8 @@ public final class PrefixTree {
     /// Reserves `bytes` for a node covering `[parent.position, position)` of `tokens`, evicting least recently
     /// used nodes for room. Returns null when nothing evictable remains. The node is invisible until
     /// [#publish], and `parent` stays pinned until [#publish] or [#abort].
-    public synchronized PrefixNode reserve(PrefixNode parent, int[] tokens, int position, boolean mtp, long bytes) {
+    public synchronized PrefixNode reserve(
+            PrefixNode parent, int[] tokens, int position, String speculation, long bytes) {
         if (position <= parent.position() || position > tokens.length || position % POSITION_GRANULE != 0)
             throw new IllegalArgumentException("a node must advance, on the page grid, within the tokens");
         parent.pins++;
@@ -105,7 +118,9 @@ public final class PrefixTree {
                 parent.position(),
                 position,
                 Arrays.copyOfRange(tokens, parent.position(), position),
-                mtp && (parent == this.root || parent.hasMtp()));
+                parent == this.root || java.util.Objects.equals(parent.speculation(), speculation)
+                        ? speculation
+                        : null);
         node.extentOffset = offset;
         node.extentBytes = bytes;
         return node;

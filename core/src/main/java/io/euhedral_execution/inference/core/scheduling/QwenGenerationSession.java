@@ -53,9 +53,9 @@ public final class QwenGenerationSession implements AutoCloseable {
     private boolean promptPrefilled;
     /// Prompt tokens the last generation took from the prefix cache instead of prefilling them.
     private volatile int restoredPromptTokens;
-    /// MTP draft depth for greedy unconstrained generation from a fresh sequence; 0 disables it.
-    private int speculativeDepth;
-    private QwenSpeculativeDecoder speculative;
+    /// The speculative strategy for greedy unconstrained generation from a fresh sequence; null disables it.
+    private SpeculativeDecoding.Factory speculation;
+    private SpeculativeDecoding speculative;
     private PrefixCache prefixCache;
 
     /// Creates a session with a new persistent sequence owned by this instance.
@@ -125,7 +125,14 @@ public final class QwenGenerationSession implements AutoCloseable {
     public void enableSpeculativeDecoding(int depth) {
         if (depth < 0 || depth > 7) throw new IllegalArgumentException("depth must be 0 to 7");
         if (depth > 0 && !this.plan.drafts()) throw new IllegalStateException("the model has no MTP draft view");
-        this.speculativeDepth = depth;
+        useSpeculativeDecoding(depth == 0 ? null : QwenSpeculativeDecoder.factory(depth));
+    }
+
+    /// Generates greedy, unconstrained calls from a fresh sequence with the speculative strategy `factory`
+    /// opens (null: none). Set before the first prompt.
+    public void useSpeculativeDecoding(SpeculativeDecoding.Factory factory) {
+        if (this.speculative != null) throw new IllegalStateException("the session already speculates");
+        this.speculation = factory;
     }
 
     /// Prefills a prompt at the current sequence position and returns the IDs sampled by this call.
@@ -372,7 +379,7 @@ public final class QwenGenerationSession implements AutoCloseable {
         if (isStopRequested()) return CompletableFuture.completedFuture(List.of());
         // A greedy, unconstrained call selects each token on the device and reads back only its ID.
         this.hostLogits.selectOnDevice(this.sampler.greedy() && constraint == null);
-        if (this.speculativeDepth > 0
+        if (this.speculation != null
                 && this.sampler.greedy()
                 && constraint == null
                 && !this.promptPrefilled
@@ -421,7 +428,7 @@ public final class QwenGenerationSession implements AutoCloseable {
 
         /// Restores the longest stored prefix of the prompt, then prefills what is left.
         void startFromCache(PrefixCache cache) {
-            PrefixCache.Hit hit = cache.lookup(this.promptTokenIds, false);
+            PrefixCache.Hit hit = cache.lookup(this.promptTokenIds);
             this.cursor = hit == null ? cache.root() : hit.cursor();
             if (hit == null) {
                 prefillNext();
@@ -588,30 +595,29 @@ public final class QwenGenerationSession implements AutoCloseable {
     private CompletableFuture<List<Integer>> generateSpeculative(
             int[] promptTokenIds, int maxNewTokens, Consumer<String> text, GenerationTimingListener timing) {
         if (this.speculative == null)
-            this.speculative = new QwenSpeculativeDecoder(
+            this.speculative = this.speculation.open(
                     this.runtime,
                     this.plan,
                     this.gpu,
                     this.sequence,
                     this.tokenizer::isGenerationEosToken,
-                    this.speculativeDepth,
                     this.prefillChunkTokens);
         PrefixCache cache = this.prefixCache;
-        if (cache == null || !cache.supportsMtp())
-            return runSpeculative(promptTokenIds, maxNewTokens, text, timing, null, 0);
-        // A speculative prompt restores only through checkpoints that hold MTP state, and stores them.
-        PrefixCache.Hit hit = cache.lookup(promptTokenIds, true);
+        if (cache == null) return runSpeculative(promptTokenIds, maxNewTokens, text, timing, null, 0);
+        // A speculative prompt restores only through checkpoints that hold its strategy's state, and stores them.
+        SpeculativeCheckpoint state = this.speculative.checkpoint();
+        PrefixCache.Hit hit = cache.lookup(promptTokenIds, state);
         AtomicReference<PrefixNode> cursor = new AtomicReference<>(hit == null ? cache.root() : hit.cursor());
-        QwenSpeculativeDecoder.PrefixHooks hooks = (end, seedRow) -> {
+        SpeculativeDecoding.PrefixHooks hooks = end -> {
             PrefixNode attachedTo = cursor.get();
             if (end <= attachedTo.position() || !cache.wantsCheckpoint(end, promptTokenIds.length))
                 return CompletableFuture.completedFuture(null);
-            return cache.capture(this.runtime.frames(), this.sequence, attachedTo, promptTokenIds, end, seedRow)
+            return cache.capture(this.runtime.frames(), this.sequence, attachedTo, promptTokenIds, end, state)
                     .thenAccept(cursor::set);
         };
         if (hit == null) return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, 0);
         long started = System.nanoTime();
-        return cache.restore(this.runtime.frames(), this.plan, this.sequence, hit, true)
+        return cache.restore(this.runtime.frames(), this.plan, this.sequence, hit, state)
                 .whenComplete((restored, failure) -> cache.release(hit))
                 .thenCompose(restored -> {
                     if (!restored || isStopRequested()) return CompletableFuture.completedFuture(List.<Integer>of());
@@ -626,7 +632,7 @@ public final class QwenGenerationSession implements AutoCloseable {
             int maxNewTokens,
             Consumer<String> text,
             GenerationTimingListener timing,
-            QwenSpeculativeDecoder.PrefixHooks hooks,
+            SpeculativeDecoding.PrefixHooks hooks,
             int startPosition) {
         return this.speculative
                 .generateAsync(

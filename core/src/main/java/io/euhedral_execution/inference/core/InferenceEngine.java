@@ -164,11 +164,7 @@ public final class InferenceEngine implements AutoCloseable {
         if (config.prefixCacheBytes() == 0 || plan.weights().layers().length <= 1) return null;
         try {
             PrefixCache cache = PrefixCache.create(
-                    gpu,
-                    plan.weights().config(),
-                    plan.drafts(),
-                    config.prefixCacheBytes(),
-                    config.prefixCacheCheckpointTokens());
+                    gpu, plan.weights().config(), config.prefixCacheBytes(), config.prefixCacheCheckpointTokens());
             LOG.info(
                     "Prefix cache: {} MiB pinned, a checkpoint every {} tokens",
                     config.prefixCacheBytes() >> 20,
