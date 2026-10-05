@@ -177,20 +177,10 @@ final class Qwen4QsaTestSupport {
                         path, artifact.tensor(base + names[i]).orElseThrow().descriptor(), gpu);
                 owned.add(h[i].deviceAddress());
             }
-            Qwen4QsaLayer.Weights weights = new Qwen4QsaLayer.Weights(
-                    h[0].deviceAddress(),
-                    h[0].byteSize(),
-                    h[1].deviceAddress(),
-                    h[1].byteSize(),
-                    h[2].deviceAddress(),
-                    h[2].byteSize(),
-                    h[3].deviceAddress(),
-                    h[3].byteSize(),
-                    h[4].deviceAddress(),
-                    h[5].deviceAddress(),
-                    h[6].deviceAddress(),
-                    h[7].deviceAddress(),
-                    h[8].deviceAddress());
+            Qwen4Weight[] w = new Qwen4Weight[h.length];
+            for (int i = 0; i < h.length; i++) w[i] = Qwen4Weight.of(h[i].deviceAddress(), h[i].byteSize());
+            Qwen4QsaLayer.Weights weights =
+                    new Qwen4QsaLayer.Weights(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
             return new Loaded(weights, artifact, owned, gpu);
         }
 

@@ -76,23 +76,18 @@ public final class Qwen4QsaLayer {
         }
     }
 
-    /// Where the layer's weights are on the device. The NVFP4 projections come with their byte
-    /// sizes; the norms and the indexer projection are BF16 (`indexProj` is `[(heads + 1) *
-    /// 128][hidden]`, the norm weights are shared by all heads).
+    /// The layer's weights. The projections are NVFP4; the norms and the indexer projection are BF16 (`indexProj` is
+    /// `[(heads + 1) * 128][hidden]`, the norm weights are shared by all heads).
     public record Weights(
-            long qProj,
-            long qProjBytes,
-            long kProj,
-            long kProjBytes,
-            long vProj,
-            long vProjBytes,
-            long oProj,
-            long oProjBytes,
-            long qNorm,
-            long kNorm,
-            long indexProj,
-            long indexQNorm,
-            long indexKNorm) {}
+            Qwen4Weight qProj,
+            Qwen4Weight kProj,
+            Qwen4Weight vProj,
+            Qwen4Weight oProj,
+            Qwen4Weight qNorm,
+            Qwen4Weight kNorm,
+            Qwen4Weight indexProj,
+            Qwen4Weight indexQNorm,
+            Qwen4Weight indexKNorm) {}
 
     /// The device buffers one call uses ([#scratch]).
     public record Scratch(
@@ -231,17 +226,40 @@ public final class Qwen4QsaLayer {
         indexKeys(gpu, w, state, rows, start, s);
         boolean selecting = select(gpu, state, rows, start, s);
         attend(gpu, state, rows, start, s, selecting, coreOutput);
-        gpu.linearNvfp4Bf16(s.gated(), w.oProj(), output, rows, config.queryWidth(), config.hidden(), w.oProjBytes());
+        Qwen4Weight o = w.oProj();
+        gpu.linearNvfp4Bf16(s.gated(), o.address(), output, rows, config.queryWidth(), config.hidden(), o.bytes());
         state.submitted();
     }
 
     /// The query/gate, key and value projections and the indexer projection of `rows` rows.
     void project(ExecutionGpu gpu, Weights w, long input, int rows, Scratch s) {
         Config c = this.config;
-        gpu.linearNvfp4Bf16(input, w.qProj(), s.qProj(), rows, c.hidden(), 2 * c.queryWidth(), w.qProjBytes());
-        gpu.linearNvfp4Bf16(input, w.kProj(), s.kProj(), rows, c.hidden(), c.keyValueWidth(), w.kProjBytes());
-        gpu.linearNvfp4Bf16(input, w.vProj(), s.vProj(), rows, c.hidden(), c.keyValueWidth(), w.vProjBytes());
-        Qwen4Ops.linearBf16(gpu, input, w.indexProj(), s.indexProj(), rows, c.hidden(), c.indexProjectionWidth());
+        gpu.linearNvfp4Bf16(
+                input,
+                w.qProj().address(),
+                s.qProj(),
+                rows,
+                c.hidden(),
+                2 * c.queryWidth(),
+                w.qProj().bytes());
+        gpu.linearNvfp4Bf16(
+                input,
+                w.kProj().address(),
+                s.kProj(),
+                rows,
+                c.hidden(),
+                c.keyValueWidth(),
+                w.kProj().bytes());
+        gpu.linearNvfp4Bf16(
+                input,
+                w.vProj().address(),
+                s.vProj(),
+                rows,
+                c.hidden(),
+                c.keyValueWidth(),
+                w.vProj().bytes());
+        Qwen4Ops.linearBf16(
+                gpu, input, w.indexProj().address(), s.indexProj(), rows, c.hidden(), c.indexProjectionWidth());
     }
 
     /// q_norm and RoPE in place on the query half of every head's [q | gate] (the gate stays where
@@ -254,7 +272,7 @@ public final class Qwen4QsaLayer {
         Qwen4QsaOps.headNormRope(
                 gpu,
                 s.qProj(),
-                w.qNorm(),
+                w.qNorm().address(),
                 s.qProj(),
                 rows,
                 c.queryHeads(),
@@ -271,7 +289,7 @@ public final class Qwen4QsaLayer {
         Qwen4QsaOps.headNormRope(
                 gpu,
                 s.kProj(),
-                w.kNorm(),
+                w.kNorm().address(),
                 s.kNormed(),
                 rows,
                 c.keyHeads(),
@@ -288,7 +306,7 @@ public final class Qwen4QsaLayer {
         Qwen4QsaOps.headNormRope(
                 gpu,
                 s.indexProj(),
-                w.indexQNorm(),
+                w.indexQNorm().address(),
                 s.indexProj(),
                 rows,
                 c.indexHeads(),
@@ -335,7 +353,7 @@ public final class Qwen4QsaLayer {
             Qwen4QsaOps.headNormRope(
                     gpu,
                     fresh,
-                    w.indexKNorm(),
+                    w.indexKNorm().address(),
                     fresh,
                     completed,
                     1,
