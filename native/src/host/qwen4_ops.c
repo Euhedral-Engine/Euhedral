@@ -38,6 +38,9 @@ static const Qwen4KernelEntry kernels[] = {
     {"euhedral_q4_ple_gate_bf16", 0},
     {"euhedral_q4_ple_conv_bf16", 0},
     {"euhedral_q4_conv_history_bf16", 0},
+    {"euhedral_q4_gdn_conv_bf16", 0},
+    {"euhedral_q4_gdn_control_bf16", 0},
+    {"euhedral_q4_gdn_gated_norm_bf16", 0},
 };
 #define KERNEL_COUNT ((int)(sizeof(kernels) / sizeof(kernels[0])))
 

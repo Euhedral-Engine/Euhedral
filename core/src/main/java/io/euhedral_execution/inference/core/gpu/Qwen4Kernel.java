@@ -12,7 +12,10 @@ public enum Qwen4Kernel {
     NGRAM_EXPAND_BF16("euhedral_q4_ngram_expand_bf16"),
     PLE_GATE_BF16("euhedral_q4_ple_gate_bf16"),
     PLE_CONV_BF16("euhedral_q4_ple_conv_bf16"),
-    CONV_HISTORY_BF16("euhedral_q4_conv_history_bf16");
+    CONV_HISTORY_BF16("euhedral_q4_conv_history_bf16"),
+    GDN_CONV_BF16("euhedral_q4_gdn_conv_bf16"),
+    GDN_CONTROL_BF16("euhedral_q4_gdn_control_bf16"),
+    GDN_GATED_NORM_BF16("euhedral_q4_gdn_gated_norm_bf16");
 
     private final String symbol;
 
