@@ -74,6 +74,8 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
   - `edrl.py`, `sources.py`, `device.py`: container format, safetensors access, CPU/CUDA selection.
 - `test_*.py`: unit tests, which need NumPy and no GPU or checkpoint (`python3 -m unittest discover -s tools`;
   three CUDA-versus-CPU byte-equality tests run when PyTorch has a CUDA device).
+- `nvfp4z.py`, `nvfp4z/`: lossless compression of NVFP4 safetensors checkpoints to about 90% of their size, on the GPU (PyTorch with
+  CUDA; docs/NVFP4_LOSSLESS.md). `test_nvfp4z.py` runs on any machine; its GPU tests need a CUDA device.
 - `compare_teacher_forced.py`: compares teacher-forced logits reports with one another (NumPy).
 - `compare_reference.py`: compares teacher-forced logits reports with a BF16 reference written by llama.cpp (NumPy).
 - `dflash2_reference.py`: runs the upstream DFlash2 draft model (z-lab/dflash, unmodified; needs PyTorch, transformers 5.15 and the
