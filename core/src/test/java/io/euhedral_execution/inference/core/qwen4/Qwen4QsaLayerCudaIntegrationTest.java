@@ -20,24 +20,21 @@ import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
 
 /// The whole QSA attention block of layer 3 of the real artifact (NVFP4 projections, BF16 indexer):
-/// against the
-/// fixtures of tools/flash_next_reference.py (upstream's unmodified eager implementation,
-/// `layer_qsa_short` and
-/// `layer_qsa_long`) and for independence from the chunking of the sequence. The linears run row-exact,
-/// so a
-/// row's projections do not depend on the chunk it is in. Skipped without the artifact (or the fixtures).
+/// against the fixtures of tools/flash_next_reference.py (upstream's unmodified eager
+/// implementation, `layer_qsa_short` and `layer_qsa_long`) and for independence from the chunking
+/// of the sequence. The linears run row-exact, so a row's projections do not depend on the chunk it
+/// is in. Skipped without the artifact (or the fixtures).
 class Qwen4QsaLayerCudaIntegrationTest {
 
     private static final int LAYER = 3;
-    /// A block may be selected or omitted against the reference only if its score is within this fraction
-    /// of the
-    /// row's highest score of the k-th score. Scores come from BF16 queries and keys that agree with the
-    /// reference's
-    /// to a few BF16 steps, so near-tied blocks at the boundary may swap.
+    /// A block may be selected or omitted against the reference only if its score is within this
+    /// fraction of the row's highest score of the k-th score. Scores come from BF16 queries and
+    /// keys that agree with the reference's to a few BF16 steps, so near-tied blocks at the
+    /// boundary may swap.
     private static final double SELECTION_EPSILON = 2e-3;
 
-    /// Fixture roots in order of preference; the first fixture of a case recorded with the NVFP4 cache
-    /// wins.
+    /// Fixture roots in order of preference; the first fixture of a case recorded with the NVFP4
+    /// cache wins.
     private static List<Path> fixtureRoots() {
         List<Path> roots = new ArrayList<>();
         String configured = System.getProperty("euhedral.qwen4.fixtures");
@@ -75,8 +72,8 @@ class Qwen4QsaLayerCudaIntegrationTest {
         return stat;
     }
 
-    /// Per tensor name, the largest relative RMS error over the chunks and the largest single difference
-    /// in RMS units.
+    /// Per tensor name, the largest relative RMS error over the chunks and the largest single
+    /// difference in RMS units.
     private static void report(String title) {
         java.util.Map<String, double[]> worst = new java.util.TreeMap<>();
         for (Stat stat : STATS) {
@@ -183,6 +180,17 @@ class Qwen4QsaLayerCudaIntegrationTest {
                                         expected,
                                         downloadShorts(gpu, arena, state.blockKeys(), blocks * 128L));
                             }
+                            if (fixtures.has(p + "kv_k")) compareCache(gpu, arena, fixtures, p, state, start + rows);
+                            if (start + rows <= 2048)
+                                compareExact(
+                                        gpu,
+                                        arena,
+                                        p,
+                                        state,
+                                        start,
+                                        rows,
+                                        qProj,
+                                        downloadShorts(gpu, arena, core, (long) rows * 6144));
                         }
                         if (start + rows - 1 >= 2051) checkSelection(gpu, arena, fixtures, p, scratch, start, rows);
                     } finally {
@@ -201,8 +209,61 @@ class Qwen4QsaLayerCudaIntegrationTest {
         report(name + (nvfp4 ? " (nvfp4 cache)" : " (bf16 cache)"));
     }
 
-    /// The GPU's block ids of a selecting chunk against the fixture's: score aware where the fixture has
-    /// the scores.
+    /// The device's cache pages, decoded, against the fixture's cache: the fixture holds the
+    /// codec's result rounded to BF16, the pages the exact represented values.
+    private static void compareCache(
+            CudaGpuMemory gpu, Arena arena, ReferenceFixtures fixtures, String p, Qwen4QsaState state, int length)
+            throws IOException {
+        for (String plane : new String[] {"kv_k", "kv_v"}) {
+            short[] expected = fixtures.bf16(p + plane);
+            long table = plane.equals("kv_k") ? state.keyPages() : state.valuePages();
+            double error = 0, norm = 0;
+            for (int head = 0; head < 2; head++) {
+                double[][] decoded = Qwen4QsaTestSupport.decodeCache(gpu, arena, table, length, 2, head);
+                for (int t = 0; t < length; t++)
+                    for (int d = 0; d < 256; d++) {
+                        double e = Qwen4Reference.bf(expected[(head * length + t) * 256 + d]);
+                        error += (e - decoded[t][d]) * (e - decoded[t][d]);
+                        norm += e * e;
+                    }
+            }
+            STATS.add(new Stat("cache_" + plane.substring(3), Math.sqrt(error / norm), 0));
+        }
+    }
+
+    /// The core of a chunk against double-precision attention over the device's own decoded cache,
+    /// for the dense rows (no selection) and the device's own queries.
+    private static void compareExact(
+            CudaGpuMemory gpu,
+            Arena arena,
+            String p,
+            Qwen4QsaState state,
+            int start,
+            int rows,
+            short[] qProj,
+            short[] core) {
+        int length = start + rows;
+        double[][][] k = new double[2][][], v = new double[2][][];
+        for (int h = 0; h < 2; h++) {
+            k[h] = Qwen4QsaTestSupport.decodeCache(gpu, arena, state.keyPages(), length, 2, h);
+            v[h] = Qwen4QsaTestSupport.decodeCache(gpu, arena, state.valuePages(), length, 2, h);
+        }
+        short[] q = qHeadParts(qProj, rows, 0);
+        double[] expected = new double[rows * 6144];
+        for (int r = 0; r < rows; r++)
+            for (int head = 0; head < 24; head++)
+                System.arraycopy(
+                        Qwen4QsaReference.attend(
+                                q, (r * 24 + head) * 256, k[head / 12], v[head / 12], start + r, null, 0),
+                        0,
+                        expected,
+                        r * 6144 + head * 256,
+                        256);
+        STATS.add(new Stat("core_vs_exact", Qwen4QsaReference.relativeRms(expected, core), 0));
+    }
+
+    /// The GPU's block ids of a selecting chunk against the fixture's: score aware where the
+    /// fixture has the scores.
     private static void checkSelection(
             CudaGpuMemory gpu,
             Arena arena,
@@ -289,9 +350,9 @@ class Qwen4QsaLayerCudaIntegrationTest {
         return chunks.stream().mapToInt(Integer::intValue).toArray();
     }
 
-    /// Any chunking of 2,300 tokens (past the budget of 2,048) gives the one-shot result: chunks of 1 to
-    /// 5 rows, blocks
-    /// completing across chunk boundaries, prefill chunks followed by decode rows.
+    /// Any chunking of 2,300 tokens (past the budget of 2,048) gives the one-shot result: chunks of
+    /// 1 to 5 rows, blocks completing across chunk boundaries, prefill chunks followed by decode
+    /// rows.
     @Test
     void chunkingDoesNotChangeTheResult() throws IOException {
         int tokens = 2300;
@@ -327,6 +388,100 @@ class Qwen4QsaLayerCudaIntegrationTest {
                 }
             } finally {
                 gpu.selectRowExact(false);
+            }
+        }
+    }
+
+    /// The layer at the end of the maximum context (262,144 tokens, 65,500 blocks), on random rows:
+    /// the selection of every row of a chunk against the reference scores of the device's own block
+    /// keys, and the attention against the decoded cache of the selected tokens.
+    @Test
+    void layerAtFullContextMatchesTheReference() throws IOException {
+        int maxTokens = 262144, history = 261632, rows = 8;
+        SplittableRandom rng = new SplittableRandom(17);
+        try (CudaGpuMemory gpu = open();
+                Arena arena = Arena.ofConfined();
+                Qwen4QsaTestSupport.Loaded loaded = Qwen4QsaTestSupport.Loaded.load(gpu, LAYER)) {
+            Qwen4QsaLayer layer =
+                    new Qwen4QsaLayer(Qwen4QsaLayer.Config.of(loaded.artifact().config(), maxTokens));
+            int maxRows = 512;
+            long base = gpu.allocate(layer.scratchBytes(maxRows));
+            Qwen4QsaLayer.Scratch s = layer.scratch(base, maxRows);
+            long input = gpu.allocate((long) maxRows * 2560 * 2), output = gpu.allocate((long) maxRows * 2560 * 2);
+            long core = gpu.allocate((long) maxRows * 6144 * 2);
+            java.lang.foreign.MemorySegment chunk = arena.allocate((long) maxRows * 2560 * 2, 16);
+            try (Qwen4QsaState state = new Qwen4QsaState(gpu, 512, maxTokens)) {
+                while (state.length() < history) {
+                    int step = Math.min(maxRows, history - state.length());
+                    Qwen4QsaTestSupport.fillRandom(chunk, rng, step, 2560);
+                    gpu.copyHostToDevice(input, chunk, (long) step * 2560 * 2);
+                    layer.run(gpu, loaded.weights(), state, input, step, output, s, 0);
+                    gpu.synchronize();
+                    state.commit();
+                }
+                Qwen4QsaTestSupport.fillRandom(chunk, rng, rows, 2560);
+                gpu.copyHostToDevice(input, chunk, (long) rows * 2560 * 2);
+                layer.run(gpu, loaded.weights(), state, input, rows, output, s, core);
+                gpu.synchronize();
+                int start = history, end = start + rows, blocks = end / 4;
+                short[] blockKeys = downloadShorts(gpu, arena, state.blockKeys(), (long) blocks * 128);
+                short[][] keys = new short[blocks][];
+                for (int j = 0; j < blocks; j++) keys[j] = Arrays.copyOfRange(blockKeys, j * 128, (j + 1) * 128);
+                short[] index = downloadShorts(gpu, arena, s.indexProj(), rows * 640L);
+                short[] qProj = downloadShorts(gpu, arena, s.qProj(), (long) rows * 12288);
+                short[] actualCore = downloadShorts(gpu, arena, core, (long) rows * 6144);
+                int[] counts = downloadInts(gpu, arena, s.counts(), rows);
+                int[] ids = downloadInts(gpu, arena, s.ids(), rows * 512L);
+                boolean[] wanted = new boolean[end];
+                int[][] selected = new int[rows][];
+                double worstGap = 0;
+                for (int r = 0; r < rows; r++) {
+                    int p = start + r, nb = (p + 1) / 4;
+                    short[][] q = new short[4][];
+                    for (int h = 0; h < 4; h++)
+                        q[h] = Arrays.copyOfRange(index, r * 640 + h * 128, r * 640 + (h + 1) * 128);
+                    double[] scores = Qwen4QsaReference.scores(q, keys, nb);
+                    double max = Arrays.stream(scores).max().orElse(0);
+                    assertEquals(512, counts[r]);
+                    selected[r] = Arrays.copyOfRange(ids, r * 512, (r + 1) * 512);
+                    Qwen4QsaReference.Check check = Qwen4QsaReference.checkSelection(
+                            scores, selected[r], 512, 512, 1e-5 * max, "full context row " + r);
+                    worstGap = Math.max(worstGap, check.gap() / max);
+                    for (int id : selected[r]) for (int u = 0; u < 4; u++) wanted[4 * id + u] = true;
+                    for (int t = 4 * nb; t <= p; t++) wanted[t] = true;
+                }
+                double[][][] k = new double[2][][], v = new double[2][][];
+                for (int h = 0; h < 2; h++) {
+                    k[h] = Qwen4QsaTestSupport.decodeTokens(gpu, arena, state.keyPages(), end, 2, h, wanted);
+                    v[h] = Qwen4QsaTestSupport.decodeTokens(gpu, arena, state.valuePages(), end, 2, h, wanted);
+                }
+                short[] q = qHeadParts(qProj, rows, 0);
+                double[] expected = new double[rows * 6144];
+                for (int r = 0; r < rows; r++)
+                    for (int head = 0; head < 24; head++)
+                        System.arraycopy(
+                                Qwen4QsaReference.attend(
+                                        q,
+                                        (r * 24 + head) * 256,
+                                        k[head / 12],
+                                        v[head / 12],
+                                        start + r,
+                                        selected[r],
+                                        512),
+                                0,
+                                expected,
+                                r * 6144 + head * 256,
+                                256);
+                double rms = Qwen4QsaReference.relativeRms(expected, actualCore);
+                System.out.printf(
+                        "full context: selection score gap %.2e of the maximum, core relative RMS %.3e%n",
+                        worstGap, rms);
+                assertTrue(rms < 3e-3, "core relative RMS " + rms);
+            } finally {
+                gpu.free(core);
+                gpu.free(output);
+                gpu.free(input);
+                gpu.free(base);
             }
         }
     }

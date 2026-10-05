@@ -5,10 +5,9 @@ import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
 import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 
 /// Typed launches of the QSA (Qwen Sparse Attention) kernels of native/src/qwen4/qsa_*.cuh
-/// (docs/FLASH_NEXT_QSA.md):
-/// the geometry each kernel is written for and the argument checks the native launcher cannot make. Every
-/// method
-/// queues on the GPU's selected stream and none allocates on the hot path.
+/// (docs/FLASH_NEXT_QSA.md): the geometry each kernel is written for and the argument checks the
+/// native launcher cannot make. Every method queues on the GPU's selected stream and none allocates
+/// on the hot path.
 public final class Qwen4QsaOps {
 
     /// Tokens per indexer block.
@@ -25,7 +24,8 @@ public final class Qwen4QsaOps {
     static final int ATTENTION_WARP_SHARED_BYTES = 17_664;
     /// The most warps an attention CTA may have (the native table's shared-memory limit).
     static final int ATTENTION_MAX_WARPS = 4;
-    /// Floats of one (row, head, split) partial: 256 values, the running maximum and the running sum.
+    /// Floats of one (row, head, split) partial: 256 values, the running maximum and the running
+    /// sum.
     static final int PARTIAL_FLOATS = 258;
 
     private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
@@ -37,11 +37,10 @@ public final class Qwen4QsaOps {
         return ARGUMENTS.get().clear();
     }
 
-    /// Per-head RMSNorm with the one weight of `width` values shared by every head, then (rotary 64) RoPE
-    /// on the first
-    /// 64 values of each head at position `position + row * positionStep`; BF16 throughout like the
-    /// upstream tensor
-    /// operations. Strides are in elements. Input and output may be the same memory.
+    /// Per-head RMSNorm with the one weight of `width` values shared by every head, then (rotary
+    /// 64) RoPE on the first 64 values of each head at position `position + row * positionStep`;
+    /// BF16 throughout like the upstream tensor operations. Strides are in elements. Input and
+    /// output may be the same memory.
     public static void headNormRope(
             ExecutionGpu gpu,
             long input,
@@ -94,11 +93,10 @@ public final class Qwen4QsaOps {
                         .float32(theta));
     }
 
-    /// Pools the blocks a chunk of `rows` tokens at `start` completes: `(start + rows) / 4 - start / 4`
-    /// blocks, each
-    /// the BF16 mean of its four raw keys (the chunk's rows at `raw`, row stride `rawStride`, or the
-    /// `tail` of the
-    /// previous chunks), written to `blocks[start / 4 ..]` still to be normalized and rotated.
+    /// Pools the blocks a chunk of `rows` tokens at `start` completes: `(start + rows) / 4 - start
+    /// / 4` blocks, each the BF16 mean of its four raw keys (the chunk's rows at `raw`, row stride
+    /// `rawStride`, or the `tail` of the previous chunks), written to `blocks[start / 4 ..]` still
+    /// to be normalized and rotated.
     public static void poolKeys(
             ExecutionGpu gpu, long raw, long tail, long blocks, int rows, int start, int rawStride) {
         int count = completedBlocks(start, rows);
@@ -127,7 +125,8 @@ public final class Qwen4QsaOps {
         return (start + rows) / BLOCK_TOKENS - start / BLOCK_TOKENS;
     }
 
-    /// Writes the raw keys of the incomplete trailing block after the chunk to `tailOut` (not `tailIn`).
+    /// Writes the raw keys of the incomplete trailing block after the chunk to `tailOut` (not
+    /// `tailIn`).
     public static void tail(ExecutionGpu gpu, long raw, long tailIn, long tailOut, int rows, int start, int rawStride) {
         requirePositive(rows);
         requireAligned(4, raw, tailIn, tailOut);
@@ -149,9 +148,9 @@ public final class Qwen4QsaOps {
                         .int32(rawStride));
     }
 
-    /// Scores of chunk rows `rowBegin ..< rowBegin + tileRows` against the first `blocksTotal` block
-    /// keys, into
-    /// `scores[tileRows][scoreStride]` (entry (r, j) only for the blocks row `rowBegin + r` sees).
+    /// Scores of chunk rows `rowBegin ..< rowBegin + tileRows` against the first `blocksTotal`
+    /// block keys, into `scores[tileRows][scoreStride]` (entry (r, j) only for the blocks row
+    /// `rowBegin + r` sees).
     public static void scores(
             ExecutionGpu gpu,
             long queries,
@@ -187,8 +186,8 @@ public final class Qwen4QsaOps {
                         .int32(blocksTotal));
     }
 
-    /// Selects the blocks of chunk rows `rowBegin ..< rowBegin + tileRows`: `ids[row][0 ..< counts[row]]`
-    /// ascending.
+    /// Selects the blocks of chunk rows `rowBegin ..< rowBegin + tileRows`: `ids[row][0 ..<
+    /// counts[row]]` ascending.
     public static void select(
             ExecutionGpu gpu,
             long scores,
@@ -219,12 +218,10 @@ public final class Qwen4QsaOps {
                         .int32(budget));
     }
 
-    /// Sparse attention of `rows` query rows at `start ..` over their selected blocks (`ids == 0`: every
-    /// block, the
-    /// dense causal prefix) and tail tokens; see native/src/qwen4/qsa_attention.cuh. With `splits == 1`
-    /// the finished
-    /// rows go to `gated` (and `core` unless 0); with more, partials go to `partial` and [#merge]
-    /// finishes them.
+    /// Sparse attention of `rows` query rows at `start ..` over their selected blocks (`ids == 0`:
+    /// every block, the dense causal prefix) and tail tokens; see
+    /// native/src/qwen4/qsa_attention.cuh. With `splits == 1` the finished rows go to `gated` (and
+    /// `core` unless 0); with more, partials go to `partial` and [#merge] finishes them.
     public static void attention(
             ExecutionGpu gpu,
             long queries,
@@ -319,9 +316,9 @@ public final class Qwen4QsaOps {
                         .int32(gateHeadStride));
     }
 
-    /// Quantizes `rows` rows of BF16 keys and values (`keyHeads` heads of 256) into the cache pages at
-    /// positions
-    /// `start ..`; `keyPages` and `valuePages` are the device page tables of the sequence's KV state.
+    /// Quantizes `rows` rows of BF16 keys and values (`keyHeads` heads of 256) into the cache pages
+    /// at positions `start ..`; `keyPages` and `valuePages` are the device page tables of the
+    /// sequence's KV state.
     public static void kvAppend(
             ExecutionGpu gpu,
             long keys,

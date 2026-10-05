@@ -17,16 +17,13 @@ import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
 
 /// The QSA operators on the GPU against CPU references written from the upstream source
-/// (Qwen4QsaReference), on
-/// synthetic data: norm and RoPE, block-key pooling across chunk boundaries, block scores, top-k
-/// selection (score
-/// aware), the sparse attention and its split merge. The whole layer is in
-/// Qwen4QsaLayerCudaIntegrationTest.
+/// (Qwen4QsaReference), on synthetic data: norm and RoPE, block-key pooling across chunk
+/// boundaries, block scores, top-k selection (score aware), the sparse attention and its split
+/// merge. The whole layer is in Qwen4QsaLayerCudaIntegrationTest.
 class Qwen4QsaOperatorCudaIntegrationTest {
 
-    /// Elements agree within one BF16 step of the reference (a value on a rounding boundary may land on
-    /// the other
-    /// side).
+    /// Elements agree within one BF16 step of the reference (a value on a rounding boundary may
+    /// land on the other side).
     private static void assertBf16Close(short[] expected, short[] actual, String what) {
         assertEquals(expected.length, actual.length, what);
         int off = 0;
@@ -120,9 +117,8 @@ class Qwen4QsaOperatorCudaIntegrationTest {
         return chunks.stream().mapToInt(Integer::intValue).toArray();
     }
 
-    /// Chunks of every small size, blocks completing across their boundaries: the pooled block keys and
-    /// the tail equal
-    /// the keys computed from the whole raw sequence.
+    /// Chunks of every small size, blocks completing across their boundaries: the pooled block keys
+    /// and the tail equal the keys computed from the whole raw sequence.
     @Test
     void pooledBlockKeysAndTailAreChunkIndependent() {
         SplittableRandom rng = new SplittableRandom(6);
@@ -300,8 +296,8 @@ class Qwen4QsaOperatorCudaIntegrationTest {
         }
     }
 
-    /// The GPU's own scores as doubles: selection is a function of them, so the lower-id rule is exact on
-    /// them.
+    /// The GPU's own scores as doubles: selection is a function of them, so the lower-id rule is
+    /// exact on them.
     private static double[] gpuTieScores(float[] scores, int offset, int n) {
         double[] values = new double[n];
         for (int i = 0; i < n; i++) values[i] = scores[offset + i];

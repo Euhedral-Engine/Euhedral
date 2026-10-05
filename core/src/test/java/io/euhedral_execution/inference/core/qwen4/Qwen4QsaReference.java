@@ -6,11 +6,9 @@ import static io.euhedral_execution.inference.core.qwen4.Qwen4Reference.r;
 
 import java.util.Arrays;
 
-/// CPU references of the QSA operators, written from Qwen4ExpTextQSAIndexer and Qwen4ExpTextAttention of
-/// the pinned
-/// upstream revision (modular_qwen4_exp.py). Tensors are BF16 where upstream's are, every elementwise
-/// operation
-/// rounds to BF16, reductions run in double.
+/// CPU references of the QSA operators, written from Qwen4ExpTextQSAIndexer and
+/// Qwen4ExpTextAttention of the pinned upstream revision (modular_qwen4_exp.py). Tensors are BF16
+/// where upstream's are, every elementwise operation rounds to BF16, reductions run in double.
 final class Qwen4QsaReference {
 
     static final int BLOCK = 4;
@@ -22,8 +20,8 @@ final class Qwen4QsaReference {
 
     private Qwen4QsaReference() {}
 
-    /// cos and sin of RoPE index `index` at `position` rounded to BF16, as Qwen4ExpTextRotaryEmbedding
-    /// builds them.
+    /// cos and sin of RoPE index `index` at `position` rounded to BF16, as
+    /// Qwen4ExpTextRotaryEmbedding builds them.
     static float[] cosSin(int position, int index, float theta, int rotary) {
         double power = Math.pow(theta, (2.0 * index) / rotary);
         float inverse = 1.0f / (float) power;
@@ -31,8 +29,8 @@ final class Qwen4QsaReference {
         return new float[] {r(Math.cos(angle)), r(Math.sin(angle))};
     }
 
-    /// Qwen4ExpTextRMSNorm of `width` BF16 values at `offset` with the `(1 + weight)` scale, as BF16
-    /// bits.
+    /// Qwen4ExpTextRMSNorm of `width` BF16 values at `offset` with the `(1 + weight)` scale, as
+    /// BF16 bits.
     static short[] headNorm(short[] x, int offset, int width, short[] weight, float epsilon) {
         double sum = 0;
         for (int i = 0; i < width; i++) sum += (double) bf(x[offset + i]) * bf(x[offset + i]);
@@ -55,15 +53,16 @@ final class Qwen4QsaReference {
         return out;
     }
 
-    /// norm then RoPE of one head: the indexer's q_layernorm + RoPE or the attention's q_norm + RoPE.
+    /// norm then RoPE of one head: the indexer's q_layernorm + RoPE or the attention's q_norm +
+    /// RoPE.
     static short[] normRope(short[] x, int offset, int width, short[] weight, int position, int rotary) {
         short[] normed = headNorm(x, offset, width, weight, EPSILON);
         return rotary == 0 ? normed : rope(normed, position, THETA, rotary);
     }
 
-    /// The pooled, normalized, rotated key of block `block` of `raw` ([token][128] BF16): the mean of the
-    /// four raw keys
-    /// in FP32 rounded to BF16, k_layernorm, RoPE at the position of the block's first token.
+    /// The pooled, normalized, rotated key of block `block` of `raw` ([token][128] BF16): the mean
+    /// of the four raw keys in FP32 rounded to BF16, k_layernorm, RoPE at the position of the
+    /// block's first token.
     static short[] blockKey(short[][] raw, int block, short[] kNorm) {
         short[] pooled = new short[INDEX_DIM];
         for (int d = 0; d < INDEX_DIM; d++) {
@@ -75,9 +74,8 @@ final class Qwen4QsaReference {
         return rope(normed, BLOCK * block, THETA, 64);
     }
 
-    /// Scores of the first `blocks` block keys for the four query heads `q[4][128]` of one row: the sum
-    /// over heads of
-    /// relu(q . key) divided by sqrt(128), in double.
+    /// Scores of the first `blocks` block keys for the four query heads `q[4][128]` of one row: the
+    /// sum over heads of relu(q . key) divided by sqrt(128), in double.
     static double[] scores(short[][] q, short[][] keys, int blocks) {
         double[] scores = new double[blocks];
         for (int j = 0; j < blocks; j++) {
@@ -105,24 +103,22 @@ final class Qwen4QsaReference {
         return ids;
     }
 
-    /// The k-th highest score (k = min(budget, n)); a block scoring above it must be selected and one
-    /// scoring below it
-    /// must not.
+    /// The k-th highest score (k = min(budget, n)); a block scoring above it must be selected and
+    /// one scoring below it must not.
     static double kthScore(double[] scores, int budget) {
         double[] sorted = scores.clone();
         Arrays.sort(sorted);
         return sorted[sorted.length - Math.min(budget, sorted.length)];
     }
 
-    /// What a selection check found: blocks the selection has that the reference's does not, and the
-    /// largest score by
-    /// which a selected block falls short of the k-th score or an omitted block exceeds it.
+    /// What a selection check found: blocks the selection has that the reference's does not, and
+    /// the largest score by which a selected block falls short of the k-th score or an omitted
+    /// block exceeds it.
     record Check(int differing, double gap) {}
 
-    /// Checks a GPU selection against reference scores up to `epsilon`: right count, ascending distinct
-    /// ids in range,
-    /// no selected block more than epsilon below the k-th score, no omitted block more than epsilon above
-    /// it.
+    /// Checks a GPU selection against reference scores up to `epsilon`: right count, ascending
+    /// distinct ids in range, no selected block more than epsilon below the k-th score, no omitted
+    /// block more than epsilon above it.
     static Check checkSelection(double[] scores, int[] ids, int count, int budget, double epsilon, String what) {
         int n = scores.length, k = Math.min(budget, n);
         if (count != k) throw new AssertionError(what + ": selected " + count + " blocks, expected " + k);
@@ -152,8 +148,8 @@ final class Qwen4QsaReference {
         return new Check(differ, gap);
     }
 
-    /// Normalized Walsh-Hadamard transform of 256 values (entries +-1/16): the cache's rotation, its own
-    /// inverse.
+    /// Normalized Walsh-Hadamard transform of 256 values (entries +-1/16): the cache's rotation,
+    /// its own inverse.
     static double[] hadamard(double[] x) {
         double[] v = x.clone();
         for (int stride = 1; stride < 256; stride <<= 1)
@@ -187,12 +183,10 @@ final class Qwen4QsaReference {
         return hadamard(rotated);
     }
 
-    /// Qwen4ExpTextAttention's softmax attention of one query head (256 BF16 values at `qOffset` of `q`)
-    /// over the
-    /// virtual key list of row `position`: the tokens of the selected blocks (`ids[0 ..< count]`, null:
-    /// all complete
-    /// blocks) then the tail. `keys` and `values` are `[token][256]` effective (unrotated) values of the
-    /// KV head.
+    /// Qwen4ExpTextAttention's softmax attention of one query head (256 BF16 values at `qOffset` of
+    /// `q`) over the virtual key list of row `position`: the tokens of the selected blocks (`ids[0
+    /// ..< count]`, null: all complete blocks) then the tail. `keys` and `values` are
+    /// `[token][256]` effective (unrotated) values of the KV head.
     static double[] attend(
             short[] q, int qOffset, double[][] keys, double[][] values, int position, int[] ids, int count) {
         int nb = (position + 1) / BLOCK;

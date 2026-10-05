@@ -3,11 +3,9 @@ package io.euhedral_execution.inference.core.qwen4;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
 
-/// The attention block of a sparse-attention layer of Flash-Next (Qwen4ExpTextAttention with its QSA
-/// indexer): the
-/// mixed block input of a chunk of rows in, the output projection's result out, before the
-/// hyper-connection
-/// injects it into the residual streams.
+/// The attention block of a sparse-attention layer of Flash-Next (Qwen4ExpTextAttention with its
+/// QSA indexer): the mixed block input of a chunk of rows in, the output projection's result out,
+/// before the hyper-connection injects it into the residual streams.
 ///
 /// ```
 /// x [rows, hidden]
@@ -20,14 +18,14 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
 ///   gated = attention * sigmoid(gate);   out = o_proj(gated)
 /// ```
 ///
-/// Any chunking of a sequence gives the same result (within the arithmetic noise of the linears): the
-/// pooled block
-/// keys are computed once, when a block completes, and the raw keys of an incomplete block are carried in
-/// the
-/// [Qwen4QsaState]. See docs/FLASH_NEXT_QSA.md for the arithmetic and the selection rule.
+/// Any chunking of a sequence gives the same result (within the arithmetic noise of the linears):
+/// the pooled block keys are computed once, when a block completes, and the raw keys of an
+/// incomplete block are carried in the [Qwen4QsaState]. See docs/FLASH_NEXT_QSA.md for the
+/// arithmetic and the selection rule.
 public final class Qwen4QsaLayer {
 
-    /// Dimensions of the layer. `maxTokens` bounds the sequence a state may hold and the scores scratch.
+    /// Dimensions of the layer. `maxTokens` bounds the sequence a state may hold and the scores
+    /// scratch.
     public record Config(
             int hidden,
             int queryHeads,
@@ -78,11 +76,9 @@ public final class Qwen4QsaLayer {
         }
     }
 
-    /// Where the layer's weights are on the device. The NVFP4 projections come with their byte sizes; the
-    /// norms
-    /// and the indexer projection are BF16 (`indexProj` is `[(heads + 1) * 128][hidden]`, the norm
-    /// weights are
-    /// shared by all heads).
+    /// Where the layer's weights are on the device. The NVFP4 projections come with their byte
+    /// sizes; the norms and the indexer projection are BF16 (`indexProj` is `[(heads + 1) *
+    /// 128][hidden]`, the norm weights are shared by all heads).
     public record Weights(
             long qProj,
             long qProjBytes,
@@ -130,9 +126,8 @@ public final class Qwen4QsaLayer {
         this(config, DEFAULT_SCORE_BYTES);
     }
 
-    /// `scoreBytes` bounds the FP32 scores scratch (a tile of rows times the blocks they see); it is
-    /// raised to hold
-    /// at least one row of a sequence of `maxTokens`.
+    /// `scoreBytes` bounds the FP32 scores scratch (a tile of rows times the blocks they see); it
+    /// is raised to hold at least one row of a sequence of `maxTokens`.
     public Qwen4QsaLayer(Config config, long scoreBytes) {
         this.config = config;
         if (config.blockTokens() != Qwen4QsaOps.BLOCK_TOKENS
@@ -207,12 +202,10 @@ public final class Qwen4QsaLayer {
     }
 
     /// Runs the attention block for `rows` rows of `input` (`[rows][hidden]` BF16) at the state's
-    /// committed
-    /// length, writing `output` (`[rows][hidden]` BF16). The state's pages are reserved and the chunk
-    /// marked
-    /// submitted; the caller commits it once the work retired, or discards it. `coreOutput`, when not 0,
-    /// receives upstream's attention output before the gate (`[rows][queryHeads * headDim]`), a
-    /// diagnostic.
+    /// committed length, writing `output` (`[rows][hidden]` BF16). The state's pages are reserved
+    /// and the chunk marked submitted; the caller commits it once the work retired, or discards it.
+    /// `coreOutput`, when not 0, receives upstream's attention output before the gate
+    /// (`[rows][queryHeads * headDim]`), a diagnostic.
     public void run(
             ExecutionGpu gpu,
             Weights w,
@@ -242,9 +235,9 @@ public final class Qwen4QsaLayer {
         Qwen4Ops.linearBf16(gpu, input, w.indexProj(), s.indexProj(), rows, c.hidden(), c.indexProjectionWidth());
     }
 
-    /// q_norm and RoPE in place on the query half of every head's [q | gate] (the gate stays where it
-    /// is),
-    /// k_norm and RoPE into `kNormed`, q_layernorm and RoPE in place on the indexer queries.
+    /// q_norm and RoPE in place on the query half of every head's [q | gate] (the gate stays where
+    /// it is), k_norm and RoPE into `kNormed`, q_layernorm and RoPE in place on the indexer
+    /// queries.
     void normAndRope(ExecutionGpu gpu, Weights w, int rows, int start, Scratch s) {
         Config c = this.config;
         int qWidth = 2 * c.queryWidth(), head = 2 * c.headDim(), kvWidth = c.keyValueWidth();
@@ -319,8 +312,8 @@ public final class Qwen4QsaLayer {
     }
 
     /// Pools the blocks the chunk completes (the raw key is the last 128 values of an indexer row),
-    /// normalizes and
-    /// rotates them into the block keys, and leaves the raw keys of the incomplete block as the new tail.
+    /// normalizes and rotates them into the block keys, and leaves the raw keys of the incomplete
+    /// block as the new tail.
     void indexKeys(ExecutionGpu gpu, Weights w, Qwen4QsaState state, int rows, int start, Scratch s) {
         Config c = this.config;
         int indexWidth = c.indexProjectionWidth();
@@ -351,17 +344,22 @@ public final class Qwen4QsaLayer {
         Qwen4QsaOps.tail(gpu, rawKeys, state.tailIn(), state.tailOut(), rows, start, indexWidth);
     }
 
-    /// Whether any row of a chunk at `start` chooses among more blocks than the budget: only then do the
-    /// scores and the selection (`ids`, `counts` of the scratch) exist.
+    /// Whether any row of a chunk at `start` chooses among more blocks than the budget: only then
+    /// do the scores and the selection (`ids`, `counts` of the scratch) exist.
     boolean selects(int rows, int start) {
         return start + rows - 1 >= this.config.budgetTokens() + Qwen4QsaOps.BLOCK_TOKENS - 1;
     }
 
-    /// Scores and selects the blocks of every row. Row p keeps every block while it sees at most `budget`
-    /// of
-    /// them, so the rows before the first one that chooses just list their blocks. Returns whether `ids`
-    /// and
-    /// `counts` were written ([#selects]).
+    /// Rows scored at a time: as many as the scores scratch holds for `selectingRows` rows seeing
+    /// the blocks of a sequence that ends at position `end`.
+    int scoreTileRows(int selectingRows, int end) {
+        int stride = scoreStride(end / Qwen4QsaOps.BLOCK_TOKENS);
+        return (int) Math.max(1, Math.min(selectingRows, this.scoreBytes / Float.BYTES / stride));
+    }
+
+    /// Scores and selects the blocks of every row. Row p keeps every block while it sees at most
+    /// `budget` of them, so the rows before the first one that chooses just list their blocks.
+    /// Returns whether `ids` and `counts` were written ([#selects]).
     boolean select(ExecutionGpu gpu, Qwen4QsaState state, int rows, int start, Scratch s) {
         if (!selects(rows, start)) return false;
         Config c = this.config;
@@ -370,9 +368,8 @@ public final class Qwen4QsaLayer {
         int firstSelecting = Math.max(0, c.budgetTokens() + Qwen4QsaOps.BLOCK_TOKENS - 1 - start);
         if (firstSelecting > 0)
             Qwen4QsaOps.select(gpu, s.scores(), s.ids(), s.counts(), 0, firstSelecting, start, 0, budget);
-        int blocksEnd = (start + rows) / Qwen4QsaOps.BLOCK_TOKENS;
-        int stride = scoreStride(blocksEnd);
-        int tile = (int) Math.min(rows - firstSelecting, this.scoreBytes / Float.BYTES / stride);
+        int stride = scoreStride((start + rows) / Qwen4QsaOps.BLOCK_TOKENS);
+        int tile = scoreTileRows(rows - firstSelecting, start + rows);
         for (int begin = firstSelecting; begin < rows; begin += tile) {
             int count = Math.min(tile, rows - begin);
             int blocks = (start + begin + count) / Qwen4QsaOps.BLOCK_TOKENS;
@@ -383,9 +380,8 @@ public final class Qwen4QsaLayer {
         return true;
     }
 
-    /// Attention of every row over its selected blocks and tail, with the sigmoid gate: `gated` of the
-    /// scratch
-    /// (and `coreOutput` unless 0).
+    /// Attention of every row over its selected blocks and tail, with the sigmoid gate: `gated` of
+    /// the scratch (and `coreOutput` unless 0).
     void attend(
             ExecutionGpu gpu, Qwen4QsaState state, int rows, int start, Scratch s, boolean selecting, long coreOutput) {
         Config c = this.config;

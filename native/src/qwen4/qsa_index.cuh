@@ -89,22 +89,34 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q4_qsa_scores(
 
 namespace q4 {
 
-// Rank of this thread among the flagged threads of the block (the number of flagged threads before it) and the
-// number flagged in all. Two barriers; `warp_counts` has one slot per warp.
-static __device__ __forceinline__ unsigned int scan_flag(bool flag, unsigned int* warp_counts, unsigned int& total) {
-    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    const unsigned int ballot = __ballot_sync(0xffffffffu, flag);
+// Ranks of this thread among the threads of the block that flag `a` and `b` (the number of such threads before it)
+// and the numbers flagged in all. `warp_counts` has 33 words; the block has 1024 threads. Two barriers around a
+// warp-level scan of the 32 warp counts (both flags packed in one word: a count never reaches 2^16).
+static __device__ __forceinline__ void scan_two(bool a, bool b, unsigned int* warp_counts, unsigned int& rank_a,
+        unsigned int& rank_b, unsigned int& total_a, unsigned int& total_b) {
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int ballot_a = __ballot_sync(0xffffffffu, a), ballot_b = __ballot_sync(0xffffffffu, b);
+    const unsigned int below = (1u << lane) - 1u;
     __syncthreads();
-    if (lane == 0) warp_counts[warp] = __popc(ballot);
+    if (lane == 0) warp_counts[warp] = __popc(ballot_a) | (__popc(ballot_b) << 16);
     __syncthreads();
-    unsigned int before = 0, all = 0;
-    for (unsigned int w = 0; w < warps; w++) {
-        const unsigned int count = warp_counts[w];
-        before += w < warp ? count : 0u;
-        all += count;
+    if (warp == 0) {
+        const unsigned int value = warp_counts[lane];
+        unsigned int inclusive = value;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const unsigned int neighbour = __shfl_up_sync(0xffffffffu, inclusive, offset);
+            if (lane >= (unsigned int)offset) inclusive += neighbour;
+        }
+        warp_counts[lane] = inclusive - value;
+        if (lane == 31) warp_counts[32] = inclusive;
     }
-    total = all;
-    return before + __popc(ballot & ((1u << lane) - 1u));
+    __syncthreads();
+    const unsigned int prefix = warp_counts[warp], all = warp_counts[32];
+    rank_a = (prefix & 0xffffu) + __popc(ballot_a & below);
+    rank_b = (prefix >> 16) + __popc(ballot_b & below);
+    total_a = all & 0xffffu;
+    total_b = all >> 16;
 }
 
 // Order-preserving key of a non-negative score: its bit pattern.
@@ -125,9 +137,10 @@ extern "C" __global__ __launch_bounds__(1024) void euhedral_q4_qsa_select(
         const float* __restrict__ scores, int* __restrict__ ids, int* __restrict__ counts, unsigned int row_begin,
         unsigned int start, unsigned int score_stride, unsigned int budget) {
     __shared__ unsigned int histogram[256];
-    __shared__ unsigned int warp_counts[32];
+    __shared__ unsigned int warp_counts[33];
     __shared__ unsigned int state[2];
     const unsigned int tid = threadIdx.x, threads = blockDim.x;
+    const unsigned int lane = tid & 31u;
     const unsigned int row = row_begin + blockIdx.x;
     const unsigned int nb = (start + row + 1u) >> 2;
     int* out = ids + (unsigned long long)row * budget;
@@ -147,37 +160,55 @@ extern "C" __global__ __launch_bounds__(1024) void euhedral_q4_qsa_select(
             if (pass == 0 || ((key ^ prefix) >> (shift + 8)) == 0u) atomicAdd(&histogram[(key >> shift) & 255u], 1u);
         }
         __syncthreads();
-        if (tid == 0) {
-            unsigned int accumulated = 0, digit = 0;
-            for (int d = 255; d >= 0; d--) {
-                const unsigned int count = histogram[d];
-                if (accumulated + count >= remaining) {
-                    digit = (unsigned int)d;
-                    break;
-                }
-                accumulated += count;
+        if (tid < 32u) {
+            // Lane l holds the digits 255 - 8 l down to 248 - 8 l: scan the lane sums from the highest digit and
+            // find the lane where the running count reaches `remaining`; that lane finds the digit.
+            unsigned int counts8[8], sum = 0;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                counts8[j] = histogram[255 - 8 * lane - j];
+                sum += counts8[j];
             }
-            state[0] = digit;
-            state[1] = accumulated;
+            unsigned int inclusive = sum;
+#pragma unroll
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const unsigned int neighbour = __shfl_up_sync(0xffffffffu, inclusive, offset);
+                if (lane >= (unsigned int)offset) inclusive += neighbour;
+            }
+            const unsigned int crossing = __ballot_sync(0xffffffffu, inclusive >= remaining);
+            if (lane == (unsigned int)(__ffs(crossing) - 1)) {
+                unsigned int accumulated = inclusive - sum;
+                unsigned int digit = 0;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    if (accumulated + counts8[j] >= remaining) {
+                        digit = 255u - 8u * lane - j;
+                        break;
+                    }
+                    accumulated += counts8[j];
+                }
+                state[0] = digit;
+                state[1] = accumulated;
+            }
         }
         __syncthreads();
         prefix |= state[0] << shift;
         remaining -= state[1];
         __syncthreads();
     }
-    // prefix is the k-th highest key; `remaining` blocks scoring exactly it still have to be taken, lowest ids first.
-    unsigned int taken_ties = 0, written = 0;
+    // prefix is the k-th highest key; `remaining` blocks scoring exactly it still have to be taken, lowest ids
+    // first. Ties kept before a thread: min(ties before it, ties still wanted).
+    unsigned int kept_ties = 0, written = 0;
     for (unsigned int base = 0; base < nb && written < budget; base += threads) {
         const unsigned int e = base + tid;
         const unsigned int key = e < nb ? q4::score_key(s[e]) : 0u;
         const bool greater = e < nb && key > prefix, tie = e < nb && key == prefix;
-        unsigned int tie_total, selected_total;
-        const unsigned int tie_rank = q4::scan_flag(tie, warp_counts, tie_total);
-        const bool keep = greater || (tie && taken_ties + tie_rank < remaining);
-        const unsigned int rank = q4::scan_flag(keep, warp_counts, selected_total);
-        if (keep) out[written + rank] = (int)e;
-        taken_ties += tie_total;
-        written += selected_total;
+        unsigned int greater_rank, tie_rank, greater_total, tie_total;
+        q4::scan_two(greater, tie, warp_counts, greater_rank, tie_rank, greater_total, tie_total);
+        const unsigned int room = remaining - kept_ties;
+        if (greater || (tie && tie_rank < room)) out[written + greater_rank + min(tie_rank, room)] = (int)e;
+        written += greater_total + min(tie_total, room);
+        kept_ties += min(tie_total, room);
     }
     if (tid == 0) counts[row] = (int)budget;
 }
