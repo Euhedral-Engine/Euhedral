@@ -252,7 +252,8 @@ public final class InferenceEngine implements AutoCloseable {
             session.enableSpeculativeDecoding(this.profile.speculativeDepth());
         if (this.profile != null
                 && this.profile.speculation() == ArtifactProfile.Speculation.DFLASH2
-                && this.plan.draftsWithDFlash2()) session.useSpeculativeDecoding(DFlash2Decoder.factory());
+                && this.plan.draftsWithDFlash2())
+            session.useSpeculativeDecoding(DFlash2Decoder.factory(this.profile.speculativeDepth()));
         if (this.prefixCache != null) session.usePrefixCache(this.prefixCache);
         this.sessions.add(session);
         return session;

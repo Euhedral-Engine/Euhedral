@@ -90,8 +90,10 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
     private Statistics statistics;
     private StepListener steps;
 
-    public static SpeculativeDecoding.Factory factory() {
-        return DFlash2Decoder::new;
+    /// DFlash2 verifying the first `verified` drafts of each block.
+    public static SpeculativeDecoding.Factory factory(int verified) {
+        return (runtime, plan, gpu, sequence, end, chunk) ->
+                new DFlash2Decoder(runtime, plan, gpu, sequence, end, chunk, verified);
     }
 
     public DFlash2Decoder(
@@ -104,9 +106,9 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         this(runtime, plan, gpu, sequence, endOfGeneration, prefillChunk, Integer.MAX_VALUE);
     }
 
-    /// As the public constructor, verifying only the first `verified` drafts of each block (screens of the
-    /// verification length; the block always proposes all of them).
-    DFlash2Decoder(
+    /// As the public constructor, verifying only the first `verified` drafts of each block; the block always proposes
+    /// all of them.
+    public DFlash2Decoder(
             EuhedralInferenceRuntime runtime,
             QwenExecutionPlan plan,
             ExecutionGpu gpu,

@@ -68,7 +68,7 @@ class ArtifactProfileTest {
         tensors.add(tensor("dflash2/config", WeightFormat.I32, WeightLayout.CONTIGUOUS_LE_V1));
         var profile = ArtifactProfile.of(new QwenArtifact(null, null, tensors.toArray(TensorDescriptor[]::new)));
         assertEquals(ArtifactProfile.Speculation.DFLASH2, profile.speculation());
-        assertEquals(7, profile.speculativeDepth());
+        assertEquals(5, profile.speculativeDepth());
         assertEquals("nvfp4-compressed-dflash2", profile.artifactName());
         assertTrue(QwenCompactWeightLoader.uploads("dflash2/fc", ArtifactProfile.Speculation.DFLASH2));
         assertFalse(QwenCompactWeightLoader.uploads("dflash2/config", ArtifactProfile.Speculation.DFLASH2));
