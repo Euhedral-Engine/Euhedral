@@ -114,32 +114,42 @@ final class Qwen4QsaReference {
         return sorted[sorted.length - Math.min(budget, sorted.length)];
     }
 
+    /// What a selection check found: blocks the selection has that the reference's does not, and the
+    /// largest score by
+    /// which a selected block falls short of the k-th score or an omitted block exceeds it.
+    record Check(int differing, double gap) {}
+
     /// Checks a GPU selection against reference scores up to `epsilon`: right count, ascending distinct
     /// ids in range,
     /// no selected block more than epsilon below the k-th score, no omitted block more than epsilon above
     /// it.
-    /// Returns the number of blocks the selection differs from the reference's by (ties and near ties).
-    static int checkSelection(double[] scores, int[] ids, int count, int budget, double epsilon, String what) {
+    static Check checkSelection(double[] scores, int[] ids, int count, int budget, double epsilon, String what) {
         int n = scores.length, k = Math.min(budget, n);
         if (count != k) throw new AssertionError(what + ": selected " + count + " blocks, expected " + k);
         double kth = kthScore(scores, budget);
+        double gap = 0;
         boolean[] chosen = new boolean[n];
         for (int i = 0; i < count; i++) {
             int id = ids[i];
             if (id < 0 || id >= n || (i > 0 && id <= ids[i - 1]))
                 throw new AssertionError(what + ": ids not ascending in range at " + i + ": " + id);
             chosen[id] = true;
+            gap = Math.max(gap, kth - scores[id]);
             if (scores[id] < kth - epsilon)
                 throw new AssertionError(
                         what + ": selected block " + id + " scores " + scores[id] + " below k-th " + kth);
         }
         for (int j = 0; j < n; j++)
-            if (!chosen[j] && scores[j] > kth + epsilon)
-                throw new AssertionError(what + ": omitted block " + j + " scores " + scores[j] + " above k-th " + kth);
+            if (!chosen[j]) {
+                gap = Math.max(gap, scores[j] - kth);
+                if (scores[j] > kth + epsilon)
+                    throw new AssertionError(
+                            what + ": omitted block " + j + " scores " + scores[j] + " above k-th " + kth);
+            }
         int[] expected = select(scores, budget);
         int differ = 0;
         for (int id : expected) if (!chosen[id]) differ++;
-        return differ;
+        return new Check(differ, gap);
     }
 
     /// Normalized Walsh-Hadamard transform of 256 values (entries +-1/16): the cache's rotation, its own
