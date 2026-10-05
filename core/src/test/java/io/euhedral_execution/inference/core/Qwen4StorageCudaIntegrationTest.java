@@ -71,7 +71,9 @@ class Qwen4StorageCudaIntegrationTest {
         System.out.println("context " + context + "\n" + plan.report());
 
         // device accounting: what the load allocated is what the plan placed, within the free memory it saw
-        long planned = plan.device().fixedResidentBytes() + plan.device().stagingRingBytes() + plan.device().expertCacheBytes();
+        long planned = plan.device().fixedResidentBytes()
+                + plan.device().stagingRingBytes()
+                + plan.device().expertCacheBytes();
         assertTrue(gpu.allocatedBytes() <= planned, "allocated " + gpu.allocatedBytes() + " of planned " + planned);
         assertTrue(plan.device().plannedBytes() <= plan.device().freeBytes());
         assertEquals(plan.device().expertCacheBytes(), model.expertCache().capacityBytes());
@@ -100,11 +102,19 @@ class Qwen4StorageCudaIntegrationTest {
         int checked = 0;
         for (TensorHandle handle : model.tensors().values()) {
             if (handle.byteSize() > (64 << 20) && checked > 0) continue;
-            byte[] expected = readFile(artifact, model.artifact().tensor(handle.name()).orElseThrow().dataOffset(), (int) handle.byteSize());
+            byte[] expected = readFile(
+                    artifact,
+                    model.artifact().tensor(handle.name()).orElseThrow().dataOffset(),
+                    (int) handle.byteSize());
             try (Arena arena = Arena.ofConfined()) {
                 MemorySegment back = arena.allocate(handle.byteSize());
                 if (handle.hostBacked() || handle.hostMapped())
-                    MemorySegment.copy(MemorySegment.ofAddress(handle.hostAddress()).reinterpret(handle.byteSize()), 0, back, 0, handle.byteSize());
+                    MemorySegment.copy(
+                            MemorySegment.ofAddress(handle.hostAddress()).reinterpret(handle.byteSize()),
+                            0,
+                            back,
+                            0,
+                            handle.byteSize());
                 else gpu.copyDeviceToHost(back, handle.deviceAddress(), handle.byteSize());
                 assertArrayEquals(expected, back.toArray(ValueLayout.JAVA_BYTE), handle.name());
             }
@@ -138,14 +148,17 @@ class Qwen4StorageCudaIntegrationTest {
                 int expert = random.nextInt(banks[bank].expertCount());
                 try (ExpertLease lease = cache.acquire(bank, expert)) {
                     gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
-                    byte[] expected = readFile(artifact, banks[bank].fileOffset(expert), (int) banks[bank].recordBytes(expert));
-                    assertArrayEquals(expected, back.asSlice(0, lease.byteSize()).toArray(ValueLayout.JAVA_BYTE));
+                    byte[] expected =
+                            readFile(artifact, banks[bank].fileOffset(expert), (int) banks[bank].recordBytes(expert));
+                    assertArrayEquals(
+                            expected, back.asSlice(0, lease.byteSize()).toArray(ValueLayout.JAVA_BYTE));
                 }
             }
         }
         var stats = cache.stats().snapshot();
         assertTrue(stats.misses() > 0 && stats.transferBytes() > 0);
-        if (slots < banks.length * banks[0].expertCount()) assertTrue(stats.evictions() > 0 || slots + 64 > stats.misses());
+        if (slots < banks.length * banks[0].expertCount())
+            assertTrue(stats.evictions() > 0 || slots + 64 > stats.misses());
         assertEquals(0, cache.openLeaseCount());
     }
 
@@ -154,11 +167,13 @@ class Qwen4StorageCudaIntegrationTest {
         SplittableRandom random = new SplittableRandom(7);
         for (int i = 0; i < 200; i++) {
             int head = random.nextInt(store.heads());
-            long row = store.globalRow(head, random.nextLong(model.artifact().config().ngram().headsVocabSizes()[head]));
+            long row = store.globalRow(
+                    head, random.nextLong(model.artifact().config().ngram().headsVocabSizes()[head]));
             Qwen4Tensor shard = model.artifact()
                     .tensor("text/layers/1/ple/ngram/shard_" + String.format("%03d", store.shardOf(row)))
                     .orElseThrow();
-            byte[] expected = readFile(artifact, shard.dataOffset() + store.localRow(row) * store.rowBytes(), store.rowBytes());
+            byte[] expected =
+                    readFile(artifact, shard.dataOffset() + store.localRow(row) * store.rowBytes(), store.rowBytes());
             assertArrayEquals(expected, store.row(row).toArray(ValueLayout.JAVA_BYTE), "row " + row);
         }
         assertTrue(store.hostBytes() > 28_000_000_000L);

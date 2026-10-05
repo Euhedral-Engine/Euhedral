@@ -62,12 +62,7 @@ public final class Qwen4Model implements AutoCloseable {
     /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and `maxContextTokens`, and
     /// loads the plan. Fails with the plan's explanation when no placement can serve the context.
     public static Qwen4Model open(
-            Path path,
-            ExecutionGpu gpu,
-            long freeDeviceBytes,
-            HostBudget host,
-            Qwen4Mode mode,
-            int maxContextTokens)
+            Path path, ExecutionGpu gpu, long freeDeviceBytes, HostBudget host, Qwen4Mode mode, int maxContextTokens)
             throws IOException {
         Qwen4Artifact artifact = Qwen4ArtifactReader.read(path);
         Qwen4Validator.validateInventory(artifact);
@@ -80,8 +75,8 @@ public final class Qwen4Model implements AutoCloseable {
             throws IOException {
         LOG.info("{}", plan.report());
         if (!plan.fits())
-            throw new IOException("a context of " + plan.maxContextTokens() + " tokens cannot be placed: "
-                    + plan.explanation());
+            throw new IOException(
+                    "a context of " + plan.maxContextTokens() + " tokens cannot be placed: " + plan.explanation());
         List<ExpertBank> banks = new ArrayList<>();
         for (ExpertBank bank : artifact.banks())
             if (plan.banks().get(bank.name()) == StorageClass.DEVICE_CACHED) banks.add(bank);
@@ -96,11 +91,16 @@ public final class Qwen4Model implements AutoCloseable {
             store = switch (plan.expertStore()) {
                 case PINNED_ARENA -> new ArenaExpertStore(gpu, path, cachedBanks, LOAD_THREADS);
                 case FILE_BACKED ->
-                    new FileExpertStore(gpu, path, cachedBanks, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
+                    new FileExpertStore(
+                            gpu, path, cachedBanks, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
             };
             transfer = new GpuExpertTransfer(gpu);
             ExpertCache cache = new ExpertCache(
-                    store, transfer, gpu, plan.expertCache().slotCount(), plan.expertCache().slotBytes());
+                    store,
+                    transfer,
+                    gpu,
+                    plan.expertCache().slotCount(),
+                    plan.expertCache().slotBytes());
             return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);
@@ -163,7 +163,8 @@ public final class Qwen4Model implements AutoCloseable {
 
     /// The ordinal of the named bank in [#expertCache()].
     public int bankOrdinal(String bankName) {
-        for (int i = 0; i < this.cachedBanks.length; i++) if (this.cachedBanks[i].name().equals(bankName)) return i;
+        for (int i = 0; i < this.cachedBanks.length; i++)
+            if (this.cachedBanks[i].name().equals(bankName)) return i;
         throw new IllegalArgumentException("not a cached expert bank: " + bankName);
     }
 
@@ -219,8 +220,7 @@ public final class Qwen4Model implements AutoCloseable {
             else failure.addSuppressed(e);
         }
         Throwable release = new Throwable("release");
-        Qwen4FixedLoader.release(
-                this.fixed.handles(), this.fixed.hostArena(), staging(this.fixed), this.gpu, release);
+        Qwen4FixedLoader.release(this.fixed.handles(), this.fixed.hostArena(), staging(this.fixed), this.gpu, release);
         if (failure == null && release.getSuppressed().length > 0) {
             failure = new IllegalStateException("releasing fixed objects failed", release.getSuppressed()[0]);
         }
