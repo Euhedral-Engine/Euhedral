@@ -1,6 +1,8 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4;
 
-/// The device bytes a running sequence of a given length needs, from the configuration alone.
+/// The device bytes a running sequence of a given length needs, from the configuration alone: the accounting the
+/// residency planner reserves. The runtime state that holds them is
+/// `io.euhedral_execution.inference.core.qwen4.Qwen4Sequence`.
 ///
 /// - Attention keys and values live in NVFP4 pages of 256 tokens: a row of 256 values takes 144 bytes, and a token
 ///   stores one K row and one V row per 256 values of each KV head, in every sparse-attention layer.
