@@ -135,7 +135,13 @@ class Qwen4QsaTimingCudaIntegrationTest {
                                 stream,
                                 reps,
                                 () -> gpu.linearNvfp4Bf16(
-                                        s.gated(), w.oProj(), output, rows, 6144, 2560, w.oProjBytes()));
+                                        s.gated(),
+                                        w.oProj().address(),
+                                        output,
+                                        rows,
+                                        6144,
+                                        2560,
+                                        w.oProj().bytes()));
                         state.discard();
                         // whole block: reserve, run, retire, discard (so every repetition sees this history)
                         int whole = rows == 1 ? 30 : 8;
