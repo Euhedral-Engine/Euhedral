@@ -76,6 +76,9 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
   three CUDA-versus-CPU byte-equality tests run when PyTorch has a CUDA device).
 - `nvfp4z.py`, `nvfp4z/`: lossless compression of NVFP4 safetensors checkpoints to about 90% of their size, on the GPU (PyTorch with
   CUDA; docs/NVFP4_LOSSLESS.md). `test_nvfp4z.py` runs on any machine; its GPU tests need a CUDA device.
+- `convert_flash_next.py`, `flash_next_inventory.py`, `euhedral_artifacts/qwen4_source.py`, `qwen4_edrl.py`: the Qwen3.8-Flash-Next
+  (`qwen4_exp`) NVFP4 checkpoint to an EDRL version 3 artifact, restartable and byte-verified, and its tensor inventory
+  (`docs/FLASH_NEXT_ARTIFACT.md`). `test_flash_next_converter.py` converts a miniature checkpoint and needs NumPy only.
 - `compare_teacher_forced.py`: compares teacher-forced logits reports with one another (NumPy).
 - `compare_reference.py`: compares teacher-forced logits reports with a BF16 reference written by llama.cpp (NumPy).
 - `dflash2_reference.py`: runs the upstream DFlash2 draft model (z-lab/dflash, unmodified; needs PyTorch, transformers 5.15 and the
