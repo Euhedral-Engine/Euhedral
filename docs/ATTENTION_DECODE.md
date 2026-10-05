@@ -58,5 +58,17 @@ verify, chat corpus) runs at 111 tok/s at 16K and 101 at 32K.
 - **Fused verifier rows** (expanding each K and V tile once for all rows). Removing all V expansion and all K and V traffic for rows 1 and
   2 of the 3-row twin saves 3% at 16K and 19% at 64K, an upper bound; a fused kernel also needs three accumulator sets of 64 registers,
   one consumer warp per 8 query columns and the producers, about 7 warps at 160 registers, which leaves fewer than two CTAs per SM.
+- **Row twins in split-major launch order** (the rows of one KV head and key split adjacent, so they share the split's keys and
+  values through L2; same per-CTA arithmetic). Real head geometry, random cache, per layer:
+
+  | Keys | 4 rows | 6 rows | 8 rows |
+  |---|---|---|---|
+  | 16K | 101.7 us (row-major 102.3) | 149.7 (143.2) | 198.0 (189.7) |
+  | 32K | 194.6 (193.2) | 285.6 (267.4) | 377.7 (349.9) |
+  | 64K | 371.8 (427.6) | 543.7 (635.7) | 717.2 (839.2) |
+
+  The twin is bound by its CTAs' dependency chains at four resident CTAs per SM (registers and shared memory), not by DRAM, so
+  sharing the reads helps only at 64K and costs up to 8% at 32K. The same residency bounds any kernel that serves several rows
+  from one CTA: one score and one consumer warp per row keep the rows in flight per SM at four unless the queries leave registers.
 - **Shared query rotation** (rotate once per KV head, not per split). Skipping the Hadamard entirely saves 2.5% at 16K and 0.7% at 64K.
 - **Merge inside the decode kernel** (the last CTA merges). The merge is 7 us of 38 us at 16K and fusing removes the launch gap, not the work.

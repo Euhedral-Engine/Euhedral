@@ -68,17 +68,28 @@ residual, so it does not change the target's numerics. Verification rows are row
 **Kernels** (`native/src/dflash/kernels.cu`, `native/src/host/dflash.c`) round where the published PyTorch model rounds:
 - a BF16 linear on m16n8k16 tensor cores with FP32 accumulation and one rounding; a row's bits do not depend on how many rows the
   call has (both its 16-row and 64-row tilings run the same K order), so context rows computed in a prefill chunk equal those of
-  a verification;
+  a verification. Outputs up to 1536 wide (the convolution kernel and selector projections) split K over a CTA's four warps,
+  summed in warp order, so the block's narrow projections keep enough loads in flight;
 - Qwen3 RMSNorm (`bf16(w · bf16(x / rms))`);
 - the dynamic convolution, bit for bit the reference's two rounded steps per tap;
-- Q/K head norm and full-width RoPE with BF16 cosines and sines, the ring append, the sliding-window block attention (FP32 scores
-  and softmax);
+- Q/K head norm and full-width RoPE with BF16 cosines and sines, the ring append;
+- the sliding-window block attention on tensor cores: one CTA per KV head and key split (8 splits) serves every row of the block,
+  the rows times the group's 4 query heads (32 queries) forming the M rows of the MMAs, so each key and value is read once per
+  block. Scores (BF16 products, FP32 sums) and the softmax's probabilities (hi + lo BF16 parts) stay in shared memory; a merge
+  kernel combines the splits in order. 35 us per layer over a full window with 8 rows;
 - SwiGLU with the SiLU rounded before the up product;
 - top-16 ordered by logit then token, and the selector walk.
 
-NVFP4 projections run on the existing NVFP4 dispatch (`linearNvfp4Bf16`): from 2 rows that is the native Blackwell FP4
-tensor-core route (two-term NVFP4 activations, block-scaled FP4 MMA), for the block's 8 rows and a prefill chunk's context rows
-alike. The output head is the target's.
+NVFP4 projections run on the existing NVFP4 dispatch (`linearNvfp4Bf16`): up to 8 rows (the block, a verification's context
+rows) on the tensor-core decode kernels ([NVFP4_NATIVE.md](NVFP4_NATIVE.md), "Decode kernels"), more rows (a prefill chunk's
+context rows) on the native Blackwell FP4 route. The output head is the target's.
+
+**Prefetch of host-backed weights.** When some target weights are host-backed, a verification streams them through the staging
+ring ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)), and its first layers wait for the first copies. The block quantum, whose transfer
+lane is otherwise idle for its few milliseconds, copies the decode view's first ring slots; a decode or verification quantum that
+finds them loaded runs a view without those transfers (`QwenExecutionPlan.preloadedVariant`). The runtime marks the ring loaded
+only when every stage of the prefetching quantum ran, under the ring's hold, so any other staging quantum in between (another
+sequence's prefill) clears it.
 
 ## 3. Artifact
 
@@ -121,46 +132,43 @@ ring is the smaller of the two that restore without arithmetic.
 
 ## 6. Measured
 
-RTX 5070 Ti (16 GB), i9-14900K, `qwen3_8_27b_nvfp4_compressed` as the target in every arm (the DFlash2 artifacts extend it, so
+RTX 5070 Ti (16 GB), i9-14900K, `qwen3_8_27b_nvfp4_compressed` as the target in every arm (the DFlash2 artifact extends it, so
 the target bytes are identical). Chat corpus v2 (`promptCorpus: "chat"`), greedy, 256 generated tokens, warmup 1; 4 prompts
 at 4K and 16K, 2 at 32K, 1 at 64K; the engine's context is sized to the scenario. Every arm's output hashes equal the ordinary
-arm's for every prompt. The DFlash2 NVFP4 artifact is `nvfp4-fc`, verifying 5 drafts.
+arm's for every prompt. The DFlash2 artifact is `nvfp4-fc`, verifying 6 drafts; MTP drafts 4. The DFlash2 64K row is the
+median of three runs (63.8, 64.8, 67.5 tok/s).
 
 Decode tok/s, time to first token, and the speculative step (per verification):
 
 | Context | Arm | Decode tok/s | TTFT s | Prefill tok/s | Tokens / verification | Verify ms | Draft ms | Host-backed MiB |
 |---|---|---|---|---|---|---|---|---|
-| 4K | ordinary | 51.6 | 1.02 | 3909 | | | | 0 |
-| 4K | MTP3 | 81.6 | 1.05 | 3791 | 2.74 | 29.98 | 2.96 | 0 |
-| 4K | DFlash2 BF16 | 29.3 | 1.09 | 3670 | 3.01 | 93.52 | 8.27 | 2922 |
-| 4K | DFlash2 NVFP4 | 83.2 | 1.04 | 3847 | 2.97 | 30.82 | 4.04 | 468 |
-| 16K | ordinary | 48.5 | 4.79 | 3345 | | | | 213 |
-| 16K | MTP3 | 77.2 | 5.00 | 3204 | 2.79 | 31.73 | 2.97 | 213 |
-| 16K | DFlash2 BF16 | 24.2 | 5.11 | 3137 | 2.96 | 112.21 | 8.34 | 3177 |
-| 16K | DFlash2 NVFP4 | 76.9 | 4.84 | 3312 | 2.89 | 32.71 | 4.02 | 733 |
-| 32K | ordinary | 46.3 | 11.44 | 2849 | | | | 468 |
-| 32K | MTP3 | 81.1 | 12.09 | 2695 | 2.97 | 33.32 | 3.23 | 468 |
-| 32K | DFlash2 BF16 | 25.7 | 12.80 | 2549 | 3.07 | 111.15 | 8.61 | 3368 |
-| 32K | DFlash2 NVFP4 | 79.9 | 11.49 | 2834 | 3.09 | 34.78 | 4.01 | 924 |
-| 64K | ordinary | 32.0 | 28.92 | 2199 | | | | 1052 |
-| 64K | MTP3 | 67.3 | 31.12 | 2045 | 3.15 | 42.27 | 4.51 | 1052 |
-| 64K | DFlash2 BF16 | 23.4 | 33.31 | 1911 | 3.31 | 131.96 | 9.32 | 4016 |
-| 64K | DFlash2 NVFP4 | 62.9 | 29.12 | 2184 | 3.23 | 45.57 | 5.75 | 1498 |
+| 4K | ordinary | 53.4 | 1.02 | 3906 | | | | 0 |
+| 4K | MTP4 | 114.5 | 1.06 | 3782 | 3.08 | 22.05 | 3.78 | 0 |
+| 4K | DFlash2 | 113.9 | 1.04 | 3845 | 3.19 | 23.05 | 3.42 | 468 |
+| 16K | ordinary | 51.1 | 4.78 | 3347 | | | | 213 |
+| 16K | MTP4 | 106.3 | 5.01 | 3202 | 3.02 | 23.97 | 3.89 | 213 |
+| 16K | DFlash2 | 105.8 | 4.83 | 3318 | 3.01 | 24.72 | 3.38 | 733 |
+| 32K | ordinary | 48.4 | 11.45 | 2849 | | | | 468 |
+| 32K | MTP4 | 109.5 | 12.06 | 2702 | 3.27 | 25.68 | 4.17 | 468 |
+| 32K | DFlash2 | 102.4 | 11.53 | 2830 | 3.11 | 27.15 | 3.38 | 924 |
+| 64K | ordinary | 36.9 | 28.90 | 2205 | | | | 1052 |
+| 64K | MTP4 | 79.2 | 31.07 | 2048 | 3.49 | 37.86 | 6.27 | 1052 |
+| 64K | DFlash2 | 64.8 | 29.12 | 2187 | 3.54 | 49.12 | 5.51 | 1498 |
 
-- **Draft time** is wall time between verifications: the context quantum of the committed rows (0.33-0.35 ms; 0.70 at 64K)
-  and the block (3.67 ms; 5.01 at 64K). The prompt's context quanta are inside the TTFT; they cost less than MTP's prompt
+- **Draft time** is wall time between verifications: the context quantum of the committed rows (0.29-0.31 ms; 0.65 at 64K)
+  and the block (3.07 ms at 4K to 32K, 4.8 ms at 64K, where its kernels span 2.9 ms). The prompt's context quanta are inside the TTFT; they cost less than MTP's prompt
   catch-up, which is why DFlash2's prefill rate is the higher of the two speculative arms.
-- **Verification** of 6 rows costs what MTP3's 4 rows cost, plus the PCIe cost of the weights the drafter's device memory
-  pushes to the host: at a given context the DFlash2 NVFP4 artifact needs about 0.45-0.55 GiB more device memory than MTP.
-- **Accepted drafts per verification** (histogram, 0..5 accepted) at 4K: `[84, 83, 66, 35, 24, 52]` over 344 verifications.
-  On short chat requests (`DFlash2QualityCudaIntegrationTest`, 8 prompts of under 40 tokens) the drafter verifies 3.0 drafts
-  on average (4.0 tokens per verification) with 7 verified; the corpus above quotes long documents, where it drafts less well.
-- The BF16 drafter (3.6 GiB) forces 2.9-4.0 GiB of the target to the host, which the verifier reads over PCIe every step.
+- **Verification** of 7 rows costs about 1 ms more than MTP4's 5 rows at 4K and 16K. The rest of the difference is the PCIe cost
+  of the weights the drafter's device memory pushes to the host: at a given context the DFlash2 artifact needs about 0.45-0.55
+  GiB more device memory than MTP, so it streams 468 MiB of target projections per verification already at 4K, where MTP
+  streams none. At 64K the verification is bound by those copies (1.5 GiB per step, the transfer lane busy 86% of the time).
+- **Accepted drafts** on short chat requests (`DFlash2QualityCudaIntegrationTest`, 8 prompts of under 40 tokens, 7 verified): 3.1
+  per verification (4.1 tokens per verification); the corpus above quotes long documents, where it drafts less well.
 
-**Kernel time of one draft block** (Nsight Systems, 4K, NVFP4 projections; per block): the drafter's NVFP4 projections about
-1.1 ms (native FP4 skinny kernel), the target's output head over 7 rows 0.65 ms, BF16 linears (convolution kernel
-projections, selector projection) 0.63 ms, block attention 0.41 ms (5 × 82 us), top-16 0.07 ms, selector walk 14 us, norms,
-convolutions and the rest 0.2 ms.
+**Kernel time of one draft block** (Nsight Systems, 64K context, per block; span 2.91 ms): the drafter's NVFP4 projections
+1.31 ms (tensor-core decode kernels, 8 rows), the target's output head over 7 rows 0.81 ms, block attention 0.25 ms (5 × 50
+us, with the merge), BF16 linears (convolution kernel projections, selector projection) 0.22 ms, norms 0.11 ms, top-16 0.11
+ms, the rest 0.1 ms.
 
 **Prefix cache** (4 GiB, the same prompt three times; the warm ones restore all but the last chunk):
 
@@ -186,16 +194,20 @@ A DFlash2 node adds its 40 MiB ring to the base state; a restore recomputes noth
 | Tap rows (per sequence, a 512-row chunk) | 25 MiB | 25 MiB |
 | Artifact | 16.15 GB | 18.63 GB |
 
-The device-resident drafter is 1,056 MiB (NVFP4) or 3,428 MiB (BF16). The MTP layer and draft head (588 MiB) are not loaded with a DFlash2 artifact. Peak allocated device memory in the runs above is
-13.9-14.0 GiB for every arm; retained workspace 112-134 MiB.
+The device-resident drafter is 1,056 MiB (NVFP4) or 3,428 MiB (BF16). The MTP layer and draft head (588 MiB) are not loaded
+with a DFlash2 artifact. Peak allocated device memory in the runs of section 6: 13.6-13.7 GiB ordinary, 13.8-13.9 GiB MTP4,
+13.9-14.0 GiB DFlash2; retained workspace 90-150 MiB.
 
 ## 8. Rejected
 
-- **Verifying all 7 drafts.** The exact verifier's NVFP4-SD4 row twins cost 120.7 us at 7 rows and 125.5 at 8 against 92.8 at 6
-  (MLP down shape, cold weights; registers 223-234, no spills), and a 7-row verification 35.5 ms against 30.4 for 6 rows (4K
-  chat prompts). With 7 verified the arm decoded 69.3 tok/s at 4K (3.07 tokens per verification).
-- **The drafter's linears on the BF16-activation row twins** instead of the native FP4 route: block 5.26 ms, acceptance unchanged
-  (3.04 tokens per verification), 66.3 tok/s at 4K.
+- **Verifying 5 or all 7 drafts.** One run per cell, decode tok/s with the tensor-core decode kernels (before the block's
+  split-K linears, tensor-core attention and ring prefetch): 5 drafts 107.8 / 99.6 / 95.7 / 65.0 and 63.0 at 4K / 16K / 32K /
+  64K, 6 drafts 109.2 / 99.7 / 96.7 / 66.2 and 65.6, 7 drafts 107.8 at 4K. Six wins or ties at every context.
+- **A deeper staging ring** for the host-backed weights: 8 and 12 slots decoded 92.9 and 90.0 tok/s at 32K against 95.7 with 4,
+  and 62.9 against 66.0 at 64K with 8. The streaming is bound by PCIe bandwidth, not by how far copies run ahead, and every slot
+  is device memory that pushes another weight to the host.
+- **Per-row block attention** (one CTA per row and KV head, FP32 dot products over every key):
+  126 us per layer in the model, 82 us alone; each row re-read the window.
 - **NVFP4 convolution kernel projections** (`nvfp4-all`): 2.9% fewer accepted drafts than the BF16 drafter on the quality
   prompts, beyond the 2% threshold; 82.4 tok/s at 4K.
 - **The first block attention** (each thread summing two output values over every key): 915 us per layer over a full window.
@@ -206,10 +218,14 @@ The device-resident drafter is 1,056 MiB (NVFP4) or 3,428 MiB (BF16). The MTP la
 
 ## 9. Open
 
-- **Verification is 85-88% of a step.** A 7- and 8-row twin of the NVFP4-SD4 decode GEMV without the 6-to-7-row step would let
-  DFlash2 verify all its drafts (4.0 against 3.6 tokens per verification on short requests).
-- **Device memory.** The drafter needs about 0.5 GiB more than MTP's layer and draft head; every 128 MiB on the host costs about
-  2-2.5% of verification. Candidates: SD4 scale tables for the drafter's projections, a deterministic split-K BF16 linear for the
-  narrow convolution and selector projections, or the MTP draft head's 131,072-row shortlist for the drafter's output head.
-- **The block** (3.7 ms): its BF16 linears stream at 373 GB/s, and the context quantum could join the block quantum.
+- **Device memory.** The drafter needs about 0.5 GiB more than MTP's layer and draft head, so the target streams projections over
+  PCIe from 4K on. Candidates: SD4 scale tables for the drafter's projections (about 50 MiB); host-backing the drafter's small
+  projections (query and output, 118 MiB) so their copies run while the block leaves the transfer lane idle, in exchange for as
+  many target bytes (an estimated 3-4% at 64K, where verification is bound by those copies); the MTP draft head's 131,072-row
+  shortlist for the drafter's output head (0.4 ms less per block, at more device memory).
+- **Verification attention** reads the KV cache once per verified row (about 0.6 ms per layer for 7 rows at 64K). A kernel that
+  shares each key and value tile across rows must also leave room for more rows in flight per SM than the row twins' 4
+  ([ATTENTION_DECODE.md](ATTENTION_DECODE.md)).
+- **The block** (2.9 ms): 2.1 ms of it streams the drafter's projections and the output head at the DRAM rate; the context
+  quantum could join the block quantum.
 - **Q3 artifacts** have no DFlash2 drafter yet.

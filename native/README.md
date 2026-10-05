@@ -50,7 +50,7 @@ root the host loads; its headers are that module's leaves and strategies:
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
 | `attention/` | NVFP4 KV append, QK norm/RoPE, per-head and GQA decode attention with row twins, the 32-row prefill tile and the producer-warp FA2 prefill kernel, and the exact twins and single-warp controls used as test oracles. |
 | `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
-| `dflash/` | The DFlash2 drafter: BF16 tensor-core linear (rows independent of the row count), Qwen3 RMSNorm, grouped dynamic convolution, Q/K norm and RoPE, the context ring append, sliding-window block attention, SwiGLU, top-16 and the candidate selector, each rounding where the published PyTorch model rounds. |
+| `dflash/` | The DFlash2 drafter: BF16 tensor-core linear (rows independent of the row count), Qwen3 RMSNorm, grouped dynamic convolution, Q/K norm and RoPE, the context ring append, sliding-window block attention on tensor cores (key splits and a merge), SwiGLU, top-16 and the candidate selector, each rounding where the published PyTorch model rounds. |
 
 Includes within a folder are relative; includes across folders name the path from the tree root
 (`common/pdl.cuh`, `nvfp4/nvfp4.cuh`), which NVRTC resolves through the installed root.

@@ -40,7 +40,8 @@ identical state, bitwise.
 
 - **Verifier (row-exact).** Every row goes through the one-row arithmetic (MTP_CONTRACT §6):
   - attention, norms and the GDN recurrence run row by row;
-  - linears use multi-row twins of the one-row GEMVs that repeat its FMA sequence per row.
+  - Q3, Q4 and Q5 linears use multi-row twins of the one-row GEMVs that repeat its FMA sequence per row; NVFP4 linears use the
+    tensor-core decode kernels, whose token rows are independent MMA columns ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
 - **Tests:**
   - `SpeculativeVerifyCudaIntegrationTest`: logits, GDN state and KV after a VERIFY quantum equal
     sequential decode, bitwise, across the 2048-key attention kernel switch; partial commits with replay.
