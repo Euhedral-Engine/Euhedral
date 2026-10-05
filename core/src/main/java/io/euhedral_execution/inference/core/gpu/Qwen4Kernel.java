@@ -27,7 +27,10 @@ public enum Qwen4Kernel {
     ROUTER_BF16("euhedral_q4_router_bf16"),
     SWIGLU_BF16("euhedral_q4_swiglu_bf16"),
     MOE_FINISH_BF16("euhedral_q4_moe_finish_bf16"),
-    EMBEDDING_BF16("euhedral_q4_embedding_bf16");
+    EMBEDDING_BF16("euhedral_q4_embedding_bf16"),
+    EXPERT_GATE_UP_SWIGLU_BF16("euhedral_q4_expert_gate_up_swiglu_bf16"),
+    EXPERT_DOWN_BF16("euhedral_q4_expert_down_bf16"),
+    EXPERT_COMBINE_BF16("euhedral_q4_expert_combine_bf16");
 
     private final String symbol;
 
