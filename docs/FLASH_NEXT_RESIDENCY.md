@@ -108,3 +108,55 @@ bytes and slots, hits, misses, evictions, transfer bytes, transfer time, wait ti
 `heads_offsets[head]`, a global row is `shard x 2,500,012 + local row`, and a row is 90 contiguous bytes. `gather` copies chosen rows into
 host memory; `stage` copies only those rows through a pinned upload buffer to the device. The tables never enter the expert cache and are
 never copied to the device whole. N-gram execution is not implemented.
+
+## Measurements
+
+### Placement matrix
+
+Expert slots by free device memory and maximum context, planned at the real object sizes (`Qwen4ResidencyPlannerTest`, text mode,
+host with 48 GiB available); `(+N)` is the MiB of fixed objects moved to the host to make room for the minimum cache of 20 slots.
+Fixed objects that stay resident take 4,190 MiB; the cache holds at most one slot (2.64 MiB) per expert, 24,576.
+
+| free device memory | 4,096 | 16,384 | 32,768 | 65,536 | 131,072 | 262,144 |
+|---|---|---|---|---|---|---|
+| 3 GiB | 35 (+2573) | 22 (+2630) | 25 (+2756) | 31 (+3012) | 43 (+3525) | does not fit |
+| 4 GiB | 31 (+1538) | 22 (+1606) | 25 (+1732) | 30 (+1985) | 44 (+2503) | 41 (+3456) |
+| 5 GiB | 305 (+1226) | 270 (+1226) | 225 (+1226) | 134 (+1226) | 44 (+1479) | 20 (+2376) |
+| 6 GiB | 249 | 215 | 170 | 79 | 340 (+1226) | 43 (+1412) |
+| 7 GiB | 637 | 603 | 557 | 467 | 285 | 364 (+1226) |
+| 8 GiB | 1,025 | 991 | 945 | 854 | 673 | 309 |
+| 15 GiB | 3,739 | 3,705 | 3,660 | 3,569 | 3,387 | 3,024 |
+| 24 GiB | 7,229 | 7,195 | 7,150 | 7,059 | 6,877 | 6,514 |
+
+The cache shrinks as the context grows until it would fall under 20 slots; then the first fixed objects leave the device (the n-gram
+projections, then the output head, 1,213 MiB, read in place from mapped host memory), and the room they free is given to the
+cache, so the slot count jumps up at that point and falls again as the context grows. Objects up to 4 MiB never move, so the
+smallest device that can serve a context is the sum of its sequence state, the 1,154 MiB of runtime reserve and workspace, the 333 MiB
+of objects that never move, the staging ring and 20 slots (3 GiB serves 131,072 tokens, 4 GiB 262,144).
+
+### The GPU of this machine
+
+RTX 5070 Ti, 15,030 MiB free after the CUDA context, host with 48 GiB available (`Qwen4StorageCudaIntegrationTest`, the real
+artifact):
+
+| maximum context | KV | indexer | context and reserve | fixed resident | expert cache | slots |
+|---|---|---|---|---|---|---|
+| 4,096 | 27 MiB | 3 MiB | 1,294 MiB | 4,190 MiB | 9,543 MiB | 3,614 |
+| 32,768 | 216 MiB | 24 MiB | 1,504 MiB | 4,190 MiB | 9,334 MiB | 3,535 |
+| 131,072 | 864 MiB | 96 MiB | 2,224 MiB | 4,190 MiB | 8,619 MiB | 3,264 |
+| 262,144 | 1,728 MiB | 192 MiB | 3,184 MiB | 4,190 MiB | 7,657 MiB | 2,900 |
+
+Host: the token embedding is mapped (1,212 MiB pinned); the 63 GiB of expert records exceed what the host can pin, so they stay in the artifact
+file behind 20 pinned staging slots (52 MiB) and the page cache; the n-gram tables (27,465 MiB) are mapped from the file; MTP (1,431 MiB) and
+vision (856 MiB) stay in the artifact. Pinned memory in all: 1,265 MiB. With the device limited to 5 GiB at 262,144 tokens the same
+load keeps 1,813 MiB resident, stages 1,164 MiB of projections through a 67 MiB ring, maps the output head (2,425 MiB mapped in all) and
+runs a cache of the minimum 20 slots.
+
+### Expert transfers
+
+On a real stream (`Qwen4ExpertCacheCudaIntegrationTest`: 6 banks of 64 experts, 8 slots, records of 2.7 MB): every record read back from the
+device equals the file's bytes and CRC-32; 369 file-backed misses moved 1.00 GB at 8.7 GB/s and 373 arena-backed misses 1.02 GB at 9.3 GB/s,
+measured as bytes over the summed start-to-completion times of single 2.7 MB copies, so each includes the retirement latency of its own
+event. Against the real artifact on the load test above, 1,820 misses (5.04 GB) took 0.27 to 0.33 s of summed transfer time, 15 to 18 GB/s.
+These are not peak pipelined rates, which are not measured here; the huge-page arena's 44 GB/s ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md))
+applies to large pipelined copies of the arena store. Loading the 1 GB arena from a cached file took 0.42 s with 16 readers.
