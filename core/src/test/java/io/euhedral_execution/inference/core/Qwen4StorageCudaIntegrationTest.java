@@ -187,11 +187,13 @@ class Qwen4StorageCudaIntegrationTest {
         SplittableRandom random = new SplittableRandom(42);
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment back = arena.allocate(cache.slotBytes());
-            // one pass over distinct experts beyond the cache's capacity: every acquisition correct, evictions forced
-            int total = Math.min(slots + 64, banks.length * banks[0].expertCount());
+            // one pass over distinct experts beyond the cache's capacity (bank-major interleaved, so no key repeats):
+            // every acquisition correct, evictions forced
+            long distinct = (long) banks.length * banks[0].expertCount();
+            int total = (int) Math.min(slots + 64L, distinct);
             for (int i = 0; i < total; i++) {
-                int bank = (int) ((i * 7919L) % banks.length);
-                int expert = (int) ((i * 31L + bank) % banks[bank].expertCount());
+                int bank = i % banks.length;
+                int expert = (i / banks.length) % banks[bank].expertCount();
                 try (ExpertLease lease = cache.acquire(bank, expert)) {
                     gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
                     CRC32 crc = new CRC32();
