@@ -1,13 +1,22 @@
 package io.euhedral_execution.inference.core.qwen4;
 
 import static io.euhedral_execution.inference.core.qwen4.Qwen4Reference.bits;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.model_loader.TensorLoader;
+import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Artifact;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4ArtifactReader;
 import io.euhedral_execution.inference.core.scheduling.AttentionKvState;
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.SplittableRandom;
 
 /// Device helpers of the QSA GPU tests: opening the GPU, uploads and downloads of arrays, the decoded
@@ -98,5 +107,60 @@ final class Qwen4QsaTestSupport {
             }
         }
         return rows;
+    }
+
+    static Path artifactPath() {
+        return Path.of(System.getProperty(
+                "euhedral.qwen4.artifact", "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"));
+    }
+
+    /// The device weights of one QSA layer, freed on close.
+    record Loaded(Qwen4QsaLayer.Weights weights, Qwen4Artifact artifact, List<Long> owned, CudaGpuMemory gpu)
+            implements AutoCloseable {
+
+        static Loaded load(CudaGpuMemory gpu, int layer) throws IOException {
+            Path path = artifactPath();
+            assumeTrue(Files.isRegularFile(path), "no Flash-Next artifact at " + path);
+            Qwen4Artifact artifact = Qwen4ArtifactReader.read(path);
+            String base = "text/layers/" + layer + "/attention/";
+            List<Long> owned = new ArrayList<>();
+            TensorHandle[] h = new TensorHandle[9];
+            String[] names = {
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "q_norm",
+                "k_norm",
+                "indexer/index_qk_proj",
+                "indexer/q_layernorm",
+                "indexer/k_layernorm"
+            };
+            for (int i = 0; i < names.length; i++) {
+                h[i] = TensorLoader.load(
+                        path, artifact.tensor(base + names[i]).orElseThrow().descriptor(), gpu);
+                owned.add(h[i].deviceAddress());
+            }
+            Qwen4QsaLayer.Weights weights = new Qwen4QsaLayer.Weights(
+                    h[0].deviceAddress(),
+                    h[0].byteSize(),
+                    h[1].deviceAddress(),
+                    h[1].byteSize(),
+                    h[2].deviceAddress(),
+                    h[2].byteSize(),
+                    h[3].deviceAddress(),
+                    h[3].byteSize(),
+                    h[4].deviceAddress(),
+                    h[5].deviceAddress(),
+                    h[6].deviceAddress(),
+                    h[7].deviceAddress(),
+                    h[8].deviceAddress());
+            return new Loaded(weights, artifact, owned, gpu);
+        }
+
+        @Override
+        public void close() {
+            for (Long address : this.owned) this.gpu.free(address);
+        }
     }
 }
