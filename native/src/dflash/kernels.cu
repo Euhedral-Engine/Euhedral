@@ -339,8 +339,12 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_attention_bf16
                 ? ringKeys + ((first + key) % window) * width + kvHead * 128
                 : blockKeys + static_cast<uint64_t>(key - contextKeys) * width + kvHead * 128;
         float dot[kGroup] = {0.0f, 0.0f, 0.0f, 0.0f};
+        uint4 row[16];
+#pragma unroll
+        for (uint32_t i = 0; i < 16; i++) row[i] = *reinterpret_cast<const uint4*>(k + 8 * i);
+#pragma unroll
         for (uint32_t d = 0; d < 128; d += 8) {
-            const uint4 packed = *reinterpret_cast<const uint4*>(k + d);
+            const uint4 packed = row[d / 8];
             const __nv_bfloat16* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
 #pragma unroll
             for (uint32_t e = 0; e < 8; e++) {
@@ -373,18 +377,58 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_attention_bf16
         if (lane == 0) scratch[warp] = 1.0f / sum;
     }
     __syncthreads();
-    // Output: thread j owns (head j / 128, dimension j % 128) for j < group * 128.
-    for (uint32_t index = threadIdx.x; index < group * 128; index += blockDim.x) {
-        const uint32_t h = index / 128, d = index % 128;
-        const float* p = scores + h * kMaxKeys;
-        float acc = 0.0f;
-        for (uint32_t key = 0; key < keys; key++) {
+    // Output: warp w takes keys w, w + 8, ...; lane l accumulates dimensions 4l .. 4l + 3 of every query head of the
+    // group over its keys from one coalesced value row per key; the 8 warps' partial sums then add in a fixed order.
+    float acc[kGroup][4];
+#pragma unroll
+    for (uint32_t h = 0; h < kGroup; h++) acc[h][0] = acc[h][1] = acc[h][2] = acc[h][3] = 0.0f;
+    const uint32_t warps = blockDim.x / 32;
+    // Keys go in batches of 8 per warp, every batch's value loads issued before its FMAs, so the loads overlap.
+    constexpr uint32_t kBatch = 8;
+    for (uint32_t base = warp * kBatch; base < keys; base += warps * kBatch) {
+        uint2 packed[kBatch];
+#pragma unroll
+        for (uint32_t i = 0; i < kBatch; i++) {
+            const uint32_t key = base + i;
+            if (key >= keys) {
+                packed[i] = make_uint2(0, 0);
+                continue;
+            }
             const __nv_bfloat16* v = key < contextKeys
                     ? ringValues + ((first + key) % window) * width + kvHead * 128
                     : kv + static_cast<uint64_t>(key - contextKeys) * 2 * width + width + kvHead * 128;
-            acc = fmaf(p[key], bf(v[d]), acc);
+            packed[i] = *reinterpret_cast<const uint2*>(v + 4 * lane);
         }
-        out[static_cast<uint64_t>(row) * heads * 128 + (kvHead * group + h) * 128 + d] = rn(acc * scratch[h]);
+#pragma unroll
+        for (uint32_t i = 0; i < kBatch; i++) {
+            const uint32_t key = base + i;
+            if (key >= keys) break;
+            const __nv_bfloat16* values = reinterpret_cast<const __nv_bfloat16*>(&packed[i]);
+            float x[4];
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++) x[e] = bf(values[e]);
+#pragma unroll
+            for (uint32_t h = 0; h < kGroup; h++) {
+                if (h >= group) continue;
+                const float p = scores[h * kMaxKeys + key];
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++) acc[h][e] = fmaf(p, x[e], acc[h][e]);
+            }
+        }
+    }
+    __syncthreads();
+    // Reuse the scores as the warps' partial sums: [warp][head][128].
+    float* partial = scores;
+#pragma unroll
+    for (uint32_t h = 0; h < kGroup; h++)
+#pragma unroll
+        for (uint32_t e = 0; e < 4; e++) partial[(warp * kGroup + h) * 128 + 4 * lane + e] = acc[h][e];
+    __syncthreads();
+    for (uint32_t index = threadIdx.x; index < group * 128; index += blockDim.x) {
+        const uint32_t h = index / 128, d = index % 128;
+        float sum = 0.0f;
+        for (uint32_t w = 0; w < warps; w++) sum += partial[(w * kGroup + h) * 128 + d];
+        out[static_cast<uint64_t>(row) * heads * 128 + (kvHead * group + h) * 128 + d] = rn(sum * scratch[h]);
     }
 }
 
@@ -409,45 +453,11 @@ __device__ __forceinline__ bool before(float a, int32_t ia, float b, int32_t ib)
     return a > b || (a == b && ia < ib);
 }
 
-extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_topk_bf16(
-        const __nv_bfloat16* logits, uint32_t vocabulary, __nv_bfloat16* values, int32_t* indices) {
-    euhedral_pdl_begin();
-    __shared__ float candidateValue[256 * kTop];
-    __shared__ int32_t candidateIndex[256 * kTop];
-    __shared__ float bestValue[8];
-    __shared__ int32_t bestIndex[8];
-    __shared__ int32_t bestThread[8];
-    const __nv_bfloat16* row = logits + static_cast<uint64_t>(blockIdx.x) * vocabulary;
-    float v[kTop];
-    int32_t ix[kTop];
-#pragma unroll
-    for (int i = 0; i < kTop; i++) {
-        v[i] = -CUDART_INF_F;
-        ix[i] = 0x7fffffff;
-    }
-    for (uint32_t token = threadIdx.x; token < vocabulary; token += blockDim.x) {
-        float value = bf(row[token]);
-        if (value != value) continue;
-        int32_t index = static_cast<int32_t>(token);
-        if (!before(value, index, v[kTop - 1], ix[kTop - 1])) continue;
-#pragma unroll
-        for (int i = 0; i < kTop; i++) {
-            if (before(value, index, v[i], ix[i])) {
-                const float tv = v[i];
-                const int32_t ti = ix[i];
-                v[i] = value;
-                ix[i] = index;
-                value = tv;
-                index = ti;
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < kTop; i++) {
-        candidateValue[threadIdx.x * kTop + i] = v[i];
-        candidateIndex[threadIdx.x * kTop + i] = ix[i];
-    }
-    __shared__ int head[256];
+// The 16 best of `count` (value, token) candidates held by this 256-thread CTA, merged in 16 rounds: each thread
+// offers its best remaining candidate and the CTA takes the best offer. Writes them in order to `values` and
+// `indices` (any float or BF16 sink through `store`).
+__device__ __forceinline__ void top16_merge(float* candidateValue, int32_t* candidateIndex, int* head,
+        float* bestValue, int32_t* bestIndex, int32_t* bestThread, float* outValues, int32_t* outIndices) {
     head[threadIdx.x] = 0;
     __syncthreads();
     const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -476,11 +486,99 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_topk_bf16(
             int best = 0;
             for (int w = 1; w < 8; w++)
                 if (before(bestValue[w], bestIndex[w], bestValue[best], bestIndex[best])) best = w;
-            values[blockIdx.x * kTop + out] = rn(bestValue[best]);
-            indices[blockIdx.x * kTop + out] = bestIndex[best];
+            outValues[out] = bestValue[best];
+            outIndices[out] = bestIndex[best];
             head[bestThread[best]]++;
         }
         __syncthreads();
+    }
+}
+
+// Inserts (value, index) into a thread's sorted top-16.
+__device__ __forceinline__ void top16_insert(float* v, int32_t* ix, float value, int32_t index) {
+    if (!before(value, index, v[kTop - 1], ix[kTop - 1])) return;
+#pragma unroll
+    for (int i = 0; i < kTop; i++) {
+        if (before(value, index, v[i], ix[i])) {
+            const float tv = v[i];
+            const int32_t ti = ix[i];
+            v[i] = value;
+            ix[i] = index;
+            value = tv;
+            index = ti;
+        }
+    }
+}
+
+// Pass 1: CTA (row, split) finds the top 16 of its slice of the row's logits (NaN never) into `partial`
+// [row][split][16] values (FP32) and tokens. Grid (rows, splits), 256 threads.
+extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_topk_partial_bf16(
+        const __nv_bfloat16* logits, uint32_t vocabulary, float* partialValues, int32_t* partialIndices) {
+    euhedral_pdl_begin();
+    __shared__ float candidateValue[256 * kTop];
+    __shared__ int32_t candidateIndex[256 * kTop];
+    __shared__ float bestValue[8];
+    __shared__ int32_t bestIndex[8];
+    __shared__ int32_t bestThread[8];
+    __shared__ int head[256];
+    const uint32_t splits = gridDim.y, split = blockIdx.y;
+    const uint32_t span = (vocabulary + splits - 1) / splits;
+    const uint32_t begin = split * span, end = min(vocabulary, begin + span);
+    const __nv_bfloat16* row = logits + static_cast<uint64_t>(blockIdx.x) * vocabulary;
+    float v[kTop];
+    int32_t ix[kTop];
+#pragma unroll
+    for (int i = 0; i < kTop; i++) {
+        v[i] = -CUDART_INF_F;
+        ix[i] = 0x7fffffff;
+    }
+    for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
+        const float value = bf(row[token]);
+        if (value == value) top16_insert(v, ix, value, static_cast<int32_t>(token));
+    }
+#pragma unroll
+    for (int i = 0; i < kTop; i++) {
+        candidateValue[threadIdx.x * kTop + i] = v[i];
+        candidateIndex[threadIdx.x * kTop + i] = ix[i];
+    }
+    const uint64_t out = (static_cast<uint64_t>(blockIdx.x) * splits + split) * kTop;
+    top16_merge(candidateValue, candidateIndex, head, bestValue, bestIndex, bestThread, partialValues + out,
+            partialIndices + out);
+}
+
+// Pass 2: the row's top 16 of its splits' candidates, in descending order (equal values: lower token first). Values
+// return to BF16 exactly (they are BF16 logits). Grid rows, 256 threads.
+extern "C" __global__ __launch_bounds__(256) void euhedral_dflash_topk_merge_bf16(
+        const float* partialValues, const int32_t* partialIndices, uint32_t splits, __nv_bfloat16* values,
+        int32_t* indices) {
+    euhedral_pdl_begin();
+    __shared__ float candidateValue[256 * kTop];
+    __shared__ int32_t candidateIndex[256 * kTop];
+    __shared__ float bestValue[8];
+    __shared__ int32_t bestIndex[8];
+    __shared__ int32_t bestThread[8];
+    __shared__ int head[256];
+    __shared__ float outValues[kTop];
+    __shared__ int32_t outIndices[kTop];
+    const uint64_t base = static_cast<uint64_t>(blockIdx.x) * splits * kTop;
+    float v[kTop];
+    int32_t ix[kTop];
+#pragma unroll
+    for (int i = 0; i < kTop; i++) {
+        v[i] = -CUDART_INF_F;
+        ix[i] = 0x7fffffff;
+    }
+    for (uint32_t i = threadIdx.x; i < splits * kTop; i += blockDim.x) top16_insert(v, ix, partialValues[base + i],
+            partialIndices[base + i]);
+#pragma unroll
+    for (int i = 0; i < kTop; i++) {
+        candidateValue[threadIdx.x * kTop + i] = v[i];
+        candidateIndex[threadIdx.x * kTop + i] = ix[i];
+    }
+    top16_merge(candidateValue, candidateIndex, head, bestValue, bestIndex, bestThread, outValues, outIndices);
+    if (threadIdx.x < kTop) {
+        values[blockIdx.x * kTop + threadIdx.x] = rn(outValues[threadIdx.x]);
+        indices[blockIdx.x * kTop + threadIdx.x] = outIndices[threadIdx.x];
     }
 }
 

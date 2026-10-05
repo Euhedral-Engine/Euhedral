@@ -17,7 +17,8 @@ static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
-static CUfunction linear, linear_rows, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk, select_path;
+static CUfunction linear, linear_rows, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk_partial, topk_merge,
+        select_path;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 /* Dynamic shared memory of the attention kernel: 4 query heads x (2048 + 16) scores, 4 x 128 queries, 8 sums. */
@@ -29,19 +30,20 @@ static void initialize(void) {
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     const char* const names[] = {"euhedral_dflash_linear_rows_bf16", "euhedral_dflash_rms_norm_bf16",
             "euhedral_dflash_conv_bf16", "euhedral_dflash_context_kv_bf16", "euhedral_dflash_block_qk_bf16",
-            "euhedral_dflash_attention_bf16", "euhedral_dflash_swiglu_bf16", "euhedral_dflash_topk_bf16",
-            "euhedral_dflash_select_bf16"};
+            "euhedral_dflash_attention_bf16", "euhedral_dflash_swiglu_bf16", "euhedral_dflash_topk_partial_bf16",
+            "euhedral_dflash_topk_merge_bf16", "euhedral_dflash_select_bf16"};
     CUfunction* const functions[] = {&linear_rows, &rms_norm, &conv, &context_kv, &block_qk, &attention, &swiglu,
-            &topk, &select_path};
-    for (int index = 0; index < 9; index++) {
+            &topk_partial, &topk_merge, &select_path};
+    for (int index = 0; index < 10; index++) {
         CUresult status = cuModuleGetFunction(functions[index], module, names[index]);
         if (status != CUDA_SUCCESS) {
             init_status = (int)status;
             return;
         }
     }
-    CUfunction all[] = {linear, linear_rows, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk, select_path};
-    for (int index = 0; index < 10; index++) euhedral_cuda_pdl_register(all[index]);
+    CUfunction all[] = {linear, linear_rows, rms_norm, conv, context_kv, block_qk, attention, swiglu, topk_partial,
+            topk_merge, select_path};
+    for (int index = 0; index < 11; index++) euhedral_cuda_pdl_register(all[index]);
 }
 #ifdef _WIN32
 static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* context) {
@@ -71,6 +73,7 @@ static int launch(CUfunction function, uint32_t gx, uint32_t gy, uint32_t block,
     return sync == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)sync;
 }
 
+#define EUHEDRAL_DFLASH_TOPK_SPLITS 64u
 #define PTR(name, value) CUdeviceptr name = (CUdeviceptr)(uintptr_t)(value)
 
 int euhedral_cuda_dflash_linear_bf16(
@@ -123,8 +126,9 @@ int euhedral_cuda_dflash_conv_bf16(const void* input, const void* dynamic, const
 int euhedral_cuda_dflash_context_kv_bf16(const void* kv, const void* key_norm, void* ring_keys, void* ring_values,
         uint32_t rows, const void* position, uint32_t window, uint32_t key_value_heads, uint32_t head_dim,
         float epsilon, float theta) {
+    /* More rows than the window would write some ring slots twice in one launch. */
     if (kv == NULL || key_norm == NULL || ring_keys == NULL || ring_values == NULL || position == NULL || rows == 0
-            || window == 0 || key_value_heads == 0 || head_dim != 128)
+            || window == 0 || rows > window || key_value_heads == 0 || head_dim != 128)
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     int status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
@@ -188,17 +192,29 @@ int euhedral_cuda_dflash_swiglu_bf16(const void* gate_up, void* output, uint32_t
     return launch(swiglu, (uint32_t)((count + 255) / 256), 1, 256, 0, parameters);
 }
 
+uint64_t euhedral_cuda_dflash_topk_scratch_bytes(uint32_t rows) {
+    return (uint64_t)rows * EUHEDRAL_DFLASH_TOPK_SPLITS * 16u * 8u;
+}
+
 int euhedral_cuda_dflash_topk_bf16(
-        const void* logits, uint32_t rows, uint32_t vocabulary, void* values, void* indices) {
-    if (logits == NULL || values == NULL || indices == NULL || rows == 0 || vocabulary < 16)
+        const void* logits, uint32_t rows, uint32_t vocabulary, void* values, void* indices, void* scratch) {
+    if (logits == NULL || values == NULL || indices == NULL || scratch == NULL || rows == 0
+            || vocabulary < 16u * EUHEDRAL_DFLASH_TOPK_SPLITS)
         return EUHEDRAL_CUDA_INVALID_ARGUMENT;
     int status = ensure_initialized();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
     PTR(source, logits);
     PTR(v, values);
     PTR(i, indices);
-    void* parameters[] = {&source, &vocabulary, &v, &i};
-    return launch(topk, rows, 1, 256, 0, parameters);
+    /* Pass 1: rows x 64 CTAs each keep their slice's top 16; pass 2 merges each row's 1024 candidates. */
+    CUdeviceptr partial_values = (CUdeviceptr)(uintptr_t)scratch;
+    CUdeviceptr partial_indices = partial_values + (uint64_t)rows * EUHEDRAL_DFLASH_TOPK_SPLITS * 16u * 4u;
+    void* first[] = {&source, &vocabulary, &partial_values, &partial_indices};
+    status = launch(topk_partial, rows, EUHEDRAL_DFLASH_TOPK_SPLITS, 256, 0, first);
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    uint32_t splits = EUHEDRAL_DFLASH_TOPK_SPLITS;
+    void* second[] = {&partial_values, &partial_indices, &splits, &v, &i};
+    return launch(topk_merge, rows, 1, 256, 0, second);
 }
 
 int euhedral_cuda_dflash_select_bf16(const void* hidden, const void* values, const void* indices,
