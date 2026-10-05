@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4;
 
 import io.euhedral_execution.inference.core.model_loader.artifact.ArtifactFileAccess;
+import io.euhedral_execution.inference.core.model_loader.artifact.Nvfp4Layout;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactFormatException;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
@@ -31,6 +32,7 @@ import java.util.zip.CRC32;
 public final class Qwen4Validator {
 
     private static final int MAX_REPORTED = 20;
+    private static final long BUFFER_BYTES = 64L << 20;
 
     private Qwen4Validator() {}
 
@@ -121,9 +123,14 @@ public final class Qwen4Validator {
                         bank.name() + "/" + projection.getKey() + " overlaps the previous projection in the record");
             cursor = actual.recordOffset() + actual.byteSize();
         }
+        // Expert `e` is the e-th record: records follow one another in expert order, so an id is its position.
         for (int expert = 0; expert < bank.expertCount(); expert++) {
             if (bank.recordBytes(expert) < cursor) {
                 problems.add(bank.name() + " expert " + expert + " has a record smaller than its projections");
+                break;
+            }
+            if (expert > 0 && bank.fileOffset(expert) < bank.fileOffset(expert - 1) + bank.recordBytes(expert - 1)) {
+                problems.add(bank.name() + " expert " + expert + " does not follow expert " + (expert - 1));
                 break;
             }
         }
@@ -141,15 +148,25 @@ public final class Qwen4Validator {
         }
     }
 
-    /// Reads every object's payload (in parallel) and compares its CRC-32 with the table's.
+    /// Reads every object's payload (in parallel) and compares its CRC-32 with the table's; the NVFP4 fixed tensors
+    /// and every expert projection are also checked structurally (no NaN block scale, a finite non-negative global
+    /// scale: [Nvfp4Layout#validate]).
     public static Report verifyChecksums(Path path, Qwen4Artifact artifact, int threads) throws IOException {
         List<long[]> work = new ArrayList<>();
         List<String> labels = new ArrayList<>();
         List<Integer> crcs = new ArrayList<>();
+        // What to check structurally in each object: its NVFP4 matrices as {offsetInObject, rows, k, bytes}.
+        List<long[][]> matrices = new ArrayList<>();
         for (Qwen4Tensor tensor : artifact.tensors()) {
             work.add(new long[] {tensor.dataOffset(), tensor.byteSize()});
             labels.add(tensor.name());
             crcs.add(tensor.crc32());
+            boolean rowSplit =
+                    tensor.format() == WeightFormat.NVFP4 && tensor.layout() == WeightLayout.ROW_SPLIT_K128_V1;
+            matrices.add(
+                    rowSplit
+                            ? new long[][] {{0, tensor.shape()[0], tensor.shape()[1], tensor.byteSize()}}
+                            : new long[0][]);
         }
         long records = 0;
         for (ExpertBank bank : artifact.banks()) {
@@ -157,6 +174,17 @@ public final class Qwen4Validator {
                 work.add(new long[] {bank.fileOffset(expert), bank.recordBytes(expert)});
                 labels.add(bank.name() + "#" + expert);
                 crcs.add(bank.crc32(expert));
+                long[][] projections = new long[bank.projections().size()][];
+                for (int p = 0; p < projections.length; p++) {
+                    ExpertProjection projection = bank.projections().get(p);
+                    projections[p] = new long[] {
+                        projection.recordOffset(),
+                        projection.shape()[0],
+                        projection.shape()[1],
+                        projection.byteSize()
+                    };
+                }
+                matrices.add(projections);
                 records++;
             }
         }
@@ -170,7 +198,7 @@ public final class Qwen4Validator {
                 futures.add(pool.submit(() -> {
                     try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ);
                             Arena arena = Arena.ofConfined()) {
-                        MemorySegment buffer = arena.allocate(1 << 24);
+                        MemorySegment buffer = arena.allocate(BUFFER_BYTES);
                         for (int index = start; index < work.size(); index += workers) {
                             long offset = work.get(index)[0];
                             long size = work.get(index)[1];
@@ -182,6 +210,18 @@ public final class Qwen4Validator {
                                 view.flip();
                                 crc.update(view);
                                 done += chunk;
+                            }
+                            if (size <= buffer.byteSize()) {
+                                // The whole object is in the buffer: check its matrices.
+                                for (long[] matrix : matrices.get(index)) {
+                                    try {
+                                        Nvfp4Layout.validate(
+                                                buffer.asSlice(matrix[0], matrix[3]), matrix[1], matrix[2]);
+                                    } catch (IllegalArgumentException | IndexOutOfBoundsException invalid) {
+                                        throw new QwenArtifactFormatException("invalid NVFP4 data in "
+                                                + labels.get(index) + ": " + invalid.getMessage());
+                                    }
+                                }
                             }
                             if ((int) crc.getValue() != crcs.get(index))
                                 throw new QwenArtifactFormatException("CRC-32 of " + labels.get(index) + " is "

@@ -269,6 +269,46 @@ class Qwen4ArtifactReaderTest {
     }
 
     @Test
+    void checksumVerificationRejectsANanBlockScaleEvenWithAMatchingChecksum() throws IOException {
+        // The writer records the CRC-32 of whatever it is given, so a bad scale arrives with a good checksum.
+        Qwen4Config config = Qwen4TestArtifact.miniConfig();
+        Path poisoned = this.directory.resolve("nan.edrl");
+        Qwen4Artifact fresh = Qwen4TestArtifact.write(poisoned, config, 7);
+        ExpertBank bank = fresh.banks()[1];
+        long scaleOffset = bank.fileOffset(3)
+                + bank.projection("down").recordOffset()
+                + io.euhedral_execution.inference.core.model_loader.artifact.Nvfp4Layout.scaleOffset(
+                        bank.projection("down").shape()[0],
+                        bank.projection("down").shape()[1]);
+        byte[] record = new byte[(int) bank.recordBytes(3)];
+        try (RandomAccessFile file = new RandomAccessFile(poisoned.toFile(), "rw")) {
+            file.seek(scaleOffset);
+            file.write(0xff);
+            file.seek(bank.fileOffset(3));
+            file.readFully(record);
+        }
+        int[] crcs = new int[bank.expertCount()];
+        long[] offsets = new long[bank.expertCount()];
+        long[] sizes = new long[bank.expertCount()];
+        for (int e = 0; e < crcs.length; e++) {
+            crcs[e] = e == 3 ? Qwen4ArtifactWriter.crc(record) : bank.crc32(e);
+            offsets[e] = bank.fileOffset(e);
+            sizes[e] = bank.recordBytes(e);
+        }
+        ExpertBank[] banks = fresh.banks().clone();
+        banks[1] = new ExpertBank(bank.name(), bank.group(), bank.layer(), bank.projections(), offsets, sizes, crcs);
+        byte[] tables = Qwen4ArtifactWriter.encodeTables(fresh.tensors(), banks);
+        try (RandomAccessFile file = new RandomAccessFile(poisoned.toFile(), "rw")) {
+            file.seek(fresh.header().tablesOffset());
+            file.write(tables);
+        }
+        Qwen4Artifact read = Qwen4ArtifactReader.read(poisoned);
+        var failure = assertThrows(IOException.class, () -> Qwen4Validator.verifyChecksums(poisoned, read, 2));
+        assertTrue(failure.getMessage().contains("NaN"), failure.getMessage());
+        assertTrue(failure.getMessage().contains(bank.name() + "#3"), failure.getMessage());
+    }
+
+    @Test
     void metadataRejectsUnknownMissingAndMistypedKeys() throws IOException {
         Map<String, Object> metadata =
                 new LinkedHashMap<>(Qwen4TestArtifact.miniConfig().toMetadata());
