@@ -44,7 +44,7 @@ public final class DFlash2SequenceState implements AutoCloseable {
     }
 
     /// Bytes of one layer's key (or value) ring.
-    long ringBytes() {
+    public long ringBytes() {
         return (long) this.config.slidingWindow() * this.config.keyValueWidth() * Short.BYTES;
     }
 

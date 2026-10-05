@@ -59,6 +59,21 @@ public final class SequenceStateProbe {
         return digests;
     }
 
+    /// Digests of the DFlash2 drafter's context ring (every layer's keys and values) and its context length, or an
+    /// empty list when the sequence has no DFlash2 state.
+    public static List<String> dflash2Digests(ExecutionGpu gpu, QwenSequenceState sequence) {
+        var state = ((AttentionSequenceStates) sequence.kvCacheState()).dflash2();
+        if (state == null) return List.of();
+        List<String> digests = new ArrayList<>();
+        digests.add("dflash2 context " + state.contextLength());
+        for (int layer = 0; layer < state.config().layers(); layer++) {
+            digests.add("dflash2 layer " + layer + " keys " + digest(gpu, state.ringKeys(layer), state.ringBytes()));
+            digests.add(
+                    "dflash2 layer " + layer + " values " + digest(gpu, state.ringValues(layer), state.ringBytes()));
+        }
+        return digests;
+    }
+
     private static String digest(ExecutionGpu gpu, long address, long bytes) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment host = arena.allocate(bytes);
