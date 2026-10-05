@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model_loader.artifact.Nvfp4Layout;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
 import io.euhedral_execution.inference.core.model_loader.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.model_loader.config.DFlash2Config;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.QwenCompactAttentionWeights;
@@ -39,12 +40,18 @@ final class QwenCompactWeightLoader {
             QwenArtifact artifact,
             GpuMemory gpuMemory,
             Map<String, TensorDescriptor> descriptors,
-            boolean speculative,
+            ArtifactProfile.Speculation speculation,
             Set<String> hostBacked)
             throws IOException {
         QwenConfig config = artifact.config();
         validateConfig(config);
-        validateInventory(config, descriptors);
+        DFlash2Config dflash2 = DFlash2Inventory.read(artifactPath, descriptors);
+        validateInventory(config, descriptors, dflash2);
+        // The DFlash2 selector's codebooks are always read in place from mapped host memory.
+        Set<String> mapped = new java.util.HashSet<>();
+        if (speculation == ArtifactProfile.Speculation.DFLASH2) mapped.addAll(DFlash2Inventory.MAPPED);
+        Set<String> host = new java.util.HashSet<>(hostBacked);
+        host.addAll(mapped);
 
         Map<String, TensorHandle> handles = new LinkedHashMap<>();
         long hostArena = 0;
@@ -53,25 +60,36 @@ final class QwenCompactWeightLoader {
             // pages are far likelier to be available then than between reads.
             long hostBytes = 0;
             for (TensorDescriptor descriptor : descriptors.values()) {
-                if (uploads(descriptor.name(), speculative) && hostBacked.contains(descriptor.name()))
+                if (uploads(descriptor.name(), speculation) && host.contains(descriptor.name()))
                     hostBytes += hostSlot(descriptor.byteSize());
             }
             if (hostBytes > 0) hostArena = gpuMemory.allocateHostWeights(hostBytes);
             long hostOffset = 0;
             for (TensorDescriptor descriptor : descriptors.values()) {
-                if (!uploads(descriptor.name(), speculative)) continue;
-                if (hostBacked.contains(descriptor.name())) {
-                    TensorHandle host = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
-                    // The embedding is a gather: kernels read its rows in place instead of staging it.
-                    if (descriptor.name().equals(HostWeightSelection.EMBEDDING))
-                        host = mapped(host, gpuMemory.hostWeightsDeviceAddress(host.hostAddress()));
-                    handles.put(descriptor.name(), host);
+                if (!uploads(descriptor.name(), speculation)) continue;
+                if (host.contains(descriptor.name())) {
+                    TensorHandle loaded = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
+                    // The embedding and the codebooks are gathers: kernels read their rows in place instead of
+                    // staging them.
+                    if (descriptor.name().equals(HostWeightSelection.EMBEDDING) || mapped.contains(descriptor.name()))
+                        loaded = mapped(loaded, gpuMemory.hostWeightsDeviceAddress(loaded.hostAddress()));
+                    handles.put(descriptor.name(), loaded);
                     hostOffset += hostSlot(descriptor.byteSize());
                 } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
             }
-            // Only a speculative load prepares the MTP layer for execution.
-            if (speculative) splitMtpAttention(handles, gpuMemory);
-            return assemble(config, handles);
+            // Only an MTP load prepares the MTP layer for execution.
+            if (speculation == ArtifactProfile.Speculation.MTP) splitMtpAttention(handles, gpuMemory);
+            QwenWeights weights = assemble(config, handles);
+            if (speculation != ArtifactProfile.Speculation.DFLASH2) return weights;
+            return new QwenWeights(
+                    weights.config(),
+                    weights.tokenEmbedding(),
+                    weights.layers(),
+                    weights.finalNorm(),
+                    weights.lmHead(),
+                    null,
+                    weights.runtimeObjects(),
+                    DFlash2Inventory.assemble(dflash2, handles));
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);
             if (hostArena != 0) {
@@ -85,17 +103,22 @@ final class QwenCompactWeightLoader {
         }
     }
 
-    /// Whether a load places the named object on the device: the MTP layer and draft head only for
-    /// speculative decoding.
-    static boolean uploads(String name, boolean speculative) {
-        return speculative || !(name.startsWith("mtp/") || name.startsWith("text/draft_head"));
+    /// Whether a load places the named object on the device (or in host memory for it): the MTP layer and draft
+    /// head only for MTP, the DFlash2 drafter (its configuration aside, which the loader reads on the host) only
+    /// for DFlash2.
+    static boolean uploads(String name, ArtifactProfile.Speculation speculation) {
+        if (name.startsWith("mtp/") || name.startsWith("text/draft_head"))
+            return speculation == ArtifactProfile.Speculation.MTP;
+        if (name.startsWith(DFlash2Inventory.PREFIX))
+            return speculation == ArtifactProfile.Speculation.DFLASH2 && !name.equals(DFlash2Inventory.CONFIG);
+        return true;
     }
 
     static QwenWeights loadFirstLayer(
             Path artifactPath, QwenConfig config, GpuMemory gpuMemory, Map<String, TensorDescriptor> descriptors)
             throws IOException {
         validateConfig(config);
-        validateInventory(config, descriptors);
+        validateInventory(config, descriptors, DFlash2Inventory.read(artifactPath, descriptors));
         if (config.layerTypes()[0] != QwenLayerType.GATED_DELTA_NET) {
             throw new QwenWeightLoadException("actual layer zero is not a compact GDN layer");
         }
@@ -281,10 +304,18 @@ final class QwenCompactWeightLoader {
     /// The text inventory: every object, and no other.
     static void validateInventory(QwenConfig config, Map<String, TensorDescriptor> descriptors)
             throws QwenWeightLoadException {
-        if (descriptors.size() != EXPECTED_OBJECT_COUNT) {
-            throw new QwenWeightLoadException("compact Qwen artifact must contain " + EXPECTED_OBJECT_COUNT
-                    + " runtime objects, found " + descriptors.size());
+        validateInventory(config, descriptors, null);
+    }
+
+    /// The text inventory and, with `dflash2`, the DFlash2 drafter's objects: every object, and no other.
+    static void validateInventory(QwenConfig config, Map<String, TensorDescriptor> descriptors, DFlash2Config dflash2)
+            throws QwenWeightLoadException {
+        int count = EXPECTED_OBJECT_COUNT + (dflash2 == null ? 0 : DFlash2Inventory.objectCount(dflash2));
+        if (descriptors.size() != count) {
+            throw new QwenWeightLoadException(
+                    "compact Qwen artifact must contain " + count + " runtime objects, found " + descriptors.size());
         }
+        if (dflash2 != null) DFlash2Inventory.validate(dflash2, descriptors);
         Set<String> expected = new LinkedHashSet<>();
         expected.add("text/token_embedding");
         expected.add("text/final_norm");
@@ -337,6 +368,7 @@ final class QwenCompactWeightLoader {
             validateExpectedDescriptor(descriptor);
         }
         for (String name : descriptors.keySet()) {
+            if (dflash2 != null && name.startsWith(DFlash2Inventory.PREFIX)) continue;
             if (!expected.contains(name))
                 throw new QwenWeightLoadException("compact artifact contains unknown runtime object '" + name + "'");
         }

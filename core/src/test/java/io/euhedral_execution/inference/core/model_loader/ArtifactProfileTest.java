@@ -61,6 +61,24 @@ class ArtifactProfileTest {
     }
 
     @Test
+    void anArtifactWithTheDFlash2DrafterDraftsWithDFlash2() {
+        List<TensorDescriptor> tensors =
+                new ArrayList<>(List.of(artifact(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_SD4_V1, true)
+                        .tensors()));
+        tensors.add(tensor("dflash2/config", WeightFormat.I32, WeightLayout.CONTIGUOUS_LE_V1));
+        var profile = ArtifactProfile.of(new QwenArtifact(null, null, tensors.toArray(TensorDescriptor[]::new)));
+        assertEquals(ArtifactProfile.Speculation.DFLASH2, profile.speculation());
+        assertEquals(7, profile.speculativeDepth());
+        assertEquals("nvfp4-compressed-dflash2", profile.artifactName());
+        assertTrue(QwenCompactWeightLoader.uploads("dflash2/fc", ArtifactProfile.Speculation.DFLASH2));
+        assertFalse(QwenCompactWeightLoader.uploads("dflash2/config", ArtifactProfile.Speculation.DFLASH2));
+        assertFalse(QwenCompactWeightLoader.uploads("mtp/input_projection", ArtifactProfile.Speculation.DFLASH2));
+        assertFalse(QwenCompactWeightLoader.uploads("dflash2/fc", ArtifactProfile.Speculation.MTP));
+        assertTrue(QwenCompactWeightLoader.uploads("text/draft_head", ArtifactProfile.Speculation.MTP));
+        assertTrue(QwenCompactWeightLoader.uploads("text/output_head", ArtifactProfile.Speculation.NONE));
+    }
+
+    @Test
     void unsupportedArtifactsAreRejected() {
         assertThrows(
                 IllegalArgumentException.class,

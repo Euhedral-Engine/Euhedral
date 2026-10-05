@@ -52,6 +52,7 @@ subprojects {
             exclude("**/SpeculativeDecodeCudaIntegrationTest.class")
             exclude("**/CapturedQuantaCudaIntegrationTest.class")
             exclude("**/TeacherForcedQualityCudaIntegrationTest.class")
+            exclude("**/DFlash2*CudaIntegrationTest.class")
             useJUnitPlatform()
             // Constrained decoding is CPU work; its tests load the host's llguidance build.
             llguidanceTasks[hostProductId]?.let { build ->
@@ -92,6 +93,7 @@ subprojects {
             include("**/PrefillPartitionCudaIntegrationTest.class")
             include("**/PrefixCacheCudaIntegrationTest.class")
             include("**/TeacherForcedQualityCudaIntegrationTest.class")
+            include("**/DFlash2*CudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -106,6 +108,15 @@ subprojects {
                     providers.gradleProperty("euhedral.qwen.nvfp4-artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl")
                             .get())
+            // Optional DFlash2 artifact (tools/convert_checkpoint.py --extend ... --dflash2 ...).
+            systemProperty(
+                    "euhedral.qwen.dflash2-artifact",
+                    providers.gradleProperty("euhedral.qwen.dflash2-artifact")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed_dflash2_bf16.edrl")
+                            .get())
+            // Optional DFlash2 reference fixtures (tools/dflash2_reference.py) and the fixtures the engine writes.
+            for (name in listOf("fixtures", "dump"))
+                providers.gradleProperty("euhedral.dflash2.$name").orNull?.let { systemProperty("euhedral.dflash2.$name", it) }
             // Optional compressed Q3 artifact (tools/convert_checkpoint.py --quantization q3 --compressed).
             systemProperty(
                     "euhedral.qwen.q3-compressed-artifact",

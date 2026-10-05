@@ -111,6 +111,89 @@ class QwenCompactWeightLoaderTest {
         QwenCompactWeightLoader.validateInventory(config(), nvfp4Inventory());
     }
 
+    private static final io.euhedral_execution.inference.core.model_loader.config.DFlash2Config DFLASH2 =
+            io.euhedral_execution.inference.core.model_loader.config.DFlash2Config.parse(new int[] {
+                1,
+                5,
+                5120,
+                17408,
+                32,
+                8,
+                128,
+                8,
+                248070,
+                2,
+                16,
+                16,
+                256,
+                2048,
+                248320,
+                Float.floatToIntBits(1e-6f),
+                Float.floatToIntBits(1e7f),
+                5,
+                5,
+                19,
+                33,
+                47,
+                61
+            });
+
+    private static Map<String, TensorDescriptor> withDFlash2(boolean nvfp4Projections) {
+        Map<String, TensorDescriptor> descriptors = nvfp4Inventory();
+        descriptors.put(
+                "dflash2/config",
+                new TensorDescriptor(
+                        "dflash2/config",
+                        new long[] {23},
+                        TensorDataType.INT32,
+                        WeightFormat.I32,
+                        WeightLayout.CONTIGUOUS_LE_V1,
+                        0,
+                        92));
+        DFlash2Inventory.expected(DFLASH2)
+                .forEach((name, entry) -> descriptors.put(
+                        name,
+                        nvfp4Projections && entry.projection()
+                                ? descriptor(name, entry.shape(), WeightFormat.NVFP4)
+                                : new TensorDescriptor(
+                                        name,
+                                        entry.shape(),
+                                        TensorDataType.BF16,
+                                        WeightFormat.BF16,
+                                        WeightLayout.CONTIGUOUS_LE_V1,
+                                        0,
+                                        1)));
+        return descriptors;
+    }
+
+    @Test
+    void acceptsTheDFlash2DrafterBesideTheTextInventory() throws Exception {
+        QwenCompactWeightLoader.validateInventory(config(), withDFlash2(false), DFLASH2);
+        QwenCompactWeightLoader.validateInventory(config(), withDFlash2(true), DFLASH2);
+        assertEquals(785 + 72, withDFlash2(false).size(), "5 x 13 layer objects, 3 shared, 3 selector, config");
+    }
+
+    @Test
+    void rejectsADFlash2ArtifactReadWithoutItsConfigurationOrWithAnUnknownObject() {
+        assertThrows(
+                QwenWeightLoadException.class,
+                () -> QwenCompactWeightLoader.validateInventory(config(), withDFlash2(false)));
+        Map<String, TensorDescriptor> extra = withDFlash2(false);
+        extra.put(
+                "dflash2/layers/5/input_norm",
+                descriptor("dflash2/layers/5/input_norm", new long[] {5120}, WeightFormat.BF16));
+        extra.remove("dflash2/final_norm");
+        assertThrows(
+                QwenWeightLoadException.class,
+                () -> QwenCompactWeightLoader.validateInventory(config(), extra, DFLASH2));
+        Map<String, TensorDescriptor> quantizedNorm = withDFlash2(false);
+        quantizedNorm.put(
+                "dflash2/hidden_norm", descriptor("dflash2/hidden_norm", new long[] {5120}, WeightFormat.NVFP4));
+        assertThrows(
+                QwenWeightLoadException.class,
+                () -> QwenCompactWeightLoader.validateInventory(config(), quantizedNorm, DFLASH2));
+    }
+
     @Test
     void rejectsAPartialVisionTower() throws Exception {
         Map<String, TensorDescriptor> descriptors = nvfp4Inventory();

@@ -247,7 +247,7 @@ public final class InferenceEngine implements AutoCloseable {
                 Objects.requireNonNull(config, "config"),
                 prefillChunkTokens,
                 this::releaseSession);
-        if (this.profile != null && this.profile.speculativeDepth() > 0 && this.plan.drafts())
+        if (this.profile != null && this.profile.speculation() == ArtifactProfile.Speculation.MTP && this.plan.drafts())
             session.enableSpeculativeDecoding(this.profile.speculativeDepth());
         if (this.prefixCache != null) session.usePrefixCache(this.prefixCache);
         this.sessions.add(session);
@@ -284,6 +284,11 @@ public final class InferenceEngine implements AutoCloseable {
     }
 
     /// Returns what the loaded artifact is, or null when the engine was started without a profiled artifact.
+    /// The loaded plan family (tests).
+    QwenExecutionPlan plan() {
+        return this.plan;
+    }
+
     public ArtifactProfile profile() {
         return this.profile;
     }
@@ -498,7 +503,7 @@ public final class InferenceEngine implements AutoCloseable {
                     plan.deviceBytes() >> 20,
                     free >> 20,
                     hostBytes >> 20);
-            return QwenModel.load(path, artifact, gpu, profile.speculative(), plan.hostBacked());
+            return QwenModel.load(path, artifact, gpu, profile.speculation(), plan.hostBacked());
         }
 
         ControlPlaneLattice createLattice(InferenceConfig config) {

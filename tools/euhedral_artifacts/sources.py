@@ -63,8 +63,14 @@ class SourceRef:
 
 class SourceStore:
     def __init__(self, model: Path):
-        index = read_json(model / "model.safetensors.index.json")
-        weight_map = index.get("weight_map")
+        if (model / "model.safetensors.index.json").exists():
+            weight_map = read_json(model / "model.safetensors.index.json").get("weight_map")
+        elif (model / "model.safetensors").exists():
+            # A single-file checkpoint (the DFlash2 drafter) has no index: its header is the map.
+            weight_map = {name: "model.safetensors"
+                          for name in read_safetensors_header(model / "model.safetensors")[1]}
+        else:
+            fail(f"{model} has neither model.safetensors.index.json nor model.safetensors")
         if not isinstance(weight_map, dict) or not weight_map:
             fail("model.safetensors.index.json has no weight_map")
         self.model = model

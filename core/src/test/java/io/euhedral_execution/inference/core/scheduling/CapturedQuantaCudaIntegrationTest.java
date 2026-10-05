@@ -50,7 +50,11 @@ class CapturedQuantaCudaIntegrationTest {
         long hostBytes = Long.getLong("euhedral.speculative.host-mib", 1024L) << 20;
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 QwenModel model = QwenModel.load(
-                        artifact, artifactData, gpu, true, HostWeightSelection.select(artifactData, hostBytes));
+                        artifact,
+                        artifactData,
+                        gpu,
+                        io.euhedral_execution.inference.core.model_loader.ArtifactProfile.Speculation.MTP,
+                        HostWeightSelection.select(artifactData, hostBytes));
                 var lattice = new PullingLattice()) {
             var plan = new QwenExecutionPlan(model.weights(), model.staging());
             int depth = ArtifactProfile.of(artifactData).speculativeDepth();

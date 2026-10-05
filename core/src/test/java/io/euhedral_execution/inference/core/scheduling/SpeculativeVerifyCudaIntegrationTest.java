@@ -210,7 +210,7 @@ class SpeculativeVerifyCudaIntegrationTest {
                 artifact,
                 data,
                 gpu,
-                false,
+                io.euhedral_execution.inference.core.model_loader.ArtifactProfile.Speculation.NONE,
                 io.euhedral_execution.inference.core.model_loader.HostWeightSelection.select(data, hostBytes));
     }
 

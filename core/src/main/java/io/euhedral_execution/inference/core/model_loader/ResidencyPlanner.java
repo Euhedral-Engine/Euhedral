@@ -61,7 +61,7 @@ public final class ResidencyPlanner {
     private static long artifactBytes(QwenArtifact artifact, ArtifactProfile profile) {
         long total = 0;
         for (TensorDescriptor tensor : artifact.tensors())
-            if (QwenCompactWeightLoader.uploads(tensor.name(), profile.speculative())) total += tensor.byteSize();
+            if (QwenCompactWeightLoader.uploads(tensor.name(), profile.speculation())) total += tensor.byteSize();
         return total;
     }
 
@@ -69,7 +69,8 @@ public final class ResidencyPlanner {
         long resident = 0;
         long largest = 0;
         for (TensorDescriptor tensor : artifact.tensors()) {
-            if (!QwenCompactWeightLoader.uploads(tensor.name(), profile.speculative())) continue;
+            if (!QwenCompactWeightLoader.uploads(tensor.name(), profile.speculation())) continue;
+            if (DFlash2Inventory.MAPPED.contains(tensor.name())) continue;
             boolean hostBacked = host.contains(tensor.name());
             if (hostBacked && tensor.name().equals(HostWeightSelection.EMBEDDING)) continue;
             if (hostBacked) largest = Math.max(largest, tensor.byteSize());

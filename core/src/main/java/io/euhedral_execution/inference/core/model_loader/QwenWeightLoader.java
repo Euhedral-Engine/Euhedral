@@ -18,13 +18,17 @@ public final class QwenWeightLoader {
     private QwenWeightLoader() {}
 
     public static QwenWeights load(Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory) throws IOException {
-        return load(artifactPath, artifact, gpuMemory, false, Set.of());
+        return load(artifactPath, artifact, gpuMemory, ArtifactProfile.Speculation.NONE, Set.of());
     }
 
     /// Loads a compact artifact's objects, keeping those named in `hostBacked` in pinned host memory;
-    /// `speculative` also uploads the MTP layer and draft head.
+    /// `speculation` also loads the drafter it uses: the MTP layer and draft head, or the DFlash2 drafter.
     public static QwenWeights load(
-            Path artifactPath, QwenArtifact artifact, GpuMemory gpuMemory, boolean speculative, Set<String> hostBacked)
+            Path artifactPath,
+            QwenArtifact artifact,
+            GpuMemory gpuMemory,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked)
             throws IOException {
         Objects.requireNonNull(artifactPath, "artifactPath");
         Objects.requireNonNull(artifact, "artifact");
@@ -36,7 +40,7 @@ public final class QwenWeightLoader {
                 artifact,
                 gpuMemory,
                 indexDescriptors(requireDescriptors(artifact)),
-                speculative,
+                speculation,
                 hostBacked);
     }
 

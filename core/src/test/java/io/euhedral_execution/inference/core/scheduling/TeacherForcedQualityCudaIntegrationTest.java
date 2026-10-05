@@ -49,8 +49,12 @@ class TeacherForcedQualityCudaIntegrationTest {
         if (document.length < prefix + steps + 1) throw new IllegalStateException("document too short");
         var data = QwenArtifactReader.read(artifact);
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                QwenModel model =
-                        QwenModel.load(artifact, data, gpu, false, HostWeightSelection.select(data, hostBytes));
+                QwenModel model = QwenModel.load(
+                        artifact,
+                        data,
+                        gpu,
+                        io.euhedral_execution.inference.core.model_loader.ArtifactProfile.Speculation.NONE,
+                        HostWeightSelection.select(data, hostBytes));
                 var lattice = new PullingLattice();
                 OutputStream file = Files.newOutputStream(Path.of(report));
                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(file, 1 << 22))) {
