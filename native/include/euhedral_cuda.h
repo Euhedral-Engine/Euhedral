@@ -316,6 +316,38 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         float epsilon,
         double rope_theta);
 
+/* DFlash2 drafter (src/dflash/kernels.cu, docs/DFLASH2.md): BF16 operators that round where the published PyTorch
+ * model rounds. `position` points at the quantum's uint64 start position in device memory. */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_linear_bf16(
+        const void* device_input, const void* device_weights, void* device_output,
+        uint32_t rows, uint32_t in_features, uint32_t out_features);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_rms_norm_bf16(
+        const void* device_input, const void* device_weight, void* device_output, uint32_t rows, uint32_t width,
+        float epsilon);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_conv_bf16(
+        const void* device_input, const void* device_dynamic, const void* device_base, void* device_output,
+        uint32_t rows, uint32_t width, uint32_t group, uint32_t taps, uint32_t part);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_context_kv_bf16(
+        const void* device_kv, const void* device_key_norm, void* device_ring_keys, void* device_ring_values,
+        uint32_t rows, const void* device_position, uint32_t window, uint32_t key_value_heads, uint32_t head_dim,
+        float epsilon, float theta);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_block_qk_bf16(
+        const void* device_query, const void* device_kv, const void* device_query_norm, const void* device_key_norm,
+        void* device_query_out, void* device_key_out, uint32_t rows, const void* device_position, uint32_t heads,
+        uint32_t key_value_heads, uint32_t head_dim, float epsilon, float theta);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_attention_bf16(
+        const void* device_query, const void* device_block_keys, const void* device_kv, const void* device_ring_keys,
+        const void* device_ring_values, void* device_output, uint32_t rows, const void* device_position,
+        uint32_t window, uint32_t heads, uint32_t key_value_heads, uint32_t head_dim);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_swiglu_bf16(
+        const void* device_gate_up, void* device_output, uint32_t rows, uint32_t intermediate);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_topk_bf16(
+        const void* device_logits, uint32_t rows, uint32_t vocabulary, void* device_values, void* device_indices);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_dflash_select_bf16(
+        const void* device_hidden, const void* device_values, const void* device_indices,
+        const void* device_predecessor, const void* device_successor, const void* device_anchor, uint32_t positions,
+        uint32_t rank, void* device_tokens, void* device_scores);
+
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_synchronize(void);
 EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_stream_create(void);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_destroy(uint64_t stream);

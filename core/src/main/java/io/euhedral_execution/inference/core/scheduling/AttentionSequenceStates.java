@@ -15,6 +15,8 @@ public final class AttentionSequenceStates implements AutoCloseable {
     private long draftSeedRows;
     private int draftSeedCapacity;
     private long draftRecursionHidden;
+    /// The DFlash2 drafter's tap rows and context ring; allocated by the first quantum that needs them.
+    private DFlash2SequenceState dflash2;
     /// Split-KV decode scratch shared by every attention layer of the sequence: a quantum's attention
     /// layers run one after another (each needs the previous layer's output) and the sequence's quanta are
     /// serialized by its lease, so one area serves them all.
@@ -66,6 +68,18 @@ public final class AttentionSequenceStates implements AutoCloseable {
         return this.draftRecursionHidden;
     }
 
+    /// The sequence's DFlash2 state, allocated on first use.
+    public DFlash2SequenceState dflash2(io.euhedral_execution.inference.core.model_loader.config.DFlash2Config config) {
+        if (this.closed) throw new IllegalStateException("attention sequence states are closed");
+        if (this.dflash2 == null) this.dflash2 = new DFlash2SequenceState(this.gpu, config);
+        return this.dflash2;
+    }
+
+    /// The sequence's DFlash2 state, or null before its first DFlash2 quantum.
+    public DFlash2SequenceState dflash2() {
+        return this.dflash2;
+    }
+
     /// Split-KV scratch for `rows` decode rows: one one-row area (queryHeads x 64 splits x 258 floats) per
     /// row, as one-row decode (one area) and the row-exact attention twins of a verification (one per
     /// verified row) need. It grows when a verification first needs more rows.
@@ -103,6 +117,7 @@ public final class AttentionSequenceStates implements AutoCloseable {
         fingerprint.add(this.gpu, this.draftSeedRows).add(this.draftSeedCapacity);
         fingerprint.add(this.gpu, this.draftRecursionHidden);
         fingerprint.add(this.gpu, this.decodeScratch).add(this.decodeScratchRows);
+        if (this.dflash2 != null) this.dflash2.fingerprint(fingerprint);
     }
 
     /// Layer slots: the model's layers, plus the MTP layer's when the sequence has it.
@@ -143,6 +158,12 @@ public final class AttentionSequenceStates implements AutoCloseable {
             if (failure == null) failure = cleanupFailure;
             else failure.addSuppressed(cleanupFailure);
         }
+        try {
+            if (this.dflash2 != null) this.dflash2.close();
+        } catch (Throwable cleanupFailure) {
+            if (failure == null) failure = cleanupFailure;
+            else failure.addSuppressed(cleanupFailure);
+        }
         for (int index = this.states.length - 1; index >= 0; index--) {
             AttentionKvState state = this.states[index];
             if (state == null) continue;
@@ -154,7 +175,10 @@ public final class AttentionSequenceStates implements AutoCloseable {
                 else failure.addSuppressed(cleanupFailure);
             }
         }
-        this.closed = this.draftSeedRows == 0 && this.draftRecursionHidden == 0 && this.decodeScratch == 0;
+        this.closed = this.draftSeedRows == 0
+                && this.draftRecursionHidden == 0
+                && this.decodeScratch == 0
+                && (this.dflash2 == null || this.dflash2.released());
         for (AttentionKvState state : this.states) this.closed &= state == null;
         if (failure instanceof Error error) throw error;
         if (failure instanceof RuntimeException runtimeException) throw runtimeException;

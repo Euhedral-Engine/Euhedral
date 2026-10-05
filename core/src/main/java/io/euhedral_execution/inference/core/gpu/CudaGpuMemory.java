@@ -124,6 +124,15 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private volatile boolean exactNumerics;
     private final MethodHandle gdnProjectControlFp32;
     private final MethodHandle swiGluBf16;
+    private final MethodHandle dflashLinearBf16;
+    private final MethodHandle dflashRmsNormBf16;
+    private final MethodHandle dflashConvBf16;
+    private final MethodHandle dflashContextKvBf16;
+    private final MethodHandle dflashBlockQkBf16;
+    private final MethodHandle dflashAttentionBf16;
+    private final MethodHandle dflashSwiGluBf16;
+    private final MethodHandle dflashTopKBf16;
+    private final MethodHandle dflashSelectBf16;
     private final MethodHandle argmaxBf16;
     private final MethodHandle zeroDeviceMemory;
     private final MethodHandle attentionQkNormRopeBf16;
@@ -456,6 +465,48 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                             ValueLayout.JAVA_INT));
             this.residualAddBf16 = bind(linker, symbols, "euhedral_cuda_residual_add_bf16", RESIDUAL_ADD_BF16);
             this.swiGluBf16 = bind(linker, symbols, "euhedral_cuda_swiglu_bf16", SWIGLU_BF16);
+            ValueLayout.OfInt i32 = ValueLayout.JAVA_INT;
+            ValueLayout.OfFloat f32 = ValueLayout.JAVA_FLOAT;
+            java.lang.foreign.AddressLayout p = ValueLayout.ADDRESS;
+            this.dflashLinearBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_linear_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, i32, i32, i32));
+            this.dflashRmsNormBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_rms_norm_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, i32, i32, f32));
+            this.dflashConvBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_conv_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, p, i32, i32, i32, i32, i32));
+            this.dflashContextKvBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_context_kv_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, p, i32, p, i32, i32, i32, f32, f32));
+            this.dflashBlockQkBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_block_qk_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, p, i32, i32, i32, f32, f32));
+            this.dflashAttentionBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_attention_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, p, i32, i32, i32, i32));
+            this.dflashSwiGluBf16 = bind(
+                    linker, symbols, "euhedral_cuda_dflash_swiglu_bf16", FunctionDescriptor.of(i32, p, p, i32, i32));
+            this.dflashTopKBf16 = bind(
+                    linker, symbols, "euhedral_cuda_dflash_topk_bf16", FunctionDescriptor.of(i32, p, i32, i32, p, p));
+            this.dflashSelectBf16 = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_dflash_select_bf16",
+                    FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, i32, p, p));
             this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
             this.attentionQkNormRopeBf16 =
@@ -2431,6 +2482,185 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 MemorySegment.ofAddress(outputAddress),
                 rows,
                 intermediateSize);
+    }
+
+    private static MemorySegment at(long address) {
+        requireDeviceAddress(address);
+        return MemorySegment.ofAddress(address);
+    }
+
+    @Override
+    public void dflashLinearBf16(long input, long weights, long output, int rows, int inFeatures, int outFeatures) {
+        ensureOpen();
+        invokeLayer(
+                "DFlash2 BF16 linear",
+                dflashLinearBf16,
+                at(input),
+                at(weights),
+                at(output),
+                rows,
+                inFeatures,
+                outFeatures);
+    }
+
+    @Override
+    public void dflashRmsNormBf16(long input, long weight, long output, int rows, int width, float epsilon) {
+        ensureOpen();
+        invokeLayer("DFlash2 RMSNorm", dflashRmsNormBf16, at(input), at(weight), at(output), rows, width, epsilon);
+    }
+
+    @Override
+    public void dflashConvBf16(
+            long input, long dynamic, long base, long output, int rows, int width, int group, int taps, int part) {
+        ensureOpen();
+        invokeLayer(
+                "DFlash2 dynamic convolution",
+                dflashConvBf16,
+                at(input),
+                at(dynamic),
+                at(base),
+                at(output),
+                rows,
+                width,
+                group,
+                taps,
+                part);
+    }
+
+    @Override
+    public void dflashContextKvBf16(
+            long kv,
+            long keyNorm,
+            long ringKeys,
+            long ringValues,
+            int rows,
+            long position,
+            int window,
+            int keyValueHeads,
+            int headDim,
+            float epsilon,
+            float theta) {
+        ensureOpen();
+        invokeLayer(
+                "DFlash2 context keys",
+                dflashContextKvBf16,
+                at(kv),
+                at(keyNorm),
+                at(ringKeys),
+                at(ringValues),
+                rows,
+                at(position),
+                window,
+                keyValueHeads,
+                headDim,
+                epsilon,
+                theta);
+    }
+
+    @Override
+    public void dflashBlockQkBf16(
+            long query,
+            long kv,
+            long queryNorm,
+            long keyNorm,
+            long queryOut,
+            long keyOut,
+            int rows,
+            long position,
+            int heads,
+            int keyValueHeads,
+            int headDim,
+            float epsilon,
+            float theta) {
+        ensureOpen();
+        invokeLayer(
+                "DFlash2 block queries and keys",
+                dflashBlockQkBf16,
+                at(query),
+                at(kv),
+                at(queryNorm),
+                at(keyNorm),
+                at(queryOut),
+                at(keyOut),
+                rows,
+                at(position),
+                heads,
+                keyValueHeads,
+                headDim,
+                epsilon,
+                theta);
+    }
+
+    @Override
+    public void dflashAttentionBf16(
+            long query,
+            long blockKeys,
+            long kv,
+            long ringKeys,
+            long ringValues,
+            long output,
+            int rows,
+            long position,
+            int window,
+            int heads,
+            int keyValueHeads,
+            int headDim) {
+        ensureOpen();
+        invokeLayer(
+                "DFlash2 attention",
+                dflashAttentionBf16,
+                at(query),
+                at(blockKeys),
+                at(kv),
+                at(ringKeys),
+                at(ringValues),
+                at(output),
+                rows,
+                at(position),
+                window,
+                heads,
+                keyValueHeads,
+                headDim);
+    }
+
+    @Override
+    public void dflashSwiGluBf16(long gateUp, long output, int rows, int intermediate) {
+        ensureOpen();
+        invokeLayer("DFlash2 SwiGLU", dflashSwiGluBf16, at(gateUp), at(output), rows, intermediate);
+    }
+
+    @Override
+    public void dflashTopKBf16(long logits, int rows, int vocabulary, long values, long indices) {
+        ensureOpen();
+        invokeLayer("DFlash2 top-k", dflashTopKBf16, at(logits), rows, vocabulary, at(values), at(indices));
+    }
+
+    @Override
+    public void dflashSelectBf16(
+            long hidden,
+            long values,
+            long indices,
+            long predecessor,
+            long successor,
+            long anchor,
+            int positions,
+            int rank,
+            long tokens,
+            long scores) {
+        ensureOpen();
+        invokeLayer(
+                "DFlash2 selector",
+                dflashSelectBf16,
+                at(hidden),
+                at(values),
+                at(indices),
+                at(predecessor),
+                at(successor),
+                at(anchor),
+                positions,
+                rank,
+                at(tokens),
+                at(scores));
     }
 
     @Override

@@ -42,6 +42,17 @@ public abstract class QwenStageFrame extends StageFrame {
                     ATTENTION_KV_APPEND,
                     ATTENTION_CAUSAL,
                     MTP_STEM -> new QwenGpuOperationFrame(graph, instruction, gpu);
+            case DFLASH_TAP,
+                    DFLASH_LINEAR,
+                    DFLASH_RMS_NORM,
+                    DFLASH_CONV,
+                    DFLASH_CONTEXT_KV,
+                    DFLASH_BLOCK_QK,
+                    DFLASH_ATTENTION,
+                    DFLASH_SWIGLU,
+                    DFLASH_LM_HEAD,
+                    DFLASH_TOPK,
+                    DFLASH_SELECT -> new DFlash2Frame(graph, instruction, gpu);
         };
     }
 

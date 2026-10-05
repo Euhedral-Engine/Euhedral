@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
 import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
 import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.scheduling.DFlash2Decoder;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.scheduling.PrefixCache;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
@@ -249,6 +250,9 @@ public final class InferenceEngine implements AutoCloseable {
                 this::releaseSession);
         if (this.profile != null && this.profile.speculation() == ArtifactProfile.Speculation.MTP && this.plan.drafts())
             session.enableSpeculativeDecoding(this.profile.speculativeDepth());
+        if (this.profile != null
+                && this.profile.speculation() == ArtifactProfile.Speculation.DFLASH2
+                && this.plan.draftsWithDFlash2()) session.useSpeculativeDecoding(DFlash2Decoder.factory());
         if (this.prefixCache != null) session.usePrefixCache(this.prefixCache);
         this.sessions.add(session);
         return session;
