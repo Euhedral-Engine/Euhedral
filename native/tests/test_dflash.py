@@ -58,8 +58,10 @@ class DFlash2KernelTest(unittest.TestCase):
         rows, k = x.shape
         n = w.shape[0]
         px, pw, py = self.put(x), self.put(w), self.gpu.zeros(2 * rows * n)
-        name = 'euhedral_dflash_linear_bf16' if rows <= 16 else 'euhedral_dflash_linear_rows_bf16'
-        tiles = (n // 32, 1) if rows <= 16 else (n // 32, (rows + 63) // 64)
+        split = n <= 1536
+        name = ('euhedral_dflash_linear' if rows <= 16 else 'euhedral_dflash_linear_rows') + ('_split' if split else '') + '_bf16'
+        columns = n // 8 if split else n // 32
+        tiles = (columns, 1) if rows <= 16 else (columns, (rows + 63) // 64)
         self.gpu.launch(name, tiles, [C.c_uint64(px), C.c_uint64(pw), C.c_uint64(py), C.c_uint(rows), C.c_uint(k),
                                       C.c_uint(n)], block=128)
         out = self.get_bf16(py, (rows, n))
@@ -77,6 +79,13 @@ class DFlash2KernelTest(unittest.TestCase):
         self.assertGreater(np.mean(full == bf16(exact.astype(np.float32))), 0.97)
         for rows in (1, 3, 8, 16, 17, 64, 65):
             np.testing.assert_array_equal(self.linear(x[:rows], w), full[:rows], err_msg=f"{rows} rows")
+        # Wider than the split limit: K unsplit, rows still independent of the row count.
+        w = self.random_bf16(2080, k, scale=0.05)
+        full = self.linear(x, w)
+        exact = x.astype(np.float64) @ w.astype(np.float64).T
+        self.assertLess(np.abs(full - exact).max() / np.abs(exact).max(), 0.01)
+        for rows in (1, 8, 17, 64):
+            np.testing.assert_array_equal(self.linear(x[:rows], w), full[:rows], err_msg=f"{rows} rows, unsplit")
 
     def test_rms_norm_rounds_the_normalized_row_then_the_weighted_row(self):
         rows, width = 5, 5120

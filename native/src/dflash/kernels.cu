@@ -44,12 +44,15 @@ __device__ __forceinline__ uint4 load_row(const __nv_bfloat16* row, uint32_t k, 
 
 // y[m][n] = sum_k x[m][k] w[n][k]: BF16 operands on m16n8k16 tensor cores, FP32 accumulation, one BF16 rounding.
 //
-// A warp owns 8 output columns over the whole K; a CTA's four warps own 32. Per 32-wide K chunk a lane loads 16
-// contiguous bytes of its column's weight row (k = 8q .. 8q + 7 for q = lane % 4) and the matching 16 bytes of its
-// activation rows, and feeds them to two MMAs as logical k {2q, 2q+1, 2q+8, 2q+9} -> 8q + 4s + {0, 1, 2, 3}: the
-// same permutation of K on both operands, so the product is the plain sum. Each output's accumulation sequence is
-// fixed by K alone; `MT` (row tiles of 16 per CTA, which reuse each weight load) never changes a row's bits.
-template <int MT, int UNROLL>
+// A CTA's four warps own 32 output columns, 8 each, over the whole K (KS = 1), or (KS = 4, for outputs up to 1536
+// wide, so a draft block's narrow projections keep enough loads in flight) 8 columns, splitting K into four
+// contiguous quarters of whole 32-wide chunks whose sums add in warp order. The split is a function of the shape
+// (host dispatch). Per 32-wide K chunk a lane loads 16 contiguous bytes of its column's weight row (k = 8q .. 8q + 7
+// for q = lane % 4) and the matching 16 bytes of its activation rows, and feeds them to two MMAs as logical k
+// {2q, 2q+1, 2q+8, 2q+9} -> 8q + 4s + {0, 1, 2, 3}: the same permutation of K on both operands, so the product is the
+// plain sum. Each output's accumulation sequence is fixed by its shape alone; `MT` (row tiles of 16 per CTA, which
+// reuse each weight load) never changes a row's bits.
+template <int MT, int UNROLL, int KS>
 __device__ __forceinline__ void linear(
         const __nv_bfloat16* __restrict__ x,
         const __nv_bfloat16* __restrict__ w,
@@ -59,9 +62,10 @@ __device__ __forceinline__ void linear(
         uint32_t n) {
     const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const uint32_t g = lane / 4, q = lane % 4;
-    const uint32_t column0 = blockIdx.x * 32 + warp * 8;
-    if (column0 >= n) return;
+    const uint32_t part = KS == 1 ? 0 : warp;
+    const uint32_t column0 = KS == 1 ? blockIdx.x * 32 + warp * 8 : blockIdx.x * 8;
     const uint32_t rowBase = blockIdx.y * 16 * MT;
+    const uint32_t begin = KS == 1 ? 0 : k / 32 * part / KS * 32, end = KS == 1 ? k : k / 32 * (part + 1) / KS * 32;
     const __nv_bfloat16* weightRow = w + static_cast<uint64_t>(column0 + g) * k;
     const __nv_bfloat16* rowPointer[MT][2];
     bool rowValid[MT][2];
@@ -77,8 +81,8 @@ __device__ __forceinline__ void linear(
     float acc[MT][4];
 #pragma unroll
     for (int t = 0; t < MT; t++) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
-    uint32_t chunk = 0;
-    for (; chunk + 32 * UNROLL <= k; chunk += 32 * UNROLL) {
+    uint32_t chunk = begin;
+    for (; chunk + 32 * UNROLL <= end; chunk += 32 * UNROLL) {
         uint4 b[UNROLL];
         uint4 a[UNROLL][MT][2];
 #pragma unroll
@@ -101,7 +105,7 @@ __device__ __forceinline__ void linear(
             }
         }
     }
-    for (; chunk < k; chunk += 32) {
+    for (; chunk < end; chunk += 32) {
         const uint32_t at = chunk + q * 8;
         const uint4 b = __ldg(reinterpret_cast<const uint4*>(weightRow + at));
 #pragma unroll
@@ -113,6 +117,24 @@ __device__ __forceinline__ void linear(
             const uint32_t step1[4] = {a0.z, a1.z, a0.w, a1.w};
             mma_bf16(acc[t], step1, b.z, b.w);
         }
+    }
+    if (KS > 1) {
+        __shared__ float partial[KS][MT][32][4];
+#pragma unroll
+        for (int t = 0; t < MT; t++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) partial[part][t][lane][i] = acc[t][i];
+        __syncthreads();
+        if (warp != 0) return;
+#pragma unroll
+        for (int t = 0; t < MT; t++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float sum = partial[0][t][lane][i];
+#pragma unroll
+                for (int v = 1; v < KS; v++) sum += partial[v][t][lane][i];
+                acc[t][i] = sum;
+            }
     }
 #pragma unroll
     for (int t = 0; t < MT; t++) {
@@ -180,17 +202,28 @@ __device__ __forceinline__ float apply_rope(
 
 using namespace dflash;
 
+// Up to 16 rows (a draft block, a verification's context rows); _split: K in four parts (outputs up to 1536 wide).
 extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_linear_bf16(
         const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y, uint32_t rows, uint32_t k, uint32_t n) {
     euhedral_pdl_begin();
-    linear<1, 4>(x, w, y, rows, k, n);
+    linear<1, 4, 1>(x, w, y, rows, k, n);
+}
+extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_linear_split_bf16(
+        const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y, uint32_t rows, uint32_t k, uint32_t n) {
+    euhedral_pdl_begin();
+    linear<1, 4, 4>(x, w, y, rows, k, n);
 }
 
-// The same arithmetic per row as euhedral_dflash_linear_bf16, four row tiles per weight load (prefill contexts).
+// The same arithmetic per row as the kernels above, four row tiles per weight load (prefill contexts).
 extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_linear_rows_bf16(
         const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y, uint32_t rows, uint32_t k, uint32_t n) {
     euhedral_pdl_begin();
-    linear<4, 2>(x, w, y, rows, k, n);
+    linear<4, 2, 1>(x, w, y, rows, k, n);
+}
+extern "C" __global__ __launch_bounds__(128) void euhedral_dflash_linear_rows_split_bf16(
+        const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y, uint32_t rows, uint32_t k, uint32_t n) {
+    euhedral_pdl_begin();
+    linear<4, 2, 4>(x, w, y, rows, k, n);
 }
 
 // Qwen3RMSNorm (plain weight): y = bf16(weight * bf16(x * rsqrt(mean(x^2) + eps))). One 256-thread CTA per row.
