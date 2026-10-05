@@ -52,7 +52,92 @@ public final class Qwen4TestArtifact {
                         1, 32, 64, 2, 3, 4, 2, 2, hidden, 16, "gelu_pytorch_tanh", new int[0], 9, 10, 11, 12));
     }
 
+    /// The real model's topology (config.json of Qwen3.8-Flash-Next), for planning against real object sizes.
+    public static Qwen4Config realConfig() {
+        Qwen4LayerType[] types = new Qwen4LayerType[48];
+        for (int i = 0; i < types.length; i++)
+            types[i] = i % 4 == 3 ? Qwen4LayerType.SPARSE_ATTENTION : Qwen4LayerType.GATED_DELTA_NET;
+        return new Qwen4Config(
+                new Qwen4Config.Text(248320, 2560, 48, 262144, 1e-6, "silu", false, 248044, 248044, types),
+                new Qwen4Config.Attention(24, 2, 256, 0.25, 1e7, new int[] {11, 11, 10}, true, "sigmoid", 4),
+                new Qwen4Config.Gdn(16, 48, 128, 128, 4, "float32"),
+                new Qwen4Config.Qsa(2048, 4, 128, 1, 4),
+                new Qwen4Config.Moe(512, 10, 640, 640),
+                new Qwen4Config.HyperConnection(4, 320),
+                new Qwen4Config.Ngram(
+                        3,
+                        20_000_000,
+                        8,
+                        128,
+                        128,
+                        2_500_012,
+                        new long[] {23703573157769L, 20109073645365L, 8052911324071L},
+                        new long[] {
+                            0, 20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297, 160000374,
+                            180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275
+                        },
+                        new long[] {
+                            20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077, 20000081,
+                            20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171
+                        }),
+                new Qwen4Config.Ple(new int[] {1}, 2560, 4),
+                new Qwen4Config.Mtp(1, true, new Qwen4LayerType[] {Qwen4LayerType.SPARSE_ATTENTION}, 1e7, false, -1),
+                new Qwen4Config.Vision(
+                        27,
+                        1152,
+                        4304,
+                        16,
+                        3,
+                        16,
+                        2,
+                        2,
+                        2560,
+                        2304,
+                        "gelu_pytorch_tanh",
+                        new int[0],
+                        248056,
+                        248057,
+                        248053,
+                        248054));
+    }
+
+    /// An artifact's tables for `config` with the real converter's object geometry, and no file: for planning and
+    /// cache tests at the real model's sizes.
+    public static Qwen4Artifact virtual(Qwen4Config config) {
+        Layout layout = layout(config);
+        return new Qwen4Artifact(
+                new Qwen4Header(
+                        Qwen4Header.MAGIC,
+                        Qwen4Header.VERSION,
+                        Qwen4Header.ARCHITECTURE_QWEN4_EXP,
+                        64,
+                        0,
+                        64,
+                        0,
+                        4096L * 256,
+                        layout.fileSize),
+                config,
+                layout.tensors,
+                layout.banks);
+    }
+
+    private record Layout(Qwen4Tensor[] tensors, ExpertBank[] banks, long fileSize) {}
+
     public static Qwen4Artifact write(Path path, Qwen4Config config, long seed) throws IOException {
+        Layout layout = layout(config);
+        return Qwen4ArtifactWriter.write(
+                path,
+                config,
+                layout.tensors,
+                layout.banks,
+                4096L * 256,
+                Math.max(layout.fileSize, 4096L * 256 + 4096),
+                tensor -> payload(
+                        seed, tensor.name(), tensor.shape(), tensor.format(), tensor.layout(), (int) tensor.byteSize()),
+                (bank, expert) -> record(seed, bank, expert));
+    }
+
+    private static Layout layout(Qwen4Config config) {
         Qwen4Inventory.Inventory inventory = Qwen4Inventory.expected(config);
         List<Qwen4Tensor> tensors = new ArrayList<>();
         List<ExpertBank> banks = new ArrayList<>();
@@ -103,17 +188,7 @@ public final class Qwen4TestArtifact {
             banks.add(new ExpertBank(
                     want.name(), want.group(), want.layer(), projections, offsets, sizes, new int[offsets.length]));
         }
-        long fileSize = alignUp(cursor, 4096);
-        return Qwen4ArtifactWriter.write(
-                path,
-                config,
-                tensors.toArray(Qwen4Tensor[]::new),
-                banks.toArray(ExpertBank[]::new),
-                4096L * 256,
-                Math.max(fileSize, 4096L * 256 + 4096),
-                tensor -> payload(
-                        seed, tensor.name(), tensor.shape(), tensor.format(), tensor.layout(), (int) tensor.byteSize()),
-                (bank, expert) -> record(seed, bank, expert));
+        return new Layout(tensors.toArray(Qwen4Tensor[]::new), banks.toArray(ExpertBank[]::new), alignUp(cursor, 4096));
     }
 
     private static long size(Qwen4Inventory.Expected want) {
