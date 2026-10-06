@@ -40,20 +40,25 @@ public final class Qwen4Model implements AutoCloseable {
     /// such reads in flight keep the disk at its sequential rate.
     static final int PRELOAD_READERS = 4;
 
-    /// How the host tier chooses its victims: `EUHEDRAL_QWEN4_TIER_POLICY` (`partitioned` or `frequency`).
-    static final ReplacementPolicy TIER_POLICY = "frequency".equals(System.getenv("EUHEDRAL_QWEN4_TIER_POLICY"))
-            ? ReplacementPolicy.FREQUENCY
-            : ReplacementPolicy.BANK_PARTITIONED;
+    /// How the host tier chooses its victims: by frequency, admitting a prefill's records only in place of records
+    /// requested less often (docs/FLASH_NEXT_CACHE.md); `EUHEDRAL_QWEN4_TIER_POLICY=partitioned` replaces by
+    /// recency in per-layer quotas, for benchmarks.
+    static final ReplacementPolicy TIER_POLICY = "partitioned".equals(System.getenv("EUHEDRAL_QWEN4_TIER_POLICY"))
+            ? ReplacementPolicy.BANK_PARTITIONED
+            : ReplacementPolicy.FREQUENCY;
 
     /// Whether a bounded tier is filled with each layer's share of records at startup;
     /// `EUHEDRAL_QWEN4_TIER_PRELOAD=0` leaves it empty until loads fill it, for benchmarks.
     static final boolean TIER_PRELOAD = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_PRELOAD"));
 
-    /// How the device cache shares its slots among the layers. `EUHEDRAL_QWEN4_GPU_POLICY`
-    /// (`global` or `partitioned`) overrides it for benchmarks.
-    static final ReplacementPolicy DEVICE_POLICY = "partitioned".equals(System.getenv("EUHEDRAL_QWEN4_GPU_POLICY"))
-            ? ReplacementPolicy.BANK_PARTITIONED
-            : ReplacementPolicy.GLOBAL_LRU;
+    /// How the device cache replaces its records. `EUHEDRAL_QWEN4_GPU_POLICY` (`global`, `partitioned` or `s3fifo`)
+    /// overrides it for benchmarks.
+    static final ReplacementPolicy DEVICE_POLICY =
+            switch (System.getenv().getOrDefault("EUHEDRAL_QWEN4_GPU_POLICY", "")) {
+                case "partitioned" -> ReplacementPolicy.BANK_PARTITIONED;
+                case "s3fifo" -> ReplacementPolicy.S3_FIFO;
+                default -> ReplacementPolicy.GLOBAL_LRU;
+            };
 
     /// Parts one record's artifact read is split into, read side by side as frames of the lattice. One: the disk
     /// reads a whole record (2.7 MiB) at its full rate, and a quarter record at three quarters of it.
