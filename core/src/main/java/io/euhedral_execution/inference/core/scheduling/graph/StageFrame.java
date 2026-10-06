@@ -78,6 +78,16 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         if (!ordered) randomizeHash(graph.nextRoutingSeed());
     }
 
+    /// A stage routed to the owner of some state: it keeps `ownerHash` as its routing hash, so the lattice
+    /// runs it in order with every other frame of that hash, one at a time, and the state it touches needs no
+    /// other protection.
+    protected StageFrame(StageGraph graph, int stage, long ownerHash) {
+        super(ownerHash);
+        this.graph = graph;
+        this.stage = stage;
+        this.inDegree = graph.topology().inDegree(stage);
+    }
+
     /// Submits this stage's device work. The quantum's stream is selected on the calling thread.
     protected abstract void submit();
 
@@ -134,6 +144,11 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     /// The lane stream this stage submits to, selected while [#submit()] runs.
     protected final GpuStream laneStream() {
         return this.graph.pool().lane(this.lane);
+    }
+
+    /// The index of the lane this stage submits to, selected while [#submit()] runs.
+    protected final int laneIndex() {
+        return this.lane;
     }
 
     public final int stage() {
@@ -227,11 +242,12 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     }
 
     /// The lane this stage continues, or -1: its path predecessor's, or the graph's home lane for a
-    /// root.
+    /// root. A host predecessor submitted to no lane, so there is nothing to continue: the stage is
+    /// placed like any other branch.
     private int continuedLane(LanePool pool, StageGraph owner) {
         if (pool.size() == 1) return -1;
         if (this.submittedPredecessors.length == 0) return owner.home();
-        return this.pathPredecessor == null ? -1 : this.pathPredecessor.lane;
+        return this.pathPredecessor == null || this.pathPredecessor.host() ? -1 : this.pathPredecessor.lane;
     }
 
     final void reset() {

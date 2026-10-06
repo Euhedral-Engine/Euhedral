@@ -72,19 +72,6 @@ public final class Qwen4ResidencyPlanner {
                 Math.min(32, config.moe().numExperts()), 2 * config.moe().expertsPerToken());
     }
 
-    /// Experts of one wave at most: a wave's experts are pinned until its kernels are submitted and
-    /// the next wave's claim slots at the same time, so a shard must hold two waves.
-    public static int expertWave(int slotsOfAShard) {
-        return Math.max(1, Math.min(32, slotsOfAShard / 2));
-    }
-
-    /// Shards (independent partitions of the expert cache, each its own lattice source) for a cache
-    /// of `slots`: as many as can each hold two full waves, at most 8.
-    public static int expertShards(int slots) {
-        int wave = expertWave(slots);
-        return Math.max(1, Math.min(8, slots / (2 * wave)));
-    }
-
     public static Qwen4ResidencyPlan plan(
             Qwen4Artifact artifact, Qwen4Mode mode, long freeBytes, HostBudget host, int maxContextTokens) {
         Qwen4Config config = artifact.config();
@@ -312,7 +299,8 @@ public final class Qwen4ResidencyPlanner {
                 geometry,
                 expertStore,
                 ngram,
-                chunk);
+                chunk,
+                host);
     }
 
     private static Qwen4ResidencyPlan.Placement deferred() {

@@ -5,7 +5,6 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.NgramStore;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4LayerType;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
-import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
@@ -59,15 +58,13 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     }
 
     /// What a layer's MoE block asked of the expert cache, for the real routing of real inference:
-    /// the distinct experts its tokens named, the waves it ran in and the cache's counters before
-    /// and after it.
+    /// the distinct experts its tokens named and the cache's counters before and after it.
     @FunctionalInterface
     public interface ExpertTrace {
         void layer(
                 int layer,
                 int rows,
                 int uniqueExperts,
-                int waves,
                 ExpertCacheStats.Snapshot before,
                 ExpertCacheStats.Snapshot after);
     }
@@ -120,9 +117,8 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     private final int streams;
     private final int vocabulary;
     private final int maxTokens;
-    private final int maxWaveExperts;
-    /// One serial source per shard of the expert cache, each attached to the lattice on its own.
-    private final ExpertSource[] expertSources;
+    /// The owner of the expert cache's bookkeeping, which the frames routed to it change.
+    private final ExpertCacheOwner expertOwner;
     private final boolean[] sparse;
     private final int[] bankOrdinals;
     private final Qwen4Weight embedding;
@@ -200,18 +196,9 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         this.bankOrdinals = new int[layers];
         for (int l = 0; l < layers; l++) this.bankOrdinals[l] = model.bankOrdinal("text/layers/" + l + "/moe/experts");
         this.geometry = Qwen4ExpertOps.Geometry.of(model.expertBanks()[0]);
-        // A wave's experts are pinned until its kernels are submitted, and the next wave's claim slots meanwhile: a
-        // shard
-        // holds two waves, so a wave of any spread over the shards fits. A request past a bound fails; nothing queues
-        // to
-        // hide it.
-        ExpertCache cache = model.expertCache();
-        this.maxWaveExperts = Qwen4ResidencyPlanner.expertWave(cache.slotCount() / cache.shardCount());
-        this.expertSources = new ExpertSource[cache.shardCount()];
-        for (int shard = 0; shard < this.expertSources.length; shard++) {
-            this.expertSources[shard] = new ExpertSource(cache, shard);
-            runtime.lake().attach(this.expertSources[shard]);
-        }
+        this.expertOwner = new ExpertCacheOwner(model.expertCache(), runtime.lake());
+        // The artifact's reads complete as frames: the workers poll their sink like every other.
+        if (model.asyncReads() != null) runtime.lake().attach(model.asyncReads().getDelegate());
         this.embedding = this.weights.embedding();
         this.head = this.weights.head();
         // The workspaces are allocated now, not by the first step: a model that cannot hold them fails to load, and the
@@ -326,8 +313,8 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     }
 
     /// The row capacity of the shape that serves `rows` rows: a decode token, a short chunk, a full
-    /// chunk. The capacity sizes the shape's workspace and the most waves its MoE blocks can have,
-    /// so a decode graph is small and has no wave stage that a token could not use.
+    /// chunk. The capacity sizes the shape's workspace and the most experts its MoE blocks can name,
+    /// so a decode graph is small and has no expert stage that a token could not use.
     int rowBucket(int rows) {
         if (rows <= 1) return 1;
         if (rows <= 16) return 16;
@@ -347,39 +334,38 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     Qwen4MoeLayer newMoeLayer(int rows) {
         return new Qwen4MoeLayer(
                 this.gpu,
-                this.model.expertCache(),
                 this.geometry,
                 this.config.moe().numExperts(),
                 this.config.moe().expertsPerToken(),
                 this.config.moe().sharedExpertIntermediateSize(),
                 rows,
-                this.maxWaveExperts,
                 this.metrics);
     }
 
-    /// The most waves a block of a shape of `rows` rows can have.
-    int maxWaves(int rows) {
-        return Qwen4MoeLayer.maxWaves(
-                this.config.moe().numExperts(),
-                Math.multiplyExact(rows, this.config.moe().expertsPerToken()),
-                this.maxWaveExperts);
+    /// The most experts a block of a shape of `rows` rows can name: the fetch and expert stages of a layer.
+    int maxExperts(int rows) {
+        return Qwen4MoeLayer.maxExperts(
+                this.config.moe().numExperts(), rows, this.config.moe().expertsPerToken());
     }
 
-    /// The loads' timings, summed over the shards' sources.
-    public ExpertSource.Timings expertTimings() {
-        ExpertSource.Timings total = new ExpertSource.Timings(0, 0, 0, 0, 0, 0);
-        for (ExpertSource source : this.expertSources) total = total.plus(source.timings());
-        return total;
+    /// The loads' timings.
+    public ExpertCacheOwner.Timings expertTimings() {
+        return this.expertOwner.timings();
     }
 
-    /// The sources that own the expert cache's shards.
-    ExpertSource[] expertSources() {
-        return this.expertSources;
+    /// Fetches that found every slot pinned and tried again.
+    public long expertFullFetches() {
+        return this.expertOwner.fullFetches();
     }
 
-    /// Experts per wave at most.
-    int maxWaveExperts() {
-        return this.maxWaveExperts;
+    /// Expert loads fetched whose copies have not retired yet. Any thread.
+    public int expertLoadsInFlight() {
+        return this.expertOwner.loadsInFlight();
+    }
+
+    /// The owner of the expert cache's bookkeeping.
+    ExpertCacheOwner expertOwner() {
+        return this.expertOwner;
     }
 
     int layers() {
@@ -504,14 +490,9 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     }
 
     void reportTrace(
-            int layer,
-            int rows,
-            int uniqueExperts,
-            int waves,
-            ExpertCacheStats.Snapshot before,
-            ExpertCacheStats.Snapshot after) {
+            int layer, int rows, int uniqueExperts, ExpertCacheStats.Snapshot before, ExpertCacheStats.Snapshot after) {
         ExpertTrace current = this.trace;
-        if (current != null) current.layer(layer, rows, uniqueExperts, waves, before, after);
+        if (current != null) current.layer(layer, rows, uniqueExperts, before, after);
     }
 
     boolean hasObserver() {
@@ -554,6 +535,5 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     public void close() {
         this.closed = true;
         closeWorkspaces();
-        for (ExpertSource source : this.expertSources) source.complete();
     }
 }

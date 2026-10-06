@@ -7,15 +7,13 @@ import org.slf4j.LoggerFactory;
 
 /// The device cache of routed experts: one slab of `slotCount * slotBytes` bytes, allocated once
 /// through [GpuMemory#allocate], split into shards, each an [ExpertCacheShard] with its own
-/// directory, its own slots and its own copy lanes. An expert belongs to the shard its key hashes
-/// to, so the experts of one layer spread over every shard.
+/// directory and its own slots. An expert belongs to the shard its key hashes to, so the experts of
+/// one layer spread over every shard.
 ///
-/// The shards are independent. Each has one owner, a serial lattice source, and the owners are
-/// attached to the lattice on their own: the whole path through the cache (claim, read, copy,
-/// lease, release) runs side by side on as many shards as there are, with no state shared between
-/// them but the read-only configuration. This class holds what the shards share: the slab, the
-/// markers, the host store and the transfer, and the shard routing. It has no lock and does not
-/// wait for anything.
+/// The shards are independent. Each has one owner that confines its bookkeeping, with no state
+/// shared between them but the read-only configuration. This class holds what the shards share: the
+/// slab, the markers, the host store and the transfer, and the shard routing. The staging buffers
+/// and the copy streams belong to no shard. It has no lock and does not wait for anything.
 ///
 /// ## Closing
 ///
@@ -38,20 +36,16 @@ public final class ExpertCache implements AutoCloseable {
     private final long slotBytes;
     private final long[] markers;
     private final ExpertCacheShard[] shards;
-    private final int[] laneBase;
-    private final int[] laneCount;
     private final ExpertCacheStats stats;
     private boolean closed;
 
     /// A cache of `slotCount` slots of `slotBytes` bytes in `shards` shards over `store`, whose
     /// records `transfer` moves into a slab allocated from `memory`. The cache owns `store` and
     /// `transfer` once this constructor returns, and closes them; if it throws, the caller still
-    /// owns them. The copy lanes (the transfer's, at most the store's) are shared out to the
-    /// shards.
+    /// owns them.
     ///
     /// @throws IllegalArgumentException when `slotBytes` is smaller than the largest record of any
-    ///     bank or is not a ///     multiple of [#SLOT_ALIGNMENT], or the shards cannot each have a
-    ///     slot and a copy lane
+    ///     bank or is not a multiple of [#SLOT_ALIGNMENT], or the shards cannot each have a slot
     public ExpertCache(
             HostExpertStore store,
             ExpertTransfer transfer,
@@ -83,10 +77,8 @@ public final class ExpertCache implements AutoCloseable {
                     "slotBytes " + slotBytes + " is smaller than the largest record " + largest);
         if (slotBytes % SLOT_ALIGNMENT != 0)
             throw new IllegalArgumentException("slotBytes " + slotBytes + " is not a multiple of " + SLOT_ALIGNMENT);
-        int lanes = Math.min(store.lanes(), transfer.lanes());
-        if (shards < 1 || shards > slotCount || shards > lanes)
-            throw new IllegalArgumentException(
-                    shards + " shards need a slot and a copy lane each: " + slotCount + " slots, " + lanes + " lanes");
+        if (shards < 1 || shards > slotCount)
+            throw new IllegalArgumentException(shards + " shards need a slot each: " + slotCount + " slots");
         long capacity = Math.multiplyExact(slotBytes, (long) slotCount);
         this.slotCount = slotCount;
         this.slotBytes = slotBytes;
@@ -94,16 +86,12 @@ public final class ExpertCache implements AutoCloseable {
         if (this.deviceBase == 0) throw new IllegalStateException("the device slab allocation returned a null address");
         this.markers = new long[slotCount];
         this.shards = new ExpertCacheShard[shards];
-        this.laneBase = new int[shards];
-        this.laneCount = new int[shards];
         ExpertCacheStats[] parts = new ExpertCacheStats[shards];
         try {
             for (int slot = 0; slot < slotCount; slot++) this.markers[slot] = transfer.openMarker();
             int firstSlot = 0;
-            int firstLane = 0;
             for (int shard = 0; shard < shards; shard++) {
                 int slots = slotCount / shards + (shard < slotCount % shards ? 1 : 0);
-                int shardLanes = lanes / shards + (shard < lanes % shards ? 1 : 0);
                 parts[shard] = new ExpertCacheStats(slots, slotBytes);
                 this.shards[shard] = new ExpertCacheShard(
                         shard,
@@ -115,10 +103,7 @@ public final class ExpertCache implements AutoCloseable {
                         parts[shard],
                         policy,
                         shards);
-                this.laneBase[shard] = firstLane;
-                this.laneCount[shard] = shardLanes;
                 firstSlot += slots;
-                firstLane += shardLanes;
             }
         } catch (RuntimeException | Error failure) {
             closeMarkers();
@@ -146,15 +131,6 @@ public final class ExpertCache implements AutoCloseable {
     /// The shard whose slots can hold the expert: the same for every request for it.
     public int shardOf(int bank, int expert) {
         return ExpertKeys.shardOf(this.keys.key(bank, expert), this.shards.length);
-    }
-
-    /// The first copy lane of `shard`; it owns [#laneCount] lanes from there.
-    public int laneBase(int shard) {
-        return this.laneBase[shard];
-    }
-
-    public int laneCount(int shard) {
-        return this.laneCount[shard];
     }
 
     public HostExpertStore store() {

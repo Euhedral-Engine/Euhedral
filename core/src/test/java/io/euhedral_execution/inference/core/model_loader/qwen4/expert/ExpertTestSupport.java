@@ -33,8 +33,8 @@ public final class ExpertTestSupport {
         return new FileExpertStore(memory, source, tier, banks, lanes);
     }
 
-    /// A lease on the expert, loading it (read, copy on the shard's first lane, wait for the copy)
-    /// when it is not resident.
+    /// A lease on the expert, loading it (read into staging buffer 0, copy on stream 0, wait for the
+    /// copy) when it is not resident.
     public static ExpertLease acquire(ExpertCache cache, int bank, int expert) {
         int shardIndex = cache.shardOf(bank, expert);
         ExpertCacheShard shard = cache.shard(shardIndex);
@@ -44,24 +44,25 @@ public final class ExpertTestSupport {
             throw new IllegalStateException("every expert slot of shard " + shardIndex + " is in use");
         if (ticket.lease() != null) return ticket.lease();
         ExpertCacheShard.Load load = ticket.load();
-        int lane = cache.laneBase(shardIndex);
+        int buffer = 0;
+        int stream = 0;
         HostRecord record = null;
         RamTierShard tier = cache.store().tier(shardIndex);
         TierDirective directive = new TierDirective();
         if (tier != null) tier.plan(bank, expert, directive);
         try {
-            record = cache.store().open(bank, expert, lane, directive);
+            record = cache.store().open(bank, expert, buffer, directive);
             settle(tier, directive, true);
             CompletableFuture<Long> retired = new CompletableFuture<>();
             cache.transfer().stream(
-                    lane,
+                    stream,
                     record,
                     load.deviceAddress(),
                     load.fence(),
                     load.readyMarker(),
                     (ticketId, driverThread) -> retired.complete(ticketId));
             ExpertLease lease = load.submitted();
-            Throwable failure = cache.transfer().confirm(lane, retired.get(20, TimeUnit.SECONDS));
+            Throwable failure = cache.transfer().confirm(stream, retired.get(20, TimeUnit.SECONDS));
             load.retired(failure);
             if (failure != null) throw new ExpertTransferException("expert " + expert + " failed to load", failure);
             return lease;

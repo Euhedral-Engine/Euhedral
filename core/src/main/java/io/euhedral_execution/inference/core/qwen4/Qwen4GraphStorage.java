@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats;
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.scheduling.graph.GraphStorage;
 import java.util.ArrayList;
 import java.util.List;
@@ -67,40 +66,16 @@ final class Qwen4GraphStorage {
     // The block in flight, written by one stage and read by the stages that follow it across an edge.
     Qwen4MoeLayer.Scratch moeBlock;
     int bank;
-    int waves;
+    int experts;
     long routeArmedNanos;
+    long plannedNanos;
     ExpertCacheStats.Snapshot traceBefore;
-    final long[] loadBegin;
-    /// What the load stage of a wave offers the experts that arrive for it.
-    interface Arrivals {
-        void expect(int count);
-
-        void arrived();
-    }
-
-    final Arrivals[] arrivals;
-
-    /// The stage that ends when every source finished its share of the block.
-    interface Drain {
-        void expect(int shares);
-
-        void done();
-    }
-
-    Drain drain;
-    /// The block in flight as the expert sources see it.
-    final Block block = new Block();
-    /// Per shard of the expert cache, the positions of the block's experts that hash there, and the
-    /// message that hands them over.
     /// The n-gram rows of the chunk, their staging buffer and how many there are: written by the stage that
     /// computes the ids and gathers them, read by the stage that copies them to the device.
     final long[] pleRowIds;
 
     ExecutionGpu.UploadBuffer pleUpload;
     int pleCount;
-    final int[][] sharePositions;
-    final int[] shareCounts;
-    final ExpertSource.Work[] shares;
 
     Qwen4GraphStorage(Qwen4ExecutionPlan plan, ExecutionGpu gpu, int rows) {
         this.gpu = gpu;
@@ -108,13 +83,6 @@ final class Qwen4GraphStorage {
         int hidden = plan.hidden();
         this.moe = plan.newMoeLayer(rows);
         this.pleRowIds = new long[rows * plan.ple().rowsPerToken()];
-        this.loadBegin = new long[this.moe.maxWaves()];
-        this.arrivals = new Arrivals[this.moe.maxWaves()];
-        int shards = plan.expertSources().length;
-        this.sharePositions = new int[shards][this.moe.maxExperts()];
-        this.shareCounts = new int[shards];
-        this.shares = new ExpertSource.Work[shards];
-        for (int shard = 0; shard < shards; shard++) this.shares[shard] = new ExpertSource.Work();
         this.tokenUpload = gpu.allocateUploadBuffer(4L * rows);
         try {
             long bf16 = Short.BYTES;
@@ -152,52 +120,6 @@ final class Qwen4GraphStorage {
         for (long address : this.allocations) this.gpu.free(address);
         this.allocations.clear();
         this.retained = 0;
-    }
-
-    /// The block in flight, for the sources that load its experts. They call it from their own
-    /// threads; its fields are written by the plan stage before it posts the shares.
-    final class Block implements ExpertBlock {
-        private Qwen4Quantum quantum;
-        int bank;
-
-        void bind(Qwen4Quantum quantum, int bank) {
-            this.quantum = quantum;
-            this.bank = bank;
-        }
-
-        @Override
-        public int bank() {
-            return this.bank;
-        }
-
-        @Override
-        public int expertAt(int position) {
-            return Qwen4GraphStorage.this.moe.expertAt(position);
-        }
-
-        @Override
-        public boolean stopped() {
-            return this.quantum.stopRequested();
-        }
-
-        @Override
-        public void arrive(int position, ExpertLease lease) {
-            if (lease != null) {
-                if (this.quantum.stopRequested()) lease.close();
-                else Qwen4GraphStorage.this.moe.hold(position, lease);
-            }
-            Qwen4GraphStorage.this.arrivals[Qwen4GraphStorage.this.moe.waveOf(position)].arrived();
-        }
-
-        @Override
-        public void failed(Throwable failure) {
-            this.quantum.fail(failure);
-        }
-
-        @Override
-        public void shardDone() {
-            Qwen4GraphStorage.this.drain.done();
-        }
     }
 
     /// Most rows a quantum on this storage may have.

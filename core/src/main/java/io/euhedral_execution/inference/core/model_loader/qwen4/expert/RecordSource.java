@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
+import io.euhedral_execution.inference.core.scheduling.graph.AsyncReads;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 
@@ -27,6 +28,14 @@ public interface RecordSource extends AutoCloseable {
     default void readRange(ExpertBank bank, int expert, long from, MemorySegment destination)
             throws IOException, InterruptedException {
         throw new UnsupportedOperationException("this source reads whole records");
+    }
+
+    /// Submits the read of the `destination.byteSize()` bytes of the record that start `from` bytes into it
+    /// and returns at once; `done` is emitted when they arrived or the read failed. Returns false, having
+    /// submitted nothing, when this source cannot read asynchronously: the caller reads with [#readRange].
+    default boolean readRangeAsync(
+            ExpertBank bank, int expert, long from, MemorySegment destination, AsyncReads.Read done) {
+        return false;
     }
 
     /// Bytes this source has read from the artifact file.

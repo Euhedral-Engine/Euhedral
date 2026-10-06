@@ -6,10 +6,10 @@ import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 
 /// Typed launches of the routed-expert kernels (native/src/qwen4/experts.cuh, docs/FLASH_NEXT_EXPERTS.md): the
-/// grouped NVFP4 math of a wave of resident experts. Every method queues on the GPU's selected stream.
+/// NVFP4 math of resident experts, one expert or several per launch. Every method queues on the GPU's selected stream.
 ///
 /// The experts stay NVFP4 in their cache slots. Activations are BF16 for any number of rows, accumulation is FP32
-/// on BF16 tensor cores, so the result for a (row, expert) pair is the same bits whatever else is in the wave.
+/// on BF16 tensor cores, so the result for a (row, expert) pair is the same bits whatever else is in the launch.
 public final class Qwen4ExpertOps {
 
     /// Row alignment the kernels need of every activation, scratch and output address.
@@ -64,7 +64,7 @@ public final class Qwen4ExpertOps {
         }
     }
 
-    /// The device scratch of a wave, one block: `act` `[pairs][inter]` at offset 0, then `weighted` `[pairs][hidden]`
+    /// The device scratch of a chunk, one block: `act` `[pairs][inter]` at offset 0, then `weighted` `[pairs][hidden]`
     /// at 16-byte alignment, both BF16.
     public static final class Scratch {
         private Scratch() {}
@@ -86,16 +86,16 @@ public final class Qwen4ExpertOps {
         }
     }
 
-    /// act of every pair of the wave: gate and up of the pair's row against the item's expert, SwiGLU.
+    /// act of every pair of the given work items: gate and up of the pair's row against the item's expert, SwiGLU.
     ///
-    /// @param slots device address of the wave's slot table (8 bytes per expert record address)
+    /// @param slots device address of the slot table (8 bytes per expert record address)
     /// @param items device address of the work items (16 bytes each), `itemCount` of them
     /// @param pairs device address of the pairs (row, weight)
     /// @param x activations `[rows][hidden]` BF16
     /// @param act output `[pairs][inter]` BF16
     public static void gateUpSwiGlu(
             ExecutionGpu gpu, Geometry geometry, long slots, long items, int itemCount, long pairs, long x, long act) {
-        if (itemCount <= 0) throw new IllegalArgumentException("a wave has at least one work item");
+        if (itemCount <= 0) throw new IllegalArgumentException("an expert has at least one work item");
         requireAligned(slots, items, pairs, x, act);
         gpu.launchQwen4(
                 Qwen4Kernel.EXPERT_GATE_UP_SWIGLU_BF16,
@@ -117,7 +117,8 @@ public final class Qwen4ExpertOps {
                         .int32(geometry.inter()));
     }
 
-    /// weighted of every pair of the wave: the down projection of the pair's act row times its routing weight.
+    /// weighted of every pair of the given work items: the down projection of the pair's act row times its routing
+    /// weight.
     public static void downWeighted(
             ExecutionGpu gpu,
             Geometry geometry,
@@ -127,7 +128,7 @@ public final class Qwen4ExpertOps {
             long pairs,
             long act,
             long weighted) {
-        if (itemCount <= 0) throw new IllegalArgumentException("a wave has at least one work item");
+        if (itemCount <= 0) throw new IllegalArgumentException("an expert has at least one work item");
         requireAligned(slots, items, pairs, act, weighted);
         gpu.launchQwen4(
                 Qwen4Kernel.EXPERT_DOWN_BF16,
@@ -149,10 +150,10 @@ public final class Qwen4ExpertOps {
                         .int32(geometry.hidden()));
     }
 
-    /// Adds every row's weighted outputs of the wave to its row of `out`, one BF16 addition at a time, in the
+    /// Adds every row's weighted outputs to its row of `out`, one BF16 addition at a time, in the
     /// order of the row's pair list (the entries of `rowPairs` from `rowOffsets[row]` up to `rowOffsets[row + 1]`).
-    /// With `zeroFirst` the sums start at zero and rows without pairs are zeroed: the first wave of a layer.
-    /// Without it a row without pairs is not touched.
+    /// With `zeroFirst` the sums start at zero and rows without pairs are zeroed; without it they add to `out` and
+    /// a row without pairs is not touched.
     public static void combine(
             ExecutionGpu gpu,
             int hidden,
@@ -184,39 +185,43 @@ public final class Qwen4ExpertOps {
                         .int32(zeroFirst ? 1 : 0));
     }
 
-    /// Runs wave `wave` of `plan`: gate_up and SwiGLU, down and routing weights, then the accumulation into `out`.
-    /// `descriptor` is the device copy of the descriptor [Qwen4ExpertWave#fill] wrote, with the slot addresses set;
-    /// `scratch` is [Qwen4ExpertWave#scratchBytes] bytes (see [Scratch]); `x` and `out` are `[rows][hidden]` BF16
-    /// of the chunk. Waves of a chunk must be run in order, the first with `firstWave`, on one stream; the experts'
-    /// leases may be released (with a fence recorded after this call) once it returns.
-    public static void runWave(
+    /// The `index`-th active expert of `routing` on its own: gate_up and SwiGLU, then down and the routing
+    /// weights, over its work items only, into its pairs' rows of `scratch` (see [Scratch], laid out for the
+    /// chunk's pairs). `descriptor` is the device copy of the descriptor [Qwen4ExpertRouting#fill] wrote,
+    /// with this expert's slot address set; `x` is `[rows][hidden]` BF16 of the chunk. Experts are independent:
+    /// they may run in any order, on any streams. The expert's lease may be released (with a fence recorded after
+    /// this call) once it returns.
+    public static void runExpert(
             ExecutionGpu gpu,
             Geometry geometry,
-            Qwen4ExpertWave plan,
-            int wave,
+            Qwen4ExpertRouting routing,
+            int index,
             long descriptor,
             long x,
-            long scratch,
-            long out,
-            boolean firstWave) {
-        int items = plan.waveItemCount(wave);
-        int pairs = plan.wavePairCount(wave);
+            long scratch) {
         long act = scratch;
-        long weighted = scratch + Scratch.weightedOffset(pairs, geometry.inter());
-        long slots = descriptor + plan.slotsOffset();
-        long itemTable = descriptor + plan.itemsOffset();
-        long pairTable = descriptor + plan.pairsOffset();
-        gateUpSwiGlu(gpu, geometry, slots, itemTable, items, pairTable, x, act);
-        downWeighted(gpu, geometry, slots, itemTable, items, pairTable, act, weighted);
+        long weighted = scratch + Scratch.weightedOffset(routing.pairCount(), geometry.inter());
+        long slots = descriptor + routing.slotsOffset();
+        long items = descriptor + routing.itemsOffset() + 16L * routing.itemStart(index);
+        long pairs = descriptor + routing.pairsOffset();
+        int count = routing.itemCount(index);
+        gateUpSwiGlu(gpu, geometry, slots, items, count, pairs, x, act);
+        downWeighted(gpu, geometry, slots, items, count, pairs, act, weighted);
+    }
+
+    /// The ordered accumulation of the chunk: every row's weighted outputs added to its row of `out` in ascending
+    /// expert order, after every expert ran ([#runExpert]); rows without pairs are zeroed.
+    public static void combineExperts(
+            ExecutionGpu gpu, Geometry geometry, Qwen4ExpertRouting routing, long descriptor, long scratch, long out) {
         combine(
                 gpu,
                 geometry.hidden(),
-                weighted,
-                descriptor + plan.rowOffsetsOffset(),
-                descriptor + plan.rowPairsOffset(),
+                scratch + Scratch.weightedOffset(routing.pairCount(), geometry.inter()),
+                descriptor + routing.rowOffsetsOffset(),
+                descriptor + routing.rowPairsOffset(),
                 out,
-                plan.rows(),
-                firstWave);
+                routing.rows(),
+                true);
     }
 
     private static void requireAligned(long... addresses) {

@@ -20,8 +20,9 @@ import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
 
 /// The routed-expert kernels on synthetic NVFP4 experts: every stage against a CPU reference written from upstream, and
-/// the bit-exactness the design promises (a pair's result does not depend on the wave split, the work items or the
-/// chunking of rows). Real weights against upstream fixtures are in Qwen4ExpertFixtureCudaIntegrationTest.
+/// the bit-exactness the design promises (a pair's result does not depend on the order the experts run in, on which
+/// slots hold them, on the work items or on the chunking of rows). Real weights against upstream fixtures are in
+/// Qwen4ExpertFixtureCudaIntegrationTest.
 class Qwen4ExpertCudaIntegrationTest {
 
     private static CudaGpuMemory open() {
@@ -93,17 +94,17 @@ class Qwen4ExpertCudaIntegrationTest {
         ids[4] = experts; // a padding entry is skipped
         ids[17] = experts;
         try (CudaGpuMemory gpu = open();
-                Qwen4ExpertHarness harness = new Qwen4ExpertHarness(gpu, experts, topK, rows, 3, 24)) {
+                Qwen4ExpertHarness harness = new Qwen4ExpertHarness(gpu, experts, topK, rows, 3)) {
             // the weighted rows of every pair as the kernels produced them, to replay the routed sum
             short[][] weightedByPair = new short[rows * topK][];
             int[] pairOfEntry = new int[rows * topK];
-            short[] sum = harness.run(rows, ids, weights, x, records(records), (wave, plan, act, weighted) -> {
-                int pairs = plan.wavePairCount(wave);
+            short[] sum = harness.run(rows, ids, weights, x, records(records), (plan, act, weighted) -> {
+                int pairs = plan.pairCount();
                 short[] actBits = harness.download(act, pairs * INTER);
                 short[] weightedBits = harness.download(weighted, pairs * HIDDEN);
                 int pair = 0;
-                for (int i = 0; i < plan.waveExpertCount(wave); i++) {
-                    int expert = plan.waveExpert(wave, i);
+                for (int i = 0; i < plan.activeExperts(); i++) {
+                    int expert = plan.activeExpert(i);
                     for (int entry = 0; entry < rows * topK; entry++) {
                         if (ids[entry] != expert) continue;
                         int row = entry / topK;
@@ -134,9 +135,10 @@ class Qwen4ExpertCudaIntegrationTest {
         }
     }
 
-    /// The same chunk played with different wave limits, in one piece, in chunks and row by row gives the same bits.
+    /// The same chunk played in either expert order, through any number of slots, in one piece, in chunks and row by
+    /// row gives the same bits.
     @Test
-    void resultsAreBitwiseIndependentOfWavesChunksAndWorkItems() throws IOException {
+    void resultsAreBitwiseIndependentOfOrderSlotsChunksAndWorkItems() throws IOException {
         int experts = 12, topK = 4, rows = 70;
         SplittableRandom random = new SplittableRandom(23);
         byte[][] records = randomRecords(experts, 59);
@@ -146,19 +148,22 @@ class Qwen4ExpertCudaIntegrationTest {
         route(random, rows, topK, experts, true, ids, weights);
         short[] baseline;
         try (CudaGpuMemory gpu = open();
-                Qwen4ExpertHarness all = new Qwen4ExpertHarness(gpu, experts, topK, rows, experts, rows * topK)) {
+                Qwen4ExpertHarness all = new Qwen4ExpertHarness(gpu, experts, topK, rows, experts)) {
             baseline = all.run(rows, ids, weights, x, records(records), null);
             assertTrue(all.plan.expertPairCount(0) > 8 * all.plan.expertPairCount(experts - 1) / 2, "skewed routing");
-            int[][] limits = {{5, 300}, {1, rows}, {3, 100}, {2, 70}};
-            for (int[] limit : limits) {
-                try (Qwen4ExpertHarness split = new Qwen4ExpertHarness(gpu, experts, topK, rows, limit[0], limit[1])) {
-                    short[] result = split.run(rows, ids, weights, x, records(records), null);
-                    assertTrue(split.plan.waveCount() > 1, "the limits split the chunk");
-                    assertArrayEquals(baseline, result, "waves of " + limit[0] + " experts, " + limit[1] + " pairs");
+            assertArrayEquals(
+                    baseline,
+                    all.run(rows, ids, weights, x, records(records), Qwen4ExpertHarness.Order.DESCENDING, null),
+                    "descending order");
+            for (int slots : new int[] {1, 3, 5}) {
+                try (Qwen4ExpertHarness few = new Qwen4ExpertHarness(gpu, experts, topK, rows, slots)) {
+                    short[] result =
+                            few.run(rows, ids, weights, x, records(records), Qwen4ExpertHarness.Order.DESCENDING, null);
+                    assertArrayEquals(baseline, result, slots + " slots");
                 }
             }
             for (int chunk : new int[] {7, 1}) {
-                try (Qwen4ExpertHarness part = new Qwen4ExpertHarness(gpu, experts, topK, chunk, 4, chunk * topK)) {
+                try (Qwen4ExpertHarness part = new Qwen4ExpertHarness(gpu, experts, topK, chunk, 4)) {
                     short[] stitched = new short[rows * HIDDEN];
                     for (int first = 0; first < rows; first += chunk) {
                         int n = Math.min(chunk, rows - first);
@@ -177,9 +182,10 @@ class Qwen4ExpertCudaIntegrationTest {
         }
     }
 
-    /// A full 512-row chunk with skewed routing: bit-identical across wave splits, and three rows against the CPU.
+    /// A full 512-row chunk with skewed routing: bit-identical in either expert order and through few slots, and three
+    /// rows against the CPU.
     @Test
-    void aFullChunkMatchesTheReferenceAndEveryWaveSplit() throws IOException {
+    void aFullChunkMatchesTheReferenceInAnyOrder() throws IOException {
         int experts = 16, topK = 10, rows = 512;
         SplittableRandom random = new SplittableRandom(29);
         byte[][] records = randomRecords(experts, 73);
@@ -188,12 +194,12 @@ class Qwen4ExpertCudaIntegrationTest {
         short[] weights = new short[rows * topK];
         route(random, rows, topK, experts, true, ids, weights);
         try (CudaGpuMemory gpu = open();
-                Qwen4ExpertHarness big = new Qwen4ExpertHarness(gpu, experts, topK, rows, 16, 5120);
-                Qwen4ExpertHarness small = new Qwen4ExpertHarness(gpu, experts, topK, rows, 3, 700)) {
+                Qwen4ExpertHarness big = new Qwen4ExpertHarness(gpu, experts, topK, rows, 16);
+                Qwen4ExpertHarness small = new Qwen4ExpertHarness(gpu, experts, topK, rows, 3)) {
             short[] result = big.run(rows, ids, weights, x, records(records), null);
-            short[] split = small.run(rows, ids, weights, x, records(records), null);
-            assertTrue(small.plan.waveCount() >= 6);
-            assertArrayEquals(result, split);
+            short[] reversed =
+                    small.run(rows, ids, weights, x, records(records), Qwen4ExpertHarness.Order.DESCENDING, null);
+            assertArrayEquals(result, reversed);
             Qwen4ExpertReference.Expert[] expanded = new Qwen4ExpertReference.Expert[experts];
             for (int e = 0; e < experts; e++) expanded[e] = Qwen4ExpertReference.expand(records[e]);
             for (int row : new int[] {0, 311, 511}) {

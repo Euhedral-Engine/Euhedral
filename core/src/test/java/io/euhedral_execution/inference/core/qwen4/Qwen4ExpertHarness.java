@@ -6,8 +6,9 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
-/// Device side of the expert tests: a slab of expert slots, the descriptor and scratch of a wave, and the loop that
-/// plays a chunk through its waves the way the model will (fill the slots of a wave, describe it, run it).
+/// Device side of the expert tests: a few expert slots, the descriptor and scratch of a chunk, and the loop that
+/// plays a chunk the way the model does: every active expert on its own (its record in a slot, its address in the
+/// descriptor, its kernels), in a chosen order, then the ordered combine.
 final class Qwen4ExpertHarness implements AutoCloseable {
 
     /// Where an expert's record comes from.
@@ -16,17 +17,24 @@ final class Qwen4ExpertHarness implements AutoCloseable {
         void read(int expert, MemorySegment destination) throws IOException;
     }
 
-    /// Called after a wave ran, with its index and the device addresses of its scratch.
-    interface WaveObserver {
-        void wave(int wave, Qwen4ExpertWave plan, long act, long weighted) throws IOException;
+    /// Called after every expert ran, before the combine, with the device addresses of the scratch.
+    interface ExpertsObserver {
+        void experts(Qwen4ExpertRouting plan, long act, long weighted) throws IOException;
+    }
+
+    /// The order the experts run in.
+    enum Order {
+        ASCENDING,
+        DESCENDING
     }
 
     static final long SLOT_BYTES = (Qwen4ExpertReference.RECORD_BYTES + 4095L) / 4096 * 4096;
 
     final CudaGpuMemory gpu;
     final Qwen4ExpertOps.Geometry geometry = Qwen4ExpertOps.Geometry.flashNext();
-    final Qwen4ExpertWave plan;
+    final Qwen4ExpertRouting plan;
     private final Arena arena = Arena.ofConfined();
+    private final int slots;
     private final long slab;
     private final long descriptor;
     private final long scratch;
@@ -38,67 +46,70 @@ final class Qwen4ExpertHarness implements AutoCloseable {
     private long outAddress;
     long bytesAllocated;
 
-    Qwen4ExpertHarness(CudaGpuMemory gpu, int experts, int topK, int maxRows, int maxWaveExperts, int maxWavePairs) {
+    Qwen4ExpertHarness(CudaGpuMemory gpu, int experts, int topK, int maxRows, int slots) {
         this.gpu = gpu;
         this.maxRows = maxRows;
-        this.plan = new Qwen4ExpertWave(experts, topK, maxRows, maxWaveExperts, maxWavePairs);
-        this.slab = gpu.allocate(SLOT_BYTES * maxWaveExperts);
+        this.slots = slots;
+        this.plan = new Qwen4ExpertRouting(experts, topK, maxRows);
+        this.slab = gpu.allocate(SLOT_BYTES * slots);
         this.descriptor = gpu.allocate(this.plan.descriptorBytes());
-        this.scratch = gpu.allocate(Qwen4ExpertWave.scratchBytes(maxWavePairs));
+        this.scratch = gpu.allocate(Qwen4ExpertRouting.scratchBytes(this.plan.maxPairs()));
         this.xAddress = gpu.allocate(2L * maxRows * 2560);
         this.outAddress = gpu.allocate(2L * maxRows * 2560);
-        this.bytesAllocated = SLOT_BYTES * maxWaveExperts
+        this.bytesAllocated = SLOT_BYTES * slots
                 + this.plan.descriptorBytes()
-                + Qwen4ExpertWave.scratchBytes(maxWavePairs)
+                + Qwen4ExpertRouting.scratchBytes(this.plan.maxPairs())
                 + 4L * maxRows * 2560;
         this.hostDescriptor = this.arena.allocate(this.plan.descriptorBytes(), 16);
         this.hostRecord = this.arena.allocate(SLOT_BYTES, 4096);
-        this.slotExpert = new int[maxWaveExperts];
+        this.slotExpert = new int[slots];
         java.util.Arrays.fill(this.slotExpert, -1);
     }
 
-    /// Runs the chunk's waves in order and returns `[rows][2560]` BF16 bits of the routed sums.
-    short[] run(int rows, int[] ids, short[] weights, short[] x, Records records, WaveObserver observer)
+    /// Runs the chunk's experts in ascending order and returns `[rows][2560]` BF16 bits of the routed sums.
+    short[] run(int rows, int[] ids, short[] weights, short[] x, Records records, ExpertsObserver observer)
+            throws IOException {
+        return run(rows, ids, weights, x, records, Order.ASCENDING, observer);
+    }
+
+    /// Runs the chunk's experts in `order` and returns `[rows][2560]` BF16 bits of the routed sums.
+    short[] run(int rows, int[] ids, short[] weights, short[] x, Records records, Order order, ExpertsObserver observer)
             throws IOException {
         if (rows > this.maxRows) throw new IllegalArgumentException("rows");
         MemorySegment hostX = this.arena.allocate(2L * rows * 2560, 16);
         MemorySegment.copy(x, 0, hostX, ValueLayout.JAVA_SHORT, 0, rows * 2560);
         this.gpu.copyHostToDevice(this.xAddress, hostX, 2L * rows * 2560);
-        // the first wave overwrites every row, so the start value is irrelevant
+        // the combine overwrites every row, so the start value is irrelevant
         this.gpu.zeroDeviceMemory(this.outAddress, 2L * rows * 2560);
         this.plan.plan(rows, ids, weights);
-        for (int wave = 0; wave < this.plan.waveCount(); wave++) {
-            this.plan.fill(wave, this.hostDescriptor);
-            for (int i = 0; i < this.plan.waveExpertCount(wave); i++) {
-                int expert = this.plan.waveExpert(wave, i);
-                if (this.slotExpert[i] != expert) {
-                    records.read(expert, this.hostRecord);
-                    this.gpu.copyHostToDevice(this.slab + SLOT_BYTES * i, this.hostRecord, SLOT_BYTES);
-                    this.slotExpert[i] = expert;
-                }
-                this.plan.setSlot(this.hostDescriptor, i, this.slab + SLOT_BYTES * i);
+        int active = this.plan.activeExperts();
+        if (active == 0) return new short[rows * 2560];
+        this.plan.fill(this.hostDescriptor);
+        this.gpu.copyHostToDevice(this.descriptor, this.hostDescriptor, this.plan.descriptorBytes());
+        for (int n = 0; n < active; n++) {
+            int index = order == Order.ASCENDING ? n : active - 1 - n;
+            int expert = this.plan.activeExpert(index);
+            int slot = index % this.slots;
+            if (this.slotExpert[slot] != expert) {
+                records.read(expert, this.hostRecord);
+                this.gpu.copyHostToDevice(this.slab + SLOT_BYTES * slot, this.hostRecord, SLOT_BYTES);
+                this.slotExpert[slot] = expert;
             }
-            this.gpu.copyHostToDevice(this.descriptor, this.hostDescriptor, this.plan.descriptorBytes());
-            Qwen4ExpertOps.runWave(
-                    this.gpu,
-                    this.geometry,
-                    this.plan,
-                    wave,
-                    this.descriptor,
-                    this.xAddress,
-                    this.scratch,
-                    this.outAddress,
-                    wave == 0);
-            if (observer != null) {
-                int pairs = this.plan.wavePairCount(wave);
-                observer.wave(
-                        wave,
-                        this.plan,
-                        this.scratch,
-                        this.scratch + Qwen4ExpertOps.Scratch.weightedOffset(pairs, this.geometry.inter()));
-            }
+            this.plan.setSlot(this.hostDescriptor, index, this.slab + SLOT_BYTES * slot);
+            long entry = this.plan.slotsOffset() + 8L * index;
+            this.gpu.copyHostToDevice(this.descriptor + entry, this.hostDescriptor.asSlice(entry, 8), 8);
+            Qwen4ExpertOps.runExpert(
+                    this.gpu, this.geometry, this.plan, index, this.descriptor, this.xAddress, this.scratch);
+            // The slot may be reloaded for the next expert: the kernels that read it must be done.
+            this.gpu.synchronize();
         }
-        if (this.plan.waveCount() == 0) return new short[rows * 2560];
+        if (observer != null)
+            observer.experts(
+                    this.plan,
+                    this.scratch,
+                    this.scratch + Qwen4ExpertOps.Scratch.weightedOffset(this.plan.pairCount(), this.geometry.inter()));
+        Qwen4ExpertOps.combineExperts(
+                this.gpu, this.geometry, this.plan, this.descriptor, this.scratch, this.outAddress);
         return download(this.outAddress, rows * 2560);
     }
 

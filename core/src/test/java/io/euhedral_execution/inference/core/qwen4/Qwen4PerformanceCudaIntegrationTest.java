@@ -72,7 +72,6 @@ class Qwen4PerformanceCudaIntegrationTest {
                 int layer,
                 int rows,
                 int uniqueExperts,
-                int waves,
                 io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats.Snapshot before,
                 io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats.Snapshot after) {
             blocks[layer]++;
@@ -137,18 +136,22 @@ class Qwen4PerformanceCudaIntegrationTest {
 
     /// Where the expert loads between `before` and `after` spent their time, per load and per token.
     private static String loads(
-            io.euhedral_execution.inference.core.qwen4.ExpertSource.Timings before,
-            io.euhedral_execution.inference.core.qwen4.ExpertSource.Timings after,
+            io.euhedral_execution.inference.core.qwen4.ExpertCacheOwner.Timings before,
+            io.euhedral_execution.inference.core.qwen4.ExpertCacheOwner.Timings after,
+            long fullBefore,
+            long fullAfter,
             int tokens) {
         long n = Math.max(1, after.loads() - before.loads());
         return String.format(
-                "%.1f loads/token; per load: dispatch %.0f us, open %.0f us, submit hop %.0f us, copy %.0f us, retire hop %.0f us",
+                "%.1f loads/token; per load: dispatch %.0f us, read %.0f us, submit hop %.0f us, copy %.0f us,"
+                        + " retire hop %.0f us; %.2f fetches/token found the cache full",
                 (double) n / tokens,
                 (after.dispatch() - before.dispatch()) / 1e3 / n,
-                (after.open() - before.open()) / 1e3 / n,
-                (after.submit() - before.submit()) / 1e3 / n,
+                (after.read() - before.read()) / 1e3 / n,
+                (after.submitHop() - before.submitHop()) / 1e3 / n,
                 (after.copy() - before.copy()) / 1e3 / n,
-                (after.retire() - before.retire()) / 1e3 / n);
+                (after.retireHop() - before.retireHop()) / 1e3 / n,
+                (double) (fullAfter - fullBefore) / tokens);
     }
 
     /// The tiers' work between `before` and now, per token.
@@ -190,6 +193,30 @@ class Qwen4PerformanceCudaIntegrationTest {
         return out.toString();
     }
 
+    /// A window for a profiler: warm decode at 64 context, then two idle seconds that mark the window's start in a
+    /// timeline, then 32 decode steps, and nothing after them.
+    private void profileWindow(Qwen4ExecutionPlan executor, int[] prompt, Qwen4ExecutionPlan.LogitsSink sink)
+            throws Exception {
+        try (Qwen4Sequence sequence = executor.newSequence()) {
+            Qwen4Blocking.step(executor, sequence, prompt, 0, 64, null);
+            int[] token = new int[1];
+            for (int i = 0; i < 64; i++) {
+                token[0] = prompt[(64 + i * 97) % prompt.length];
+                Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+            }
+            Thread.sleep(2000);
+            long start = System.nanoTime();
+            int steps = 32;
+            for (int i = 0; i < steps; i++) {
+                token[0] = prompt[(64 + i * 89) % prompt.length];
+                Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+            }
+            line(String.format(
+                    "profile window: %d decode steps at 64 context, %.1f ms/token",
+                    steps, (System.nanoTime() - start) / 1e6 / steps));
+        }
+    }
+
     @Test
     void firstPerformanceRecord() throws Exception {
         assumeTrue(
@@ -200,10 +227,14 @@ class Qwen4PerformanceCudaIntegrationTest {
         try (Qwen4TestLattice lattice = Qwen4TestLattice.start(4);
                 CudaGpuMemory gpu = Qwen4TestSupport.openGpu()) {
             long loadStart = System.nanoTime();
+            // A profiler that replays kernels needs device memory of its own: EUHEDRAL_QWEN4_PERF_DEVICE_MIB caps
+            // what the plan may use.
+            long free = gpu.deviceMemoryInfo().freeBytes();
+            long cap = intEnv("EUHEDRAL_QWEN4_PERF_DEVICE_MIB", 0);
             try (Qwen4Model model = Qwen4Model.open(
                             Qwen4TestSupport.artifactPath(),
                             gpu,
-                            gpu.deviceMemoryInfo().freeBytes(),
+                            cap > 0 ? Math.min(free, cap << 20) : free,
                             HostBudget.system(),
                             Qwen4Mode.TEXT,
                             CONTEXT);
@@ -221,6 +252,10 @@ class Qwen4PerformanceCudaIntegrationTest {
                 // Warm the kernels and the cache with a short run.
                 try (Qwen4Sequence warm = executor.newSequence()) {
                     Qwen4Blocking.step(executor, warm, prompt, 0, 64, sink);
+                }
+                if (System.getenv("EUHEDRAL_QWEN4_PERF_PROFILE") != null) {
+                    profileWindow(executor, prompt, sink);
+                    return;
                 }
                 for (int target : Arrays.stream(new int[] {512, 4096, 16384})
                         .filter(t -> t <= MAX)
@@ -274,6 +309,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                             var before = model.expertCache().stats().snapshot();
                             var tiersBefore = model.hierarchyStats();
                             var loadsBefore = executor.expertTimings();
+                            long fullBefore = executor.expertFullFetches();
                             var counters = executor.moeCounters();
                             LayerStats decodeLayers = new LayerStats();
                             if (context == 4096) executor.trace(decodeLayers);
@@ -306,7 +342,13 @@ class Qwen4PerformanceCudaIntegrationTest {
                                     (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
                                     (after.expertWaitNanos() - counters.expertWaitNanos()) / 1e6 / steps));
                             line("  tiers: " + tiers(model, tiersBefore, steps));
-                            line("  loads: " + loads(loadsBefore, executor.expertTimings(), steps));
+                            line("  loads: "
+                                    + loads(
+                                            loadsBefore,
+                                            executor.expertTimings(),
+                                            fullBefore,
+                                            executor.expertFullFetches(),
+                                            steps));
                         }
                     }
                 }

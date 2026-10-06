@@ -5,8 +5,8 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /// One shard of the host tier: the bookkeeping for the slots of ordinary memory that hold the records of
-/// the experts that hash to it, and nothing else. It has one owner, the serial source of the device cache
-/// shard with the same index, and every method but the readers of the counters runs there: the directory,
+/// the experts that hash to it, and nothing else. It has one owner, the owner of the device cache shard
+/// with the same index, which confines it, and every method but the readers of the counters runs there: the directory,
 /// the slot states, the recency lists and the pins are plain arrays.
 ///
 /// A slot is free, filling or ready. A load asks [#plan] what to do: copy a ready record out of its slot

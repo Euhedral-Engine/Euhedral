@@ -13,7 +13,7 @@ import java.util.Objects;
 /// A device eviction does not evict from the tier, so once it is warm a device miss is a copy out of RAM
 /// and no artifact read. The memory is one block, [PageableMemory], committed as records arrive, cut into
 /// equal page-aligned slots. The slots are shared out to shards by the same hash that shards the device
-/// cache, and each [RamTierShard] is owned by the source of the device shard with its index: the
+/// cache, and each [RamTierShard] is owned by the owner of the device shard with its index: the
 /// bookkeeping has no lock because nothing else touches it. The tier object holds what the shards share
 /// (the memory and the key space) and the startup preload.
 ///

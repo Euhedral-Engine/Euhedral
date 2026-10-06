@@ -11,6 +11,7 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.expert.FileRecord
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.GpuExpertTransfer;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTier;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ReplacementPolicy;
+import io.euhedral_execution.inference.core.scheduling.graph.AsyncReads;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -51,6 +52,14 @@ public final class Qwen4Model implements AutoCloseable {
             "euhedral.qwen4.read-parts",
             Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READ_PARTS", "4")));
 
+    /// Copy streams the experts' device copies are spread over: an order of copies on the device,
+    /// independent of the staging buffers and of the loads in flight. One: one stream takes the copies
+    /// of every buffer and reaches the same transfer rate as several. `euhedral.qwen4.copy-streams`
+    /// (or `EUHEDRAL_QWEN4_COPY_STREAMS`) overrides it for benchmarks.
+    static final int COPY_STREAMS = Integer.getInteger(
+            "euhedral.qwen4.copy-streams",
+            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_COPY_STREAMS", "1")));
+
     private final Qwen4Artifact artifact;
     private final Qwen4ResidencyPlan plan;
     private final Qwen4FixedLoader.Loaded fixed;
@@ -61,6 +70,9 @@ public final class Qwen4Model implements AutoCloseable {
     private final FileExpertStore fileStore;
     private final FileRecordSource artifactSource;
     private final GpuExpertTransfer gpuTransfer;
+    /// The artifact's asynchronous reads (null where the machine has none): their completions are frames, so
+    /// the owner of the lattice attaches them to it.
+    private final AsyncReads asyncReads;
     private boolean closed;
 
     private Qwen4Model(
@@ -73,7 +85,8 @@ public final class Qwen4Model implements AutoCloseable {
             ExpertBank[] cachedBanks,
             FileExpertStore fileStore,
             FileRecordSource artifactSource,
-            GpuExpertTransfer gpuTransfer) {
+            GpuExpertTransfer gpuTransfer,
+            AsyncReads asyncReads) {
         this.artifact = artifact;
         this.plan = plan;
         this.fixed = fixed;
@@ -84,6 +97,7 @@ public final class Qwen4Model implements AutoCloseable {
         this.fileStore = fileStore;
         this.artifactSource = artifactSource;
         this.gpuTransfer = gpuTransfer;
+        this.asyncReads = asyncReads;
     }
 
     /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and
@@ -116,14 +130,15 @@ public final class Qwen4Model implements AutoCloseable {
         RamTier tier = null;
         FileExpertStore store = null;
         GpuExpertTransfer transfer = null;
+        AsyncReads reads = null;
         try {
             ngram = NgramStore.open(path, artifact, plan.ngram(), gpu);
-            int lanes = Qwen4ResidencyPlanner.fileStagingSlots(artifact.config());
-            int shards = Qwen4ResidencyPlanner.expertShards(plan.expertCache().slotCount());
-            artifactSource = new FileRecordSource(path, cachedBanks);
+            // Staging buffers pinned up front; the store pins more if more loads are ever in flight at once.
+            int buffers = Qwen4ResidencyPlanner.fileStagingSlots(artifact.config());
+            reads = openAsyncReads();
+            artifactSource = new FileRecordSource(path, cachedBanks, reads);
             if (plan.expertStore() != Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
-                tier = new RamTier(
-                        cachedBanks, plan.host().expertRamSlots(), shards, ReplacementPolicy.BANK_PARTITIONED);
+                tier = new RamTier(cachedBanks, plan.host().expertRamSlots(), 1, ReplacementPolicy.BANK_PARTITIONED);
                 if (tier.isResident()) {
                     long begin = System.nanoTime();
                     tier.preload(artifactSource, PRELOAD_READERS);
@@ -138,16 +153,16 @@ public final class Qwen4Model implements AutoCloseable {
             // The store owns the source and the tier from here on, and closes them.
             FileRecordSource owned = artifactSource;
             RamTier ownedTier = tier;
-            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, lanes, READ_PARTS);
-            transfer = new GpuExpertTransfer(gpu, lanes);
+            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, buffers, READ_PARTS);
+            transfer = new GpuExpertTransfer(gpu, COPY_STREAMS);
             ExpertCache cache = new ExpertCache(
                     store,
                     transfer,
                     gpu,
                     plan.expertCache().slotCount(),
                     plan.expertCache().slotBytes(),
-                    shards);
-            return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer);
+                    1);
+            return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer, reads);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);
             if (store != null) closeQuietly(store, failure);
@@ -156,12 +171,30 @@ public final class Qwen4Model implements AutoCloseable {
                 closeQuietly(tier, failure);
             }
             closeQuietly(ngram, failure);
+            closeQuietly(reads, failure);
             Qwen4FixedLoader.release(fixed.handles(), fixed.hostArena(), staging(fixed), gpu, failure);
             if (failure instanceof IOException io) throw io;
             if (failure instanceof RuntimeException runtime) throw runtime;
             if (failure instanceof Error error) throw error;
             throw new IOException(failure);
         }
+    }
+
+    /// The machine's asynchronous reads, or null when it has none (they are then made on the workers).
+    private static AsyncReads openAsyncReads() {
+        if (!AsyncReads.available()) return null;
+        try {
+            return AsyncReads.open();
+        } catch (RuntimeException unavailable) {
+            LOG.warn("expert records are read synchronously: {}", unavailable.getMessage());
+            return null;
+        }
+    }
+
+    /// The artifact's asynchronous reads, whose completions are frames for the lattice; null when the machine
+    /// has none.
+    public AsyncReads asyncReads() {
+        return this.asyncReads;
     }
 
     private static long staging(Qwen4FixedLoader.Loaded fixed) {
@@ -197,10 +230,10 @@ public final class Qwen4Model implements AutoCloseable {
         return handle;
     }
 
-    /// Pinned staging slots every expert record passes through when it is read from the artifact:
-    /// the most loads that can be outstanding at once.
+    /// Pinned staging buffers every expert record passes through on its way to the device: the most
+    /// loads that hold one at once.
     public int stagingSlots() {
-        return Qwen4ResidencyPlanner.fileStagingSlots(this.artifact.config());
+        return this.fileStore.stagingBuffers();
     }
 
     /// The device ring that host-staged fixed objects pass through, or null when none is
@@ -265,7 +298,7 @@ public final class Qwen4Model implements AutoCloseable {
                         this.artifactSource.readNanos(),
                         this.artifactSource.concurrentReadsHighWater()),
                 new ExpertHierarchyStats.Staging(
-                        this.fileStore.lanes(),
+                        this.fileStore.stagingBuffers(),
                         this.fileStore.recordOpens(),
                         this.fileStore.ramCopyBytes(),
                         this.fileStore.ramCopyNanos()),
@@ -293,6 +326,12 @@ public final class Qwen4Model implements AutoCloseable {
         }
         try {
             this.ngram.close();
+        } catch (RuntimeException e) {
+            if (failure == null) failure = e;
+            else failure.addSuppressed(e);
+        }
+        try {
+            if (this.asyncReads != null) this.asyncReads.close();
         } catch (RuntimeException e) {
             if (failure == null) failure = e;
             else failure.addSuppressed(e);

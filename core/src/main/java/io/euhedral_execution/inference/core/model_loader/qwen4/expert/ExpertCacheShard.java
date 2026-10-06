@@ -9,11 +9,11 @@ import org.slf4j.LoggerFactory;
 /// the directory of the experts that hash to it.
 ///
 /// A shard has one owner, and every method but [#isCurrent] and the inspection methods is called
-/// only by it. The owner is a serial source
-/// ([io.euhedral_execution.inference.core.scheduling.graph.SerialSource]): the lattice runs its
-/// `request` and `pull` one thread at a time, so the shard's state is plain fields with no lock, no
-/// atomic and no condition. A lease closed on any thread reports to its [ExpertLease.Owner], which
-/// posts the release to the owner's mailbox; nothing here waits or is waited for.
+/// only by it. The owner confines it
+/// ([io.euhedral_execution.inference.core.scheduling.graph.Confined]): one thread at a time applies
+/// its transitions, so the shard's state is plain fields with no lock, no atomic and no condition. A
+/// lease closed on any thread reports to its [ExpertLease.Owner], which posts the release to the
+/// owner; nothing here waits or is waited for.
 ///
 /// An expert is used through a lease, which pins its slot: a slot that is loading or leased is
 /// never evicted or refilled, so the address a lease exposes is valid until it is closed.
@@ -310,9 +310,25 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         /// The copy was submitted: the load's own claim on the slot becomes the returned lease,
         /// which carries the copy's marker.
         public ExpertLease submitted() {
+            return lease();
+        }
+
+        /// The load's own claim on the slot as a lease carrying the copy's marker, made before the copy is
+        /// submitted: whoever submits the copy hands it on, and only then, so nothing waits for the marker
+        /// before it was recorded. A miss of the same expert is never asked while its copy is being made
+        /// (a block names an expert once, and a quantum's fetches end before the next quantum's begin).
+        public ExpertLease lease() {
             this.streamed = true;
             this.startNanos = System.nanoTime();
             return newLease(this.slot, this.generation, this.bank, this.expert, readyMarker());
+        }
+
+        /// Ends a load whose lease ([#lease]) was made but never handed on, because its record could not be
+        /// read or its copy not submitted: the lease is gone with it and the slot returns to the cache.
+        public void failed(ExpertLease unused, Throwable failure) {
+            unused.discard();
+            ExpertCacheShard.this.leasesOpen--;
+            finishLoad(this, failure);
         }
 
         /// The copy retired: the expert is resident once nobody holds it. `failure` is the device's

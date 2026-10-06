@@ -11,9 +11,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// the lease is closed: close it with a [DeviceFence] instead.
 public final class ExpertLease implements AutoCloseable {
 
-    /// Who a lease reports to when it closes. The cache's owner decides what that means: a source
-    /// posts the release to its own mailbox (the cache is touched only there), a test releases
-    /// inline.
+    /// Who a lease reports to when it closes. The cache's owner decides what that means: the
+    /// shard's owner posts the release to itself (the shard is touched only by its transitions), a
+    /// test releases inline.
     public interface Owner {
         /// The lease of `slot` closed; `fence` (or null) orders the device work that read the slot.
         void release(int slot, int generation, DeviceFence fence);
@@ -103,6 +103,11 @@ public final class ExpertLease implements AutoCloseable {
     /// [#close], and after the cache closed with the lease open.
     public boolean isValid() {
         return !this.closed.get() && this.owner.isCurrent(this.slot, this.generation);
+    }
+
+    /// Marks the lease closed without reporting to its owner: for the cache, which ends the claim itself.
+    void discard() {
+        this.closed.set(true);
     }
 
     /// Returns the slot to the cache. Idempotent.

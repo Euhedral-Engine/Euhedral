@@ -102,15 +102,14 @@ class Qwen4ArchitectureTest {
                             throw new java.io.UncheckedIOException(failure);
                         }
                     })
-                    .map(Qwen4ArchitectureTest::relative)
+                    .map(p -> relative(p))
                     .toList();
             assertTrue(offenders.isEmpty(), "host work outside the graph: " + offenders);
         }
     }
 
-    /// The path through the cache and back holds no lock: its state has one owner (a serial source,
-    /// whose `request` and `pull` Euhedral runs one thread at a time) or belongs to a lane, and
-    /// everything else reaches it as a message.
+    /// The path through the cache and back holds no lock: its bookkeeping is changed only by frames
+    /// routed to its owner, and everything else reaches it as such a frame.
     @Test
     void theExpertHotPathHoldsNoLockAndStartsNoThread() throws IOException {
         Pattern lock = Pattern.compile(
@@ -121,7 +120,7 @@ class Qwen4ArchitectureTest {
                 walk.filter(p -> p.toString().endsWith(".java")).forEach(hot::add);
             }
         }
-        hot.add(MAIN.resolve("scheduling/graph/SerialSource.java"));
+        hot.add(MAIN.resolve("scheduling/graph/Join.java"));
         List<String> violations = new ArrayList<>();
         for (Path file : hot) {
             // The resident tier is read by loader threads that end with the load, before any request exists.
@@ -134,6 +133,51 @@ class Qwen4ArchitectureTest {
             }
         }
         assertTrue(violations.isEmpty(), "locks or threads on the hot path:\n" + String.join("\n", violations));
+    }
+
+    /// Loading experts is ordinary lattice work, not a subsystem attached to the lattice: frames, dependencies,
+    /// and state confined by routing every frame that touches it to its owner. Nothing in the expert path is a
+    /// source or a sink of its own, keeps a queue of work, admits work, groups experts into waves, binds a staging
+    /// buffer to a scheduling identity, or locks the owner's state.
+    @Test
+    void theExpertPathIsFramesAndDependenciesNotAScheduler() throws IOException {
+        for (String gone : List.of(
+                "scheduling/graph/SerialSource.java",
+                "scheduling/graph/Confined.java",
+                "scheduling/graph/GatedSink.java",
+                "qwen4/ExpertSource.java",
+                "qwen4/ExpertOwner.java",
+                "qwen4/StagingPool.java",
+                "qwen4/Qwen4ExpertWave.java"))
+            assertTrue(!Files.exists(MAIN.resolve(gone)), "a scheduler of the expert path: " + gone);
+        Pattern scheduler = Pattern.compile("implements\\s+LatticeSource|extends\\s+AbstractIngestSink"
+                + "|(Deque|Queue|List)<(AbstractFrame|ExpertLoad|Claim)>|\\bclass\\s+(Lane|Claim)\\b"
+                + "|\\btryExclusive\\(|\\bfreeLane\\(|\\bwaveStart\\(|\\bWAVE\\b");
+        List<String> violations = new ArrayList<>();
+        for (String directory : List.of("qwen4", "model_loader/qwen4/expert", "scheduling/graph")) {
+            try (Stream<Path> walk = Files.walk(MAIN.resolve(directory))) {
+                for (Path file :
+                        walk.filter(p -> p.toString().endsWith(".java")).toList()) {
+                    // The lattice's ingest sinks (the lake's, the dense runtime's) are its sources; the lake counts the
+                    // units it admits for its own completion.
+                    String name = file.getFileName().toString();
+                    // The asynchronous reads' sink is how the disk's completions reach the lattice, as driver
+                    // callbacks publish the device's.
+                    if (name.equals("InferenceLake.java")
+                            || name.equals("QwenExecutionSource.java")
+                            || name.equals("FrameLake.java")
+                            || name.equals("AsyncReads.java")) continue;
+                    List<String> lines = Files.readAllLines(file);
+                    for (int i = 0; i < lines.size(); i++) {
+                        String code = lines.get(i).strip();
+                        if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
+                        if (scheduler.matcher(code).find())
+                            violations.add(relative(file) + ":" + (i + 1) + ": " + code);
+                    }
+                }
+            }
+        }
+        assertTrue(violations.isEmpty(), "a scheduler in the expert path:\n" + String.join("\n", violations));
     }
 
     /// A source path relative to the main tree, with forward slashes on every platform.
