@@ -202,7 +202,7 @@ public final class StageGraph implements AutoCloseable {
             if (pool.size() > 1) {
                 preparedMarker = pool.lane(this.home).openMarker();
                 for (StageFrame stage : this.stages) {
-                    if (stage.submittedSuccessors.length > 0)
+                    if (stage.submittedSuccessors.length > 0 && !stage.host())
                         stage.marker = pool.lane(this.home).openMarker();
                 }
                 for (int lane = 0; lane < this.tails.length; lane++) {
@@ -377,10 +377,7 @@ public final class StageGraph implements AutoCloseable {
         try {
             for (StageFrame successor : stage.submittedSuccessors) {
                 if (stopRequested()) break;
-                if (successor.arrive()) {
-                    this.live.incrementAndGet();
-                    this.source.publish(successor);
-                }
+                if (successor.arrive()) publish(successor);
             }
             for (RetiredEdge edge : stage.retiredEdges) {
                 if (stopRequested()) break;
@@ -391,6 +388,19 @@ public final class StageGraph implements AutoCloseable {
         } finally {
             stageFinished();
         }
+    }
+
+    /// Makes `stage` available after its last incoming edge arrived: a worker takes it first come,
+    /// first served, unless it has nothing to do, in which case it completes here, on the arriving
+    /// thread, without a hop.
+    void publish(StageFrame stage) {
+        this.live.incrementAndGet();
+        if (stage.skips()) {
+            stage.execute();
+            stage.doFinally();
+            return;
+        }
+        this.source.publish(stage);
     }
 
     void stageFailed(Throwable failure) {
@@ -904,10 +914,7 @@ public final class StageGraph implements AutoCloseable {
                 this.graph.fail(failure);
                 return;
             }
-            if (!this.graph.stopRequested() && this.consumer.arrive()) {
-                this.graph.addLive();
-                this.graph.source.publish(this.consumer);
-            }
+            if (!this.graph.stopRequested() && this.consumer.arrive()) this.graph.publish(this.consumer);
         }
 
         @Override

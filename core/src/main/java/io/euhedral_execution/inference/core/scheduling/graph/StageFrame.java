@@ -4,6 +4,7 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /// One execution stage of a reusable [StageGraph], an Euhedral frame like any other.
 ///
@@ -50,6 +51,13 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     @SuppressWarnings("unused")
     private volatile int arrivals;
 
+    /// Set by a stage whose completion is not its submission: its work finishes later,
+    /// asynchronously (an expert load that ends on a transfer's completion frame). Its outgoing
+    /// edges are then satisfied by [#completeDeferred], not by the end of `submit()`.
+    private volatile boolean deferred;
+
+    private final AtomicInteger deferral = new AtomicInteger();
+
     boolean attempted;
     boolean submitted;
 
@@ -64,15 +72,50 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     /// Submits this stage's device work. The quantum's stream is selected on the calling thread.
     protected abstract void submit();
 
+    /// Called from `submit()` by a stage that starts asynchronous work and completes when that work
+    /// does: the stage stays live, and satisfies its outgoing edges only when [#completeDeferred]
+    /// is called, from any thread that may run frames. A completion that arrives before the frame's
+    /// own end is held until it.
+    protected final void deferCompletion() {
+        this.deferred = true;
+    }
+
+    /// The asynchronous work of a deferring stage ended: satisfy its outgoing edges, as the end of
+    /// `submit()` does for other stages. Called exactly once per deferring run.
+    protected final void completeDeferred() {
+        if (this.deferral.incrementAndGet() == 2) finishDeferred();
+    }
+
+    private void finishDeferred() {
+        if (this.submitted) this.graph.release(this);
+        else this.graph.stageFinished();
+    }
+
     /// Whether this stage only copies host memory to the device. Such a stage runs on the pool's
     /// transfer lane when it has one, and never carries a compute chain.
     protected boolean transfers() {
         return false;
     }
 
-    /// Runs once per quantum on the retiring worker for a stage that attempted submission, after the
-    /// quantum's device work has retired. `committed` is true only when the whole quantum succeeded:
-    /// publish externally visible state then, and release temporary resources either way.
+    /// Whether this stage does host work only: it submits nothing to a lane, records no marker and
+    /// orders nothing on the device. A device stage that must follow a host stage's effect names
+    /// the device stage that produced it as a predecessor too.
+    protected boolean host() {
+        return false;
+    }
+
+    /// Whether this stage has nothing to do in the current quantum (decided when its last incoming
+    /// edge arrives): it then only joins its predecessors' device order, so that its successors
+    /// still wait for what it stood after, and it runs in place on the thread that satisfied its
+    /// last edge instead of being published.
+    protected boolean skips() {
+        return false;
+    }
+
+    /// Runs once per quantum on the retiring worker for a stage that attempted submission, after
+    /// the quantum's device work has retired. `committed` is true only when the whole quantum
+    /// succeeded: publish externally visible state then, and release temporary resources either
+    /// way.
     protected void retired(boolean committed) {}
 
     protected final StageGraph graph() {
@@ -94,7 +137,19 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         this.submitted = false;
         StageGraph owner = this.graph;
         if (owner.stopRequested()) return;
-        this.attempted = true;
+        boolean skipped = skips();
+        this.attempted = !skipped;
+        if (host()) {
+            this.lane = owner.home();
+            try {
+                if (!skipped) submit();
+            } catch (Throwable failure) {
+                owner.fail(failure);
+                return;
+            }
+            this.submitted = true;
+            return;
+        }
         LanePool pool = owner.pool();
         int lane = transfers() && pool.transferLane() >= 0
                 ? pool.transferLane()
@@ -111,7 +166,7 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
                     awaited = true;
                 }
                 for (StageFrame predecessor : this.submittedPredecessors) {
-                    if (predecessor.lane == lane) continue;
+                    if (predecessor.lane == lane || predecessor.host()) continue;
                     stream.await(predecessor.marker);
                     if (recording) owner.shadowAwait(lane, predecessor.shadowMarker);
                     awaited = true;
@@ -119,7 +174,7 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
                 owner.used(lane);
             }
             // A launch that waits on another lane does not overlap its stream predecessor.
-            owner.submit(this, stream, lane, owner.overlapLaunches() && !awaited, !awaited);
+            if (!skipped) owner.submit(this, stream, lane, owner.overlapLaunches() && !awaited, !awaited);
             if (this.marker != 0) {
                 stream.mark(this.marker);
                 if (recording) owner.shadowMark(lane, this.shadowMarker);
@@ -140,6 +195,11 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     @Override
     public final void doFinally() {
+        if (this.deferred) {
+            // The edges are satisfied by whichever of the frame's end and the asynchronous completion comes second.
+            if (this.deferral.incrementAndGet() == 2) finishDeferred();
+            return;
+        }
         if (this.submitted) this.graph.release(this);
         else this.graph.stageFinished();
     }
@@ -166,6 +226,8 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     final void reset() {
         ARRIVALS.set(this, 0);
+        this.deferred = false;
+        this.deferral.set(0);
         this.attempted = false;
         this.submitted = false;
     }

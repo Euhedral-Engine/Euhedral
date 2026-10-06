@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.scheduling;
 
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.scheduling.graph.GraphStorage;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -11,11 +12,12 @@ import java.util.Objects;
 /// Each quantum's [QwenExecutionWorkspace] acquires its buffers here at admission and releases them at
 /// retirement without freeing them; the next quantum on the same graph finds them already allocated.
 ///
-/// Storage is a fixed table of slots, one per workspace buffer, not a general allocator. A slot keeps
-/// the largest allocation any binding requested, so memory is bounded by the graph's largest quantum
-/// rather than by token count. A request that exceeds a slot's capacity replaces its allocation; that
-/// only happens at admission, while the graph is idle, so no queued work references the old one.
-public final class QwenWorkspaceStorage implements AutoCloseable {
+/// Storage is a fixed table of slots, one per workspace buffer, not a general allocator. A slot
+/// keeps the largest allocation any binding requested, so memory is bounded by the graph's largest
+/// quantum rather than by token count. A request that exceeds a slot's capacity replaces its
+/// allocation; that only happens at admission, while the graph is idle, so no queued work
+/// references the old one.
+public final class QwenWorkspaceStorage implements GraphStorage {
 
     private final GpuMemory gpu;
     private long[] addresses = new long[0];
@@ -63,12 +65,14 @@ public final class QwenWorkspaceStorage implements AutoCloseable {
     }
 
     /// Device bytes this storage currently holds.
+    @Override
     public long retainedBytes() {
         long total = 0;
         for (long capacity : this.capacities) total += capacity;
         return total;
     }
 
+    @Override
     public boolean isClosed() {
         return this.closed;
     }
