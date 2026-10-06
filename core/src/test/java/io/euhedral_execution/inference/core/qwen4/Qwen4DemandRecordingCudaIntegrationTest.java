@@ -26,7 +26,9 @@ import org.junit.jupiter.api.Test;
 /// The file is little-endian 32-bit integers: the header `EXD1`, version 1, device slots, tier slots (0 without a
 /// tier), banks, then each bank's experts and record bytes; then records. A block is `1, layer, bank, rows, count`
 /// followed by `count` pairs of expert and routed rows; a mark is `2, kind, request, tokens` with kind 0 for a
-/// request's prefill and 1 for its decode.
+/// request's prefill and 1 for its decode; a prediction is `3, layer, bank, count` followed by `count` experts of the
+/// next layer ranked by its router applied to a decode step's input at the layer before (written before the block of
+/// the layer before is reported).
 class Qwen4DemandRecordingCudaIntegrationTest {
 
     /// Prompt lengths of the requests, in the order they arrive.
@@ -67,6 +69,24 @@ class Qwen4DemandRecordingCudaIntegrationTest {
             write(kind);
             write(request);
             write(tokens);
+        }
+
+        @Override
+        public boolean predicts() {
+            return true;
+        }
+
+        @Override
+        public synchronized void prediction(int layer, int bank, int[] ranked) {
+            try {
+                write(3);
+                write(layer);
+                write(bank);
+                write(ranked.length);
+                for (int expert : ranked) write(expert);
+            } catch (IOException failure) {
+                throw new java.io.UncheckedIOException(failure);
+            }
         }
 
         @Override

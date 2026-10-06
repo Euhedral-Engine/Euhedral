@@ -50,6 +50,31 @@ class Predictor:
         return self.pending.pop(bank, ([], 0))
 
 
+class RouterPredictor:
+    """The recording's predictions: the next layer's router applied to a decode step's input at the layer before,
+    ranked; the first `k` are candidates, at most `budget` of them read."""
+
+    def __init__(self, trace, k, budget):
+        self.by_block = {}
+        blocks = [i for i, e in enumerate(trace.events) if e[0] == "block"]
+        ordinal = {index: n for n, index in enumerate(blocks)}
+        for index, bank, ranked in trace.predictions:
+            if index in ordinal:
+                self.by_block[ordinal[index]] = (bank, ranked[:k])
+        self.n = 0
+        self.pending = {}
+        self.budget = budget
+
+    def observe(self, bank, rows, keys):
+        prediction = self.by_block.get(self.n)
+        self.n += 1
+        if prediction is not None:
+            self.pending[prediction[0]] = (prediction[1], self.budget)
+
+    def take(self, bank, rows):
+        return self.pending.pop(bank, ([], 0))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("trace")
@@ -58,6 +83,7 @@ def main():
     parser.add_argument("--tier", type=int)
     parser.add_argument("--decode-budget", type=int, nargs="+", default=[0, 1, 2, 4, 8])
     parser.add_argument("--prefill-budget", type=int, nargs="+", default=[0])
+    parser.add_argument("--router", type=int, nargs="+", help="use the recording's router predictions, top K")
     args = parser.parse_args()
     trace = sim.read_trace(args.trace)
     tier = args.tier or trace.tier_slots
@@ -68,9 +94,16 @@ def main():
             phase = "prefill" if e[1] == 0 else "decode"
             tokens[phase] += e[3]
     print(f"{args.trace}: device {args.device_policy} {trace.device_slots}, tier {args.tier_policy} {tier}")
+    configs = []
     for pb in args.prefill_budget:
         for db in args.decode_budget:
-            predictor = Predictor(len(trace.experts), db, pb) if (db or pb) else None
+            if args.router:
+                for k in args.router:
+                    configs.append((f"router top-{k:2d}", pb, db, RouterPredictor(trace, k, db) if db else None))
+            else:
+                configs.append(("cooccur", pb, db, Predictor(len(trace.experts), db, pb) if (db or pb) else None))
+    for name, pb, db, predictor in configs:
+        if True:
             t = sim.replay(trace, args.device_policy, args.tier_policy, trace.device_slots, tier, True, predictor)
             cells = []
             for ph in ("prefill", "decode"):
@@ -79,7 +112,7 @@ def main():
                     f"{ph}: demand disk {x.disk_bytes / 1e6 / tokens[ph]:6.1f} MB/token,"
                     f" prefetch {x.prefetch_bytes / 1e6 / tokens[ph]:6.1f} MB/token"
                 )
-            print(f"  budget prefill {pb:4d} decode {db:2d} per layer || " + " | ".join(cells))
+            print(f"  {name:13s} budget prefill {pb:4d} decode {db:2d} per layer || " + " | ".join(cells))
 
 
 if __name__ == "__main__":

@@ -455,6 +455,15 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     @FunctionalInterface
     public interface ExpertDemand {
         void block(int layer, int bank, int rows, int[] experts, int[] pairs, int count);
+
+        /// The next layer's router applied to a single-row block's input: `layer`'s experts in bank `bank`, ranked
+        /// by that router's logits, best first. Reported only when [#predicts()].
+        default void prediction(int layer, int bank, int[] ranked) {}
+
+        /// Whether to run and report the next layer's router on every single-row block.
+        default boolean predicts() {
+            return false;
+        }
     }
 
     /// Reports every MoE block's demand to `demand` (null stops it). Diagnostics, never production.
