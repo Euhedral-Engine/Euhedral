@@ -22,19 +22,11 @@ import java.util.Objects;
 /// lazily by the loads that miss it, and replaced by the shards' policy.
 public final class RamTier implements AutoCloseable {
 
-    /// How a shard shares its slots among the layers.
-    public enum Policy {
-        /// Each layer has a quota in proportion to its experts, lent to the layers that need it.
-        BANK_PARTITIONED,
-        /// One recency order over every record: the baseline.
-        GLOBAL_LRU
-    }
-
     private static final long PAGE = 4096;
 
     private final ExpertBank[] banks;
     private final ExpertKeys keys;
-    private final Policy policy;
+    private final ReplacementPolicy policy;
     private final int shards;
     private final long slotBytes;
     private final int slotCount;
@@ -46,7 +38,7 @@ public final class RamTier implements AutoCloseable {
 
     /// A tier of at most `slotCount` slots over `banks`, in `shards` shards. A tier with a slot for every
     /// record is resident, and holds exactly that many.
-    public RamTier(ExpertBank[] banks, int slotCount, int shards, Policy policy) {
+    public RamTier(ExpertBank[] banks, int slotCount, int shards, ReplacementPolicy policy) {
         this.banks = banks.clone();
         this.keys = new ExpertKeys(this.banks);
         this.policy = Objects.requireNonNull(policy, "policy");
@@ -70,8 +62,8 @@ public final class RamTier implements AutoCloseable {
         this.shardList = new RamTierShard[shards];
         int first = 0;
         for (int shard = 0; shard < shards; shard++) {
-            this.shardList[shard] =
-                    new RamTierShard(this, this.keys, shard, first, sizes[shard], policy == Policy.BANK_PARTITIONED);
+            this.shardList[shard] = new RamTierShard(
+                    this, this.keys, shard, first, sizes[shard], policy == ReplacementPolicy.BANK_PARTITIONED);
             first += sizes[shard];
         }
         if (this.resident) for (int shard = 0; shard < shards; shard++) this.shardList[shard].assignResident(shard);
@@ -86,7 +78,7 @@ public final class RamTier implements AutoCloseable {
         return this.shardList[shard];
     }
 
-    public Policy policy() {
+    public ReplacementPolicy policy() {
         return this.policy;
     }
 
