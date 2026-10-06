@@ -1,13 +1,15 @@
 package io.euhedral_execution.inference.core.scheduling;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.scheduling.graph.FrameLake;
 import io.euhedral_execution.inference.core.scheduling.graph.GraphShape;
 import io.euhedral_execution.inference.core.scheduling.graph.GraphStorage;
+import io.euhedral_execution.inference.core.scheduling.graph.InferenceLake;
 import io.euhedral_execution.inference.core.scheduling.graph.LanePool;
-import io.euhedral_execution.inference.core.scheduling.graph.QwenExecutionSource;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 import io.euhedral_execution.inference.core.scheduling.graph.StageQuantum;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -22,29 +24,39 @@ import java.util.function.Supplier;
 
 /// Admits Qwen quanta into reusable frame graphs and owns the Euhedral sources that run them.
 ///
-/// Admission acquires an idle graph for the quantum's plan view, binds the graph's workspace storage and
-/// prepares quantum-owned resources on that graph's stream, and publishes the root stages. After that it
-/// is out of the execution path: the stages publish their successors, workers take the published frames
-/// (first come, first served, or routed through the lattice by the frame's hash), and the quantum's
-/// retirement frame recycles the graph, with its storage, before publishing the outcome. No central
-/// scheduler decides where a stage runs.
+/// Admission acquires an idle graph for the quantum's plan view, binds the graph's workspace
+/// storage and prepares quantum-owned resources on that graph's stream, and publishes the root
+/// stages. After that it is out of the execution path: the stages publish their successors, workers
+/// take the published frames (first come, first served, or routed through the lattice by the
+/// frame's hash), and the quantum's retirement frame recycles the graph, with its storage, before
+/// publishing the outcome. No central scheduler decides where a stage runs.
 ///
-/// Each graph publishes through its own source, attached to the lattice once when the graph is built.
-/// Independent quanta therefore stay independent: a worker draining one graph's source never holds
-/// another quantum's ready frames.
+/// Each graph publishes through its own source, attached to the lattice once when the graph is
+/// built. Independent quanta therefore stay independent: a worker draining one graph's source never
+/// holds another quantum's ready frames.
 public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     private static final Consumer<QwenExecutionContext> NO_TERMINAL_CONSUMER = ignored -> {};
+    /// Ingest sinks of the runtime's lake (upstream sources of the lattice) and the producer
+    /// partitions of each.
+    static final int LAKE_SINKS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_SINKS", "4"));
+    static final int LAKE_PARTITIONS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_PARTITIONS", "2"));
 
-    private final LatticeTerminal lattice;
-    /// The dense plan this runtime executes, or null for a runtime that runs any [GraphShape] a caller gives it.
+    /// The dense plan this runtime executes, or null for a runtime that runs any [GraphShape] a
+    /// caller gives it.
     private final QwenExecutionPlan plan;
     private final ExecutionGpu gpu;
     private final ConcurrentHashMap<GraphShape, GraphPool> pools = new ConcurrentHashMap<>();
     private final Object closeLock = new Object();
-    /// Host work that is not a quantum's stage (prompt tokenization), attached on first use.
+    /// The pool of ready work that every graph's stages, the driver callbacks and the host work
+    /// throw frames into: this runtime is the root source of the lattice, through the lake's ingest
+    /// sinks.
+    private final InferenceLake lake;
+    private final boolean ownsLake;
+    /// What the graphs publish through: the lake, with this runtime's quanta counted.
+    private final QuantumLake quanta = new QuantumLake();
+    /// Host work that is not a quantum's stage (prompt tokenization), published into the lake.
     private final HostTasks hostTasks;
-    private final boolean ownsHostTasks;
     private boolean closed;
     /// Device lanes shared by every graph, opened with the first graph.
     private LanePool lanes;
@@ -52,15 +64,16 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     private final int laneCount;
     /// Held by the quantum that stages weights, from its admission until its last stage submitted.
     private final java.util.concurrent.Semaphore stagingHold = new java.util.concurrent.Semaphore(1);
-    /// Whether the staging ring holds the decode view's first slots ([QwenExecutionPlan#prefetchesRing]).
-    /// Read and written only under `stagingHold`.
+    /// Whether the staging ring holds the decode view's first slots
+    /// ([QwenExecutionPlan#prefetchesRing]). Read and written only under `stagingHold`.
     private boolean ringPreloaded;
-    /// Recorded on the releasing quantum's home lane once its lanes joined; the next staging quantum's
-    /// preparation awaits it, so its first copies follow every earlier read of the ring.
+    /// Recorded on the releasing quantum's home lane once its lanes joined; the next staging
+    /// quantum's preparation awaits it, so its first copies follow every earlier read of the ring.
     private long stagingIdle;
 
     /// Decode, verification and draft quanta replay CUDA graphs captured from earlier quanta
-    /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage instead.
+    /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage
+    /// instead.
     static final boolean CAPTURE_GRAPHS = !"0".equals(System.getenv("EUHEDRAL_CUDA_GRAPHS"));
 
     private final boolean captureGraphs;
@@ -70,8 +83,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return Math.min(Runtime.getRuntime().availableProcessors(), LanePool.MAX_LANES);
     }
 
-    /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime closed
-    /// releases its streams itself, because close() never saw it.
+    /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime
+    /// closed releases its streams itself, because close() never saw it.
     private LanePool lanes() {
         synchronized (this.laneLock) {
             synchronized (this.closeLock) {
@@ -109,19 +122,26 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
     }
 
+    /// A lake of the default shape (sinks and producer partitions) attached to `lattice`, for a
+    /// runtime that an owner builds in parts.
+    public static InferenceLake newLake(LatticeTerminal lattice) {
+        return new InferenceLake(lattice, LAKE_SINKS, LAKE_PARTITIONS);
+    }
+
     /// A runtime whose lane pool has one lane per available processor.
     public EuhedralInferenceRuntime(LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu) {
         this(lattice, plan, gpu, laneCount());
     }
 
     /// A runtime of any model: it runs the [GraphShape]s its callers admit through [#admit], on
-    /// `laneCount` device lanes, with host work published through `hostTasks` (which the caller
-    /// owns). Quanta are never captured into CUDA graphs.
-    public EuhedralInferenceRuntime(LatticeTerminal lattice, HostTasks hostTasks, ExecutionGpu gpu, int laneCount) {
+    /// `laneCount` device lanes, throwing every ready frame into `lake` (which the caller owns and
+    /// has attached to the lattice) and running host work through `hostTasks` (also the caller's).
+    /// Quanta are never captured into CUDA graphs.
+    public EuhedralInferenceRuntime(InferenceLake lake, HostTasks hostTasks, ExecutionGpu gpu, int laneCount) {
         this.captureGraphs = false;
-        this.lattice = Objects.requireNonNull(lattice, "lattice");
+        this.lake = Objects.requireNonNull(lake, "lake");
+        this.ownsLake = false;
         this.hostTasks = Objects.requireNonNull(hostTasks, "hostTasks");
-        this.ownsHostTasks = false;
         this.plan = null;
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
@@ -134,13 +154,14 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         this(lattice, plan, gpu, laneCount, CAPTURE_GRAPHS);
     }
 
-    /// A runtime that captures decode, verification and draft quanta into CUDA graphs only with `captureGraphs`.
+    /// A runtime that captures decode, verification and draft quanta into CUDA graphs only with
+    /// `captureGraphs`.
     EuhedralInferenceRuntime(
             LatticeTerminal lattice, QwenExecutionPlan plan, ExecutionGpu gpu, int laneCount, boolean captureGraphs) {
         this.captureGraphs = captureGraphs;
-        this.lattice = Objects.requireNonNull(lattice, "lattice");
-        this.hostTasks = new HostTasks(lattice);
-        this.ownsHostTasks = true;
+        this.lake = new InferenceLake(lattice, LAKE_SINKS, LAKE_PARTITIONS);
+        this.ownsLake = true;
+        this.hostTasks = new HostTasks(this.lake);
         this.plan = Objects.requireNonNull(plan, "plan").executionOwner();
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
@@ -183,8 +204,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// Admits one quantum. The returned future completes after its device work retired and the
-    /// quantum's graph was recycled. A quantum is admitted at most once: when admission itself fails,
-    /// the failure is thrown and the quantum's outcome is failed as well.
+    /// quantum's graph was recycled. A quantum is admitted at most once: when admission itself
+    /// fails, the failure is thrown and the quantum's outcome is failed as well.
     public CompletableFuture<QwenExecutionContext.Outcome> submit(
             QwenExecutionContext context, Consumer<? super QwenExecutionContext> terminalConsumer) {
         Objects.requireNonNull(context, "context");
@@ -249,7 +270,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
         StageGraph graph = pooled.graph();
         try {
-            graph.source().admit();
+            this.quanta.admit();
         } catch (RuntimeException | Error failure) {
             pool.recycle(pooled);
             quantum.lanesJoined(null);
@@ -281,7 +302,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             if (!started) {
                 quantum.lanesJoined(null);
                 pool.recycle(pooled);
-                graph.source().terminated();
+                this.quanta.terminated();
                 // Outcome callbacks never run with the graph's stream selected.
                 quantum.publishOutcome();
             }
@@ -306,9 +327,9 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return this.hostTasks.prefixFrames();
     }
 
-    /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when its
-    /// lanes were proven idle instead. `preloaded`: every stage of a prefetching quantum ran, so the ring
-    /// holds the decode view's first slots once `stagingIdle` is reached.
+    /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when
+    /// its lanes were proven idle instead. `preloaded`: every stage of a prefetching quantum ran,
+    /// so the ring holds the decode view's first slots once `stagingIdle` is reached.
     private void releaseStaging(GpuStream home, boolean preloaded) {
         try {
             if (home != null) home.mark(this.stagingIdle);
@@ -333,8 +354,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
     }
 
-    /// Stops admission, waits for every accepted quantum to retire, detaches the graphs' sources from
-    /// Euhedral, and releases their streams.
+    /// Stops admission, waits for every accepted quantum to retire, detaches the graphs' sources
+    /// from Euhedral, and releases their streams.
     @Override
     public void close() {
         synchronized (this.closeLock) {
@@ -342,21 +363,15 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             this.closed = true;
         }
         RuntimeException failure = null;
-        if (this.ownsHostTasks) {
+        if (this.ownsLake) {
             try {
                 this.hostTasks.close();
             } catch (RuntimeException completionFailure) {
                 failure = completionFailure;
             }
         }
-        for (GraphPool pool : this.pools.values()) {
-            try {
-                pool.completeSources();
-            } catch (RuntimeException completionFailure) {
-                if (failure == null) failure = completionFailure;
-                else failure.addSuppressed(completionFailure);
-            }
-        }
+        // Every accepted quantum retires on the lattice before its graph, workspace and lanes are released.
+        this.quanta.awaitIdle();
         for (GraphPool pool : this.pools.values()) {
             try {
                 pool.close();
@@ -385,6 +400,15 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 else failure.addSuppressed(closeFailure);
             }
         }
+        if (this.ownsLake) {
+            try {
+                this.lake.completeGracefully();
+                this.lake.awaitTermination();
+            } catch (RuntimeException completionFailure) {
+                if (failure == null) failure = completionFailure;
+                else failure.addSuppressed(completionFailure);
+            }
+        }
         if (failure != null) throw failure;
     }
 
@@ -404,15 +428,74 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     /// Admitted quanta whose graphs have not yet retired.
     public int activeQuanta() {
-        int active = 0;
-        for (GraphPool pool : this.pools.values()) active += pool.activeQuanta();
-        return active;
+        return this.quanta.active();
     }
 
-    /// Whether any graph's source is still attached to Euhedral.
+    /// Whether the lake's sinks are still attached to the lattice.
     public boolean isAttached() {
-        for (GraphPool pool : this.pools.values()) if (pool.attached()) return true;
-        return false;
+        return this.lake.isAttached();
+    }
+
+    /// The runtime's lake: the root source of the lattice, which every producer throws ready frames
+    /// into.
+    public InferenceLake lake() {
+        return this.lake;
+    }
+
+    /// The host work of this runtime.
+    public HostTasks hostTasks() {
+        return this.hostTasks;
+    }
+
+    /// The lake as the graphs see it: publishing goes to the lake, and the quanta they carry are
+    /// counted so that a closing runtime can wait for them whatever else the lake carries.
+    private final class QuantumLake implements FrameLake {
+        private static final int CLOSED = Integer.MIN_VALUE;
+        private final java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger();
+        private final CompletableFuture<Void> idle = new CompletableFuture<>();
+
+        @Override
+        public void publish(AbstractFrame frame) {
+            EuhedralInferenceRuntime.this.lake.publish(frame);
+        }
+
+        @Override
+        public void publishFromCallback(AbstractFrame frame) {
+            EuhedralInferenceRuntime.this.lake.publishFromCallback(frame);
+        }
+
+        @Override
+        public void admit() {
+            EuhedralInferenceRuntime.this.lake.admit();
+            this.count.incrementAndGet();
+        }
+
+        @Override
+        public void admitDuringDrain() {
+            EuhedralInferenceRuntime.this.lake.admitDuringDrain();
+            this.count.incrementAndGet();
+        }
+
+        @Override
+        public void terminated() {
+            try {
+                EuhedralInferenceRuntime.this.lake.terminated();
+            } finally {
+                if (this.count.decrementAndGet() == CLOSED) this.idle.complete(null);
+            }
+        }
+
+        int active() {
+            return this.count.get() & Integer.MAX_VALUE;
+        }
+
+        /// Waits for every admitted quantum to terminate; new quanta are refused in the meantime by
+        /// the runtime's closed flag.
+        void awaitIdle() {
+            int old = this.count.getAndUpdate(value -> value | CLOSED);
+            if ((old & Integer.MAX_VALUE) == 0) this.idle.complete(null);
+            this.idle.join();
+        }
     }
 
     /// A reusable graph and the workspace storage its quanta bind. Both are recycled together, only
@@ -454,7 +537,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                                     frames,
                                     lanes,
                                     true,
-                                    new QwenExecutionSource(),
+                                    EuhedralInferenceRuntime.this.quanta,
                                     retired -> recycle(pooled[0]),
                                     gpu::openStream)
                             : new StageGraph(
@@ -462,7 +545,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                                     frames,
                                     lanes,
                                     true,
-                                    new QwenExecutionSource(),
+                                    EuhedralInferenceRuntime.this.quanta,
                                     retired -> recycle(pooled[0]));
             pooled[0] = new PooledGraph(graph, storage);
             synchronized (EuhedralInferenceRuntime.this.closeLock) {
@@ -475,45 +558,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     this.built.add(pooled[0]);
                 }
             }
-            // Attached once per reusable graph, never per quantum. A close from here on completes it.
-            EuhedralInferenceRuntime.this.lattice.addUpstream(graph.source());
             return pooled[0];
-        }
-
-        /// Closes each graph's admission, then waits until its accepted quantum retired and Euhedral
-        /// detached the source. The first failure is reported after every graph was completed.
-        void completeSources() {
-            List<StageGraph> graphs;
-            synchronized (this.built) {
-                graphs = this.built.stream().map(PooledGraph::graph).toList();
-            }
-            RuntimeException failure = null;
-            for (StageGraph graph : graphs) {
-                try {
-                    graph.source().completeGracefully();
-                } catch (RuntimeException completionFailure) {
-                    if (failure == null) failure = completionFailure;
-                    else failure.addSuppressed(completionFailure);
-                }
-            }
-            for (StageGraph graph : graphs) {
-                try {
-                    graph.source().awaitTermination();
-                } catch (java.util.concurrent.CompletionException terminationFailure) {
-                    // A downstream completion failure was already reported by completeGracefully.
-                    if (failure == null) failure = terminationFailure;
-                }
-            }
-            if (failure != null) throw failure;
-        }
-
-        int activeQuanta() {
-            int active = 0;
-            synchronized (this.built) {
-                for (PooledGraph pooled : this.built)
-                    active += pooled.graph().source().activeGraphs();
-            }
-            return active;
         }
 
         long replayedQuanta() {
@@ -524,14 +569,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             return replayed;
         }
 
-        boolean attached() {
-            synchronized (this.built) {
-                for (PooledGraph pooled : this.built)
-                    if (pooled.graph().source().isAttached()) return true;
-            }
-            return false;
-        }
-
         long retainedWorkspaceBytes() {
             long bytes = 0;
             synchronized (this.built) {
@@ -540,8 +577,9 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             return bytes;
         }
 
-        /// Releases each retired graph's stream and storage. A GPU that cannot prove its submitted work
-        /// stopped keeps the storage, which stays counted: queued kernels may still reference it.
+        /// Releases each retired graph's stream and storage. A GPU that cannot prove its submitted
+        /// work stopped keeps the storage, which stays counted: queued kernels may still reference
+        /// it.
         void close() {
             RuntimeException failure = null;
             boolean proven = EuhedralInferenceRuntime.this.gpu.completionProven();

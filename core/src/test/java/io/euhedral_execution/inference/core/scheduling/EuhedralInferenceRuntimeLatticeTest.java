@@ -11,9 +11,6 @@ import io.euhedral_execution.core.config.LatticeConfig;
 import io.euhedral_execution.core.control_plane.ControlPlaneLattice;
 import io.euhedral_execution.core.control_plane.ControlPlaneShard;
 import io.euhedral_execution.core.flow_control.LatticeEdge;
-import io.euhedral_execution.core.frames.AbstractFrame;
-import io.euhedral_execution.core.generics.LatticeReceiver;
-import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
@@ -136,12 +133,15 @@ class EuhedralInferenceRuntimeLatticeTest {
                     assertEquals(
                             QwenExecutionContext.Status.SUCCESS,
                             second.get(10, TimeUnit.SECONDS).getFirst().status());
-                    assertEquals(2, attachments.get(), "each reusable graph attaches its source once");
+                    assertEquals(
+                            EuhedralInferenceRuntime.LAKE_SINKS,
+                            attachments.get(),
+                            "the runtime attaches its lake once");
                     assertEquals(0, runtime.activeQuanta());
                 } finally {
                     gpu.embeddingGate.release();
                 }
-                // Later quanta reuse the idle graphs: no further source is attached.
+                // Later quanta reuse the idle graphs and the lake: no further source is attached.
                 for (int index = 0; index < 4; index++) {
                     assertEquals(
                             QwenExecutionContext.Status.SUCCESS,
@@ -154,7 +154,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                                     .getFirst()
                                     .status());
                 }
-                assertEquals(2, attachments.get());
+                assertEquals(EuhedralInferenceRuntime.LAKE_SINKS, attachments.get());
             } finally {
                 runtime.close();
             }
@@ -186,29 +186,7 @@ class EuhedralInferenceRuntimeLatticeTest {
     void closeReportsADownstreamCompletionFailureAfterTheGraphsRetired() throws Exception {
         var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
         var completionFailure = new IllegalStateException("injected downstream completion failure");
-        var runtime = new EuhedralInferenceRuntime(
-                upstream -> {
-                    upstream.addDownstream(new LatticeReceiver() {
-                        @Override
-                        public void addUpstream(LatticeSource source) {}
-
-                        @Override
-                        public void push(AbstractFrame frame) {
-                            PullingLattice.run(frame);
-                        }
-
-                        @Override
-                        public void onError(Throwable error) {}
-
-                        @Override
-                        public void onComplete() {
-                            throw completionFailure;
-                        }
-                    });
-                    upstream.request(Long.MAX_VALUE);
-                },
-                plan,
-                new ConcurrentGpu());
+        var runtime = new EuhedralInferenceRuntime(new PullingLattice(completionFailure), plan, new ConcurrentGpu());
         var outcome = runtime.execute(List.of(new QwenExecutionContext(
                 plan, new QwenSequenceState(703), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1})));
         assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.getFirst().status());

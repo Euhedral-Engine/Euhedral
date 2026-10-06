@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.host.HostFrames;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -19,46 +20,52 @@ import org.slf4j.LoggerFactory;
 /// A bounded cache of routed experts in device memory, keyed by `(bank ordinal, expert)`.
 ///
 /// The device holds exactly `slotCount * slotBytes` bytes for it: one slab, allocated once through
-/// [GpuMemory#allocate] and sliced into equal slots, each large enough for any record. An expert is used
-/// through a lease ([#acquire]), which pins its slot: a slot that is loading or leased is never evicted or
-/// refilled, so the address a lease exposes is valid until it is closed. Everything else is replaced least
-/// recently used first (a slot's recency is the last time a lease on it was closed).
+/// [GpuMemory#allocate] and sliced into equal slots, each large enough for any record. An expert is
+/// used through a lease ([#acquire]), which pins its slot: a slot that is loading or leased is
+/// never evicted or refilled, so the address a lease exposes is valid until it is closed.
+/// Everything else is replaced least recently used first (a slot's recency is the last time a lease
+/// on it was closed).
 ///
-/// Misses are loaded by the acquirer that found them: it reserves a slot (a free one, else the least recently
-/// used unpinned resident), opens the record in the [HostExpertStore] and starts the [ExpertTransfer], all
-/// outside the cache's lock, then waits for completion like everyone else. Concurrent requests for an expert
-/// that is already loading join that transfer instead of starting another. An acquirer that is interrupted or
-/// times out gives up only its own claim: a transfer that was started completes and leaves the expert
-/// resident, whoever is left waiting for it.
+/// Misses are loaded by the acquirer that found them: it reserves a slot (a free one, else the
+/// least recently used unpinned resident), opens the record in the [HostExpertStore] and starts the
+/// [ExpertTransfer], all outside the cache's lock, then waits for completion like everyone else.
+/// Concurrent requests for an expert that is already loading join that transfer instead of starting
+/// another. An acquirer that is interrupted or times out gives up only its own claim: a transfer
+/// that was started completes and leaves the expert resident, whoever is left waiting for it.
 ///
-/// A failed transfer fails every acquirer waiting for it with an [ExpertTransferException], returns the slot
-/// to the free list and leaves nothing behind; the next request for the expert starts a new transfer.
+/// A failed transfer fails every acquirer waiting for it with an [ExpertTransferException], returns
+/// the slot to the free list and leaves nothing behind; the next request for the expert starts a
+/// new transfer.
 ///
-/// The directory and the slot metadata are primitive arrays sized by the number of experts and slots; the
-/// only objects are one small record per transfer in flight and one lease per open lease.
+/// The directory and the slot metadata are primitive arrays sized by the number of experts and
+/// slots; the only objects are one small record per transfer in flight and one lease per open
+/// lease.
 ///
 /// ## Closing
 ///
-/// [#close()] rejects new requests and aborts the waiting ones, waits (up to the close timeout) for transfers
-/// in flight to complete, then invalidates every lease still open (they report `isValid() == false`; a caller
-/// that still has device work reading a slot must have ordered it before closing, as the slab is freed),
-/// closes the transfer and the store, and frees the slab, each exactly once. If transfers are still in flight
-/// at the timeout nothing is released and `close()` throws; calling it again retries.
+/// [#close()] rejects new requests and aborts the waiting ones, waits (up to the close timeout) for
+/// transfers in flight to complete, then invalidates every lease still open (they report `isValid()
+/// == false`; a caller that still has device work reading a slot must have ordered it before
+/// closing, as the slab is freed), closes the transfer and the store, and frees the slab, each
+/// exactly once. If transfers are still in flight at the timeout nothing is released and `close()`
+/// throws; calling it again retries.
 ///
-/// A caller holding leases while acquiring another can exhaust the slots and wait for itself: a thread should
-/// not hold more leases than there are slots less those other threads need, or should use a timeout.
+/// A caller holding leases while acquiring another can exhaust the slots and wait for itself: a
+/// thread should not hold more leases than there are slots less those other threads need, or should
+/// use a timeout.
 ///
 /// ## Asynchronous requests
 ///
-/// [#acquireAsync] and [#prefetch] never block the caller, and nothing on their path waits on a thread or in
-/// a queue. A hit answers at once; a miss reserves a slot and the load proceeds as a chain of frames: the
-/// record's open ([HostExpertStore#openAsync], whose read runs as frames of its own), the copy
-/// ([ExpertTransfer#startAsync]), and the copy's completion as a frame, which ends by answering every request
-/// that asked for the expert, each with its own lease. Each completion is what makes the next piece of work
-/// available. A requester bounds what it has outstanding by the slots it may use; a request that finds every
-/// slot pinned or loading broke that bound and fails at once, instead of queueing to hide it. A request
-/// cannot be withdrawn: a requester that no longer wants its lease closes it. The blocking [#acquire] shares
-/// all of the state and remains for callers that are not lattice workers.
+/// [#acquireAsync] and [#prefetch] never block the caller, and nothing on their path waits on a
+/// thread or in a queue. A hit answers at once; a miss reserves a slot and the load proceeds as a
+/// chain of frames: the record's open ([HostExpertStore#openAsync], whose read runs as frames of
+/// its own), the copy ([ExpertTransfer#startAsync]), and the copy's completion as a frame, which
+/// ends by answering every request that asked for the expert, each with its own lease. Each
+/// completion is what makes the next piece of work available. A requester bounds what it has
+/// outstanding by the slots it may use; a request that finds every slot pinned or loading broke
+/// that bound and fails at once, instead of queueing to hide it. A request cannot be withdrawn: a
+/// requester that no longer wants its lease closes it. The blocking [#acquire] shares all of the
+/// state and remains for callers that are not lattice workers.
 public final class ExpertCache implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(ExpertCache.class);
 
@@ -99,6 +106,8 @@ public final class ExpertCache implements AutoCloseable {
     private final DeviceFence[] fence;
     private final Load[] load;
     private final boolean[] prefetched;
+    /// Per slot, the device marker its copy records (streaming transfers only; 0 otherwise).
+    private final long[] readyMarker;
     private final int[] prev;
     private final int[] next;
     private int freeHead = NONE;
@@ -115,16 +124,16 @@ public final class ExpertCache implements AutoCloseable {
     private boolean storeClosed;
     private boolean slabFreed;
 
-    /// A cache of `slotCount` slots of `slotBytes` bytes over `store`, whose records `transfer` moves into a
-    /// slab allocated from `memory`. The cache owns `store` and `transfer` once this constructor returns, and
-    /// closes them; if it throws, the caller still owns them.
+    /// A cache of `slotCount` slots of `slotBytes` bytes over `store`, whose records `transfer`
+    /// moves into a slab allocated from `memory`. The cache owns `store` and `transfer` once this
+    /// constructor returns, and closes them; if it throws, the caller still owns them.
     public ExpertCache(
             HostExpertStore store, ExpertTransfer transfer, GpuMemory memory, int slotCount, long slotBytes) {
         this(store, transfer, memory, slotCount, slotBytes, System::nanoTime, DEFAULT_CLOSE_TIMEOUT_NANOS, null);
     }
 
-    /// As above, whose asynchronous requests ([#acquireAsync], [#prefetch]) run their continuations as host
-    /// work on `frames`.
+    /// As above, whose asynchronous requests ([#acquireAsync], [#prefetch]) run their continuations
+    /// as host work on `frames`.
     public ExpertCache(
             HostExpertStore store,
             ExpertTransfer transfer,
@@ -143,8 +152,8 @@ public final class ExpertCache implements AutoCloseable {
                 Objects.requireNonNull(frames, "frames"));
     }
 
-    /// As above, with the nanosecond clock that times the statistics and the time [#close()] waits for
-    /// transfers in flight.
+    /// As above, with the nanosecond clock that times the statistics and the time [#close()] waits
+    /// for transfers in flight.
     ///
     /// @throws IllegalArgumentException when `slotBytes` is smaller than the largest record of any bank, is not
     ///     a multiple of [#SLOT_ALIGNMENT], or the cache would need more than 2^63 bytes
@@ -198,6 +207,7 @@ public final class ExpertCache implements AutoCloseable {
         this.fence = new DeviceFence[slotCount];
         this.load = new Load[slotCount];
         this.prefetched = new boolean[slotCount];
+        this.readyMarker = new long[slotCount];
         this.prev = new int[slotCount];
         this.next = new int[slotCount];
         for (int slot = 0; slot < slotCount; slot++) {
@@ -208,6 +218,23 @@ public final class ExpertCache implements AutoCloseable {
         this.freeHead = 0;
         this.deviceBase = memory.allocate(capacity);
         if (this.deviceBase == 0) throw new IllegalStateException("the device slab allocation returned a null address");
+        if (transfer.streams()) {
+            try {
+                for (int slot = 0; slot < slotCount; slot++) this.readyMarker[slot] = transfer.openMarker();
+            } catch (RuntimeException | Error failure) {
+                closeMarkers();
+                memory.free(this.deviceBase);
+                throw failure;
+            }
+        }
+    }
+
+    private void closeMarkers() {
+        for (int slot = 0; slot < this.readyMarker.length; slot++) {
+            if (this.readyMarker[slot] == 0) continue;
+            this.transfer.closeMarker(this.readyMarker[slot]);
+            this.readyMarker[slot] = 0;
+        }
     }
 
     /// The smallest slot size that holds every record of `banks`.
@@ -217,8 +244,8 @@ public final class ExpertCache implements AutoCloseable {
 
     // ---------------------------------------------------------------- acquiring
 
-    /// Returns a lease on the expert, loading it when it is not resident and waiting for a slot when every
-    /// slot is leased or loading.
+    /// Returns a lease on the expert, loading it when it is not resident and waiting for a slot
+    /// when every slot is leased or loading.
     ///
     /// @throws IndexOutOfBoundsException when `bank` or `expert` is out of range
     /// @throws ExpertTransferException when loading the expert failed
@@ -251,7 +278,8 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// Returns a lease on the expert only when it is resident, without waiting and without starting a load.
+    /// Returns a lease on the expert only when it is resident, without waiting and without starting
+    /// a load.
     ///
     /// @throws IllegalStateException when the cache is closed
     public Optional<ExpertLease> tryAcquire(int bank, int expert) {
@@ -268,8 +296,8 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// What one pass through the directory decided: a lease (hit), a load to run and wait for (miss, as its
-    /// loader), or a load to wait for (joined).
+    /// What one pass through the directory decided: a lease (hit), a load to run and wait for
+    /// (miss, as its loader), or a load to wait for (joined).
     private static final class Claim {
         private final ExpertLease lease;
         private final Load load;
@@ -282,26 +310,33 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// One transfer, from the reservation of its slot to its completion. For an asynchronous load it is also
-    /// the listener of its record's opening and the completion of its copy, so a load allocates nothing else.
-    private final class Load implements HostExpertStore.OpenListener, ExpertTransfer.Completion {
+    /// One transfer, from the reservation of its slot to its completion. For an asynchronous load
+    /// it is also the listener of its record's opening and the completion of its copy, so a load
+    /// allocates nothing else.
+    public final class Load implements HostExpertStore.OpenListener, ExpertTransfer.Completion {
         private final int slot;
         private final int key;
         private final int generation;
         private final long bytes;
         private final int bank;
         private final int expert;
-        /// Started by [#prefetch]: the load itself holds the slot's first pin, released when it finishes.
+        /// Started by [#prefetch]: the load itself holds the slot's first pin, released when it
+        /// finishes.
         private boolean prefetch;
-        /// The slot's pending fence, taken for the transfer to wait behind; guarded by the cache lock.
+        /// The slot's pending fence, taken for the transfer to wait behind; guarded by the cache
+        /// lock.
         private DeviceFence fence;
 
         private boolean finished;
         private Throwable failure;
         private boolean retriable;
         private volatile long startNanos;
+        /// The copy was submitted on the streaming path: requests that find the slot loading are
+        /// served a lease that carries the copy's marker. Guarded by the cache lock.
+        private boolean streamed;
 
-        /// Asynchronous requests waiting for this load, each holding one pin; guarded by the cache lock.
+        /// Asynchronous requests waiting for this load, each holding one pin; guarded by the cache
+        /// lock.
         private ExpertListener[] listeners = new ExpertListener[2];
         private int[] tags = new int[2];
         private int listenerCount;
@@ -313,6 +348,81 @@ public final class ExpertCache implements AutoCloseable {
             this.bytes = bytes;
             this.bank = bank;
             this.expert = expert;
+        }
+
+        /// The expert this load brings.
+        public int expert() {
+            return this.expert;
+        }
+
+        public int bank() {
+            return this.bank;
+        }
+
+        /// Reads the record from the store into pinned host memory, on the calling thread: the one
+        /// blocking step of a load, which the caller runs in a frame of its own. The caller owns
+        /// the record. A caller within its bound on outstanding records never waits for a staging
+        /// slot.
+        public HostRecord open() throws IOException, InterruptedException {
+            return ExpertCache.this.store.open(this.bank, this.expert);
+        }
+
+        /// Submits the copy of `record` (opened by the reserving caller) on copy lane `lane` and
+        /// returns the lease that the load's own claim on the slot becomes: it carries the marker
+        /// the copy records, so the caller's device work waits for the bytes on its own stream
+        /// while no host thread waits for them. `retired` is armed on the lane's stream and called
+        /// once the copy retired; the caller then confirms it with [#retire(int, long, Throwable)].
+        /// A load whose record was opened and not submitted ends with [#fail].
+        ///
+        /// @throws RuntimeException when the copy was not armed; the caller recovers the lane,
+        ///     closes the record and ends the load with [#fail]
+        public ExpertLease submit(int lane, HostRecord record, GpuStream.RetirementListener retired) {
+            if (record.byteSize() != this.bytes)
+                throw new IllegalStateException("the store returned " + record.byteSize() + " bytes for a record of "
+                        + this.bytes + " (bank " + this.bank + ", expert " + this.expert + ")");
+            long marker = ExpertCache.this.readyMarker[this.slot];
+            this.startNanos = ExpertCache.this.clock.getAsLong();
+            ExpertCache.this.transfer.stream(lane, record, slotAddress(this.slot), this.fence, marker, retired);
+            ExpertCache.this.lock.lock();
+            try {
+                this.streamed = true;
+                return newLease(this.slot, this.generation, this.bank, this.expert, marker);
+            } finally {
+                ExpertCache.this.lock.unlock();
+            }
+        }
+
+        /// Ends a load whose record was opened (or not: `record` null) but whose copy was not
+        /// armed: the lane's stream is proved idle first when `touchedLane`, the record is
+        /// released, and the slot returns to the cache.
+        public void abandon(int lane, HostRecord record, Throwable failure, boolean touchedLane) {
+            if (touchedLane) {
+                try {
+                    ExpertCache.this.transfer.recover(lane, failure);
+                } catch (RuntimeException | Error recoverFailure) {
+                    failure.addSuppressed(recoverFailure);
+                }
+            }
+            closeQuietly(record);
+            finishLoad(this, failure, false);
+        }
+
+        /// The copy retired: the expert is resident once nobody holds it. `failure` is the device's
+        /// report, or null.
+        public void retire(int lane, long ticket) {
+            Throwable failure = null;
+            try {
+                failure = ExpertCache.this.transfer.confirm(lane, ticket);
+            } catch (Throwable confirmFailure) {
+                failure = confirmFailure;
+            }
+            finishStreamed(this, failure);
+        }
+
+        /// Ends a load that never submitted its copy (the record could not be read, or the copy was
+        /// not armed).
+        public void fail(Throwable failure) {
+            finishLoad(this, failure, false);
         }
 
         void addListener(ExpertListener listener, int tag) {
@@ -423,12 +533,16 @@ public final class ExpertCache implements AutoCloseable {
     }
 
     private ExpertLease newLease(int slot, int generation, int bank, int expert) {
-        this.leasesOpen++;
-        return new ExpertLease(this, this.banks[bank], bank, expert, slot, generation, slotAddress(slot));
+        return newLease(slot, generation, bank, expert, 0);
     }
 
-    /// Takes the free or least recently used slot `victim` for `fresh`. Called with the lock held; changes
-    /// only primitives, so it cannot fail halfway.
+    private ExpertLease newLease(int slot, int generation, int bank, int expert, long readyMarker) {
+        this.leasesOpen++;
+        return new ExpertLease(this, this.banks[bank], bank, expert, slot, generation, slotAddress(slot), readyMarker);
+    }
+
+    /// Takes the free or least recently used slot `victim` for `fresh`. Called with the lock held;
+    /// changes only primitives, so it cannot fail halfway.
     private void reserve(int victim, Load fresh) {
         if (this.state[victim] == RESIDENT) {
             lruRemove(victim);
@@ -460,9 +574,9 @@ public final class ExpertCache implements AutoCloseable {
 
     // ---------------------------------------------------------------- loading
 
-    /// Opens the record and starts its transfer, on the acquirer that reserved the slot and outside the lock.
-    /// Returns once the transfer is under way (its completion may already have run); throws when it never
-    /// started, after resetting the slot.
+    /// Opens the record and starts its transfer, on the acquirer that reserved the slot and outside
+    /// the lock. Returns once the transfer is under way (its completion may already have run);
+    /// throws when it never started, after resetting the slot.
     private void runLoader(Load load, int bank, int expert, long deadline, boolean timed)
             throws InterruptedException, TimeoutException {
         HostRecord record = null;
@@ -513,9 +627,9 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// Ends `load`. `abandoned` marks a load dropped before any transfer started, which its waiters retry.
-    /// Returns false when the load had already ended. The asynchronous requests that waited for it are
-    /// answered here, after the lock is released.
+    /// Ends `load`. `abandoned` marks a load dropped before any transfer started, which its waiters
+    /// retry. Returns false when the load had already ended. The asynchronous requests that waited
+    /// for it are answered here, after the lock is released.
     private boolean finishLoad(Load load, Throwable failure, boolean abandoned) {
         DeviceFence consumed = null;
         ExpertLease[] granted = null;
@@ -598,11 +712,105 @@ public final class ExpertCache implements AutoCloseable {
 
     // ---------------------------------------------------------------- asynchronous requests
 
-    /// Asks for the expert without blocking: `listener` is called exactly once with a lease (which the
-    /// requester then owns and must close) or the reason there is none. See the class documentation.
+    // ---------------------------------------------------------------- streaming requests
+
+    /// The answer to [#claim]: a lease, or a load that the caller runs.
+    public static final class Ticket {
+        private ExpertLease lease;
+        private Load load;
+
+        /// The lease, when the expert was resident (or its copy already submitted).
+        public ExpertLease lease() {
+            return this.lease;
+        }
+
+        /// The load to run when the expert was not in the cache: its slot is reserved for the
+        /// caller.
+        public Load load() {
+            return this.load;
+        }
+    }
+
+    /// Asks for the expert on the streaming path, which no thread waits on and nothing queues
+    /// behind: the answer is a lease (the expert is resident, or another request's copy of it was
+    /// already submitted and the lease carries its marker) or a [Load] for the caller to run
+    /// ([Load#submit]). The caller bounds what it has outstanding by the slots it may use; a
+    /// request that finds every slot pinned or loading fails at once.
     ///
-    /// A hit calls the listener on the calling thread before this returns; anything else, later on a worker.
-    /// The listener must not block.
+    /// @throws IllegalStateException when the cache is closed, was not built with a streaming
+    ///     transfer, the expert is loading by another path, or no slot is free or evictable
+    public void claim(int bank, int expert, Ticket ticket) {
+        if (this.readyMarker.length == 0 || !this.transfer.streams())
+            throw new IllegalStateException("the cache was not built with a streaming transfer");
+        int key = this.keys.key(bank, expert);
+        ticket.lease = null;
+        ticket.load = null;
+        this.lock.lock();
+        try {
+            ensureOpen();
+            int slot = this.directory[key];
+            if (slot != NONE) {
+                if (this.state[slot] == LOADING) {
+                    Load joined = this.load[slot];
+                    if (!joined.streamed)
+                        throw new IllegalStateException(
+                                "expert " + expert + " of bank " + bank + " is being loaded by another request");
+                    this.pins[slot]++;
+                    this.stats.coalesced();
+                    ticket.lease = newLease(slot, this.generation[slot], bank, expert, this.readyMarker[slot]);
+                    return;
+                }
+                this.stats.hit();
+                ticket.lease = pin(slot, bank, expert);
+            } else if (this.freeHead != NONE || this.lruHead != NONE) {
+                int victim = this.freeHead != NONE ? this.freeHead : this.lruHead;
+                Load fresh = new Load(
+                        victim, key, this.generation[victim] + 1, this.banks[bank].recordBytes(expert), bank, expert);
+                reserve(victim, fresh);
+                this.stats.miss();
+                ticket.load = fresh;
+            } else {
+                throw new IllegalStateException("every expert slot is in use or loading: " + this.pinned + " of "
+                        + this.slotCount + " (bank " + bank + ", expert " + expert + ")");
+            }
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    /// Ends a streamed load whose copy retired. The caller's lease keeps the slot pinned; with a
+    /// device failure the expert is no longer found by later requests, and the slot is returned as
+    /// an ordinary evictable one when its holders close their leases.
+    private void finishStreamed(Load load, Throwable failure) {
+        if (failure == null) {
+            finishLoad(load, null, false);
+            return;
+        }
+        DeviceFence consumed;
+        this.lock.lock();
+        try {
+            if (load.finished) return;
+            load.finished = true;
+            load.failure = failure;
+            this.load[load.slot] = null;
+            this.loading--;
+            if (this.directory[load.key] == load.slot) this.directory[load.key] = NONE;
+            consumed = load.fence;
+            load.fence = null;
+            this.stats.failedTransfer();
+            this.loadFinished.signalAll();
+        } finally {
+            this.lock.unlock();
+        }
+        releaseFence(consumed);
+    }
+
+    /// Asks for the expert without blocking: `listener` is called exactly once with a lease (which
+    /// the requester then owns and must close) or the reason there is none. See the class
+    /// documentation.
+    ///
+    /// A hit calls the listener on the calling thread before this returns; anything else, later on
+    /// a worker. The listener must not block.
     ///
     /// @throws IllegalStateException when the cache is closed, was built without host frames, or more requests wait
     ///     for a slot than the cache has slots; the listener is not called
@@ -656,9 +864,10 @@ public final class ExpertCache implements AutoCloseable {
         else startLoad(start);
     }
 
-    /// Starts the load of the expert if it is neither resident nor loading and a slot is free or evictable
-    /// right now. Once the load ends it holds no lease and no pin: the expert is an ordinary evictable
-    /// resident, counted as a used prefetch if a request finds it before it is evicted. Never waits.
+    /// Starts the load of the expert if it is neither resident nor loading and a slot is free or
+    /// evictable right now. Once the load ends it holds no lease and no pin: the expert is an
+    /// ordinary evictable resident, counted as a used prefetch if a request finds it before it is
+    /// evicted. Never waits.
     ///
     /// @return whether a load was started
     /// @throws IllegalStateException when the cache is closed or was built without host frames
@@ -684,8 +893,8 @@ public final class ExpertCache implements AutoCloseable {
         return true;
     }
 
-    /// Begins a reserved load: its record is opened without blocking, and the open's completion starts the
-    /// copy.
+    /// Begins a reserved load: its record is opened without blocking, and the open's completion
+    /// starts the copy.
     private void startLoad(Load load) {
         try {
             this.store.openAsync(load.bank, load.expert, this.frames, load, 0);
@@ -694,8 +903,8 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// Waits for `load`, whose slot is pinned for this acquirer, and returns the lease; null when the load
-    /// was abandoned and the request should start over.
+    /// Waits for `load`, whose slot is pinned for this acquirer, and returns the lease; null when
+    /// the load was abandoned and the request should start over.
     private ExpertLease awaitLoad(Load load, int bank, int expert, long deadline, boolean timed, long begin)
             throws InterruptedException, TimeoutException {
         this.lock.lock();
@@ -771,10 +980,16 @@ public final class ExpertCache implements AutoCloseable {
     /// Removes one pin from a slot that has leases. Called with the lock held.
     private void unpin(int slot) {
         if (--this.pins[slot] > 0) return;
+        // A streamed load whose copy has not retired keeps its slot: the leases may all be closed (the kernels that
+        // read
+        // it were submitted behind the copy's marker), but the copy is still writing it. Its retirement makes the slot
+        // evictable.
+        if (this.state[slot] == LOADING) return;
         evictable(slot);
     }
 
-    /// A slot with no claims becomes the most recently used evictable resident. Called with the lock held.
+    /// A slot with no claims becomes the most recently used evictable resident. Called with the
+    /// lock held.
     private void evictable(int slot) {
         this.state[slot] = RESIDENT;
         lruAppend(slot);
@@ -862,8 +1077,8 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// Whether the expert's record is in a slot now (resident, leased or being refreshed by no one). A
-    /// loading expert is not resident.
+    /// Whether the expert's record is in a slot now (resident, leased or being refreshed by no
+    /// one). A loading expert is not resident.
     public boolean isResident(int bank, int expert) {
         int key = this.keys.key(bank, expert);
         this.lock.lock();
@@ -887,8 +1102,8 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// [#checkInvariants()], and also that no request is in progress: nothing is loading, and the pins are
-    /// exactly the open leases.
+    /// [#checkInvariants()], and also that no request is in progress: nothing is loading, and the
+    /// pins are exactly the open leases.
     ///
     /// @throws IllegalStateException naming the first violation
     public void checkQuiescent() {
@@ -905,9 +1120,9 @@ public final class ExpertCache implements AutoCloseable {
         }
     }
 
-    /// Verifies the cache's bookkeeping, which holds at any moment, and throws [IllegalStateException] naming
-    /// the first inconsistency: the directory and the slots agree, every slot is in exactly the list its
-    /// state says, no lease is without a pin.
+    /// Verifies the cache's bookkeeping, which holds at any moment, and throws
+    /// [IllegalStateException] naming the first inconsistency: the directory and the slots agree,
+    /// every slot is in exactly the list its state says, no lease is without a pin.
     public void checkInvariants() {
         this.lock.lock();
         try {
@@ -988,8 +1203,8 @@ public final class ExpertCache implements AutoCloseable {
 
     // ---------------------------------------------------------------- closing
 
-    /// Closes the cache as described in the class documentation. Safe to call more than once and from any
-    /// thread.
+    /// Closes the cache as described in the class documentation. Safe to call more than once and
+    /// from any thread.
     ///
     /// @throws IllegalStateException when transfers were still in flight at the close timeout (nothing was
     ///     released; call again to retry) or releasing a resource failed
@@ -1036,12 +1251,13 @@ public final class ExpertCache implements AutoCloseable {
         releaseResources();
     }
 
-    /// Closes the transfer, then the store, then frees the slab, each at most once even when one of them
-    /// fails: only a failing transfer close stops the sequence, as the slab and the host records may still be
-    /// in use by a copy.
+    /// Closes the transfer, then the store, then frees the slab, each at most once even when one of
+    /// them fails: only a failing transfer close stops the sequence, as the slab and the host
+    /// records may still be in use by a copy.
     private void releaseResources() {
         synchronized (this.closeMonitor) {
             if (!this.transferClosed) {
+                closeMarkers();
                 this.transfer.close();
                 this.transferClosed = true;
             }

@@ -66,12 +66,15 @@ final class Qwen4Shape implements GraphShape {
     private final List<Spec> specs = new ArrayList<>();
     private final List<Edge[]> incoming = new ArrayList<>();
     private final int waveCap;
+    private final int[] loadStages;
     private final StageTopology topology;
 
     Qwen4Shape(Qwen4ExecutionPlan plan, Qwen4ExecutionPlan.ShapeKey key) {
         this.plan = plan;
         this.key = key;
         this.waveCap = plan.maxWaves(key.rows());
+        this.loadStages =
+                new int[Math.max(1, key.range().endLayer() - key.range().firstLayer()) * this.waveCap];
         build();
         int[][] dependencies = new int[this.incoming.size()][];
         Boundary[][] boundaries = new Boundary[this.incoming.size()][];
@@ -119,7 +122,6 @@ final class Qwen4Shape implements GraphShape {
             previous = add(Kind.EMBED, -1, -1);
             edge = between;
         }
-        int window = this.plan.window();
         for (int layer = range.firstLayer(); layer < range.endLayer(); layer++) {
             if (layer == this.plan.pleLayer()) {
                 previous = add(Kind.PLE, layer, -1, follow(previous, edge));
@@ -137,10 +139,10 @@ final class Qwen4Shape implements GraphShape {
             int planned = add(Kind.PLAN, layer, -1, retired(route));
             int[] waves = new int[this.waveCap];
             for (int w = 0; w < this.waveCap; w++) {
-                Edge[] loadEdges = w >= window
-                        ? new Edge[] {after(planned), after(waves[w - window])}
-                        : new Edge[] {after(planned)};
-                int load = add(Kind.LOAD, layer, w, loadEdges);
+                // The window's gates are not edges of the shape: the experts of a wave are items that the plan stage
+                // spawns, and an item runs when the wave `window` before its own was submitted.
+                int load = add(Kind.LOAD, layer, w, after(planned));
+                this.loadStages[(layer - range.firstLayer()) * this.waveCap + w] = load;
                 waves[w] = add(Kind.WAVE, layer, w, after(load), after(w == 0 ? route : waves[w - 1]));
             }
             previous = add(Kind.FINISH, layer, -1, after(waves[this.waveCap - 1]), after(shared));
@@ -166,6 +168,11 @@ final class Qwen4Shape implements GraphShape {
     @Override
     public GraphStorage newStorage(ExecutionGpu gpu) {
         return this.plan.leaseStorage(gpu, this.key.rows());
+    }
+
+    /// The stage that collects the arrivals of wave `wave` of `layer`.
+    int loadStage(int layer, int wave) {
+        return this.loadStages[(layer - this.key.range().firstLayer()) * this.waveCap + wave];
     }
 
     Qwen4ExecutionPlan plan() {

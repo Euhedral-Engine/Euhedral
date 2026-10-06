@@ -9,16 +9,16 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.concurrent.atomic.LongAdder;
 
-/// The sparse MoE block of a Flash-Next layer (Qwen4ExpTextSparseMoeBlock): a router chooses ten of 512
-/// experts per token, a shared expert runs for every token, and
+/// The sparse MoE block of a Flash-Next layer (Qwen4ExpTextSparseMoeBlock): a router chooses ten of
+/// 512 experts per token, a shared expert runs for every token, and
 ///
 /// ```
 /// out = routed experts (weighted, summed in ascending expert order) + sigmoid(shared gate) * shared expert
 /// ```
 ///
-/// The routed experts are not on the device: they pass through the [ExpertCache]. One instance is the block
-/// resources of one stage graph (its route readback, its wave descriptors, the leases a block holds); the
-/// stages of the graph use it in turn, never concurrently:
+/// The routed experts are not on the device: they pass through the [ExpertCache]. One instance is
+/// the block resources of one stage graph (its route readback, its wave descriptors, the leases a
+/// block holds); the stages of the graph use it in turn, never concurrently:
 ///
 /// 1. [#submitRouting] queues the router and the copy of its choice to the host. The plan stage follows it
 ///    across a device-completion edge, so the host learns the routing without waiting for work that does not
@@ -34,11 +34,12 @@ import java.util.concurrent.atomic.LongAdder;
 ///    lease is held only while the kernels are being submitted;
 /// 4. [#submitFinish] combines the routed sum with the shared expert's gated output.
 ///
-/// No device pointer into a slot outlives its lease: the kernels read the slot addresses from the descriptor
-/// the wave built while it held the leases, and the fence orders their completion before the slot's next use.
+/// No device pointer into a slot outlives its lease: the kernels read the slot addresses from the
+/// descriptor the wave built while it held the leases, and the fence orders their completion before
+/// the slot's next use.
 ///
-/// One block is in flight at a time (a graph runs one quantum, and its layers in turn), so the per-block
-/// state is plain fields.
+/// One block is in flight at a time (a graph runs one quantum, and its layers in turn), so the
+/// per-block state is plain fields.
 public final class Qwen4MoeLayer implements AutoCloseable {
 
     /// The block's weights: the BF16 router and shared-expert gate, the NVFP4 shared expert.
@@ -210,9 +211,9 @@ public final class Qwen4MoeLayer implements AutoCloseable {
 
     // ---------------------------------------------------------------- the pieces of a block
 
-    /// Queues the router (logits, softmax, top ten, renormalized weights) and the copy of its choice to the
-    /// host, on the layer's stream. The caller arms a retirement boundary after this, then calls
-    /// [#submitShared].
+    /// Queues the router (logits, softmax, top ten, renormalized weights) and the copy of its
+    /// choice to the host, on the layer's stream. The caller arms a retirement boundary after this,
+    /// then calls [#submitShared].
     public void submitRouting(Weights weights, long input, int rows, Scratch scratch) {
         if (rows <= 0 || rows > this.maxRows) throw new IllegalArgumentException("rows " + rows);
         Qwen4Ops.linearBf16(
@@ -251,9 +252,9 @@ public final class Qwen4MoeLayer implements AutoCloseable {
                 this.gpu, input, weights.sharedExpertGate().address(), scratch.gateRaw(), rows, this.hidden, 1);
     }
 
-    /// Reads the routing the device copied (readable once the boundary armed after [#submitRouting] retired)
-    /// and plans the waves of the block over `rows` rows, for the layer whose experts are bank `bank`.
-    /// Returns the waves.
+    /// Reads the routing the device copied (readable once the boundary armed after [#submitRouting]
+    /// retired) and plans the waves of the block over `rows` rows, for the layer whose experts are
+    /// bank `bank`. Returns the waves.
     public int plan(int bank, int rows) {
         int pairs = rows * this.topK;
         MemorySegment.copy(this.routeIds.segment(), INT, 0, this.ids, 0, pairs);
@@ -278,14 +279,14 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         return this.wave.waveCount();
     }
 
-    /// Experts of the planned block, in wave order: the positions the loads and the held leases are indexed
-    /// by.
+    /// Experts of the planned block, in wave order: the positions the loads and the held leases are
+    /// indexed by.
     public int activeExperts() {
         return this.wave.activeExperts();
     }
 
-    /// Position of wave `w`'s first expert in the block's flattened list (`waveStart(waveCount())` is the
-    /// total).
+    /// Position of wave `w`'s first expert in the block's flattened list (`waveStart(waveCount())`
+    /// is the total).
     public int waveStart(int w) {
         return this.waveStart[w];
     }
@@ -312,6 +313,11 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         return this.bank;
     }
 
+    /// Most experts a block can name: the length of its flattened list of waves.
+    public int maxExperts() {
+        return this.held.length;
+    }
+
     /// Most waves a block can have: the descriptors one block uses.
     public int maxWaves() {
         return this.hostDescriptors.length;
@@ -322,7 +328,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         return this.maxWaveExperts;
     }
 
-    /// Stores the lease that the load of position `position` produced, for the wave that will submit it.
+    /// Stores the lease that the load of position `position` produced, for the wave that will
+    /// submit it.
     public void hold(int position, ExpertLease lease) {
         this.held[position] = lease;
     }
@@ -351,6 +358,12 @@ public final class Qwen4MoeLayer implements AutoCloseable {
                 if (lease == null)
                     throw new IllegalStateException("wave " + w + " is missing the lease of expert " + i);
                 this.wave.setSlot(descriptor, i, lease.deviceAddress());
+            }
+            // An expert whose copy was only submitted is waited for here, on the device: the lane that runs the kernels
+            // waits for the marker the copy recorded, and no host thread waits for the bytes.
+            for (int i = 0; i < count; i++) {
+                long ready = this.held[first + i].readyMarker();
+                if (ready != 0) stream.await(ready);
             }
             long deviceDescriptor = this.deviceDescriptors[w];
             this.gpu.copyUploadToDevice(deviceDescriptor, this.hostDescriptors[w]);

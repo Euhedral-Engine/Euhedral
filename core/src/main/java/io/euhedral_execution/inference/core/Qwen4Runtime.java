@@ -10,31 +10,34 @@ import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.scheduling.GenerationSession;
 import io.euhedral_execution.inference.core.scheduling.HostTasks;
 import io.euhedral_execution.inference.core.scheduling.Qwen4GenerationSession;
+import io.euhedral_execution.inference.core.scheduling.graph.InferenceLake;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
-/// What a Flash-Next engine runs on: the storage the residency plan produced, the execution plan over it, the
-/// lattice runtime that instantiates and runs the plan's stage graphs, and the lattice attachments its host work
-/// is published through. It owns resources, not execution threads and not a scheduler: a generation is a chain
-/// of continuations ([Qwen4GenerationSession]), a step is a quantum of a static stage graph
-/// ([Qwen4ExecutionPlan]) that the lattice runs, the expert hierarchy's reads, copies and completions are frames
-/// too, and every one of them runs on the lattice's workers. Nothing here waits for the device or the artifact
-/// with a thread of its own.
+/// What a Flash-Next engine runs on: the storage the residency plan produced, the execution plan
+/// over it, the lattice runtime that instantiates and runs the plan's stage graphs, and the lattice
+/// attachments its host work is published through. It owns resources, not execution threads and not
+/// a scheduler: a generation is a chain of continuations ([Qwen4GenerationSession]), a step is a
+/// quantum of a static stage graph ([Qwen4ExecutionPlan]) that the lattice runs, the expert
+/// hierarchy's reads, copies and completions are frames too, and every one of them runs on the
+/// lattice's workers. Nothing here waits for the device or the artifact with a thread of its own.
 ///
-/// Two attachments, so that unrelated work stays independent: `execution` carries the expert pipeline and the
-/// generation chain (everything that serves the GPU), `host` carries the work around a request (tokenizing,
-/// rendering).
+/// Two attachments, so that unrelated work stays independent: `execution` carries the expert
+/// pipeline and the generation chain (everything that serves the GPU), `host` carries the work
+/// around a request (tokenizing, rendering).
 final class Qwen4Runtime implements AutoCloseable {
 
-    /// Device lanes the stages of a step spread over: the critical chain and the shared expert's side branch.
+    /// Device lanes the stages of a step spread over: the critical chain and the shared expert's
+    /// side branch.
     private static final int LANES = 2;
 
     private final Qwen4Storage storage;
     private final EuhedralInferenceRuntime runtime;
     private final Qwen4ExecutionPlan plan;
+    private final InferenceLake lake;
     private final HostTasks execution;
     private final HostTasks host;
     private boolean closed;
@@ -43,8 +46,10 @@ final class Qwen4Runtime implements AutoCloseable {
             Qwen4Storage storage,
             EuhedralInferenceRuntime runtime,
             Qwen4ExecutionPlan plan,
+            InferenceLake lake,
             HostTasks execution,
             HostTasks host) {
+        this.lake = lake;
         this.storage = storage;
         this.runtime = runtime;
         this.plan = plan;
@@ -52,18 +57,19 @@ final class Qwen4Runtime implements AutoCloseable {
         this.host = host;
     }
 
-    /// Loads the `qwen4_exp` artifact of `config` as a text model whose host work runs on `lattice`, which must be
-    /// started and outlive the runtime.
+    /// Loads the `qwen4_exp` artifact of `config` as a text model whose host work runs on
+    /// `lattice`, which must be started and outlive the runtime.
     static Qwen4Runtime load(InferenceConfig config, LatticeTerminal lattice) throws IOException {
-        HostTasks execution = new HostTasks(lattice);
-        HostTasks host = new HostTasks(lattice);
+        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
+        HostTasks execution = new HostTasks(lake);
+        HostTasks host = new HostTasks(lake);
         Qwen4Storage storage = Qwen4Storage.load(config, execution);
         EuhedralInferenceRuntime runtime = null;
         try {
-            runtime = new EuhedralInferenceRuntime(lattice, execution, storage.gpu(), LANES);
+            runtime = new EuhedralInferenceRuntime(lake, execution, storage.gpu(), LANES);
             Qwen4ExecutionPlan plan =
                     new Qwen4ExecutionPlan(storage.gpu(), storage.model(), config.maxContextTokens(), runtime);
-            return new Qwen4Runtime(storage, runtime, plan, execution, host);
+            return new Qwen4Runtime(storage, runtime, plan, lake, execution, host);
         } catch (Throwable failure) {
             try {
                 if (runtime != null) runtime.close();
@@ -74,6 +80,8 @@ final class Qwen4Runtime implements AutoCloseable {
             try {
                 host.close();
                 execution.close();
+                lake.completeGracefully();
+                lake.awaitTermination();
             } catch (RuntimeException cleanup) {
                 failure.addSuppressed(cleanup);
             }
@@ -133,9 +141,9 @@ final class Qwen4Runtime implements AutoCloseable {
         return this.host.tokenize(tokenizer, text, modelSpecialTokens);
     }
 
-    /// Releases the executor, the storage (which settles every expert transfer: the lattice still runs their
-    /// completions), then drains and detaches the host work. The owner has stopped admission and ended every
-    /// generation before calling.
+    /// Releases the executor, the storage (which settles every expert transfer: the lattice still
+    /// runs their completions), then drains and detaches the host work. The owner has stopped
+    /// admission and ended every generation before calling.
     @Override
     public synchronized void close() {
         if (this.closed) return;
@@ -160,6 +168,13 @@ final class Qwen4Runtime implements AutoCloseable {
                 if (failure == null) failure = closeFailure;
                 else failure.addSuppressed(closeFailure);
             }
+        }
+        try {
+            this.lake.completeGracefully();
+            this.lake.awaitTermination();
+        } catch (RuntimeException closeFailure) {
+            if (failure == null) failure = closeFailure;
+            else failure.addSuppressed(closeFailure);
         }
         if (failure != null) throw failure;
     }
