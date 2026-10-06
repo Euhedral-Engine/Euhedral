@@ -69,7 +69,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     private final int maxRows;
     private final Qwen4ExpertRouting routing;
     private final ExecutionGpu.ReadbackBuffer routeIds;
-    // Diagnostics: the next layer's router applied to this layer's input, for one row (allocated on first use).
+    // The next layer's router applied to this layer's input, for one row (allocated on first use): the prediction
+    // a prefetch reads ahead by, and that a demand recording reports.
     private ExecutionGpu.ReadbackBuffer predictedLogits;
     private long predictedDevice;
     private boolean predicted;
@@ -370,7 +371,7 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     }
 
     /// Queues, behind this block's routing, the next layer's router (`next`) applied to this block's single row: a
-    /// prediction of the experts the next layer will ask for, read back for [#reportDemand]. Diagnostics only.
+    /// prediction of the experts the next layer will ask for, read back for [#takePrediction].
     void submitPrediction(Weights next, long input) {
         if (this.predictedLogits == null) {
             this.predictedLogits = this.gpu.allocateReadbackBuffer(2L * this.experts);
@@ -382,20 +383,35 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         this.predicted = true;
     }
 
-    /// Reports the latest block's distinct experts and their routed rows to `demand`, and the next layer's
-    /// predicted experts (ranked by the next router's logits) when [#submitPrediction] queued them.
-    void reportDemand(Qwen4ExecutionPlan.ExpertDemand demand, int layer, int nextBank, int rows) {
-        if (this.predicted) {
-            this.predicted = false;
-            short[] logits = new short[this.experts];
-            MemorySegment.copy(this.predictedLogits.segment(), SHORT, 0, logits, 0, this.experts);
-            Integer[] order = new Integer[this.experts];
-            for (int e = 0; e < this.experts; e++) order[e] = e;
-            java.util.Arrays.sort(order, (a, b) -> Float.compare(bf16(logits[b]), bf16(logits[a])));
-            int[] ranked = new int[Math.min(64, this.experts)];
-            for (int i = 0; i < ranked.length; i++) ranked[i] = order[i];
-            demand.prediction(layer + 1, nextBank, ranked);
+    /// The `k` experts the prediction [#submitPrediction] queued ranks best, best first, or null when none was
+    /// queued; each prediction is taken once. A selection over the read-back logits: no sort, no boxing.
+    int[] takePrediction(int k) {
+        if (!this.predicted) return null;
+        this.predicted = false;
+        k = Math.min(k, this.experts);
+        int[] best = new int[k];
+        float[] value = new float[k];
+        int held = 0;
+        MemorySegment logits = this.predictedLogits.segment();
+        for (int e = 0; e < this.experts; e++) {
+            float v = bf16(logits.getAtIndex(SHORT, e));
+            if (held == k && v <= value[k - 1]) continue;
+            int at = held < k ? held++ : k - 1;
+            while (at > 0 && value[at - 1] < v) {
+                value[at] = value[at - 1];
+                best[at] = best[at - 1];
+                at--;
+            }
+            value[at] = v;
+            best[at] = e;
         }
+        return best;
+    }
+
+    /// Reports the latest block's distinct experts and their routed rows to `demand`, and `prediction` (the next
+    /// layer's experts ranked by its router) when there is one.
+    void reportDemand(Qwen4ExecutionPlan.ExpertDemand demand, int layer, int nextBank, int rows, int[] prediction) {
+        if (prediction != null) demand.prediction(layer + 1, nextBank, prediction);
         int bank = this.bank;
         int count = this.routing.activeExperts();
         int[] experts = new int[count];

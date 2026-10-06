@@ -78,6 +78,9 @@ public final class RamTierShard {
     private final AtomicLongArray evictions;
     private final AtomicLongArray bypasses;
     private final AtomicIntegerArray readyPerBank;
+    /// Slots a prefetch filled whose record nobody asked for since.
+    private final boolean[] prefetched;
+    private final java.util.concurrent.atomic.LongAdder prefetchesUsed = new java.util.concurrent.atomic.LongAdder();
 
     RamTierShard(
             RamTier tier,
@@ -115,6 +118,7 @@ public final class RamTierShard {
         this.evictions = new AtomicLongArray(banks);
         this.bypasses = new AtomicLongArray(banks);
         this.readyPerBank = new AtomicIntegerArray(banks);
+        this.prefetched = new boolean[slots];
 
         int[] owned = new int[banks];
         int ownedTotal = 0;
@@ -171,6 +175,10 @@ public final class RamTierShard {
                 this.pins[slot]++;
                 if (!this.resident) touch(slot, bank);
                 if (this.frequency) this.lastUse[slot] = this.clock;
+                if (this.prefetched[slot]) {
+                    this.prefetched[slot] = false;
+                    this.prefetchesUsed.increment();
+                }
                 count(this.hits, bank);
                 out.set(TierDirective.Mode.HIT, this.firstSlot + slot, this.tier.address(this.firstSlot + slot));
             } else {
@@ -195,6 +203,43 @@ public final class RamTierShard {
         out.set(TierDirective.Mode.FILL, this.firstSlot + slot, this.tier.address(this.firstSlot + slot));
     }
 
+    /// Plans a prefetch of `(bank, expert)`: a fill of a slot ahead of any request, which counts no request and
+    /// faces no admission. Writes [TierDirective.Mode#FILL] to `out` (the slot is pinned until [#filled] or
+    /// [#abandoned]) or [TierDirective.Mode#NONE] when the tier holds or is filling the record, or no slot can be
+    /// taken.
+    public void planPrefetch(int bank, int expert, TierDirective out) {
+        int key = this.keys.key(bank, expert);
+        if (this.resident || this.directory[key] != NONE) {
+            out.set(TierDirective.Mode.NONE, -1, 0);
+            return;
+        }
+        this.clock++;
+        int slot = take(bank, 0, false);
+        if (slot == NONE) {
+            out.set(TierDirective.Mode.NONE, -1, 0);
+            return;
+        }
+        this.state[slot] = FILLING;
+        this.pins[slot] = 1;
+        this.slotKey[slot] = key;
+        this.directory[key] = slot;
+        this.used[list(bank)]++;
+        if (this.frequency) this.lastUse[slot] = this.clock;
+        this.prefetched[slot] = true;
+        out.set(TierDirective.Mode.FILL, this.firstSlot + slot, this.tier.address(this.firstSlot + slot));
+    }
+
+    /// Whether the record's slot is being filled. On the owner.
+    public boolean isFilling(int bank, int expert) {
+        int slot = this.directory[this.keys.key(bank, expert)];
+        return slot != NONE && this.state[slot] == FILLING;
+    }
+
+    /// Prefetched records a later request found. Any thread.
+    public long prefetchesUsed() {
+        return this.prefetchesUsed.sum();
+    }
+
     /// The load that planned a hit is done with the slot.
     public void used(TierDirective directive) {
         int slot = directive.slot() - this.firstSlot;
@@ -215,6 +260,7 @@ public final class RamTierShard {
     /// The fill failed: the slot holds nothing usable and goes back to the free slots.
     public void abandoned(TierDirective directive) {
         int slot = directive.slot() - this.firstSlot;
+        this.prefetched[slot] = false;
         int key = this.slotKey[slot];
         this.directory[key] = NONE;
         this.used[list(this.keys.bankOf(key))]--;
@@ -294,6 +340,7 @@ public final class RamTierShard {
     }
 
     private void evict(int slot) {
+        this.prefetched[slot] = false;
         int key = this.slotKey[slot];
         int bank = this.keys.bankOf(key);
         unlink(slot, bank);

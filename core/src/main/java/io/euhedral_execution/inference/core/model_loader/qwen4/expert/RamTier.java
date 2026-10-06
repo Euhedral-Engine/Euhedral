@@ -199,6 +199,13 @@ public final class RamTier implements AutoCloseable {
                 this.preloadNanos);
     }
 
+    /// Prefetched records a later request found, over every shard. Any thread.
+    public long prefetchesUsed() {
+        long used = 0;
+        for (RamTierShard shard : this.shardList) used += shard.prefetchesUsed();
+        return used;
+    }
+
     /// [RamTierShard#checkInvariants()] of every shard. Read it with the tier quiescent.
     public void checkInvariants() {
         for (RamTierShard shard : this.shardList) shard.checkInvariants();

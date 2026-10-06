@@ -353,6 +353,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                             var tiersBefore = model.hierarchyStats();
                             var loadsBefore = executor.expertTimings();
                             long fullBefore = executor.expertFullFetches();
+                            long[] prefetchBefore = executor.expertPrefetches();
+                            long usedBefore = model.tierPrefetchesUsed();
                             var counters = executor.moeCounters();
                             LayerStats decodeLayers = new LayerStats();
                             if (context == 4096) executor.trace(decodeLayers);
@@ -385,6 +387,13 @@ class Qwen4PerformanceCudaIntegrationTest {
                                     (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
                                     (after.expertWaitNanos() - counters.expertWaitNanos()) / 1e6 / steps));
                             line("  tiers: " + tiers(model, tiersBefore, steps));
+                            long[] prefetchAfter = executor.expertPrefetches();
+                            if (prefetchAfter[0] + prefetchAfter[1] > 0)
+                                line(String.format(
+                                        "  prefetch: %.1f records read per token, %.1f of them used, %.1f failed",
+                                        (double) (prefetchAfter[0] - prefetchBefore[0]) / steps,
+                                        (double) (model.tierPrefetchesUsed() - usedBefore) / steps,
+                                        (double) (prefetchAfter[1] - prefetchBefore[1]) / steps));
                             line("  loads: "
                                     + loads(
                                             loadsBefore,

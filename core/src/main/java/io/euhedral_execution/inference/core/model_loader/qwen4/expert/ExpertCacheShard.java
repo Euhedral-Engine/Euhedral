@@ -621,6 +621,11 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         return this.loading;
     }
 
+    /// Whether the expert has a slot, resident, leased or loading. On the owner.
+    public boolean holds(int bank, int expert) {
+        return this.directory[this.keys.key(bank, expert)] != NONE;
+    }
+
     /// Whether the expert's record is in a slot now (resident or leased). A loading expert is not
     /// resident.
     public boolean isResident(int bank, int expert) {
