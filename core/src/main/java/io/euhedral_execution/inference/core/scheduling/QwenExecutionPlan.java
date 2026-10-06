@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.scheduling;
 
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.QwenWeights;
 import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.artifact.CompactTensorLayout;
@@ -16,6 +17,11 @@ import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDat
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
+import io.euhedral_execution.inference.core.scheduling.frames.QwenStageFrame;
+import io.euhedral_execution.inference.core.scheduling.graph.GraphShape;
+import io.euhedral_execution.inference.core.scheduling.graph.GraphStorage;
+import io.euhedral_execution.inference.core.scheduling.graph.StageFrame;
+import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 import io.euhedral_execution.inference.core.scheduling.graph.StageTopology;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -25,7 +31,7 @@ import java.util.Objects;
 
 /// Immutable operation instructions and dependency edges for the loaded Qwen text model.
 /// Model weights are borrowed; sequence state and quantum workspace have separate owners.
-public final class QwenExecutionPlan {
+public final class QwenExecutionPlan implements GraphShape {
 
     public enum Kind {
         EMBEDDING,
@@ -1017,6 +1023,21 @@ public final class QwenExecutionPlan {
     /// boundary is its retirement, where sequence state is published and quantum storage released.
     public StageTopology stageTopology() {
         return this.stageTopology;
+    }
+
+    @Override
+    public StageTopology topology() {
+        return this.stageTopology;
+    }
+
+    @Override
+    public StageFrame createStage(StageGraph graph, int stage, ExecutionGpu gpu) {
+        return QwenStageFrame.create(graph, this.instructions.get(stage), gpu);
+    }
+
+    @Override
+    public GraphStorage newStorage(ExecutionGpu gpu) {
+        return new QwenWorkspaceStorage(gpu);
     }
 
     public List<Integer> successors(int instructionId) {

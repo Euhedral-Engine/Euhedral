@@ -47,6 +47,18 @@ public final class QwenExecutionSource implements LatticeSource {
         }
     }
 
+    /// Accepts one more unit while the source drains: allowed only while an accepted unit is still running, whose
+    /// continuation this is, so a closing source finishes the work it holds and then refuses everything.
+    public void admitDuringDrain() {
+        while (true) {
+            int count = this.accepted.get();
+            if ((count & Integer.MAX_VALUE) == 0) throw new IllegalStateException("Qwen execution admission is closed");
+            if ((count & Integer.MAX_VALUE) == Integer.MAX_VALUE)
+                throw new IllegalStateException("too many active quanta");
+            if (this.accepted.compareAndSet(count, count + 1)) return;
+        }
+    }
+
     /// Accepted graphs that have not yet reached their terminal state.
     public int activeGraphs() {
         return this.accepted.get() & Integer.MAX_VALUE;
