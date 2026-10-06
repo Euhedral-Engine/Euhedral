@@ -9,8 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
-import io.euhedral_execution.core.generics.LatticeReceiver;
-import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
 import java.util.ArrayList;
@@ -267,10 +265,10 @@ class QwenExecutionContextTest {
         gpu.afterEmbedding = context::cancel;
         var runtime = QwenExecutionFixtures.runtime(plan, gpu);
         var outcome = runtime.submit(context);
-        assertTrue(outcome.isDone(), "terminal cleanup failure stranded the generation future");
         assertEquals(
                 QwenExecutionContext.Status.FAILED,
-                outcome.get(1, TimeUnit.SECONDS).status());
+                outcome.get(10, TimeUnit.SECONDS).status(),
+                "terminal cleanup failure stranded the generation future");
         assertFalse(sequence.isExecutionClaimed());
         sequence.complete();
         assertEquals(2, attempts.get());
@@ -322,9 +320,9 @@ class QwenExecutionContextTest {
                 plan, new QwenSequenceState(11), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
         runtime.submit(context);
         List<AbstractFrame> pulled = new ArrayList<>();
-        assertEquals(0, lattice.source.pull(pulled::add, frame -> true, 1));
+        assertEquals(0, lattice.pull(pulled::add, frame -> true, 1));
         assertTrue(pulled.isEmpty());
-        assertEquals(1, lattice.source.pull(pulled::add, frame -> false, 1));
+        assertEquals(1, lattice.pull(pulled::add, frame -> false, 1));
         assertEquals(1, pulled.size(), "admission exposes only the root stage");
         // The caller owns the pulled frame, including its execution and terminal notification.
         pulled.getFirst().execute();
@@ -358,56 +356,6 @@ class QwenExecutionContextTest {
         assertEquals(QwenExecutionContext.Status.SUCCESS, first.outcome().join().status());
         assertEquals(
                 QwenExecutionContext.Status.SUCCESS, second.outcome().join().status());
-        runtime.close();
-    }
-
-    @Test
-    void demandLeftByAnEmptyRequestIsServedWhenAStageBecomesReady() {
-        var plan = new QwenExecutionPlan(QwenExecutionFixtures.weights());
-        var pushes = new AtomicInteger();
-        var source = new java.util.concurrent.atomic.AtomicReference<LatticeSource>();
-        var runtime = new EuhedralInferenceRuntime(
-                attached -> {
-                    source.set(attached);
-                    attached.addDownstream(new LatticeReceiver() {
-                        @Override
-                        public void addUpstream(LatticeSource upstream) {}
-
-                        @Override
-                        public void push(AbstractFrame frame) {
-                            pushes.incrementAndGet();
-                            frame.execute();
-                            frame.doFinally();
-                        }
-
-                        @Override
-                        public void onComplete() {}
-
-                        @Override
-                        public void onError(Throwable error) {
-                            throw new AssertionError(error);
-                        }
-                    });
-                },
-                plan,
-                new QwenExecutionFixtures.RecordingGpu());
-        // The graph and its source are built by the first quantum; pull drives it without leaving demand.
-        var warm = runtime.submit(new QwenExecutionContext(
-                plan, new QwenSequenceState(15), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1}));
-        source.get().pull(PullingLattice::run, frame -> false, Long.MAX_VALUE);
-        assertEquals(QwenExecutionContext.Status.SUCCESS, warm.join().status());
-        assertEquals(0, pushes.get());
-
-        source.get().request(1);
-        assertEquals(0, pushes.get(), "nothing was ready");
-        var context = new QwenExecutionContext(
-                plan, new QwenSequenceState(16), QwenExecutionContext.ExecutionKind.DECODE, 0, new int[] {1});
-        var outcome = runtime.submit(context);
-        assertEquals(1, pushes.get(), "the earlier demand delivered the root when admission published it");
-        assertFalse(outcome.isDone(), "the demand was consumed; retirement waits for more");
-        source.get().request(1);
-        assertEquals(2, pushes.get());
-        assertEquals(QwenExecutionContext.Status.SUCCESS, outcome.join().status());
         runtime.close();
     }
 

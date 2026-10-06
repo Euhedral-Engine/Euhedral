@@ -21,14 +21,14 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/// A Flash-Next model whose storage is established and whose execution is not: every object has a known
-/// location, the fixed objects the plan keeps on the device are loaded, the routed experts sit behind a
-/// bounded device cache over a host store, the n-gram tables are on the host, and MTP and vision stay in the
-/// artifact unless the mode selects them.
+/// A Flash-Next model whose storage is established and whose execution is not: every object has a
+/// known location, the fixed objects the plan keeps on the device are loaded, the routed experts
+/// sit behind a bounded device cache over a host store, the n-gram tables are on the host, and MTP
+/// and vision stay in the artifact unless the mode selects them.
 ///
-/// The GPU is borrowed and must outlive the model. Close the model only after every lease on its expert cache
-/// is returned; closing releases the device slab, the staging ring, the fixed tensors and every host
-/// allocation.
+/// The GPU is borrowed and must outlive the model. Close the model only after every lease on its
+/// expert cache is returned; closing releases the device slab, the staging ring, the fixed tensors
+/// and every host allocation.
 public final class Qwen4Model implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(Qwen4Model.class);
@@ -63,8 +63,8 @@ public final class Qwen4Model implements AutoCloseable {
     }
 
     /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and
-    /// `maxContextTokens`, and loads the plan. Fails with the plan's explanation when no placement can serve
-    /// the context.
+    /// `maxContextTokens`, and loads the plan. Fails with the plan's explanation when no placement
+    /// can serve the context.
     public static Qwen4Model open(
             Path path,
             ExecutionGpu gpu,
@@ -82,7 +82,8 @@ public final class Qwen4Model implements AutoCloseable {
 
     /// Loads `plan`, which must have been made for `artifact`.
     ///
-    /// `frames` runs the expert hierarchy's continuations: reads, copies' completions, parked requests.
+    /// `frames` runs the expert hierarchy's continuations: reads, copies' completions, parked
+    /// requests.
     public static Qwen4Model load(
             Path path, Qwen4Artifact artifact, Qwen4ResidencyPlan plan, ExecutionGpu gpu, HostFrames frames)
             throws IOException {
@@ -107,7 +108,7 @@ public final class Qwen4Model implements AutoCloseable {
                     new FileExpertStore(
                             gpu, path, cachedBanks, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
             };
-            transfer = new GpuExpertTransfer(gpu, frames);
+            transfer = new GpuExpertTransfer(gpu, frames, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
             ExpertCache cache = new ExpertCache(
                     store,
                     transfer,
@@ -149,8 +150,8 @@ public final class Qwen4Model implements AutoCloseable {
         return this.plan;
     }
 
-    /// The fixed objects that are loaded (device resident, host staged or host mapped), by name; deferred
-    /// objects and the n-gram tables are not here.
+    /// The fixed objects that are loaded (device resident, host staged or host mapped), by name;
+    /// deferred objects and the n-gram tables are not here.
     public Map<String, TensorHandle> tensors() {
         return Collections.unmodifiableMap(this.fixed.handles());
     }
@@ -161,13 +162,14 @@ public final class Qwen4Model implements AutoCloseable {
         return handle;
     }
 
-    /// Pinned staging slots every expert record passes through when it is read from the artifact: the most
-    /// loads that can be outstanding at once.
+    /// Pinned staging slots every expert record passes through when it is read from the artifact:
+    /// the most loads that can be outstanding at once.
     public int stagingSlots() {
         return Qwen4ResidencyPlanner.fileStagingSlots(this.artifact.config());
     }
 
-    /// The device ring that host-staged fixed objects pass through, or null when none is host-staged.
+    /// The device ring that host-staged fixed objects pass through, or null when none is
+    /// host-staged.
     public WeightStaging staging() {
         return this.fixed.staging();
     }

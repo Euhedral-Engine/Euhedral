@@ -76,6 +76,11 @@ final class Qwen4GraphStorage {
     long routeArmedNanos;
     ExpertCacheStats.Snapshot traceBefore;
     final long[] loadBegin;
+    /// The block's experts as items, by position in its flattened list of waves.
+    final ExpertItem[] items;
+    final ExpertItem.Arrivals[] arrivals;
+    /// Per wave, the items that have not ended: the wave's slots are free when it reaches zero.
+    final java.util.concurrent.atomic.AtomicInteger[] waveLive;
 
     Qwen4GraphStorage(Qwen4ExecutionPlan plan, ExecutionGpu gpu, int rows) {
         this.gpu = gpu;
@@ -83,6 +88,11 @@ final class Qwen4GraphStorage {
         int hidden = plan.hidden();
         this.moe = plan.newMoeLayer(rows);
         this.loadBegin = new long[this.moe.maxWaves()];
+        this.items = new ExpertItem[this.moe.maxExperts()];
+        this.arrivals = new ExpertItem.Arrivals[this.moe.maxWaves()];
+        this.waveLive = new java.util.concurrent.atomic.AtomicInteger[this.moe.maxWaves()];
+        for (int w = 0; w < this.waveLive.length; w++)
+            this.waveLive[w] = new java.util.concurrent.atomic.AtomicInteger();
         this.tokenUpload = gpu.allocateUploadBuffer(4L * rows);
         try {
             long bf16 = Short.BYTES;
@@ -120,6 +130,16 @@ final class Qwen4GraphStorage {
         for (long address : this.allocations) this.gpu.free(address);
         this.allocations.clear();
         this.retained = 0;
+    }
+
+    /// An item of `wave` ended (its copy retired and its staging slot is free): when the whole wave
+    /// did, its cache slots are free, and the items of the wave `window` after it may take them.
+    void itemEnded(int wave, int window) {
+        if (this.waveLive[wave].decrementAndGet() != 0) return;
+        int released = wave + window;
+        if (released >= this.waves) return;
+        this.loadBegin[released] = System.nanoTime();
+        for (int p = this.moe.waveStart(released); p < this.moe.waveStart(released + 1); p++) this.items[p].arrive();
     }
 
     /// Most rows a quantum on this storage may have.

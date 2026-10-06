@@ -1,8 +1,6 @@
 package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertListener;
 import io.euhedral_execution.inference.core.scheduling.graph.StageFrame;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -14,6 +12,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class Qwen4Stages {
 
     private Qwen4Stages() {}
+
+    /// Whether the critical chain's stages keep one routing hash (the lane of the step); experiment
+    /// switch.
+    static final boolean ORDERED = System.getenv("EUHEDRAL_QWEN4_UNORDERED") == null;
 
     static StageFrame create(StageGraph graph, int stage, Qwen4Shape shape, Qwen4Shape.Spec spec) {
         int layer = spec.layer();
@@ -44,7 +46,11 @@ final class Qwen4Stages {
         final int layer;
 
         Base(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
-            super(graph, stage);
+            this(graph, stage, shape, layer, ORDERED);
+        }
+
+        Base(StageGraph graph, int stage, Qwen4Shape shape, int layer, boolean ordered) {
+            super(graph, stage, ordered);
             this.shape = shape;
             this.layer = layer;
         }
@@ -331,7 +337,7 @@ final class Qwen4Stages {
     /// movement.
     private static final class Shared extends Base {
         Shared(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
-            super(graph, stage, shape, layer);
+            super(graph, stage, shape, layer, false);
         }
 
         @Override
@@ -357,15 +363,65 @@ final class Qwen4Stages {
         protected void submit() {
             Qwen4GraphStorage storage = storage();
             Qwen4MoeLayer moe = storage.moe();
-            moe.chargeRouteWait(System.nanoTime() - storage.routeArmedNanos);
+            long now = System.nanoTime();
+            moe.chargeRouteWait(now - storage.routeArmedNanos);
             storage.waves = moe.plan(storage.bank, rows());
+            spawnItems();
+        }
+
+        /// Spawns the block's experts as items (frames that read, copy and hold one expert each),
+        /// lane by lane, and readies the arrival counts of the waves' load stages. The items of the
+        /// first `window` waves that lead a lane start now; the others start as their gates arrive.
+        private void spawnItems() {
+            Qwen4ExecutionPlan plan = plan();
+            Qwen4GraphStorage storage = storage();
+            Qwen4MoeLayer moe = storage.moe();
+            int total = moe.waveStart(storage.waves);
+            int lanes = Math.min(plan.copyLanes(), total);
+            int window = plan.window();
+            long now = System.nanoTime();
+            for (int w = 0; w < storage.waves; w++) {
+                ExpertItem.Arrivals arrivals = (ExpertItem.Arrivals) graph().stage(this.shape.loadStage(this.layer, w));
+                arrivals.expect(moe.waveStart(w + 1) - moe.waveStart(w));
+                storage.arrivals[w] = arrivals;
+                // The wave frees its slots when every item ended and the wave itself submitted (its leases closed).
+                storage.waveLive[w].set(moe.waveStart(w + 1) - moe.waveStart(w) + 1);
+                storage.loadBegin[w] = now;
+            }
+            int wave = 0;
+            for (int p = 0; p < total; p++) {
+                while (moe.waveStart(wave + 1) <= p) wave++;
+                int gates = (p >= lanes ? 1 : 0) + (wave >= window ? 1 : 0);
+                ExpertItem item = plan.obtainItem();
+                item.bind(
+                        graph(),
+                        quantum(),
+                        storage,
+                        plan,
+                        storage.arrivals[wave],
+                        storage.bank,
+                        moe.expertAt(p),
+                        p,
+                        wave,
+                        p % lanes,
+                        gates);
+                if (p >= lanes) storage.items[p - lanes].linkTo(item);
+                storage.items[p] = item;
+            }
+            // Gates were fixed when each item was bound: a published item may end (and open its successors) while
+            // this loop runs, so the starting set is decided by position and wave, not by reading the gates.
+            for (int p = 0; p < lanes; p++) {
+                if (moe.waveOf(p) >= window) continue;
+                storage.items[p].publish();
+            }
         }
     }
 
-    /// One wave's loads: every expert of the wave is asked of the cache at once, and the stage
-    /// completes when the last lease arrived, from whichever frame delivers it. A resident expert's
-    /// lease arrives before the stage returns. A wave the block does not have does nothing.
-    private static final class Load extends Base implements ExpertListener {
+    /// The arrival point of one wave's experts: the stage ends when every expert of the wave has
+    /// been taken from the cache or its copy submitted (each item reports its arrival), from
+    /// whichever frame reports the last. It does no work itself; a wave the block does not have
+    /// does nothing.
+    private static final class Load extends Base implements ExpertItem.Arrivals {
         private final int wave;
         private final AtomicInteger pending = new AtomicInteger();
 
@@ -384,49 +440,26 @@ final class Qwen4Stages {
             return this.wave >= storage().waves;
         }
 
+        /// The plan stage sets the count before it spawns an item, and this stage's own part (the
+        /// extra one) arrives when it runs.
+        @Override
+        public void expect(int count) {
+            this.pending.set(count + 1);
+        }
+
+        @Override
+        public void arrived() {
+            settle();
+        }
+
         @Override
         protected void submit() {
-            Qwen4GraphStorage storage = storage();
-            Qwen4MoeLayer moe = storage.moe();
-            storage.loadBegin[this.wave] = System.nanoTime();
-            int first = moe.waveStart(this.wave);
-            int count = moe.waveStart(this.wave + 1) - first;
-            // The count of leases to come, and one for this submission.
-            this.pending.set(count + 1);
             deferCompletion();
-            int issued = 0;
-            try {
-                for (; issued < count; issued++)
-                    plan().expertCache()
-                            .acquireAsync(storage.bank, moe.expertOf(this.wave, issued), this, first + issued);
-            } catch (Throwable failure) {
-                quantum().fail(failure);
-            } finally {
-                settle(1 + count - issued);
-            }
+            settle();
         }
 
-        /// A lease arrived (or the load failed): the wave's stage may finish when every one has.
-        @Override
-        public void ready(int position, ExpertLease lease, Throwable failure) {
-            try {
-                if (failure != null) quantum().fail(failure);
-                else if (quantum().stopRequested()) lease.close();
-                else {
-                    try {
-                        storage().moe().hold(position, lease);
-                    } catch (Throwable held) {
-                        lease.close();
-                        quantum().fail(held);
-                    }
-                }
-            } finally {
-                settle(1);
-            }
-        }
-
-        private void settle(int arrivals) {
-            if (this.pending.addAndGet(-arrivals) == 0) completeDeferred();
+        private void settle() {
+            if (this.pending.decrementAndGet() == 0) completeDeferred();
         }
     }
 
@@ -449,8 +482,10 @@ final class Qwen4Stages {
         protected void submit() {
             Qwen4GraphStorage storage = storage();
             Qwen4MoeLayer moe = storage.moe();
-            moe.chargeExpertWait(System.nanoTime() - storage.loadBegin[this.wave]);
+            long now = System.nanoTime();
+            moe.chargeExpertWait(now - storage.loadBegin[this.wave]);
             moe.submitWave(this.wave, laneStream(), storage.mixed(), storage.moeBlock);
+            storage.itemEnded(this.wave, plan().window());
         }
     }
 

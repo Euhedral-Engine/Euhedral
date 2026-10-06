@@ -18,31 +18,32 @@ import org.slf4j.LoggerFactory;
 /// device-completion edge are wired at construction and rebound to each quantum.
 ///
 /// Stages submit to the lanes of a [LanePool], choosing a lane each time they run. The graph's home
-/// lane prepares the quantum and carries its retirement boundary. Every stage with successors records
-/// a reusable marker after submitting; a successor that runs on another lane awaits it on the device,
-/// and a root on another lane awaits the quantum's preparation marker. Before the retirement boundary
-/// every other lane the quantum used joins the home lane the same way, so that boundary covers all of
-/// the quantum's device work.
+/// lane prepares the quantum and carries its retirement boundary. Every stage with successors
+/// records a reusable marker after submitting; a successor that runs on another lane awaits it on
+/// the device, and a root on another lane awaits the quantum's preparation marker. Before the
+/// retirement boundary every other lane the quantum used joins the home lane the same way, so that
+/// boundary covers all of the quantum's device work.
 ///
 /// Admission publishes only the root stages. A stage that submitted successfully satisfies its
 /// outgoing edges; a submission edge is satisfied at once and a device-completion edge when the
 /// producer's work retires. The final arrival at a successor publishes it to the source. The graph
 /// never runs a stage, scans for ready work, or walks its topology after admission.
 ///
-/// `live` counts published frames that have not finished plus armed device-completion edges. When it
-/// reaches zero, no stage of this quantum can run again, whether it succeeded, failed, or was
+/// `live` counts published frames that have not finished plus armed device-completion edges. When
+/// it reaches zero, no stage of this quantum can run again, whether it succeeded, failed, or was
 /// cancelled. The graph then arms the quantum's single retirement boundary. The retirement frame
 /// confirms it, runs each attempted stage's retirement hook and the quantum's terminal work, and
 /// returns the graph to its recycler before publishing the outcome.
 ///
-/// Captured quanta. A graph built with shadow streams captures the device work of quanta that carry a
-/// [StageQuantum#captureKey] into CUDA graphs, one per key. The second quantum with a key records: each
-/// stage submits as usual and again to the shadow of its lane, a stream under capture, whose markers
-/// mirror the lanes' so the captured graph keeps the quantum's branches. Every later quantum with the key
-/// replays: one frame launches the captured graph on the home lane, then runs every stage in topological
-/// order with its submissions checked instead of run. That keeps each stage's host-side effects and
-/// retirement hooks, and proves that the stage would have submitted exactly what was captured: a stage
-/// whose submissions hash differently fails the quantum and discards the capture.
+/// Captured quanta. A graph built with shadow streams captures the device work of quanta that carry
+/// a [StageQuantum#captureKey] into CUDA graphs, one per key. The second quantum with a key
+/// records: each stage submits as usual and again to the shadow of its lane, a stream under
+/// capture, whose markers mirror the lanes' so the captured graph keeps the quantum's branches.
+/// Every later quantum with the key replays: one frame launches the captured graph on the home
+/// lane, then runs every stage in topological order with its submissions checked instead of run.
+/// That keeps each stage's host-side effects and retirement hooks, and proves that the stage would
+/// have submitted exactly what was captured: a stage whose submissions hash differently fails the
+/// quantum and discards the capture.
 public final class StageGraph implements AutoCloseable {
 
     /// Creates the frame for one stage while the graph is built.
@@ -70,10 +71,12 @@ public final class StageGraph implements AutoCloseable {
     private final long[] tails;
     private final AtomicLong usedLanes = new AtomicLong();
     private final boolean spread;
-    private final QwenExecutionSource source;
+    private final FrameLake source;
     private final Recycler recycler;
     /// Routing seeds of this graph's frames (FrameSeeds): each frame keeps its hash across quanta.
     private final FrameSeeds seeds = new FrameSeeds();
+    /// The one routing hash of this graph's ordered stages.
+    private final long chainHash = io.euhedral_execution.hashing.HasherApi.mix(this.seeds.next() ^ 0x5bd1e995L);
     private final StageFrame[] stages;
     private final StageFrame[] roots;
     private final Retirement retirement;
@@ -91,7 +94,8 @@ public final class StageGraph implements AutoCloseable {
     private Capture recording;
     private Capture replaying;
     private final AtomicBoolean recordingBroken = new AtomicBoolean();
-    /// The current recording used device storage that other streams' quanta share, chained by this order.
+    /// The current recording used device storage that other streams' quanta share, chained by this
+    /// order.
     private final AtomicBoolean recordingShared = new AtomicBoolean();
     private GpuStream.SharedOrdering sharedOrdering;
     private long sharedMarker;
@@ -102,11 +106,7 @@ public final class StageGraph implements AutoCloseable {
 
     /// Builds a graph that owns one stream: every stage keeps that stream's order.
     public StageGraph(
-            StageTopology topology,
-            StageFactory factory,
-            GpuStream stream,
-            QwenExecutionSource source,
-            Recycler recycler) {
+            StageTopology topology, StageFactory factory, GpuStream stream, FrameLake source, Recycler recycler) {
         this(
                 topology,
                 factory,
@@ -118,15 +118,15 @@ public final class StageGraph implements AutoCloseable {
                 null);
     }
 
-    /// Builds a graph whose stages run on the lanes of a shared `pool`, which outlives the graph. With
-    /// `spread`, stages are placed over the pool's lanes; otherwise every stage keeps the graph's home
-    /// lane, so the graph still has its own device ordering but no cross-lane edges.
+    /// Builds a graph whose stages run on the lanes of a shared `pool`, which outlives the graph.
+    /// With `spread`, stages are placed over the pool's lanes; otherwise every stage keeps the
+    /// graph's home lane, so the graph still has its own device ordering but no cross-lane edges.
     public StageGraph(
             StageTopology topology,
             StageFactory factory,
             LanePool pool,
             boolean spread,
-            QwenExecutionSource source,
+            FrameLake source,
             Recycler recycler) {
         this(topology, factory, source, recycler, pool, false, spread, null);
     }
@@ -137,7 +137,7 @@ public final class StageGraph implements AutoCloseable {
             StageFactory factory,
             LanePool pool,
             boolean spread,
-            QwenExecutionSource source,
+            FrameLake source,
             Recycler recycler,
             Supplier<GpuStream> shadowStreams) {
         this(topology, factory, source, recycler, pool, false, spread, Objects.requireNonNull(shadowStreams));
@@ -146,7 +146,7 @@ public final class StageGraph implements AutoCloseable {
     private StageGraph(
             StageTopology topology,
             StageFactory factory,
-            QwenExecutionSource source,
+            FrameLake source,
             Recycler recycler,
             LanePool pool,
             boolean ownsPool,
@@ -261,8 +261,8 @@ public final class StageGraph implements AutoCloseable {
     }
 
     /// Whether stages are placed over the pool's lanes; otherwise they all run on the home lane.
-    /// Links each stage to the successor that continues its longest submitted path to a sink (the first
-    /// listed on ties), so lane placement keeps a graph's critical chain on one lane.
+    /// Links each stage to the successor that continues its longest submitted path to a sink (the
+    /// first listed on ties), so lane placement keeps a graph's critical chain on one lane.
     private static void markPaths(StageFrame[] stages) {
         int[] height = new int[stages.length];
         int[] pending = new int[stages.length];
@@ -323,6 +323,10 @@ public final class StageGraph implements AutoCloseable {
         return this.stages[stage];
     }
 
+    long chainHash() {
+        return this.chainHash;
+    }
+
     /// The routing seed of the next frame built for this graph.
     long nextRoutingSeed() {
         return this.seeds.next();
@@ -336,8 +340,8 @@ public final class StageGraph implements AutoCloseable {
         return this.quantum.stopRequested();
     }
 
-    /// Binds a quantum whose resources are already prepared and publishes the root stages, or the frame
-    /// that replays the quantum's captured graph.
+    /// Binds a quantum whose resources are already prepared and publishes the root stages, or the
+    /// frame that replays the quantum's captured graph.
     public void start(StageQuantum quantum) {
         Objects.requireNonNull(quantum, "quantum");
         if (this.quantum != null) throw new IllegalStateException("stage graph already runs a quantum");
@@ -422,12 +426,35 @@ public final class StageGraph implements AutoCloseable {
         this.live.incrementAndGet();
     }
 
+    /// Publishes a frame that a stage of this graph spawned (a part of the stage's work that runs
+    /// on its own, such as the load of one expert). It counts as live work of the quantum, which
+    /// cannot retire before [#finishChild]; a frame that is published from a driver callback thread
+    /// passes `fromCallback`. Called while the spawner is still live (a running stage or an earlier
+    /// child), so the quantum cannot retire between the two.
+    public void spawn(AbstractFrame child, boolean fromCallback) {
+        this.live.incrementAndGet();
+        try {
+            if (fromCallback) this.source.publishFromCallback(child);
+            else this.source.publish(child);
+        } catch (RuntimeException | Error failure) {
+            this.live.decrementAndGet();
+            throw failure;
+        }
+    }
+
+    /// A spawned frame ended. The caller must not touch the graph or its quantum afterwards: this
+    /// may have been the last live work.
+    public void finishChild() {
+        stageFinished();
+    }
+
     /// The source through which this graph's frames reach Euhedral.
-    public QwenExecutionSource source() {
+    public FrameLake lake() {
         return this.source;
     }
 
-    /// No stage of this quantum can run again. Arms the quantum's single device-completion boundary.
+    /// No stage of this quantum can run again. Arms the quantum's single device-completion
+    /// boundary.
     private void quiesce() {
         Retirement terminal = this.retirement;
         GpuStream home = this.pool.lane(this.home);
@@ -451,8 +478,9 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Terminal work for the bound quantum; runs on an ordinary worker after device retirement. Every
-    /// failure before recycling is recorded on the quantum, whose outcome is always published.
+    /// Terminal work for the bound quantum; runs on an ordinary worker after device retirement.
+    /// Every failure before recycling is recorded on the quantum, whose outcome is always
+    /// published.
     void retire(long ticket) {
         StageQuantum retiring = this.quantum;
         Throwable deviceFailure =
@@ -484,8 +512,8 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Releases the graph's markers and captured graphs, and its stream when it owns one. Only an unbound
-    /// graph whose work has retired may be closed.
+    /// Releases the graph's markers and captured graphs, and its stream when it owns one. Only an
+    /// unbound graph whose work has retired may be closed.
     @Override
     public void close() {
         if (this.quantum != null) throw new IllegalStateException("stage graph still runs a quantum");
@@ -578,8 +606,8 @@ public final class StageGraph implements AutoCloseable {
         return shadow;
     }
 
-    /// Mirrors a marker wait on `lane`'s shadow; the shadow joins the recording by its first wait. A failed
-    /// shadow operation ends the recording, never the quantum.
+    /// Mirrors a marker wait on `lane`'s shadow; the shadow joins the recording by its first wait.
+    /// A failed shadow operation ends the recording, never the quantum.
     void shadowAwait(int lane, long marker) {
         if (!recording()) return;
         try {
@@ -603,10 +631,10 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Submits `stage` to `stream` on `lane`, recording it on the lane's shadow while the recording holds.
-    /// A stage that waits on no other lane (`independent`) is captured with programmatic dependent launch
-    /// for its registered kernels whatever the quantum's stream policy: inside a graph the edges pay at
-    /// every position and in every kind of quantum.
+    /// Submits `stage` to `stream` on `lane`, recording it on the lane's shadow while the recording
+    /// holds. A stage that waits on no other lane (`independent`) is captured with programmatic
+    /// dependent launch for its registered kernels whatever the quantum's stream policy: inside a
+    /// graph the edges pay at every position and in every kind of quantum.
     void submit(StageFrame stage, GpuStream stream, int lane, boolean overlap, boolean independent) {
         if (!recording()) {
             stream.submit(stage, overlap);
@@ -634,8 +662,8 @@ public final class StageGraph implements AutoCloseable {
         if (this.recordingBroken.compareAndSet(false, true)) LOG.debug("Qwen quantum recording ended", cause);
     }
 
-    /// Joins every shadow lane to the home shadow, ends the capture, and keeps the graph when the whole
-    /// quantum was recorded.
+    /// Joins every shadow lane to the home shadow, ends the capture, and keeps the graph when the
+    /// whole quantum was recorded.
     private void finishRecording() {
         Capture capture = this.recording;
         long joined = this.shadowLanes.get() & ~(1L << this.home);
@@ -716,8 +744,8 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Publishes the root stages of a quantum that was to replay; the replay frame's own count keeps the
-    /// quantum live until they are published.
+    /// Publishes the root stages of a quantum that was to replay; the replay frame's own count
+    /// keeps the quantum live until they are published.
     private void runStages() {
         this.replaying = null;
         if (this.prepared != 0) this.pool.lane(this.home).mark(this.prepared);
@@ -767,9 +795,8 @@ public final class StageGraph implements AutoCloseable {
         private final StageGraph graph;
 
         Replay(StageGraph graph) {
-            super(FrameSeeds.ID_HASH);
+            super(graph.chainHash());
             this.graph = graph;
-            randomizeHash(graph.nextRoutingSeed());
         }
 
         @Override
@@ -824,16 +851,15 @@ public final class StageGraph implements AutoCloseable {
 
     /// The single device-completion boundary of a quantum. The driver callback only publishes it.
     ///
-    /// Its `execute` never throws: the graph may serve another quantum as soon as it is recycled, so
-    /// `doFinallyWithError` means only that the lattice rejected the frame without running it.
+    /// Its `execute` never throws: the graph may serve another quantum as soon as it is recycled,
+    /// so `doFinallyWithError` means only that the lattice rejected the frame without running it.
     static final class Retirement extends AbstractFrame implements GpuStream.RetirementListener {
         private final StageGraph graph;
         private long ticket;
 
         Retirement(StageGraph graph) {
-            super(FrameSeeds.ID_HASH);
+            super(graph.chainHash());
             this.graph = graph;
-            randomizeHash(graph.nextRoutingSeed());
         }
 
         void reset() {
@@ -862,16 +888,18 @@ public final class StageGraph implements AutoCloseable {
         public void doFinally() {}
 
         /// The lattice rejected the frame without running it: the worker's cache retired, or no
-        /// downstream was routable. The quantum still retires exactly once, and the rejecting thread is an
-        /// ordinary worker or admission thread, never a driver callback: retire it here.
+        /// downstream was routable. The quantum still retires exactly once, and the rejecting
+        /// thread is an ordinary worker or admission thread, never a driver callback: retire it
+        /// here.
         @Override
         public void doFinallyWithError(Throwable rejection) {
             execute();
         }
     }
 
-    /// A device-completion edge. Its producer arms it after submission; the driver callback publishes
-    /// it, and an ordinary worker confirms retirement before satisfying the consumer's edge.
+    /// A device-completion edge. Its producer arms it after submission; the driver callback
+    /// publishes it, and an ordinary worker confirms retirement before satisfying the consumer's
+    /// edge.
     static final class RetiredEdge extends AbstractFrame implements GpuStream.RetirementListener {
         private final StageGraph graph;
         private final StageFrame producer;
@@ -880,11 +908,10 @@ public final class StageGraph implements AutoCloseable {
         private long ticket;
 
         RetiredEdge(StageGraph graph, StageFrame producer, StageFrame consumer) {
-            super(FrameSeeds.ID_HASH);
+            super(graph.chainHash());
             this.graph = graph;
             this.producer = producer;
             this.consumer = consumer;
-            randomizeHash(graph.nextRoutingSeed());
         }
 
         /// Arms the boundary on the lane the producer submitted to.
@@ -922,9 +949,9 @@ public final class StageGraph implements AutoCloseable {
             this.graph.stageFinished();
         }
 
-        /// `execute` never throws, so the lattice rejected this frame without running it. The producer's
-        /// boundary must still be confirmed and the edge resolved once; the rejecting thread is never a
-        /// driver callback, so the edge is finished here.
+        /// `execute` never throws, so the lattice rejected this frame without running it. The
+        /// producer's boundary must still be confirmed and the edge resolved once; the rejecting
+        /// thread is never a driver callback, so the edge is finished here.
         @Override
         public void doFinallyWithError(Throwable rejection) {
             execute();
