@@ -273,6 +273,10 @@ class Qwen4PerformanceCudaIntegrationTest {
                         var tiersBefore = model.hierarchyStats();
                         var loadsBefore = executor.expertTimings();
                         long fullBefore = executor.expertFullFetches();
+                        long busyBefore = model.asyncReads() == null
+                                ? 0
+                                : model.asyncReads().busyNanos();
+                        long diskBefore = model.hierarchyStats().artifact().bytesRead();
                         LayerStats layers = new LayerStats();
                         if (target == 4096) executor.trace(layers);
                         long start = System.nanoTime();
@@ -307,6 +311,14 @@ class Qwen4PerformanceCudaIntegrationTest {
                                         fullBefore,
                                         executor.expertFullFetches(),
                                         target));
+                        if (model.asyncReads() != null) {
+                            double busy = (model.asyncReads().busyNanos() - busyBefore) / 1e9;
+                            long disk = model.hierarchyStats().artifact().bytesRead() - diskBefore;
+                            line(String.format(
+                                    "  disk: reads in flight %.0f%% of the time, %.2f GB/s while they were, %.2f GB/s"
+                                            + " overall",
+                                    100 * busy / seconds, disk / 1e9 / Math.max(busy, 1e-9), disk / 1e9 / seconds));
+                        }
                     }
                 }
                 // `EUHEDRAL_QWEN4_PERF_PREFILL_ONLY=1` stops after the prefills, for screening the expert path.
