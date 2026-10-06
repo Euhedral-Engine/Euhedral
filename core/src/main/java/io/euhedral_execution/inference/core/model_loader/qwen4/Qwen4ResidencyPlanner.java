@@ -64,12 +64,18 @@ public final class Qwen4ResidencyPlanner {
         return 2 * config.moe().expertsPerToken();
     }
 
-    /// Pinned staging slots when expert records pass through the host from the artifact file: a
-    /// wave of experts (at most 32, and no more than a layer has) loads at once, and each load
-    /// holds a slot until its copy retires.
+    /// Records read from the artifact at once at most: the depth of the disk's queue that keeps it busy, past which
+    /// a read only waits behind the others and every record arrives late. `EUHEDRAL_QWEN4_READS` overrides it for
+    /// benchmarks.
+    public static final int DISK_READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "32"));
+
+    /// Pinned staging slots when expert records pass through the host from the artifact file: one per read the disk
+    /// has in flight ([#DISK_READS]) but no more than a layer has experts, as each load holds its slot until its
+    /// copy retires, and at least two tokens' experts.
     public static int fileStagingSlots(Qwen4Config config) {
         return Math.max(
-                Math.min(32, config.moe().numExperts()), 2 * config.moe().expertsPerToken());
+                Math.min(DISK_READS, config.moe().numExperts()),
+                2 * config.moe().expertsPerToken());
     }
 
     public static Qwen4ResidencyPlan plan(

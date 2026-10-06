@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.hashing.HasherApi;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.DeviceFence;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheShard;
@@ -63,10 +64,8 @@ public final class ExpertCacheOwner {
         }
     }
 
-    /// Records read from the artifact at once at most: the depth of the disk's queue that keeps it busy, past which
-    /// a read only waits behind the others and every record arrives late. `EUHEDRAL_QWEN4_READS` overrides it for
-    /// benchmarks.
-    static final int READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "32"));
+    /// Records read from the artifact at once at most ([Qwen4ResidencyPlanner#DISK_READS]).
+    static final int READS = Qwen4ResidencyPlanner.DISK_READS;
 
     final ExpertCache cache;
     final FrameLake lake;
