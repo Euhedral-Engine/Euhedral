@@ -323,6 +323,12 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             return newLease(this.slot, this.generation, this.bank, this.expert, readyMarker());
         }
 
+        /// Gives the reserved slot back before anything was loaded or leased (the load could not start): the
+        /// cache is as it was, but for the slot's previous expert if it was evicted.
+        public void cancel() {
+            finishLoad(this, CANCELLED);
+        }
+
         /// Ends a load whose lease ([#lease]) was made but never handed on, because its record could not be
         /// read or its copy not submitted: the lease is gone with it and the slot returns to the cache.
         public void failed(ExpertLease unused, Throwable failure) {
@@ -391,6 +397,9 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         this.stats.slotsInUse(this.pinned);
     }
 
+    /// The reason of a load that was cancelled before it began; not counted as a failed transfer.
+    private static final Throwable CANCELLED = new IllegalStateException("cancelled before it began");
+
     /// Ends `load` that never submitted, or whose copy retired well.
     private void finishLoad(Load load, Throwable failure) {
         if (load.finished) {
@@ -419,7 +428,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             this.next[slot] = this.freeHead;
             this.freeHead = slot;
             this.pinned--;
-            this.stats.failedTransfer();
+            if (failure != CANCELLED) this.stats.failedTransfer();
+            else this.stats.cancelledMiss();
         }
         releaseFence(consumed);
     }

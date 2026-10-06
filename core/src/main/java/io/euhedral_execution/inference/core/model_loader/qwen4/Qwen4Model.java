@@ -60,6 +60,10 @@ public final class Qwen4Model implements AutoCloseable {
             "euhedral.qwen4.copy-streams",
             Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_COPY_STREAMS", "1")));
 
+    /// Whether the RAM tier may be pinned host memory; `EUHEDRAL_QWEN4_PIN_TIER=0` keeps it pageable, for
+    /// benchmarks.
+    static final boolean PIN_TIER = !"0".equals(System.getenv("EUHEDRAL_QWEN4_PIN_TIER"));
+
     private final Qwen4Artifact artifact;
     private final Qwen4ResidencyPlan plan;
     private final Qwen4FixedLoader.Loaded fixed;
@@ -138,7 +142,18 @@ public final class Qwen4Model implements AutoCloseable {
             reads = openAsyncReads();
             artifactSource = new FileRecordSource(path, cachedBanks, reads);
             if (plan.expertStore() != Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
-                tier = new RamTier(cachedBanks, plan.host().expertRamSlots(), 1, ReplacementPolicy.BANK_PARTITIONED);
+                // The tier is pinned when the machine can page-lock it beside the plan's other pinned memory: the
+                // device's copies then read a record from its slot, with no staging copy.
+                boolean pin = PIN_TIER
+                        && plan.budget().pinnableBytes() - plan.host().pinnedBytes()
+                                >= plan.host().expertRamBytes();
+                tier = new RamTier(
+                        cachedBanks,
+                        plan.host().expertRamSlots(),
+                        1,
+                        ReplacementPolicy.BANK_PARTITIONED,
+                        pin ? gpu : null);
+                LOG.info("Expert tier: {} MiB of {} memory", tier.capacityBytes() >> 20, pin ? "pinned" : "pageable");
                 if (tier.isResident()) {
                     long begin = System.nanoTime();
                     tier.preload(artifactSource, PRELOAD_READERS);

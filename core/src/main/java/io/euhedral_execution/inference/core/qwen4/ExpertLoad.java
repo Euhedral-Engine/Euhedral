@@ -41,7 +41,7 @@ final class ExpertLoad {
     final ExpertCacheShard.Load load;
     final ExpertLease lease;
     final RamTierShard tier;
-    final TierDirective directive = new TierDirective();
+    final TierDirective directive;
     private final long seed;
     private final Part[] parts;
     private final Join join;
@@ -76,6 +76,7 @@ final class ExpertLoad {
             ExpertCacheShard.Load load,
             int buffer,
             RamTierShard tier,
+            TierDirective directive,
             long seed) {
         this.owner = owner;
         this.target = target;
@@ -85,7 +86,7 @@ final class ExpertLoad {
         this.tier = tier;
         this.seed = seed;
         this.fetchedAt = System.nanoTime();
-        if (tier != null) tier.plan(load.bank(), load.expert(), this.directive);
+        this.directive = directive;
         int count = this.directive.mode() != TierDirective.Mode.HIT
                         && owner.cache.store().rangedReads()
                 ? Math.max(1, owner.readParts)
@@ -104,8 +105,24 @@ final class ExpertLoad {
         return this.owner.cache.store();
     }
 
-    /// Publishes the load's first frames. Called by the owner's fetch.
+    /// Publishes the load's first frames. Called by the owner's fetch. A record in a pinned tier needs no frame:
+    /// its copy is submitted here, from its slot.
     void start() {
+        if (this.join == null && !store().stagesThrough(this.directive)) {
+            this.startedAt = System.nanoTime();
+            try {
+                this.record = store().open(this.load.bank(), this.load.expert(), this.buffer, this.directive);
+                this.read = true;
+                this.readAt = System.nanoTime();
+                this.submittingAt = this.readAt;
+                submitCopy();
+            } catch (Throwable thrown) {
+                failed(thrown);
+                return;
+            }
+            this.target.arrived(this.lease);
+            return;
+        }
         if (this.join != null) {
             this.join.expect(this.parts.length);
             for (Part part : this.parts) this.owner.lake.publish(part);
@@ -305,6 +322,17 @@ final class ExpertLoad {
         }
     }
 
+    /// Gives back what [RamTierShard#plan] reserved for a load that will not start. Owner frames only.
+    static void giveBack(RamTierShard tier, TierDirective directive) {
+        if (tier == null) return;
+        switch (directive.mode()) {
+            case HIT -> tier.used(directive);
+            case FILL -> tier.abandoned(directive);
+            case NONE, BYPASS -> {}
+        }
+        directive.clear();
+    }
+
     /// The load is done with its tier slot: a fill whose record was read (`read`) keeps it for the next miss;
     /// one that was not gives the slot back. Owner frames only.
     private void settleTier(boolean read) {
@@ -340,7 +368,7 @@ final class ExpertLoad {
                 }
             }
             load.load.failed(load.lease, thrown);
-            load.store().releaseStaging(load.buffer);
+            if (load.buffer >= 0) load.store().releaseStaging(load.buffer);
             load.target.failed(thrown);
             load.owner.ended(load, false);
         }
@@ -388,7 +416,7 @@ final class ExpertLoad {
             // quantum that read it fails at its own retirement.
             if (device != null) LOG.error("an expert copy failed on the device", device);
             load.settleTier(true);
-            load.store().releaseStaging(load.buffer);
+            if (load.buffer >= 0) load.store().releaseStaging(load.buffer);
             load.owner.ended(load, true);
         }
 

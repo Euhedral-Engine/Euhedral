@@ -49,6 +49,11 @@ public final class ExpertCacheStats {
         this.misses.increment();
     }
 
+    /// A miss whose load was cancelled before it began: it will be asked again, and counted then.
+    void cancelledMiss() {
+        this.misses.decrement();
+    }
+
     void eviction() {
         this.evictions.increment();
     }
