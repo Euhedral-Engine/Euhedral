@@ -119,9 +119,7 @@ class Qwen4DemandRecordingCudaIntegrationTest {
                 Recorder recorder = new Recorder(Files.newOutputStream(Path.of(target)))) {
             var tier = model.hierarchyStats().ram();
             recorder.header(
-                    model.expertCache().slotCount(),
-                    tier == null ? 0 : model.ramTierSlots(),
-                    model.expertBanks());
+                    model.expertCache().slotCount(), tier == null ? 0 : model.ramTierSlots(), model.expertBanks());
             int vocabulary = executor.vocabularySize();
             var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
             Qwen4ExecutionPlan.LogitsSink sink =
