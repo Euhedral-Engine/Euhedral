@@ -122,9 +122,13 @@ public final class FileExpertStore implements HostExpertStore {
 
     /// One copy of the record from its tier slot into the staging slot.
     private void copyOut(TierDirective directive, MemorySegment staging, long size) {
+        copyRange(staging, MemorySegment.ofAddress(directive.address()).reinterpret(size));
+    }
+
+    private void copyRange(MemorySegment staging, MemorySegment tier) {
         long begin = System.nanoTime();
-        staging.copyFrom(MemorySegment.ofAddress(directive.address()).reinterpret(size));
-        this.ramCopyBytes.add(size);
+        staging.copyFrom(tier);
+        this.ramCopyBytes.add(tier.byteSize());
         this.ramCopyNanos.add(System.nanoTime() - begin);
     }
 
@@ -142,22 +146,26 @@ public final class FileExpertStore implements HostExpertStore {
         long from = Math.min(size, chunk * part);
         long length = Math.min(size, from + chunk) - from;
         if (length <= 0) return;
-        long base = directive.mode() == TierDirective.Mode.FILL
-                ? directive.address()
-                : this.arena.address() + this.slotBytes * lane;
+        long staging = this.arena.address() + this.slotBytes * lane;
+        boolean fill = directive.mode() == TierDirective.Mode.FILL;
+        long base = fill ? directive.address() : staging;
         this.source.readRange(
                 this.banks[bank],
                 expert,
                 from,
                 MemorySegment.ofAddress(base + from).reinterpret(length));
+        // A fill keeps what it read in the tier slot and stages it too: each part copies its own range,
+        // so the copies run side by side as the reads do.
+        if (fill)
+            copyRange(
+                    MemorySegment.ofAddress(staging + from).reinterpret(length),
+                    MemorySegment.ofAddress(base + from).reinterpret(length));
     }
 
     @Override
     public HostRecord completeOpen(int bank, int expert, int lane, TierDirective directive) {
         long size = this.banks[bank].recordBytes(expert);
         long address = this.arena.address() + this.slotBytes * lane;
-        if (directive.mode() == TierDirective.Mode.FILL)
-            copyOut(directive, MemorySegment.ofAddress(address).reinterpret(size), size);
         this.opens.increment();
         return new StagedRecord(address, size);
     }
