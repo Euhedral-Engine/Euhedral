@@ -360,6 +360,58 @@ class ExpertCacheShardTest {
         assertTrue(hits[0] > requests / 3, "the partitioned policy keeps a share of every pass: " + hits[0]);
     }
 
+    /// Under S3-FIFO a record asked for again keeps its place through a sweep of records asked for once: the sweep
+    /// passes through the small queue. A recency order loses the hot records to the same sweep.
+    @Test
+    void s3FifoKeepsRecordsAskedForAgainThroughASweepOfRecordsAskedForOnce() throws Exception {
+        long[] hotHits = new long[2];
+        ReplacementPolicy[] policies = {ReplacementPolicy.S3_FIFO, ReplacementPolicy.GLOBAL_LRU};
+        for (int p = 0; p < 2; p++) {
+            if (this.cache != null) this.cache.close();
+            cache(10, 1, policies[p]);
+            for (int round = 0; round < 3; round++)
+                for (int hot = 0; hot < 4; hot++)
+                    ExpertTestSupport.acquire(this.cache, 2, hot).close();
+            for (int bank : new int[] {0, 4})
+                for (int expert = 0; expert < 8; expert++)
+                    ExpertTestSupport.acquire(this.cache, bank, expert).close();
+            long before = this.cache.stats().snapshot().hits();
+            for (int hot = 0; hot < 4; hot++) {
+                try (ExpertLease lease = ExpertTestSupport.acquire(this.cache, 2, hot)) {
+                    assertArrayEquals(
+                            this.fixture.record(2, hot), this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
+                }
+            }
+            hotHits[p] = this.cache.stats().snapshot().hits() - before;
+            this.cache.checkQuiescent();
+        }
+        assertEquals(4, hotHits[0], "S3-FIFO kept the hot records");
+        assertEquals(0, hotHits[1], "a recency order lost them to the sweep");
+    }
+
+    /// S3-FIFO under a random workload with leases held across requests: the bytes are right and the bookkeeping
+    /// holds.
+    @Test
+    void s3FifoServesARandomWorkloadWithLeasesHeld() throws Exception {
+        cache(12, 1, ReplacementPolicy.S3_FIFO);
+        java.util.SplittableRandom random = new java.util.SplittableRandom(11);
+        java.util.ArrayDeque<ExpertLease> held = new java.util.ArrayDeque<>();
+        for (int i = 0; i < 3000; i++) {
+            int bank = random.nextInt(5);
+            int expert = random.nextInt(this.fixture.banks[bank].expertCount());
+            if (random.nextInt(4) == 0) expert = 0;
+            ExpertLease lease = ExpertTestSupport.acquire(this.cache, bank, expert);
+            assertArrayEquals(
+                    this.fixture.record(bank, expert), this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
+            held.add(lease);
+            if (held.size() > 4) held.poll().close();
+            this.cache.shard(0).checkInvariants();
+        }
+        while (!held.isEmpty()) held.poll().close();
+        this.cache.checkQuiescent();
+        assertTrue(this.cache.stats().snapshot().hits() > 0);
+    }
+
     @Test
     void aFailedLoadReturnsItsSlotToItsLayerUnderThePartitionedPolicy() throws Exception {
         cache(4, 1, ReplacementPolicy.BANK_PARTITIONED);

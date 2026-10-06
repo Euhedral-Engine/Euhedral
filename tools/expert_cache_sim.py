@@ -437,6 +437,66 @@ class S3FIFO(Policy):
         return False
 
 
+class S3FIFOTouch(Policy):
+    """S3-FIFO as a cache that takes a record out of its queue while it is used can run it: a hit also moves the
+    record to the tail of its queue (the engine's device cache re-appends a slot when its last lease closes)."""
+
+    name = "s3fifo-touch"
+
+    def __init__(self, capacity, trace, future=None):
+        super().__init__(capacity, trace)
+        self.small_cap = max(1, capacity // 10)
+        self.small: OrderedDict = OrderedDict()
+        self.main: OrderedDict = OrderedDict()
+        self.ghost: OrderedDict = OrderedDict()
+        self.freq: dict[int, int] = {}
+
+    def access(self, key, pinned):
+        if key in self.small or key in self.main:
+            self.freq[key] = min(3, self.freq[key] + 1)
+            (self.small if key in self.small else self.main).move_to_end(key)
+            return True
+        while len(self.small) + len(self.main) >= self.capacity:
+            if not self._evict(pinned):
+                return False
+        if key in self.ghost:
+            del self.ghost[key]
+            self.main[key] = None
+        else:
+            self.small[key] = None
+        self.freq[key] = 0
+        return False
+
+    def _evict(self, pinned) -> bool:
+        if len(self.small) >= self.small_cap:
+            for k in list(self.small):
+                if k in pinned:
+                    continue
+                del self.small[k]
+                if self.freq[k] > 0:
+                    self.freq[k] = 0
+                    self.main[k] = None
+                    if len(self.small) + len(self.main) < self.capacity:
+                        return True
+                    continue
+                del self.freq[k]
+                self.ghost[k] = None
+                if len(self.ghost) > self.capacity:
+                    self.ghost.popitem(last=False)
+                return True
+        for _ in range(4 * len(self.main) + 1):
+            k = next((k for k in self.main if k not in pinned), None)
+            if k is None:
+                return False
+            if self.freq[k] > 0:
+                self.freq[k] -= 1
+                self.main.move_to_end(k)
+                continue
+            del self.main[k], self.freq[k]
+            return True
+        return False
+
+
 class SIEVE(Policy):
     name = "sieve"
 
@@ -662,7 +722,7 @@ class LayerAge(Policy):
 
 
 POLICIES = {
-    p.name: p for p in (LRU, ScanLRU, SampledLFU, SampledLFUAdmit, SampledLFUScanAdmit, BankLRU, LFU, TinyLFU, WTinyLFU, ARC, S3FIFO, SIEVE, OPT, Static, LayerAge)
+    p.name: p for p in (LRU, ScanLRU, SampledLFU, SampledLFUAdmit, SampledLFUScanAdmit, BankLRU, LFU, TinyLFU, WTinyLFU, ARC, S3FIFO, S3FIFOTouch, SIEVE, OPT, Static, LayerAge)
 }
 
 
