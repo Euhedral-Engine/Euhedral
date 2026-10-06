@@ -154,6 +154,16 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
             assertTrue(model.expertCache().slotCount() <= 64);
             minimal = teacherForced(gpu, model, cases);
             assertTrue(model.expertCache().stats().snapshot().evictions() > 0);
+            var tiers = model.hierarchyStats();
+            System.out.println("minimal cache: " + model.expertCache().slotCount() + " device slots, host store "
+                    + model.plan().expertStore()
+                    + (tiers.ram() == null
+                            ? ""
+                            : ", " + tiers.ram().residentExperts() + " resident in RAM, "
+                                    + tiers.ram().totalEvictions() + " RAM evictions, "
+                                    + tiers.ram().totalHits()
+                                    + " RAM hits")
+                    + ", " + tiers.artifact().recordReads() + " artifact reads");
         }
         int agree = 0, total = 0;
         for (int c = 0; c < cases.size(); c++) {
