@@ -92,6 +92,12 @@ final class Qwen4GraphStorage {
     final Block block = new Block();
     /// Per shard of the expert cache, the positions of the block's experts that hash there, and the
     /// message that hands them over.
+    /// The n-gram rows of the chunk, their staging buffer and how many there are: written by the stage that
+    /// computes the ids and gathers them, read by the stage that copies them to the device.
+    final long[] pleRowIds;
+
+    ExecutionGpu.UploadBuffer pleUpload;
+    int pleCount;
     final int[][] sharePositions;
     final int[] shareCounts;
     final ExpertSource.Work[] shares;
@@ -101,6 +107,7 @@ final class Qwen4GraphStorage {
         this.rows = rows;
         int hidden = plan.hidden();
         this.moe = plan.newMoeLayer(rows);
+        this.pleRowIds = new long[rows * plan.ple().rowsPerToken()];
         this.loadBegin = new long[this.moe.maxWaves()];
         this.arrivals = new Arrivals[this.moe.maxWaves()];
         int shards = plan.expertSources().length;
