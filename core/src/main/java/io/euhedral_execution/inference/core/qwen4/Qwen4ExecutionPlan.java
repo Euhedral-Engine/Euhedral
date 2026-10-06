@@ -359,6 +359,11 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         return this.expertOwner.fullFetches();
     }
 
+    /// [ExpertCacheOwner#prefetchCounts()]. Any thread.
+    public long[] expertPrefetches() {
+        return this.expertOwner.prefetchCounts();
+    }
+
     /// [ExpertCacheOwner#fullCauses()]. Any thread.
     public long[] expertFullCauses() {
         return this.expertOwner.fullCauses();

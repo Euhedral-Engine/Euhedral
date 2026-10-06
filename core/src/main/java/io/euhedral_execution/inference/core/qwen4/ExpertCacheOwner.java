@@ -179,6 +179,14 @@ public final class ExpertCacheOwner {
             (staged && buffer < 0 ? this.fullStaging : this.fullSlots).increment();
             return Outcome.FULL;
         }
+        if (tier != null && tier.isFilling(bank, expert)) {
+            // A prefetch is reading the record into the tier: once it is in, the load copies it from there.
+            reserved.cancel();
+            if (buffer >= 0) this.cache.store().releaseStaging(buffer);
+            this.fullFetches.increment();
+            this.fullReads.increment();
+            return Outcome.FULL;
+        }
         if (!inTier && this.reading.get() >= READS) {
             // The disk has as many records in flight as keep it busy: this one is read once one of them is in.
             reserved.cancel();
@@ -203,6 +211,94 @@ public final class ExpertCacheOwner {
         this.inFlight.incrementAndGet();
         load.start();
         return Outcome.LOADING;
+    }
+
+    /// Records the prefetch reads per layer at most (`EUHEDRAL_QWEN4_PREFETCH=K,B`: the next layer's router's best `K`,
+    /// at most `B` read; `0` or unset: none).
+    static final int[] PREFETCH = prefetchSetting(System.getenv("EUHEDRAL_QWEN4_PREFETCH"));
+
+    private static int[] prefetchSetting(String value) {
+        if (value == null || value.isBlank() || value.equals("0")) return new int[] {0, 0};
+        String[] parts = value.split(",");
+        return new int[] {Integer.parseInt(parts[0].trim()), Integer.parseInt(parts[1].trim())};
+    }
+
+    /// The best experts of the next layer's router to consider, and how many of them a prefetch reads at most.
+    public static int prefetchCandidates() {
+        return PREFETCH[0];
+    }
+
+    private final LongAdder prefetches = new LongAdder();
+    private final LongAdder prefetchFailures = new LongAdder();
+
+    /// Publishes a prefetch of `experts` of bank `bank` (best first): the owner's frame reads up to the configured
+    /// number of them that neither the device nor the host tier holds into the tier, while the disk has a read to
+    /// spare. Any thread.
+    public void publishPrefetch(int bank, int[] experts) {
+        if (PREFETCH[1] <= 0) return;
+        this.lake.publish(new Prefetch(bank, experts));
+    }
+
+    /// A prediction of a layer's experts, on the owner: speculative, so it reads only what the disk can take now and
+    /// never waits.
+    private final class Prefetch extends AbstractFrame {
+        private final int bank;
+        private final int[] experts;
+
+        Prefetch(int bank, int[] experts) {
+            super(HASH);
+            this.bank = bank;
+            this.experts = experts;
+        }
+
+        @Override
+        public void execute() {
+            prefetch(this.bank, this.experts, PREFETCH[1]);
+        }
+
+        @Override
+        public void doFinally() {}
+
+        @Override
+        public void doFinallyWithError(Throwable rejection) {}
+    }
+
+    /// Reads up to `budget` of `experts` into the host tier. Called by a frame routed with [#HASH].
+    public void prefetch(int bank, int[] experts, int budget) {
+        for (int expert : experts) {
+            if (budget <= 0 || this.reading.get() >= READS) return;
+            int shardIndex = this.cache.shardOf(bank, expert);
+            RamTierShard tier = this.cache.store().tier(shardIndex);
+            if (tier == null || !tier.pinned()) return;
+            if (this.cache.shard(shardIndex).holds(bank, expert)) continue;
+            TierDirective directive = new TierDirective();
+            tier.planPrefetch(bank, expert, directive);
+            if (directive.mode() != TierDirective.Mode.FILL) continue;
+            budget--;
+            this.reading.incrementAndGet();
+            this.lake.admitDuringDrain();
+            this.inFlight.incrementAndGet();
+            TierFill fill = new TierFill(this, tier, directive, bank, expert, this.nextSeed);
+            this.nextSeed += 64;
+            if (!fill.start()) {
+                this.reading.decrementAndGet();
+                tier.abandoned(directive);
+                prefetchEnded(false);
+                return;
+            }
+        }
+    }
+
+    /// A prefetch ended, its record in the tier (`read`) or not. On the owner.
+    void prefetchEnded(boolean read) {
+        (read ? this.prefetches : this.prefetchFailures).increment();
+        this.inFlight.decrementAndGet();
+        this.lake.terminated();
+    }
+
+    /// Prefetches that read their record, and those that failed. Any thread.
+    public long[] prefetchCounts() {
+        return new long[] {this.prefetches.sum(), this.prefetchFailures.sum()};
     }
 
     /// The load's artifact read is over: the disk may take another. Any thread, once per load.

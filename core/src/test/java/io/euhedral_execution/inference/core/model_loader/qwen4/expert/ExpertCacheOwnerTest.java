@@ -254,6 +254,60 @@ class ExpertCacheOwnerTest {
         drained();
     }
 
+    /// A prefetch reads a record into the pinned tier with no device load; a fetch that finds it still being read
+    /// publishes itself again, and once it is in, the fetch copies it from the tier slot.
+    @Test
+    void aPrefetchReadsIntoTheTierAndAFetchWaitsForItThenCopiesFromIt() throws Exception {
+        org.junit.jupiter.api.Assumptions.assumeTrue(AsyncReads.available(), "no io_uring on this machine");
+        this.reads = AsyncReads.open();
+        this.reads.getDelegate().addDownstream(new io.euhedral_execution.core.generics.LatticeReceiver() {
+            @Override
+            public void addUpstream(io.euhedral_execution.core.generics.LatticeSource upstream) {}
+
+            @Override
+            public void push(AbstractFrame frame) {
+                ExpertCacheOwnerTest.this.lake.publish(frame);
+            }
+
+            @Override
+            public void onComplete() {}
+
+            @Override
+            public void onError(Throwable error) {
+                throw new AssertionError(error);
+            }
+        });
+        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.FREQUENCY, this.gpu, true);
+        build(
+                6,
+                new FileExpertStore(
+                        this.gpu,
+                        new FileRecordSource(this.fixture.file, this.fixture.banks, this.reads),
+                        tier,
+                        this.fixture.banks,
+                        2,
+                        1));
+        this.owner.prefetch(0, new int[] {5, 6, 7}, 2);
+        assertTrue(tier.shard(0).isFilling(0, 5) && tier.shard(0).isFilling(0, 6), "two reads, the budget");
+        assertFalse(tier.shard(0).isFilling(0, 7));
+        assertFalse(this.cache.shard(0).holds(0, 5), "a prefetch takes no device slot");
+        fetch(0, 5, ExpertCacheOwner.Outcome.FULL);
+        drive(() -> tier.shard(0).isResident(0, 5) && tier.shard(0).isResident(0, 6));
+        Fetch hit = fetch(0, 5, ExpertCacheOwner.Outcome.LOADING);
+        drive(hit::ended);
+        drained();
+        assertArrayEquals(
+                this.fixture.record(0, 5),
+                this.gpu.readDevice(hit.lease().deviceAddress(), hit.lease().byteSize()));
+        hit.lease().close();
+        drained();
+        assertEquals(2, this.owner.prefetchCounts()[0]);
+        assertEquals(1, tier.prefetchesUsed());
+        assertEquals(0, this.owner.readsInFlight());
+        tier.checkInvariants();
+        this.cache.checkQuiescent();
+    }
+
     @Test
     void aReadInPartsSubmitsItsReadsAndTheirCompletionsAreFrames() throws Exception {
         org.junit.jupiter.api.Assumptions.assumeTrue(AsyncReads.available(), "no io_uring on this machine");

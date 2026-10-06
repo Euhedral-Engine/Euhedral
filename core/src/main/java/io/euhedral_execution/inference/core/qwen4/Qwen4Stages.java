@@ -402,7 +402,8 @@ final class Qwen4Stages {
             if (plan.traceOn()) storage.traceBefore = plan.expertStats().snapshot();
             moe.submitRouting(plan.weights().moe(this.layer), storage.mixed(), rows(), storage.moeBlock);
             Qwen4ExecutionPlan.ExpertDemand demand = plan.demandListener();
-            if (demand != null && demand.predicts() && rows() == 1 && this.layer + 1 < plan.layers())
+            boolean predict = ExpertCacheOwner.prefetchCandidates() > 0 || (demand != null && demand.predicts());
+            if (predict && rows() == 1 && this.layer + 1 < plan.layers())
                 moe.submitPrediction(plan.weights().moe(this.layer + 1), storage.mixed());
             storage.routeArmedNanos = System.nanoTime();
         }
@@ -438,12 +439,17 @@ final class Qwen4Stages {
             storage.plannedNanos = now;
             storage.experts = moe.plan(storage.bank, rows());
             Qwen4ExecutionPlan.ExpertDemand demand = plan().demandListener();
-            if (demand != null)
-                moe.reportDemand(
-                        demand,
-                        this.layer,
-                        this.layer + 1 < plan().layers() ? plan().bankOrdinal(this.layer + 1) : -1,
-                        rows());
+            int candidates = Math.max(ExpertCacheOwner.prefetchCandidates(), demand != null ? 64 : 0);
+            int[] prediction = candidates > 0 ? moe.takePrediction(candidates) : null;
+            int nextBank = this.layer + 1 < plan().layers() ? plan().bankOrdinal(this.layer + 1) : -1;
+            if (prediction != null && ExpertCacheOwner.prefetchCandidates() > 0)
+                plan().expertOwner()
+                        .publishPrefetch(
+                                nextBank,
+                                java.util.Arrays.copyOf(
+                                        prediction,
+                                        Math.min(prediction.length, ExpertCacheOwner.prefetchCandidates())));
+            if (demand != null) moe.reportDemand(demand, this.layer, nextBank, rows(), prediction);
             moe.submitPlan();
         }
     }

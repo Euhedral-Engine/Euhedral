@@ -268,6 +268,12 @@ public final class Qwen4Model implements AutoCloseable {
         return handle;
     }
 
+    /// Prefetched records a request found in the host tier; 0 without a tier.
+    public long tierPrefetchesUsed() {
+        RamTier tier = this.fileStore.ramTier();
+        return tier == null ? 0 : tier.prefetchesUsed();
+    }
+
     /// Records the host tier has slots for; 0 without a tier.
     public int ramTierSlots() {
         RamTier tier = this.fileStore.ramTier();
