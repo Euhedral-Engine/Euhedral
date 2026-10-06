@@ -302,6 +302,22 @@ class ExpertCacheOwnerTest {
         this.cache.checkQuiescent();
     }
 
+    /// A load holds one of the disk's reads only while it reads: the read is back once the record is in, before the
+    /// device copy retires.
+    @Test
+    void aLoadGivesItsReadBackWhenTheRecordIsInNotWhenItsCopyRetires() throws Exception {
+        build(4, 2);
+        Fetch miss = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        assertEquals(1, this.owner.readsInFlight(), "the fetch took a read");
+        drive(miss::ended);
+        assertEquals(0, this.owner.readsInFlight(), "the record is in: the read is back");
+        drained();
+        assertEquals(0, this.owner.readsInFlight());
+        miss.lease().close();
+        drained();
+        this.cache.checkQuiescent();
+    }
+
     @Test
     void aMissNeedsAStagingBufferAsWellAsASlotAndFindsTheCacheFullWithoutOne() throws Exception {
         build(4, 1);
