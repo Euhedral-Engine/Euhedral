@@ -517,7 +517,88 @@ class Static(Policy):
         return key in self.held
 
 
-POLICIES = {p.name: p for p in (LRU, BankLRU, LFU, TinyLFU, WTinyLFU, ARC, S3FIFO, SIEVE, OPT, Static)}
+class ScanLRU(Policy):
+    """LRU that a prefill cannot flush: records a multi-row block (a prefill chunk) brings in enter at the cold end,
+    and its hits do not promote, so a prefill's sweep of nearly every expert of a layer replaces only what earlier
+    sweeps brought, while decode's records keep their places."""
+
+    name = "scan-lru"
+
+    def __init__(self, capacity, trace, future=None):
+        super().__init__(capacity, trace)
+        self.order: OrderedDict[int, None] = OrderedDict()
+        self.rows = 1
+
+    def block(self, bank, rows):
+        self.rows = rows
+
+    def access(self, key, pinned):
+        scan = self.rows > 1
+        if key in self.order:
+            if not scan:
+                self.order.move_to_end(key)
+            return True
+        if len(self.order) >= self.capacity:
+            victim = next((v for v in self.order if v not in pinned), None)
+            if victim is None:
+                return False
+            del self.order[victim]
+        self.order[key] = None
+        if scan:
+            self.order.move_to_end(key, last=False)
+        return False
+
+
+class LayerAge(Policy):
+    """Recency measured in visits to the record's own layer, not in time: the model visits its layers in a cycle, so
+    a global recency order calls the next layer's records the oldest and evicts them just before they are used. The
+    victim is the record whose layer has been visited most often since it was used; among equals, the record of the
+    layer visited most recently, whose next visit is furthest away."""
+
+    name = "layer-age"
+
+    def __init__(self, capacity, trace, future=None):
+        super().__init__(capacity, trace)
+        self.lists = [OrderedDict() for _ in trace.experts]  # per bank, key -> visit of the bank when last used
+        self.visits = [0] * len(trace.experts)
+        self.visited_at = [0] * len(trace.experts)  # global clock of each bank's latest visit
+        self.clock = 0
+        self.size = 0
+        self.current = None
+
+    def visit(self, bank):
+        self.clock += 1
+        self.visits[bank] += 1
+        self.visited_at[bank] = self.clock
+
+    def access(self, key, pinned):
+        bank = key // 4096
+        lst = self.lists[bank]
+        if key in lst:
+            lst[key] = self.visits[bank]
+            lst.move_to_end(key)
+            return True
+        if self.size >= self.capacity:
+            best = None
+            for b, other in enumerate(self.lists):
+                victim = next((k for k in other if k not in pinned), None)
+                if victim is None:
+                    continue
+                rank = (self.visits[b] - other[victim], self.visited_at[b])
+                if best is None or rank > best[0]:
+                    best = (rank, b, victim)
+            if best is None:
+                return False
+            del self.lists[best[1]][best[2]]
+            self.size -= 1
+        lst[key] = self.visits[bank]
+        self.size += 1
+        return False
+
+
+POLICIES = {
+    p.name: p for p in (LRU, ScanLRU, BankLRU, LFU, TinyLFU, WTinyLFU, ARC, S3FIFO, SIEVE, OPT, Static, LayerAge)
+}
 
 
 # ---------------------------------------------------------------------------------------------- replay
@@ -548,10 +629,28 @@ class Tally:
     disk_bytes: int = 0
 
 
-def replay(trace: Trace, device_policy: str, tier_policy: str, device_slots: int, tier_slots: int):
+def preload(tier: Policy, trace: Trace, slots: int):
+    """The engine's startup fill: each bank's share of the slots holds its lowest experts. Each is offered to the
+    policy as a request from an empty block, and policies that count requests then forget it (a preloaded record
+    is a placeholder until it is asked for)."""
+    total = sum(trace.experts)
+    for bank, experts in enumerate(trace.experts):
+        for expert in range(slots * experts // total):
+            tier.access(bank * 4096 + expert, set())
+    counts = getattr(tier, "counts", None)
+    if counts is not None:
+        counts.count.clear()
+        counts.seen = 0
+
+
+def replay(
+    trace: Trace, device_policy: str, tier_policy: str, device_slots: int, tier_slots: int, fill: bool = False
+):
     nxt = next_uses(trace)
     device = POLICIES[device_policy](device_slots, trace)
     tier = POLICIES[tier_policy](tier_slots, trace) if tier_slots > 0 else None
+    if fill and tier is not None and not isinstance(tier, (OPT, Static)):
+        preload(tier, trace, tier_slots)
     # The tier sees only device misses; Belady at the tier needs the next use among those, which depends on the
     # device's choices: approximate it with the next use in the whole stream.
     tallies = defaultdict(Tally)
@@ -563,6 +662,11 @@ def replay(trace: Trace, device_policy: str, tier_policy: str, device_slots: int
             continue
         _, bank, rows, keys = event
         pinned = set(keys)
+        for level in (device, tier):
+            if level is not None and hasattr(level, "visit"):
+                level.visit(bank)
+            if level is not None and hasattr(level, "block"):
+                level.block(bank, rows)
         tally = tallies[phase]
         for key in keys:
             tally.requests += 1
@@ -603,6 +707,7 @@ def main():
     parser.add_argument("--tier", type=int, help="tier slots (default: the recording's)")
     parser.add_argument("--device-policy", nargs="+", default=["lru"])
     parser.add_argument("--tier-policy", nargs="+", default=["bank-lru", "tinylfu"])
+    parser.add_argument("--fill", action="store_true", help="start the tier with the engine's startup fill")
     args = parser.parse_args()
     trace = read_trace(args.trace)
     device_slots = args.device if args.device is not None else trace.device_slots
@@ -622,7 +727,7 @@ def main():
     )
     for dp in args.device_policy:
         for tp in args.tier_policy:
-            tallies = replay(trace, dp, tp, device_slots, tier_slots)
+            tallies = replay(trace, dp, tp, device_slots, tier_slots, args.fill)
             report(trace, dp, tp, device_slots, tier_slots, tallies, tokens)
 
 
