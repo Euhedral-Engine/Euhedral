@@ -55,9 +55,7 @@ class Qwen4ArchitectureTest {
                 walk.filter(p -> p.toString().endsWith(".java")).forEach(files::add);
             }
         }
-        return files.stream()
-                .filter(p -> !STARTUP.contains(MAIN.relativize(p).toString()))
-                .toList();
+        return files.stream().filter(p -> !STARTUP.contains(relative(p))).toList();
     }
 
     @Test
@@ -70,8 +68,7 @@ class Qwen4ArchitectureTest {
                 String code = line.strip();
                 if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
                 for (Pattern forbidden : FORBIDDEN)
-                    if (forbidden.matcher(line).find())
-                        violations.add(MAIN.relativize(file) + ":" + (i + 1) + ": " + code);
+                    if (forbidden.matcher(line).find()) violations.add(relative(file) + ":" + (i + 1) + ": " + code);
             }
         }
         assertTrue(violations.isEmpty(), "private scheduling infrastructure:\n" + String.join("\n", violations));
@@ -105,7 +102,7 @@ class Qwen4ArchitectureTest {
                             throw new java.io.UncheckedIOException(failure);
                         }
                     })
-                    .map(p -> MAIN.relativize(p).toString())
+                    .map(Qwen4ArchitectureTest::relative)
                     .toList();
             assertTrue(offenders.isEmpty(), "host work outside the graph: " + offenders);
         }
@@ -133,9 +130,14 @@ class Qwen4ArchitectureTest {
             for (int i = 0; i < lines.size(); i++) {
                 String code = lines.get(i).strip();
                 if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
-                if (lock.matcher(code).find()) violations.add(MAIN.relativize(file) + ":" + (i + 1) + ": " + code);
+                if (lock.matcher(code).find()) violations.add(relative(file) + ":" + (i + 1) + ": " + code);
             }
         }
         assertTrue(violations.isEmpty(), "locks or threads on the hot path:\n" + String.join("\n", violations));
+    }
+
+    /// A source path relative to the main tree, with forward slashes on every platform.
+    private static String relative(Path file) {
+        return MAIN.relativize(file).toString().replace('\\', '/');
     }
 }
