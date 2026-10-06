@@ -1,5 +1,8 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
+import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -8,6 +11,27 @@ import java.util.concurrent.TimeUnit;
 public final class ExpertTestSupport {
 
     private ExpertTestSupport() {}
+
+    /// A store of `lanes` staging slots over `file` with a host tier of `ramSlots` records in `shards`
+    /// shards in front of it, preloaded when the tier holds every record.
+    public static FileExpertStore ramStore(
+            GpuMemory memory, Path file, ExpertBank[] banks, int lanes, int ramSlots, int shards) throws IOException {
+        FileRecordSource source = new FileRecordSource(file, banks);
+        RamTier tier = new RamTier(banks, ramSlots, shards, RamTier.Policy.BANK_PARTITIONED);
+        try {
+            if (tier.isResident()) tier.preload(source, 4);
+        } catch (InterruptedException interrupted) {
+            source.close();
+            tier.close();
+            Thread.currentThread().interrupt();
+            throw new IOException(interrupted);
+        } catch (IOException | RuntimeException | Error failure) {
+            source.close();
+            tier.close();
+            throw failure;
+        }
+        return new FileExpertStore(memory, source, tier, banks, lanes);
+    }
 
     /// A lease on the expert, loading it (read, copy on the shard's first lane, wait for the copy)
     /// when it is not resident.
@@ -22,8 +46,12 @@ public final class ExpertTestSupport {
         ExpertCacheShard.Load load = ticket.load();
         int lane = cache.laneBase(shardIndex);
         HostRecord record = null;
+        RamTierShard tier = cache.store().tier(shardIndex);
+        TierDirective directive = new TierDirective();
+        if (tier != null) tier.plan(bank, expert, directive);
         try {
-            record = cache.store().open(bank, expert, lane);
+            record = cache.store().open(bank, expert, lane, directive);
+            settle(tier, directive, true);
             CompletableFuture<Long> retired = new CompletableFuture<>();
             cache.transfer().stream(
                     lane,
@@ -40,8 +68,24 @@ public final class ExpertTestSupport {
         } catch (ExpertTransferException failure) {
             throw failure;
         } catch (Exception failure) {
-            if (record == null) load.failed(failure);
+            if (record == null) {
+                settle(tier, directive, false);
+                load.failed(failure);
+            }
             throw new IllegalStateException("expert " + expert + " of bank " + bank + " could not be loaded", failure);
         }
+    }
+
+    private static void settle(RamTierShard tier, TierDirective directive, boolean read) {
+        if (tier == null) return;
+        switch (directive.mode()) {
+            case HIT -> tier.used(directive);
+            case FILL -> {
+                if (read) tier.filled(directive);
+                else tier.abandoned(directive);
+            }
+            case NONE, BYPASS -> {}
+        }
+        directive.clear();
     }
 }

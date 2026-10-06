@@ -58,7 +58,7 @@ class ExpertCacheShardTest {
     }
 
     private ExpertCache cache(int slots, int shards) throws IOException {
-        var store = new ArenaExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 2);
+        var store = new FileExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 4);
         var transfer = new GpuExpertTransfer(this.gpu, 4);
         this.cache = new ExpertCache(store, transfer, this.gpu, slots, this.fixture.slotBytes(), shards);
         return this.cache;

@@ -37,12 +37,12 @@ class Qwen4ArchitectureTest {
             Pattern.compile("\\bparallelStream\\b"));
 
     /// Startup loaders that read the artifact before any request exists. They are not execution
-    /// paths; the expert store's own fill is replaced by lattice frames with the host tier.
+    /// paths: the threads end with the load.
     private static final Set<String> STARTUP = Set.of(
             "model_loader/qwen4/Qwen4FixedLoader.java",
             "model_loader/qwen4/Qwen4Validator.java",
             "model_loader/qwen4/NgramStore.java",
-            "model_loader/qwen4/expert/ArenaExpertStore.java");
+            "model_loader/qwen4/expert/RamTierPreload.java");
 
     private static List<Path> executionSources() throws IOException {
         List<Path> files = new ArrayList<>();
@@ -127,8 +127,8 @@ class Qwen4ArchitectureTest {
         hot.add(MAIN.resolve("scheduling/graph/SerialSource.java"));
         List<String> violations = new ArrayList<>();
         for (Path file : hot) {
-            // The artifact is loaded into the pinned arena by readers at startup, before any request exists.
-            if (file.getFileName().toString().equals("ArenaExpertStore.java")) continue;
+            // The resident tier is read by loader threads that end with the load, before any request exists.
+            if (file.getFileName().toString().equals("RamTierPreload.java")) continue;
             List<String> lines = Files.readAllLines(file);
             for (int i = 0; i < lines.size(); i++) {
                 String code = lines.get(i).strip();
