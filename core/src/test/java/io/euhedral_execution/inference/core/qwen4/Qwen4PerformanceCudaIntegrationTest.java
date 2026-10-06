@@ -241,6 +241,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                     Qwen4TestLattice.Run run = lattice.run(gpu, model, CONTEXT);
                     Qwen4ExecutionPlan executor = run.plan()) {
                 line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));
+                line("workers: " + lattice.cpus().cardinality() + " on processors " + lattice.cpus());
                 line("expert cache: " + model.expertCache().slotCount() + " slots; plan:\n"
                         + model.plan().report());
                 int chunk = Math.min(executor.maxRows(), intEnv("EUHEDRAL_QWEN4_CHUNK", executor.maxRows()));

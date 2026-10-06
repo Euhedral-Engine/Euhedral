@@ -64,9 +64,9 @@ public final class Qwen4ResidencyPlanner {
         return 2 * config.moe().expertsPerToken();
     }
 
-    /// Records read from the artifact at once at most: enough reads in flight to keep the disk busy across the hops
-    /// from one read's completion to the next submission (a 990 Pro prefills 9% faster at 64 than at 32), and no more
-    /// pinned staging than that. `EUHEDRAL_QWEN4_READS` overrides it for benchmarks.
+    /// Records read from the artifact at once at most: enough to keep the disk busy across the hops from one
+    /// read's completion to the next submission, and no more pinned staging than that. `EUHEDRAL_QWEN4_READS`
+    /// overrides it for benchmarks.
     public static final int DISK_READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "64"));
 
     /// Pinned staging slots when expert records pass through the host from the artifact file: one per read the disk

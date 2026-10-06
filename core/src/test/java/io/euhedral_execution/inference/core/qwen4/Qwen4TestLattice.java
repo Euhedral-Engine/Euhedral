@@ -24,29 +24,44 @@ public final class Qwen4TestLattice implements AutoCloseable {
     private final ControlPlaneLattice lattice;
     private final InferenceLake lake;
     private final HostTasks tasks;
+    private final BitSet cpus;
 
-    private Qwen4TestLattice(ControlPlaneLattice lattice, InferenceLake lake, HostTasks tasks) {
+    private Qwen4TestLattice(ControlPlaneLattice lattice, InferenceLake lake, HostTasks tasks, BitSet cpus) {
         this.lattice = lattice;
         this.lake = lake;
         this.tasks = tasks;
+        this.cpus = cpus;
     }
 
-    /// Starts a lattice with workers on `workers` distinct physical cores (`EUHEDRAL_QWEN4_WORKERS`
-    /// overrides).
+    /// The logical processors the workers run on, one worker each.
+    public BitSet cpus() {
+        return (BitSet) this.cpus.clone();
+    }
+
+    /// Starts a lattice with `workers` workers (`EUHEDRAL_QWEN4_WORKERS` overrides), one per logical processor: one
+    /// on each performance core first, then the efficiency cores, then the performance cores' other hardware
+    /// threads, so a count of every processor (as the engine is deployed) takes them all.
     public static Qwen4TestLattice start(int workers) {
         String override = System.getenv("EUHEDRAL_QWEN4_WORKERS");
         if (override != null) workers = Integer.parseInt(override);
         BitSet cpus = new BitSet();
         BitSet cores = new BitSet();
-        var physical = SystemInfo.getPCpuSet();
-        int selected = 0;
-        for (int cpu = physical.nextSetBit(0); cpu >= 0 && selected < workers; cpu = physical.nextSetBit(cpu + 1)) {
+        var performance = SystemInfo.getPCpuSet();
+        for (int cpu = performance.nextSetBit(0);
+                cpu >= 0 && cpus.cardinality() < workers;
+                cpu = performance.nextSetBit(cpu + 1)) {
             var info = SystemInfo.getCpuInfo(cpu);
             if (info == null || cores.get(info.core())) continue;
             cores.set(info.core());
             cpus.set(cpu);
-            selected++;
         }
+        var efficiency = SystemInfo.getECpuSet();
+        for (int cpu = efficiency.nextSetBit(0);
+                cpu >= 0 && cpus.cardinality() < workers;
+                cpu = efficiency.nextSetBit(cpu + 1)) cpus.set(cpu);
+        for (int cpu = performance.nextSetBit(0);
+                cpu >= 0 && cpus.cardinality() < workers;
+                cpu = performance.nextSetBit(cpu + 1)) cpus.set(cpu);
         // Fixed idle timing, as the engine runs the lattice: adaptive parking leaves workers asleep for the
         // frame-by-frame quanta of generation.
         FragmentConfig defaults = FragmentConfig.ofDefaults();
@@ -66,7 +81,7 @@ public final class Qwen4TestLattice implements AutoCloseable {
                 new LatticeConfig("Qwen4TestLattice", cpus, Duration.ofSeconds(10), shard));
         lattice.start();
         InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
-        return new Qwen4TestLattice(lattice, lake, new HostTasks(lake));
+        return new Qwen4TestLattice(lattice, lake, new HostTasks(lake), cpus);
     }
 
     public HostTasks tasks() {
