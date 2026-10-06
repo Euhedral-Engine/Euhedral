@@ -51,6 +51,18 @@ public final class RamTier implements AutoCloseable {
     /// As above, in pinned host memory from `pinned` (null: pageable memory). A pinned tier is a staging area
     /// itself: a record in it is copied to the device straight from its slot.
     public RamTier(ExpertBank[] banks, int slotCount, int shards, ReplacementPolicy policy, GpuMemory pinned) {
+        this(banks, slotCount, shards, policy, pinned, false);
+    }
+
+    /// As above; with `admission` a record replaces a victim only if it was asked for more often (see
+    /// [RamTierShard]).
+    public RamTier(
+            ExpertBank[] banks,
+            int slotCount,
+            int shards,
+            ReplacementPolicy policy,
+            GpuMemory pinned,
+            boolean admission) {
         this.banks = banks.clone();
         this.keys = new ExpertKeys(this.banks);
         this.policy = Objects.requireNonNull(policy, "policy");
@@ -83,7 +95,13 @@ public final class RamTier implements AutoCloseable {
         int first = 0;
         for (int shard = 0; shard < shards; shard++) {
             this.shardList[shard] = new RamTierShard(
-                    this, this.keys, shard, first, sizes[shard], policy == ReplacementPolicy.BANK_PARTITIONED);
+                    this,
+                    this.keys,
+                    shard,
+                    first,
+                    sizes[shard],
+                    policy == ReplacementPolicy.BANK_PARTITIONED,
+                    admission);
             first += sizes[shard];
         }
         if (this.resident) for (int shard = 0; shard < shards; shard++) this.shardList[shard].assignResident(shard);
