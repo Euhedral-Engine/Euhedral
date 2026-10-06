@@ -280,10 +280,21 @@ public final class NgramStore implements AutoCloseable {
     public void gatherRecords(long[] globalRows, int count, MemorySegment destination) {
         ensureOpen();
         if (count < 0 || count > globalRows.length) throw new IllegalArgumentException("count");
-        int recordBytes = recordBytes();
-        if (destination.byteSize() < (long) count * recordBytes)
+        if (destination.byteSize() < (long) count * recordBytes())
             throw new IllegalArgumentException("destination holds " + destination.byteSize() + " bytes");
-        for (int i = 0; i < count; i++) {
+        gatherRecordsRange(globalRows, 0, count, destination);
+        this.gathers.increment();
+    }
+
+    /// The records of rows `[from, to)` of `globalRows`, each at its own place in `destination` (record `i`
+    /// at `i * recordBytes()`): callers that gather disjoint ranges of one list side by side fill one buffer.
+    public void gatherRecordsRange(long[] globalRows, int from, int to, MemorySegment destination) {
+        ensureOpen();
+        if (from < 0 || to < from || to > globalRows.length) throw new IllegalArgumentException("range");
+        int recordBytes = recordBytes();
+        if (destination.byteSize() < (long) to * recordBytes)
+            throw new IllegalArgumentException("destination holds " + destination.byteSize() + " bytes");
+        for (int i = from; i < to; i++) {
             long row = checked(globalRows[i]);
             long at = (long) i * recordBytes;
             MemorySegment.copy(row(row), 0, destination, at, this.rowBytes);
@@ -295,8 +306,7 @@ public final class NgramStore implements AutoCloseable {
                     at + recordBytes - 4,
                     this.globalScales[(int) (row / this.config.shardRows())]);
         }
-        this.gathers.increment();
-        this.rowsGathered.add(count);
+        this.rowsGathered.add(to - from);
     }
 
     /// [#gatherRecords] into pinned memory and a queued copy to `deviceAddress` on the selected stream. The caller
@@ -315,6 +325,11 @@ public final class NgramStore implements AutoCloseable {
         }
         this.bytesStaged.add(bytes);
         return upload;
+    }
+
+    /// Records that `bytes` of staged records were copied to the device by a caller that gathered them itself.
+    public void recordStaged(long bytes) {
+        this.bytesStaged.add(bytes);
     }
 
     public Stats stats() {

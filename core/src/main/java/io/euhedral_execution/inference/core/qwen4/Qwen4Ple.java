@@ -135,9 +135,34 @@ public final class Qwen4Ple {
         return new Scratch(records, embedding, key, keyNormed, value, query, gated, gatedNormed);
     }
 
-    /// Computes the PLE output of `rows` tokens (`tokens[offset ..]`) whose residual states are at `streamsAddress`
-    /// into `output` (rows x streams x hidden), advancing the state past them. Returns the staging buffer of the
-    /// n-gram rows, which the caller closes once the work has retired.
+    /// N-gram rows one token gathers.
+    public int rowsPerToken() {
+        return this.store.heads();
+    }
+
+    /// Bytes of the staged records of `rows` tokens.
+    public long recordsBytes(int rows) {
+        return (long) rows * this.store.heads() * this.store.recordBytes();
+    }
+
+    /// The first half of a call: the n-gram row ids of `rows` tokens (`tokens[offset ..]`) into `rowIds`
+    /// (`rows * rowsPerToken()` of them), advancing the token context past them. Returns the count.
+    public int prepare(State state, int[] tokens, int offset, int rows, long[] rowIds) {
+        int count = rows * this.store.heads();
+        if (rowIds.length < count) throw new IllegalArgumentException("rowIds holds " + rowIds.length);
+        this.ids.compute(state.context(), tokens, offset, rows, rowIds);
+        return count;
+    }
+
+    /// Gathers the records of rows `[from, to)` of `rowIds` into `records`: disjoint ranges are gathered
+    /// side by side by callers of their own.
+    public void gather(long[] rowIds, int from, int to, java.lang.foreign.MemorySegment records) {
+        this.store.gatherRecordsRange(rowIds, from, to, records);
+    }
+
+    /// Computes the PLE output of `rows` tokens (`tokens[offset ..]` ) as one call: ids, gather and
+    /// [#apply(ExecutionGpu, Weights, State, int, long, Scratch, long, ExecutionGpu.UploadBuffer)].
+    /// Returns the staging buffer of the n-gram rows, which the caller closes once the work has retired.
     public ExecutionGpu.UploadBuffer apply(
             ExecutionGpu gpu,
             Weights weights,
@@ -148,12 +173,38 @@ public final class Qwen4Ple {
             long streamsAddress,
             Scratch scratch,
             long output) {
+        int count = rows * this.store.heads();
+        if (this.rowIds.length < count) this.rowIds = new long[count];
+        prepare(state, tokens, offset, rows, this.rowIds);
+        ExecutionGpu.UploadBuffer staged = gpu.allocateUploadBuffer(recordsBytes(rows));
+        try {
+            gather(this.rowIds, 0, count, staged.segment());
+            apply(gpu, weights, state, rows, streamsAddress, scratch, output, staged);
+        } catch (Throwable failure) {
+            staged.close();
+            throw failure;
+        }
+        return staged;
+    }
+
+    /// The second half: the records at `staged` are copied to the device and expanded, and the PLE
+    /// output of `rows` tokens whose residual states are at `streamsAddress` is computed into `output`
+    /// (rows x streams x hidden), advancing the convolution history past them. The caller closes `staged`
+    /// once the work has retired.
+    public void apply(
+            ExecutionGpu gpu,
+            Weights weights,
+            State state,
+            int rows,
+            long streamsAddress,
+            Scratch scratch,
+            long output,
+            ExecutionGpu.UploadBuffer staged) {
         int heads = this.store.heads();
         int count = rows * heads;
-        if (this.rowIds.length < count) this.rowIds = new long[count];
-        this.ids.compute(state.context(), tokens, offset, rows, this.rowIds);
-        ExecutionGpu.UploadBuffer staged = this.store.stageRecords(gpu, this.rowIds, count, scratch.records());
-        try {
+        gpu.copyUploadToDevice(scratch.records(), staged);
+        this.store.recordStaged(recordsBytes(rows));
+        {
             int width = stateWidth();
             Qwen4Ops.ngramExpand(
                     gpu,
@@ -226,10 +277,6 @@ public final class Qwen4Ple {
                     this.taps,
                     this.dilation);
             Qwen4Ops.convHistory(gpu, scratch.gatedNormed(), state.history(), rows, width, historyRows());
-        } catch (Throwable failure) {
-            staged.close();
-            throw failure;
         }
-        return staged;
     }
 }

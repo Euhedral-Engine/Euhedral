@@ -136,6 +136,31 @@ class NgramStoreTest {
     }
 
     @Test
+    void rangesOfOneListGatheredSideBySideFillOneBufferLikeAWholeGather() throws Exception {
+        try (NgramStore store =
+                        NgramStore.open(this.path, this.artifact, Qwen4ResidencyPlan.NgramMode.MAPPED_FILE, null);
+                Arena arena = Arena.ofShared()) {
+            long[] rows = new long[40];
+            for (int i = 0; i < rows.length; i++) rows[i] = (i * 37L) % store.totalRows();
+            MemorySegment whole = arena.allocate((long) rows.length * store.recordBytes());
+            store.gatherRecords(rows, rows.length, whole);
+            MemorySegment parts = arena.allocate((long) rows.length * store.recordBytes());
+            parts.fill((byte) 0x5a);
+            Thread[] threads = new Thread[4];
+            for (int part = 0; part < threads.length; part++) {
+                int from = rows.length * part / threads.length;
+                int to = rows.length * (part + 1) / threads.length;
+                threads[part] = new Thread(() -> store.gatherRecordsRange(rows, from, to, parts));
+                threads[part].start();
+            }
+            for (Thread thread : threads) thread.join();
+            assertArrayEquals(whole.toArray(ValueLayout.JAVA_BYTE), parts.toArray(ValueLayout.JAVA_BYTE));
+            assertThrows(IllegalArgumentException.class, () -> store.gatherRecordsRange(rows, 30, 41, parts));
+            assertThrows(IllegalArgumentException.class, () -> store.gatherRecordsRange(rows, 5, 4, parts));
+        }
+    }
+
+    @Test
     void closedStoresRefuseWork() throws IOException {
         NgramStore store = NgramStore.open(this.path, this.artifact, Qwen4ResidencyPlan.NgramMode.MAPPED_FILE, null);
         store.close();

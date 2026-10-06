@@ -22,6 +22,8 @@ final class Qwen4Stages {
         int wave = spec.wave();
         return switch (spec.kind()) {
             case EMBED -> new Embed(graph, stage, shape);
+            case PLEIDS -> new PleIds(graph, stage, shape, layer);
+            case PLEGATHER -> new PleGather(graph, stage, shape, layer, wave);
             case PLE -> new Ple(graph, stage, shape, layer);
             case MIX -> new Mix(graph, stage, shape, layer);
             case ATTENTION -> new Attention(graph, stage, shape, layer, false);
@@ -174,11 +176,87 @@ final class Qwen4Stages {
         }
     }
 
-    /// The per-layer embedding: n-gram rows gathered on the host, uploaded, and added to the
-    /// residual state.
-    private static final class Ple extends Base {
-        private ExecutionGpu.UploadBuffer upload;
+    /// The n-gram row ids of the chunk's tokens and the staging buffer their records are gathered into.
+    /// Host work that needs nothing from the device: a root of the graph. The stage owns the buffer for the
+    /// quantum, whichever stages ran.
+    private static final class PleIds extends Base {
+        PleIds(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
+            super(graph, stage, shape, layer);
+        }
 
+        @Override
+        protected boolean host() {
+            return true;
+        }
+
+        @Override
+        protected void submit() {
+            Qwen4ExecutionPlan plan = plan();
+            Qwen4GraphStorage storage = storage();
+            Qwen4Quantum quantum = quantum();
+            storage.pleUpload = null;
+            storage.pleCount = plan.ple()
+                    .prepare(quantum.sequence().ple(), quantum.tokens(), quantum.offset(), rows(), storage.pleRowIds);
+            storage.pleUpload = gpu().allocateUploadBuffer(plan.ple().recordsBytes(rows()));
+        }
+
+        /// The device stopped reading the staging buffer, or the quantum ended without reading it.
+        @Override
+        protected void retired(boolean committed) {
+            Qwen4GraphStorage storage = storage();
+            ExecutionGpu.UploadBuffer finished = storage.pleUpload;
+            storage.pleUpload = null;
+            if (finished != null) finished.close();
+        }
+    }
+
+    /// One part of the gather of the chunk's n-gram records: a range of the rows, read from the table
+    /// (a mapped file whose pages may have to be faulted in) into the staging buffer. The parts are
+    /// stages of their own, so their reads overlap on different workers.
+    private static final class PleGather extends Base {
+        private final int part;
+
+        PleGather(StageGraph graph, int stage, Qwen4Shape shape, int layer, int part) {
+            super(graph, stage, shape, layer, false);
+            this.part = part;
+        }
+
+        @Override
+        protected boolean host() {
+            return true;
+        }
+
+        /// Rows below which a gather is not worth splitting: a part is a frame, and its hop costs more than
+        /// a few dozen rows of copying.
+        private static final int MIN_PART_ROWS = 64;
+
+        private int parts() {
+            return (int) Math.max(1, Math.min(Qwen4Shape.PLE_PARTS, storage().pleCount / MIN_PART_ROWS));
+        }
+
+        private int from() {
+            return this.part >= parts() ? 0 : (int) ((long) storage().pleCount * this.part / parts());
+        }
+
+        private int to() {
+            return this.part >= parts() ? 0 : (int) ((long) storage().pleCount * (this.part + 1) / parts());
+        }
+
+        @Override
+        protected boolean skips() {
+            return from() >= to();
+        }
+
+        @Override
+        protected void submit() {
+            Qwen4GraphStorage storage = storage();
+            plan().ple().gather(storage.pleRowIds, from(), to(), storage.pleUpload.segment());
+        }
+    }
+
+    /// The per-layer embedding: the gathered n-gram records are copied to the device, expanded, and added
+    /// to the residual state.
+    private static final class Ple extends Base {
         Ple(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
             super(graph, stage, shape, layer);
         }
@@ -189,33 +267,23 @@ final class Qwen4Stages {
             Qwen4ExecutionPlan plan = plan();
             Qwen4GraphStorage storage = storage();
             Qwen4Quantum quantum = quantum();
-            this.upload = null;
             var scratch = plan.ple().scratch(storage.layerScratch(), rows());
-            this.upload = plan.ple()
+            plan.ple()
                     .apply(
                             gpu(),
                             plan.weights().ple(this.layer),
                             quantum.sequence().ple(),
-                            quantum.tokens(),
-                            quantum.offset(),
                             rows(),
                             storage.state(),
                             scratch,
-                            storage.pleOutput());
+                            storage.pleOutput(),
+                            storage.pleUpload);
             gpu().residualAddBf16(
                             storage.state(),
                             storage.pleOutput(),
                             storage.state(),
                             rows(),
                             plan.hyperConnection().stateWidth());
-        }
-
-        /// The device stopped reading the upload.
-        @Override
-        protected void retired(boolean committed) {
-            ExecutionGpu.UploadBuffer finished = this.upload;
-            this.upload = null;
-            if (finished != null) finished.close();
         }
     }
 

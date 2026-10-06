@@ -15,6 +15,7 @@ import java.util.List;
 /// description of the work; running it is the lattice's business.
 ///
 /// ```
+/// (n-gram ids -> gather x8 ─┐)
 /// embed -> [PLE] -> attention block -> route ─┬─> shared expert ───────────────────────────┐
 ///   ^                                         └─(route copy retires)─> plan                │
 ///   |                                                                   │                 v
@@ -39,6 +40,8 @@ final class Qwen4Shape implements GraphShape {
 
     enum Kind {
         EMBED,
+        PLEIDS,
+        PLEGATHER,
         PLE,
         MIX,
         ATTENTION,
@@ -61,6 +64,9 @@ final class Qwen4Shape implements GraphShape {
     record Spec(Kind kind, int layer, int wave) {}
 
     private record Edge(int from, Boundary boundary) {}
+
+    /// Stages that gather the n-gram rows of a chunk side by side.
+    static final int PLE_PARTS = 8;
 
     private final Qwen4ExecutionPlan plan;
     private final Qwen4ExecutionPlan.ShapeKey key;
@@ -128,7 +134,15 @@ final class Qwen4Shape implements GraphShape {
         }
         for (int layer = range.firstLayer(); layer < range.endLayer(); layer++) {
             if (layer == this.plan.pleLayer()) {
-                previous = add(Kind.PLE, layer, -1, follow(previous, edge));
+                // The n-gram rows depend on the tokens alone: their ids and gather are roots of the graph, so
+                // they run beside the embedding and the layers before this one, in parts on different workers.
+                int ids = add(Kind.PLEIDS, layer, -1);
+                int extra = previous < 0 ? 0 : 1;
+                Edge[] inputs = new Edge[PLE_PARTS + extra];
+                for (int part = 0; part < PLE_PARTS; part++)
+                    inputs[part] = after(add(Kind.PLEGATHER, layer, part, after(ids)));
+                if (extra == 1) inputs[PLE_PARTS] = new Edge(previous, edge);
+                previous = add(Kind.PLE, layer, -1, inputs);
                 edge = between;
             }
             if (diagnostic) {
