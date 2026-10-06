@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core.qwen4;
 
+import io.euhedral_execution.core.config.FragmentConfig;
+import io.euhedral_execution.core.config.IdlePolicy;
 import io.euhedral_execution.core.config.LatticeConfig;
 import io.euhedral_execution.core.control_plane.ControlPlaneLattice;
 import io.euhedral_execution.core.control_plane.ControlPlaneShard;
@@ -45,7 +47,21 @@ public final class Qwen4TestLattice implements AutoCloseable {
             cpus.set(cpu);
             selected++;
         }
-        var shard = ControlPlaneShard.createBaseShard("Qwen4TestShard", new BaseCloneableObject(new DefaultExecutor()));
+        // Fixed idle timing, as the engine runs the lattice: adaptive parking leaves workers asleep for the
+        // frame-by-frame quanta of generation.
+        FragmentConfig defaults = FragmentConfig.ofDefaults();
+        FragmentConfig fixed = new FragmentConfig(
+                defaults.cloneConfig(),
+                defaults.cacheConfig(),
+                defaults.observer(),
+                defaults.maxBatchSize(),
+                defaults.smtEnabled(),
+                new IdlePolicy(IdlePolicy.DEFAULT_IDLE_PARK_NS, IdlePolicy.DEFAULT_CONTENTION_HALF_LIFE_NANOS),
+                defaults.benchmarkMode(),
+                defaults.metricPrefix(),
+                defaults.registry());
+        var shard = ControlPlaneShard.createBaseShard(
+                "Qwen4TestShard", new BaseCloneableObject(fixed, new DefaultExecutor()));
         ControlPlaneLattice lattice = ControlPlaneLattice.getOrCreate(
                 new LatticeConfig("Qwen4TestLattice", cpus, Duration.ofSeconds(10), shard));
         lattice.start();
