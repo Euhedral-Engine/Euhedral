@@ -133,18 +133,28 @@ class Qwen4ExpertCacheCudaIntegrationTest {
     }
 
     @Test
-    void arenaBackedCacheMovesEveryRecordIntactOverARealStream() throws Exception {
+    void residentRamTierMovesEveryRecordIntactOverARealStream() throws Exception {
         long slotBytes = ExpertCache.slotBytesFor(this.banks);
         long start = System.nanoTime();
-        ArenaExpertStore store = new ArenaExpertStore(this.gpu, this.file, this.banks, 16);
+        FileExpertStore store = ExpertTestSupport.ramStore(this.gpu, this.file, this.banks, 6, BANKS * EXPERTS, 1);
         double seconds = (System.nanoTime() - start) / 1e9;
         System.out.printf(
-                "arena load: %.2f GB in %.2f s = %.2f GB/s (file, page cache)%n",
-                store.arenaBytes() / 1e9, seconds, store.bytesRead() / 1e9 / seconds);
-        runCache("arena", store, slotBytes);
+                "ram tier load: %.2f GB in %.2f s = %.2f GB/s (file, page cache)%n",
+                store.bytesRead() / 1e9, seconds, store.bytesRead() / 1e9 / seconds);
+        runCache("ram resident", store, slotBytes);
+        assertEquals(BANKS * EXPERTS * 1L, store.ramTier().stats().residentExperts());
     }
 
-    private void runCache(String name, HostExpertStore store, long slotBytes) throws Exception {
+    @Test
+    void boundedRamTierMovesEveryRecordIntactOverARealStream() throws Exception {
+        long slotBytes = ExpertCache.slotBytesFor(this.banks);
+        FileExpertStore store = ExpertTestSupport.ramStore(this.gpu, this.file, this.banks, 6, 40, 1);
+        runCache("ram cached", store, slotBytes);
+        assertTrue(store.ramTier().stats().totalHits() > 0, "the tier answered some misses");
+        assertTrue(store.ramTier().stats().residentExperts() <= 40);
+    }
+
+    private void runCache(String name, FileExpertStore store, long slotBytes) throws Exception {
         long deviceBefore = this.gpu.allocatedBytes();
         ExpertCache cache = new ExpertCache(store, new GpuExpertTransfer(this.gpu, 4), this.gpu, SLOTS, slotBytes, 1);
         assertEquals(deviceBefore + SLOTS * slotBytes, this.gpu.allocatedBytes(), "one slab, nothing else");

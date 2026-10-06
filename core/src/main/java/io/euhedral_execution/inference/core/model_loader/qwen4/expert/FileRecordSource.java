@@ -7,6 +7,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 /// Reads records straight from the artifact file with positional reads. Every record of every bank is checked
@@ -19,6 +20,10 @@ import java.util.concurrent.atomic.LongAdder;
 public final class FileRecordSource implements RecordSource {
     private final Path file;
     private final LongAdder bytesRead = new LongAdder();
+    private final LongAdder reads = new LongAdder();
+    private final LongAdder readNanos = new LongAdder();
+    private final AtomicInteger readsNow = new AtomicInteger();
+    private final AtomicInteger readsHighWater = new AtomicInteger();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     public FileRecordSource(Path file, ExpertBank[] banks) throws IOException {
@@ -35,19 +40,41 @@ public final class FileRecordSource implements RecordSource {
             throw new IllegalArgumentException(
                     "destination holds " + destination.byteSize() + " bytes, record " + size);
         if (this.closed.get()) throw new IllegalStateException("the record source is closed");
+        int now = this.readsNow.incrementAndGet();
+        this.readsHighWater.accumulateAndGet(now, Math::max);
+        long begin = System.nanoTime();
         try (FileChannel channel = FileChannel.open(this.file, StandardOpenOption.READ)) {
             ExpertFiles.readFully(channel, destination, bank.fileOffset(expert));
         } catch (ClosedByInterruptException interrupted) {
             // The interrupt closed this read's channel and left the flag set; the exception consumes it.
             Thread.interrupted();
             throw new InterruptedException("interrupted while reading expert " + expert + " of " + bank.name());
+        } finally {
+            this.readsNow.decrementAndGet();
+            this.readNanos.add(System.nanoTime() - begin);
         }
+        this.reads.increment();
         this.bytesRead.add(size);
     }
 
     @Override
     public long bytesRead() {
         return this.bytesRead.sum();
+    }
+
+    /// Record reads completed.
+    public long recordReads() {
+        return this.reads.sum();
+    }
+
+    /// Time spent in reads, summed over reads (parallel reads add up).
+    public long readNanos() {
+        return this.readNanos.sum();
+    }
+
+    /// The most reads that ran at once.
+    public int concurrentReadsHighWater() {
+        return this.readsHighWater.get();
     }
 
     @Override

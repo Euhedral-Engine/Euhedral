@@ -75,12 +75,15 @@ embedding is always `HOST_MAPPED` when the host can pin it. MTP and vision count
 
 ### Host
 
-Pinned memory is the host's `MemAvailable` less 10% (at least 4 GiB), taken in this order: the mapped embedding, staged fixed
-objects, the experts. The expert store is a single pinned huge-page arena when every expert record fits in what is left, as for
-`ArenaExpertStore`; otherwise records stay in the artifact file (and the operating system's page cache) and pass through a small pinned
-staging pool (`FileExpertStore`, `max(16, 2 x experts-per-token)` slots of one record). The n-gram tables are mapped read-only from the
-file unless the experts are pinned too and there is room: they are gathered a few rows per token, and unpinned memory is worth more as
-the experts' page cache.
+Host memory is two budgets from the same physical memory: what the runtime may pin (the host's `MemAvailable` less 10%, at least
+4 GiB) and what it may hold as ordinary memory, which is only what the user offers through `EUHEDRAL_HOST_MEMORY_MIB` (less the same
+margin; none when unset). Pinned memory
+is a small tier, taken in this order: the mapped embedding, staged fixed objects, and the staging slots every expert record passes
+through (`max(16, 2 x experts-per-token)` slots of one record). The routed experts are never pinned: they live in ordinary memory, in
+what the resident budget has left after the pinned part. Every record when it fits (`RAM_RESIDENT`: preloaded at startup, no artifact read
+during inference), otherwise a bounded layer-aware cache (`RAM_CACHED`), and no tier at all (`FILE_BACKED`) when it would not exceed the
+device cache. The n-gram tables are mapped read-only from the file unless every expert is resident and there is room. See
+[FLASH_NEXT_HOST_TIER.md](FLASH_NEXT_HOST_TIER.md).
 
 ## Expert cache
 

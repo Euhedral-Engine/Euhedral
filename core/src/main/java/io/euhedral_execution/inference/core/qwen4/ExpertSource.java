@@ -8,6 +8,8 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCach
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheShard;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.HostRecord;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTierShard;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.TierDirective;
 import io.euhedral_execution.inference.core.scheduling.graph.SerialSource;
 
 /// The owner of one [ExpertCacheShard], as a lattice source that is attached to the lattice on its
@@ -30,6 +32,11 @@ import io.euhedral_execution.inference.core.scheduling.graph.SerialSource;
 /// submits the copy on the lane's copy stream (which records the marker the lease will carry), and
 /// posts that it did. The source then answers the block with the lease. The copy's retirement is a
 /// driver callback that posts too; the lane is free again after it.
+///
+/// The host tier's shard with the same index is owned here too. Before a load frame is published
+/// the source asks it what the load does (copy the record out of RAM, read the artifact through a
+/// tier slot, or read the artifact alone) and hands the answer to the frame in the lane's
+/// directive; the slot stays pinned until the load frame has posted that it is done with it.
 public final class ExpertSource extends SerialSource implements ExpertLease.Owner {
 
     /// A share of a block for this shard: the positions (in order) of the block's experts that hash
@@ -58,6 +65,7 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
 
     private final ExpertCache cache;
     private final ExpertCacheShard shard;
+    private final RamTierShard tier;
     private final int laneBase;
     private final Lane[] lanes;
     private final ExpertCacheShard.Ticket ticket = new ExpertCacheShard.Ticket();
@@ -70,6 +78,7 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
     public ExpertSource(ExpertCache cache, int shard) {
         this.cache = cache;
         this.shard = cache.shard(shard);
+        this.tier = cache.store().tier(shard);
         this.laneBase = cache.laneBase(shard);
         this.lanes = new Lane[cache.laneCount(shard)];
         for (int lane = 0; lane < this.lanes.length; lane++) this.lanes[lane] = new Lane(lane);
@@ -170,6 +179,7 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
         private ExpertBlock block;
         private int position;
         private ExpertCacheShard.Load load;
+        private final TierDirective directive = new TierDirective();
         private boolean submittedSeen;
         private boolean retiredEarly;
         // Written by the load frame before it posts.
@@ -196,6 +206,8 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
             this.record = null;
             this.touched = false;
             this.failure = null;
+            if (ExpertSource.this.tier == null) this.directive.clear();
+            else ExpertSource.this.tier.plan(this.load.bank(), this.load.expert(), this.directive);
             ready(this);
         }
 
@@ -204,7 +216,8 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
         public void execute() {
             ExpertSource source = ExpertSource.this;
             try {
-                this.record = source.cache.store().open(this.load.bank(), this.load.expert(), this.global);
+                this.record =
+                        source.cache.store().open(this.load.bank(), this.load.expert(), this.global, this.directive);
                 this.touched = true;
                 source.cache.transfer().stream(
                         this.global,
@@ -237,6 +250,7 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
         void handle(Kind kind) {
             switch (kind) {
                 case SUBMITTED -> {
+                    settleTier(true);
                     this.submittedSeen = true;
                     this.block.arrive(this.position, this.load.submitted());
                     if (this.retiredEarly) finish();
@@ -248,6 +262,7 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
                 }
                 case FAILED -> {
                     ExpertSource source = ExpertSource.this;
+                    settleTier(this.touched);
                     if (this.touched) source.cache.transfer().recover(this.global, this.failure);
                     this.load.failed(this.failure);
                     this.block.failed(this.failure);
@@ -255,6 +270,22 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
                     release();
                 }
             }
+        }
+
+        /// Serial: the load frame is done with its tier slot. A fill whose record was read (`read`) keeps
+        /// it for the next miss; one that was not gives the slot back.
+        private void settleTier(boolean read) {
+            RamTierShard tier = ExpertSource.this.tier;
+            if (tier == null) return;
+            switch (this.directive.mode()) {
+                case HIT -> tier.used(this.directive);
+                case FILL -> {
+                    if (read) tier.filled(this.directive);
+                    else tier.abandoned(this.directive);
+                }
+                case NONE, BYPASS -> {}
+            }
+            this.directive.clear();
         }
 
         /// The copy retired and was submitted: the load is over and the lane is free.

@@ -220,33 +220,44 @@ public final class Qwen4ResidencyPlanner {
         long cacheBytes = geometry.bytes();
         long slack = Math.max(0, cacheBudget - cacheBytes);
 
-        // The host: pinned memory goes to the gathered embedding, staged fixed objects, then the experts.
+        // The host. Pinned memory is a small tier: the gathered embedding, staged fixed objects, and the staging slots
+        // every expert record passes through. The routed experts themselves live in ordinary memory, in what the
+        // resident budget has left after the pinned part (pinned memory comes out of the same physical memory).
         long mapped = (embeddingMapped ? embedding.byteSize() : 0) + selection.mappedBytes;
         long staged = selection.stagedBytes;
         pinnedLeft -= selection.stagedBytes + selection.mappedBytes;
-        Qwen4ResidencyPlan.ExpertStoreMode expertStore;
-        long expertPinned = 0;
-        long expertFile = 0;
         long stagingPinned = fileStagingSlots(config) * alignUp(slotBytes, 4096);
-        if (expertBytes <= pinnedLeft) {
-            expertStore = Qwen4ResidencyPlan.ExpertStoreMode.PINNED_ARENA;
-            expertPinned = expertBytes;
-        } else {
-            expertStore = Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED;
-            expertPinned = stagingPinned;
-            expertFile = expertBytes;
-        }
-        pinnedLeft -= expertPinned;
+        pinnedLeft -= stagingPinned;
         if (pinnedLeft < 0 && problem == null)
             problem = "the host cannot pin " + ((host.pinnableBytes() - pinnedLeft) >> 20)
                     + " MiB for host-backed weights and expert staging; " + (host.pinnableBytes() >> 20)
                     + " MiB is pinnable";
-        // The tables are sparse gathers: they go to pinned memory only when the experts already do and room is left;
-        // otherwise they are read from the mapped file and the unpinned memory serves the experts' page cache.
+        long pinnedPlanned = host.pinnableBytes() - Math.max(0, pinnedLeft);
+        long residentLeft = host.residentBytes() - pinnedPlanned;
+        long ramSlotBytes = alignUp(slotBytes, 4096);
+        long ramSlots = residentLeft <= 0 ? 0 : Math.min(totalExperts, residentLeft / ramSlotBytes);
+        Qwen4ResidencyPlan.ExpertStoreMode expertStore;
+        long expertRamBytes = 0;
+        if (ramSlots >= totalExperts) {
+            expertStore = Qwen4ResidencyPlan.ExpertStoreMode.RAM_RESIDENT;
+            expertRamBytes = totalExperts * ramSlotBytes;
+        } else if (ramSlots > geometry.slotCount()) {
+            // A tier no larger than the device cache would only repeat it.
+            expertStore = Qwen4ResidencyPlan.ExpertStoreMode.RAM_CACHED;
+            expertRamBytes = ramSlots * ramSlotBytes;
+        } else {
+            expertStore = Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED;
+            ramSlots = 0;
+        }
+        residentLeft -= expertRamBytes;
+        // The tables are sparse gathers: they are pinned only when every expert is already resident and memory is
+        // left over; otherwise they are read from the mapped file, and what is left serves the experts' page cache.
         Qwen4ResidencyPlan.NgramMode ngram = Qwen4ResidencyPlan.NgramMode.MAPPED_FILE;
         long ngramPinned = 0;
         long ngramFile = ngramBytes;
-        if (expertStore == Qwen4ResidencyPlan.ExpertStoreMode.PINNED_ARENA && ngramBytes <= pinnedLeft) {
+        if (expertStore == Qwen4ResidencyPlan.ExpertStoreMode.RAM_RESIDENT
+                && ngramBytes <= pinnedLeft
+                && ngramBytes <= residentLeft) {
             ngram = Qwen4ResidencyPlan.NgramMode.PINNED_ARENA;
             ngramPinned = ngramBytes;
             ngramFile = 0;
@@ -255,7 +266,16 @@ public final class Qwen4ResidencyPlanner {
         var device = new Qwen4ResidencyPlan.Device(
                 freeBytes, kv, indexer, gdn, workspace, KERNEL_RESERVE_BYTES, resident, ring, cacheBytes, slack);
         var hostPlan = new Qwen4ResidencyPlan.Host(
-                mapped, staged, expertPinned, expertFile, ngramPinned, ngramFile, deferredMtp, deferredVision);
+                mapped,
+                staged,
+                stagingPinned,
+                expertRamBytes,
+                (int) ramSlots,
+                expertBytes,
+                ngramPinned,
+                ngramFile,
+                deferredMtp,
+                deferredVision);
         boolean fits = problem == null && geometry.viable();
         return new Qwen4ResidencyPlan(
                 maxContextTokens,
