@@ -22,6 +22,22 @@ public interface ExpertTransfer extends AutoCloseable {
     /// @throws InterruptedException when interrupted while waiting for capacity
     void start(HostRecord record, long deviceAddress, DeviceFence waitFor, Completion done) throws InterruptedException;
 
+    /// As [#start], without blocking the caller: a transfer that must wait for capacity parks as a continuation. The
+    /// outcome, including a failure to start, is reported only through `done`, exactly once; `record` is closed
+    /// once the copy no longer reads it. May call `done` on the calling thread.
+    ///
+    /// The default adapts a transfer whose [#start] does not block.
+    default void startAsync(HostRecord record, long deviceAddress, DeviceFence waitFor, Completion done) {
+        try {
+            start(record, deviceAddress, waitFor, done);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            done.complete(interrupted);
+        } catch (RuntimeException | Error failure) {
+            done.complete(failure);
+        }
+    }
+
     /// Waits for the transfers in flight, then releases what the transfer holds.
     @Override
     void close();

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
@@ -74,7 +75,8 @@ class Qwen4ModelTest {
         int slots = 20;
         long free = freeFor(Qwen4Mode.TEXT, slots);
         long acquisitions = 0;
-        try (Qwen4Model model = Qwen4Model.open(this.path, gpu, free, host, Qwen4Mode.TEXT, CONTEXT)) {
+        try (Qwen4Model model =
+                Qwen4Model.open(this.path, gpu, free, host, Qwen4Mode.TEXT, CONTEXT, TestHostFrames.SHARED)) {
             var plan = model.plan();
             assertTrue(plan.fits(), plan.report());
             assertEquals(expectedStore, plan.expertStore());
@@ -154,8 +156,14 @@ class Qwen4ModelTest {
     void selectingMtpLoadsItsLayerAndCachesItsExperts() throws Exception {
         HostMemoryGpu gpu = new HostMemoryGpu();
         Qwen4Mode mode = new Qwen4Mode(true, false);
-        try (Qwen4Model model =
-                Qwen4Model.open(this.path, gpu, freeFor(mode, 20), HostBudget.ofAvailable(64 * GIB), mode, CONTEXT)) {
+        try (Qwen4Model model = Qwen4Model.open(
+                this.path,
+                gpu,
+                freeFor(mode, 20),
+                HostBudget.ofAvailable(64 * GIB),
+                mode,
+                CONTEXT,
+                TestHostFrames.SHARED)) {
             assertEquals(5, model.expertBanks().length);
             assertEquals(StorageClass.DEVICE_CACHED, model.plan().storageOf("mtp/layers/0/moe/experts"));
             assertTrue(model.tensors().containsKey("mtp/fc_embedding"));
@@ -174,7 +182,13 @@ class Qwen4ModelTest {
         var failure = assertThrows(
                 IOException.class,
                 () -> Qwen4Model.open(
-                        this.path, gpu, 64 * GIB, HostBudget.ofAvailable(64 * GIB), Qwen4Mode.TEXT, 4097));
+                        this.path,
+                        gpu,
+                        64 * GIB,
+                        HostBudget.ofAvailable(64 * GIB),
+                        Qwen4Mode.TEXT,
+                        4097,
+                        TestHostFrames.SHARED));
         assertTrue(failure.getMessage().contains("4096 positions"), failure.getMessage());
         assertEquals(0, gpu.liveDeviceAllocations());
         assertEquals(0, gpu.livePinnedAllocations());
@@ -186,7 +200,13 @@ class Qwen4ModelTest {
         var failure = assertThrows(
                 IOException.class,
                 () -> Qwen4Model.open(
-                        this.path, gpu, 512L << 20, HostBudget.ofAvailable(64 * GIB), Qwen4Mode.TEXT, CONTEXT));
+                        this.path,
+                        gpu,
+                        512L << 20,
+                        HostBudget.ofAvailable(64 * GIB),
+                        Qwen4Mode.TEXT,
+                        CONTEXT,
+                        TestHostFrames.SHARED));
         assertTrue(failure.getMessage().contains("MiB free"), failure.getMessage());
         assertEquals(0, gpu.liveDeviceAllocations());
         assertEquals(0, gpu.livePinnedAllocations());
@@ -215,7 +235,8 @@ class Qwen4ModelTest {
                         freeFor(Qwen4Mode.TEXT, 20),
                         HostBudget.ofAvailable(64 * GIB),
                         Qwen4Mode.TEXT,
-                        CONTEXT));
+                        CONTEXT,
+                        TestHostFrames.SHARED));
         assertEquals(0, gpu.liveDeviceAllocations());
         assertEquals(0, gpu.livePinnedAllocations());
     }

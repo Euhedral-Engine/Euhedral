@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
@@ -51,7 +52,8 @@ class Qwen4ModelFixtureCudaIntegrationTest {
                 gpu.deviceMemoryInfo().freeBytes(),
                 HostBudget.system(),
                 Qwen4Mode.TEXT,
-                CONTEXT);
+                CONTEXT,
+                TestHostFrames.SHARED);
     }
 
     private static ReferenceFixtures fixtures(String name) throws Exception {
@@ -68,14 +70,16 @@ class Qwen4ModelFixtureCudaIntegrationTest {
             Qwen4TestSupport.Report report = new Qwen4TestSupport.Report("layers fed their input, case " + name);
             try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu();
                     Qwen4Model model = open(gpu);
-                    Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT);
+                    Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                    Qwen4ExecutionPlan executor = run.plan();
                     Qwen4Sequence sequence = executor.newSequence()) {
                 int layers = model.artifact().config().text().numLayers();
                 for (int chunk = 0; chunk < chunkCount(fixture); chunk++) {
                     int[] tokens = tokens(fixture, chunk);
                     for (int layer = 0; layer < layers; layer++) {
                         short[] in = fixture.bf16("c" + chunk + "/L" + layer + "/in");
-                        short[] out = executor.runSingleLayer(sequence, layer, tokens, 0, tokens.length, in);
+                        short[] out =
+                                Qwen4Blocking.runSingleLayer(executor, sequence, layer, tokens, 0, tokens.length, in);
                         report.check(
                                 "c" + chunk + "/L" + String.format("%02d", layer) + "/out",
                                 error(fixture.bf16("c" + chunk + "/L" + layer + "/out"), out),
@@ -97,9 +101,10 @@ class Qwen4ModelFixtureCudaIntegrationTest {
             Qwen4TestSupport.Report report =
                     new Qwen4TestSupport.Report("state after the attention block, case " + name);
             try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu();
-                    Arena arena = Arena.ofConfined();
+                    Arena arena = Arena.ofShared();
                     Qwen4Model model = open(gpu);
-                    Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT);
+                    Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                    Qwen4ExecutionPlan executor = run.plan();
                     Qwen4Sequence sequence = executor.newSequence()) {
                 int[] chunkHolder = new int[1];
                 executor.observeMid((layer, state, rows) -> {
@@ -117,7 +122,7 @@ class Qwen4ModelFixtureCudaIntegrationTest {
                     int[] tokens = tokens(fixture, chunk);
                     for (int layer = 0; layer < 4; layer++) {
                         short[] in = fixture.bf16("c" + chunk + "/L" + layer + "/in");
-                        executor.runSingleLayer(sequence, layer, tokens, 0, tokens.length, in);
+                        Qwen4Blocking.runSingleLayer(executor, sequence, layer, tokens, 0, tokens.length, in);
                     }
                     executor.finishChunk(sequence, tokens.length);
                 }
@@ -134,9 +139,10 @@ class Qwen4ModelFixtureCudaIntegrationTest {
         ReferenceFixtures fixture = fixtures("short");
         Qwen4TestSupport.Report report = new Qwen4TestSupport.Report("full forward, case short");
         try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu();
-                Arena arena = Arena.ofConfined();
+                Arena arena = Arena.ofShared();
                 Qwen4Model model = open(gpu);
-                Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT);
+                Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                Qwen4ExecutionPlan executor = run.plan();
                 Qwen4Sequence sequence = executor.newSequence()) {
             int vocabulary = executor.vocabularySize();
             var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
@@ -156,7 +162,8 @@ class Qwen4ModelFixtureCudaIntegrationTest {
             for (int chunk = 0; chunk < chunkCount(fixture); chunk++) {
                 chunkHolder[0] = chunk;
                 int[] tokens = tokens(fixture, chunk);
-                executor.step(
+                Qwen4Blocking.step(
+                        executor,
                         sequence,
                         tokens,
                         0,

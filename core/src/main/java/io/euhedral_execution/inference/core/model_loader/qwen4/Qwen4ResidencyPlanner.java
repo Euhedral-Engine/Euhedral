@@ -53,9 +53,11 @@ public final class Qwen4ResidencyPlanner {
         return 2 * config.moe().expertsPerToken();
     }
 
-    /// Pinned staging slots when expert records pass through the host from the artifact file.
+    /// Pinned staging slots when expert records pass through the host from the artifact file: a wave of experts (at
+    /// most 32, and no more than a layer has) loads at once, and each load holds a slot until its copy retires.
     public static int fileStagingSlots(Qwen4Config config) {
-        return Math.max(16, 2 * config.moe().expertsPerToken());
+        return Math.max(
+                Math.min(32, config.moe().numExperts()), 2 * config.moe().expertsPerToken());
     }
 
     public static Qwen4ResidencyPlan plan(

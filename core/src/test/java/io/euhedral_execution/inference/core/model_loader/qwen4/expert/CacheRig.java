@@ -3,14 +3,15 @@ package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 
-/// An [ExpertCache] over a fixture file on a [HostBackedGpu], assembled from one of the host stores and one of
-/// the transfers, so the same behaviour is proven on each combination.
+/// An [ExpertCache] over a fixture file on a [HostBackedGpu], assembled from one of the host stores and one
+/// of the transfers, so the same behaviour is proven on each combination.
 final class CacheRig implements AutoCloseable {
 
     enum StoreKind {
@@ -23,7 +24,8 @@ final class CacheRig implements AutoCloseable {
         SYNTHETIC,
         /// The real [GpuExpertTransfer] on a synchronous stream.
         GPU_INLINE,
-        /// The real [GpuExpertTransfer] on an asynchronous stream whose boundaries fire on a driver-like thread.
+        /// The real [GpuExpertTransfer] on an asynchronous stream whose boundaries fire on a driver-like
+        /// thread.
         GPU_ASYNC
     }
 
@@ -65,7 +67,7 @@ final class CacheRig implements AutoCloseable {
             }
             case GPU_INLINE -> {
                 this.synthetic = null;
-                this.transfer = new GpuExpertTransfer(this.gpu, 4);
+                this.transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED);
             }
             case GPU_ASYNC -> {
                 this.synthetic = null;
@@ -74,7 +76,7 @@ final class CacheRig implements AutoCloseable {
                     this.asyncStream = stream;
                     return stream;
                 });
-                this.transfer = new GpuExpertTransfer(this.gpu, 4);
+                this.transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED);
             }
             default -> throw new IllegalArgumentException();
         }
@@ -85,11 +87,12 @@ final class CacheRig implements AutoCloseable {
                 slots,
                 fixture.slotBytes(),
                 clock,
-                ExpertCache.DEFAULT_CLOSE_TIMEOUT_NANOS);
+                ExpertCache.DEFAULT_CLOSE_TIMEOUT_NANOS,
+                TestHostFrames.SHARED);
     }
 
-    /// Whether `hold` can keep transfers in flight on this combination (a synchronous stream copies inside the
-    /// submitting call).
+    /// Whether `hold` can keep transfers in flight on this combination (a synchronous stream copies inside
+    /// the submitting call).
     boolean holdable() {
         return this.transferKind != TransferKind.GPU_INLINE;
     }

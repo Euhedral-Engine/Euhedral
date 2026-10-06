@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
+import io.euhedral_execution.inference.core.host.HostFrames;
 import java.io.IOException;
 import java.util.concurrent.TimeoutException;
 
@@ -33,6 +34,33 @@ public interface HostExpertStore extends AutoCloseable {
     /// @throws TimeoutException when no staging space became free in time
     /// @throws IndexOutOfBoundsException when `bank` or `expert` is out of range
     HostRecord open(int bank, int expert, long timeoutNanos) throws IOException, InterruptedException, TimeoutException;
+
+    /// Receives the outcome of [#openAsync]: the record (the receiver must close it) or the failure.
+    @FunctionalInterface
+    interface OpenListener {
+        void opened(int tag, HostRecord record, Throwable failure);
+    }
+
+    /// Opens a record without blocking the caller: `listener` runs exactly once, on the calling thread when the
+    /// record is at hand, otherwise later on a worker. A store that must wait for staging space parks a
+    /// continuation instead of a thread, and a store that must read performs the (synchronous) read as its own host
+    /// frame through `frames`, so that simultaneous opens read on different workers.
+    ///
+    /// The default adapts a store whose [#open] never blocks.
+    default void openAsync(int bank, int expert, HostFrames frames, OpenListener listener, int tag) {
+        HostRecord record;
+        try {
+            record = open(bank, expert);
+        } catch (IOException | RuntimeException | Error failure) {
+            listener.opened(tag, null, failure);
+            return;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            listener.opened(tag, null, interrupted);
+            return;
+        }
+        listener.opened(tag, record, null);
+    }
 
     /// Bytes read from the artifact file so far.
     long bytesRead();

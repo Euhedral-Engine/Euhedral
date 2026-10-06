@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -70,7 +71,7 @@ class GpuExpertTransferTest {
 
     @Test
     void copiesTheRecordAndSignalsOnceOnASynchronousStream() throws Exception {
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             HostRecord record = this.store.open(1, 1);
             CompletableFuture<Throwable> done = completion();
             transfer.start(record, slot(2), null, done::complete);
@@ -87,7 +88,7 @@ class GpuExpertTransferTest {
     @Test
     void completionsNeverRunOnTheDriverThread() throws Exception {
         asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 4)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             List<CompletableFuture<String>> threads = new ArrayList<>();
             for (int expert = 0; expert < 3; expert++) {
                 CompletableFuture<String> done = new CompletableFuture<>();
@@ -97,8 +98,12 @@ class GpuExpertTransferTest {
                     done.complete(Thread.currentThread().getName());
                 });
             }
-            for (CompletableFuture<String> done : threads)
-                assertEquals("expert-transfer-completion", done.get(10, TimeUnit.SECONDS));
+            for (CompletableFuture<String> done : threads) {
+                String name = done.get(10, TimeUnit.SECONDS);
+                assertTrue(
+                        name.startsWith("test-host-frames-"),
+                        "completions run as host work, not on the driver: " + name);
+            }
             assertFalse(this.copyStream.get().confirmedOnWorker(), "confirmRetired runs on an ordinary thread");
             for (int expert = 0; expert < 3; expert++)
                 assertArrayEquals(
@@ -110,7 +115,7 @@ class GpuExpertTransferTest {
     @Test
     void aDeviceFailureFailsTheCompletionAndStillReleasesTheRecord() throws Exception {
         asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             this.copyStream.get().failNextRetirements(1);
             CompletableFuture<Throwable> done = completion();
             transfer.start(this.store.open(0, 0), slot(0), null, done::complete);
@@ -126,7 +131,7 @@ class GpuExpertTransferTest {
     @Test
     void aFailedSubmissionThrowsAfterRecoveringTheStreamAndReleasingEverything() throws Exception {
         asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 1)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             this.gpu.failNextHostCopies(1);
             AtomicReference<Throwable> signalled = new AtomicReference<>();
             assertThrows(
@@ -145,7 +150,7 @@ class GpuExpertTransferTest {
     @Test
     void aFailedBoundaryRegistrationThrowsAndReleases() throws Exception {
         asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 1)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             this.copyStream.get().failNextNotifications(1);
             assertThrows(
                     IllegalStateException.class,
@@ -163,7 +168,7 @@ class GpuExpertTransferTest {
     @Test
     void anUnprovenCompletionKeepsTheStagedRecord() throws Exception {
         asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             this.gpu.completionProven(false);
             this.copyStream.get().failNextRetirements(1);
             CompletableFuture<Throwable> done = completion();
@@ -178,7 +183,7 @@ class GpuExpertTransferTest {
     void theCopyWaitsOnTheDeviceBehindTheFence() throws Exception {
         asyncStream();
         FakeStream compute = new FakeStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             long old = slot(0);
             this.gpu.copyHostToDevice(
                     old,
@@ -239,7 +244,7 @@ class GpuExpertTransferTest {
     @Test
     void closeWaitsForTransfersInFlight() throws Exception {
         asyncStream();
-        GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2);
+        GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED);
         CountDownLatch release = new CountDownLatch(1);
         this.copyStream.get().stall(release);
         CompletableFuture<Throwable> done = completion();
@@ -259,60 +264,20 @@ class GpuExpertTransferTest {
     }
 
     @Test
-    void inFlightTransfersAreBoundedByTheirPermits() throws Exception {
+    void transfersQueueOnTheCopyStreamAndNeverBlockTheirRequester() throws Exception {
         asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
             CountDownLatch release = new CountDownLatch(1);
             this.copyStream.get().stall(release);
             List<CompletableFuture<Throwable>> done = new ArrayList<>();
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 3; i++) {
                 CompletableFuture<Throwable> d = completion();
                 done.add(d);
                 transfer.start(this.store.open(0, i), slot(i), null, d::complete);
             }
-            Future<?> third = this.pool.submit(() -> {
-                CompletableFuture<Throwable> d = completion();
-                done.add(d);
-                transfer.start(this.store.open(0, 2), slot(2), null, d::complete);
-                return null;
-            });
-            assertThrows(TimeoutException.class, () -> third.get(200, TimeUnit.MILLISECONDS));
+            assertEquals(3, transfer.inFlightHighWater());
             release.countDown();
-            third.get(10, TimeUnit.SECONDS);
             for (CompletableFuture<Throwable> d : done) assertNull(d.get(10, TimeUnit.SECONDS));
-        }
-    }
-
-    @Test
-    void anInterruptedStartReleasesTheRecordAndSignalsNothing() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 1)) {
-            CountDownLatch release = new CountDownLatch(1);
-            this.copyStream.get().stall(release);
-            CompletableFuture<Throwable> first = completion();
-            transfer.start(this.store.open(0, 0), slot(0), null, first::complete);
-            AtomicReference<Throwable> outcome = new AtomicReference<>();
-            CountDownLatch entered = new CountDownLatch(1);
-            Thread blocked = new Thread(() -> {
-                entered.countDown();
-                try {
-                    transfer.start(this.store.open(0, 1), slot(1), null, failure -> outcome.set(failure));
-                } catch (InterruptedException interrupted) {
-                    outcome.set(interrupted);
-                } catch (IOException ignored) {
-                    // not thrown by open here
-                }
-            });
-            blocked.start();
-            assertTrue(entered.await(5, TimeUnit.SECONDS));
-            while (this.store.freeSlots() > 2) Thread.sleep(1);
-            Thread.sleep(50);
-            blocked.interrupt();
-            blocked.join(10_000);
-            assertInstanceOf(InterruptedException.class, outcome.get());
-            assertEquals(3, this.store.freeSlots(), "the interrupted start closed its record");
-            release.countDown();
-            assertNull(first.get(10, TimeUnit.SECONDS));
         }
     }
 }

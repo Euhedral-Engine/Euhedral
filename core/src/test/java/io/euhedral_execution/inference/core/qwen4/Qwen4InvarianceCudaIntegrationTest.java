@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
@@ -36,13 +37,15 @@ class Qwen4InvarianceCudaIntegrationTest {
 
     /// The last row's logits after prefilling `tokens` in chunks of the given sizes.
     private static short[] prefill(
-            CudaGpuMemory gpu, Qwen4Executor executor, int[] tokens, int[] chunks, int decodeSteps) throws Exception {
+            CudaGpuMemory gpu, Qwen4ExecutionPlan executor, int[] tokens, int[] chunks, int decodeSteps)
+            throws Exception {
         int vocabulary = executor.vocabularySize();
         var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
         try (Qwen4Sequence sequence = executor.newSequence()) {
             int at = 0;
             for (int chunk : chunks) {
-                executor.step(
+                Qwen4Blocking.step(
+                        executor,
                         sequence,
                         tokens,
                         at,
@@ -88,8 +91,10 @@ class Qwen4InvarianceCudaIntegrationTest {
                         gpu.deviceMemoryInfo().freeBytes(),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        CONTEXT);
-                Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT)) {
+                        CONTEXT,
+                        TestHostFrames.SHARED);
+                Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                Qwen4ExecutionPlan executor = run.plan()) {
             short[] whole = prefill(gpu, executor, tokens, new int[] {tokens.length}, 0);
             int expected = argmax(whole);
             for (int[] cut : new int[][] {
@@ -125,8 +130,10 @@ class Qwen4InvarianceCudaIntegrationTest {
                         gpu.deviceMemoryInfo().freeBytes(),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        CONTEXT);
-                Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT)) {
+                        CONTEXT,
+                        TestHostFrames.SHARED);
+                Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                Qwen4ExecutionPlan executor = run.plan()) {
             roomy = prefill(gpu, executor, tokens, cut, 0);
             // Cold, then warm: the second run finds most experts resident.
             long hits = model.expertCache().stats().snapshot().hits();
@@ -141,8 +148,10 @@ class Qwen4InvarianceCudaIntegrationTest {
                         Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes()),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        262144);
-                Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT)) {
+                        262144,
+                        TestHostFrames.SHARED);
+                Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                Qwen4ExecutionPlan executor = run.plan()) {
             System.out.println("small cache: " + model.expertCache().slotCount() + " slots");
             assertTrue(model.expertCache().slotCount() <= 64, "expected a small cache");
             short[] small = prefill(gpu, executor, tokens, cut, 0);
@@ -165,8 +174,10 @@ class Qwen4InvarianceCudaIntegrationTest {
                         gpu.deviceMemoryInfo().freeBytes(),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        CONTEXT);
-                Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT)) {
+                        CONTEXT,
+                        TestHostFrames.SHARED);
+                Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, CONTEXT);
+                Qwen4ExecutionPlan executor = run.plan()) {
             var config = model.artifact().config();
             long before = gpu.allocatedBytes();
             long scratchBefore = gpu.retainedScratchBytes();
@@ -180,7 +191,7 @@ class Qwen4InvarianceCudaIntegrationTest {
                 // The tails of incomplete indexer blocks and the PLE history are a few hundred KiB the plan's workspace
                 // covers.
                 assertTrue(opened >= accounted && opened <= accounted + (2L << 20), opened + " vs " + accounted);
-                executor.step(sequence, tokens, 0, tokens.length, null);
+                Qwen4Blocking.step(executor, sequence, tokens, 0, tokens.length, null);
                 // The shared native-kernel scratch grows on first use: the workspace, not the sequence.
                 long grown = gpu.allocatedBytes() - before - (gpu.retainedScratchBytes() - scratchBefore);
                 long kv = io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4SequenceState.kvBytes(

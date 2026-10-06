@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
@@ -85,7 +86,8 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
 
     /// The engine's token at each step when fed the reference's own continuation.
     private static int[][] teacherForced(CudaGpuMemory gpu, Qwen4Model model, List<Case> cases) throws Exception {
-        try (Qwen4Executor executor = new Qwen4Executor(gpu, model, 2048)) {
+        try (Qwen4TestLattice.Run run = Qwen4TestLattice.shared().run(gpu, model, 2048);
+                Qwen4ExecutionPlan executor = run.plan()) {
             int vocabulary = executor.vocabularySize();
             var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
             int[][] tokens = new int[cases.size()][];
@@ -98,7 +100,8 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                         for (int step = 0; step < tokens[c].length; step++) {
                             for (int at = 0; at < feed.length; at += 512) {
                                 int rows = Math.min(512, feed.length - at);
-                                executor.step(
+                                Qwen4Blocking.step(
+                                        executor,
                                         sequence,
                                         feed,
                                         at,
@@ -134,7 +137,8 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                         gpu.deviceMemoryInfo().freeBytes(),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        4096)) {
+                        4096,
+                        TestHostFrames.SHARED)) {
             roomy = teacherForced(gpu, model, cases);
         }
         int[][] minimal;
@@ -145,7 +149,8 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                         Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes()),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        262144)) {
+                        262144,
+                        TestHostFrames.SHARED)) {
             assertTrue(model.expertCache().slotCount() <= 64);
             minimal = teacherForced(gpu, model, cases);
             assertTrue(model.expertCache().stats().snapshot().evictions() > 0);
