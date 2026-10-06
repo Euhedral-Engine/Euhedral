@@ -149,10 +149,14 @@ public final class ExpertCacheOwner {
         int shardIndex = this.cache.shardOf(bank, expert);
         ExpertCacheShard shard = this.cache.shard(shardIndex);
         RamTierShard tier = this.cache.store().tier(shardIndex);
-        // A miss needs a slot and, unless its record is in a pinned tier, a staging buffer: both, or neither.
+        // A miss needs a slot and, unless a pinned tier holds or takes its record, a staging buffer: both are reserved
+        // before the tier is asked, so a fetch that has to wait leaves the tier as it was (a fill's plan takes a slot
+        // and evicts its record, and admission counts the request).
         boolean pinnedTier = tier != null && tier.pinned();
-        int buffer = pinnedTier ? -1 : this.cache.store().acquireStaging();
-        shard.claim(bank, expert, pinnedTier || buffer >= 0, this.ticket);
+        boolean inTier = tier != null && tier.isResident(bank, expert);
+        boolean staged = !(pinnedTier && inTier);
+        int buffer = staged ? this.cache.store().acquireStaging() : -1;
+        shard.claim(bank, expert, !staged || buffer >= 0, this.ticket);
         ExpertLease lease = this.ticket.lease();
         ExpertCacheShard.Load reserved = this.ticket.load();
         if (reserved == null && buffer >= 0) this.cache.store().releaseStaging(buffer);
@@ -164,26 +168,20 @@ public final class ExpertCacheOwner {
             this.fullFetches.increment();
             return Outcome.FULL;
         }
-        TierDirective directive = new TierDirective();
-        if (tier != null) tier.plan(bank, expert, directive);
-        boolean reads = directive.mode() != TierDirective.Mode.HIT;
-        if (reads && this.reading >= READS) {
+        if (!inTier && this.reading >= READS) {
             // The disk has as many records in flight as keep it busy: this one is read once one of them is in.
-            ExpertLoad.giveBack(tier, directive);
             reserved.cancel();
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
             this.fullFetches.increment();
             return Outcome.FULL;
         }
-        if (buffer < 0 && this.cache.store().stagesThrough(directive)) {
-            // A pinned tier with every slot in use: the record bypasses it through a staging buffer.
-            buffer = this.cache.store().acquireStaging();
-            if (buffer < 0) {
-                ExpertLoad.giveBack(tier, directive);
-                reserved.cancel();
-                this.fullFetches.increment();
-                return Outcome.FULL;
-            }
+        TierDirective directive = new TierDirective();
+        if (tier != null) tier.plan(bank, expert, directive);
+        boolean reads = directive.mode() != TierDirective.Mode.HIT;
+        if (buffer >= 0 && !this.cache.store().stagesThrough(directive)) {
+            // A pinned tier takes the record into its slot: the copy reads it there.
+            this.cache.store().releaseStaging(buffer);
+            buffer = -1;
         }
         if (reads) this.reading++;
         ExpertLoad load = new ExpertLoad(this, target, reserved, buffer, tier, directive, reads, this.nextSeed);

@@ -359,7 +359,7 @@ public final class RamTierShard {
         return count;
     }
 
-    /// Whether the record has a ready slot. Read it with the shard quiescent.
+    /// Whether the record has a ready slot. Read it on the owner, or with the shard quiescent.
     public boolean isResident(int bank, int expert) {
         int slot = this.directory[this.keys.key(bank, expert)];
         return slot != NONE && this.state[slot] == READY;

@@ -405,10 +405,12 @@ class ExpertCacheOwnerTest {
         var store = new FileExpertStore(
                 this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 1, 2);
         build(1, store);
-        // The one staging buffer is held throughout: no load of a pinned tier may need it.
-        int held = store.acquireStaging();
-        assertEquals(-1, store.acquireStaging());
+        // A record read from the artifact reserves a staging buffer with its slot, and a fill of a pinned tier gives
+        // it back at once: the load reads into the tier slot.
         Fetch fill = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        int free = store.acquireStaging();
+        assertTrue(free >= 0, "the fill gave its staging buffer back");
+        store.releaseStaging(free);
         drive(fill::ended);
         assertTrue(fill.failures.isEmpty(), "a fill reads into its tier slot and is copied from there");
         drained();
@@ -420,6 +422,9 @@ class ExpertCacheOwnerTest {
         drained();
         other.lease().close();
         drained();
+        // The one staging buffer is held: a hit in a pinned tier needs none.
+        int held = store.acquireStaging();
+        assertEquals(-1, store.acquireStaging());
         Fetch hit = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
         assertTrue(hit.ended(), "the fetch submitted the copy from the tier slot itself");
         assertTrue(this.lake.ready.isEmpty() || this.lake.readyOf("Copy") == 0, "with no frame of its own");
@@ -431,6 +436,34 @@ class ExpertCacheOwnerTest {
         drained();
         assertEquals(1, tier.stats().totalHits());
         store.releaseStaging(held);
+        tier.checkInvariants();
+        this.cache.checkQuiescent();
+    }
+
+    /// A fetch that has to wait asks the tier nothing: planning a fill would take a slot, and evict its record, for
+    /// a load that does not start, again on every try.
+    @Test
+    void aFetchThatWaitsLeavesTheTierAsItWas() throws Exception {
+        var tier = new RamTier(this.fixture.banks, 1, 1, ReplacementPolicy.BANK_PARTITIONED, this.gpu);
+        var store = new FileExpertStore(
+                this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 1, 1);
+        build(1, store);
+        Fetch fill = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        drive(fill::ended);
+        drained();
+        fill.lease().close();
+        drained();
+        assertTrue(tier.shard(0).isResident(2, 0));
+        int held = store.acquireStaging();
+        for (int attempt = 0; attempt < 3; attempt++) fetch(2, 1, ExpertCacheOwner.Outcome.FULL);
+        assertTrue(tier.shard(0).isResident(2, 0), "the tier kept its record");
+        assertEquals(0, tier.stats().totalEvictions());
+        store.releaseStaging(held);
+        Fetch other = fetch(2, 1, ExpertCacheOwner.Outcome.LOADING);
+        drive(other::ended);
+        drained();
+        other.lease().close();
+        drained();
         tier.checkInvariants();
         this.cache.checkQuiescent();
     }
