@@ -11,7 +11,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
@@ -29,18 +28,21 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
-/// The end-to-end gate: fixed text prompts, the upstream model's greedy continuations (with every step's top-5 logits,
-/// `tools/flash_next_reference.py greedy`, KV cache through the engine's NVFP4 codec) and the engine's.
+/// The end-to-end gate: fixed text prompts, the upstream model's greedy continuations (with every
+/// step's top-5 logits, `tools/flash_next_reference.py greedy`, KV cache through the engine's NVFP4
+/// codec) and the engine's.
 ///
-/// A greedy token may differ from the reference only where the reference's own margin between the two tokens is inside
-/// BF16 noise (a logit difference of `NOISE`), because the engine's logits differ from the reference's by a few percent
-/// (chunking alone moves the reference by as much). Teacher-forced, so one flip does not change what follows, the
-/// engine's token at every step is compared with the reference's, and across expert-cache capacities the engine's own
-/// tokens must be identical.
+/// A greedy token may differ from the reference only where the reference's own margin between the
+/// two tokens is inside BF16 noise (a logit difference of `NOISE`), because the engine's logits
+/// differ from the reference's by a few percent (chunking alone moves the reference by as much).
+/// Teacher-forced, so one flip does not change what follows, the engine's token at every step is
+/// compared with the reference's, and across expert-cache capacities the engine's own tokens must
+/// be identical.
 class Qwen4GreedyAgreementCudaIntegrationTest {
 
-    /// Logit difference below which two tokens are interchangeable: the reference's own logits move by up to 0.75
-    /// between chunkings of one prompt (docs/FLASH_NEXT_REFERENCE.md), whose logits are about 20.
+    /// Logit difference below which two tokens are interchangeable: the reference's own logits move
+    /// by up to 0.75 between chunkings of one prompt (docs/FLASH_NEXT_REFERENCE.md), whose logits
+    /// are about 20.
     private static final double NOISE = 1.0;
 
     private record Step(int token, int[] top5, double[] logits) {
@@ -137,8 +139,7 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                         gpu.deviceMemoryInfo().freeBytes(),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        4096,
-                        TestHostFrames.SHARED)) {
+                        4096)) {
             roomy = teacherForced(gpu, model, cases);
         }
         int[][] minimal;
@@ -149,8 +150,7 @@ class Qwen4GreedyAgreementCudaIntegrationTest {
                         Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes()),
                         HostBudget.system(),
                         Qwen4Mode.TEXT,
-                        262144,
-                        TestHostFrames.SHARED)) {
+                        262144)) {
             assertTrue(model.expertCache().slotCount() <= 64);
             minimal = teacherForced(gpu, model, cases);
             assertTrue(model.expertCache().stats().snapshot().evictions() > 0);

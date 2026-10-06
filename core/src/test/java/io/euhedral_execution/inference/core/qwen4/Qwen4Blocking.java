@@ -6,8 +6,8 @@ import java.lang.foreign.ValueLayout;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
-/// Blocking forms of the executor's asynchronous steps, for tests whose calling thread is not a lattice
-/// worker: each starts the step and waits for its listener.
+/// Blocking forms of the executor's asynchronous steps, for tests whose calling thread is not a
+/// lattice worker: each starts the step and waits for its listener.
 public final class Qwen4Blocking {
 
     private Qwen4Blocking() {}
@@ -29,7 +29,8 @@ public final class Qwen4Blocking {
         await(done);
     }
 
-    /// Runs one layer of a chunk on a residual state the caller supplies and returns the state after it.
+    /// Runs one layer of a chunk on a residual state the caller supplies and returns the state
+    /// after it.
     static short[] runSingleLayer(
             Qwen4ExecutionPlan plan,
             Qwen4Sequence sequence,
@@ -76,10 +77,10 @@ public final class Qwen4Blocking {
         return out;
     }
 
-    /// Runs one MoE block through the layer's pieces on the calling thread (not a worker) and returns once
-    /// every wave is submitted (the stream is not waited for): the router and its route copy, a boundary
-    /// behind them, the shared expert, the planned waves whose experts are leased through the cache's
-    /// blocking acquire, and the combination.
+    /// Runs one MoE block through the layer's pieces on the calling thread (not a worker) and
+    /// returns once every wave is submitted (the stream is not waited for): the router and its
+    /// route copy, a boundary behind them, the shared expert, the planned waves whose experts are
+    /// leased through the cache's blocking acquire, and the combination.
     public static void runMoe(
             Qwen4MoeLayer moe,
             io.euhedral_execution.inference.core.gpu.GpuStream stream,
@@ -101,7 +102,10 @@ public final class Qwen4Blocking {
         int waves = moe.plan(bank, rows);
         for (int w = 0; w < waves; w++) {
             for (int position = moe.waveStart(w); position < moe.waveStart(w + 1); position++)
-                moe.hold(position, cache.acquire(bank, moe.expertAt(position)));
+                moe.hold(
+                        position,
+                        io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport.acquire(
+                                cache, bank, moe.expertAt(position)));
             int wave = w;
             stream.submit(() -> moe.submitWave(wave, stream, input, scratch), false);
         }

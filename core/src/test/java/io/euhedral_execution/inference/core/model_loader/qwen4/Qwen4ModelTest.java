@@ -6,10 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
@@ -22,8 +22,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/// The storage load end to end on the host-memory test GPU, with the mini artifact: placement, device and host
-/// accounting, the expert cache's bytes against the file, and that closing returns every allocation.
+/// The storage load end to end on the host-memory test GPU, with the mini artifact: placement,
+/// device and host accounting, the expert cache's bytes against the file, and that closing returns
+/// every allocation.
 class Qwen4ModelTest {
 
     static final long GIB = 1L << 30;
@@ -41,7 +42,8 @@ class Qwen4ModelTest {
         this.artifact = Qwen4TestArtifact.write(this.path, Qwen4TestArtifact.miniConfig(), 3);
     }
 
-    /// Free device memory that leaves exactly `slots` expert slots beside the mini model's other needs.
+    /// Free device memory that leaves exactly `slots` expert slots beside the mini model's other
+    /// needs.
     long freeFor(Qwen4Mode mode, int slots) {
         var roomy =
                 Qwen4ResidencyPlanner.plan(this.artifact, mode, 64 * GIB, HostBudget.ofAvailable(64 * GIB), CONTEXT);
@@ -75,8 +77,7 @@ class Qwen4ModelTest {
         int slots = 20;
         long free = freeFor(Qwen4Mode.TEXT, slots);
         long acquisitions = 0;
-        try (Qwen4Model model =
-                Qwen4Model.open(this.path, gpu, free, host, Qwen4Mode.TEXT, CONTEXT, TestHostFrames.SHARED)) {
+        try (Qwen4Model model = Qwen4Model.open(this.path, gpu, free, host, Qwen4Mode.TEXT, CONTEXT)) {
             var plan = model.plan();
             assertTrue(plan.fits(), plan.report());
             assertEquals(expectedStore, plan.expertStore());
@@ -122,7 +123,7 @@ class Qwen4ModelTest {
                 for (int round = 0; round < 40; round++) {
                     int bank = random.nextInt(banks.length);
                     int expert = random.nextInt(banks[bank].expertCount());
-                    try (ExpertLease lease = model.expertCache().acquire(bank, expert)) {
+                    try (ExpertLease lease = ExpertTestSupport.acquire(model.expertCache(), bank, expert)) {
                         acquisitions++;
                         gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
                         assertArrayEquals(
@@ -156,19 +157,14 @@ class Qwen4ModelTest {
     void selectingMtpLoadsItsLayerAndCachesItsExperts() throws Exception {
         HostMemoryGpu gpu = new HostMemoryGpu();
         Qwen4Mode mode = new Qwen4Mode(true, false);
-        try (Qwen4Model model = Qwen4Model.open(
-                this.path,
-                gpu,
-                freeFor(mode, 20),
-                HostBudget.ofAvailable(64 * GIB),
-                mode,
-                CONTEXT,
-                TestHostFrames.SHARED)) {
+        try (Qwen4Model model =
+                Qwen4Model.open(this.path, gpu, freeFor(mode, 20), HostBudget.ofAvailable(64 * GIB), mode, CONTEXT)) {
             assertEquals(5, model.expertBanks().length);
             assertEquals(StorageClass.DEVICE_CACHED, model.plan().storageOf("mtp/layers/0/moe/experts"));
             assertTrue(model.tensors().containsKey("mtp/fc_embedding"));
             assertTrue(model.bankOrdinal("mtp/layers/0/moe/experts") >= 0);
-            try (ExpertLease lease = model.expertCache().acquire(model.bankOrdinal("mtp/layers/0/moe/experts"), 7)) {
+            try (ExpertLease lease =
+                    ExpertTestSupport.acquire(model.expertCache(), model.bankOrdinal("mtp/layers/0/moe/experts"), 7)) {
                 assertTrue(lease.isValid());
             }
         }
@@ -182,13 +178,7 @@ class Qwen4ModelTest {
         var failure = assertThrows(
                 IOException.class,
                 () -> Qwen4Model.open(
-                        this.path,
-                        gpu,
-                        64 * GIB,
-                        HostBudget.ofAvailable(64 * GIB),
-                        Qwen4Mode.TEXT,
-                        4097,
-                        TestHostFrames.SHARED));
+                        this.path, gpu, 64 * GIB, HostBudget.ofAvailable(64 * GIB), Qwen4Mode.TEXT, 4097));
         assertTrue(failure.getMessage().contains("4096 positions"), failure.getMessage());
         assertEquals(0, gpu.liveDeviceAllocations());
         assertEquals(0, gpu.livePinnedAllocations());
@@ -200,13 +190,7 @@ class Qwen4ModelTest {
         var failure = assertThrows(
                 IOException.class,
                 () -> Qwen4Model.open(
-                        this.path,
-                        gpu,
-                        512L << 20,
-                        HostBudget.ofAvailable(64 * GIB),
-                        Qwen4Mode.TEXT,
-                        CONTEXT,
-                        TestHostFrames.SHARED));
+                        this.path, gpu, 512L << 20, HostBudget.ofAvailable(64 * GIB), Qwen4Mode.TEXT, CONTEXT));
         assertTrue(failure.getMessage().contains("MiB free"), failure.getMessage());
         assertEquals(0, gpu.liveDeviceAllocations());
         assertEquals(0, gpu.livePinnedAllocations());
@@ -235,8 +219,7 @@ class Qwen4ModelTest {
                         freeFor(Qwen4Mode.TEXT, 20),
                         HostBudget.ofAvailable(64 * GIB),
                         Qwen4Mode.TEXT,
-                        CONTEXT,
-                        TestHostFrames.SHARED));
+                        CONTEXT));
         assertEquals(0, gpu.liveDeviceAllocations());
         assertEquals(0, gpu.livePinnedAllocations());
     }

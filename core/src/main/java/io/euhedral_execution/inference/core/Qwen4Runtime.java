@@ -63,7 +63,7 @@ final class Qwen4Runtime implements AutoCloseable {
         InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
         HostTasks execution = new HostTasks(lake);
         HostTasks host = new HostTasks(lake);
-        Qwen4Storage storage = Qwen4Storage.load(config, execution);
+        Qwen4Storage storage = Qwen4Storage.load(config);
         EuhedralInferenceRuntime runtime = null;
         try {
             runtime = new EuhedralInferenceRuntime(lake, execution, storage.gpu(), LANES);
@@ -149,12 +149,13 @@ final class Qwen4Runtime implements AutoCloseable {
         if (this.closed) return;
         this.closed = true;
         RuntimeException failure = null;
-        this.plan.close();
+        // Every accepted step retires (its expert sources still serve it) before the plan completes the sources.
         try {
             this.runtime.close();
         } catch (RuntimeException closeFailure) {
             failure = closeFailure;
         }
+        this.plan.close();
         try {
             this.storage.close();
         } catch (RuntimeException closeFailure) {

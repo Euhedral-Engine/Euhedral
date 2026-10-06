@@ -31,6 +31,8 @@ public final class InferenceLake implements FrameLake {
     private final LatticeTerminal lattice;
     private final QueueIngestSink[] sinks;
     private volatile boolean attached;
+    private final java.util.List<io.euhedral_execution.core.generics.LatticeSource> attachedSources =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
     private final AtomicInteger accepted = new AtomicInteger();
     private final AtomicBoolean finished = new AtomicBoolean();
     private final CompletableFuture<Void> termination = new CompletableFuture<>();
@@ -44,6 +46,14 @@ public final class InferenceLake implements FrameLake {
         this.sinks = new QueueIngestSink[sinks];
         for (int i = 0; i < sinks; i++)
             this.sinks[i] = new QueueIngestSink(new PartitionedMpscQueue<>(partitions, QUEUE_CAPACITY));
+    }
+
+    /// Attaches `source` (a serial source of work the lake does not carry) to the lattice, and
+    /// completes it with the lake.
+    public void attach(io.euhedral_execution.core.generics.LatticeSource source) {
+        Objects.requireNonNull(source, "source");
+        this.lattice.addUpstream(source);
+        this.attachedSources.add(source);
     }
 
     /// Attaches every sink to the lattice, once. A lake that completed before anything used it
@@ -117,6 +127,13 @@ public final class InferenceLake implements FrameLake {
     private void signalComplete() {
         if (!this.finished.compareAndSet(false, true)) return;
         RuntimeException failure = null;
+        for (io.euhedral_execution.core.generics.LatticeSource source : this.attachedSources) {
+            try {
+                source.complete();
+            } catch (RuntimeException completionFailure) {
+                failure = completionFailure;
+            }
+        }
         for (QueueIngestSink sink : this.sinks) {
             try {
                 sink.complete();

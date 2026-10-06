@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.ComponentGroup;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
@@ -31,10 +30,10 @@ import java.util.SplittableRandom;
 import java.util.zip.CRC32;
 import org.junit.jupiter.api.Test;
 
-/// The real Flash-Next artifact through the engine's storage load on the real GPU, for several maximum contexts:
-/// every
-/// component has a location, device memory stays within the plan, experts move through the cache with the artifact's
-/// own bytes, rows come out of the n-gram tables, and closing returns every allocation. No model runs.
+/// The real Flash-Next artifact through the engine's storage load on the real GPU, for several
+/// maximum contexts: every component has a location, device memory stays within the plan, experts
+/// move through the cache with the artifact's own bytes, rows come out of the n-gram tables, and
+/// closing returns every allocation. No model runs.
 class Qwen4StorageCudaIntegrationTest {
 
     static final int[] CONTEXTS = {4096, 32768, 131072, 262144};
@@ -54,7 +53,7 @@ class Qwen4StorageCudaIntegrationTest {
             cpus.set(0);
             InferenceConfig config =
                     new InferenceConfig(artifact, Path.of("unused"), library, cpus, context, Duration.ofSeconds(30));
-            Qwen4Storage storage = Qwen4Storage.load(config, TestHostFrames.SHARED);
+            Qwen4Storage storage = Qwen4Storage.load(config);
             CudaGpuMemory gpu = (CudaGpuMemory) storage.gpu();
             try {
                 verify(storage.model(), gpu, artifact, context);
@@ -66,8 +65,9 @@ class Qwen4StorageCudaIntegrationTest {
         }
     }
 
-    /// A device with far less free memory than the GPU has: fixed objects must leave it, the output head is read in
-    /// place from mapped host memory, and the load still places every object and moves every expert correctly.
+    /// A device with far less free memory than the GPU has: fixed objects must leave it, the output
+    /// head is read in place from mapped host memory, and the load still places every object and
+    /// moves every expert correctly.
     @Test
     void placesFixedObjectsOnTheHostWhenTheDeviceIsSmall() throws Exception {
         Path artifact = artifactPath();
@@ -75,8 +75,7 @@ class Qwen4StorageCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library)) {
             long free = Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes());
-            Qwen4Model model = Qwen4Model.open(
-                    artifact, gpu, free, HostBudget.system(), Qwen4Mode.TEXT, 262144, TestHostFrames.SHARED);
+            Qwen4Model model = Qwen4Model.open(artifact, gpu, free, HostBudget.system(), Qwen4Mode.TEXT, 262144);
             try {
                 var plan = model.plan();
                 assertTrue(plan.host().stagedBytes() > 0, plan.report());
@@ -92,7 +91,8 @@ class Qwen4StorageCudaIntegrationTest {
         }
     }
 
-    /// The MTP layer and its experts load, and their experts move through the same cache, when the mode selects MTP.
+    /// The MTP layer and its experts load, and their experts move through the same cache, when the
+    /// mode selects MTP.
     @Test
     void selectingMtpLoadsItsLayerAndItsExpertBank() throws Exception {
         Path artifact = artifactPath();
@@ -105,14 +105,15 @@ class Qwen4StorageCudaIntegrationTest {
                     gpu.deviceMemoryInfo().freeBytes(),
                     HostBudget.system(),
                     new Qwen4Mode(true, false),
-                    8192,
-                    TestHostFrames.SHARED);
+                    8192);
             try {
                 assertEquals(49, model.expertBanks().length);
                 assertTrue(model.tensors().containsKey("mtp/fc_embedding"));
                 int mtp = model.bankOrdinal("mtp/layers/0/moe/experts");
                 ExpertBank bank = model.expertBanks()[mtp];
-                try (ExpertLease lease = model.expertCache().acquire(mtp, 511);
+                try (ExpertLease lease =
+                                io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport
+                                        .acquire(model.expertCache(), mtp, 511);
                         Arena arena = Arena.ofConfined()) {
                     MemorySegment back = arena.allocate(lease.byteSize());
                     gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
@@ -161,7 +162,8 @@ class Qwen4StorageCudaIntegrationTest {
         System.out.println(model.telemetry());
     }
 
-    /// Every loaded fixed object holds the artifact's bytes where the plan put it (the first 64 MiB of the big ones).
+    /// Every loaded fixed object holds the artifact's bytes where the plan put it (the first 64 MiB
+    /// of the big ones).
     private static void verifyFixed(Qwen4Model model, CudaGpuMemory gpu, Path artifact) throws IOException {
         int checked = 0;
         for (TensorHandle handle : model.tensors().values()) {
@@ -197,7 +199,9 @@ class Qwen4StorageCudaIntegrationTest {
             for (int i = 0; i < total; i++) {
                 int bank = i % banks.length;
                 int expert = (i / banks.length) % banks[bank].expertCount();
-                try (ExpertLease lease = cache.acquire(bank, expert)) {
+                try (ExpertLease lease =
+                        io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport.acquire(
+                                cache, bank, expert)) {
                     gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
                     CRC32 crc = new CRC32();
                     crc.update(back.asSlice(0, lease.byteSize()).asByteBuffer());
@@ -208,7 +212,9 @@ class Qwen4StorageCudaIntegrationTest {
             for (int i = 0; i < 300; i++) {
                 int bank = random.nextInt(banks.length);
                 int expert = random.nextInt(banks[bank].expertCount());
-                try (ExpertLease lease = cache.acquire(bank, expert)) {
+                try (ExpertLease lease =
+                        io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport.acquire(
+                                cache, bank, expert)) {
                     gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
                     byte[] expected =
                             readFile(artifact, banks[bank].fileOffset(expert), (int) banks[bank].recordBytes(expert));

@@ -14,11 +14,12 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.regex.Pattern;
 
-/// The fixed-memory half of Flash-Next residency: from the device's free memory, the host's pinnable memory, the
-/// requested maximum context and the artifact's actual object sizes it decides what lives on the device for good,
-/// what is host-backed, what is mapped, what stays unloaded, and how many bytes are left for the routed-expert
-/// cache. It keeps no replacement state; the cache ([io.euhedral_execution.inference.core.model_loader.qwen4.expert])
-/// manages the budget this planner hands it.
+/// The fixed-memory half of Flash-Next residency: from the device's free memory, the host's
+/// pinnable memory, the requested maximum context and the artifact's actual object sizes it decides
+/// what lives on the device for good, what is host-backed, what is mapped, what stays unloaded, and
+/// how many bytes are left for the routed-expert cache. It keeps no replacement state; the cache
+/// ([io.euhedral_execution.inference.core.model_loader.qwen4.expert]) manages the budget this
+/// planner hands it.
 ///
 /// ```
 /// free device memory
@@ -29,15 +30,16 @@ import java.util.regex.Pattern;
 ///   = the expert cache, in whole slots
 /// ```
 ///
-/// Context has priority: a longer context takes memory from the expert cache first, and only when the cache would
-/// fall below its minimum does a fixed object move to the host, lowest priority first and the fewest bytes that
-/// suffice. A fixed byte is read on every token while a cached expert is hit only on some, so the planner never moves
-/// fixed objects to enlarge the cache. A plan that cannot meet the minimum even with every movable object on the host
-/// is returned with `fits` false and the reason.
+/// Context has priority: a longer context takes memory from the expert cache first, and only when
+/// the cache would fall below its minimum does a fixed object move to the host, lowest priority
+/// first and the fewest bytes that suffice. A fixed byte is read on every token while a cached
+/// expert is hit only on some, so the planner never moves fixed objects to enlarge the cache. A
+/// plan that cannot meet the minimum even with every movable object on the host is returned with
+/// `fits` false and the reason.
 public final class Qwen4ResidencyPlanner {
 
-    /// The CUDA context, kernel modules and graph pools that exist beside the model (about 0.9 GiB measured on
-    /// the dense model's engine, docs/NVFP4_RESIDENCY.md).
+    /// The CUDA context, kernel modules and graph pools that exist beside the model (about 0.9 GiB
+    /// measured on the dense model's engine, docs/NVFP4_RESIDENCY.md).
     public static final long KERNEL_RESERVE_BYTES = 1024L << 20;
 
     /// Staging slots for host-backed fixed objects, shared with the dense engine's ring.
@@ -48,16 +50,31 @@ public final class Qwen4ResidencyPlanner {
 
     private Qwen4ResidencyPlanner() {}
 
-    /// The smallest expert cache that can serve one token: its selected experts plus a second set in flight.
+    /// The smallest expert cache that can serve one token: its selected experts plus a second set
+    /// in flight.
     public static int minimumSlots(Qwen4Config config) {
         return 2 * config.moe().expertsPerToken();
     }
 
-    /// Pinned staging slots when expert records pass through the host from the artifact file: a wave of experts (at
-    /// most 32, and no more than a layer has) loads at once, and each load holds a slot until its copy retires.
+    /// Pinned staging slots when expert records pass through the host from the artifact file: a
+    /// wave of experts (at most 32, and no more than a layer has) loads at once, and each load
+    /// holds a slot until its copy retires.
     public static int fileStagingSlots(Qwen4Config config) {
         return Math.max(
                 Math.min(32, config.moe().numExperts()), 2 * config.moe().expertsPerToken());
+    }
+
+    /// Experts of one wave at most: a wave's experts are pinned until its kernels are submitted and
+    /// the next wave's claim slots at the same time, so a shard must hold two waves.
+    public static int expertWave(int slotsOfAShard) {
+        return Math.max(1, Math.min(32, slotsOfAShard / 2));
+    }
+
+    /// Shards (independent partitions of the expert cache, each its own lattice source) for a cache
+    /// of `slots`: as many as can each hold two full waves, at most 8.
+    public static int expertShards(int slots) {
+        int wave = expertWave(slots);
+        return Math.max(1, Math.min(8, slots / (2 * wave)));
     }
 
     public static Qwen4ResidencyPlan plan(
@@ -274,10 +291,10 @@ public final class Qwen4ResidencyPlanner {
         static final Selection NONE = new Selection(Set.of(), 0, 0, 0);
     }
 
-    /// At least `bytes` of movable objects (or all of them), in offload-rank order. Within a rank, whole
-    /// families (the same object in every layer) go smallest tensor first, and the last family takes layers
-    /// spread evenly, so that transfers interleave with resident work and the staging ring holds the smallest
-    /// possible tensor.
+    /// At least `bytes` of movable objects (or all of them), in offload-rank order. Within a rank,
+    /// whole families (the same object in every layer) go smallest tensor first, and the last
+    /// family takes layers spread evenly, so that transfers interleave with resident work and the
+    /// staging ring holds the smallest possible tensor.
     private static Selection select(List<Qwen4Tensor> movable, long bytes) {
         if (bytes <= 0) return Selection.NONE;
         Map<Integer, Map<String, List<Qwen4Tensor>>> ranks = new TreeMap<>();

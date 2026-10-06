@@ -1,7 +1,6 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.host.HostFrames;
 import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ArenaExpertStore;
@@ -66,26 +65,16 @@ public final class Qwen4Model implements AutoCloseable {
     /// `maxContextTokens`, and loads the plan. Fails with the plan's explanation when no placement
     /// can serve the context.
     public static Qwen4Model open(
-            Path path,
-            ExecutionGpu gpu,
-            long freeDeviceBytes,
-            HostBudget host,
-            Qwen4Mode mode,
-            int maxContextTokens,
-            HostFrames frames)
+            Path path, ExecutionGpu gpu, long freeDeviceBytes, HostBudget host, Qwen4Mode mode, int maxContextTokens)
             throws IOException {
         Qwen4Artifact artifact = Qwen4ArtifactReader.read(path);
         Qwen4Validator.validateInventory(artifact);
         Qwen4ResidencyPlan plan = Qwen4ResidencyPlanner.plan(artifact, mode, freeDeviceBytes, host, maxContextTokens);
-        return load(path, artifact, plan, gpu, frames);
+        return load(path, artifact, plan, gpu);
     }
 
     /// Loads `plan`, which must have been made for `artifact`.
-    ///
-    /// `frames` runs the expert hierarchy's continuations: reads, copies' completions, parked
-    /// requests.
-    public static Qwen4Model load(
-            Path path, Qwen4Artifact artifact, Qwen4ResidencyPlan plan, ExecutionGpu gpu, HostFrames frames)
+    public static Qwen4Model load(Path path, Qwen4Artifact artifact, Qwen4ResidencyPlan plan, ExecutionGpu gpu)
             throws IOException {
         LOG.info("{}", plan.report());
         if (!plan.fits())
@@ -108,14 +97,14 @@ public final class Qwen4Model implements AutoCloseable {
                     new FileExpertStore(
                             gpu, path, cachedBanks, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
             };
-            transfer = new GpuExpertTransfer(gpu, frames, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
+            transfer = new GpuExpertTransfer(gpu, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
             ExpertCache cache = new ExpertCache(
                     store,
                     transfer,
                     gpu,
                     plan.expertCache().slotCount(),
                     plan.expertCache().slotBytes(),
-                    frames);
+                    Qwen4ResidencyPlanner.expertShards(plan.expertCache().slotCount()));
             return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);

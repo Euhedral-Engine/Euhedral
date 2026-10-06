@@ -1,11 +1,11 @@
 package io.euhedral_execution.inference.core.qwen4;
 
-import io.euhedral_execution.core.impl.FrameManager;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.qwen4.NgramStore;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4LayerType;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
+import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
@@ -32,13 +32,11 @@ import java.util.concurrent.atomic.LongAdder;
 /// runs, waits, or in what order beyond the edges of the shape. The plan owns the model-level
 /// resources that stages read (weights, the layers' operators, the expert cache); each graph owns
 /// its workspace ([Qwen4GraphStorage]); and the plan serves one quantum at a time through a
-/// completion chain, because a graph's expert window is sized to the cache's slots.
+/// completion chain, because a block's experts are sized to the cache's slots.
 public final class Qwen4ExecutionPlan implements AutoCloseable {
 
     /// Most tokens of one chunk.
     public static final int MAX_ROWS = 512;
-
-    private static final long ITEM_PASSWORD = 0x1e57_17e3L;
 
     /// The row capacities of the plan's shapes: a decode token, a short chunk, a full chunk.
     private static final int[] ROW_BUCKETS = {1, 16, MAX_ROWS};
@@ -125,18 +123,17 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     private final int streams;
     private final int vocabulary;
     private final int maxTokens;
-    private final int window;
     private final int maxWaveExperts;
-    private final int copyLanes;
-    private final FrameManager<ExpertItem, ExpertItem> items = new FrameManager<>(1024, ITEM_PASSWORD);
+    /// One serial source per shard of the expert cache, each attached to the lattice on its own.
+    private final ExpertSource[] expertSources;
     private final boolean[] sparse;
     private final int[] bankOrdinals;
     private final Qwen4Weight embedding;
     private final Qwen4Weight head;
     private final ConcurrentHashMap<ShapeKey, Qwen4Shape> shapes = new ConcurrentHashMap<>();
-    private final java.util.Map<Integer, Qwen4GraphStorage> workspaces = new java.util.HashMap<>();
-    private final java.util.List<Qwen4GraphStorage.Lease> reserved = new java.util.ArrayList<>();
-    private final java.util.Map<Integer, Integer> leases = new java.util.HashMap<>();
+    /// The workspaces, one per row capacity of [#ROW_BUCKETS]: allocated with the plan, shared by
+    /// the graphs of a capacity, freed by [#close].
+    private final Qwen4GraphStorage[] workspaces = new Qwen4GraphStorage[ROW_BUCKETS.length];
     /// The last quantum admitted: a new quantum registers as its successor, and its conclusion
     /// starts the new one.
     private final AtomicReference<Qwen4Quantum> chainTail = new AtomicReference<>();
@@ -152,27 +149,11 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     /// @param runtime the lattice runtime that instantiates and runs the plan's graphs
     public Qwen4ExecutionPlan(
             ExecutionGpu gpu, Qwen4Model model, int maxContextTokens, EuhedralInferenceRuntime runtime) {
-        this(gpu, model, maxContextTokens, runtime, 0);
-    }
-
-    /// @param acquireWindow the expert waves of a block that are read ahead at once, the one
-    ///     whose copies are still in flight included; 0 sizes it from the cache (half its slots
-    ///     hold waves being read, the rest the waves that are draining)
-    public Qwen4ExecutionPlan(
-            ExecutionGpu gpu,
-            Qwen4Model model,
-            int maxContextTokens,
-            EuhedralInferenceRuntime runtime,
-            int acquireWindow) {
-        if (acquireWindow < 0) throw new IllegalArgumentException("acquireWindow must not be negative");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.model = model;
         this.config = model.artifact().config();
         this.maxTokens = maxContextTokens;
-        int slots = model.expertCache().slotCount();
-        int wave = Math.max(1, Math.min(32, slots / 2));
-        this.window = acquireWindow > 0 ? acquireWindow : Math.max(1, slots / (2 * wave));
         this.hidden = this.config.text().hiddenSize();
         this.streams = this.config.hyperConnection().count();
         this.vocabulary = this.config.text().vocabSize();
@@ -215,28 +196,37 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         this.bankOrdinals = new int[layers];
         for (int l = 0; l < layers; l++) this.bankOrdinals[l] = model.bankOrdinal("text/layers/" + l + "/moe/experts");
         this.geometry = Qwen4ExpertOps.Geometry.of(model.expertBanks()[0]);
-        // The window's waves hold a cache slot per expert until each wave is submitted, so a window needs at most the
-        // cache's slots; the copy lanes (one staging slot and one copy stream each) bound the reads in flight. A
-        // request
-        // past a bound fails; nothing queues to hide it.
-        int cacheSlots = model.expertCache().slotCount();
-        this.maxWaveExperts = Math.max(1, Math.min(cacheSlots / (this.window + 1), 32));
-        this.copyLanes = model.stagingSlots();
+        // A wave's experts are pinned until its kernels are submitted, and the next wave's claim slots meanwhile: a
+        // shard
+        // holds two waves, so a wave of any spread over the shards fits. A request past a bound fails; nothing queues
+        // to
+        // hide it.
+        ExpertCache cache = model.expertCache();
+        this.maxWaveExperts = Qwen4ResidencyPlanner.expertWave(cache.slotCount() / cache.shardCount());
+        this.expertSources = new ExpertSource[cache.shardCount()];
+        for (int shard = 0; shard < this.expertSources.length; shard++) {
+            this.expertSources[shard] = new ExpertSource(cache, shard);
+            runtime.lake().attach(this.expertSources[shard]);
+        }
         this.embedding = this.weights.embedding();
         this.head = this.weights.head();
         // The workspaces are allocated now, not by the first step: a model that cannot hold them fails to load, and the
         // residency plan's reserve is spent at a known time.
         try {
-            for (int rows : ROW_BUCKETS) this.reserved.add(leaseStorage(gpu, rows));
+            for (int i = 0; i < ROW_BUCKETS.length; i++)
+                this.workspaces[i] = new Qwen4GraphStorage(this, gpu, ROW_BUCKETS[i]);
         } catch (Throwable failure) {
-            releaseReserved();
+            closeWorkspaces();
             throw failure;
         }
     }
 
-    private void releaseReserved() {
-        for (Qwen4GraphStorage.Lease lease : this.reserved) lease.close();
-        this.reserved.clear();
+    private void closeWorkspaces() {
+        for (int i = 0; i < this.workspaces.length; i++) {
+            Qwen4GraphStorage storage = this.workspaces[i];
+            this.workspaces[i] = null;
+            if (storage != null) storage.close();
+        }
     }
 
     // ---------------------------------------------------------------- starting quanta
@@ -318,23 +308,12 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         return quantum;
     }
 
-    /// A lease on the workspace of capacity `rows`, allocated by its first lease and freed with its
-    /// last.
-    synchronized Qwen4GraphStorage.Lease leaseStorage(ExecutionGpu gpu, int rows) {
-        Qwen4GraphStorage storage = this.workspaces.get(rows);
-        if (storage == null) {
-            storage = new Qwen4GraphStorage(this, gpu, rows);
-            this.workspaces.put(rows, storage);
-        }
-        this.leases.merge(rows, 1, Integer::sum);
-        return new Qwen4GraphStorage.Lease(this, rows, storage);
-    }
-
-    synchronized void releaseStorage(int rows) {
-        if (this.leases.merge(rows, -1, Integer::sum) > 0) return;
-        this.leases.remove(rows);
-        Qwen4GraphStorage storage = this.workspaces.remove(rows);
-        if (storage != null) storage.close();
+    /// A graph's hold on the workspace of capacity `rows`: the graphs of a capacity take turns on
+    /// it.
+    Qwen4GraphStorage.Lease leaseStorage(int rows) {
+        for (int i = 0; i < ROW_BUCKETS.length; i++)
+            if (ROW_BUCKETS[i] == rows) return new Qwen4GraphStorage.Lease(this.workspaces[i]);
+        throw new IllegalArgumentException("no workspace of " + rows + " rows");
     }
 
     /// The row capacity of the shape that serves `rows` rows: a decode token, a short chunk, a full
@@ -377,25 +356,14 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
                 this.maxWaveExperts);
     }
 
-    /// Copy lanes: the experts of a block that are read and copied at once.
-    int copyLanes() {
-        return this.copyLanes;
-    }
-
-    /// An expert item from the plan's pool; only the plan stage of the one running quantum calls
-    /// it.
-    ExpertItem obtainItem() {
-        return ExpertItem.obtain(this.items, ITEM_PASSWORD);
+    /// The sources that own the expert cache's shards.
+    ExpertSource[] expertSources() {
+        return this.expertSources;
     }
 
     /// Experts per wave at most.
     int maxWaveExperts() {
         return this.maxWaveExperts;
-    }
-
-    /// Waves whose experts load ahead at once.
-    int window() {
-        return this.window;
     }
 
     int layers() {
@@ -569,6 +537,7 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     @Override
     public void close() {
         this.closed = true;
-        releaseReserved();
+        closeWorkspaces();
+        for (ExpertSource source : this.expertSources) source.complete();
     }
 }
