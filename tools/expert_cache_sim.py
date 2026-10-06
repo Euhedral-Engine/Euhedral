@@ -82,6 +82,23 @@ class Policy:
     def access(self, key: int, pinned: set) -> bool:
         raise NotImplementedError
 
+    def holds(self, key: int) -> bool:
+        raise NotImplementedError
+
+    def prefetch(self, key: int, pinned: set) -> bool:
+        """Brings `key` in ahead of a request, without counting one; returns whether it was taken in."""
+        counts = getattr(self, "counts", None)
+        if counts is not None:
+            before, seen = counts.count.get(key), counts.seen
+        self.access(key, pinned)
+        if counts is not None:
+            if before is None:
+                counts.count.pop(key, None)
+            else:
+                counts.count[key] = before
+            counts.seen = seen
+        return self.holds(key)
+
 
 class LRU(Policy):
     name = "lru"
@@ -577,6 +594,24 @@ class Static(Policy):
         return key in self.held
 
 
+def _holds_default(self, key):
+    for attr in ("order", "index", "held", "where", "visited"):
+        container = getattr(self, attr, None)
+        if container is not None:
+            return key in container
+    for attr in ("small", "main", "protected", "probation", "window", "t1", "t2"):
+        container = getattr(self, attr, None)
+        if container is not None and key in container:
+            return True
+    lists = getattr(self, "lists", None)
+    if lists is not None:
+        return key in lists[key // 4096]
+    return False
+
+
+Policy.holds = _holds_default
+
+
 class SampledLFU(Policy):
     """Evicts the least requested of a sample of held records (aged counts; the least recent among equals), and with
     admission replaces it only by a record requested more often before. Sampling stands in for a full frequency
@@ -752,6 +787,8 @@ class Tally:
     tier_hits: int = 0
     disk: int = 0
     disk_bytes: int = 0
+    prefetched: int = 0
+    prefetch_bytes: int = 0
 
 
 def preload(tier: Policy, trace: Trace, slots: int):
@@ -769,7 +806,13 @@ def preload(tier: Policy, trace: Trace, slots: int):
 
 
 def replay(
-    trace: Trace, device_policy: str, tier_policy: str, device_slots: int, tier_slots: int, fill: bool = False
+    trace: Trace,
+    device_policy: str,
+    tier_policy: str,
+    device_slots: int,
+    tier_slots: int,
+    fill: bool = False,
+    predictor=None,
 ):
     nxt = next_uses(trace)
     device = POLICIES[device_policy](device_slots, trace)
@@ -787,6 +830,19 @@ def replay(
             continue
         _, bank, rows, keys = event
         pinned = set(keys)
+        if predictor is not None and tier is not None:
+            # The previous block's prediction of this layer was read into the tier before this block asks.
+            candidates, budget = predictor.take(bank, rows)
+            for key in candidates:
+                if budget <= 0:
+                    break
+                if device.holds(key) or tier.holds(key):
+                    continue
+                budget -= 1
+                tallies[phase].prefetched += 1
+                tallies[phase].prefetch_bytes += trace.record_bytes[bank]
+                tier.prefetch(key, pinned)
+            predictor.observe(bank, rows, keys)
         for level in (device, tier):
             if level is not None and hasattr(level, "visit"):
                 level.visit(bank)
