@@ -3,281 +3,165 @@ package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.inference.core.host.TestHostFrames;
-import java.io.IOException;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicReference;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+/// Copies on lanes: each lane has a copy stream of its own, a copy records a marker behind itself,
+/// its retirement is a driver callback that only reports a ticket, and nothing waits for it.
 class GpuExpertTransferTest {
 
     @TempDir
     Path directory;
 
+    private final HostBackedGpu gpu = new HostBackedGpu();
+    private final List<FakeStream> streams = new ArrayList<>();
     private ExpertFixture fixture;
-    private HostBackedGpu gpu;
-    private FileExpertStore store;
-    private long slab;
-    private final AtomicReference<FakeStream> copyStream = new AtomicReference<>();
-    private ExecutorService pool;
+    private ArenaExpertStore store;
 
     @BeforeEach
-    void setUp() throws IOException {
+    void setUp() throws Exception {
         this.fixture = ExpertFixture.standard(this.directory, 21);
-        this.gpu = new HostBackedGpu();
-        this.store = new FileExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 4);
-        this.slab = this.gpu.allocate(8 * this.fixture.slotBytes());
-        this.pool = Executors.newCachedThreadPool();
-    }
-
-    @AfterEach
-    void tearDown() {
-        this.pool.shutdownNow();
-    }
-
-    private void asyncStream() {
         this.gpu.streamFactory(() -> {
             FakeStream stream = new FakeStream();
-            this.copyStream.set(stream);
+            synchronized (this.streams) {
+                this.streams.add(stream);
+            }
             return stream;
         });
+        this.store = new ArenaExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 2);
     }
 
-    private long slot(int index) {
-        return this.slab + index * this.fixture.slotBytes();
-    }
-
-    private static CompletableFuture<Throwable> completion() {
-        return new CompletableFuture<>();
-    }
-
-    @Test
-    void copiesTheRecordAndSignalsOnceOnASynchronousStream() throws Exception {
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            HostRecord record = this.store.open(1, 1);
-            CompletableFuture<Throwable> done = completion();
-            transfer.start(record, slot(2), null, done::complete);
-            assertNull(done.get(10, TimeUnit.SECONDS));
-            assertArrayEquals(
-                    this.fixture.record(1, 1), this.gpu.readDevice(slot(2), this.fixture.banks[1].recordBytes(1)));
-            assertEquals(4, this.store.freeSlots(), "the staging slot returned after the copy");
-            assertEquals(1, this.gpu.hostCopies());
+    private FakeStream lane(int lane) {
+        synchronized (this.streams) {
+            return this.streams.get(1 + lane);
         }
-        assertEquals(1, this.gpu.streamsOpened());
-        assertEquals(1, this.gpu.streamsClosed());
     }
 
-    @Test
-    void completionsNeverRunOnTheDriverThread() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            List<CompletableFuture<String>> threads = new ArrayList<>();
-            for (int expert = 0; expert < 3; expert++) {
-                CompletableFuture<String> done = new CompletableFuture<>();
-                threads.add(done);
-                transfer.start(this.store.open(0, expert), slot(expert), null, failure -> {
-                    assertNull(failure);
-                    done.complete(Thread.currentThread().getName());
-                });
-            }
-            for (CompletableFuture<String> done : threads) {
-                String name = done.get(10, TimeUnit.SECONDS);
-                assertTrue(
-                        name.startsWith("test-host-frames-"),
-                        "completions run as host work, not on the driver: " + name);
-            }
-            assertFalse(this.copyStream.get().confirmedOnWorker(), "confirmRetired runs on an ordinary thread");
-            for (int expert = 0; expert < 3; expert++)
-                assertArrayEquals(
-                        this.fixture.record(0, expert),
-                        this.gpu.readDevice(slot(expert), this.fixture.banks[0].recordBytes(expert)));
+    private static final class Retired implements GpuStream.RetirementListener {
+        final CompletableFuture<Long> ticket = new CompletableFuture<>();
+        volatile boolean driver;
+
+        @Override
+        public void retired(long ticket, boolean driverThread) {
+            this.driver = driverThread;
+            this.ticket.complete(ticket);
         }
     }
 
     @Test
-    void aDeviceFailureFailsTheCompletionAndStillReleasesTheRecord() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            this.copyStream.get().failNextRetirements(1);
-            CompletableFuture<Throwable> done = completion();
-            transfer.start(this.store.open(0, 0), slot(0), null, done::complete);
-            Throwable failure = done.get(10, TimeUnit.SECONDS);
-            assertInstanceOf(IllegalStateException.class, failure);
-            assertEquals(4, this.store.freeSlots());
-            CompletableFuture<Throwable> retry = completion();
-            transfer.start(this.store.open(0, 0), slot(0), null, retry::complete);
-            assertNull(retry.get(10, TimeUnit.SECONDS));
+    void aCopyLandsInTheSlotAndItsRetirementIsADriverCallback() throws Exception {
+        long slot = this.gpu.allocate(this.fixture.slotBytes());
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+            assertEquals(2, transfer.lanes());
+            long marker = transfer.openMarker();
+            Retired retired = new Retired();
+            HostRecord record = this.store.open(2, 7, 0);
+            transfer.stream(1, record, slot, null, marker, retired);
+            long ticket = retired.ticket.get(10, TimeUnit.SECONDS);
+            assertTrue(retired.driver, "the boundary reports from a driver thread, where it may only enqueue");
+            assertNull(transfer.confirm(1, ticket));
+            assertArrayEquals(this.fixture.record(2, 7), this.gpu.readDevice(slot, record.byteSize()));
+            assertEquals(1, transfer.submittedCopies());
+            transfer.closeMarker(marker);
         }
+        this.gpu.free(slot);
     }
 
     @Test
-    void aFailedSubmissionThrowsAfterRecoveringTheStreamAndReleasingEverything() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            this.gpu.failNextHostCopies(1);
-            AtomicReference<Throwable> signalled = new AtomicReference<>();
-            assertThrows(
-                    IllegalStateException.class,
-                    () -> transfer.start(this.store.open(0, 0), slot(0), null, signalled::set));
-            assertNull(signalled.get(), "a throwing start signals no completion");
-            assertEquals(4, this.store.freeSlots());
-            assertEquals(1, this.copyStream.get().recoveries());
-            // The single in-flight permit came back.
-            CompletableFuture<Throwable> done = completion();
-            transfer.start(this.store.open(0, 1), slot(0), null, done::complete);
-            assertNull(done.get(10, TimeUnit.SECONDS));
-        }
-    }
-
-    @Test
-    void aFailedBoundaryRegistrationThrowsAndReleases() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            this.copyStream.get().failNextNotifications(1);
-            assertThrows(
-                    IllegalStateException.class,
-                    () -> transfer.start(this.store.open(0, 0), slot(0), null, failure -> {
-                        throw new AssertionError("no completion expected");
-                    }));
-            assertEquals(4, this.store.freeSlots());
-            assertEquals(1, this.copyStream.get().recoveries());
-            CompletableFuture<Throwable> done = completion();
-            transfer.start(this.store.open(0, 1), slot(0), null, done::complete);
-            assertNull(done.get(10, TimeUnit.SECONDS));
-        }
-    }
-
-    @Test
-    void anUnprovenCompletionKeepsTheStagedRecord() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            this.gpu.completionProven(false);
-            this.copyStream.get().failNextRetirements(1);
-            CompletableFuture<Throwable> done = completion();
-            transfer.start(this.store.open(0, 0), slot(0), null, done::complete);
-            assertNotEquals(null, done.get(10, TimeUnit.SECONDS));
-            assertEquals(3, this.store.freeSlots(), "a copy that may still run keeps its source pinned");
-            this.gpu.completionProven(true);
-        }
-    }
-
-    @Test
-    void theCopyWaitsOnTheDeviceBehindTheFence() throws Exception {
-        asyncStream();
-        FakeStream compute = new FakeStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
-            long old = slot(0);
-            this.gpu.copyHostToDevice(
-                    old,
-                    java.lang.foreign.MemorySegment.ofArray(new byte[9001]),
-                    9001); // the slot holds zeros: the kernels' data
-            CountDownLatch kernels = new CountDownLatch(1);
-            compute.stall(kernels);
-            long marker = compute.openMarker();
-            compute.mark(marker);
-            StreamFence fence = StreamFence.owning(compute, marker);
-            CompletableFuture<Throwable> done = completion();
-            transfer.start(this.store.open(1, 1), old, fence, done::complete);
-            assertThrows(TimeoutException.class, () -> done.get(200, TimeUnit.MILLISECONDS));
-            assertArrayEquals(
-                    new byte[(int) this.fixture.banks[1].recordBytes(1)],
-                    this.gpu.readDevice(old, this.fixture.banks[1].recordBytes(1)),
-                    "the refill did not overtake the work the fence stands for");
-            kernels.countDown();
-            assertNull(done.get(10, TimeUnit.SECONDS));
-            assertArrayEquals(
-                    this.fixture.record(1, 1), this.gpu.readDevice(old, this.fixture.banks[1].recordBytes(1)));
-            assertFalse(compute.markerClosed(marker), "the transfer does not release the fence; its owner does");
-            fence.release();
-            assertTrue(compute.markerClosed(marker));
-        } finally {
-            compute.close();
-        }
-    }
-
-    @Test
-    void sharedStreamFencesCoverEachOtherAndCompositesReleaseEveryMember() {
-        FakeStream compute = new FakeStream();
-        try {
-            long marker = compute.openMarker();
-            long other = compute.openMarker();
-            StreamFence a = new StreamFence(compute, marker);
-            StreamFence b = new StreamFence(compute, marker);
-            StreamFence c = StreamFence.owning(compute, other);
-            assertTrue(a.covers(b));
-            assertFalse(a.covers(c));
-            List<DeviceFence> dropped = new ArrayList<>();
-            DeviceFence merged = DeviceFences.merge(null, a, dropped);
-            assertEquals(a, merged);
-            merged = DeviceFences.merge(merged, b, dropped);
-            assertEquals(a, merged, "an equal shared fence adds nothing");
-            assertEquals(1, dropped.size());
-            merged = DeviceFences.merge(merged, c, dropped);
-            assertTrue(merged.covers(a) && merged.covers(c));
-            merged.release();
-            assertTrue(compute.markerClosed(other), "the owning member was released");
-            assertFalse(compute.markerClosed(marker), "a shared marker stays with its owner");
-            assertTrue(merged == DeviceFences.merge(merged, a, dropped));
-        } finally {
-            compute.close();
-        }
-    }
-
-    @Test
-    void closeWaitsForTransfersInFlight() throws Exception {
-        asyncStream();
-        GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED);
-        CountDownLatch release = new CountDownLatch(1);
-        this.copyStream.get().stall(release);
-        CompletableFuture<Throwable> done = completion();
-        transfer.start(this.store.open(0, 0), slot(0), null, done::complete);
-        Future<?> closing = this.pool.submit(transfer::close);
-        assertThrows(TimeoutException.class, () -> closing.get(200, TimeUnit.MILLISECONDS));
-        assertEquals(0, this.gpu.streamsClosed());
-        release.countDown();
-        closing.get(10, TimeUnit.SECONDS);
-        assertTrue(done.isDone());
-        assertEquals(1, this.gpu.streamsClosed());
-        transfer.close();
-        assertEquals(1, this.gpu.streamsClosed(), "closing twice closes the stream once");
-        HostRecord rejected = this.store.open(0, 1);
-        assertThrows(IllegalStateException.class, () -> transfer.start(rejected, slot(0), null, failure -> {}));
-        assertEquals(4, this.store.freeSlots(), "a rejected record is still released");
-    }
-
-    @Test
-    void transfersQueueOnTheCopyStreamAndNeverBlockTheirRequester() throws Exception {
-        asyncStream();
-        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED)) {
+    void theCopyDoesNotWaitForTheHostAndLanesDoNotWaitForEachOther() throws Exception {
+        long slotA = this.gpu.allocate(this.fixture.slotBytes());
+        long slotB = this.gpu.allocate(this.fixture.slotBytes());
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 2)) {
+            long markerA = transfer.openMarker();
+            long markerB = transfer.openMarker();
             CountDownLatch release = new CountDownLatch(1);
-            this.copyStream.get().stall(release);
-            List<CompletableFuture<Throwable>> done = new ArrayList<>();
-            for (int i = 0; i < 3; i++) {
-                CompletableFuture<Throwable> d = completion();
-                done.add(d);
-                transfer.start(this.store.open(0, i), slot(i), null, d::complete);
-            }
-            assertEquals(3, transfer.inFlightHighWater());
+            lane(0).stall(release);
+            Retired slow = new Retired();
+            Retired fast = new Retired();
+            transfer.stream(0, this.store.open(2, 1, 0), slotA, null, markerA, slow);
+            transfer.stream(1, this.store.open(2, 2, 1), slotB, null, markerB, fast);
+            fast.ticket.get(10, TimeUnit.SECONDS);
+            assertFalse(slow.ticket.isDone(), "a stalled lane leaves the other lane's copy alone");
             release.countDown();
-            for (CompletableFuture<Throwable> d : done) assertNull(d.get(10, TimeUnit.SECONDS));
+            slow.ticket.get(10, TimeUnit.SECONDS);
+            assertNull(transfer.confirm(0, slow.ticket.get()));
+            assertNull(transfer.confirm(1, fast.ticket.get()));
+            transfer.closeMarker(markerA);
+            transfer.closeMarker(markerB);
         }
+        this.gpu.free(slotA);
+        this.gpu.free(slotB);
+    }
+
+    @Test
+    void aFenceOrdersTheLanesStreamBehindTheKernelsThatReadTheSlot() throws Exception {
+        long slot = this.gpu.allocate(this.fixture.slotBytes());
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 1)) {
+            long marker = transfer.openMarker();
+            int[] waited = {0};
+            DeviceFence fence = copyStream -> {
+                assertNotNull(copyStream);
+                waited[0]++;
+            };
+            Retired retired = new Retired();
+            transfer.stream(0, this.store.open(0, 0, 0), slot, fence, marker, retired);
+            retired.ticket.get(10, TimeUnit.SECONDS);
+            assertEquals(1, waited[0]);
+            assertNull(transfer.confirm(0, retired.ticket.get()));
+            transfer.closeMarker(marker);
+        }
+        this.gpu.free(slot);
+    }
+
+    @Test
+    void aDeviceFailureIsReportedWhenTheCopyIsConfirmed() throws Exception {
+        long slot = this.gpu.allocate(this.fixture.slotBytes());
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 1)) {
+            long marker = transfer.openMarker();
+            lane(0).failNextRetirements(1);
+            Retired retired = new Retired();
+            transfer.stream(0, this.store.open(0, 0, 0), slot, null, marker, retired);
+            assertNotNull(transfer.confirm(0, retired.ticket.get(10, TimeUnit.SECONDS)));
+            transfer.closeMarker(marker);
+        }
+        this.gpu.free(slot);
+    }
+
+    @Test
+    void aCopyThatCannotBeSubmittedThrowsAndTheLaneIsRecovered() throws Exception {
+        long slot = this.gpu.allocate(this.fixture.slotBytes());
+        try (GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 1)) {
+            long marker = transfer.openMarker();
+            this.gpu.failNextHostCopies(1);
+            assertThrows(
+                    RuntimeException.class,
+                    () -> transfer.stream(0, this.store.open(0, 0, 0), slot, null, marker, new Retired()));
+            transfer.recover(0, new IllegalStateException("the copy was not queued"));
+            assertEquals(1, lane(0).recoveries());
+            transfer.closeMarker(marker);
+        }
+        this.gpu.free(slot);
+    }
+
+    @Test
+    void closingClosesEveryStreamOnceAndTwiceIsHarmless() throws Exception {
+        GpuExpertTransfer transfer = new GpuExpertTransfer(this.gpu, 3);
+        transfer.close();
+        transfer.close();
+        assertEquals(this.gpu.streamsOpened(), this.gpu.streamsClosed());
+        assertEquals(4, this.gpu.streamsClosed(), "three lanes and the marker stream");
     }
 }

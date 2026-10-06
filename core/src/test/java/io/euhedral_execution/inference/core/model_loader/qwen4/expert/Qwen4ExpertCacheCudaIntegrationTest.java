@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
-import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDataType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
@@ -19,22 +18,18 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import java.util.SplittableRandom;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-/// The expert cache on a real GPU: records of about 2.7 MB from a synthetic file of about 1 GB are copied
-/// into a small slab by [GpuExpertTransfer] on a real stream, read back, and compared with the file. Run with
-/// `./gradlew :core:cudaIntegrationTest --tests '*Qwen4ExpertCacheCudaIntegrationTest'`.
+/// The expert cache on a real GPU: records of about 2.7 MB from a synthetic file of about 1 GB are
+/// copied into a small slab by [GpuExpertTransfer] on a real stream, read back, and compared with
+/// the file. Run with `./gradlew :core:cudaIntegrationTest --tests
+/// '*Qwen4ExpertCacheCudaIntegrationTest'`.
 class Qwen4ExpertCacheCudaIntegrationTest {
     private static final int BANKS = 6;
     private static final int EXPERTS = 64;
@@ -66,8 +61,8 @@ class Qwen4ExpertCacheCudaIntegrationTest {
         if (this.file != null) Files.deleteIfExists(this.file);
     }
 
-    /// Writes `BANKS * EXPERTS` records of pseudo-random bytes, in a few slightly different sizes, and
-    /// describes them.
+    /// Writes `BANKS * EXPERTS` records of pseudo-random bytes, in a few slightly different sizes,
+    /// and describes them.
     private static ExpertBank[] generate(Path file) throws IOException {
         SplittableRandom random = new SplittableRandom(20261005L);
         ExpertBank[] banks = new ExpertBank[BANKS];
@@ -151,46 +146,31 @@ class Qwen4ExpertCacheCudaIntegrationTest {
 
     private void runCache(String name, HostExpertStore store, long slotBytes) throws Exception {
         long deviceBefore = this.gpu.allocatedBytes();
-        ExpertCache cache = new ExpertCache(
-                store, new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED), this.gpu, SLOTS, slotBytes);
+        ExpertCache cache = new ExpertCache(store, new GpuExpertTransfer(this.gpu, 4), this.gpu, SLOTS, slotBytes, 1);
         assertEquals(deviceBefore + SLOTS * slotBytes, this.gpu.allocatedBytes(), "one slab, nothing else");
-        ExecutorService pool = Executors.newFixedThreadPool(4);
         try (FileChannel channel = FileChannel.open(this.file, StandardOpenOption.READ);
                 Arena arena = Arena.ofConfined()) {
             // Sequential misses: every record of two banks, so each copy runs alone and is timed alone.
             for (int bank = 0; bank < 2; bank++) {
                 for (int expert = 0; expert < EXPERTS; expert++) {
-                    try (ExpertLease lease = cache.acquire(bank, expert)) {
+                    try (ExpertLease lease = ExpertTestSupport.acquire(cache, bank, expert)) {
                         verify(lease, channel, arena);
                     }
                 }
             }
-            // Random traffic with hits, from several threads at once.
-            List<Future<?>> futures = new ArrayList<>();
-            for (int t = 0; t < 4; t++) {
-                int seed = t;
-                futures.add(pool.submit(() -> {
-                    Random random = new Random(seed);
-                    try (FileChannel own = FileChannel.open(this.file, StandardOpenOption.READ);
-                            Arena ownArena = Arena.ofConfined()) {
-                        for (int i = 0; i < 60; i++) {
-                            int bank = random.nextInt(BANKS);
-                            int expert = random.nextInt(random.nextBoolean() ? 6 : EXPERTS);
-                            try (ExpertLease lease = cache.acquire(bank, expert)) {
-                                verify(lease, own, ownArena);
-                            }
-                        }
-                    }
-                    return null;
-                }));
+            // Random traffic with hits.
+            Random random = new Random(0);
+            for (int i = 0; i < 240; i++) {
+                int bank = random.nextInt(BANKS);
+                int expert = random.nextInt(random.nextBoolean() ? 6 : EXPERTS);
+                try (ExpertLease lease = ExpertTestSupport.acquire(cache, bank, expert)) {
+                    verify(lease, channel, arena);
+                }
             }
-            for (Future<?> future : futures) future.get(120, TimeUnit.SECONDS);
             cache.checkQuiescent();
 
             fencedRelease(cache, channel, arena, slotBytes);
             cache.checkQuiescent();
-        } finally {
-            pool.shutdownNow();
         }
         ExpertCacheStats.Snapshot stats = cache.stats().snapshot();
         double gigabytesPerSecond = stats.transferBytesPerSecond() / 1e9;
@@ -218,8 +198,9 @@ class Qwen4ExpertCacheCudaIntegrationTest {
         assertEquals(this.baseHostWeights, this.gpu.hostWeightBytes(), "the host arena was freed");
     }
 
-    /// A kernel-like read of a slot on a compute stream, closed with a stream marker: the refill of that slot
-    /// is ordered behind it on the device, so the compute stream's copy still sees the old record.
+    /// A kernel-like read of a slot on a compute stream, closed with a stream marker: the refill of
+    /// that slot is ordered behind it on the device, so the compute stream's copy still sees the
+    /// old record.
     private void fencedRelease(ExpertCache cache, FileChannel channel, Arena arena, long slotBytes) throws Exception {
         long scratch = this.gpu.allocate(slotBytes);
         GpuStream compute = this.gpu.openStream();
@@ -227,15 +208,15 @@ class Qwen4ExpertCacheCudaIntegrationTest {
             // Replace every resident, so 4/63 is loaded into a slot of its own and is evicted by the eighth
             // miss after it.
             for (int expert = 0; expert < SLOTS; expert++)
-                cache.acquire(3, 56 + expert).close();
-            ExpertLease reader = cache.acquire(4, 63);
+                ExpertTestSupport.acquire(cache, 3, 56 + expert).close();
+            ExpertLease reader = ExpertTestSupport.acquire(cache, 4, 63);
             long size = reader.byteSize();
             long marker = compute.openMarker();
             compute.submit(() -> this.gpu.copyDeviceToDevice(scratch, reader.deviceAddress(), size), false);
             compute.mark(marker);
             reader.close(StreamFence.owning(compute, marker));
             for (int expert = 0; expert < SLOTS; expert++)
-                cache.acquire(3, 40 + expert).close();
+                ExpertTestSupport.acquire(cache, 3, 40 + expert).close();
             assertTrue(!cache.isResident(4, 63), "its slot was refilled behind the fence");
             compute.synchronize();
             MemorySegment copy = arena.allocate(size, 64);

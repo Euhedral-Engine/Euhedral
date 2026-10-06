@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.host.HostFrames;
 import io.euhedral_execution.inference.core.model_loader.ModelArchitecture;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
@@ -13,13 +12,13 @@ import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/// The Flash-Next load the engine performs from the artifact and the maximum context alone: it reads and validates the
-/// artifact, plans residency from the device's free memory and the context, loads the fixed objects and the host
-/// stores, and builds the expert cache from what the plan leaves. It runs no model: execution for `qwen4_exp` builds on
-/// the [Qwen4Model] this holds.
+/// The Flash-Next load the engine performs from the artifact and the maximum context alone: it
+/// reads and validates the artifact, plans residency from the device's free memory and the context,
+/// loads the fixed objects and the host stores, and builds the expert cache from what the plan
+/// leaves. It runs no model: execution for `qwen4_exp` builds on the [Qwen4Model] this holds.
 ///
-/// Nothing about placement is configured. The user chooses the artifact and the maximum context; the cache size, the
-/// offload, the staging depth and the host stores are derived.
+/// Nothing about placement is configured. The user chooses the artifact and the maximum context;
+/// the cache size, the offload, the staging depth and the host stores are derived.
 public final class Qwen4Storage implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(Qwen4Storage.class);
@@ -68,13 +67,13 @@ public final class Qwen4Storage implements AutoCloseable {
         this.model = model;
     }
 
-    /// Loads the `qwen4_exp` artifact of `config` for `config.maxContextTokens()`, selecting no MTP and no vision.
-    public static Qwen4Storage load(InferenceConfig config, HostFrames frames) throws IOException {
-        return load(config, SYSTEM, Qwen4Mode.TEXT, frames);
+    /// Loads the `qwen4_exp` artifact of `config` for `config.maxContextTokens()`, selecting no MTP
+    /// and no vision.
+    public static Qwen4Storage load(InferenceConfig config) throws IOException {
+        return load(config, SYSTEM, Qwen4Mode.TEXT);
     }
 
-    static Qwen4Storage load(InferenceConfig config, Environment environment, Qwen4Mode mode, HostFrames frames)
-            throws IOException {
+    static Qwen4Storage load(InferenceConfig config, Environment environment, Qwen4Mode mode) throws IOException {
         Objects.requireNonNull(config, "config");
         ModelArchitecture architecture = ModelArchitecture.detect(config.artifactPath());
         if (architecture != ModelArchitecture.QWEN4_EXP)
@@ -83,13 +82,7 @@ public final class Qwen4Storage implements AutoCloseable {
         try {
             long free = environment.freeDeviceBytes(gpu);
             Qwen4Model model = Qwen4Model.open(
-                    config.artifactPath(),
-                    gpu,
-                    free,
-                    environment.hostBudget(),
-                    mode,
-                    config.maxContextTokens(),
-                    frames);
+                    config.artifactPath(), gpu, free, environment.hostBudget(), mode, config.maxContextTokens());
             LOG.info(
                     "Flash-Next storage loaded: {} expert slots, {} MiB of fixed objects on the device",
                     model.plan().expertCache().slotCount(),

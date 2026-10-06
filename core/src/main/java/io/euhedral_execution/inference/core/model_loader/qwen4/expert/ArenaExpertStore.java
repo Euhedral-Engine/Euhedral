@@ -15,17 +15,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
-/// Every record of every bank, loaded at construction into one pinned huge-page arena. [#open] returns an
-/// address inside the arena: no copy and no staging, so closing a record does nothing.
+/// Every record of every bank, loaded at construction into one pinned huge-page arena. [#open]
+/// returns an address inside the arena: no copy and no staging.
 ///
-/// One arena, not one allocation per record: the device's copy engines reach their full host-to-device rate
-/// only from large huge-page-backed ranges, and a pinned allocation per record falls back to small pages.
-/// The arena is read from the file by a bounded pool of threads issuing large positional reads, so loading
-/// scales with the storage's parallelism rather than with one reader.
+/// One arena, not one allocation per record: the device's copy engines reach their full
+/// host-to-device rate only from large huge-page-backed ranges, and a pinned allocation per record
+/// falls back to small pages. The arena is read from the file by a bounded pool of threads issuing
+/// large positional reads, so loading scales with the storage's parallelism rather than with one
+/// reader.
 public final class ArenaExpertStore implements HostExpertStore {
     /// Records start on cache-line boundaries inside the arena.
     private static final long RECORD_ALIGNMENT = 64;
@@ -135,13 +135,17 @@ public final class ArenaExpertStore implements HostExpertStore {
         return this.banks.clone();
     }
 
+    /// Every record is addressable already: no lane is needed and nothing limits how many are open.
     @Override
-    public HostRecord open(int bank, int expert, long timeoutNanos) {
+    public int lanes() {
+        return Integer.MAX_VALUE;
+    }
+
+    @Override
+    public HostRecord open(int bank, int expert, int lane) {
         int key = this.keys.key(bank, expert);
-        this.arena.borrow();
         this.opens.increment();
-        return new ArenaRecord(
-                this.arena, this.arena.address() + this.hostOffsets[key], this.banks[bank].recordBytes(expert));
+        return new ArenaRecord(this.arena.address() + this.hostOffsets[key], this.banks[bank].recordBytes(expert));
     }
 
     /// Bytes read from the file: the sum of every record, once, at construction.
@@ -160,37 +164,11 @@ public final class ArenaExpertStore implements HostExpertStore {
         return this.arena.byteSize();
     }
 
-    /// Frees the arena once no record is open.
+    /// Frees the arena. No record may be in use.
     @Override
     public void close() {
         this.arena.close();
     }
 
-    private static final class ArenaRecord implements HostRecord {
-        private final HostArena arena;
-        private final long address;
-        private final long byteSize;
-        private final AtomicBoolean closed = new AtomicBoolean();
-
-        private ArenaRecord(HostArena arena, long address, long byteSize) {
-            this.arena = arena;
-            this.address = address;
-            this.byteSize = byteSize;
-        }
-
-        @Override
-        public long hostAddress() {
-            return this.address;
-        }
-
-        @Override
-        public long byteSize() {
-            return this.byteSize;
-        }
-
-        @Override
-        public void close() {
-            if (this.closed.compareAndSet(false, true)) this.arena.giveBack();
-        }
-    }
+    private record ArenaRecord(long hostAddress, long byteSize) implements HostRecord {}
 }

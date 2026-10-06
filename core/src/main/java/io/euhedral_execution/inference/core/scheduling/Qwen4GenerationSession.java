@@ -16,16 +16,17 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
-/// One persistent Flash-Next sequence being generated from: prefill chunks, then one decode step per token, with the
-/// engine's sampler, constraint and text decoding around the model. The model is ordinary autoregressive text
-/// generation: every token is the target model's own.
+/// One persistent Flash-Next sequence being generated from: prefill chunks, then one decode step
+/// per token, with the engine's sampler, constraint and text decoding around the model. The model
+/// is ordinary autoregressive text generation: every token is the target model's own.
 ///
-/// A generation is a chain of continuations, not a loop on a thread. Each step is started on the plan and ends
-/// by calling the chain on the worker that retired it; the chain samples, emits text, and starts the next step, then
-/// returns. While a step waits for the device or for an expert the generation occupies no thread. Generations of
-/// different sessions interleave step by step. The text callback runs on whichever worker retired a step, one call
-/// at a time and in order. The session never knows the model is sparse: it hands token ids to the plan and takes a
-/// logits row back.
+/// A generation is a chain of continuations, not a loop on a thread. Each step is started on the
+/// plan and ends by calling the chain on the worker that retired it; the chain samples, emits text,
+/// and starts the next step, then returns. While a step waits for the device or for an expert the
+/// generation occupies no thread. Generations of different sessions interleave step by step. The
+/// text callback runs on whichever worker retired a step, one call at a time and in order. The
+/// session never knows the model is sparse: it hands token ids to the plan and takes a logits row
+/// back.
 public final class Qwen4GenerationSession implements GenerationSession {
 
     /// Prompt tokens per prefill step (the plan's chunk).
@@ -38,7 +39,12 @@ public final class Qwen4GenerationSession implements GenerationSession {
     private final QwenLogitsSampler sampler;
     private final QwenHostLogits hostLogits;
     private final Qwen4ExecutionPlan.LogitsSink sink;
-    private final List<Integer> generatedTokenIds = new ArrayList<>();
+    /// The generated tokens: appended by the generation chain, one frame at a time, and read by any
+    /// thread. The array only grows, with its earlier entries copied before it is published, so a
+    /// reader that takes the count and then the array sees that many tokens.
+    private volatile int[] generatedIds = new int[64];
+
+    private volatile int generatedCount;
     private final AtomicBoolean generationActive = new AtomicBoolean();
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -202,8 +208,8 @@ public final class Qwen4GenerationSession implements GenerationSession {
             decodeNext();
         }
 
-        /// One iteration of the decode loop: commit the selected token, and sample the next unless the budget is
-        /// spent.
+        /// One iteration of the decode loop: commit the selected token, and sample the next unless
+        /// the budget is spent.
         private void decodeNext() {
             if (this.generated >= this.maxNewTokens || isStopRequested()) {
                 finishDecoding();
@@ -287,9 +293,15 @@ public final class Qwen4GenerationSession implements GenerationSession {
 
         private void record(int tokenId) {
             this.callTokens.add(tokenId);
-            synchronized (Qwen4GenerationSession.this.generatedTokenIds) {
-                Qwen4GenerationSession.this.generatedTokenIds.add(tokenId);
+            Qwen4GenerationSession session = Qwen4GenerationSession.this;
+            int count = session.generatedCount;
+            int[] ids = session.generatedIds;
+            if (count == ids.length) {
+                ids = java.util.Arrays.copyOf(ids, count * 2);
+                session.generatedIds = ids;
             }
+            ids[count] = tokenId;
+            session.generatedCount = count + 1;
         }
 
         private void finishDecoding() {
@@ -354,9 +366,11 @@ public final class Qwen4GenerationSession implements GenerationSession {
 
     @Override
     public List<Integer> generatedTokenIds() {
-        synchronized (this.generatedTokenIds) {
-            return List.copyOf(this.generatedTokenIds);
-        }
+        int count = this.generatedCount;
+        int[] ids = this.generatedIds;
+        List<Integer> copy = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) copy.add(ids[i]);
+        return List.copyOf(copy);
     }
 
     /// The model keeps no prefix cache: every prompt is prefilled whole.

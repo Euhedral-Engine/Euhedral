@@ -18,11 +18,11 @@ import java.util.List;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
-/// First performance record of ordinary Flash-Next generation: load time, prefill of 512, 4K and 16K tokens, decode at
-/// short, 4K, 16K and 32K context, expert-cache behavior and the time per component. Measurements, not assertions;
-/// opt-in because it takes minutes: `EUHEDRAL_QWEN4_PERF=1`; `EUHEDRAL_QWEN4_PERF_MAX` bounds the contexts (default
-/// 4096).
-/// The prompt is the repository's own documentation, tokenized with the model's tokenizer.
+/// First performance record of ordinary Flash-Next generation: load time, prefill of 512, 4K and
+/// 16K tokens, decode at short, 4K, 16K and 32K context, expert-cache behavior and the time per
+/// component. Measurements, not assertions; opt-in because it takes minutes:
+/// `EUHEDRAL_QWEN4_PERF=1`; `EUHEDRAL_QWEN4_PERF_MAX` bounds the contexts (default 4096). The
+/// prompt is the repository's own documentation, tokenized with the model's tokenizer.
 class Qwen4PerformanceCudaIntegrationTest {
 
     private static final int MAX = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_PERF_MAX", "4096"));
@@ -146,8 +146,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                             gpu.deviceMemoryInfo().freeBytes(),
                             HostBudget.system(),
                             Qwen4Mode.TEXT,
-                            CONTEXT,
-                            lattice.tasks());
+                            CONTEXT);
                     Qwen4TestLattice.Run run = lattice.run(gpu, model, CONTEXT);
                     Qwen4ExecutionPlan executor = run.plan()) {
                 line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));

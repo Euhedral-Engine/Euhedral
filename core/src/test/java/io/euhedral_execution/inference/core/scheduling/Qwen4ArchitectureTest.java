@@ -12,15 +12,17 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
-/// A guard on the shape of Flash-Next host execution, in addition to the behavioural tests: the model's runtime and its
-/// execution path create no scheduling infrastructure of their own. Every piece of host work is a frame on the
-/// lattice; the only waiting a path may do is a parked continuation.
+/// A guard on the shape of Flash-Next host execution, in addition to the behavioural tests: the
+/// model's runtime and its execution path create no scheduling infrastructure of their own. Every
+/// piece of host work is a frame on the lattice; the only waiting a path may do is a parked
+/// continuation.
 class Qwen4ArchitectureTest {
 
     private static final Path MAIN = Path.of("src/main/java/io/euhedral_execution/inference/core");
 
-    /// What would be a private scheduler: pools, executors, virtual threads, threads, CompletableFuture's async
-    /// forms (which run on the common pool), and blocking waits on asynchronous operations.
+    /// What would be a private scheduler: pools, executors, virtual threads, threads,
+    /// CompletableFuture's async forms (which run on the common pool), and blocking waits on
+    /// asynchronous operations.
     private static final List<Pattern> FORBIDDEN = List.of(
             Pattern.compile("\\bExecutorService\\b"),
             Pattern.compile("\\bExecutors\\b"),
@@ -34,8 +36,8 @@ class Qwen4ArchitectureTest {
             Pattern.compile("\\.awaitCompletion\\("),
             Pattern.compile("\\bparallelStream\\b"));
 
-    /// Startup loaders that read the artifact before any request exists. They are not execution paths; the expert
-    /// store's own fill is replaced by lattice frames with the host tier.
+    /// Startup loaders that read the artifact before any request exists. They are not execution
+    /// paths; the expert store's own fill is replaced by lattice frames with the host tier.
     private static final Set<String> STARTUP = Set.of(
             "model_loader/qwen4/Qwen4FixedLoader.java",
             "model_loader/qwen4/Qwen4Validator.java",
@@ -107,5 +109,33 @@ class Qwen4ArchitectureTest {
                     .toList();
             assertTrue(offenders.isEmpty(), "host work outside the graph: " + offenders);
         }
+    }
+
+    /// The path through the cache and back holds no lock: its state has one owner (a serial source,
+    /// whose `request` and `pull` Euhedral runs one thread at a time) or belongs to a lane, and
+    /// everything else reaches it as a message.
+    @Test
+    void theExpertHotPathHoldsNoLockAndStartsNoThread() throws IOException {
+        Pattern lock = Pattern.compile(
+                "\\bsynchronized\\b|\\bReentrantLock\\b|\\bReadWriteLock\\b|\\bCondition\\b|\\bSemaphore\\b|\\.wait\\(|\\bnew Thread\\(|\\bExecutors\\b");
+        List<Path> hot = new ArrayList<>();
+        for (String directory : List.of("qwen4", "model_loader/qwen4/expert")) {
+            try (Stream<Path> walk = Files.walk(MAIN.resolve(directory))) {
+                walk.filter(p -> p.toString().endsWith(".java")).forEach(hot::add);
+            }
+        }
+        hot.add(MAIN.resolve("scheduling/graph/SerialSource.java"));
+        List<String> violations = new ArrayList<>();
+        for (Path file : hot) {
+            // The artifact is loaded into the pinned arena by readers at startup, before any request exists.
+            if (file.getFileName().toString().equals("ArenaExpertStore.java")) continue;
+            List<String> lines = Files.readAllLines(file);
+            for (int i = 0; i < lines.size(); i++) {
+                String code = lines.get(i).strip();
+                if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
+                if (lock.matcher(code).find()) violations.add(MAIN.relativize(file) + ":" + (i + 1) + ": " + code);
+            }
+        }
+        assertTrue(violations.isEmpty(), "locks or threads on the hot path:\n" + String.join("\n", violations));
     }
 }
