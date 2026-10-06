@@ -356,6 +356,13 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
                 this.maxWaveExperts);
     }
 
+    /// The loads' timings, summed over the shards' sources.
+    public ExpertSource.Timings expertTimings() {
+        ExpertSource.Timings total = new ExpertSource.Timings(0, 0, 0, 0, 0, 0);
+        for (ExpertSource source : this.expertSources) total = total.plus(source.timings());
+        return total;
+    }
+
     /// The sources that own the expert cache's shards.
     ExpertSource[] expertSources() {
         return this.expertSources;

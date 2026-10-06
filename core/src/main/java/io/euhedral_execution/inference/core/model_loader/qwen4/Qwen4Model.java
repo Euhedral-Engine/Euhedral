@@ -38,6 +38,12 @@ public final class Qwen4Model implements AutoCloseable {
     /// records at a time.
     static final int PRELOAD_READERS = 16;
 
+    /// Parts one record's artifact read is split into, read side by side as frames of the lattice.
+    /// `euhedral.qwen4.read-parts` (or `EUHEDRAL_QWEN4_READ_PARTS`) overrides it for benchmarks.
+    static final int READ_PARTS = Integer.getInteger(
+            "euhedral.qwen4.read-parts",
+            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READ_PARTS", "4")));
+
     private final Qwen4Artifact artifact;
     private final Qwen4ResidencyPlan plan;
     private final Qwen4FixedLoader.Loaded fixed;
@@ -124,7 +130,7 @@ public final class Qwen4Model implements AutoCloseable {
             // The store owns the source and the tier from here on, and closes them.
             FileRecordSource owned = artifactSource;
             RamTier ownedTier = tier;
-            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, lanes);
+            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, lanes, READ_PARTS);
             transfer = new GpuExpertTransfer(gpu, lanes);
             ExpertCache cache = new ExpertCache(
                     store,

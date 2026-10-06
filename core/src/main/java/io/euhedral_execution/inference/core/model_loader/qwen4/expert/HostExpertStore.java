@@ -36,6 +36,28 @@ public interface HostExpertStore extends AutoCloseable {
         return open(bank, expert, lane);
     }
 
+    /// How many parts one record's artifact read can be split into, each read by a caller of its own
+    /// ([#readPart]); 1 when it cannot be split.
+    default int readParts() {
+        return 1;
+    }
+
+    /// Reads part `part` of `parts` of the record's bytes from the artifact into where the
+    /// `directive` puts them (the tier slot of a fill, otherwise the lane's staging slot). The parts
+    /// are disjoint, so callers read them side by side; when all have returned,
+    /// [#completeOpen] makes the record addressable. Only for a directive that reads the artifact
+    /// and a store with `readParts() > 1`.
+    default void readPart(int bank, int expert, int lane, TierDirective directive, int part, int parts)
+            throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("this store reads whole records");
+    }
+
+    /// The record read by [#readPart] in all its parts, addressable in pinned host memory (a fill
+    /// copies it out of its tier slot).
+    default HostRecord completeOpen(int bank, int expert, int lane, TierDirective directive) {
+        throw new UnsupportedOperationException("this store reads whole records");
+    }
+
     /// The host tier's bookkeeping for the device cache shard `shard`, owned by that shard's source, or
     /// null when the store has no tier.
     default RamTierShard tier(int shard) {

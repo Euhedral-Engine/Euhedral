@@ -346,4 +346,111 @@ class ExpertSourceTest {
         tier.checkInvariants();
         assertEquals(0, tier.shard(0).pinnedSlots());
     }
+
+    @Test
+    void anArtifactReadSplitIntoPartsLoadsTheSameBytesWithAndWithoutATierSlot() throws Exception {
+        var tier = new RamTier(this.fixture.banks, 10, 1, RamTier.Policy.BANK_PARTITIONED);
+        build(
+                3,
+                4,
+                new FileExpertStore(
+                        this.gpu,
+                        new FileRecordSource(this.fixture.file, this.fixture.banks),
+                        tier,
+                        this.fixture.banks,
+                        4,
+                        4));
+        assertEquals(4, this.cache.store().readParts());
+        // Banks 0 (9000-byte records) and 2 (8192 bytes at page-aligned offsets): the parts end at page
+        // boundaries, so the last parts are short or empty. Twelve experts through a 10-slot tier fill it,
+        // and the rest bypass or evict.
+        for (int bank : new int[] {0, 2, 4}) {
+            Block block = new Block(bank, 0, 1, 2, 3, 4, 5);
+            this.source.submit(block.work());
+            boolean[] closed = new boolean[6];
+            drive(() -> {
+                for (int position = 0; position < 6; position++) {
+                    ExpertLease lease = block.lease(position);
+                    if (lease != null && !closed[position]) {
+                        assertArrayEquals(
+                                this.fixture.record(bank, position),
+                                this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
+                        closed[position] = true;
+                        lease.close();
+                    }
+                }
+                return block.done.get() == 1 && this.cache.openLeaseCount() == 0;
+            });
+            assertTrue(block.failures.isEmpty());
+        }
+        tier.checkInvariants();
+        assertEquals(0, tier.shard(0).pinnedSlots());
+        // A second pass over the first bank's experts finds some of them in the tier.
+        long reads = this.cache.store().bytesRead();
+        Block again = new Block(0, 0, 1);
+        this.source.submit(again.work());
+        drive(() -> again.done.get() == 1);
+        assertArrayEquals(
+                this.fixture.record(0, 0),
+                this.gpu.readDevice(
+                        again.lease(0).deviceAddress(), again.lease(0).byteSize()));
+        again.lease(0).close();
+        again.lease(1).close();
+        drive(() -> this.cache.openLeaseCount() == 0);
+        assertTrue(this.cache.store().bytesRead() >= reads);
+    }
+
+    @Test
+    void aFailedPartFailsTheLoadOnceAndGivesItsTierSlotBack() throws Exception {
+        var failingPart = new RecordSource() {
+            private final FileRecordSource real = new FileRecordSource(fixture.file, fixture.banks);
+
+            @Override
+            public boolean ranged() {
+                return true;
+            }
+
+            @Override
+            public void read(ExpertBank bank, int expert, java.lang.foreign.MemorySegment destination)
+                    throws IOException, InterruptedException {
+                this.real.read(bank, expert, destination);
+            }
+
+            @Override
+            public void readRange(ExpertBank bank, int expert, long from, java.lang.foreign.MemorySegment destination)
+                    throws IOException, InterruptedException {
+                if (from > 0 && expert == 2) throw new IOException("injected");
+                this.real.readRange(bank, expert, from, destination);
+            }
+
+            @Override
+            public long bytesRead() {
+                return this.real.bytesRead();
+            }
+
+            @Override
+            public void close() {
+                this.real.close();
+            }
+        };
+        var tier = new RamTier(this.fixture.banks, 10, 1, RamTier.Policy.BANK_PARTITIONED);
+        build(4, 4, new FileExpertStore(this.gpu, failingPart, tier, this.fixture.banks, 4, 4));
+        Block block = new Block(2, 1, 2, 3);
+        this.source.submit(block.work());
+        drive(() -> block.done.get() == 1);
+        assertEquals(1, block.failures.size(), "one failed load fails the block once");
+        int leases = 0;
+        for (Object[] arrival : block.arrivals)
+            if (arrival[1] != null) {
+                leases++;
+                ((ExpertLease) arrival[1]).close();
+            }
+        assertEquals(2, leases, "the other two experts loaded");
+        drive(() -> this.cache.openLeaseCount() == 0);
+        assertFalse(tier.shard(0).isResident(2, 2));
+        assertTrue(tier.shard(0).isResident(2, 1));
+        assertEquals(0, tier.shard(0).pinnedSlots());
+        tier.checkInvariants();
+        this.cache.checkQuiescent();
+    }
 }

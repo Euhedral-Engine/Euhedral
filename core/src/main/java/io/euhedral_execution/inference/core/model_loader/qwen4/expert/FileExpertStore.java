@@ -28,6 +28,7 @@ public final class FileExpertStore implements HostExpertStore {
     private final long slotBytes;
     private final int slotCount;
     private final RamTier tier;
+    private final int readParts;
     private final LongAdder ramCopyBytes = new LongAdder();
     private final LongAdder ramCopyNanos = new LongAdder();
     private final LongAdder opens = new LongAdder();
@@ -46,7 +47,16 @@ public final class FileExpertStore implements HostExpertStore {
     /// A store over `source` with `tier` in front of it (or none, when null). The store owns both from
     /// here on, and closes them, also when this constructor fails.
     public FileExpertStore(GpuMemory memory, RecordSource source, RamTier tier, ExpertBank[] banks, int lanes) {
+        this(memory, source, tier, banks, lanes, 1);
+    }
+
+    /// As above, with each artifact read split into up to `readParts` parts when the source can read
+    /// ranges.
+    public FileExpertStore(
+            GpuMemory memory, RecordSource source, RamTier tier, ExpertBank[] banks, int lanes, int readParts) {
         Objects.requireNonNull(memory, "memory");
+        if (readParts < 1) throw new IllegalArgumentException("readParts must be positive");
+        this.readParts = source.ranged() ? readParts : 1;
         this.source = Objects.requireNonNull(source, "source");
         this.tier = tier;
         try {
@@ -116,6 +126,40 @@ public final class FileExpertStore implements HostExpertStore {
         staging.copyFrom(MemorySegment.ofAddress(directive.address()).reinterpret(size));
         this.ramCopyBytes.add(size);
         this.ramCopyNanos.add(System.nanoTime() - begin);
+    }
+
+    @Override
+    public int readParts() {
+        return this.readParts;
+    }
+
+    @Override
+    public void readPart(int bank, int expert, int lane, TierDirective directive, int part, int parts)
+            throws IOException, InterruptedException {
+        long size = this.banks[bank].recordBytes(expert);
+        // Parts start on page boundaries; the last ones may be short or empty.
+        long chunk = ExpertFiles.alignUp((size + parts - 1) / parts, PAGE);
+        long from = Math.min(size, chunk * part);
+        long length = Math.min(size, from + chunk) - from;
+        if (length <= 0) return;
+        long base = directive.mode() == TierDirective.Mode.FILL
+                ? directive.address()
+                : this.arena.address() + this.slotBytes * lane;
+        this.source.readRange(
+                this.banks[bank],
+                expert,
+                from,
+                MemorySegment.ofAddress(base + from).reinterpret(length));
+    }
+
+    @Override
+    public HostRecord completeOpen(int bank, int expert, int lane, TierDirective directive) {
+        long size = this.banks[bank].recordBytes(expert);
+        long address = this.arena.address() + this.slotBytes * lane;
+        if (directive.mode() == TierDirective.Mode.FILL)
+            copyOut(directive, MemorySegment.ofAddress(address).reinterpret(size), size);
+        this.opens.increment();
+        return new StagedRecord(address, size);
     }
 
     @Override
