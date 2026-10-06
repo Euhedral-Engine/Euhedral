@@ -50,11 +50,12 @@ public final class Qwen4Model implements AutoCloseable {
             ? ReplacementPolicy.BANK_PARTITIONED
             : ReplacementPolicy.GLOBAL_LRU;
 
-    /// Parts one record's artifact read is split into, read side by side as frames of the lattice.
+    /// Parts one record's artifact read is split into, read side by side as frames of the lattice. One: the disk
+    /// reads a whole record (2.7 MiB) at its full rate, and a quarter record at three quarters of it.
     /// `euhedral.qwen4.read-parts` (or `EUHEDRAL_QWEN4_READ_PARTS`) overrides it for benchmarks.
     static final int READ_PARTS = Integer.getInteger(
             "euhedral.qwen4.read-parts",
-            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READ_PARTS", "4")));
+            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READ_PARTS", "1")));
 
     /// Copy streams the experts' device copies are spread over: an order of copies on the device,
     /// independent of the staging buffers and of the loads in flight. One: one stream takes the copies

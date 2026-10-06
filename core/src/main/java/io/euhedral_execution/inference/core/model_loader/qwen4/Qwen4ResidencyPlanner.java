@@ -64,10 +64,10 @@ public final class Qwen4ResidencyPlanner {
         return 2 * config.moe().expertsPerToken();
     }
 
-    /// Records read from the artifact at once at most: enough to keep the disk busy across the hops from one
-    /// read's completion to the next submission, and no more pinned staging than that. `EUHEDRAL_QWEN4_READS`
-    /// overrides it for benchmarks.
-    public static final int DISK_READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "64"));
+    /// Records read from the artifact at once at most. A load holds its read only while it reads, and the disk
+    /// reads fastest with a few records in flight: past about 30 MB it slows down (docs/FLASH_NEXT_DISK.md).
+    /// `EUHEDRAL_QWEN4_READS` overrides it for benchmarks.
+    public static final int DISK_READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "8"));
 
     /// Pinned staging slots when expert records pass through the host from the artifact file: one per read the disk
     /// has in flight ([#DISK_READS]) but no more than a layer has experts, as each load holds its slot until its

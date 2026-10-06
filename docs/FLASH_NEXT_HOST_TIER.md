@@ -94,17 +94,19 @@ nothing else in the tier starts a thread.
 
 Every record of the artifact is 4096-aligned in offset and length, so the artifact is opened with `O_DIRECT`
 (`EUHEDRAL_QWEN4_DIRECT_READS=0` reads through the page cache): the reads go from the device to the slot or buffer, and the page
-cache keeps the memory-mapped n-gram rows instead of records the tier already holds. The owner keeps at most
-`EUHEDRAL_QWEN4_READS` records (64) reading at once; the staging pool has one buffer per read.
+cache keeps the memory-mapped n-gram rows instead of records the tier already holds. At most `EUHEDRAL_QWEN4_READS` records (8)
+are read at once: the owner's fetch takes a read, and the frame that has the record gives it back on whichever worker runs it,
+before the device copy, so the disk is offered the next record as soon as one is in. The drive reads fastest with a few records
+in flight and slows past about 30 MB (docs/FLASH_NEXT_DISK.md).
 
 A record the tier does not hold is read in page-aligned parts, each straight into its destination (the tier slot of a fill, or the
 staging buffer), and no worker waits for the disk: each part's frame submits its read to the kernel (io_uring, through
 `AsyncReads`) and ends, and the read's completion is a frame that the workers find when they poll the reads' sink. A fill's
 completion then copies its range into the staging buffer. Whichever part runs first takes the staging buffer, and the others use
 it; the parts join (`Join`, a fan-in edge whose arrivals are decided at run time) into the frame that submits the device copy. The
-artifact therefore sees several outstanding reads per record, and up to the read bound of records in flight. The number of
-parts is a constant (4); a source that cannot read ranges is read whole, and a machine without io_uring reads each part on the
-worker that runs it.
+artifact sees up to the read bound of records in flight. A record is one part by default (`EUHEDRAL_QWEN4_READ_PARTS`): the drive
+reads a whole record at 6.9 GB/s and a quarter record at 5.2 GB/s at most. A source that cannot read ranges is read whole, and a
+machine without io_uring reads each part on the worker that runs it.
 
 ## Device cache replacement
 
