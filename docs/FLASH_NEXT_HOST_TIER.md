@@ -5,14 +5,16 @@ from the artifact (the OS page cache, when the machine can keep it) unless the h
 real ordinary-RAM tier:
 
 ```
-GPU expert cache <-- async H2D --- pinned staging --- RAM copy --- RAM tier <-- cold read --- artifact (EDRL / NVMe)
- (device slots)      (a few copy    (a pool of        (one memcpy   (pageable,    (positional reads in parts,
-                      streams)       buffers, grown    of a record)  large)        per missing record)
-                                     as needed)
+GPU expert cache <-- async H2D --- RAM tier (pinned) <------------- direct reads --- artifact (EDRL / NVMe)
+ (device slots)   \                                                                    (io_uring, O_DIRECT, in parts)
+                   `-- async H2D --- pinned staging <-------------- direct reads ---'
+                                     (one buffer per read in flight: records the tier does not take)
 ```
 
-A GPU eviction does not evict from the RAM tier: once warm, a GPU miss is a RAM hit and no artifact read. Pinned memory stays a
-small transfer tier (the staging slots, the host-mapped token embedding, any staged fixed objects); the experts are never pinned.
+A GPU eviction does not evict from the RAM tier: once warm, a GPU miss is a RAM hit and no artifact read. When the machine can
+page-lock the tier beside the plan's other pinned memory, the tier is pinned (`EUHEDRAL_QWEN4_PIN_TIER=0` keeps it pageable): the
+device's copy reads a record straight from its slot, and a record the tier takes is read straight into its slot, so neither needs a
+staging buffer. A pageable tier copies a hit into a staging buffer first.
 
 ## Memory planning
 
@@ -53,13 +55,18 @@ When a miss becomes a load the owner's fetch asks the tier what the load does, a
 
 | Directive | The load's frames |
 | --- | --- |
-| `HIT` | copy the record out of the tier slot into the load's staging buffer; the slot is pinned until the load reports |
-| `FILL` | read the artifact into the slot reserved for the record, and copy it into the staging buffer; the slot is pinned until the load reports |
-| `BYPASS` | read the artifact into the staging buffer alone (the record is being filled, or every slot is pinned) |
+| `HIT` | copy the record to the device from its slot (pinned tier), or out of it into the load's staging buffer; the slot is pinned until the copy retires |
+| `FILL` | read the artifact into the slot reserved for the record and copy it from there (pinned tier), or on into the staging buffer; the slot is pinned until the copy retires |
+| `BYPASS` | read the artifact into the staging buffer alone (the record is being filled, every slot is pinned, or admission refused it) |
 
-The read and copy frames touch only memory the directive names. The slot's state changes in the owner's submit frame, once the
-record was staged (`filled` or `used`) or could not be read (`abandoned`, which returns the slot). A slot that is filling or
+The read and copy frames touch only memory the directive names. The slot's state changes in the owner's frames, once the copy
+retired (`filled` or `used`) or the record could not be read (`abandoned`, which returns the slot). A slot that is filling or
 pinned is never a victim.
+
+The fetch reserves everything a load needs before it asks the tier: the device slot, a staging buffer (given back at once when a
+pinned tier takes the record) and, for a record the tier does not hold, one of the disk's reads in flight. A fetch that finds any
+of them taken publishes itself again and leaves the tier as it was: planning a fill takes a slot and evicts its record, and a fetch
+that waits for the disk would otherwise evict a record on every try.
 
 ## Replacement: layer-aware
 
@@ -69,6 +76,14 @@ borrow the slots of layers that are not using theirs, takes a victim from the la
 quota needs one, and otherwise evicts the layer's own least recently used record. `GLOBAL_LRU` is the baseline; `RamTierTest` runs
 a cyclic trace through both.
 
+## Admission
+
+A prefill visits nearly every expert of a layer once per chunk, so recency alone replaces each record just before the next chunk
+needs it. With admission (the default; `EUHEDRAL_QWEN4_TIER_ADMISSION=0` turns it off), a record that finds no free slot replaces
+the victim only if it was asked for more often than the victim was; otherwise it is read around the tier (`BYPASS`). The request
+counts are halved every ten requests per slot, so a record that was hot long ago does not keep its slot. `RamTierTest` runs
+repeated sweeps through both: recency serves none of them, admission half.
+
 ## Startup fill
 
 A resident tier is filled before the model serves anything, by `RamTierPreload`: 16 reader threads take chunks of consecutive
@@ -77,12 +92,17 @@ nothing else in the tier starts a thread.
 
 ## Reads in parts
 
+Every record of the artifact is 4096-aligned in offset and length, so the artifact is opened with `O_DIRECT`
+(`EUHEDRAL_QWEN4_DIRECT_READS=0` reads through the page cache): the reads go from the device to the slot or buffer, and the page
+cache keeps the memory-mapped n-gram rows instead of records the tier already holds. The owner keeps at most
+`EUHEDRAL_QWEN4_READS` records (64) reading at once; the staging pool has one buffer per read.
+
 A record the tier does not hold is read in page-aligned parts, each straight into its destination (the tier slot of a fill, or the
 staging buffer), and no worker waits for the disk: each part's frame submits its read to the kernel (io_uring, through
 `AsyncReads`) and ends, and the read's completion is a frame that the workers find when they poll the reads' sink. A fill's
 completion then copies its range into the staging buffer. Whichever part runs first takes the staging buffer, and the others use
 it; the parts join (`Join`, a fan-in edge whose arrivals are decided at run time) into the frame that submits the device copy. The
-artifact therefore sees several outstanding reads per record, and as many records in flight as the misses ask for. The number of
+artifact therefore sees several outstanding reads per record, and up to the read bound of records in flight. The number of
 parts is a constant (4); a source that cannot read ranges is read whole, and a machine without io_uring reads each part on the
 worker that runs it.
 
