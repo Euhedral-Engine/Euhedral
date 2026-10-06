@@ -178,6 +178,9 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     private final AtomicReferenceArray<Read> pending = new AtomicReferenceArray<>(PENDING);
     private final AtomicLong tags = new AtomicLong();
     private final AtomicInteger inFlight = new AtomicInteger();
+    /// When the reads in flight last went from none to some, and the time summed over the spans with some.
+    private volatile long busySince;
+    private final java.util.concurrent.atomic.LongAdder busyNanos = new java.util.concurrent.atomic.LongAdder();
     private final Delegate delegate = new Delegate();
     private volatile boolean closed;
 
@@ -275,10 +278,10 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         long tag = this.tags.getAndIncrement();
         int slot = (int) (tag & (PENDING - 1));
         if (!this.pending.compareAndSet(slot, null, done)) return false;
-        this.inFlight.incrementAndGet();
+        if (this.inFlight.incrementAndGet() == 1) this.busySince = System.nanoTime();
         if (!enqueue(ring, done, slot)) {
             this.pending.set(slot, null);
-            this.inFlight.decrementAndGet();
+            if (this.inFlight.decrementAndGet() == 0) this.busyNanos.add(System.nanoTime() - this.busySince);
             return false;
         }
         return true;
@@ -333,15 +336,20 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                     result = -5;
                 }
                 this.pending.set(slot, null);
-                this.inFlight.decrementAndGet();
+                read.completedAt = System.nanoTime();
+                if (this.inFlight.decrementAndGet() == 0) this.busyNanos.add(read.completedAt - this.busySince);
                 if (result < 0) read.failure = -result;
                 else if (result == 0) read.failure = 5;
-                read.completedAt = System.nanoTime();
                 emit.accept(read);
                 emitted++;
             }
         }
         return emitted;
+    }
+
+    /// Time with at least one read in flight, summed (approximate: the spans are read without a lock). Any thread.
+    public long busyNanos() {
+        return this.busyNanos.sum();
     }
 
     /// Reads submitted and not yet emitted. Any thread.
