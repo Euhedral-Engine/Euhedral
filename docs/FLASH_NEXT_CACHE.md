@@ -63,3 +63,25 @@ for (`slfu-scan`), and S3-FIFO on the device:
 
 (with the startup fill). The online policies differ by a few percent; the tier's capacity and knowledge of the future
 differ by far more: 12,000 tier slots halve the disk bytes, and Belady halves decode's again.
+
+## In the engine
+
+The tier's `FREQUENCY` policy (`RamTierShard`: the least requested of 32 sampled ready slots, the least recent among
+equals; admission only for a prefill chunk's records) and the device's `S3_FIFO` (`ExpertCacheShard`: a small and a
+main queue, 2-bit counts, a ghost stamp per key; a leased slot leaves its queue and returns to its tail) are the
+defaults; `EUHEDRAL_QWEN4_TIER_POLICY=partitioned` and `EUHEDRAL_QWEN4_GPU_POLICY=global` restore the old ones. The
+device's policy switch had never reached the cache before; it does now.
+
+Quick screens (one process each, about 50 s; the decode phases feed the prompt's tokens, 32 steps twice):
+
+| scenario | before (partitioned tier, LRU device) | frequency tier | frequency tier, S3-FIFO device |
+|---|---|---|---|
+| prefill 512 (tokens/s, 3 runs) | 148 | 153 | 138-140 (1 run each) |
+| prefill 4096 (tokens/s, 3 runs) | 472 | 482 | 483-486 |
+| decode cold 64 (ms/token) | 48.9 | 48.0-48.3 | 47.5-48.0 |
+| decode cold 4096 (ms/token) | 53.2 | 52.6-53.1 | 46.6-47.1 |
+| decode warm 64 (ms/token) | 38.9 | 36.6-37.1 | 36.2-36.9 |
+| decode warm 4096 (ms/token) | 43.9 | 37.2-37.3 | 37.5-38.1 |
+
+The warm decode repeats the same 32 tokens, which suits recency; S3-FIFO costs it 0.5-0.8 ms there and gains 6 ms in
+cold decode at 4096 context, where its device hit rate rises from 71.8% to 77.4%.

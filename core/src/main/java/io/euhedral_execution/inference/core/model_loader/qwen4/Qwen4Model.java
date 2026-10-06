@@ -51,13 +51,13 @@ public final class Qwen4Model implements AutoCloseable {
     /// `EUHEDRAL_QWEN4_TIER_PRELOAD=0` leaves it empty until loads fill it, for benchmarks.
     static final boolean TIER_PRELOAD = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_PRELOAD"));
 
-    /// How the device cache replaces its records. `EUHEDRAL_QWEN4_GPU_POLICY` (`global`, `partitioned` or `s3fifo`)
-    /// overrides it for benchmarks.
+    /// How the device cache replaces its records: S3-FIFO (docs/FLASH_NEXT_CACHE.md). `EUHEDRAL_QWEN4_GPU_POLICY`
+    /// (`global`, `partitioned` or `s3fifo`) overrides it for benchmarks.
     static final ReplacementPolicy DEVICE_POLICY =
             switch (System.getenv().getOrDefault("EUHEDRAL_QWEN4_GPU_POLICY", "")) {
+                case "global" -> ReplacementPolicy.GLOBAL_LRU;
                 case "partitioned" -> ReplacementPolicy.BANK_PARTITIONED;
-                case "s3fifo" -> ReplacementPolicy.S3_FIFO;
-                default -> ReplacementPolicy.GLOBAL_LRU;
+                default -> ReplacementPolicy.S3_FIFO;
             };
 
     /// Parts one record's artifact read is split into, read side by side as frames of the lattice. One: the disk
