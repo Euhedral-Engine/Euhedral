@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.ComponentGroup;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
@@ -53,7 +54,7 @@ class Qwen4StorageCudaIntegrationTest {
             cpus.set(0);
             InferenceConfig config =
                     new InferenceConfig(artifact, Path.of("unused"), library, cpus, context, Duration.ofSeconds(30));
-            Qwen4Storage storage = Qwen4Storage.load(config);
+            Qwen4Storage storage = Qwen4Storage.load(config, TestHostFrames.SHARED);
             CudaGpuMemory gpu = (CudaGpuMemory) storage.gpu();
             try {
                 verify(storage.model(), gpu, artifact, context);
@@ -74,7 +75,8 @@ class Qwen4StorageCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (CudaGpuMemory gpu = new CudaGpuMemory(library)) {
             long free = Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes());
-            Qwen4Model model = Qwen4Model.open(artifact, gpu, free, HostBudget.system(), Qwen4Mode.TEXT, 262144);
+            Qwen4Model model = Qwen4Model.open(
+                    artifact, gpu, free, HostBudget.system(), Qwen4Mode.TEXT, 262144, TestHostFrames.SHARED);
             try {
                 var plan = model.plan();
                 assertTrue(plan.host().stagedBytes() > 0, plan.report());
@@ -103,7 +105,8 @@ class Qwen4StorageCudaIntegrationTest {
                     gpu.deviceMemoryInfo().freeBytes(),
                     HostBudget.system(),
                     new Qwen4Mode(true, false),
-                    8192);
+                    8192,
+                    TestHostFrames.SHARED);
             try {
                 assertEquals(49, model.expertBanks().length);
                 assertTrue(model.tensors().containsKey("mtp/fc_embedding"));

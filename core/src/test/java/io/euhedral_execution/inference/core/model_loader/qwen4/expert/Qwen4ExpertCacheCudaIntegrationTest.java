@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorDataType;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightFormat;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
@@ -31,8 +32,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-/// The expert cache on a real GPU: records of about 2.7 MB from a synthetic file of about 1 GB are copied into
-/// a small slab by [GpuExpertTransfer] on a real stream, read back, and compared with the file. Run with
+/// The expert cache on a real GPU: records of about 2.7 MB from a synthetic file of about 1 GB are copied
+/// into a small slab by [GpuExpertTransfer] on a real stream, read back, and compared with the file. Run with
 /// `./gradlew :core:cudaIntegrationTest --tests '*Qwen4ExpertCacheCudaIntegrationTest'`.
 class Qwen4ExpertCacheCudaIntegrationTest {
     private static final int BANKS = 6;
@@ -65,8 +66,8 @@ class Qwen4ExpertCacheCudaIntegrationTest {
         if (this.file != null) Files.deleteIfExists(this.file);
     }
 
-    /// Writes `BANKS * EXPERTS` records of pseudo-random bytes, in a few slightly different sizes, and describes
-    /// them.
+    /// Writes `BANKS * EXPERTS` records of pseudo-random bytes, in a few slightly different sizes, and
+    /// describes them.
     private static ExpertBank[] generate(Path file) throws IOException {
         SplittableRandom random = new SplittableRandom(20261005L);
         ExpertBank[] banks = new ExpertBank[BANKS];
@@ -150,7 +151,8 @@ class Qwen4ExpertCacheCudaIntegrationTest {
 
     private void runCache(String name, HostExpertStore store, long slotBytes) throws Exception {
         long deviceBefore = this.gpu.allocatedBytes();
-        ExpertCache cache = new ExpertCache(store, new GpuExpertTransfer(this.gpu, 4), this.gpu, SLOTS, slotBytes);
+        ExpertCache cache = new ExpertCache(
+                store, new GpuExpertTransfer(this.gpu, TestHostFrames.SHARED), this.gpu, SLOTS, slotBytes);
         assertEquals(deviceBefore + SLOTS * slotBytes, this.gpu.allocatedBytes(), "one slab, nothing else");
         ExecutorService pool = Executors.newFixedThreadPool(4);
         try (FileChannel channel = FileChannel.open(this.file, StandardOpenOption.READ);

@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.host.HostFrames;
 import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ArenaExpertStore;
@@ -20,12 +21,14 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/// A Flash-Next model whose storage is established and whose execution is not: every object has a known location, the
-/// fixed objects the plan keeps on the device are loaded, the routed experts sit behind a bounded device cache over a
-/// host store, the n-gram tables are on the host, and MTP and vision stay in the artifact unless the mode selects them.
+/// A Flash-Next model whose storage is established and whose execution is not: every object has a known
+/// location, the fixed objects the plan keeps on the device are loaded, the routed experts sit behind a
+/// bounded device cache over a host store, the n-gram tables are on the host, and MTP and vision stay in the
+/// artifact unless the mode selects them.
 ///
-/// The GPU is borrowed and must outlive the model. Close the model only after every lease on its expert cache is
-/// returned; closing releases the device slab, the staging ring, the fixed tensors and every host allocation.
+/// The GPU is borrowed and must outlive the model. Close the model only after every lease on its expert cache
+/// is returned; closing releases the device slab, the staging ring, the fixed tensors and every host
+/// allocation.
 public final class Qwen4Model implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(Qwen4Model.class);
@@ -59,19 +62,29 @@ public final class Qwen4Model implements AutoCloseable {
         this.cachedBanks = cachedBanks;
     }
 
-    /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and `maxContextTokens`, and
-    /// loads the plan. Fails with the plan's explanation when no placement can serve the context.
+    /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and
+    /// `maxContextTokens`, and loads the plan. Fails with the plan's explanation when no placement can serve
+    /// the context.
     public static Qwen4Model open(
-            Path path, ExecutionGpu gpu, long freeDeviceBytes, HostBudget host, Qwen4Mode mode, int maxContextTokens)
+            Path path,
+            ExecutionGpu gpu,
+            long freeDeviceBytes,
+            HostBudget host,
+            Qwen4Mode mode,
+            int maxContextTokens,
+            HostFrames frames)
             throws IOException {
         Qwen4Artifact artifact = Qwen4ArtifactReader.read(path);
         Qwen4Validator.validateInventory(artifact);
         Qwen4ResidencyPlan plan = Qwen4ResidencyPlanner.plan(artifact, mode, freeDeviceBytes, host, maxContextTokens);
-        return load(path, artifact, plan, gpu);
+        return load(path, artifact, plan, gpu, frames);
     }
 
     /// Loads `plan`, which must have been made for `artifact`.
-    public static Qwen4Model load(Path path, Qwen4Artifact artifact, Qwen4ResidencyPlan plan, ExecutionGpu gpu)
+    ///
+    /// `frames` runs the expert hierarchy's continuations: reads, copies' completions, parked requests.
+    public static Qwen4Model load(
+            Path path, Qwen4Artifact artifact, Qwen4ResidencyPlan plan, ExecutionGpu gpu, HostFrames frames)
             throws IOException {
         LOG.info("{}", plan.report());
         if (!plan.fits())
@@ -94,13 +107,14 @@ public final class Qwen4Model implements AutoCloseable {
                     new FileExpertStore(
                             gpu, path, cachedBanks, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
             };
-            transfer = new GpuExpertTransfer(gpu);
+            transfer = new GpuExpertTransfer(gpu, frames);
             ExpertCache cache = new ExpertCache(
                     store,
                     transfer,
                     gpu,
                     plan.expertCache().slotCount(),
-                    plan.expertCache().slotBytes());
+                    plan.expertCache().slotBytes(),
+                    frames);
             return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);
@@ -135,8 +149,8 @@ public final class Qwen4Model implements AutoCloseable {
         return this.plan;
     }
 
-    /// The fixed objects that are loaded (device resident, host staged or host mapped), by name; deferred objects and
-    /// the n-gram tables are not here.
+    /// The fixed objects that are loaded (device resident, host staged or host mapped), by name; deferred
+    /// objects and the n-gram tables are not here.
     public Map<String, TensorHandle> tensors() {
         return Collections.unmodifiableMap(this.fixed.handles());
     }
@@ -145,6 +159,12 @@ public final class Qwen4Model implements AutoCloseable {
         TensorHandle handle = this.fixed.handles().get(name);
         if (handle == null) throw new IllegalArgumentException("not a loaded object: " + name);
         return handle;
+    }
+
+    /// Pinned staging slots every expert record passes through when it is read from the artifact: the most
+    /// loads that can be outstanding at once.
+    public int stagingSlots() {
+        return Qwen4ResidencyPlanner.fileStagingSlots(this.artifact.config());
     }
 
     /// The device ring that host-staged fixed objects pass through, or null when none is host-staged.
