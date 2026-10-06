@@ -69,8 +69,10 @@ public final class ExpertCacheOwner {
 
     final ExpertCache cache;
     final FrameLake lake;
-    /// Loads reading the artifact now; owner frames only.
-    private int reading;
+    /// Loads reading the artifact now: a physical resource, like the staging pool. The owner's fetch takes a read;
+    /// the frame that has the record (its read complete) gives it back, on whichever worker runs it, so the disk
+    /// is offered the next record as soon as one is in, not once its copy retired.
+    private final AtomicInteger reading = new AtomicInteger();
     final int readParts;
     private final ExpertCacheShard.Ticket ticket = new ExpertCacheShard.Ticket();
     private final AtomicInteger inFlight = new AtomicInteger();
@@ -167,7 +169,7 @@ public final class ExpertCacheOwner {
             this.fullFetches.increment();
             return Outcome.FULL;
         }
-        if (!inTier && this.reading >= READS) {
+        if (!inTier && this.reading.get() >= READS) {
             // The disk has as many records in flight as keep it busy: this one is read once one of them is in.
             reserved.cancel();
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
@@ -182,7 +184,7 @@ public final class ExpertCacheOwner {
             this.cache.store().releaseStaging(buffer);
             buffer = -1;
         }
-        if (reads) this.reading++;
+        if (reads) this.reading.incrementAndGet();
         ExpertLoad load = new ExpertLoad(this, target, reserved, buffer, tier, directive, reads, this.nextSeed);
         this.nextSeed += 64;
         // The load is the quantum's continuation until its copy retired: the lake cannot finish without it.
@@ -192,9 +194,14 @@ public final class ExpertCacheOwner {
         return Outcome.LOADING;
     }
 
+    /// The load's artifact read is over: the disk may take another. Any thread, once per load.
+    void readEnded() {
+        this.reading.decrementAndGet();
+    }
+
     /// A load ended (its copy retired, or it failed). Called by a frame routed with [#HASH].
     void ended(ExpertLoad load, boolean submitted) {
-        if (load.reads) this.reading--;
+        load.readDone();
         if (submitted) {
             this.loads.increment();
             this.dispatchNanos.add(load.startedAt - load.fetchedAt);
@@ -212,6 +219,11 @@ public final class ExpertCacheOwner {
     /// Loads fetched whose copies have not retired yet.
     public int loadsInFlight() {
         return this.inFlight.get();
+    }
+
+    /// Loads whose artifact read has not ended. Any thread.
+    public int readsInFlight() {
+        return this.reading.get();
     }
 
     /// Fetches that found every slot pinned and were published again.

@@ -42,8 +42,10 @@ final class ExpertLoad {
     final ExpertLease lease;
     final RamTierShard tier;
     final TierDirective directive;
-    /// Whether the load reads the artifact (one of the disk's reads in flight until it ends).
+    /// Whether the load reads the artifact (one of the disk's reads in flight until its record is in).
     final boolean reads;
+    /// Whether the load gave its read back.
+    private final java.util.concurrent.atomic.AtomicBoolean readGiven = new java.util.concurrent.atomic.AtomicBoolean();
     private final long seed;
     private final Part[] parts;
     private final Join join;
@@ -116,6 +118,7 @@ final class ExpertLoad {
             this.startedAt = System.nanoTime();
             try {
                 this.record = store().open(this.load.bank(), this.load.expert(), this.buffer, this.directive);
+                readDone();
                 this.read = true;
                 this.readAt = System.nanoTime();
                 this.submittingAt = this.readAt;
@@ -131,6 +134,11 @@ final class ExpertLoad {
             this.join.expect(this.parts.length);
             for (Part part : this.parts) this.owner.lake.publish(part);
         } else this.owner.lake.publish(this.copy);
+    }
+
+    /// Gives the load's read back to the owner, once: when its record is in, or when the load ends without it.
+    void readDone() {
+        if (this.reads && this.readGiven.compareAndSet(false, true)) this.owner.readEnded();
     }
 
     /// The staging buffer; the first frame that writes the record marks the load started.
@@ -271,6 +279,7 @@ final class ExpertLoad {
             long last = 0;
             for (long end : load.partEnd) last = Math.max(last, end);
             load.readAt = last;
+            load.readDone();
             try {
                 Throwable thrown = load.join.failure();
                 if (thrown != null) throw thrown;
@@ -306,6 +315,7 @@ final class ExpertLoad {
             ExpertLoad load = ExpertLoad.this;
             try {
                 load.record = load.store().open(load.load.bank(), load.load.expert(), load.staging(), load.directive);
+                load.readDone();
                 load.read = true;
                 load.readAt = System.nanoTime();
                 load.submittingAt = load.readAt;
