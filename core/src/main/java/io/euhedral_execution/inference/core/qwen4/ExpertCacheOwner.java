@@ -43,7 +43,8 @@ public final class ExpertCacheOwner {
         LEASED,
         /// The expert is being loaded: the fetch hears from the load.
         LOADING,
-        /// Every slot that could hold it is pinned, or every staging buffer is in use: nothing changed.
+        /// Every slot that could hold it is pinned, every staging buffer is in use, or the disk has all the
+        /// reads in flight that keep it busy: nothing changed.
         FULL
     }
 
@@ -62,8 +63,15 @@ public final class ExpertCacheOwner {
         }
     }
 
+    /// Records read from the artifact at once at most: the depth of the disk's queue that keeps it busy, past which
+    /// a read only waits behind the others and every record arrives late. `EUHEDRAL_QWEN4_READS` overrides it for
+    /// benchmarks.
+    static final int READS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READS", "32"));
+
     final ExpertCache cache;
     final FrameLake lake;
+    /// Loads reading the artifact now; owner frames only.
+    private int reading;
     final int readParts;
     private final ExpertCacheShard.Ticket ticket = new ExpertCacheShard.Ticket();
     private final AtomicInteger inFlight = new AtomicInteger();
@@ -158,6 +166,15 @@ public final class ExpertCacheOwner {
         }
         TierDirective directive = new TierDirective();
         if (tier != null) tier.plan(bank, expert, directive);
+        boolean reads = directive.mode() != TierDirective.Mode.HIT;
+        if (reads && this.reading >= READS) {
+            // The disk has as many records in flight as keep it busy: this one is read once one of them is in.
+            ExpertLoad.giveBack(tier, directive);
+            reserved.cancel();
+            if (buffer >= 0) this.cache.store().releaseStaging(buffer);
+            this.fullFetches.increment();
+            return Outcome.FULL;
+        }
         if (buffer < 0 && this.cache.store().stagesThrough(directive)) {
             // A pinned tier with every slot in use: the record bypasses it through a staging buffer.
             buffer = this.cache.store().acquireStaging();
@@ -168,7 +185,8 @@ public final class ExpertCacheOwner {
                 return Outcome.FULL;
             }
         }
-        ExpertLoad load = new ExpertLoad(this, target, reserved, buffer, tier, directive, this.nextSeed);
+        if (reads) this.reading++;
+        ExpertLoad load = new ExpertLoad(this, target, reserved, buffer, tier, directive, reads, this.nextSeed);
         this.nextSeed += 64;
         // The load is the quantum's continuation until its copy retired: the lake cannot finish without it.
         this.lake.admitDuringDrain();
@@ -179,6 +197,7 @@ public final class ExpertCacheOwner {
 
     /// A load ended (its copy retired, or it failed). Called by a frame routed with [#HASH].
     void ended(ExpertLoad load, boolean submitted) {
+        if (load.reads) this.reading--;
         if (submitted) {
             this.loads.increment();
             this.dispatchNanos.add(load.startedAt - load.fetchedAt);
