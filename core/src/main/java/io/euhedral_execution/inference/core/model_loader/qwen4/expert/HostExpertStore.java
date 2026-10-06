@@ -59,6 +59,12 @@ public interface HostExpertStore extends AutoCloseable {
         throw new UnsupportedOperationException("this store reads whole records");
     }
 
+    /// Whether a load with `directive` needs a staging buffer; false where the record's tier slot is pinned
+    /// memory the device's copy reads in place.
+    default boolean stagesThrough(TierDirective directive) {
+        return true;
+    }
+
     /// Whether a record's artifact read can be made in parts ([#readPart], [#readPartAsync]).
     default boolean rangedReads() {
         return false;

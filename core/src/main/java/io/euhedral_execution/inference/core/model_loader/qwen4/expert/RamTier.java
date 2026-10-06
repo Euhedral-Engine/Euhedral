@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
+import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Objects;
@@ -30,7 +31,12 @@ public final class RamTier implements AutoCloseable {
     private final int shards;
     private final long slotBytes;
     private final int slotCount;
-    private final PageableMemory memory;
+    /// The block's start; the block is pageable memory, or pinned host memory (`pinned`) that the device's copy
+    /// engines read in place.
+    private final long base;
+    private final PageableMemory pageable;
+    private final GpuMemory pinnedBy;
+    private boolean closed;
     private final RamTierShard[] shardList;
     private final boolean resident;
     private volatile long preloadBytes;
@@ -39,6 +45,12 @@ public final class RamTier implements AutoCloseable {
     /// A tier of at most `slotCount` slots over `banks`, in `shards` shards. A tier with a slot for every
     /// record is resident, and holds exactly that many.
     public RamTier(ExpertBank[] banks, int slotCount, int shards, ReplacementPolicy policy) {
+        this(banks, slotCount, shards, policy, null);
+    }
+
+    /// As above, in pinned host memory from `pinned` (null: pageable memory). A pinned tier is a staging area
+    /// itself: a record in it is copied to the device straight from its slot.
+    public RamTier(ExpertBank[] banks, int slotCount, int shards, ReplacementPolicy policy, GpuMemory pinned) {
         this.banks = banks.clone();
         this.keys = new ExpertKeys(this.banks);
         this.policy = Objects.requireNonNull(policy, "policy");
@@ -58,7 +70,15 @@ public final class RamTier implements AutoCloseable {
             total += sizes[shard];
         }
         this.slotCount = total;
-        this.memory = PageableMemory.allocate(Math.multiplyExact(this.slotBytes, (long) Math.max(1, total)));
+        long bytes = Math.multiplyExact(this.slotBytes, (long) Math.max(1, total));
+        this.pinnedBy = pinned;
+        if (pinned != null) {
+            this.pageable = null;
+            this.base = pinned.allocateHostWeights(bytes);
+        } else {
+            this.pageable = PageableMemory.allocate(bytes);
+            this.base = this.pageable.segment().address();
+        }
         this.shardList = new RamTierShard[shards];
         int first = 0;
         for (int shard = 0; shard < shards; shard++) {
@@ -100,7 +120,12 @@ public final class RamTier implements AutoCloseable {
     }
 
     long address(int slot) {
-        return this.memory.segment().address() + this.slotBytes * slot;
+        return this.base + this.slotBytes * slot;
+    }
+
+    /// Whether the tier is pinned host memory, which the device's copies read in place.
+    public boolean pinned() {
+        return this.pinnedBy != null;
     }
 
     // ---------------------------------------------------------------- preload
@@ -208,6 +233,9 @@ public final class RamTier implements AutoCloseable {
     /// Releases the memory. No load may be using a slot.
     @Override
     public void close() {
-        this.memory.close();
+        if (this.closed) return;
+        this.closed = true;
+        if (this.pinnedBy != null) this.pinnedBy.freeHostWeights(this.base);
+        else this.pageable.close();
     }
 }

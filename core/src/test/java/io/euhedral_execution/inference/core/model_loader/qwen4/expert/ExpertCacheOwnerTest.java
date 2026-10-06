@@ -399,6 +399,43 @@ class ExpertCacheOwnerTest {
     }
 
     @Test
+    void aPinnedTierIsCopiedFromInPlaceWithNoStagingBuffer() throws Exception {
+        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED, this.gpu);
+        assertTrue(tier.pinned());
+        var store = new FileExpertStore(
+                this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 1, 2);
+        build(1, store);
+        // The one staging buffer is held throughout: no load of a pinned tier may need it.
+        int held = store.acquireStaging();
+        assertEquals(-1, store.acquireStaging());
+        Fetch fill = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        drive(fill::ended);
+        assertTrue(fill.failures.isEmpty(), "a fill reads into its tier slot and is copied from there");
+        drained();
+        fill.lease().close();
+        drained();
+        // Another expert takes the device's only slot; the first is then a hit in the tier.
+        Fetch other = fetch(2, 1, ExpertCacheOwner.Outcome.LOADING);
+        drive(other::ended);
+        drained();
+        other.lease().close();
+        drained();
+        Fetch hit = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        assertTrue(hit.ended(), "the fetch submitted the copy from the tier slot itself");
+        assertTrue(this.lake.ready.isEmpty() || this.lake.readyOf("Copy") == 0, "with no frame of its own");
+        drained();
+        assertArrayEquals(
+                this.fixture.record(2, 0),
+                this.gpu.readDevice(hit.lease().deviceAddress(), hit.lease().byteSize()));
+        hit.lease().close();
+        drained();
+        assertEquals(1, tier.stats().totalHits());
+        store.releaseStaging(held);
+        tier.checkInvariants();
+        this.cache.checkQuiescent();
+    }
+
+    @Test
     void aReadThatFailsGivesItsTierSlotBackAndAFailedCopyKeepsTheRecordItRead() throws Exception {
         var failingReads = new RecordSource() {
             private final FileRecordSource real = new FileRecordSource(fixture.file, fixture.banks);

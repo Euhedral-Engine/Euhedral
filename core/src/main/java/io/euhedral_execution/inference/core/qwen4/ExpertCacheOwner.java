@@ -6,6 +6,8 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.expert.DeviceFenc
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheShard;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTierShard;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.TierDirective;
 import io.euhedral_execution.inference.core.scheduling.graph.FrameLake;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
@@ -138,9 +140,11 @@ public final class ExpertCacheOwner {
     public Outcome fetch(Fetch target, int bank, int expert) {
         int shardIndex = this.cache.shardOf(bank, expert);
         ExpertCacheShard shard = this.cache.shard(shardIndex);
-        // A miss needs a slot and a staging buffer: both are reserved, or neither.
-        int buffer = this.cache.store().acquireStaging();
-        shard.claim(bank, expert, buffer >= 0, this.ticket);
+        RamTierShard tier = this.cache.store().tier(shardIndex);
+        // A miss needs a slot and, unless its record is in a pinned tier, a staging buffer: both, or neither.
+        boolean pinnedTier = tier != null && tier.pinned();
+        int buffer = pinnedTier ? -1 : this.cache.store().acquireStaging();
+        shard.claim(bank, expert, pinnedTier || buffer >= 0, this.ticket);
         ExpertLease lease = this.ticket.lease();
         ExpertCacheShard.Load reserved = this.ticket.load();
         if (reserved == null && buffer >= 0) this.cache.store().releaseStaging(buffer);
@@ -152,8 +156,19 @@ public final class ExpertCacheOwner {
             this.fullFetches.increment();
             return Outcome.FULL;
         }
-        ExpertLoad load = new ExpertLoad(
-                this, target, reserved, buffer, this.cache.store().tier(shardIndex), this.nextSeed);
+        TierDirective directive = new TierDirective();
+        if (tier != null) tier.plan(bank, expert, directive);
+        if (buffer < 0 && this.cache.store().stagesThrough(directive)) {
+            // A pinned tier with every slot in use: the record bypasses it through a staging buffer.
+            buffer = this.cache.store().acquireStaging();
+            if (buffer < 0) {
+                ExpertLoad.giveBack(tier, directive);
+                reserved.cancel();
+                this.fullFetches.increment();
+                return Outcome.FULL;
+            }
+        }
+        ExpertLoad load = new ExpertLoad(this, target, reserved, buffer, tier, directive, this.nextSeed);
         this.nextSeed += 64;
         // The load is the quantum's continuation until its copy retired: the lake cannot finish without it.
         this.lake.admitDuringDrain();

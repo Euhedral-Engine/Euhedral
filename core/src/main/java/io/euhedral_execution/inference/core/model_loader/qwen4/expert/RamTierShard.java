@@ -97,6 +97,11 @@ public final class RamTierShard {
             for (int bank = 0; bank < banks; bank++) this.quota[bank] = (int) ((long) slots * owned[bank] / ownedTotal);
     }
 
+    /// Whether the tier is pinned host memory, which the device's copies read in place.
+    public boolean pinned() {
+        return this.tier.pinned();
+    }
+
     /// Whether every record of this shard has a slot: nothing is ever evicted or filled.
     public boolean isResident() {
         return this.resident;

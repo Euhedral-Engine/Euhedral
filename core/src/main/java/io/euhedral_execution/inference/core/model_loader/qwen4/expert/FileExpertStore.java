@@ -149,9 +149,20 @@ public final class FileExpertStore implements HostExpertStore {
             throws IOException, InterruptedException {
         this.keys.key(bank, expert);
         long size = this.banks[bank].recordBytes(expert);
+        TierDirective.Mode mode = directive == null ? TierDirective.Mode.NONE : directive.mode();
+        if (!stagesThrough(directive)) {
+            // A pinned tier is read by the device's copy in place.
+            if (mode == TierDirective.Mode.FILL)
+                this.source.read(
+                        this.banks[bank],
+                        expert,
+                        MemorySegment.ofAddress(directive.address()).reinterpret(size));
+            this.opens.increment();
+            return new StagedRecord(directive.address(), size);
+        }
         long address = staging(buffer);
         MemorySegment staging = MemorySegment.ofAddress(address).reinterpret(size);
-        switch (directive == null ? TierDirective.Mode.NONE : directive.mode()) {
+        switch (mode) {
             case HIT -> copyOut(directive, staging, size);
             case FILL -> {
                 this.source.read(
@@ -216,7 +227,7 @@ public final class FileExpertStore implements HostExpertStore {
     public void completePart(
             int bank, int expert, int buffer, TierDirective directive, int part, int parts, long readNanos) {
         if (readNanos > 0 && this.source instanceof FileRecordSource file) file.asyncReadEnded(readNanos);
-        if (directive.mode() != TierDirective.Mode.FILL) return;
+        if (directive.mode() != TierDirective.Mode.FILL || !stagesThrough(directive)) return;
         long size = this.banks[bank].recordBytes(expert);
         long chunk = partChunk(size, parts);
         long from = Math.min(size, chunk * part);
@@ -243,9 +254,17 @@ public final class FileExpertStore implements HostExpertStore {
     @Override
     public HostRecord completeOpen(int bank, int expert, int buffer, TierDirective directive) {
         long size = this.banks[bank].recordBytes(expert);
-        long address = staging(buffer);
+        long address = stagesThrough(directive) ? staging(buffer) : directive.address();
         this.opens.increment();
         return new StagedRecord(address, size);
+    }
+
+    /// Whether a load with `directive` passes through a staging buffer: always, but for a record whose tier slot
+    /// is pinned memory (a hit or a fill of a pinned tier), which the device's copy reads in place.
+    @Override
+    public boolean stagesThrough(TierDirective directive) {
+        if (this.tier == null || !this.tier.pinned() || directive == null) return true;
+        return directive.mode() != TierDirective.Mode.HIT && directive.mode() != TierDirective.Mode.FILL;
     }
 
     @Override
