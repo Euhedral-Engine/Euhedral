@@ -210,7 +210,7 @@ public final class RamTierShard {
         if (before < Integer.MAX_VALUE) this.requests[key] = before + 1;
         if (++this.sinceAging >= AGE_PER_SLOT * this.slots) {
             this.sinceAging = 0;
-            for (int k = 0; k < this.requests.length; k++) this.requests[k] >>>= 1;
+            for (int k = 0; k < this.requests.length; k++) this.requests[k] >>= 1;
         }
         return before;
     }
@@ -307,8 +307,9 @@ public final class RamTierShard {
 
     /// Gives each bank its share of this shard's slots (its quota, in proportion to its experts), filled by its
     /// lowest experts in consecutive slots, ready, at the cold end of the recency order. Before any load, for a
-    /// bounded tier; the startup fill reads the records into the slots. Nothing was asked for yet, so with
-    /// admission any record asked for once before replaces one of them.
+    /// bounded tier; the startup fill reads the records into the slots. They hold their slots only until a request
+    /// needs one: with admission each counts as asked for less than never (-1), so the first request of any record
+    /// replaces it as it would take a free slot, and the tier adapts as an empty one would.
     void assignShare(int index) {
         if (this.resident) return;
         int banks = this.keys.bankCount();
@@ -331,6 +332,7 @@ public final class RamTierShard {
             this.state[slot] = READY;
             this.pins[slot] = 0;
             this.used[list(bank)]++;
+            if (this.admission) this.requests[key] = -1;
             link(slot, bank);
             this.readyPerBank.lazySet(bank, this.readyPerBank.get(bank) + 1);
             slot++;

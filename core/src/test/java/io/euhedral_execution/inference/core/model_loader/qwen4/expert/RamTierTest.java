@@ -226,6 +226,31 @@ class RamTierTest {
         return this.store.ramTier().stats().hitRate();
     }
 
+    /// A preloaded record holds its slot only until a request needs it: with admission, the first request of a
+    /// record the tier lacks replaces one, as it would take a free slot; a preloaded record that was asked for is
+    /// an ordinary record from then on.
+    @Test
+    void aPreloadedRecordGivesWayToTheFirstRequestOfAnother() throws Exception {
+        admitting(8, ReplacementPolicy.GLOBAL_LRU);
+        RamTier tier = this.store.ramTier();
+        tier.preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 2);
+        RamTierShard shard = this.store.tier(0);
+        assertTrue(shard.isResident(2, 0));
+        // The shares round down: two slots are free and take the first two records.
+        assertEquals(6, tier.stats().residentExperts());
+        load(2, 14, 0);
+        load(2, 13, 0);
+        assertEquals(0, tier.stats().totalEvictions());
+        assertFalse(shard.isResident(2, 15));
+        assertArrayEquals(this.fixture.record(2, 15), load(2, 15, 0));
+        assertTrue(shard.isResident(2, 15), "the first request replaced a preloaded record");
+        assertEquals(1, tier.stats().totalEvictions());
+        load(2, 0, 0);
+        assertArrayEquals(this.fixture.record(4, 11), load(4, 11, 0));
+        assertTrue(shard.isResident(2, 0), "a preloaded record that was asked for is not a placeholder any more");
+        tier.checkInvariants();
+    }
+
     /// A record asked for more often than the victim replaces it; until then it is read around the tier.
     @Test
     void aRecordAskedForMoreOftenThanTheVictimReplacesIt() throws Exception {
