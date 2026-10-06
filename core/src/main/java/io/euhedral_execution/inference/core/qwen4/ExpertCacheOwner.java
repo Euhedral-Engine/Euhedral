@@ -84,6 +84,9 @@ public final class ExpertCacheOwner {
     private final LongAdder copyNanos = new LongAdder();
     private final LongAdder retireNanos = new LongAdder();
     private final LongAdder fullFetches = new LongAdder();
+    private final LongAdder fullSlots = new LongAdder();
+    private final LongAdder fullStaging = new LongAdder();
+    private final LongAdder fullReads = new LongAdder();
 
     public ExpertCacheOwner(ExpertCache cache, FrameLake lake) {
         this.cache = cache;
@@ -167,6 +170,7 @@ public final class ExpertCacheOwner {
         }
         if (reserved == null) {
             this.fullFetches.increment();
+            (staged && buffer < 0 ? this.fullStaging : this.fullSlots).increment();
             return Outcome.FULL;
         }
         if (!inTier && this.reading.get() >= READS) {
@@ -174,6 +178,7 @@ public final class ExpertCacheOwner {
             reserved.cancel();
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
             this.fullFetches.increment();
+            this.fullReads.increment();
             return Outcome.FULL;
         }
         TierDirective directive = new TierDirective();
@@ -219,6 +224,12 @@ public final class ExpertCacheOwner {
     /// Loads fetched whose copies have not retired yet.
     public int loadsInFlight() {
         return this.inFlight.get();
+    }
+
+    /// Fetches that found the cache full, by what was missing: a device slot, a staging buffer, or one of the
+    /// disk's reads. Any thread.
+    public long[] fullCauses() {
+        return new long[] {this.fullSlots.sum(), this.fullStaging.sum(), this.fullReads.sum()};
     }
 
     /// Loads whose artifact read has not ended. Any thread.

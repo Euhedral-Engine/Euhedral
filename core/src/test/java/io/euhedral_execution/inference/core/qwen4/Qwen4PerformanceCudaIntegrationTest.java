@@ -265,9 +265,14 @@ class Qwen4PerformanceCudaIntegrationTest {
                     profileWindow(executor, prompt, sink);
                     return;
                 }
-                for (int target : Arrays.stream(new int[] {512, 4096, 16384})
+                // `EUHEDRAL_QWEN4_PERF_ITERATIONS` repeats the prefills, for screens that need more samples.
+                int[] sizes = Arrays.stream(new int[] {512, 4096, 16384})
                         .filter(t -> t <= MAX)
-                        .toArray()) {
+                        .toArray();
+                int iterations = Math.max(1, intEnv("EUHEDRAL_QWEN4_PERF_ITERATIONS", 1));
+                int[] targets = new int[sizes.length * iterations];
+                for (int i = 0; i < targets.length; i++) targets[i] = sizes[i % sizes.length];
+                for (int target : targets) {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         var before = model.expertCache().stats().snapshot();
                         var tiersBefore = model.hierarchyStats();
@@ -276,6 +281,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                         long busyBefore = model.asyncReads() == null
                                 ? 0
                                 : model.asyncReads().busyNanos();
+                        long[] causesBefore = executor.expertFullCauses();
                         long diskBefore = model.hierarchyStats().artifact().bytesRead();
                         LayerStats layers = new LayerStats();
                         if (target == 4096) executor.trace(layers);
@@ -311,6 +317,12 @@ class Qwen4PerformanceCudaIntegrationTest {
                                         fullBefore,
                                         executor.expertFullFetches(),
                                         target));
+                        long[] causes = executor.expertFullCauses();
+                        line(String.format(
+                                "  full fetches per token by cause: device slots %.1f, staging %.1f, disk reads %.1f",
+                                (double) (causes[0] - causesBefore[0]) / target,
+                                (double) (causes[1] - causesBefore[1]) / target,
+                                (double) (causes[2] - causesBefore[2]) / target));
                         if (model.asyncReads() != null) {
                             double busy = (model.asyncReads().busyNanos() - busyBefore) / 1e9;
                             long disk = model.hierarchyStats().artifact().bytesRead() - diskBefore;
@@ -384,7 +396,9 @@ class Qwen4PerformanceCudaIntegrationTest {
                     }
                 }
                 // Component times: decode at 4K and a 512-token prefill chunk, each step followed by a device wait.
-                for (int[] shape : decode ? new int[][] {{4096, 1}, {4096, 512}} : new int[0][]) {
+                // `EUHEDRAL_QWEN4_PERF_COMPONENTS=0` skips the component times (each stage followed by a device wait).
+                boolean components = decode && !"0".equals(System.getenv("EUHEDRAL_QWEN4_PERF_COMPONENTS"));
+                for (int[] shape : components ? new int[][] {{4096, 1}, {4096, 512}} : new int[0][]) {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         int at = 0;
                         while (at < shape[0]) {
