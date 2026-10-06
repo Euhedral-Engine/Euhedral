@@ -262,6 +262,12 @@ public final class Qwen4Model implements AutoCloseable {
         return handle;
     }
 
+    /// Records the host tier has slots for; 0 without a tier.
+    public int ramTierSlots() {
+        RamTier tier = this.fileStore.ramTier();
+        return tier == null ? 0 : tier.slotCount();
+    }
+
     /// Pinned staging buffers every expert record passes through on its way to the device: the most
     /// loads that hold one at once.
     public int stagingSlots() {

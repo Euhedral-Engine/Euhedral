@@ -434,6 +434,8 @@ final class Qwen4Stages {
             moe.chargeRouteWait(now - storage.routeArmedNanos);
             storage.plannedNanos = now;
             storage.experts = moe.plan(storage.bank, rows());
+            Qwen4ExecutionPlan.ExpertDemand demand = plan().demandListener();
+            if (demand != null) moe.reportDemand(demand, this.layer, rows());
             moe.submitPlan();
         }
     }

@@ -357,6 +357,19 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         this.routeWeights.close();
     }
 
+    /// Reports the latest block's distinct experts and their routed rows to `demand`.
+    void reportDemand(Qwen4ExecutionPlan.ExpertDemand demand, int layer, int rows) {
+        int bank = this.bank;
+        int count = this.routing.activeExperts();
+        int[] experts = new int[count];
+        int[] pairs = new int[count];
+        for (int i = 0; i < count; i++) {
+            experts[i] = this.routing.activeExpert(i);
+            pairs[i] = this.routing.expertPairCount(experts[i]);
+        }
+        demand.block(layer, bank, rows, experts, pairs, count);
+    }
+
     /// Distinct experts the latest block routed to, and the waves it ran in.
     public int lastUniqueExperts() {
         return this.lastUnique;
