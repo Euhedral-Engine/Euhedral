@@ -1,73 +1,89 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
+import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.scheduling.graph.AsyncReads;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 /// Cold storage: records stay in the artifact file, with an optional [RamTier] of ordinary memory in
-/// front of it, and a lane's pinned staging slot holds one between the read and the end of its
-/// device copy.
+/// front of it, and a pinned staging buffer holds one between the read and the end of its device
+/// copy.
 ///
-/// All slots are carved from one pinned arena, each as large as the biggest record rounded up to a
-/// page. [#open] fills the lane's slot as its [TierDirective] says: from the artifact (the one host
-/// copy of the record is from the page cache into pinned memory, with no heap array in between),
-/// from a tier slot (one copy of the record out of RAM), or from the artifact through a tier slot
-/// that keeps the record for the next miss. The lane owns its slot, so there is no pool, no wait and
-/// no lock; memory is bounded by `lanes * slotBytes` however many records are requested. The tier's
-/// bookkeeping is not here: its shards belong to the cache shards' owners, who decide the directive.
+/// Every buffer is as large as the biggest record rounded up to a page; there are as many as the plan
+/// pins, a fixed amount of physical memory. A load takes one with [#acquireStaging] when the cache's
+/// owner admits it and gives it back with [#releaseStaging] once the device copy that read it retired;
+/// when none is free, the load is not started yet (its fetch tries again). [#open] fills a buffer as the load's
+/// [TierDirective] says: from the artifact (the one host copy of the record is from the page cache into
+/// pinned memory, with no heap array in between), from a tier slot (one copy of the record out of RAM),
+/// or from the artifact through a tier slot that keeps the record for the next miss. The tier's
+/// bookkeeping is not here: it belongs to the cache's owner, who decides the directive.
 public final class FileExpertStore implements HostExpertStore {
     private static final long PAGE = 4096;
 
     private final ExpertBank[] banks;
     private final ExpertKeys keys;
     private final RecordSource source;
-    private final HostArena arena;
+    private final GpuMemory memory;
     private final long slotBytes;
-    private final int slotCount;
+    /// The buffers pinned so far, by index; an index is published to a load (through the free list, or by
+    /// the thread that pinned it) only after its address is written.
+    private final HostArena[] buffers = new HostArena[MAX_BUFFERS];
+    private final long[] addresses = new long[MAX_BUFFERS];
+    private final Integer[] indices = new Integer[MAX_BUFFERS];
+    private final AtomicInteger pinned = new AtomicInteger();
+    private final MpmcQueue<Integer> free = new MpmcQueue<>(64, 4);
     private final RamTier tier;
     private final int readParts;
     private final LongAdder ramCopyBytes = new LongAdder();
     private final LongAdder ramCopyNanos = new LongAdder();
     private final LongAdder opens = new LongAdder();
 
-    /// A store that reads `file` directly.
-    public FileExpertStore(GpuMemory memory, Path file, ExpertBank[] banks, int lanes) throws IOException {
-        this(memory, new FileRecordSource(file, banks), banks, lanes);
+    /// The most staging buffers a store pins: far more than loads can be in flight on any machine.
+    static final int MAX_BUFFERS = 4096;
+
+    /// A store that reads `file` directly, with `buffers` staging buffers pinned up front.
+    public FileExpertStore(GpuMemory memory, Path file, ExpertBank[] banks, int buffers) throws IOException {
+        this(memory, new FileRecordSource(file, banks), banks, buffers);
     }
 
     /// A store over `source`, which it owns from here on: it is closed with the store, and also
     /// when this constructor fails.
-    public FileExpertStore(GpuMemory memory, RecordSource source, ExpertBank[] banks, int lanes) {
-        this(memory, source, null, banks, lanes);
+    public FileExpertStore(GpuMemory memory, RecordSource source, ExpertBank[] banks, int buffers) {
+        this(memory, source, null, banks, buffers);
     }
 
     /// A store over `source` with `tier` in front of it (or none, when null). The store owns both from
     /// here on, and closes them, also when this constructor fails.
-    public FileExpertStore(GpuMemory memory, RecordSource source, RamTier tier, ExpertBank[] banks, int lanes) {
-        this(memory, source, tier, banks, lanes, 1);
+    public FileExpertStore(GpuMemory memory, RecordSource source, RamTier tier, ExpertBank[] banks, int buffers) {
+        this(memory, source, tier, banks, buffers, 1);
     }
 
     /// As above, with each artifact read split into up to `readParts` parts when the source can read
-    /// ranges.
+    /// ranges. `buffers` staging buffers are pinned up front; more are pinned when a load finds none
+    /// free.
     public FileExpertStore(
-            GpuMemory memory, RecordSource source, RamTier tier, ExpertBank[] banks, int lanes, int readParts) {
+            GpuMemory memory, RecordSource source, RamTier tier, ExpertBank[] banks, int buffers, int readParts) {
         Objects.requireNonNull(memory, "memory");
         if (readParts < 1) throw new IllegalArgumentException("readParts must be positive");
         this.readParts = source.ranged() ? readParts : 1;
         this.source = Objects.requireNonNull(source, "source");
         this.tier = tier;
+        this.memory = memory;
         try {
-            if (lanes < 1) throw new IllegalArgumentException("lanes must be positive");
+            if (buffers < 1 || buffers > MAX_BUFFERS)
+                throw new IllegalArgumentException("buffers must be 1 to " + MAX_BUFFERS);
             this.banks = banks.clone();
             this.keys = new ExpertKeys(this.banks);
-            this.slotCount = lanes;
             this.slotBytes = ExpertFiles.alignUp(ExpertFiles.maxRecordBytes(this.banks), PAGE);
-            this.arena = new HostArena(memory, Math.multiplyExact(this.slotBytes, (long) lanes));
+            for (int i = 0; i < buffers; i++) this.free.offer(pin());
         } catch (RuntimeException | Error failure) {
             try {
+                freeBuffers();
                 source.close();
                 if (tier != null) tier.close();
             } catch (RuntimeException closeFailure) {
@@ -82,28 +98,58 @@ public final class FileExpertStore implements HostExpertStore {
         return this.banks.clone();
     }
 
-    @Override
-    public int lanes() {
-        return this.slotCount;
+    /// Pins one more staging buffer and returns its index.
+    private Integer pin() {
+        int index = this.pinned.getAndIncrement();
+        if (index >= MAX_BUFFERS) {
+            this.pinned.decrementAndGet();
+            throw new IllegalStateException("more than " + MAX_BUFFERS + " expert records staged at once");
+        }
+        HostArena arena = new HostArena(this.memory, this.slotBytes);
+        this.buffers[index] = arena;
+        this.addresses[index] = arena.address();
+        this.indices[index] = index;
+        return this.indices[index];
     }
 
     @Override
-    public HostRecord open(int bank, int expert, int lane) throws IOException, InterruptedException {
-        return stage(bank, expert, lane, null);
+    public int acquireStaging() {
+        Integer buffer = this.free.poll();
+        return buffer != null ? buffer : -1;
     }
 
     @Override
-    public HostRecord open(int bank, int expert, int lane, TierDirective directive)
+    public void releaseStaging(int buffer) {
+        if (!this.free.offer(this.indices[buffer])) throw new IllegalStateException("a staging buffer was lost");
+    }
+
+    /// Staging buffers pinned.
+    @Override
+    public int stagingBuffers() {
+        return this.pinned.get();
+    }
+
+    private long staging(int buffer) {
+        java.util.Objects.checkIndex(buffer, this.pinned.get());
+        return this.addresses[buffer];
+    }
+
+    @Override
+    public HostRecord open(int bank, int expert, int buffer) throws IOException, InterruptedException {
+        return stage(bank, expert, buffer, null);
+    }
+
+    @Override
+    public HostRecord open(int bank, int expert, int buffer, TierDirective directive)
             throws IOException, InterruptedException {
-        return stage(bank, expert, lane, directive);
+        return stage(bank, expert, buffer, directive);
     }
 
-    private HostRecord stage(int bank, int expert, int lane, TierDirective directive)
+    private HostRecord stage(int bank, int expert, int buffer, TierDirective directive)
             throws IOException, InterruptedException {
         this.keys.key(bank, expert);
-        java.util.Objects.checkIndex(lane, this.slotCount);
         long size = this.banks[bank].recordBytes(expert);
-        long address = this.arena.address() + this.slotBytes * lane;
+        long address = staging(buffer);
         MemorySegment staging = MemorySegment.ofAddress(address).reinterpret(size);
         switch (directive == null ? TierDirective.Mode.NONE : directive.mode()) {
             case HIT -> copyOut(directive, staging, size);
@@ -138,34 +184,66 @@ public final class FileExpertStore implements HostExpertStore {
     }
 
     @Override
-    public void readPart(int bank, int expert, int lane, TierDirective directive, int part, int parts)
+    public void readPart(int bank, int expert, int buffer, TierDirective directive, int part, int parts)
             throws IOException, InterruptedException {
         long size = this.banks[bank].recordBytes(expert);
-        // Parts start on page boundaries; the last ones may be short or empty.
-        long chunk = ExpertFiles.alignUp((size + parts - 1) / parts, PAGE);
+        long chunk = partChunk(size, parts);
         long from = Math.min(size, chunk * part);
         long length = Math.min(size, from + chunk) - from;
         if (length <= 0) return;
-        long staging = this.arena.address() + this.slotBytes * lane;
-        boolean fill = directive.mode() == TierDirective.Mode.FILL;
-        long base = fill ? directive.address() : staging;
-        this.source.readRange(
-                this.banks[bank],
-                expert,
-                from,
-                MemorySegment.ofAddress(base + from).reinterpret(length));
-        // A fill keeps what it read in the tier slot and stages it too: each part copies its own range,
-        // so the copies run side by side as the reads do.
-        if (fill)
-            copyRange(
-                    MemorySegment.ofAddress(staging + from).reinterpret(length),
-                    MemorySegment.ofAddress(base + from).reinterpret(length));
+        this.source.readRange(this.banks[bank], expert, from, partDestination(buffer, directive, from, length));
+        completePart(bank, expert, buffer, directive, part, parts, 0);
     }
 
     @Override
-    public HostRecord completeOpen(int bank, int expert, int lane, TierDirective directive) {
+    public boolean rangedReads() {
+        return this.source.ranged();
+    }
+
+    @Override
+    public boolean readPartAsync(
+            int bank, int expert, int buffer, TierDirective directive, int part, int parts, AsyncReads.Read done) {
         long size = this.banks[bank].recordBytes(expert);
-        long address = this.arena.address() + this.slotBytes * lane;
+        long chunk = partChunk(size, parts);
+        long from = Math.min(size, chunk * part);
+        long length = Math.min(size, from + chunk) - from;
+        if (length <= 0) return false;
+        return this.source.readRangeAsync(
+                this.banks[bank], expert, from, partDestination(buffer, directive, from, length), done);
+    }
+
+    @Override
+    public void completePart(
+            int bank, int expert, int buffer, TierDirective directive, int part, int parts, long readNanos) {
+        if (readNanos > 0 && this.source instanceof FileRecordSource file) file.asyncReadEnded(readNanos);
+        if (directive.mode() != TierDirective.Mode.FILL) return;
+        long size = this.banks[bank].recordBytes(expert);
+        long chunk = partChunk(size, parts);
+        long from = Math.min(size, chunk * part);
+        long length = Math.min(size, from + chunk) - from;
+        if (length <= 0) return;
+        // A fill keeps what it read in the tier slot and stages it too: each part copies its own range,
+        // so the copies run side by side as the reads do.
+        copyRange(
+                MemorySegment.ofAddress(staging(buffer) + from).reinterpret(length),
+                MemorySegment.ofAddress(directive.address() + from).reinterpret(length));
+    }
+
+    /// Parts start on page boundaries; the last ones may be short or empty.
+    private static long partChunk(long size, int parts) {
+        return ExpertFiles.alignUp((size + parts - 1) / parts, PAGE);
+    }
+
+    /// Where a part's bytes are read to: the tier slot of a fill, otherwise the staging buffer.
+    private MemorySegment partDestination(int buffer, TierDirective directive, long from, long length) {
+        long base = directive.mode() == TierDirective.Mode.FILL ? directive.address() : staging(buffer);
+        return MemorySegment.ofAddress(base + from).reinterpret(length);
+    }
+
+    @Override
+    public HostRecord completeOpen(int bank, int expert, int buffer, TierDirective directive) {
+        long size = this.banks[bank].recordBytes(expert);
+        long address = staging(buffer);
         this.opens.increment();
         return new StagedRecord(address, size);
     }
@@ -200,12 +278,12 @@ public final class FileExpertStore implements HostExpertStore {
         return this.ramCopyNanos.sum();
     }
 
-    /// Bytes of one staging slot.
+    /// Bytes of one staging buffer.
     public long slotBytes() {
         return this.slotBytes;
     }
 
-    /// Closes the source and the tier and frees the staging arena. No lane may be in use.
+    /// Closes the source and the tier and frees the staging buffers. No buffer may be in use.
     @Override
     public void close() {
         try {
@@ -214,10 +292,17 @@ public final class FileExpertStore implements HostExpertStore {
             try {
                 if (this.tier != null) this.tier.close();
             } finally {
-                this.arena.close();
+                freeBuffers();
             }
         }
     }
 
     private record StagedRecord(long hostAddress, long byteSize) implements HostRecord {}
+
+    private void freeBuffers() {
+        int count = Math.min(this.pinned.get(), MAX_BUFFERS);
+        for (int i = 0; i < count; i++) {
+            if (this.buffers[i] != null) this.buffers[i].close();
+        }
+    }
 }

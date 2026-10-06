@@ -49,8 +49,7 @@ class Qwen4MoeFixtureCudaIntegrationTest {
                 new ExpertCache(store, transfer, gpu, slots, ExpertCache.slotBytesFor(new ExpertBank[] {bank}), 1)) {
             GpuStream stream = gpu.openStream();
             var geometry = Qwen4ExpertOps.Geometry.of(bank);
-            var layer = new Qwen4MoeLayer(
-                    gpu, cache, geometry, 512, 10, 640, 64, Math.min(slots, 32), new Qwen4MoeLayer.Metrics());
+            var layer = new Qwen4MoeLayer(gpu, geometry, 512, 10, 640, 64, new Qwen4MoeLayer.Metrics());
             var moeWeights = weights_for(weights, layerIndex);
             try {
                 for (int chunk = 0; chunk < chunks; chunk++) {

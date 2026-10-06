@@ -7,12 +7,11 @@ import java.util.concurrent.atomic.LongAdder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/// Copies expert records into device memory, each lane on a copy stream of its own (see
-/// [ExpertTransfer]). Nothing is shared between lanes but counters: no lock, no queue, no
-/// completion thread. A copy's retirement boundary is a driver callback that enqueues; whoever owns
-/// the lane takes it from there.
+/// Copies expert records into device memory on a fixed set of copy streams (see [ExpertTransfer]):
+/// no lock, no queue, no completion thread. A copy's retirement boundary is a driver callback that
+/// enqueues; the load that submitted it takes it from there.
 ///
-/// A [DeviceFence] is honoured on the device: before the copy is submitted, the lane's stream is
+/// A [DeviceFence] is honoured on the device: before the copy is submitted, the copy stream is
 /// ordered behind the fence ([DeviceFence#awaitOn]), so a refill of a slot never overtakes the
 /// kernels that were reading it. The host never waits for the fence.
 public final class GpuExpertTransfer implements ExpertTransfer {
@@ -20,19 +19,20 @@ public final class GpuExpertTransfer implements ExpertTransfer {
 
     private final ExecutionGpu gpu;
     private final GpuStream marks;
-    private final GpuStream[] laneStreams;
+    private final GpuStream[] copyStreams;
     private final LongAdder submitted = new LongAdder();
+    private final java.util.concurrent.atomic.AtomicInteger turn = new java.util.concurrent.atomic.AtomicInteger();
     private boolean closed;
 
-    /// A transfer with `lanes` copy streams from `gpu`.
-    public GpuExpertTransfer(ExecutionGpu gpu, int lanes) {
+    /// A transfer with `streams` copy streams from `gpu`.
+    public GpuExpertTransfer(ExecutionGpu gpu, int streams) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
-        if (lanes < 1) throw new IllegalArgumentException("lanes must be positive");
+        if (streams < 1) throw new IllegalArgumentException("streams must be positive");
         // Markers are device-wide events: any stream opens them.
         this.marks = gpu.openStream();
-        this.laneStreams = new GpuStream[lanes];
+        this.copyStreams = new GpuStream[streams];
         try {
-            for (int lane = 0; lane < lanes; lane++) this.laneStreams[lane] = gpu.openStream();
+            for (int stream = 0; stream < streams; stream++) this.copyStreams[stream] = gpu.openStream();
         } catch (RuntimeException | Error failure) {
             closeStreams();
             throw failure;
@@ -40,8 +40,13 @@ public final class GpuExpertTransfer implements ExpertTransfer {
     }
 
     @Override
-    public int lanes() {
-        return this.laneStreams.length;
+    public int nextStream() {
+        return Math.floorMod(this.turn.getAndIncrement(), this.copyStreams.length);
+    }
+
+    @Override
+    public int streams() {
+        return this.copyStreams.length;
     }
 
     @Override
@@ -56,13 +61,13 @@ public final class GpuExpertTransfer implements ExpertTransfer {
 
     @Override
     public void stream(
-            int lane,
+            int copyStream,
             HostRecord record,
             long deviceAddress,
             DeviceFence waitFor,
             long marker,
             GpuStream.RetirementListener retired) {
-        GpuStream stream = this.laneStreams[lane];
+        GpuStream stream = this.copyStreams[copyStream];
         if (waitFor != null) waitFor.awaitOn(stream);
         stream.submit(
                 () -> this.gpu.copyHostWeightsToDevice(deviceAddress, record.hostAddress(), record.byteSize()), false);
@@ -72,13 +77,13 @@ public final class GpuExpertTransfer implements ExpertTransfer {
     }
 
     @Override
-    public Throwable confirm(int lane, long ticket) {
-        return this.laneStreams[lane].confirmRetired(ticket);
+    public Throwable confirm(int copyStream, long ticket) {
+        return this.copyStreams[copyStream].confirmRetired(ticket);
     }
 
     @Override
-    public void recover(int lane, Throwable failure) {
-        this.laneStreams[lane].recover(failure);
+    public void recover(int copyStream, Throwable failure) {
+        this.copyStreams[copyStream].recover(failure);
     }
 
     /// Copies submitted so far.
@@ -87,14 +92,14 @@ public final class GpuExpertTransfer implements ExpertTransfer {
     }
 
     private void closeStreams() {
-        for (int lane = 0; lane < this.laneStreams.length; lane++) {
-            GpuStream stream = this.laneStreams[lane];
+        for (int index = 0; index < this.copyStreams.length; index++) {
+            GpuStream stream = this.copyStreams[index];
             if (stream == null) continue;
-            this.laneStreams[lane] = null;
+            this.copyStreams[index] = null;
             try {
                 stream.close();
             } catch (RuntimeException failure) {
-                LOG.warn("closing an expert copy lane failed", failure);
+                LOG.warn("closing an expert copy stream failed", failure);
             }
         }
         try {
@@ -110,7 +115,7 @@ public final class GpuExpertTransfer implements ExpertTransfer {
     public void close() {
         if (this.closed) return;
         this.closed = true;
-        for (GpuStream lane : this.laneStreams) if (lane != null) lane.synchronize();
+        for (GpuStream stream : this.copyStreams) if (stream != null) stream.synchronize();
         closeStreams();
     }
 }

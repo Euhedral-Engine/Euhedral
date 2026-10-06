@@ -122,8 +122,8 @@ class Qwen4ExpertFixtureCudaIntegrationTest {
                 short[] routedSum = fixtures.bf16(prefix + "routed_sum");
                 assertEquals(rows * topK, ids.length);
                 Stats weightedStats = new Stats();
-                // 16 expert slots and waves of at most 1024 pairs: a chunk of 64 rows needs several waves
-                try (Qwen4ExpertHarness harness = new Qwen4ExpertHarness(gpu, bank.expertCount(), topK, 64, 16, 1024)) {
+                // 16 expert slots: a chunk of 64 rows names more experts, so slots are reused between experts
+                try (Qwen4ExpertHarness harness = new Qwen4ExpertHarness(gpu, bank.expertCount(), topK, 64, 16)) {
                     short[] out = harness.run(
                             rows,
                             ids,
@@ -137,11 +137,11 @@ class Qwen4ExpertFixtureCudaIntegrationTest {
                                     if (n < 0) throw new IOException("short read of expert " + expert);
                                 }
                             },
-                            (wave, plan, act, weighted) -> {
-                                short[] weightedBits = harness.download(weighted, plan.wavePairCount(wave) * HIDDEN);
+                            (plan, act, weighted) -> {
+                                short[] weightedBits = harness.download(weighted, plan.pairCount() * HIDDEN);
                                 int pair = 0;
-                                for (int i = 0; i < plan.waveExpertCount(wave); i++) {
-                                    int expert = plan.waveExpert(wave, i);
+                                for (int i = 0; i < plan.activeExperts(); i++) {
+                                    int expert = plan.activeExpert(i);
                                     int[] tokens = fixtures.i32(prefix + "expert/" + expert + "/tokens");
                                     short[] expected = fixtures.bf16(prefix + "expert/" + expert + "/weighted");
                                     for (int row = 0; row < rows; row++) {
@@ -156,10 +156,10 @@ class Qwen4ExpertFixtureCudaIntegrationTest {
                                         pair++;
                                     }
                                 }
-                                assertEquals(plan.wavePairCount(wave), pair);
+                                assertEquals(plan.pairCount(), pair);
                             });
-                    System.out.println("chunk " + chunk + " (" + rows + " rows, " + harness.plan.waveCount()
-                            + " waves) weighted: " + weightedStats);
+                    System.out.println("chunk " + chunk + " (" + rows + " rows, " + harness.plan.activeExperts()
+                            + " experts) weighted: " + weightedStats);
                     Stats sums = new Stats();
                     for (int row = 0; row < rows; row++)
                         sums.addRow(routedSum, row * HIDDEN, out, row * HIDDEN, HIDDEN);

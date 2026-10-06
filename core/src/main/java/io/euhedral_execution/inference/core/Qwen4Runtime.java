@@ -30,9 +30,9 @@ import java.util.function.Supplier;
 /// around a request (tokenizing, rendering).
 final class Qwen4Runtime implements AutoCloseable {
 
-    /// Device lanes the stages of a step spread over: the critical chain and the shared expert's
-    /// side branch.
-    private static final int LANES = 2;
+    /// Device lanes the stages of a step spread over: the critical chain, the shared expert's side
+    /// branch and the experts. `EUHEDRAL_QWEN4_LANES` overrides it for benchmarks.
+    static final int LANES = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_LANES", "2"));
 
     private final Qwen4Storage storage;
     private final EuhedralInferenceRuntime runtime;

@@ -12,18 +12,18 @@ import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/// The cold store stages a record in the pinned slot of a lane: no pool, no wait, no lock.
+/// The cold store stages a record in the pinned staging buffer it is given: no wait, no lock.
 class FileExpertStoreTest {
 
     @TempDir
     Path directory;
 
     @Test
-    void aRecordIsReadIntoTheStagingOfItsLane() throws Exception {
+    void aRecordIsReadIntoTheStagingBufferItIsGiven() throws Exception {
         ExpertFixture fixture = ExpertFixture.standard(this.directory, 11);
         HostBackedGpu gpu = new HostBackedGpu();
         try (FileExpertStore store = new FileExpertStore(gpu, fixture.file, fixture.banks, 3)) {
-            assertEquals(3, store.lanes());
+            assertEquals(3, store.stagingBuffers());
             for (int bank = 0; bank < fixture.banks.length; bank++) {
                 for (int expert = 0; expert < fixture.expertCount(bank); expert++) {
                     HostRecord record = store.open(bank, expert, expert % 3);
@@ -39,16 +39,16 @@ class FileExpertStoreTest {
     }
 
     @Test
-    void lanesStageInDifferentSlotsAndALaneIsReusedByItsNextOpen() throws Exception {
+    void buffersStageInDifferentPagesAndABufferIsReusedByItsNextOpen() throws Exception {
         ExpertFixture fixture = ExpertFixture.standard(this.directory, 12);
         HostBackedGpu gpu = new HostBackedGpu();
         try (FileExpertStore store = new FileExpertStore(gpu, fixture.file, fixture.banks, 2)) {
             HostRecord first = store.open(0, 0, 0);
             HostRecord second = store.open(0, 1, 1);
             assertNotEquals(first.hostAddress(), second.hostAddress());
-            assertEquals(0, first.hostAddress() % 4096, "a slot starts on a page");
+            assertEquals(0, first.hostAddress() % 4096, "a buffer starts on a page");
             long address = first.hostAddress();
-            // The lane's next record replaces the previous one: the caller opens only after the copy that read it
+            // The buffer's next record replaces the previous one: its holder opens only after the copy that read it
             // retired.
             HostRecord next = store.open(0, 2, 0);
             assertEquals(address, next.hostAddress());
@@ -58,7 +58,7 @@ class FileExpertStoreTest {
     }
 
     @Test
-    void rejectsOutOfRangeRecordsAndLanes() throws Exception {
+    void rejectsOutOfRangeRecordsAndBuffers() throws Exception {
         ExpertFixture fixture = ExpertFixture.standard(this.directory, 13);
         HostBackedGpu gpu = new HostBackedGpu();
         try (FileExpertStore store = new FileExpertStore(gpu, fixture.file, fixture.banks, 2)) {

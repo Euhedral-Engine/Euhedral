@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
+import io.euhedral_execution.inference.core.scheduling.graph.AsyncReads;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.channels.ClosedByInterruptException;
@@ -10,8 +11,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
-/// Reads records straight from the artifact file with positional reads. Every record of every bank is checked
-/// against the file's size when the source opens.
+/// Reads records straight from the artifact file with positional reads, or asynchronously through [AsyncReads]
+/// when it is given them. Every record of every bank is checked against the file's size when the source opens.
 ///
 /// Each read opens its own channel. A [FileChannel] is closed for everyone when a thread blocked in it is
 /// interrupted, and records are read on the threads that ask for them, which callers may interrupt: a channel
@@ -25,12 +26,41 @@ public final class FileRecordSource implements RecordSource {
     private final AtomicInteger readsNow = new AtomicInteger();
     private final AtomicInteger readsHighWater = new AtomicInteger();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AsyncReads async;
+    private final int fd;
 
     public FileRecordSource(Path file, ExpertBank[] banks) throws IOException {
+        this(file, banks, null);
+    }
+
+    /// A source that reads asynchronously through `async` (null: positional reads only).
+    public FileRecordSource(Path file, ExpertBank[] banks, AsyncReads async) throws IOException {
         this.file = file;
         try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
             ExpertFiles.validate(banks, channel.size());
         }
+        this.async = async;
+        this.fd = async == null ? -1 : async.openFile(file);
+    }
+
+    @Override
+    public boolean readRangeAsync(
+            ExpertBank bank, int expert, long from, MemorySegment destination, AsyncReads.Read done) {
+        if (this.async == null || this.closed.get()) return false;
+        long size = destination.byteSize();
+        if (from < 0 || from > bank.recordBytes(expert) - size)
+            throw new IllegalArgumentException(
+                    "bytes " + from + ".." + (from + size) + " are outside record " + bank.recordBytes(expert));
+        if (!this.async.submit(this.fd, destination.address(), size, bank.fileOffset(expert) + from, done))
+            return false;
+        if (from == 0) this.reads.increment();
+        this.bytesRead.add(size);
+        return true;
+    }
+
+    /// Adds the time of a read made with [#readRangeAsync], once it ended.
+    public void asyncReadEnded(long nanos) {
+        this.readNanos.add(nanos);
     }
 
     @Override
@@ -94,6 +124,7 @@ public final class FileRecordSource implements RecordSource {
 
     @Override
     public void close() {
-        this.closed.set(true);
+        if (this.closed.getAndSet(true)) return;
+        if (this.fd >= 0) this.async.closeFile(this.fd);
     }
 }

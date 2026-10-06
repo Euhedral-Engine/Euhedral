@@ -88,7 +88,11 @@ public final class Qwen4TestLattice implements AutoCloseable {
 
     /// The execution plan of `model` on this lattice, with the runtime that runs its graphs.
     public Run run(ExecutionGpu gpu, Qwen4Model model, int maxContextTokens) {
-        EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(this.lake, this.tasks, gpu, 2);
+        EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(
+                this.lake,
+                this.tasks,
+                gpu,
+                Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_LANES", "2")));
         try {
             return new Run(runtime, new Qwen4ExecutionPlan(gpu, model, maxContextTokens, runtime));
         } catch (RuntimeException | Error failure) {

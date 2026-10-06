@@ -99,6 +99,10 @@ class Qwen4EngineCudaIntegrationTest {
     private static void assertNoLeftovers(InferenceEngine engine) {
         Qwen4Runtime runtime = engine.qwen4Runtime();
         var cache = runtime.storage().model().expertCache();
+        // A step's outcome may be published before its last copies' retirement frames ran: they end on their own.
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (runtime.plan().expertLoadsInFlight() != 0 && System.nanoTime() < deadline) Thread.onSpinWait();
+        assertEquals(0, runtime.plan().expertLoadsInFlight(), "every expert load ended");
         cache.checkQuiescent();
         assertEquals(0, cache.openLeaseCount());
         assertEquals(0, runtime.plan().stepsInFlight());

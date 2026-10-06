@@ -773,7 +773,8 @@ public final class StageGraph implements AutoCloseable {
         private final StageGraph graph;
 
         Replay(StageGraph graph) {
-            super(graph.chainHash());
+            super(FrameSeeds.ID_HASH);
+            randomizeHash(graph.nextRoutingSeed());
             this.graph = graph;
         }
 
@@ -836,7 +837,8 @@ public final class StageGraph implements AutoCloseable {
         private long ticket;
 
         Retirement(StageGraph graph) {
-            super(graph.chainHash());
+            super(FrameSeeds.ID_HASH);
+            randomizeHash(graph.nextRoutingSeed());
             this.graph = graph;
         }
 
@@ -886,7 +888,8 @@ public final class StageGraph implements AutoCloseable {
         private long ticket;
 
         RetiredEdge(StageGraph graph, StageFrame producer, StageFrame consumer) {
-            super(graph.chainHash());
+            super(FrameSeeds.ID_HASH);
+            randomizeHash(graph.nextRoutingSeed());
             this.graph = graph;
             this.producer = producer;
             this.consumer = consumer;

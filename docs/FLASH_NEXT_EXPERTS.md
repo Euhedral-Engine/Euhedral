@@ -1,14 +1,16 @@
 # Flash-Next routed-expert kernels
 
-The routed experts of Flash-Next (`qwen4_exp`: 512 experts per layer, 10 per token) run on grouped NVFP4 kernels that read the
-expert records where the expert cache holds them ([FLASH_NEXT_RESIDENCY.md](FLASH_NEXT_RESIDENCY.md)). A *wave* is the set of
-experts resident at one time; the kernels take a wave and the pairs (token row, routing weight) routed to its experts, and
-produce the routed sum of those experts into the layer's output rows. The router, the cache, the leases and the order of waves
-belong to the caller; this document is the contract between the two.
+The routed experts of Flash-Next (`qwen4_exp`: 512 experts per layer, 10 per token) run on NVFP4 kernels that read the expert
+records where the expert cache holds them ([FLASH_NEXT_RESIDENCY.md](FLASH_NEXT_RESIDENCY.md)). The kernels take work items (an
+expert and up to 16 of the pairs, token row and routing weight, routed to it) and write each pair's weighted output; a combine
+kernel then adds every row's outputs into the layer's output rows in ascending expert order. The model launches the item kernels
+once per expert, as soon as that expert is in the cache, and the combine once after every expert ran
+([FLASH_NEXT_LATTICE.md](FLASH_NEXT_LATTICE.md)). The router, the cache and the leases belong to the caller; this document is the
+contract between the two.
 
 ```
 native/src/qwen4/experts.cuh        kernels (module native/src/qwen4/kernels.cu, table native/src/host/qwen4_ops.c)
-core/.../qwen4/Qwen4ExpertWave      host planner: pairs by expert, waves, the descriptor the kernels read
+core/.../qwen4/Qwen4ExpertRouting   host planner: pairs by expert, each expert's items, the descriptor the kernels read
 core/.../qwen4/Qwen4ExpertOps       typed launches, record geometry, scratch layout
 ```
 
@@ -35,19 +37,19 @@ The kernels compute exactly this chain:
   rounding of the output. This is the arithmetic of the dense decode kernels.
 - Weight rows are the MMA's 16 M rows and token rows its 8 N columns. The result of a column never depends on the other columns,
   and the order in which K is summed is a function of the tile alone (below), so **the result for a (token, expert) pair is the same
-  bits whatever else is in the wave**: the other tokens of its expert, the experts of the wave, the wave split, the work item it
-  falls in and the column it occupies. An expert that saw 1 token and one that saw 300 compute each pair identically.
+  bits whatever else is in the launch**: the other tokens of its expert, the other experts of the launch, the work item it falls
+  in and the column it occupies. An expert that saw 1 token and one that saw 300 compute each pair identically.
 - `silu` is `x / (1 + expf(-x))` in FP32 of the BF16 gate, rounded to BF16; the product with `up` is rounded again. `weighted`
   rounds `y` to BF16, multiplies by the BF16 routing weight in FP32 and rounds.
 - **Routed sum.** A row's sum is a sequence of BF16 additions, `out = bf16(out + weighted)`, starting from zero, in ascending
-  expert id (and, for an expert listed twice for one row, ascending top-k position). The combine kernel adds a wave's
-  contributions to the running `out` in that order; waves must be run in ascending order of their experts (the planner produces
-  them so), which makes the order global. Adding to zero is exact, so the first wave starts from zeros (`zeroFirst`).
+  expert id (and, for an expert listed twice for one row, ascending top-k position). The combine kernel adds a row's
+  contributions in that order, from the row list the planner wrote, after every expert's kernels ran; the experts themselves may
+  run in any order. Adding to zero is exact, so the sum starts from zeros (`zeroFirst`).
 - The padding id (`experts`, one past the last) is skipped, as upstream skips it.
 
 ## Kernels
 
-Three kernels, launched in order on one stream per wave.
+Three kernels: gate_up and down over the items of one expert (or of several), then the combine over every row.
 
 | kernel | grid | block | job |
 |---|---|---|---|
@@ -66,70 +68,64 @@ Lanes without a token load nothing, so a decode item reads only its weights. Sha
 
 K order is `W = 4` warps for gate_up and one warp for down. The other tile dimensions (fragments per warp, warps along rows) do
 not touch K order; if a variant of them is added it stays bit-exact, but changing `W` changes the bits of every result and must
-not be selected per wave.
+not be selected per launch.
 
 Limits: `hidden` and `inter` multiples of 128 (K of the two tensors), `inter` a multiple of 32 and `hidden` of 128 (tile rows),
-`hidden` a multiple of 8 (combine). Item counts 1..16. Any number of experts and items per wave.
+`hidden` a multiple of 8 (combine). Item counts 1..16. Any number of experts and items per launch.
 
-## Wave planning and the descriptor
+## Planning and the descriptor
 
-`Qwen4ExpertWave(experts, topK, maxRows, maxWaveExperts, maxWavePairs)` preallocates everything; `plan(rows, topKIds,
-topKWeights)` (`[rows][topK]` row-major, ids `int`, weights BF16 bits as `short`) groups the pairs by expert (stable: ascending row,
-then top-k position) and cuts the experts that received pairs, in ascending id order, into waves of at most `maxWaveExperts`
-experts and `maxWavePairs` pairs. `maxWavePairs` must be at least `maxRows` so that any expert fits (an expert has at most one pair
-per row). Neither `plan` nor `fill` allocates.
+`Qwen4ExpertRouting(experts, topK, maxRows)` preallocates everything; `plan(rows, topKIds, topKWeights)` (`[rows][topK]` row-major,
+ids `int`, weights BF16 bits as `short`) groups the pairs by expert (stable: ascending row, then top-k position). The experts that
+received pairs are the chunk's *active* experts, in ascending id order; the `i`-th has its work items contiguous
+(`itemStart(i)`, `itemCount(i)`), and they name slot `i` of the descriptor's slot table. Neither `plan` nor `fill` allocates.
 
-For wave `w` the caller asks `waveExpertCount(w)` and `waveExpert(w, i)` (ascending), acquires those experts from the cache,
-calls `fill(w, hostDescriptor)`, writes each lease's slot address with `setSlot(hostDescriptor, i, slotAddress)`, copies
-`descriptorBytes()` bytes to the device and calls `Qwen4ExpertOps.runWave`.
+`fill(hostDescriptor)` writes the descriptor except the slot addresses; the caller copies it to the device once. For each active
+expert, once the expert is held, the caller writes its record address with `setSlot(hostDescriptor, i, slotAddress)`, copies that
+entry to the device, and calls `Qwen4ExpertOps.runExpert(gpu, geometry, plan, i, descriptorDevice, x, scratch)`. After every expert
+ran, `Qwen4ExpertOps.combineExperts` adds the rows.
 
 The descriptor is one block, little-endian, 16-byte aligned sections (offsets from the planner's accessors):
 
 | section | content | bytes |
 |---|---|---|
-| slots | device address of each expert record of the wave (`setSlot`) | 8 E |
+| slots | device address of each active expert's record (`setSlot`) | 8 E |
 | items | slot index, first pair, pair count (1..16), 0 | 16 I |
 | pairs | row (int32), BF16 routing weight (int32, low 16 bits) | 8 P |
 | row offsets | `rows + 1` offsets into the row lists (uint32) | 4 (T + 1) |
-| row pairs | per row, the wave's pair indices in ascending expert order (uint32) | 4 P |
+| row pairs | per row, its pair indices in ascending expert order (uint32) | 4 P |
 
-with `E = maxWaveExperts`, `I = maxWavePairs / 16 + maxWaveExperts`, `P = maxWavePairs`, `T = maxRows`. For 64 experts, 1,024
-pairs and 512 rows it is 16,912 bytes. The pair list of a wave is the pairs of its experts one after another; item `i` of the
-kernels is `(slot, first, count)` into it. Pair indices are wave-local.
-
-`Qwen4ExpertOps.runWave(gpu, geometry, plan, wave, descriptorDevice, x, scratch, out, firstWave)` launches the three kernels with the
-counts the plan holds for the wave; `gateUpSwiGlu`, `downWeighted` and `combine` are the individual launches.
+with `P = maxRows * topK`, `E = min(experts, P)`, `I = P / 16 + E`, `T = maxRows`. The pair list is the pairs of the active
+experts one after another; an item is `(slot, first, count)` into it.
 
 ## What the caller must honor
 
 - **Alignment.** Every device address the kernels read or write (descriptor sections, `x`, `out`, scratch) is 16-byte aligned; the
   expert slots are 4096-aligned (cache slots are) and both record offsets are multiples of 256. `x` and `out` are `[rows][hidden]`
   BF16, rows contiguous, `rows <= maxRows`.
-- **Scratch.** `Qwen4ExpertWave.scratchBytes(maxWavePairs)` bytes of device memory, one block per stream in flight: `act`
-  `[pairs][640]` at offset 0, then `weighted` `[pairs][2560]` at the next 16-byte boundary after `act` (6,400 bytes per pair:
-  6.55 MB for 1,024 pairs, 32.8 MB for the 5,120 pairs of a full chunk in one wave, 64 KB for a decode wave of 10).
-- **Order.** Waves of a chunk run in order on one stream, the first with `firstWave` (it zeroes every row of `out` before adding,
-  including rows without pairs in that wave). If a chunk has no pairs at all (every id is padding) the planner has no waves and the
-  caller zeroes `out`.
-- **Descriptor reuse.** The descriptor copy is queued on the same stream as the kernels, so the device copy may be overwritten by
-  the next wave's copy; the *host* descriptor must not be rewritten before the copy it sources has retired.
-- **Leases.** The kernels read the slots until the combine kernel of the wave has run; record the fence after `runWave` and close
-  the leases with it.
-- **Expert order.** Experts must reach the kernels in ascending id across waves; the planner guarantees it, an arbitrary wave
-  order would change the routed sum's rounding.
+- **Scratch.** `Qwen4ExpertRouting.scratchBytes(rows * topK)` bytes of device memory: `act` `[pairs][640]` at offset 0, then
+  `weighted` `[pairs][2560]` at the next 16-byte boundary after `act`, where `pairs` is the chunk's pair count (6,400 bytes per
+  pair: 64 KB for a decode token, 32.8 MB for the 5,120 pairs of a 512-row chunk). Every expert writes its own pairs' rows, so
+  experts may run side by side on different streams.
+- **Order.** The combine runs after every expert's kernels (on its stream, behind their markers). If a chunk has no pairs at all
+  (every id is padding) there is nothing to combine and the caller zeroes `out`.
+- **Descriptor reuse.** The host descriptor must not be rewritten before the copies it sources have retired: the next chunk's
+  plan runs only after the router of that chunk retired, which follows this chunk's combine.
+- **Leases.** An expert's kernels read its slot until they have run; record a fence after `runExpert` on its stream and close the
+  lease with it.
 
 ## Validation
 
 - `native/tests/test_qwen4_experts.py` (numpy venv): both projections against float64 over the exactly expanded weights, bit equality
   of a pair across work items of 16, 8, 5, 3 and 1 pairs and in reverse order, and the combine order and `zeroFirst`.
-- `Qwen4ExpertWaveTest` (CPU): every pair appears once, experts and items ascend, wave limits hold, each row's addition list
-  ascends in expert id across waves, padding ids and repeated experts.
+- `Qwen4ExpertRoutingTest` (CPU): every pair appears once, in its expert's contiguous items that name the expert's slot, each
+  row's addition list ascends in expert id, padding ids and repeated experts.
 - `Qwen4ExpertCudaIntegrationTest` (synthetic NVFP4 experts): `act` and `weighted` of every pair against a CPU reference written from
   upstream; the routed sum equals, bit for bit, the BF16 chain over the kernels' own `weighted` values; results are **bit-identical**
-  for a 70-row chunk across wave limits (1 to 12 experts, 70 to 300 pairs), chunks of 7 and 1 rows, and one piece; a 512-row skewed
-  chunk (up to 347 pairs per expert) is bit-identical across wave splits and agrees with the CPU on three rows.
-- `Qwen4ExpertFixtureCudaIntegrationTest`: real layer-0 experts, records read straight from the artifact into 16 device slots, waves of
-  at most 1,024 pairs, against the upstream fixtures `layer_moe` (`c0` 1 row, `c1` 8 rows, `c2` 64 rows in 15 waves). The upstream
+  for a 70-row chunk whichever order the experts run in and through 1 to 12 slots, in chunks of 7 and 1 rows and in one piece; a
+  512-row skewed chunk (up to 347 pairs per expert) is bit-identical in either order and agrees with the CPU on three rows.
+- `Qwen4ExpertFixtureCudaIntegrationTest`: real layer-0 experts, records read straight from the artifact into 16 device slots reused
+  from expert to expert, against the upstream fixtures `layer_moe` (`c0` 1 row, `c1` 8 rows, `c2` 64 rows). The upstream
   product is an FP32 matmul over exactly expanded weights, the kernels accumulate in FP32 in another order, so values agree to BF16
   rounding:
 
@@ -144,7 +140,8 @@ outputs close to zero in cancelling sums.
 
 ## Measured
 
-RTX 5070 Ti (sm_120, 70 SMs, 16 GB), CUDA 13.1, graph of the kernels of every wave of a chunk, GPU time between events
+RTX 5070 Ti (sm_120, 70 SMs, 16 GB), CUDA 13.1, grouped launches (several experts per launch, the benchmark's "waves"), GPU
+time between events
 (`native/tests/bench_qwen4_experts.py`). The weights of small chunks are replicated over distinct slots until each replay reads
 more than 250 MB, so they come from DRAM. "GB/s" is the stored expert bytes (2,764,808 per expert: gate_up 1,843,204 and
 down 921,604) over the whole time.
@@ -164,8 +161,8 @@ Single launches of one wave, 64 experts at one item each: gate_up 156 us for 118
 the same experts with 9 to 16 pairs (one two-tile item each) 187 us and 94 us; with 24 pairs 260 and 153 us; with 64 pairs (4 items
 of 16) 506 and 321 us, where the decode of the weights into BF16 fragments and the MMAs, not DRAM, bound the kernels.
 
-Memory: the kernels allocate nothing (no local memory). The device cost of a wave is its slots, the descriptor (about 17 KB) and the
-scratch (6,400 bytes per pair of a wave).
+Memory: the kernels allocate nothing (no local memory). The device cost of a chunk is its slots, the descriptor and the scratch
+(6,400 bytes per pair).
 
 Tuning notes (one-wave launches, cold weights; us for 10 experts x 1 pair / 64 experts x 9 pairs / 64 experts x 64 pairs):
 - gate_up, `W = 4`, fragments per warp x warp rows: 2 x 1 (chosen) 28 / 187 / 506; 1 x 2 29 / 198 / 670; 4 x 1 30 / 177 / 483;
@@ -179,9 +176,7 @@ Tuning notes (one-wave launches, cold weights; us for 10 experts x 1 pair / 64 e
 
 ## Known gaps
 
-- Experts are not prefetched across waves by the kernels: overlapping the next wave's transfer with this wave's math is the
-  caller's scheduling.
-- Gate_up reaches 60 to 70% of DRAM bandwidth when a wave has few items (decode and 2 to 4 rows); more bytes in flight per SM
+- Gate_up reaches 60 to 70% of DRAM bandwidth when a launch has few items (decode and 2 to 4 rows); more bytes in flight per SM
   (a deeper K pipeline with `cp.async`) are not implemented.
 - Compute-bound cases (an expert with 64 or more pairs) run at roughly 40% of the BF16 tensor-core peak, limited by decoding NVFP4 into
   BF16 fragments. Native FP4 MMA is not used: it needs FP4 activations, which would make a pair's result depend on the

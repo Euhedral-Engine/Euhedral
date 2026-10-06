@@ -1,9 +1,10 @@
 package io.euhedral_execution.inference.core.qwen4;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.scheduling.graph.StageFrame;
 import io.euhedral_execution.inference.core.scheduling.graph.StageGraph;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /// The stage frames of a [Qwen4Shape]. Each is a [StageFrame]: it submits its device work to the
 /// lane it was given (or does its host work) and its completion makes its successors available. A
@@ -13,17 +14,13 @@ final class Qwen4Stages {
 
     private Qwen4Stages() {}
 
-    /// Whether the critical chain's stages keep one routing hash (the lane of the step); experiment
-    /// switch.
-    static final boolean ORDERED = System.getenv("EUHEDRAL_QWEN4_UNORDERED") == null;
-
     static StageFrame create(StageGraph graph, int stage, Qwen4Shape shape, Qwen4Shape.Spec spec) {
         int layer = spec.layer();
-        int wave = spec.wave();
+        int index = spec.index();
         return switch (spec.kind()) {
             case EMBED -> new Embed(graph, stage, shape);
             case PLEIDS -> new PleIds(graph, stage, shape, layer);
-            case PLEGATHER -> new PleGather(graph, stage, shape, layer, wave);
+            case PLEGATHER -> new PleGather(graph, stage, shape, layer, index);
             case PLE -> new Ple(graph, stage, shape, layer);
             case MIX -> new Mix(graph, stage, shape, layer);
             case ATTENTION -> new Attention(graph, stage, shape, layer, false);
@@ -33,9 +30,8 @@ final class Qwen4Stages {
             case ROUTE -> new Route(graph, stage, shape, layer);
             case SHARED -> new Shared(graph, stage, shape, layer);
             case PLAN -> new Plan(graph, stage, shape, layer);
-            case LOAD -> new Load(graph, stage, shape, layer, wave);
-            case WAVE -> new Wave(graph, stage, shape, layer, wave);
-            case DRAIN -> new Drain(graph, stage, shape, layer);
+            case FETCH -> new Fetch(graph, stage, shape, layer, index);
+            case EXPERT -> new Expert(graph, stage, shape, layer, index);
             case FINISH -> new Finish(graph, stage, shape, layer);
             case ENDINJECT -> new EndInject(graph, stage, shape, layer);
             case OBSERVE -> new Observe(graph, stage, shape, layer, false);
@@ -49,7 +45,14 @@ final class Qwen4Stages {
         final int layer;
 
         Base(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
-            this(graph, stage, shape, layer, ORDERED);
+            this(graph, stage, shape, layer, false);
+        }
+
+        /// A stage routed to the owner of some state, by its hash.
+        Base(StageGraph graph, int stage, Qwen4Shape shape, int layer, long ownerHash) {
+            super(graph, stage, ownerHash);
+            this.shape = shape;
+            this.layer = layer;
         }
 
         Base(StageGraph graph, int stage, Qwen4Shape shape, int layer, boolean ordered) {
@@ -416,16 +419,11 @@ final class Qwen4Stages {
         }
     }
 
-    /// Reads the router's choice (it reaches this stage across a device-completion edge) and plans
-    /// the block's waves.
+    /// Reads the router's choice (it reaches this stage across a device-completion edge), groups the block's
+    /// pairs by expert, and copies the block's description to the device for the expert stages.
     private static final class Plan extends Base {
         Plan(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
             super(graph, stage, shape, layer);
-        }
-
-        @Override
-        protected boolean host() {
-            return true;
         }
 
         @Override
@@ -434,58 +432,25 @@ final class Qwen4Stages {
             Qwen4MoeLayer moe = storage.moe();
             long now = System.nanoTime();
             moe.chargeRouteWait(now - storage.routeArmedNanos);
-            storage.waves = moe.plan(storage.bank, rows());
-            postShares();
-        }
-
-        /// Hands the block to the sources that own the cache's shards: each gets the positions of
-        /// the experts that hash to it, in order, and generates the loads it needs. The wave
-        /// stages' arrival points are readied first.
-        private void postShares() {
-            Qwen4ExecutionPlan plan = plan();
-            Qwen4GraphStorage storage = storage();
-            Qwen4MoeLayer moe = storage.moe();
-            int total = moe.waveStart(storage.waves);
-            long now = System.nanoTime();
-            for (int w = 0; w < storage.waves; w++) {
-                Qwen4GraphStorage.Arrivals arrivals =
-                        (Qwen4GraphStorage.Arrivals) graph().stage(this.shape.loadStage(this.layer, w));
-                arrivals.expect(moe.waveStart(w + 1) - moe.waveStart(w));
-                storage.arrivals[w] = arrivals;
-                storage.loadBegin[w] = now;
-            }
-            ExpertSource[] sources = plan.expertSources();
-            java.util.Arrays.fill(storage.shareCounts, 0);
-            var cache = plan.expertCache();
-            for (int p = 0; p < total; p++) {
-                int shard = cache.shardOf(storage.bank, moe.expertAt(p));
-                storage.sharePositions[shard][storage.shareCounts[shard]++] = p;
-            }
-            storage.block.bind(quantum(), storage.bank);
-            int shares = 0;
-            for (int shard = 0; shard < sources.length; shard++) if (storage.shareCounts[shard] != 0) shares++;
-            Drain drain = (Drain) graph().stage(this.shape.drainStage(this.layer));
-            drain.expect(shares);
-            storage.drain = drain;
-            for (int shard = 0; shard < sources.length; shard++) {
-                if (storage.shareCounts[shard] == 0) continue;
-                sources[shard].submit(storage.shares[shard].set(
-                        storage.block, storage.sharePositions[shard], storage.shareCounts[shard]));
-            }
+            storage.plannedNanos = now;
+            storage.experts = moe.plan(storage.bank, rows());
+            moe.submitPlan();
         }
     }
 
-    /// The arrival point of one wave's experts: the stage ends when every expert of the wave has
-    /// been taken from the cache or its copy submitted (each item reports its arrival), from
-    /// whichever frame reports the last. It does no work itself; a wave the block does not have
-    /// does nothing.
-    private static final class Load extends Base implements Qwen4GraphStorage.Arrivals {
-        private final int wave;
-        private final AtomicInteger pending = new AtomicInteger();
+    /// Takes the `index`-th active expert of the block from the cache. It runs where the cache's bookkeeping
+    /// lives (its routing hash is the cache owner's, so it runs in order with every other frame that touches
+    /// that state): a resident expert is a lease at once and the stage ends; a missing one reserves a slot and
+    /// starts its load, and the stage ends when the load hands it the lease. When every slot that could hold
+    /// the expert is pinned, the stage publishes itself again and tries once more when the lattice runs it, as
+    /// any frame that finds its resource full does; no other expert waits for it.
+    private static final class Fetch extends Base implements ExpertCacheOwner.Fetch {
+        private final int index;
+        private final Retry retry = new Retry();
 
-        Load(StageGraph graph, int stage, Qwen4Shape shape, int layer, int wave) {
-            super(graph, stage, shape, layer);
-            this.wave = wave;
+        Fetch(StageGraph graph, int stage, Qwen4Shape shape, int layer, int index) {
+            super(graph, stage, shape, layer, ExpertCacheOwner.HASH);
+            this.index = index;
         }
 
         @Override
@@ -495,92 +460,85 @@ final class Qwen4Stages {
 
         @Override
         protected boolean skips() {
-            return this.wave >= storage().waves;
-        }
-
-        /// The plan stage sets the count before it spawns an item, and this stage's own part (the
-        /// extra one) arrives when it runs.
-        @Override
-        public void expect(int count) {
-            this.pending.set(count + 1);
-        }
-
-        @Override
-        public void arrived() {
-            settle();
+            return this.index >= storage().experts;
         }
 
         @Override
         protected void submit() {
             deferCompletion();
-            settle();
+            fetch();
         }
 
-        private void settle() {
-            if (this.pending.decrementAndGet() == 0) completeDeferred();
+        /// Asks the cache for the expert. Runs on the owner's frames only (this stage, or its retry).
+        private void fetch() {
+            if (stopped()) {
+                completeDeferred();
+                return;
+            }
+            Qwen4GraphStorage storage = storage();
+            int expert = storage.moe().activeExpert(this.index);
+            if (plan().expertOwner().fetch(this, storage.bank, expert) == ExpertCacheOwner.Outcome.FULL)
+                graph().lake().publish(this.retry);
+        }
+
+        @Override
+        public boolean stopped() {
+            return quantum().stopRequested();
+        }
+
+        @Override
+        public void arrived(ExpertLease lease) {
+            if (stopped()) lease.close();
+            else storage().moe().hold(this.index, lease);
+            completeDeferred();
+        }
+
+        @Override
+        public void failed(Throwable failure) {
+            quantum().fail(failure);
+            completeDeferred();
+        }
+
+        /// The fetch once more, routed to the owner.
+        private final class Retry extends AbstractFrame {
+            Retry() {
+                super(ExpertCacheOwner.HASH);
+            }
+
+            @Override
+            public void execute() {
+                fetch();
+            }
+
+            @Override
+            public void doFinally() {}
+
+            @Override
+            public void doFinallyWithError(Throwable rejection) {
+                failed(new IllegalStateException("the lattice rejected an expert fetch", rejection));
+            }
         }
     }
 
-    /// The end of a block's claims: this stage ends when every source finished its share (each
-    /// expert taken, each copy retired), so the next layer's plan only posts to sources that are
-    /// free. It does no work itself.
-    private static final class Drain extends Base implements Qwen4GraphStorage.Drain {
-        private final AtomicInteger pending = new AtomicInteger();
+    /// The kernels of the `index`-th active expert, once it is held; its lease closes behind a marker of the
+    /// lane. Independent of every other expert.
+    private static final class Expert extends Base {
+        private final int index;
 
-        Drain(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
-            super(graph, stage, shape, layer);
-        }
-
-        @Override
-        protected boolean host() {
-            return true;
-        }
-
-        /// The plan stage sets the count before it posts the first share; this stage's own part is
-        /// the extra one.
-        @Override
-        public void expect(int shares) {
-            this.pending.set(shares + 1);
-        }
-
-        @Override
-        public void done() {
-            settle();
-        }
-
-        @Override
-        protected void submit() {
-            deferCompletion();
-            settle();
-        }
-
-        private void settle() {
-            if (this.pending.decrementAndGet() == 0) completeDeferred();
-        }
-    }
-
-    /// One wave's kernels, over the experts the wave's load holds; the leases close behind a marker
-    /// of the lane.
-    private static final class Wave extends Base {
-        private final int wave;
-
-        Wave(StageGraph graph, int stage, Qwen4Shape shape, int layer, int wave) {
-            super(graph, stage, shape, layer);
-            this.wave = wave;
+        Expert(StageGraph graph, int stage, Qwen4Shape shape, int layer, int index) {
+            super(graph, stage, shape, layer, false);
+            this.index = index;
         }
 
         @Override
         protected boolean skips() {
-            return this.wave >= storage().waves;
+            return this.index >= storage().experts;
         }
 
         @Override
         protected void submit() {
             Qwen4GraphStorage storage = storage();
-            Qwen4MoeLayer moe = storage.moe();
-            long now = System.nanoTime();
-            moe.chargeExpertWait(now - storage.loadBegin[this.wave]);
-            moe.submitWave(this.wave, laneStream(), storage.mixed(), storage.moeBlock);
+            storage.moe().submitExpert(this.index, laneStream(), laneIndex(), storage.mixed(), storage.moeBlock);
         }
     }
 
@@ -596,13 +554,13 @@ final class Qwen4Stages {
             Qwen4ExecutionPlan plan = plan();
             Qwen4GraphStorage storage = storage();
             Qwen4MoeLayer moe = storage.moe();
+            moe.chargeExpertWait(System.nanoTime() - storage.plannedNanos);
             moe.submitFinish(storage.blockOutput(), rows(), storage.moeBlock);
             if (plan.traceOn())
                 plan.reportTrace(
                         this.layer,
                         rows(),
                         moe.lastUniqueExperts(),
-                        moe.lastWaves(),
                         storage.traceBefore,
                         plan.expertStats().snapshot());
             if (!this.shape.diagnostic()) blockInject();

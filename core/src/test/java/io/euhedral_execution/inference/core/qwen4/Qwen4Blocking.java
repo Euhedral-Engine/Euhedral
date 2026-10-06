@@ -78,9 +78,9 @@ public final class Qwen4Blocking {
     }
 
     /// Runs one MoE block through the layer's pieces on the calling thread (not a worker) and
-    /// returns once every wave is submitted (the stream is not waited for): the router and its
-    /// route copy, a boundary behind them, the shared expert, the planned waves whose experts are
-    /// leased through the cache's blocking acquire, and the combination.
+    /// returns once everything is submitted (the stream is not waited for): the router and its
+    /// route copy, a boundary behind them, the shared expert, the block's plan, every expert (leased
+    /// through the test support's blocking acquire), and the ordered combine.
     public static void runMoe(
             Qwen4MoeLayer moe,
             io.euhedral_execution.inference.core.gpu.GpuStream stream,
@@ -99,15 +99,15 @@ public final class Qwen4Blocking {
         routed.await();
         Throwable device = stream.confirmRetired(ticket);
         if (device != null) throw new IllegalStateException("device work failed", device);
-        int waves = moe.plan(bank, rows);
-        for (int w = 0; w < waves; w++) {
-            for (int position = moe.waveStart(w); position < moe.waveStart(w + 1); position++)
-                moe.hold(
-                        position,
-                        io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport.acquire(
-                                cache, bank, moe.expertAt(position)));
-            int wave = w;
-            stream.submit(() -> moe.submitWave(wave, stream, input, scratch), false);
+        int experts = moe.plan(bank, rows);
+        stream.submit(moe::submitPlan, false);
+        for (int index = 0; index < experts; index++) {
+            moe.hold(
+                    index,
+                    io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTestSupport.acquire(
+                            cache, bank, moe.activeExpert(index)));
+            int expert = index;
+            stream.submit(() -> moe.submitExpert(expert, stream, 0, input, scratch), false);
         }
         stream.submit(() -> moe.submitFinish(output, rows, scratch), false);
     }

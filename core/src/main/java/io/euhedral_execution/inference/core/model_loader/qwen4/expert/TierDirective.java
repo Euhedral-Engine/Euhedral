@@ -1,7 +1,7 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
 /// What the host tier asks of one load, decided by the tier's owner before the load runs and read by the
-/// frame that does it. A lane owns one: the owner writes it, then publishes the frame that reads it.
+/// frames that do it. A load owns one: the owner writes it, then the load's frames are published and read it.
 public final class TierDirective {
 
     /// What the load does with the tier.
