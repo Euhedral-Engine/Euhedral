@@ -28,7 +28,7 @@ class Qwen4PerformanceCudaIntegrationTest {
     private static final int MAX = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_PERF_MAX", "4096"));
     private static final int CONTEXT = Math.max(MAX, 4096) + 1024;
 
-    private static int[] corpus(int tokens) throws IOException {
+    static int[] corpus(int tokens) throws IOException {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
         assumeTrue(Files.isRegularFile(tokenizerDirectory.resolve("tokenizer.json")), "no tokenizer");
@@ -111,6 +111,11 @@ class Qwen4PerformanceCudaIntegrationTest {
                     100.0 * totalHits / Math.max(1, totalHits + totalMisses)));
             return text.toString();
         }
+    }
+
+    private static int intEnv(String name, int fallback) {
+        String value = System.getenv(name);
+        return value == null ? fallback : Integer.parseInt(value);
     }
 
     private void line(String text) {
@@ -207,6 +212,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                 line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));
                 line("expert cache: " + model.expertCache().slotCount() + " slots; plan:\n"
                         + model.plan().report());
+                int chunk = Math.min(executor.maxRows(), intEnv("EUHEDRAL_QWEN4_CHUNK", executor.maxRows()));
+                line("prefill chunk: " + chunk + " tokens (plan " + executor.maxRows() + ")");
                 int vocabulary = executor.vocabularySize();
                 var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
                 Qwen4ExecutionPlan.LogitsSink sink =
@@ -226,7 +233,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                         long start = System.nanoTime();
                         int at = 0;
                         while (at < target) {
-                            int rows = Math.min(512, target - at);
+                            int rows = Math.min(chunk, target - at);
                             Qwen4Blocking.step(executor, sequence, prompt, at, rows, at + rows == target ? sink : null);
                             at += rows;
                         }
@@ -256,7 +263,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         int at = 0;
                         while (at < context) {
-                            int rows = Math.min(512, context - at);
+                            int rows = Math.min(chunk, context - at);
                             Qwen4Blocking.step(executor, sequence, prompt, at, rows, null);
                             at += rows;
                         }
@@ -308,7 +315,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         int at = 0;
                         while (at < shape[0]) {
-                            int rows = Math.min(512, shape[0] - at);
+                            int rows = Math.min(chunk, shape[0] - at);
                             Qwen4Blocking.step(executor, sequence, prompt, at, rows, null);
                             at += rows;
                         }

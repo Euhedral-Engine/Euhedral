@@ -124,6 +124,11 @@ final class Qwen4Runtime implements AutoCloseable {
         return this.host;
     }
 
+    /// Prompt tokens per prefill step: the most the plan's workspace holds.
+    int prefillChunkTokens() {
+        return this.plan.maxRows();
+    }
+
     Qwen4GenerationSession createSession(
             QwenTokenizer tokenizer,
             GenerationConfig config,

@@ -37,7 +37,7 @@ Fixed objects keep the dense engine's `TensorHandle` (device address, host addre
 ```
 free device memory
   - runtime reserve (CUDA context, kernel modules, graph pools)           1,024 MiB
-  - workspace of one execution step                                         130 MiB
+  - workspaces of the execution plan (a decode token, a short chunk, a full chunk)
   - sequence state of the maximum context (KV, indexer keys, GDN state)
   - fixed objects placed on the device
   - the staging ring of fixed objects moved to the host
@@ -47,8 +47,19 @@ free device memory
 Sequence state comes from the configuration (`Qwen4SequenceState`): KV is NVFP4 pages of 256 tokens, 576 bytes per token in each
 of the 12 sparse-attention layers (1.69 GiB at 262,144 tokens); the indexer keeps one BF16 key of 128 values per 4 tokens per
 layer (192 MiB at 262,144); GDN keeps 110 MiB regardless of length. The workspace is sized from the topology (hyper-connection
-streams, the widest mixer's intermediates, router and selected-expert activations for a 512-token chunk, decode logits); it is a
-bound to be tightened with measured high-water marks when execution exists.
+streams, the widest mixer's intermediates, router and selected-expert activations per token of every workspace the execution
+plan allocates, decode logits); it is a bound to be tightened with measured high-water marks.
+
+### Prefill chunk
+
+A prefill chunk reads most of the experts of every layer once, whatever its length, so the cost of a chunk is almost independent of
+its tokens and a longer chunk serves a prompt better. The planner therefore chooses the length of the full chunk as well: the
+largest power of two from 512 to 4096, no longer than the context needs (`chunk / 2 < context`), whose extra workspace over a
+512-token chunk is at most a tenth of the memory the expert cache would have had. The chunk the plan chose is
+`Qwen4ResidencyPlan.prefillChunkTokens`; the execution plan's full workspace has that many rows, a session cuts a prompt into
+chunks of that size, and the report prints it. A decode token and a short chunk have workspaces of their own and take nothing from
+it. `Qwen4ChunkSizeCudaIntegrationTest` runs one prompt in chunks of 512, of 333 and in one chunk, and requires the same greedy
+continuation.
 
 Context has priority. A longer context takes memory from the expert cache first. Only when the cache would fall below its
 minimum (`2 x experts-per-token` = 20 slots: the selected experts of a token and a second set in flight) does a fixed object

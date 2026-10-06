@@ -47,8 +47,10 @@ public final class Qwen4SequenceState {
         return kvBytes(config, tokens) + indexerBytes(config, tokens) + gdnStateBytes(config);
     }
 
-    /// Prefill tokens an execution step holds at once.
+    /// Prefill tokens an execution step holds at once unless the residency plan finds room for more.
     public static final int PREFILL_CHUNK_TOKENS = 512;
+    /// Rows of the workspaces that serve a decode token and a short chunk, beside the full chunk's.
+    private static final int SMALL_WORKSPACE_ROWS = 1 + 16;
     /// Rows of one decode or verification step's logits.
     private static final int LOGIT_ROWS = 8;
 
@@ -57,6 +59,12 @@ public final class Qwen4SequenceState {
     /// intermediates (double buffered, BF16), the router logits and the selected experts' gate/up and down
     /// activations; plus the logits of a decode step. A bound sized from the topology, not a measurement.
     public static long workspaceBytes(Qwen4Config config) {
+        return workspaceBytes(config, PREFILL_CHUNK_TOKENS);
+    }
+
+    /// As [#workspaceBytes(Qwen4Config)] for chunks of `chunkTokens` tokens, with the smaller workspaces that
+    /// serve a decode token and a short chunk: every workspace the execution plan allocates.
+    public static long workspaceBytes(Qwen4Config config, int chunkTokens) {
         long hidden = config.text().hiddenSize();
         long stream = (long) config.hyperConnection().count() * hidden * 2L;
         Qwen4Config.Gdn gdn = config.gdn();
@@ -71,6 +79,6 @@ public final class Qwen4SequenceState {
                 + (long) moe.expertsPerToken() * 8L;
         long perToken = 3 * stream + mixer + experts + 4 * hidden * 2L;
         long logits = (long) LOGIT_ROWS * config.text().vocabSize() * Float.BYTES;
-        return PREFILL_CHUNK_TOKENS * perToken + logits;
+        return ((long) chunkTokens + SMALL_WORKSPACE_ROWS) * perToken + logits;
     }
 }

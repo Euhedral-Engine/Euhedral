@@ -47,8 +47,11 @@ class Qwen4ModelTest {
     long freeFor(Qwen4Mode mode, int slots) {
         var roomy =
                 Qwen4ResidencyPlanner.plan(this.artifact, mode, 64 * GIB, HostBudget.ofAvailable(64 * GIB), CONTEXT);
+        // A roomy device plans a longer prefill chunk than a tight one can afford: count the tight one's.
         return roomy.device().plannedBytes()
                 - roomy.device().expertCacheBytes()
+                - roomy.device().workspaceBytes()
+                + Qwen4SequenceState.workspaceBytes(this.artifact.config())
                 + slots * roomy.expertCache().slotBytes();
     }
 

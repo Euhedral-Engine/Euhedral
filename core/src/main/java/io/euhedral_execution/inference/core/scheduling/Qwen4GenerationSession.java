@@ -29,9 +29,6 @@ import java.util.function.Consumer;
 /// back.
 public final class Qwen4GenerationSession implements GenerationSession {
 
-    /// Prompt tokens per prefill step (the plan's chunk).
-    public static final int DEFAULT_PREFILL_CHUNK_TOKENS = Qwen4ExecutionPlan.MAX_ROWS;
-
     private final QwenTokenizer tokenizer;
     private final Qwen4ExecutionPlan plan;
     private final HostFrames frames;
@@ -65,8 +62,8 @@ public final class Qwen4GenerationSession implements GenerationSession {
             GenerationConfig config,
             int prefillChunkTokens,
             Consumer<? super Qwen4GenerationSession> closeListener) {
-        if (prefillChunkTokens <= 0 || prefillChunkTokens > Qwen4ExecutionPlan.MAX_ROWS)
-            throw new IllegalArgumentException("prefillChunkTokens must be in 1.." + Qwen4ExecutionPlan.MAX_ROWS);
+        if (prefillChunkTokens <= 0 || prefillChunkTokens > plan.maxRows())
+            throw new IllegalArgumentException("prefillChunkTokens must be in 1.." + plan.maxRows());
         this.tokenizer = Objects.requireNonNull(tokenizer, "tokenizer");
         this.plan = Objects.requireNonNull(plan, "plan");
         this.frames = Objects.requireNonNull(frames, "frames");

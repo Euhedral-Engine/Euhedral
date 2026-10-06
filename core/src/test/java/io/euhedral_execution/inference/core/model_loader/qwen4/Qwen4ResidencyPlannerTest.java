@@ -243,6 +243,41 @@ class Qwen4ResidencyPlannerTest {
     }
 
     @Test
+    void theCacheGivesUpAtMostATenthOfItsMemoryToALongerPrefillChunk() {
+        var config = artifact.config();
+        long base = Qwen4SequenceState.workspaceBytes(config);
+        for (long free : DEVICES) {
+            for (int context : CONTEXTS) {
+                var plan = plan(free, context);
+                if (!plan.fits()) continue;
+                int chunk = plan.prefillChunkTokens();
+                assertTrue(chunk >= Qwen4SequenceState.PREFILL_CHUNK_TOKENS, report(plan, free, context));
+                assertTrue(chunk <= Qwen4ResidencyPlanner.LARGEST_PREFILL_CHUNK_TOKENS);
+                assertEquals(Integer.bitCount(chunk), 1, "a power of two: " + chunk);
+                // The workspace the plan reserves is every workspace the execution plan allocates.
+                assertEquals(
+                        Qwen4SequenceState.workspaceBytes(config, chunk),
+                        plan.device().workspaceBytes());
+                if (chunk > Qwen4SequenceState.PREFILL_CHUNK_TOKENS) {
+                    long extra = plan.device().workspaceBytes() - base;
+                    long budget =
+                            plan.device().expertCacheBytes() + plan.device().slackBytes() + extra;
+                    assertTrue(extra <= budget / 10, report(plan, free, context));
+                    assertTrue(chunk / 2 < context, "no chunk longer than the context needs");
+                }
+            }
+        }
+        assertEquals(
+                Qwen4ResidencyPlanner.LARGEST_PREFILL_CHUNK_TOKENS,
+                plan(96 * GIB, 32768).prefillChunkTokens(),
+                "a roomy device takes the largest chunk");
+        assertEquals(
+                Qwen4SequenceState.PREFILL_CHUNK_TOKENS,
+                plan(5 * GIB, 32768).prefillChunkTokens(),
+                "a device with little to spare keeps its slots");
+    }
+
+    @Test
     void hostPlacementFollowsTheHostBudget() {
         var roomy = Qwen4ResidencyPlanner.plan(
                 artifact, Qwen4Mode.TEXT, 15 * GIB, HostBudget.ofAvailable(256 * GIB), 32768);
