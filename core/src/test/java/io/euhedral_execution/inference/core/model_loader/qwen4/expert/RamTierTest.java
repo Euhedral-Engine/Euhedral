@@ -55,6 +55,13 @@ class RamTierTest {
         return this.store;
     }
 
+    private FileExpertStore admitting(int slots, ReplacementPolicy policy) throws IOException {
+        RamTier tier = new RamTier(this.fixture.banks, slots, 1, policy, null, true);
+        this.store = new FileExpertStore(
+                this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 4);
+        return this.store;
+    }
+
     private FileExpertStore store(int slots, int shards, ReplacementPolicy policy) throws IOException {
         return store(slots, shards, policy, new FileRecordSource(this.fixture.file, this.fixture.banks));
     }
@@ -173,6 +180,48 @@ class RamTierTest {
             for (int bank = 0; bank < 5; bank++) for (int hot = 0; hot < hotPerBank[bank]; hot++) load(bank, hot, 0);
         this.store.ramTier().checkInvariants();
         return this.store.ramTier().stats().hitRate();
+    }
+
+    /// A prefill visits every expert of a layer once per chunk. Eight slots cannot hold the 16 experts of bank 2:
+    /// recency replaces each record just before the next sweep needs it, while admission keeps the records the
+    /// tier has and serves half of every sweep.
+    @Test
+    void admissionKeepsAShareOfARepeatedSweepThatRecencyThrashes() throws Exception {
+        double recency = sweepHitRate(false);
+        this.store.close();
+        double admitted = sweepHitRate(true);
+        System.out.printf("sweeps of 16 records through 8 slots: recency %.3f, admission %.3f%n", recency, admitted);
+        assertTrue(recency < 0.05, "recency thrashes on the sweep: " + recency);
+        assertTrue(admitted > 0.4, "admission keeps half of every sweep: " + admitted);
+    }
+
+    private double sweepHitRate(boolean admission) throws Exception {
+        if (admission) admitting(8, ReplacementPolicy.GLOBAL_LRU);
+        else store(8, 1, ReplacementPolicy.GLOBAL_LRU);
+        for (int sweep = 0; sweep < 20; sweep++)
+            for (int expert = 0; expert < 16; expert++)
+                assertArrayEquals(this.fixture.record(2, expert), load(2, expert, 0));
+        this.store.ramTier().checkInvariants();
+        return this.store.ramTier().stats().hitRate();
+    }
+
+    /// A record asked for more often than the victim replaces it; until then it is read around the tier.
+    @Test
+    void aRecordAskedForMoreOftenThanTheVictimReplacesIt() throws Exception {
+        admitting(1, ReplacementPolicy.GLOBAL_LRU);
+        RamTierShard shard = this.store.tier(0);
+        load(0, 0, 0);
+        assertTrue(shard.isResident(0, 0), "a free slot takes the first record");
+        load(0, 1, 0);
+        load(0, 1, 0);
+        assertTrue(shard.isResident(0, 0), "asked for once before, as often as the victim: read around the tier");
+        assertFalse(shard.isResident(0, 1));
+        assertArrayEquals(this.fixture.record(0, 1), load(0, 1, 0));
+        assertTrue(shard.isResident(0, 1), "asked for twice before, more often than the victim: it replaces it");
+        var stats = this.store.ramTier().stats();
+        assertEquals(2, stats.totalBypasses());
+        assertEquals(1, stats.totalEvictions());
+        shard.checkInvariants();
     }
 
     @Test

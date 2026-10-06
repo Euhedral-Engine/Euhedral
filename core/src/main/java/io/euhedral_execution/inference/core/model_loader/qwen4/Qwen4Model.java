@@ -64,6 +64,10 @@ public final class Qwen4Model implements AutoCloseable {
     /// benchmarks.
     static final boolean PIN_TIER = !"0".equals(System.getenv("EUHEDRAL_QWEN4_PIN_TIER"));
 
+    /// Whether a record must have been asked for more often than the tier's victim to replace it;
+    /// `EUHEDRAL_QWEN4_TIER_ADMISSION=0` replaces by recency alone, for benchmarks.
+    static final boolean TIER_ADMISSION = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_ADMISSION"));
+
     private final Qwen4Artifact artifact;
     private final Qwen4ResidencyPlan plan;
     private final Qwen4FixedLoader.Loaded fixed;
@@ -159,7 +163,8 @@ public final class Qwen4Model implements AutoCloseable {
                         plan.host().expertRamSlots(),
                         1,
                         ReplacementPolicy.BANK_PARTITIONED,
-                        pin ? gpu : null);
+                        pin ? gpu : null,
+                        TIER_ADMISSION);
                 LOG.info("Expert tier: {} MiB of {} memory", tier.capacityBytes() >> 20, pin ? "pinned" : "pageable");
                 if (tier.isResident()) {
                     long begin = System.nanoTime();
