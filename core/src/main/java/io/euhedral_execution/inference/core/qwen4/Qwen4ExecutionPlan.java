@@ -35,11 +35,8 @@ import java.util.concurrent.atomic.LongAdder;
 /// completion chain, because a block's experts are sized to the cache's slots.
 public final class Qwen4ExecutionPlan implements AutoCloseable {
 
-    /// Most tokens of one chunk.
+    /// Most tokens of one chunk when the residency plan does not say otherwise.
     public static final int MAX_ROWS = 512;
-
-    /// The row capacities of the plan's shapes: a decode token, a short chunk, a full chunk.
-    private static final int[] ROW_BUCKETS = {1, 16, MAX_ROWS};
 
     /// Receives the logits row of a step: called while the head stage's lane is selected, after the
     /// output head's launch, so a copy it queues is ordered behind the head.
@@ -131,9 +128,13 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     private final Qwen4Weight embedding;
     private final Qwen4Weight head;
     private final ConcurrentHashMap<ShapeKey, Qwen4Shape> shapes = new ConcurrentHashMap<>();
-    /// The workspaces, one per row capacity of [#ROW_BUCKETS]: allocated with the plan, shared by
+    /// The workspaces, one per row capacity of [#rowBuckets]: allocated with the plan, shared by
     /// the graphs of a capacity, freed by [#close].
-    private final Qwen4GraphStorage[] workspaces = new Qwen4GraphStorage[ROW_BUCKETS.length];
+    private final Qwen4GraphStorage[] workspaces;
+
+    /// The row capacities of the plan's shapes: a decode token, a short chunk, a full chunk.
+    private final int[] rowBuckets;
+    private final int maxRows;
     /// The last quantum admitted: a new quantum registers as its successor, and its conclusion
     /// starts the new one.
     private final AtomicReference<Qwen4Quantum> chainTail = new AtomicReference<>();
@@ -154,6 +155,9 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         this.model = model;
         this.config = model.artifact().config();
         this.maxTokens = maxContextTokens;
+        this.maxRows = model.plan().prefillChunkTokens();
+        this.rowBuckets = new int[] {1, 16, this.maxRows};
+        this.workspaces = new Qwen4GraphStorage[this.rowBuckets.length];
         this.hidden = this.config.text().hiddenSize();
         this.streams = this.config.hyperConnection().count();
         this.vocabulary = this.config.text().vocabSize();
@@ -213,8 +217,8 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         // The workspaces are allocated now, not by the first step: a model that cannot hold them fails to load, and the
         // residency plan's reserve is spent at a known time.
         try {
-            for (int i = 0; i < ROW_BUCKETS.length; i++)
-                this.workspaces[i] = new Qwen4GraphStorage(this, gpu, ROW_BUCKETS[i]);
+            for (int i = 0; i < this.rowBuckets.length; i++)
+                this.workspaces[i] = new Qwen4GraphStorage(this, gpu, this.rowBuckets[i]);
         } catch (Throwable failure) {
             closeWorkspaces();
             throw failure;
@@ -297,7 +301,7 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
             StateExchange exchange,
             Listener listener) {
         if (this.closed) throw new IllegalStateException("the plan is closed");
-        if (rows <= 0 || rows > MAX_ROWS) throw new IllegalArgumentException("rows " + rows);
+        if (rows <= 0 || rows > this.maxRows) throw new IllegalArgumentException("rows " + rows);
         if (range.advances() && sequence.position() + rows > sequence.maxTokens())
             throw new IllegalStateException("the sequence would exceed its " + sequence.maxTokens() + " positions");
         boolean diagnostic = timingsOn() || hasObserver() || hasMidObserver();
@@ -311,18 +315,23 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     /// A graph's hold on the workspace of capacity `rows`: the graphs of a capacity take turns on
     /// it.
     Qwen4GraphStorage.Lease leaseStorage(int rows) {
-        for (int i = 0; i < ROW_BUCKETS.length; i++)
-            if (ROW_BUCKETS[i] == rows) return new Qwen4GraphStorage.Lease(this.workspaces[i]);
+        for (int i = 0; i < this.rowBuckets.length; i++)
+            if (this.rowBuckets[i] == rows) return new Qwen4GraphStorage.Lease(this.workspaces[i]);
         throw new IllegalArgumentException("no workspace of " + rows + " rows");
+    }
+
+    /// Most tokens of one chunk: the residency plan's prefill chunk.
+    public int maxRows() {
+        return this.maxRows;
     }
 
     /// The row capacity of the shape that serves `rows` rows: a decode token, a short chunk, a full
     /// chunk. The capacity sizes the shape's workspace and the most waves its MoE blocks can have,
     /// so a decode graph is small and has no wave stage that a token could not use.
-    static int rowBucket(int rows) {
+    int rowBucket(int rows) {
         if (rows <= 1) return 1;
         if (rows <= 16) return 16;
-        return MAX_ROWS;
+        return this.maxRows;
     }
 
     // ---------------------------------------------------------------- what the shapes and their stages read

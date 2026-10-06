@@ -42,6 +42,14 @@ public final class Qwen4ResidencyPlanner {
     /// measured on the dense model's engine, docs/NVFP4_RESIDENCY.md).
     public static final long KERNEL_RESERVE_BYTES = 1024L << 20;
 
+    /// The largest prefill chunk the planner will make room for.
+    public static final int LARGEST_PREFILL_CHUNK_TOKENS = 4096;
+
+    /// The share of the expert cache's memory that a larger prefill chunk may take: a chunk of many tokens
+    /// reads most of the experts of every layer once however many tokens it holds, so its cost is
+    /// amortized over its tokens, and the cache gives up a tenth of its slots at most for that.
+    private static final int CHUNK_SHARE_DIVISOR = 10;
+
     /// Staging slots for host-backed fixed objects, shared with the dense engine's ring.
     public static final int STAGING_SLOTS = ResidencyPlanner.STAGING_SLOTS;
 
@@ -215,6 +223,21 @@ public final class Qwen4ResidencyPlanner {
             } else placements.put(tensor.name(), new Qwen4ResidencyPlan.Placement(StorageClass.DEVICE_RESIDENT, null));
         }
 
+        // A longer chunk spends the device's memory on workspace instead of expert slots. A prefill chunk reads
+        // most of the experts of every layer once, whatever its length, so the longest chunk the cache can
+        // afford to give up memory for is the one that serves a prompt best. A decode token needs none of it.
+        int chunk = Qwen4SequenceState.PREFILL_CHUNK_TOKENS;
+        long budget512 = freeBytes - need - reserved;
+        long base = Qwen4SequenceState.workspaceBytes(config, chunk);
+        for (int candidate = chunk * 2;
+                candidate <= LARGEST_PREFILL_CHUNK_TOKENS && candidate / 2 < maxContextTokens;
+                candidate *= 2) {
+            long extra = Qwen4SequenceState.workspaceBytes(config, candidate) - base;
+            if (extra > budget512 / CHUNK_SHARE_DIVISOR || budget512 - extra < minimumCache) break;
+            chunk = candidate;
+        }
+        workspace = Qwen4SequenceState.workspaceBytes(config, chunk);
+        reserved = KERNEL_RESERVE_BYTES + workspace + kv + indexer + gdn;
         long cacheBudget = freeBytes - need - reserved;
         ExpertCacheGeometry geometry = ExpertCacheGeometry.derive(cacheBudget, slotBytes, totalExperts, minimumSlots);
         long cacheBytes = geometry.bytes();
@@ -288,7 +311,8 @@ public final class Qwen4ResidencyPlanner {
                 hostPlan,
                 geometry,
                 expertStore,
-                ngram);
+                ngram,
+                chunk);
     }
 
     private static Qwen4ResidencyPlan.Placement deferred() {

@@ -20,7 +20,8 @@ public record Qwen4ResidencyPlan(
         Host host,
         ExpertCacheGeometry expertCache,
         ExpertStoreMode expertStore,
-        NgramMode ngram) {
+        NgramMode ngram,
+        int prefillChunkTokens) {
 
     /// Storage of one fixed object; `move` is set for objects that left the device.
     public record Placement(StorageClass storage, Qwen4Priority.Move move) {}
@@ -145,6 +146,7 @@ public record Qwen4ResidencyPlan(
         line(out, "n-gram host storage", this.ngram + ", " + mib(h.ngramPinnedBytes() + h.ngramFileBytes()));
         line(out, "deferred MTP", mib(h.deferredMtpBytes()));
         line(out, "deferred vision", mib(h.deferredVisionBytes()));
+        line(out, "prefill chunk", this.prefillChunkTokens + " tokens");
         line(out, "pinned host memory", mib(h.pinnedBytes()));
         line(out, "ordinary host memory", mib(h.residentBytes()));
         if (!this.fits) line(out, "does not fit", this.explanation);

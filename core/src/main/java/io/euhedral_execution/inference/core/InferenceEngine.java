@@ -23,7 +23,6 @@ import io.euhedral_execution.inference.core.scheduling.DFlash2Decoder;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.scheduling.GenerationSession;
 import io.euhedral_execution.inference.core.scheduling.PrefixCache;
-import io.euhedral_execution.inference.core.scheduling.Qwen4GenerationSession;
 import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
 import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -333,7 +332,7 @@ public final class InferenceEngine implements AutoCloseable {
         var session = this.qwen4.createSession(
                 this.tokenizer,
                 Objects.requireNonNull(config, "config"),
-                Qwen4GenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS,
+                this.qwen4.prefillChunkTokens(),
                 this::releaseGenerationSession);
         this.sessions.add(session);
         return session;
