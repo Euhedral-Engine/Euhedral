@@ -39,12 +39,27 @@ public final class FileRecordSource implements RecordSource {
         if (destination.byteSize() != size)
             throw new IllegalArgumentException(
                     "destination holds " + destination.byteSize() + " bytes, record " + size);
+        readRange(bank, expert, 0, destination);
+    }
+
+    @Override
+    public boolean ranged() {
+        return true;
+    }
+
+    @Override
+    public void readRange(ExpertBank bank, int expert, long from, MemorySegment destination)
+            throws IOException, InterruptedException {
+        long size = destination.byteSize();
+        if (from < 0 || from > bank.recordBytes(expert) - size)
+            throw new IllegalArgumentException(
+                    "bytes " + from + ".." + (from + size) + " are outside record " + bank.recordBytes(expert));
         if (this.closed.get()) throw new IllegalStateException("the record source is closed");
         int now = this.readsNow.incrementAndGet();
         this.readsHighWater.accumulateAndGet(now, Math::max);
         long begin = System.nanoTime();
         try (FileChannel channel = FileChannel.open(this.file, StandardOpenOption.READ)) {
-            ExpertFiles.readFully(channel, destination, bank.fileOffset(expert));
+            ExpertFiles.readFully(channel, destination, bank.fileOffset(expert) + from);
         } catch (ClosedByInterruptException interrupted) {
             // The interrupt closed this read's channel and left the flag set; the exception consumes it.
             Thread.interrupted();
@@ -53,7 +68,7 @@ public final class FileRecordSource implements RecordSource {
             this.readsNow.decrementAndGet();
             this.readNanos.add(System.nanoTime() - begin);
         }
-        this.reads.increment();
+        if (from == 0) this.reads.increment();
         this.bytesRead.add(size);
     }
 

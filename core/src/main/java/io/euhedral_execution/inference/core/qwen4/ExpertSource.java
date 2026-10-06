@@ -11,6 +11,9 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.expert.HostRecord
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTierShard;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.TierDirective;
 import io.euhedral_execution.inference.core.scheduling.graph.SerialSource;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 
 /// The owner of one [ExpertCacheShard], as a lattice source that is attached to the lattice on its
 /// own: the cache of a model is several of these, side by side.
@@ -52,6 +55,40 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
             this.count = count;
             return this;
         }
+    }
+
+    /// Where the loads of this source spent their time, summed over loads (loads of different lanes
+    /// overlap, so the sums exceed wall time): `dispatch` from the claim to a worker starting the
+    /// frame, `open` in the host store (the read or the RAM copy), `submit` from the frame's end to
+    /// the source handling it, `copy` from the copy's submission to its retirement callback, and
+    /// `retire` from that callback to the source handling it.
+    public record Timings(long loads, long dispatch, long open, long submit, long copy, long retire) {
+        public Timings plus(Timings other) {
+            return new Timings(
+                    this.loads + other.loads,
+                    this.dispatch + other.dispatch,
+                    this.open + other.open,
+                    this.submit + other.submit,
+                    this.copy + other.copy,
+                    this.retire + other.retire);
+        }
+    }
+
+    private final LongAdder loadCount = new LongAdder();
+    private final LongAdder dispatchNanos = new LongAdder();
+    private final LongAdder openNanos = new LongAdder();
+    private final LongAdder submitNanos = new LongAdder();
+    private final LongAdder copyNanos = new LongAdder();
+    private final LongAdder retireNanos = new LongAdder();
+
+    public Timings timings() {
+        return new Timings(
+                this.loadCount.sum(),
+                this.dispatchNanos.sum(),
+                this.openNanos.sum(),
+                this.submitNanos.sum(),
+                this.copyNanos.sum(),
+                this.retireNanos.sum());
     }
 
     private record Release(int slot, int generation, DeviceFence fence) {}
@@ -187,12 +224,51 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
         private boolean touched;
         private Throwable failure;
         private volatile long ticket;
+        // Timestamps for the load's timings: the owner writes the first, the frame the next three, the
+        // driver callback the last.
+        private long claimedAt;
+        private long startedAt;
+        private long openedAt;
+        private long submittedAt;
+        private volatile long retiredAt;
+        // The parts of an artifact read, when it is split: the frames that read them, how many have yet
+        // to end, and the first failure.
+        private final Part[] parts;
+        private final AtomicInteger pending = new AtomicInteger();
+        private final AtomicReference<Throwable> partFailure = new AtomicReference<>();
 
         private Lane(int local) {
             // The lane's hash is its identity: every load of the lane is routed to the same worker.
             super(HasherApi.mix(0x1a4e_0000L + ExpertSource.this.laneBase + local));
             this.local = local;
             this.global = ExpertSource.this.laneBase + local;
+            this.parts = new Part[ExpertSource.this.cache.store().readParts()];
+            for (int part = 0; part < this.parts.length; part++) this.parts[part] = new Part(this, part);
+        }
+
+        /// One part of an artifact read: a frame of its own, so that the parts of one record are read
+        /// side by side on different workers. The part that ends last carries the load on.
+        private final class Part extends AbstractFrame {
+            private final Lane lane;
+            private final int index;
+
+            Part(Lane lane, int index) {
+                super(HasherApi.mix(0x2b5f_0000L + 64L * (ExpertSource.this.laneBase + lane.local) + index));
+                this.lane = lane;
+                this.index = index;
+            }
+
+            @Override
+            public void execute() {
+                this.lane.readPart(this.index);
+            }
+
+            @Override
+            public void doFinallyWithError(Throwable rejection) {
+                this.lane.partFailure.compareAndSet(
+                        null, new IllegalStateException("the lattice rejected an expert read", rejection));
+                this.lane.partDone();
+            }
         }
 
         /// Serial: the claim found a miss; the load frame is ready.
@@ -206,27 +282,77 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
             this.record = null;
             this.touched = false;
             this.failure = null;
+            this.claimedAt = System.nanoTime();
             if (ExpertSource.this.tier == null) this.directive.clear();
             else ExpertSource.this.tier.plan(this.load.bank(), this.load.expert(), this.directive);
-            ready(this);
+            if (this.parts.length > 1 && this.directive.mode() != TierDirective.Mode.HIT) {
+                this.partFailure.set(null);
+                this.pending.set(this.parts.length);
+                for (Part part : this.parts) ready(part);
+            } else ready(this);
+        }
+
+        /// Runs on a worker: one part of the artifact read.
+        private void readPart(int index) {
+            ExpertSource source = ExpertSource.this;
+            if (index == 0) this.startedAt = System.nanoTime();
+            try {
+                source.cache
+                        .store()
+                        .readPart(
+                                this.load.bank(),
+                                this.load.expert(),
+                                this.global,
+                                this.directive,
+                                index,
+                                this.parts.length);
+            } catch (Throwable thrown) {
+                this.partFailure.compareAndSet(null, thrown);
+            }
+            partDone();
+        }
+
+        private void partDone() {
+            if (this.pending.decrementAndGet() != 0) return;
+            Throwable thrown = this.partFailure.get();
+            try {
+                if (thrown != null) throw thrown;
+                this.record = ExpertSource.this
+                        .cache
+                        .store()
+                        .completeOpen(this.load.bank(), this.load.expert(), this.global, this.directive);
+                submitCopy();
+            } catch (Throwable failed) {
+                this.failure = failed;
+                ExpertSource.this.post(this.failedReport);
+            }
+        }
+
+        /// The record is addressable in the lane's staging slot: submit its copy and tell the owner.
+        private void submitCopy() {
+            ExpertSource source = ExpertSource.this;
+            this.touched = true;
+            this.openedAt = System.nanoTime();
+            source.cache.transfer().stream(
+                    this.global,
+                    this.record,
+                    this.load.deviceAddress(),
+                    this.load.fence(),
+                    this.load.readyMarker(),
+                    this);
+            this.submittedAt = System.nanoTime();
+            source.post(this.submitted);
         }
 
         /// Runs on a worker of the lattice: the blocking read, then the copy's submission.
         @Override
         public void execute() {
             ExpertSource source = ExpertSource.this;
+            this.startedAt = System.nanoTime();
             try {
                 this.record =
                         source.cache.store().open(this.load.bank(), this.load.expert(), this.global, this.directive);
-                this.touched = true;
-                source.cache.transfer().stream(
-                        this.global,
-                        this.record,
-                        this.load.deviceAddress(),
-                        this.load.fence(),
-                        this.load.readyMarker(),
-                        this);
-                source.post(this.submitted);
+                submitCopy();
             } catch (Throwable thrown) {
                 this.failure = thrown;
                 source.post(this.failedReport);
@@ -243,6 +369,7 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
         @Override
         public void retired(long ticket, boolean driverThread) {
             this.ticket = ticket;
+            this.retiredAt = System.nanoTime();
             post(this.retired);
         }
 
@@ -250,6 +377,11 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
         void handle(Kind kind) {
             switch (kind) {
                 case SUBMITTED -> {
+                    long now = System.nanoTime();
+                    ExpertSource.this.loadCount.increment();
+                    ExpertSource.this.dispatchNanos.add(this.startedAt - this.claimedAt);
+                    ExpertSource.this.openNanos.add(this.openedAt - this.startedAt);
+                    ExpertSource.this.submitNanos.add(now - this.submittedAt);
                     settleTier(true);
                     this.submittedSeen = true;
                     this.block.arrive(this.position, this.load.submitted());
@@ -290,6 +422,8 @@ public final class ExpertSource extends SerialSource implements ExpertLease.Owne
 
         /// The copy retired and was submitted: the load is over and the lane is free.
         private void finish() {
+            ExpertSource.this.copyNanos.add(this.retiredAt - this.submittedAt);
+            ExpertSource.this.retireNanos.add(System.nanoTime() - this.retiredAt);
             Throwable device = ExpertSource.this.cache.transfer().confirm(this.global, this.ticket);
             this.load.retired(device);
             if (device != null) this.block.failed(device);

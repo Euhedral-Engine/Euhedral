@@ -14,6 +14,21 @@ public interface RecordSource extends AutoCloseable {
     /// @throws InterruptedException when the reading thread was interrupted; the source is unaffected
     void read(ExpertBank bank, int expert, MemorySegment destination) throws IOException, InterruptedException;
 
+    /// Whether [#readRange] reads part of a record, so that one record's read can be split across
+    /// callers.
+    default boolean ranged() {
+        return false;
+    }
+
+    /// Fills `destination` with the `destination.byteSize()` bytes of the record that start `from`
+    /// bytes into it. Only for a source that is [#ranged].
+    ///
+    /// @throws InterruptedException when the reading thread was interrupted; the source is unaffected
+    default void readRange(ExpertBank bank, int expert, long from, MemorySegment destination)
+            throws IOException, InterruptedException {
+        throw new UnsupportedOperationException("this source reads whole records");
+    }
+
     /// Bytes this source has read from the artifact file.
     long bytesRead();
 

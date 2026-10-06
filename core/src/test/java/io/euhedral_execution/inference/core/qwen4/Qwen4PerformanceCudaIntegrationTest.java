@@ -130,6 +130,22 @@ class Qwen4PerformanceCudaIntegrationTest {
                 (now.loadWaitNanos() - waitNanos) / 1e6 / tokens);
     }
 
+    /// Where the expert loads between `before` and `after` spent their time, per load and per token.
+    private static String loads(
+            io.euhedral_execution.inference.core.qwen4.ExpertSource.Timings before,
+            io.euhedral_execution.inference.core.qwen4.ExpertSource.Timings after,
+            int tokens) {
+        long n = Math.max(1, after.loads() - before.loads());
+        return String.format(
+                "%.1f loads/token; per load: dispatch %.0f us, open %.0f us, submit hop %.0f us, copy %.0f us, retire hop %.0f us",
+                (double) n / tokens,
+                (after.dispatch() - before.dispatch()) / 1e3 / n,
+                (after.open() - before.open()) / 1e3 / n,
+                (after.submit() - before.submit()) / 1e3 / n,
+                (after.copy() - before.copy()) / 1e3 / n,
+                (after.retire() - before.retire()) / 1e3 / n);
+    }
+
     /// The tiers' work between `before` and now, per token.
     private static String tiers(
             Qwen4Model model,
@@ -151,8 +167,15 @@ class Qwen4PerformanceCudaIntegrationTest {
                     100.0 * ramHits / Math.max(1, ramHits + ramOther),
                     after.ram().residentExperts()));
         }
+        long reads = after.artifact().recordReads() - before.artifact().recordReads();
+        long readNanos = after.artifact().readNanos() - before.artifact().readNanos();
+        long copyBytes = after.staging().ramCopyBytes() - before.staging().ramCopyBytes();
+        long copyNanos = after.staging().ramCopyNanos() - before.staging().ramCopyNanos();
         out.append(String.format(
-                ", disk %.1f MB/token (reads in flight <= %d), ram copy %.1f MB/token, H2D %.1f MB/token at %.1f GB/s",
+                ", artifact read %.0f us/record, ram copy %.1f GB/s,",
+                readNanos / 1e3 / Math.max(1, reads), (double) copyBytes / Math.max(1, copyNanos)));
+        out.append(String.format(
+                " disk %.1f MB/token (reads in flight <= %d), ram copy %.1f MB/token, H2D %.1f MB/token at %.1f GB/s",
                 (after.artifact().bytesRead() - before.artifact().bytesRead()) / 1e6 / tokens,
                 after.artifact().concurrentReadsHighWater(),
                 (after.staging().ramCopyBytes() - before.staging().ramCopyBytes()) / 1e6 / tokens,
@@ -243,6 +266,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                             int[] token = new int[1];
                             var before = model.expertCache().stats().snapshot();
                             var tiersBefore = model.hierarchyStats();
+                            var loadsBefore = executor.expertTimings();
                             var counters = executor.moeCounters();
                             LayerStats decodeLayers = new LayerStats();
                             if (context == 4096) executor.trace(decodeLayers);
@@ -275,6 +299,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                                     (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
                                     (after.expertWaitNanos() - counters.expertWaitNanos()) / 1e6 / steps));
                             line("  tiers: " + tiers(model, tiersBefore, steps));
+                            line("  loads: " + loads(loadsBefore, executor.expertTimings(), steps));
                         }
                     }
                 }
