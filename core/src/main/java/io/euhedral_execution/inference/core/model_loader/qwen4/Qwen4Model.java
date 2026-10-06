@@ -141,6 +141,13 @@ public final class Qwen4Model implements AutoCloseable {
             int buffers = Qwen4ResidencyPlanner.fileStagingSlots(artifact.config());
             reads = openAsyncReads();
             artifactSource = new FileRecordSource(path, cachedBanks, reads);
+            LOG.info(
+                    "Expert records are read {}",
+                    reads == null
+                            ? "synchronously, through the page cache"
+                            : artifactSource.direct()
+                                    ? "asynchronously, past the page cache"
+                                    : "asynchronously, through the page cache");
             if (plan.expertStore() != Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
                 // The tier is pinned when the machine can page-lock it beside the plan's other pinned memory: the
                 // device's copies then read a record from its slot, with no staging copy.
