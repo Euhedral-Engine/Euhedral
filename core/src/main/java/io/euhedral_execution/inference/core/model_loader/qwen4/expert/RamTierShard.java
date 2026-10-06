@@ -305,9 +305,44 @@ public final class RamTierShard {
         for (int free = slot; free < this.slots; free++) this.free[this.freeTop++] = free;
     }
 
-    /// The global slot of a resident record.
-    int residentSlot(int key) {
-        return this.firstSlot + this.directory[key];
+    /// Gives each bank its share of this shard's slots (its quota, in proportion to its experts), filled by its
+    /// lowest experts in consecutive slots, ready, at the cold end of the recency order. Before any load, for a
+    /// bounded tier; the startup fill reads the records into the slots. Nothing was asked for yet, so with
+    /// admission any record asked for once before replaces one of them.
+    void assignShare(int index) {
+        if (this.resident) return;
+        int banks = this.keys.bankCount();
+        int[] owned = new int[banks];
+        int ownedTotal = 0;
+        for (int key = 0; key < this.keys.keyCount(); key++) {
+            if (ExpertKeys.shardOf(key, this.tier.shards()) != index) continue;
+            owned[this.keys.bankOf(key)]++;
+            ownedTotal++;
+        }
+        int[] taken = new int[banks];
+        int slot = 0;
+        for (int key = 0; key < this.keys.keyCount() && ownedTotal > 0; key++) {
+            if (ExpertKeys.shardOf(key, this.tier.shards()) != index) continue;
+            int bank = this.keys.bankOf(key);
+            if (taken[bank] >= (int) ((long) this.slots * owned[bank] / ownedTotal)) continue;
+            taken[bank]++;
+            this.directory[key] = slot;
+            this.slotKey[slot] = key;
+            this.state[slot] = READY;
+            this.pins[slot] = 0;
+            this.used[list(bank)]++;
+            link(slot, bank);
+            this.readyPerBank.lazySet(bank, this.readyPerBank.get(bank) + 1);
+            slot++;
+        }
+        this.freeTop = 0;
+        for (int free = this.slots - 1; free >= slot; free--) this.free[this.freeTop++] = free;
+    }
+
+    /// The global slot of `key`'s record, or -1 when it has none. Read it on the owner, or quiescent.
+    int slotOf(int key) {
+        int slot = this.directory[key];
+        return slot == NONE ? -1 : this.firstSlot + slot;
     }
 
     // ---------------------------------------------------------------- inspection (quiescent)

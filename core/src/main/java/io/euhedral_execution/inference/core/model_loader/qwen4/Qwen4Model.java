@@ -36,9 +36,13 @@ public final class Qwen4Model implements AutoCloseable {
     /// Threads that read and check fixed objects while loading.
     static final int LOAD_THREADS = 8;
 
-    /// Readers that fill a resident expert tier at startup, each taking about 32 MiB of contiguous
-    /// records at a time.
-    static final int PRELOAD_READERS = 16;
+    /// Readers that fill the expert tier at startup, each reading about 8 MiB of contiguous records at a time: a few
+    /// such reads in flight keep the disk at its sequential rate.
+    static final int PRELOAD_READERS = 4;
+
+    /// Whether a bounded tier is filled with each layer's share of records at startup;
+    /// `EUHEDRAL_QWEN4_TIER_PRELOAD=0` leaves it empty until loads fill it, for benchmarks.
+    static final boolean TIER_PRELOAD = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_PRELOAD"));
 
     /// How the device cache shares its slots among the layers. `EUHEDRAL_QWEN4_GPU_POLICY`
     /// (`global` or `partitioned`) overrides it for benchmarks.
@@ -166,13 +170,13 @@ public final class Qwen4Model implements AutoCloseable {
                         pin ? gpu : null,
                         TIER_ADMISSION);
                 LOG.info("Expert tier: {} MiB of {} memory", tier.capacityBytes() >> 20, pin ? "pinned" : "pageable");
-                if (tier.isResident()) {
+                if (tier.isResident() || TIER_PRELOAD) {
                     long begin = System.nanoTime();
                     tier.preload(artifactSource, PRELOAD_READERS);
                     LOG.info(
                             "Expert tier loaded: {} records, {} MiB in {} ms ({} MiB/s)",
-                            tier.slotCount(),
-                            tier.capacityBytes() >> 20,
+                            tier.stats().residentExperts(),
+                            tier.stats().preloadBytes() >> 20,
                             (System.nanoTime() - begin) / 1_000_000,
                             (long) (tier.stats().preloadBytesPerSecond() / 1048576.0));
                 }

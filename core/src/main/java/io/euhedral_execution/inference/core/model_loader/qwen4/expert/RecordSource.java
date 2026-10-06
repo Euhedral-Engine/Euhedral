@@ -38,6 +38,19 @@ public interface RecordSource extends AutoCloseable {
         return false;
     }
 
+    /// Fills `destination` with records `first` to `first + count - 1` of `bank`, one after another. For a loading
+    /// thread that may block (the startup fill); a source whose records lie end to end in its file reads them in
+    /// one go.
+    default void readRun(ExpertBank bank, int first, int count, MemorySegment destination)
+            throws IOException, InterruptedException {
+        long at = 0;
+        for (int expert = first; expert < first + count; expert++) {
+            long size = bank.recordBytes(expert);
+            read(bank, expert, destination.asSlice(at, size));
+            at += size;
+        }
+    }
+
     /// Bytes this source has read from the artifact file.
     long bytesRead();
 

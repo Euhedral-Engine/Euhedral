@@ -148,12 +148,13 @@ public final class RamTier implements AutoCloseable {
 
     // ---------------------------------------------------------------- preload
 
-    /// Reads every record into its slot, by `readers` threads that each take consecutive records of one
-    /// bank up to about 32 MiB, so at most `readers` chunks are in flight. Returns when every record is in
-    /// memory. Only for a resident tier, before the model serves, on the loading thread: the readers end
-    /// with the call.
+    /// Fills the tier before the model serves: every record of a resident tier, and each layer's share of a
+    /// bounded one ([RamTierShard#assignShare]). `readers` threads each take a run of consecutive records of one
+    /// bank (about [RamTierPreload#CHUNK_BYTES]) and read it into its consecutive slots in one read where the
+    /// source can, so at most `readers` runs are in flight. On the loading thread, before any load: the readers
+    /// end with the call.
     public void preload(RecordSource source, int readers) throws IOException, InterruptedException {
-        if (!this.resident) throw new IllegalStateException("only a tier with a slot per record preloads");
+        if (!this.resident) for (int shard = 0; shard < this.shards; shard++) this.shardList[shard].assignShare(shard);
         long begin = System.nanoTime();
         this.preloadBytes = RamTierPreload.run(this, source, readers);
         this.preloadNanos = System.nanoTime() - begin;
@@ -167,9 +168,9 @@ public final class RamTier implements AutoCloseable {
         return this.keys;
     }
 
-    /// Where the resident record `key` lives.
-    long residentAddress(int key) {
-        return address(this.shardList[ExpertKeys.shardOf(key, this.shards)].residentSlot(key));
+    /// The slot of `key`'s record, or -1 when it has none. On the loading thread, or quiescent.
+    int slotOf(int key) {
+        return this.shardList[ExpertKeys.shardOf(key, this.shards)].slotOf(key);
     }
 
     // ---------------------------------------------------------------- inspection
