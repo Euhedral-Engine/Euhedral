@@ -517,6 +517,71 @@ class Static(Policy):
         return key in self.held
 
 
+class SampledLFU(Policy):
+    """Evicts the least requested of a sample of held records (aged counts; the least recent among equals), and with
+    admission replaces it only by a record requested more often before. Sampling stands in for a full frequency
+    order, as Redis does."""
+
+    name = "slfu"
+    admit = False
+    sample = 32
+
+    def __init__(self, capacity, trace, future=None):
+        super().__init__(capacity, trace)
+        self.counts = Counts(10 * capacity)
+        self.keys: list[int] = []
+        self.index: dict[int, int] = {}
+        self.last: dict[int, int] = {}
+        self.clock = 0
+        self.rng = __import__("random").Random(7)
+
+    def access(self, key, pinned):
+        asked = self.counts.add(key)
+        self.clock += 1
+        if key in self.index:
+            self.last[key] = self.clock
+            return True
+        if len(self.keys) >= self.capacity:
+            best = None
+            for _ in range(self.sample):
+                k = self.keys[self.rng.randrange(len(self.keys))]
+                if k in pinned:
+                    continue
+                rank = (self.counts.count.get(k, 0), self.last[k])
+                if best is None or rank < best[0]:
+                    best = (rank, k)
+            if best is None:
+                return False
+            victim = best[1]
+            if self.admit and self.counts.count.get(victim, 0) >= asked:
+                return False
+            i = self.index.pop(victim)
+            moved = self.keys.pop()
+            if moved != victim:
+                self.keys[i] = moved
+                self.index[moved] = i
+            del self.last[victim]
+        self.index[key] = len(self.keys)
+        self.keys.append(key)
+        self.last[key] = self.clock
+        return False
+
+
+class SampledLFUAdmit(SampledLFU):
+    name = "slfu-admit"
+    admit = True
+
+
+class SampledLFUScanAdmit(SampledLFU):
+    """Sampled LFU that applies admission only to records a prefill chunk asks for: a decode step's records always
+    enter, a prefill's sweep replaces only records asked for less often."""
+
+    name = "slfu-scan"
+
+    def block(self, bank, rows):
+        self.admit = rows > 1
+
+
 class ScanLRU(Policy):
     """LRU that a prefill cannot flush: records a multi-row block (a prefill chunk) brings in enter at the cold end,
     and its hits do not promote, so a prefill's sweep of nearly every expert of a layer replaces only what earlier
@@ -597,7 +662,7 @@ class LayerAge(Policy):
 
 
 POLICIES = {
-    p.name: p for p in (LRU, ScanLRU, BankLRU, LFU, TinyLFU, WTinyLFU, ARC, S3FIFO, SIEVE, OPT, Static, LayerAge)
+    p.name: p for p in (LRU, ScanLRU, SampledLFU, SampledLFUAdmit, SampledLFUScanAdmit, BankLRU, LFU, TinyLFU, WTinyLFU, ARC, S3FIFO, SIEVE, OPT, Static, LayerAge)
 }
 
 

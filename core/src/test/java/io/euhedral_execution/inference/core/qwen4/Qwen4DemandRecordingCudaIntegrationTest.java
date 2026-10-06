@@ -102,8 +102,18 @@ class Qwen4DemandRecordingCudaIntegrationTest {
         assumeTrue(target != null, "set EUHEDRAL_QWEN4_TRACE to the output file");
         assumeTrue(Qwen4TestSupport.hasArtifact(), "no artifact");
         int decode = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_TRACE_DECODE", "256"));
+        // `EUHEDRAL_QWEN4_TRACE_REQUESTS` (comma-separated prompt lengths) and `EUHEDRAL_QWEN4_TRACE_OFFSET` (where in
+        // the
+        // documents the first request starts) give other workloads.
+        String lengths = System.getenv("EUHEDRAL_QWEN4_TRACE_REQUESTS");
+        int[] requests = lengths == null
+                ? REQUESTS
+                : java.util.Arrays.stream(lengths.split(","))
+                        .mapToInt(Integer::parseInt)
+                        .toArray();
+        int start = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_TRACE_OFFSET", "0"));
         int context = 0;
-        for (int length : REQUESTS) context = Math.max(context, length + decode);
+        for (int length : requests) context = Math.max(context, length + decode);
         int[] corpus = Qwen4PerformanceCudaIntegrationTest.corpus(1 << 16);
         try (Qwen4TestLattice lattice = Qwen4TestLattice.start(4);
                 CudaGpuMemory gpu = Qwen4TestSupport.openGpu();
@@ -126,9 +136,9 @@ class Qwen4DemandRecordingCudaIntegrationTest {
                     address -> gpu.copyDeviceToReadback(readback, address, vocabulary * 2L);
             executor.demand(recorder);
             try {
-                int offset = 0;
-                for (int request = 0; request < REQUESTS.length; request++) {
-                    int length = REQUESTS[request];
+                int offset = start;
+                for (int request = 0; request < requests.length; request++) {
+                    int length = requests[request];
                     int[] prompt = new int[length];
                     for (int i = 0; i < length; i++) prompt[i] = corpus[(offset + i) % corpus.length];
                     offset += 7919 + length;

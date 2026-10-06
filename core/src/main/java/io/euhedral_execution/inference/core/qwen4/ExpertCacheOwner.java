@@ -36,6 +36,12 @@ public final class ExpertCacheOwner {
 
         /// The expert will not come: its load failed.
         void failed(Throwable failure);
+
+        /// Whether the asking block is a prefill chunk (more than one row), which visits nearly every expert of a
+        /// layer: the tier admits its records only in place of records asked for less often.
+        default boolean scan() {
+            return false;
+        }
     }
 
     /// What [#fetch] did.
@@ -182,7 +188,7 @@ public final class ExpertCacheOwner {
             return Outcome.FULL;
         }
         TierDirective directive = new TierDirective();
-        if (tier != null) tier.plan(bank, expert, directive);
+        if (tier != null) tier.plan(bank, expert, target.scan(), directive);
         boolean reads = directive.mode() != TierDirective.Mode.HIT;
         if (buffer >= 0 && !this.cache.store().stagesThrough(directive)) {
             // A pinned tier takes the record into its slot: the copy reads it there.
