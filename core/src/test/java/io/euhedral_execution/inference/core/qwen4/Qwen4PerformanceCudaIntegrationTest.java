@@ -130,6 +130,38 @@ class Qwen4PerformanceCudaIntegrationTest {
                 (now.loadWaitNanos() - waitNanos) / 1e6 / tokens);
     }
 
+    /// The tiers' work between `before` and now, per token.
+    private static String tiers(
+            Qwen4Model model,
+            io.euhedral_execution.inference.core.model_loader.qwen4.ExpertHierarchyStats before,
+            int tokens) {
+        var after = model.hierarchyStats();
+        long gpuHits = after.gpu().hits() - before.gpu().hits();
+        long gpuMisses = after.gpu().misses() - before.gpu().misses();
+        StringBuilder out =
+                new StringBuilder(String.format("gpu hit %.1f%%", 100.0 * gpuHits / Math.max(1, gpuHits + gpuMisses)));
+        if (after.ram() != null) {
+            long ramHits = after.ram().totalHits() - before.ram().totalHits();
+            long ramOther = after.ram().totalMisses()
+                    + after.ram().totalBypasses()
+                    - before.ram().totalMisses()
+                    - before.ram().totalBypasses();
+            out.append(String.format(
+                    ", ram hit %.1f%% (%d resident)",
+                    100.0 * ramHits / Math.max(1, ramHits + ramOther),
+                    after.ram().residentExperts()));
+        }
+        out.append(String.format(
+                ", disk %.1f MB/token (reads in flight <= %d), ram copy %.1f MB/token, H2D %.1f MB/token at %.1f GB/s",
+                (after.artifact().bytesRead() - before.artifact().bytesRead()) / 1e6 / tokens,
+                after.artifact().concurrentReadsHighWater(),
+                (after.staging().ramCopyBytes() - before.staging().ramCopyBytes()) / 1e6 / tokens,
+                (after.h2d().bytes() - before.h2d().bytes()) / 1e6 / tokens,
+                (double) (after.h2d().bytes() - before.h2d().bytes())
+                        / Math.max(1, after.h2d().nanos() - before.h2d().nanos())));
+        return out.toString();
+    }
+
     @Test
     void firstPerformanceRecord() throws Exception {
         assumeTrue(
@@ -165,6 +197,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                         .toArray()) {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         var before = model.expertCache().stats().snapshot();
+                        var tiersBefore = model.hierarchyStats();
                         LayerStats layers = new LayerStats();
                         if (target == 4096) executor.trace(layers);
                         long start = System.nanoTime();
@@ -191,6 +224,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                                         before.transferBytes(),
                                         before.loadWaitNanos(),
                                         target)));
+                        line("  tiers: " + tiers(model, tiersBefore, target));
                     }
                 }
                 for (int context : Arrays.stream(new int[] {64, 4096, 16384, 32768})
@@ -203,38 +237,45 @@ class Qwen4PerformanceCudaIntegrationTest {
                             Qwen4Blocking.step(executor, sequence, prompt, at, rows, null);
                             at += rows;
                         }
-                        int[] token = new int[1];
-                        var before = model.expertCache().stats().snapshot();
-                        var counters = executor.moeCounters();
-                        LayerStats decodeLayers = new LayerStats();
-                        if (context == 4096) executor.trace(decodeLayers);
-                        int steps = 32;
-                        long start = System.nanoTime();
-                        for (int i = 0; i < steps; i++) {
-                            token[0] = prompt[(context + i * 97) % prompt.length];
-                            Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
-                            short[] logits = new short[vocabulary];
-                            MemorySegment.copy(readback.segment(), ValueLayout.JAVA_SHORT, 0, logits, 0, 16);
+                        // Twice over the same tokens: the first finds the tiers as the prefill left them, the second
+                        // warm.
+                        for (int round = 0; round < 2; round++) {
+                            int[] token = new int[1];
+                            var before = model.expertCache().stats().snapshot();
+                            var tiersBefore = model.hierarchyStats();
+                            var counters = executor.moeCounters();
+                            LayerStats decodeLayers = new LayerStats();
+                            if (context == 4096) executor.trace(decodeLayers);
+                            int steps = 32;
+                            long start = System.nanoTime();
+                            for (int i = 0; i < steps; i++) {
+                                token[0] = prompt[(context + i * 97) % prompt.length];
+                                Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+                                short[] logits = new short[vocabulary];
+                                MemorySegment.copy(readback.segment(), ValueLayout.JAVA_SHORT, 0, logits, 0, 16);
+                            }
+                            double seconds = (System.nanoTime() - start) / 1e9;
+                            executor.trace(null);
+                            if (context == 4096) line(decodeLayers.summary("expert cache, decode at 4096 context"));
+                            var after = executor.moeCounters();
+                            line(String.format(
+                                    "decode (%s) at %d context: %.1f ms/token, %.1f tokens/s; %s; route wait %.2f ms + acquire %.2f ms per token",
+                                    round == 0 ? "cold" : "warm",
+                                    context,
+                                    seconds * 1e3 / steps,
+                                    steps / seconds,
+                                    cache(
+                                            model,
+                                            before.hits(),
+                                            before.misses(),
+                                            before.evictions(),
+                                            before.transferBytes(),
+                                            before.loadWaitNanos(),
+                                            steps),
+                                    (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
+                                    (after.expertWaitNanos() - counters.expertWaitNanos()) / 1e6 / steps));
+                            line("  tiers: " + tiers(model, tiersBefore, steps));
                         }
-                        double seconds = (System.nanoTime() - start) / 1e9;
-                        executor.trace(null);
-                        if (context == 4096) line(decodeLayers.summary("expert cache, decode at 4096 context"));
-                        var after = executor.moeCounters();
-                        line(String.format(
-                                "decode at %d context: %.1f ms/token, %.1f tokens/s; %s; route wait %.2f ms + acquire %.2f ms per token",
-                                context,
-                                seconds * 1e3 / steps,
-                                steps / seconds,
-                                cache(
-                                        model,
-                                        before.hits(),
-                                        before.misses(),
-                                        before.evictions(),
-                                        before.transferBytes(),
-                                        before.loadWaitNanos(),
-                                        steps),
-                                (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
-                                (after.expertWaitNanos() - counters.expertWaitNanos()) / 1e6 / steps));
                     }
                 }
                 // Component times: decode at 4K and a 512-token prefill chunk, each step followed by a device wait.
