@@ -75,9 +75,25 @@ A resident tier is filled before the model serves anything, by `RamTierPreload`:
 records of one bank (about 32 MiB) from a shared counter and read each record straight into its slot. The threads end with the load;
 nothing else in the tier starts a thread.
 
+## Reads in parts
+
+A record the tier does not hold is read by several frames at once: each takes a page-aligned part of the record and reads it straight
+into the destination (the tier slot of a fill, or the staging slot), and a fill's part copies its own range into the staging slot as
+soon as it has read it. The last part to end carries the load on. One record's read therefore spreads over the lattice's workers,
+and the artifact sees several outstanding reads for it instead of one. The number of parts is a constant (4); a source that cannot
+read ranges is read whole.
+
+## Device cache replacement
+
+The device cache can replace by the same layer quotas as the tier (`ReplacementPolicy.BANK_PARTITIONED`). The global recency
+order stays the default: on the model's decode the two keep the same experts (a few popular experts per layer dominate, and no
+cyclic pass evicts them), and `ExpertCacheShardTest` shows where they differ, on a trace that does cycle.
+
 ## Telemetry
 
 `Qwen4Model.hierarchyStats()` keeps the tiers apart: the GPU cache, the RAM tier by layer (hits, misses, bypasses, evictions,
 resident experts and bytes, preload throughput), artifact reads (records, bytes, read time, concurrent-read high-water mark), the
-staging copies (records staged, RAM-to-pinned bytes and time) and H2D (bytes, time, copies). The tier's counters are written by the
+staging copies (records staged, RAM-to-pinned bytes and time) and H2D (bytes, time, copies). Each expert source also times its
+loads (`ExpertSource.Timings`): the hop from the claim to a worker starting the load, the read or copy, the hop that reports the
+copy's submission, the copy itself, and the hop that reports its retirement. The performance record prints them per load. The tier's counters are written by the
 shard's owner and read from anywhere, so a reading under load is approximate.

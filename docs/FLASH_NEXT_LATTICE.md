@@ -24,7 +24,8 @@ decides the lattice and the model plugs into it.
 ## The shape of a step
 
 ```
-embed -> [PLE] -> attention block -> route ─┬─> shared expert ────────────────────────────┐
+n-gram ids -> gather in parts ──┐
+embed ──────────────────────────> PLE -> attention block -> route ─┬─> shared expert ───────┐
   ^                                          └─(route copy retires)─> plan                 │
   |                                                                    │                  v
   |                       plan ──posts shares──> the cache's sources ──leases arrive──> load w (arrivals)
@@ -68,6 +69,11 @@ embed -> [PLE] -> attention block -> route ─┬─> shared expert ────
   wave's kernels wait for that marker on the device, and no host thread waits for the bytes. When nothing is free the walk
   waits; a lease closing or a copy retiring is a message that resumes it. A shard holds two waves, so in-order claiming never
   pins more than it has.
+- **A miss reads in parts.** A load that has to read the artifact (a record the host tier does not hold, or is filling) is split
+  into parts, each a page-aligned range of the record read straight into its destination by a frame of its own. The parts of
+  one record run side by side on different workers, a fill's part also copies its range from the tier slot into the staging
+  slot, and the part that ends last carries the load on: the device copy, then the report to the owner. A hit in the tier is
+  one frame (one copy out of RAM).
 - **Waves overlap.** A wave's stage runs as soon as every one of its experts was taken or its copy submitted; the next wave's
   experts are claimed as slots free up. A `drain` stage ends a layer's block when every source finished its share, so the next
   layer's plan posts only to free sources.
@@ -80,14 +86,18 @@ embed -> [PLE] -> attention block -> route ─┬─> shared expert ────
   frame that follows. It exists because the host reads the router's choice.
 - A **host stage** (plan, load) submits nothing to a lane and orders nothing on the device. A **deferred** stage (load) ends when its
   asynchronous work does: it is the arrival point of its wave's items and completes on whichever item reports the last one.
+- The **per-layer embedding's host work** is stages too. The n-gram row ids depend on the tokens alone, so computing them and
+  gathering the rows from the mapped table are roots of the graph: the ids first, then the gather in parts that each take a
+  range of the rows (a gather too short to be worth a frame per part stays in one), while the embedding and the layers before
+  the per-layer embedding run. The stage that copies the records to the device and expands them waits for the parts.
 - A **drain** stage (host, deferred) ends when every source finished its share of the block: each expert taken, each copy retired.
 - A stage that **has nothing to do** (a wave beyond what the block uses) completes in place on the thread that satisfied its last
   edge, still joining its predecessors' device order so that its successors wait for what it stood after.
 - The **slots of a shard** bound the claims *by construction*: an expert is claimed only when a slot and a copy lane are free, so
   nothing queues, parks or holds a permit, and a shard that holds two waves (a wave has at most 32 experts) never deadlocks.
 
-The only blocking left is where an external API is itself synchronous and is isolated in one frame: the positional read of one
-expert record, the host gather of the per-layer embedding's n-gram rows, and `stream.recover` on a failure path.
+The only blocking left is where an external API is itself synchronous and is isolated in one frame: the positional read of a part
+of an expert record, the host gather of a part of the per-layer embedding's n-gram rows, and `stream.recover` on a failure path.
 
 ## Failure, cancellation, shutdown
 
