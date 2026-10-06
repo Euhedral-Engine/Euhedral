@@ -126,14 +126,17 @@ the expert saw, which wave it ran in or what was in the cache. `Qwen4MoeFixtureC
 
 Kernel contract and measurements of the expert kernels: [FLASH_NEXT_EXPERTS.md](FLASH_NEXT_EXPERTS.md).
 
-## Executor, sequence state, prefill and decode
+## Execution plan, sequence state, prefill and decode
 
-`Qwen4Executor` runs a loaded `Qwen4Model` one chunk of up to 512 tokens at a time: the embedding gather (the table may be in
+`Qwen4ExecutionPlan` describes how a loaded `Qwen4Model` runs one chunk of up to 512 tokens: the embedding gather (the table may be in
 device memory or host-mapped), the repetition over four streams, 48 layers, then, when logits are wanted, the final mix of the
 last row and the output head. Prefill chunks and decode steps are the same code over different row counts; the output of a step
-is the logits row of its last token, offered to a `LogitsSink` that queues its copy behind the head. The executor owns one stream
-and one workspace (state, mixer, block output, hyper-connection, layer and MoE scratch, about 260 MiB at 512 rows), allocated once.
-A step waits for the device once per MoE block (the routing) and once at its end.
+is the logits row of its last token, offered to a `LogitsSink` that queues its copy behind the head. A chunk is a quantum of a
+static stage graph that the lattice's runtime runs ([FLASH_NEXT_LATTICE.md](FLASH_NEXT_LATTICE.md)): the router's choice reaches the
+host across a device-completion edge (the shared expert is a side branch that overlaps the host's planning), each wave's experts are
+loaded by a stage that completes when they are resident, the wave's kernels follow, and the step ends with the single boundary the
+runtime arms after the output head. Each graph owns a workspace (state, mixer, block output, hyper-connection, layer and MoE
+scratch, about 260 MiB at 512 rows), allocated once with the plan.
 
 **Sequence state** (`Qwen4Sequence`) is what one sequence carries between steps: the FP32 recurrent state and three rows of
 convolution history of each of the 36 GDN layers (114 MiB, independent of length), the NVFP4 key/value pages and pooled indexer
@@ -164,11 +167,14 @@ written per layer without changing the graph, and fences stay device-ordered eit
 ## Engine and API
 
 A Flash-Next artifact is selected by the artifact alone: `InferenceEngine` recognises the `qwen4_exp` architecture, opens the
-storage, planner, expert cache and `Qwen4Executor` (`Qwen4Runtime`), and hands the API a `GenerationSession`. The session
+storage, planner, expert cache and `Qwen4ExecutionPlan` (`Qwen4Runtime`), and hands the API a `GenerationSession`. The session
 interface is the part of generation the API needs (prefill chunks, decode steps, cancellation, the sampler's logits); the dense
 model's session and `Qwen4GenerationSession` both implement it, and the API's request handling contains no model-specific
-branches. Prefill chunks and the decode loop run on one generation worker per runtime, so a request's GPU work is serial and
-cancellation takes effect between steps; the runtime's host pool (two threads) serves the host-side work around a step. Chat completions on the real artifact are covered by `Qwen4ChatCompletionsCudaIntegrationTest`.
+branches. A generation is a chain of continuations on the lattice, not a loop on a thread: each step's end samples, emits text and starts the
+next step; the plan runs one step at a time and a step admitted meanwhile starts when the running one concludes. Cancellation stops the
+running step at its next stage. The runtime owns no executor, pool or thread; prompt tokenization and the host work a request needs
+are frames on the same lattice. The engine therefore needs worker CPUs like the dense model, and a Flash-Next deployment benefits
+from several: the expert reads of one wave run on as many workers as the staging pool allows. Chat completions on the real artifact are covered by `Qwen4ChatCompletionsCudaIntegrationTest`.
 
 ## End-to-end agreement
 
@@ -215,7 +221,7 @@ The per-layer embedding figure of a 512-row step is the n-gram record gather fro
 - **Small launches.** The gated residual (four-stream mix and its low-rank gates) takes 10.6 ms of a decode step as many small
   launches; the step is uncaptured.
 - **Per-layer embedding.** 720 ms of a 512-row prefill step is the host gather of n-gram records.
-- **Planner workspace.** The planner reserves 130 MiB for the executor's workspace; the executor measures about 260 MiB at 512
+- **Planner workspace.** The planner reserves 130 MiB for the plan's workspace; the plan measures about 260 MiB at 512
   rows, so the plan's bound is too small by that much (the runtime reserve absorbs it).
 
 ## Next optimisation priorities

@@ -1,24 +1,31 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.host.HostFrames;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
-/// Cold storage: records stay in the artifact file, and a bounded pool of pinned staging slots holds one between
-/// the file read and the end of its device copy.
+/// Cold storage: records stay in the artifact file, and a bounded pool of pinned staging slots holds one
+/// between the file read and the end of its device copy.
 ///
-/// All slots are carved from one pinned arena, each as large as the biggest record rounded up to a page. [#open]
-/// waits (interruptibly, with an optional timeout) for a free slot, then has the [RecordSource] fill it: the one
-/// host copy of the record is from the page cache into pinned memory, with no heap array in between. The slot
-/// returns to the pool when the record is closed. Memory is bounded by `stagingSlots * slotBytes` however many
-/// records are requested.
+/// All slots are carved from one pinned arena, each as large as the biggest record rounded up to a page.
+/// [#open] waits (interruptibly, with an optional timeout) for a free slot, then has the [RecordSource] fill
+/// it: the one host copy of the record is from the page cache into pinned memory, with no heap array in
+/// between. The slot returns to the pool when the record is closed. Memory is bounded by `stagingSlots *
+/// slotBytes` however many records are requested.
+///
+/// [#openAsync] never blocks its caller. A request that finds no staging slot parks as a continuation, and
+/// the record that closes next hands its slot to the oldest one; the read itself is dispatched as a host
+/// frame, so simultaneous requests read on different workers, and at most `stagingSlots` reads run at once:
+/// the staging pool is the bound on concurrent reads.
 public final class FileExpertStore implements HostExpertStore {
     private static final long PAGE = 4096;
 
@@ -31,6 +38,9 @@ public final class FileExpertStore implements HostExpertStore {
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition slotFree = this.lock.newCondition();
     private final int[] freeSlots;
+    private final AtomicInteger readsNow = new AtomicInteger();
+    private final AtomicInteger readsHighWater = new AtomicInteger();
+    private final LongAdder readNanos = new LongAdder();
     private int freeCount;
     private boolean closed;
     private final LongAdder opens = new LongAdder();
@@ -98,6 +108,94 @@ public final class FileExpertStore implements HostExpertStore {
         }
     }
 
+    @Override
+    public void openAsync(int bank, int expert, HostFrames frames, OpenListener listener, int tag) {
+        this.keys.key(bank, expert);
+        AsyncOpen open = new AsyncOpen(bank, expert, frames, listener, tag);
+        Throwable refused = null;
+        int slot = -1;
+        this.lock.lock();
+        try {
+            if (this.closed) refused = new IllegalStateException("the expert store is closed");
+            else if (this.freeCount > 0) slot = this.freeSlots[--this.freeCount];
+            else {
+                // The requester bounds its outstanding opens by the staging slots; one past that fails, it never
+                // queues.
+                this.blockedOpens.increment();
+                refused = new IllegalStateException(
+                        "all " + this.slotCount + " staging slots hold records: more opens than slots are outstanding");
+            }
+        } finally {
+            this.lock.unlock();
+        }
+        if (refused != null) listener.opened(tag, null, refused);
+        else open.dispatch(slot);
+    }
+
+    /// One asynchronous open: a staging slot taken at once, then read frames, then the listener.
+    private final class AsyncOpen implements HostFrames.Task {
+        private final int bank;
+        private final int expert;
+        private final HostFrames frames;
+        private final OpenListener listener;
+        private final int tag;
+        private int slot = -1;
+
+        AsyncOpen(int bank, int expert, HostFrames frames, OpenListener listener, int tag) {
+            this.bank = bank;
+            this.expert = expert;
+            this.frames = frames;
+            this.listener = listener;
+            this.tag = tag;
+        }
+
+        /// Staging slot `slot` is ours: read the record as a frame of its own.
+        void dispatch(int slot) {
+            this.slot = slot;
+            try {
+                this.frames.run(this);
+            } catch (RuntimeException | Error rejected) {
+                fail(rejected);
+            }
+        }
+
+        @Override
+        public void run() {
+            ExpertBank source = FileExpertStore.this.banks[this.bank];
+            long size = source.recordBytes(this.expert);
+            long address = FileExpertStore.this.arena.address() + FileExpertStore.this.slotBytes * this.slot;
+            int now = FileExpertStore.this.readsNow.incrementAndGet();
+            FileExpertStore.this.readsHighWater.accumulateAndGet(now, Math::max);
+            long begin = System.nanoTime();
+            FileExpertStore.this.arena.borrow();
+            try {
+                FileExpertStore.this.source.read(
+                        source, this.expert, MemorySegment.ofAddress(address).reinterpret(size));
+            } catch (IOException | InterruptedException | RuntimeException | Error failure) {
+                FileExpertStore.this.arena.giveBack();
+                fail(failure);
+                return;
+            } finally {
+                FileExpertStore.this.readsNow.decrementAndGet();
+                FileExpertStore.this.readNanos.add(System.nanoTime() - begin);
+            }
+            FileExpertStore.this.opens.increment();
+            this.listener.opened(this.tag, new StagedRecord(this.slot, address, size), null);
+        }
+
+        @Override
+        public void failed(Throwable cause) {
+            fail(cause);
+        }
+
+        private void fail(Throwable cause) {
+            int held = this.slot;
+            this.slot = -1;
+            if (held >= 0) returnSlot(held);
+            this.listener.opened(this.tag, null, cause);
+        }
+    }
+
     private int takeSlot(long timeoutNanos) throws InterruptedException, TimeoutException {
         long remaining = timeoutNanos;
         this.lock.lockInterruptibly();
@@ -142,6 +240,16 @@ public final class FileExpertStore implements HostExpertStore {
     /// Opens that found every staging slot taken and had to wait.
     public long blockedOpens() {
         return this.blockedOpens.sum();
+    }
+
+    /// Time spent in positional reads, summed over reads (parallel reads add up).
+    public long readNanos() {
+        return this.readNanos.sum();
+    }
+
+    /// The most reads that ran at once.
+    public int concurrentReadsHighWater() {
+        return this.readsHighWater.get();
     }
 
     /// Staging slots not holding a record.

@@ -18,6 +18,9 @@ public final class ExpertCacheStats {
     private final LongAdder failedTransfers = new LongAdder();
     private final LongAdder abandonedLoads = new LongAdder();
     private final LongAdder forcedLeases = new LongAdder();
+    private final LongAdder prefetchesStarted = new LongAdder();
+    private final LongAdder prefetchesUsed = new LongAdder();
+    private final LongAdder prefetchesWasted = new LongAdder();
     private final AtomicInteger peakSlotsInUse = new AtomicInteger();
 
     ExpertCacheStats(int slotCount, long slotBytes) {
@@ -66,6 +69,18 @@ public final class ExpertCacheStats {
         this.forcedLeases.add(count);
     }
 
+    void prefetchStarted() {
+        this.prefetchesStarted.increment();
+    }
+
+    void prefetchUsed() {
+        this.prefetchesUsed.increment();
+    }
+
+    void prefetchWasted() {
+        this.prefetchesWasted.increment();
+    }
+
     void slotsInUse(int count) {
         this.peakSlotsInUse.accumulateAndGet(count, Math::max);
     }
@@ -85,7 +100,10 @@ public final class ExpertCacheStats {
                 this.forcedLeases.sum(),
                 this.peakSlotsInUse.get(),
                 this.slotCount,
-                this.slotBytes);
+                this.slotBytes,
+                this.prefetchesStarted.sum(),
+                this.prefetchesUsed.sum(),
+                this.prefetchesWasted.sum());
     }
 
     /// An immutable reading of the counters.
@@ -105,6 +123,9 @@ public final class ExpertCacheStats {
     /// @param peakSlotsInUse most slots at once that were loading or leased
     /// @param slotCount slots in the cache
     /// @param slotBytes bytes of one slot
+    /// @param prefetchesStarted loads started by [ExpertCache#prefetch]
+    /// @param prefetchesUsed prefetched experts that a request later found resident (or joined while loading)
+    /// @param prefetchesWasted prefetched experts evicted before any request used them
     public record Snapshot(
             long hits,
             long misses,
@@ -119,7 +140,10 @@ public final class ExpertCacheStats {
             long forcedLeases,
             int peakSlotsInUse,
             int slotCount,
-            long slotBytes) {
+            long slotBytes,
+            long prefetchesStarted,
+            long prefetchesUsed,
+            long prefetchesWasted) {
 
         public long capacityBytes() {
             return (long) this.slotCount * this.slotBytes;

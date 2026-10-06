@@ -57,7 +57,7 @@ class Qwen4PerformanceCudaIntegrationTest {
     private final List<String> report = new ArrayList<>();
 
     /// Per-layer use of the expert cache, accumulated over the MoE blocks a run executed.
-    private static final class LayerStats implements Qwen4Executor.ExpertTrace {
+    private static final class LayerStats implements Qwen4ExecutionPlan.ExpertTrace {
         final long[] blocks = new long[48],
                 unique = new long[48],
                 hits = new long[48],
@@ -137,7 +137,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                 "set EUHEDRAL_QWEN4_PERF=1 to run the performance record");
         assumeTrue(Qwen4TestSupport.hasArtifact(), "no artifact");
         int[] prompt = corpus(CONTEXT);
-        try (CudaGpuMemory gpu = Qwen4TestSupport.openGpu()) {
+        try (Qwen4TestLattice lattice = Qwen4TestLattice.start(4);
+                CudaGpuMemory gpu = Qwen4TestSupport.openGpu()) {
             long loadStart = System.nanoTime();
             try (Qwen4Model model = Qwen4Model.open(
                             Qwen4TestSupport.artifactPath(),
@@ -145,17 +146,20 @@ class Qwen4PerformanceCudaIntegrationTest {
                             gpu.deviceMemoryInfo().freeBytes(),
                             HostBudget.system(),
                             Qwen4Mode.TEXT,
-                            CONTEXT);
-                    Qwen4Executor executor = new Qwen4Executor(gpu, model, CONTEXT)) {
+                            CONTEXT,
+                            lattice.tasks());
+                    Qwen4TestLattice.Run run = lattice.run(gpu, model, CONTEXT);
+                    Qwen4ExecutionPlan executor = run.plan()) {
                 line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));
                 line("expert cache: " + model.expertCache().slotCount() + " slots; plan:\n"
                         + model.plan().report());
                 int vocabulary = executor.vocabularySize();
                 var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
-                Qwen4Executor.LogitsSink sink = address -> gpu.copyDeviceToReadback(readback, address, vocabulary * 2L);
+                Qwen4ExecutionPlan.LogitsSink sink =
+                        address -> gpu.copyDeviceToReadback(readback, address, vocabulary * 2L);
                 // Warm the kernels and the cache with a short run.
                 try (Qwen4Sequence warm = executor.newSequence()) {
-                    executor.step(warm, prompt, 0, 64, sink);
+                    Qwen4Blocking.step(executor, warm, prompt, 0, 64, sink);
                 }
                 for (int target : Arrays.stream(new int[] {512, 4096, 16384})
                         .filter(t -> t <= MAX)
@@ -168,7 +172,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                         int at = 0;
                         while (at < target) {
                             int rows = Math.min(512, target - at);
-                            executor.step(sequence, prompt, at, rows, at + rows == target ? sink : null);
+                            Qwen4Blocking.step(executor, sequence, prompt, at, rows, at + rows == target ? sink : null);
                             at += rows;
                         }
                         double seconds = (System.nanoTime() - start) / 1e9;
@@ -197,7 +201,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                         int at = 0;
                         while (at < context) {
                             int rows = Math.min(512, context - at);
-                            executor.step(sequence, prompt, at, rows, null);
+                            Qwen4Blocking.step(executor, sequence, prompt, at, rows, null);
                             at += rows;
                         }
                         int[] token = new int[1];
@@ -209,7 +213,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                         long start = System.nanoTime();
                         for (int i = 0; i < steps; i++) {
                             token[0] = prompt[(context + i * 97) % prompt.length];
-                            executor.step(sequence, token, 0, 1, sink);
+                            Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
                             short[] logits = new short[vocabulary];
                             MemorySegment.copy(readback.segment(), ValueLayout.JAVA_SHORT, 0, logits, 0, 16);
                         }
@@ -231,7 +235,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                                         before.loadWaitNanos(),
                                         steps),
                                 (after.routeWaitNanos() - counters.routeWaitNanos()) / 1e6 / steps,
-                                (after.acquireNanos() - counters.acquireNanos()) / 1e6 / steps));
+                                (after.expertWaitNanos() - counters.expertWaitNanos()) / 1e6 / steps));
                     }
                 }
                 // Component times: decode at 4K and a 512-token prefill chunk, each step followed by a device wait.
@@ -240,24 +244,24 @@ class Qwen4PerformanceCudaIntegrationTest {
                         int at = 0;
                         while (at < shape[0]) {
                             int rows = Math.min(512, shape[0] - at);
-                            executor.step(sequence, prompt, at, rows, null);
+                            Qwen4Blocking.step(executor, sequence, prompt, at, rows, null);
                             at += rows;
                         }
-                        var timings = new Qwen4Executor.Timings();
+                        var timings = new Qwen4ExecutionPlan.Timings();
                         executor.timings(timings);
                         int steps = shape[1] == 1 ? 16 : 1;
                         for (int i = 0; i < steps; i++) {
                             int rows = shape[1];
                             int[] tokens = Arrays.copyOfRange(prompt, at, at + rows);
-                            executor.step(sequence, tokens, 0, rows, sink);
+                            Qwen4Blocking.step(executor, sequence, tokens, 0, rows, sink);
                             at += rows;
                         }
                         executor.timings(null);
                         StringBuilder text = new StringBuilder(
                                 String.format("components, %d-row steps at %d context (ms/step):", shape[1], shape[0]));
-                        for (int i = 0; i < Qwen4Executor.Timings.NAMES.length; i++)
+                        for (int i = 0; i < Qwen4ExecutionPlan.Timings.NAMES.length; i++)
                             text.append(String.format(
-                                    " %s %.2f;", Qwen4Executor.Timings.NAMES[i], timings.nanos[i] / 1e6 / steps));
+                                    " %s %.2f;", Qwen4ExecutionPlan.Timings.NAMES[i], timings.nanos[i] / 1e6 / steps));
                         line(text.toString());
                     }
                 }

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.ModelArchitecture;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostMemoryGpu;
@@ -73,7 +74,8 @@ class Qwen4StorageTest {
         Path path = this.directory.resolve("mini.edrl");
         Qwen4TestArtifact.write(path, Qwen4TestArtifact.miniConfig(), 1);
         var environment = new FakeEnvironment(4L << 30);
-        try (Qwen4Storage storage = Qwen4Storage.load(config(path, 2048), environment, Qwen4Mode.TEXT)) {
+        try (Qwen4Storage storage =
+                Qwen4Storage.load(config(path, 2048), environment, Qwen4Mode.TEXT, TestHostFrames.SHARED)) {
             assertTrue(storage.plan().fits());
             assertEquals(2048, storage.plan().maxContextTokens());
             assertTrue(storage.model().expertCache().slotCount() > 0);
@@ -90,7 +92,8 @@ class Qwen4StorageTest {
         Qwen4TestArtifact.write(path, Qwen4TestArtifact.miniConfig(), 1);
         var environment = new FakeEnvironment(256L << 20);
         var failure = assertThrows(
-                IOException.class, () -> Qwen4Storage.load(config(path, 2048), environment, Qwen4Mode.TEXT));
+                IOException.class,
+                () -> Qwen4Storage.load(config(path, 2048), environment, Qwen4Mode.TEXT, TestHostFrames.SHARED));
         assertTrue(failure.getMessage().contains("cannot be placed"), failure.getMessage());
         assertTrue(environment.closed);
         assertEquals(0, environment.gpu.liveDeviceAllocations());

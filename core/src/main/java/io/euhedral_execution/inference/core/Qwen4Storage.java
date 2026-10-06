@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.host.HostFrames;
 import io.euhedral_execution.inference.core.model_loader.ModelArchitecture;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
@@ -68,11 +69,12 @@ public final class Qwen4Storage implements AutoCloseable {
     }
 
     /// Loads the `qwen4_exp` artifact of `config` for `config.maxContextTokens()`, selecting no MTP and no vision.
-    public static Qwen4Storage load(InferenceConfig config) throws IOException {
-        return load(config, SYSTEM, Qwen4Mode.TEXT);
+    public static Qwen4Storage load(InferenceConfig config, HostFrames frames) throws IOException {
+        return load(config, SYSTEM, Qwen4Mode.TEXT, frames);
     }
 
-    static Qwen4Storage load(InferenceConfig config, Environment environment, Qwen4Mode mode) throws IOException {
+    static Qwen4Storage load(InferenceConfig config, Environment environment, Qwen4Mode mode, HostFrames frames)
+            throws IOException {
         Objects.requireNonNull(config, "config");
         ModelArchitecture architecture = ModelArchitecture.detect(config.artifactPath());
         if (architecture != ModelArchitecture.QWEN4_EXP)
@@ -81,7 +83,13 @@ public final class Qwen4Storage implements AutoCloseable {
         try {
             long free = environment.freeDeviceBytes(gpu);
             Qwen4Model model = Qwen4Model.open(
-                    config.artifactPath(), gpu, free, environment.hostBudget(), mode, config.maxContextTokens());
+                    config.artifactPath(),
+                    gpu,
+                    free,
+                    environment.hostBudget(),
+                    mode,
+                    config.maxContextTokens(),
+                    frames);
             LOG.info(
                     "Flash-Next storage loaded: {} expert slots, {} MiB of fixed objects on the device",
                     model.plan().expertCache().slotCount(),

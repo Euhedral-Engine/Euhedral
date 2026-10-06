@@ -174,14 +174,22 @@ public final class InferenceEngine implements AutoCloseable {
     }
 
     /// Loads a Flash-Next (`qwen4_exp`) artifact as a text model. The residency is derived from the artifact and the
-    /// maximum context alone; generation runs on the model's own worker, not on the dense engine's lattice.
+    /// maximum context alone. Generation, the expert hierarchy and the host work around a request all run on the
+    /// engine's lattice, as the dense model's do: the runtime owns resources, not threads.
     private static InferenceEngine loadQwen4(InferenceConfig config, Bootstrap bootstrap) throws IOException {
+        // Euhedral silently drops unavailable CPUs; fail before claiming the lattice or loading anything.
+        ProcessorTopology topology = bootstrap.processorTopology();
+        topology.requireAvailable(config.workerCpus());
+        BitSet workerCoreIds = topology.coreIds(config.workerCpus());
         if (!LATTICE_OWNED.compareAndSet(false, true))
-            throw new IllegalStateException("an inference engine already owns the GPU");
+            throw new IllegalStateException("an inference engine already owns the process-wide Euhedral lattice");
+        ControlPlaneLattice lattice = null;
         Qwen4Runtime runtime = null;
         try {
             QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
-            runtime = Qwen4Runtime.load(config);
+            lattice = bootstrap.createLattice(config);
+            bootstrap.startLattice(lattice);
+            runtime = Qwen4Runtime.load(config, lattice);
             var modelIdentity = qwen4Identity(config.artifactPath(), runtime.config());
             var runtimeIdentity = runtimeIdentity(config.cudaLibraryPath());
             return new InferenceEngine(
@@ -189,12 +197,12 @@ public final class InferenceEngine implements AutoCloseable {
                     tokenizer,
                     runtime.gpu(),
                     null,
-                    null,
+                    lattice,
                     null,
                     null,
                     config,
                     null,
-                    new BitSet(),
+                    workerCoreIds,
                     modelIdentity,
                     runtimeIdentity,
                     null,
@@ -202,6 +210,14 @@ public final class InferenceEngine implements AutoCloseable {
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 if (runtime != null) runtime.close();
+            } catch (RuntimeException | Error cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            try {
+                if (lattice != null) {
+                    LAST_CLOSED_LATTICE.set(lattice);
+                    lattice.close();
+                }
             } catch (RuntimeException | Error cleanup) {
                 failure.addSuppressed(cleanup);
             } finally {
@@ -362,6 +378,11 @@ public final class InferenceEngine implements AutoCloseable {
 
     private synchronized void releaseGenerationSession(GenerationSession session) {
         this.sessions.remove(session);
+    }
+
+    /// The Flash-Next runtime, or null for a dense engine (tests).
+    Qwen4Runtime qwen4Runtime() {
+        return this.qwen4;
     }
 
     public QwenTokenizer tokenizer() {
@@ -530,8 +551,11 @@ public final class InferenceEngine implements AutoCloseable {
             if (failure instanceof RuntimeException exception) throw exception;
             if (failure instanceof Error error) throw error;
             if (this.qwen4 != null) {
-                // The runtime releases the executor, the model and the GPU, in that order.
+                // The runtime releases the executor, the model and the GPU, then drains its host work; with every
+                // source detached the lattice can stop.
                 this.qwen4.close();
+                LAST_CLOSED_LATTICE.set(this.lattice);
+                this.lattice.close();
             } else {
                 this.runtime.close();
                 if (this.prefixCache != null) this.prefixCache.close();
