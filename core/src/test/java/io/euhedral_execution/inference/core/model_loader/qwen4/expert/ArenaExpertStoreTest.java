@@ -32,7 +32,8 @@ class ArenaExpertStoreTest {
         try (ArenaExpertStore store = new ArenaExpertStore(gpu, fixture.file, fixture.banks, 4)) {
             for (int bank = 0; bank < fixture.banks.length; bank++) {
                 for (int expert = 0; expert < fixture.expertCount(bank); expert++) {
-                    try (HostRecord record = store.open(bank, expert)) {
+                    {
+                        HostRecord record = store.open(bank, expert, 0);
                         byte[] bytes = record.segment().toArray(ValueLayout.JAVA_BYTE);
                         assertArrayEquals(fixture.record(bank, expert), bytes, bank + "/" + expert);
                         assertEquals(fixture.banks[bank].crc32(expert), ExpertFixture.crc32(bytes));
@@ -57,7 +58,8 @@ class ArenaExpertStoreTest {
             List<long[]> ranges = new ArrayList<>();
             for (int bank = 0; bank < fixture.banks.length; bank++) {
                 for (int expert = 0; expert < fixture.expertCount(bank); expert++) {
-                    try (HostRecord record = store.open(bank, expert)) {
+                    {
+                        HostRecord record = store.open(bank, expert, 0);
                         ranges.add(new long[] {record.hostAddress(), record.hostAddress() + record.byteSize()});
                     }
                 }
@@ -81,7 +83,8 @@ class ArenaExpertStoreTest {
         try (ArenaExpertStore store = new ArenaExpertStore(gpu, fixture.file, fixture.banks, 8)) {
             for (int bank = 0; bank < fixture.banks.length; bank++) {
                 for (int expert = 0; expert < fixture.expertCount(bank); expert++) {
-                    try (HostRecord record = store.open(bank, expert)) {
+                    {
+                        HostRecord record = store.open(bank, expert, 0);
                         assertEquals(
                                 fixture.banks[bank].crc32(expert),
                                 ExpertFixture.crc32(record.segment().toArray(ValueLayout.JAVA_BYTE)));
@@ -106,7 +109,8 @@ class ArenaExpertStoreTest {
                     for (int i = 0; i < 500; i++) {
                         int bank = random.nextInt(fixture.banks.length);
                         int expert = random.nextInt(fixture.expertCount(bank));
-                        try (HostRecord record = store.open(bank, expert)) {
+                        {
+                            HostRecord record = store.open(bank, expert, 0);
                             assertArrayEquals(
                                     fixture.record(bank, expert),
                                     record.segment().toArray(ValueLayout.JAVA_BYTE));
@@ -147,32 +151,26 @@ class ArenaExpertStoreTest {
         ExpertFixture fixture = ExpertFixture.standard(this.directory, 6);
         HostBackedGpu gpu = new HostBackedGpu();
         try (ArenaExpertStore store = new ArenaExpertStore(gpu, fixture.file, fixture.banks, 2)) {
-            assertThrows(IndexOutOfBoundsException.class, () -> store.open(0, 8));
-            assertThrows(IndexOutOfBoundsException.class, () -> store.open(0, -1));
-            assertThrows(IndexOutOfBoundsException.class, () -> store.open(5, 0));
-            assertThrows(IndexOutOfBoundsException.class, () -> store.open(-1, 0));
+            assertThrows(IndexOutOfBoundsException.class, () -> store.open(0, 8, 0));
+            assertThrows(IndexOutOfBoundsException.class, () -> store.open(0, -1, 0));
+            assertThrows(IndexOutOfBoundsException.class, () -> store.open(5, 0, 0));
+            assertThrows(IndexOutOfBoundsException.class, () -> store.open(-1, 0, 0));
             assertEquals(0, store.recordOpens());
         }
     }
 
     @Test
-    void closingFreesTheArenaOnceAfterTheLastOpenRecord() throws Exception {
+    void closingFreesTheArenaOnce() throws Exception {
         ExpertFixture fixture = ExpertFixture.standard(this.directory, 7);
         HostBackedGpu gpu = new HostBackedGpu();
         ArenaExpertStore store = new ArenaExpertStore(gpu, fixture.file, fixture.banks, 2);
-        HostRecord first = store.open(0, 0);
-        HostRecord second = store.open(1, 1);
-        store.close();
-        store.close();
-        assertEquals(1, gpu.liveHostAllocations(), "open records keep the arena alive");
+        HostRecord first = store.open(0, 0, 0);
         assertArrayEquals(fixture.record(0, 0), first.segment().toArray(ValueLayout.JAVA_BYTE));
-        assertThrows(IllegalStateException.class, () -> store.open(0, 1));
-        first.close();
-        first.close();
-        assertEquals(1, gpu.liveHostAllocations(), "closing a record twice does not release a second claim");
-        second.close();
+        assertEquals(1, gpu.liveHostAllocations());
+        store.close();
+        store.close();
         assertEquals(0, gpu.liveHostAllocations());
-        assertEquals(1, gpu.hostFrees());
+        assertEquals(1, gpu.hostFrees(), "the arena is freed once");
         gpu.assertAllReleased();
     }
 

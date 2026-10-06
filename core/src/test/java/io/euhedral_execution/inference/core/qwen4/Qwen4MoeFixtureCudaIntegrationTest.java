@@ -11,7 +11,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
-import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.FileExpertStore;
@@ -26,8 +25,9 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /// The whole MoE block of layer 0 (router, shared expert, routed experts through the expert cache,
-/// combination) against the upstream fixtures, and the cache's independence: the same block with the minimum
-/// cache (20 slots, so every chunk evicts) and with a cache that holds every expert must give the same bits.
+/// combination) against the upstream fixtures, and the cache's independence: the same block with
+/// the minimum cache (20 slots, so every chunk evicts) and with a cache that holds every expert
+/// must give the same bits.
 class Qwen4MoeFixtureCudaIntegrationTest {
 
     private static short[] runBlock(
@@ -44,14 +44,9 @@ class Qwen4MoeFixtureCudaIntegrationTest {
             throws Exception {
         short[] all = new short[0];
         var store = new FileExpertStore(gpu, weights.path(), new ExpertBank[] {bank}, 16);
-        var transfer = new GpuExpertTransfer(gpu, TestHostFrames.SHARED);
-        try (ExpertCache cache = new ExpertCache(
-                store,
-                transfer,
-                gpu,
-                slots,
-                ExpertCache.slotBytesFor(new ExpertBank[] {bank}),
-                TestHostFrames.SHARED)) {
+        var transfer = new GpuExpertTransfer(gpu, 4);
+        try (ExpertCache cache =
+                new ExpertCache(store, transfer, gpu, slots, ExpertCache.slotBytesFor(new ExpertBank[] {bank}), 1)) {
             GpuStream stream = gpu.openStream();
             var geometry = Qwen4ExpertOps.Geometry.of(bank);
             var layer = new Qwen4MoeLayer(
@@ -124,8 +119,8 @@ class Qwen4MoeFixtureCudaIntegrationTest {
                 weights.weight(p + "shared_expert_gate"));
     }
 
-    /// The router's choice as a set per row, with the reference's weights per expert. A row whose 10th and
-    /// 11th probabilities tie in the reference may legitimately differ in the tied expert.
+    /// The router's choice as a set per row, with the reference's weights per expert. A row whose
+    /// 10th and 11th probabilities tie in the reference may legitimately differ in the tied expert.
     private static void checkRouting(
             CudaGpuMemory gpu,
             Arena arena,
@@ -190,9 +185,10 @@ class Qwen4MoeFixtureCudaIntegrationTest {
         report.finish();
     }
 
-    /// A QSA layer's MoE block (layer 3 of the model case `short`) on the reference's own input: the block
-    /// alone agrees with the reference far better than the whole layer does when the attention block's small
-    /// error reaches the router (the reason deep layers of the model comparison show a few percent).
+    /// A QSA layer's MoE block (layer 3 of the model case `short`) on the reference's own input:
+    /// the block alone agrees with the reference far better than the whole layer does when the
+    /// attention block's small error reaches the router (the reason deep layers of the model
+    /// comparison show a few percent).
     @Test
     void aMoeBlockOfAnAttentionLayerOnTheReferenceInput() throws Exception {
         Path directory = Qwen4TestSupport.modelFixtureRoot().resolve("short");

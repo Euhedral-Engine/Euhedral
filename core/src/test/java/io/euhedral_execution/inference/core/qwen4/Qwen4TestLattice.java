@@ -102,8 +102,9 @@ public final class Qwen4TestLattice implements AutoCloseable {
 
         @Override
         public void close() {
-            this.plan.close();
+            // Every accepted step retires (its expert sources still serve it) before the plan completes the sources.
             this.runtime.close();
+            this.plan.close();
         }
     }
 

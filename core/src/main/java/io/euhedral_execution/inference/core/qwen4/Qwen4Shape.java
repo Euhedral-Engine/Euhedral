@@ -50,6 +50,7 @@ final class Qwen4Shape implements GraphShape {
         PLAN,
         LOAD,
         WAVE,
+        DRAIN,
         FINISH,
         ENDINJECT,
         OBSERVE,
@@ -67,14 +68,16 @@ final class Qwen4Shape implements GraphShape {
     private final List<Edge[]> incoming = new ArrayList<>();
     private final int waveCap;
     private final int[] loadStages;
+    private final int[] drainStages;
     private final StageTopology topology;
 
     Qwen4Shape(Qwen4ExecutionPlan plan, Qwen4ExecutionPlan.ShapeKey key) {
         this.plan = plan;
         this.key = key;
         this.waveCap = plan.maxWaves(key.rows());
-        this.loadStages =
-                new int[Math.max(1, key.range().endLayer() - key.range().firstLayer()) * this.waveCap];
+        int layerCount = Math.max(1, key.range().endLayer() - key.range().firstLayer());
+        this.loadStages = new int[layerCount * this.waveCap];
+        this.drainStages = new int[layerCount];
         build();
         int[][] dependencies = new int[this.incoming.size()][];
         Boundary[][] boundaries = new Boundary[this.incoming.size()][];
@@ -117,6 +120,7 @@ final class Qwen4Shape implements GraphShape {
         // The boundary a piece waits for in its predecessor: a diagnostic shape waits for the device between pieces.
         Boundary between = diagnostic ? Boundary.RETIRED : Boundary.SUBMITTED;
         int previous = -1;
+        int previousDrain = -1;
         Boundary edge = Boundary.SUBMITTED;
         if (range.embeds()) {
             previous = add(Kind.EMBED, -1, -1);
@@ -136,7 +140,14 @@ final class Qwen4Shape implements GraphShape {
             int route = add(Kind.ROUTE, layer, -1, after(previous));
             int shared = add(Kind.SHARED, layer, -1, after(route));
             // The plan reads the route copy on the host: it waits for the device to retire it.
-            int planned = add(Kind.PLAN, layer, -1, retired(route));
+            // The block's experts are claimed in the sources: a layer's plan waits until the layer before it drained
+            // them.
+            int planned = previousDrain < 0
+                    ? add(Kind.PLAN, layer, -1, retired(route))
+                    : add(Kind.PLAN, layer, -1, retired(route), after(previousDrain));
+            int drain = add(Kind.DRAIN, layer, -1, after(planned));
+            this.drainStages[layer - range.firstLayer()] = drain;
+            previousDrain = drain;
             int[] waves = new int[this.waveCap];
             for (int w = 0; w < this.waveCap; w++) {
                 // The window's gates are not edges of the shape: the experts of a wave are items that the plan stage
@@ -167,7 +178,12 @@ final class Qwen4Shape implements GraphShape {
 
     @Override
     public GraphStorage newStorage(ExecutionGpu gpu) {
-        return this.plan.leaseStorage(gpu, this.key.rows());
+        return this.plan.leaseStorage(this.key.rows());
+    }
+
+    /// The stage that ends when the sources finished `layer`'s block.
+    int drainStage(int layer) {
+        return this.drainStages[layer - this.key.range().firstLayer()];
     }
 
     /// The stage that collects the arrivals of wave `wave` of `layer`.

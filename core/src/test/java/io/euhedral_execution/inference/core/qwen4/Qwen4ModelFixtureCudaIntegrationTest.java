@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.host.TestHostFrames;
 import io.euhedral_execution.inference.core.model_loader.qwen4.HostBudget;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Mode;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
@@ -17,18 +16,17 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 
-/// The whole model on the real artifact against the upstream fixtures of the model cases (`short`, `eos`), recorded
-/// through the NVFP4 KV codec the engine's cache applies: every layer fed the reference's own input (so a layer's error
-/// is its own), and the full forward from tokens (prefill chunks and decode steps) compared at every layer boundary and
-/// at the logits.
+/// The whole model on the real artifact against the upstream fixtures of the model cases (`short`,
+/// `eos`), recorded through the NVFP4 KV codec the engine's cache applies: every layer fed the
+/// reference's own input (so a layer's error is its own), and the full forward from tokens (prefill
+/// chunks and decode steps) compared at every layer boundary and at the logits.
 ///
-/// Bounds: a layer fed the reference's own input agrees to about 1% (GDN layers) to a few percent. A sparse-attention
-/// layer's attention block differs from the reference by 0.5% (the BF16 rounding of upstream's own score tensors and
-/// the
-/// KV codec's), and the MoE block that follows is chaotic in that difference: its router sees an input one rounding
-/// step
-/// away, which can choose another expert for a near-tied token. The MoE block alone on the reference's input agrees to
-/// 3e-4 (`Qwen4MoeFixtureCudaIntegrationTest`), so the layer bound is 10%, not a kernel tolerance.
+/// Bounds: a layer fed the reference's own input agrees to about 1% (GDN layers) to a few percent.
+/// A sparse-attention layer's attention block differs from the reference by 0.5% (the BF16 rounding
+/// of upstream's own score tensors and the KV codec's), and the MoE block that follows is chaotic
+/// in that difference: its router sees an input one rounding step away, which can choose another
+/// expert for a near-tied token. The MoE block alone on the reference's input agrees to 3e-4
+/// (`Qwen4MoeFixtureCudaIntegrationTest`), so the layer bound is 10%, not a kernel tolerance.
 class Qwen4ModelFixtureCudaIntegrationTest {
 
     private static final int CONTEXT = 8192;
@@ -52,8 +50,7 @@ class Qwen4ModelFixtureCudaIntegrationTest {
                 gpu.deviceMemoryInfo().freeBytes(),
                 HostBudget.system(),
                 Qwen4Mode.TEXT,
-                CONTEXT,
-                TestHostFrames.SHARED);
+                CONTEXT);
     }
 
     private static ReferenceFixtures fixtures(String name) throws Exception {
@@ -92,8 +89,8 @@ class Qwen4ModelFixtureCudaIntegrationTest {
         }
     }
 
-    /// Where a layer's error enters: the state after the attention block (before the MoE block) against the
-    /// reference's, for the layers the case captures in detail.
+    /// Where a layer's error enters: the state after the attention block (before the MoE block)
+    /// against the reference's, for the layers the case captures in detail.
     @Test
     void attentionBlocksFollowTheReferenceBeforeTheMoeBlock() throws Exception {
         for (String name : new String[] {"short", "eos"}) {
@@ -131,9 +128,9 @@ class Qwen4ModelFixtureCudaIntegrationTest {
         }
     }
 
-    /// The forward from tokens: prefill and decode steps with the sequence state carried. The error accumulates
-    /// with depth the way the reference's own does between chunkings (BF16 noise); the greedy token must agree at
-    /// every step.
+    /// The forward from tokens: prefill and decode steps with the sequence state carried. The error
+    /// accumulates with depth the way the reference's own does between chunkings (BF16 noise); the
+    /// greedy token must agree at every step.
     @Test
     void theFullForwardFollowsTheReference() throws Exception {
         ReferenceFixtures fixture = fixtures("short");

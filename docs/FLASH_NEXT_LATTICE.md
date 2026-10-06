@@ -27,9 +27,11 @@ decides the lattice and the model plugs into it.
 embed -> [PLE] -> attention block -> route ─┬─> shared expert ────────────────────────────┐
   ^                                          └─(route copy retires)─> plan                 │
   |                                                                    │                  v
-  |        wave 0:  load ──────────────────────────────────────────> wave 0 ─> wave 1 ... ─> finish
-  |        wave w:  load (after wave w-window was submitted) ───────> wave w                  │
-  └─────────────────────────────────────── next layer <──────────────────────────────────────┘  ...  -> head
+  |                       plan ──posts shares──> the cache's sources ──leases arrive──> load w (arrivals)
+  |                                                                                          │
+  |        wave 0 <──────────────────────────────────────────────────────────────────────────┘
+  |        wave 0 ─> wave 1 ... ─> finish ─┐        drain (every source finished its share)
+  └──────────────────── next layer <───────┘                   │  ...  -> head
 ```
 
 | Piece | Role |
@@ -40,7 +42,8 @@ embed -> [PLE] -> attention block -> route ─┬─> shared expert ────
 | `Qwen4GraphStorage` | The device workspace of one row capacity and the MoE block resources (`Qwen4MoeLayer`); the graphs of a capacity take turns on it through leases. |
 | `Qwen4Quantum` | A `StageQuantum`: what the stages read, whether the step stopped, and the terminal work after retirement (commit the sequence, close leases a stopped block still holds, report to the listener). |
 | `EuhedralInferenceRuntime` | Unchanged lifecycle: admits a quantum to an idle graph of its shape (building one when none is idle), publishes its roots, recycles the graph at retirement. `Qwen4Runtime` uses it with no dense plan. |
-| `ExpertItem` | One expert of a block as a frame: claim the expert in the cache, read, submit the copy on the lane's copy stream, hold the lease that carries the copy's marker; a second frame of the lane runs when the copy retired. |
+| `ExpertCache` / `ExpertCacheShard` | The slab, the markers, the host store and the transfer, and the shards: single-owner partitions with their own slots, directory and copy lanes. No lock, no wait. |
+| `ExpertSource` / `SerialSource` | The owner of a shard as a lattice source: it walks a block's share of experts in order, generates the load frames, and answers the block with leases. |
 | `InferenceLake` / `FrameLake` | The pool of ready work: queue ingest sinks, each an upstream source of the lattice, that every producer publishes into. It counts the units it carries and completes once they all ended. |
 | `HostFrames` / `HostTasks` | Where the work around the graph runs: the generation chain, tokenization, the expert hierarchy's other asynchronous work. `run` from a worker or ordinary thread, `runFromCallback` from a CUDA driver thread (enqueue only). |
 
@@ -50,16 +53,24 @@ embed -> [PLE] -> attention block -> route ─┬─> shared expert ────
   the waves, the finish, the head) and the device-completion frames between them share one routing hash per graph, so the lattice
   places them on the same lane: a frame that ends publishes its successor into the lane's sink and the worker that ended it takes
   it next. The side branch (the shared expert) and everything else that may run in parallel is spread over the lanes.
-- **Experts are items.** The plan stage spawns the block's experts as frames, one per expert (`ExpertItem`, recycled through a
-  `FrameManager`), in lanes: expert `p` runs on lane `p % lanes`, one at a time per lane, and the lanes (one pinned staging slot and one
-  copy stream each) spread over the workers. An item finds its expert in the cache (a resident one is held at once) or reads the
-  record into its staging slot and submits the host-to-device copy on its lane's own copy stream. The lease it holds carries the
-  marker the copy records behind itself: the wave's kernels wait for that marker on the device, and no host thread waits for the
-  bytes. When the copy retires (a driver callback that publishes a second frame of the lane) the staging slot is free and the lane's
-  next expert becomes runnable.
-- **Waves overlap.** A wave's stage runs as soon as every one of its experts was taken or its copy submitted. The experts of a
-  later wave start as the cache's slots free up: an item is runnable when its lane's previous expert ended and the wave `window`
-  before its own was submitted and retired. The bounds hold by construction; nothing queues, parks or holds a permit.
+- **The cache is several sources.** The device cache of experts is split into shards: each owns a range of the slab's
+  slots, the directory of the experts that hash to it, and its own copy lanes (a pinned staging slot and a copy stream each).
+  Every shard is owned by an `ExpertSource`, a `SerialSource`: a lattice source that generates its frames from its own
+  `request` and `pull`, which Euhedral runs one thread at a time. The shard's state is plain fields touched only there, with no
+  lock, atomic or volatile; everything else reaches it as a message in the source's mailbox (a lock-free enqueue): the share
+  of a block the plan stage posts, a lease that closed, a copy that was submitted or retired (a driver callback that only
+  enqueues). The sources are attached to the lattice on their own, so the path through the cache and back runs side by side
+  on as many shards as there are, and a layer's experts, which hash to every shard, are claimed in parallel.
+- **A block is walked in order.** A source claims its share of the experts in order. A resident expert is a lease at once, with
+  no frame at all. A miss that finds a slot and a copy lane free becomes a load frame that the source generates and Euhedral
+  routes to the lane's worker (an ordered frame, so the lane keeps its worker): the one blocking step, the read into the
+  lane's staging slot, then the copy submitted on the lane's copy stream, which records the marker the lease carries. The
+  wave's kernels wait for that marker on the device, and no host thread waits for the bytes. When nothing is free the walk
+  waits; a lease closing or a copy retiring is a message that resumes it. A shard holds two waves, so in-order claiming never
+  pins more than it has.
+- **Waves overlap.** A wave's stage runs as soon as every one of its experts was taken or its copy submitted; the next wave's
+  experts are claimed as slots free up. A `drain` stage ends a layer's block when every source finished its share, so the next
+  layer's plan posts only to free sources.
 
 ### Edges are the synchronization
 
@@ -69,13 +80,11 @@ embed -> [PLE] -> attention block -> route ─┬─> shared expert ────
   frame that follows. It exists because the host reads the router's choice.
 - A **host stage** (plan, load) submits nothing to a lane and orders nothing on the device. A **deferred** stage (load) ends when its
   asynchronous work does: it is the arrival point of its wave's items and completes on whichever item reports the last one.
-- A **spawned frame** (an expert item) is a part of a stage's work that runs on its own. It counts as live work of the quantum, which
-  cannot retire before it ended.
+- A **drain** stage (host, deferred) ends when every source finished its share of the block: each expert taken, each copy retired.
 - A stage that **has nothing to do** (a wave beyond what the block uses) completes in place on the thread that satisfied its last
   edge, still joining its predecessors' device order so that its successors wait for what it stood after.
-- The **gates of the items** (the lane's previous expert ended; the wave `window` before was submitted and retired) bound the loads
-  outstanding by the pinned staging slots and the cache's slots *by construction*. Nothing queues and nothing parks: a request past a
-  bound fails loudly, and the sizes (a wave holds at most `slots / (window + 1)` experts, at most 32) keep it from happening.
+- The **slots of a shard** bound the claims *by construction*: an expert is claimed only when a slot and a copy lane are free, so
+  nothing queues, parks or holds a permit, and a shard that holds two waves (a wave has at most 32 experts) never deadlocks.
 
 The only blocking left is where an external API is itself synchronous and is isolated in one frame: the positional read of one
 expert record, the host gather of the per-layer embedding's n-gram rows, and `stream.recover` on a failure path.
@@ -100,8 +109,11 @@ tests and measurement; production uses the plain shape.
 continuations occupy no worker; a driver-callback publication runs on a worker; close drains chains and detaches.
 `StageGraphHostStageTest`: host stages, stages completed in place, and deferred stages (what each does to the edges, the lanes and the
 quantum's retirement). `InferenceLakeTest`: sinks attach once and lazily, frames route by hash, completion waits for every admitted
-unit. `ExpertCacheStreamTest`: a lease before its bytes arrive carries the copy's marker, the slot stays unevictable until the copy
-retired, a device failure unmaps the expert. `ExpertCacheAsyncTest`: coalescing, bounds that fail loudly, failures, prefetch, close.
+unit. `ExpertCacheShardTest`: a lease before its bytes arrive carries the copy's marker, the slot stays unevictable until the copy
+retired, least-recently-used eviction, fences order a refill, shards partition slots and experts. `ExpertSourceTest`: hits need no
+frame, a miss is a generated load frame, the walk waits for room and resumes on a release, a stopped or failed block still ends.
+`FileExpertStoreTest`, `GpuExpertTransferTest`: lane-owned staging and copy streams. The architecture test also guards that the
+expert path holds no lock and starts no thread.
 `Qwen4ArchitectureTest`: a source guard against private executors, pools, virtual threads, async `CompletableFuture` forms and
 blocking waits in the execution path, and that a step is the shape of a graph (no executor or step machine).
 `Qwen4EngineCudaIntegrationTest`: one lattice worker generates the reference continuation; host work progresses during a generation;

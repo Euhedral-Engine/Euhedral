@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.scheduling.graph.GraphStorage;
 import java.util.ArrayList;
 import java.util.List;
@@ -14,17 +15,13 @@ import java.util.List;
 /// workspace through a [Lease] instead of each holding their own.
 final class Qwen4GraphStorage {
 
-    /// A graph's hold on the shared workspace of its capacity, in the runtime's terms: closing the
-    /// last lease frees it.
+    /// A graph's hold on the shared workspace of its capacity, in the runtime's terms. The plan
+    /// owns the workspace and frees it; closing a lease only ends the graph's use.
     static final class Lease implements GraphStorage {
-        private final Qwen4ExecutionPlan plan;
-        private final int rows;
         private final Qwen4GraphStorage storage;
         private boolean closed;
 
-        Lease(Qwen4ExecutionPlan plan, int rows, Qwen4GraphStorage storage) {
-            this.plan = plan;
-            this.rows = rows;
+        Lease(Qwen4GraphStorage storage) {
             this.storage = storage;
         }
 
@@ -44,9 +41,7 @@ final class Qwen4GraphStorage {
 
         @Override
         public void close() {
-            if (this.closed) return;
             this.closed = true;
-            this.plan.releaseStorage(this.rows);
         }
     }
 
@@ -76,11 +71,30 @@ final class Qwen4GraphStorage {
     long routeArmedNanos;
     ExpertCacheStats.Snapshot traceBefore;
     final long[] loadBegin;
-    /// The block's experts as items, by position in its flattened list of waves.
-    final ExpertItem[] items;
-    final ExpertItem.Arrivals[] arrivals;
-    /// Per wave, the items that have not ended: the wave's slots are free when it reaches zero.
-    final java.util.concurrent.atomic.AtomicInteger[] waveLive;
+    /// What the load stage of a wave offers the experts that arrive for it.
+    interface Arrivals {
+        void expect(int count);
+
+        void arrived();
+    }
+
+    final Arrivals[] arrivals;
+
+    /// The stage that ends when every source finished its share of the block.
+    interface Drain {
+        void expect(int shares);
+
+        void done();
+    }
+
+    Drain drain;
+    /// The block in flight as the expert sources see it.
+    final Block block = new Block();
+    /// Per shard of the expert cache, the positions of the block's experts that hash there, and the
+    /// message that hands them over.
+    final int[][] sharePositions;
+    final int[] shareCounts;
+    final ExpertSource.Work[] shares;
 
     Qwen4GraphStorage(Qwen4ExecutionPlan plan, ExecutionGpu gpu, int rows) {
         this.gpu = gpu;
@@ -88,11 +102,12 @@ final class Qwen4GraphStorage {
         int hidden = plan.hidden();
         this.moe = plan.newMoeLayer(rows);
         this.loadBegin = new long[this.moe.maxWaves()];
-        this.items = new ExpertItem[this.moe.maxExperts()];
-        this.arrivals = new ExpertItem.Arrivals[this.moe.maxWaves()];
-        this.waveLive = new java.util.concurrent.atomic.AtomicInteger[this.moe.maxWaves()];
-        for (int w = 0; w < this.waveLive.length; w++)
-            this.waveLive[w] = new java.util.concurrent.atomic.AtomicInteger();
+        this.arrivals = new Arrivals[this.moe.maxWaves()];
+        int shards = plan.expertSources().length;
+        this.sharePositions = new int[shards][this.moe.maxExperts()];
+        this.shareCounts = new int[shards];
+        this.shares = new ExpertSource.Work[shards];
+        for (int shard = 0; shard < shards; shard++) this.shares[shard] = new ExpertSource.Work();
         this.tokenUpload = gpu.allocateUploadBuffer(4L * rows);
         try {
             long bf16 = Short.BYTES;
@@ -132,14 +147,50 @@ final class Qwen4GraphStorage {
         this.retained = 0;
     }
 
-    /// An item of `wave` ended (its copy retired and its staging slot is free): when the whole wave
-    /// did, its cache slots are free, and the items of the wave `window` after it may take them.
-    void itemEnded(int wave, int window) {
-        if (this.waveLive[wave].decrementAndGet() != 0) return;
-        int released = wave + window;
-        if (released >= this.waves) return;
-        this.loadBegin[released] = System.nanoTime();
-        for (int p = this.moe.waveStart(released); p < this.moe.waveStart(released + 1); p++) this.items[p].arrive();
+    /// The block in flight, for the sources that load its experts. They call it from their own
+    /// threads; its fields are written by the plan stage before it posts the shares.
+    final class Block implements ExpertBlock {
+        private Qwen4Quantum quantum;
+        int bank;
+
+        void bind(Qwen4Quantum quantum, int bank) {
+            this.quantum = quantum;
+            this.bank = bank;
+        }
+
+        @Override
+        public int bank() {
+            return this.bank;
+        }
+
+        @Override
+        public int expertAt(int position) {
+            return Qwen4GraphStorage.this.moe.expertAt(position);
+        }
+
+        @Override
+        public boolean stopped() {
+            return this.quantum.stopRequested();
+        }
+
+        @Override
+        public void arrive(int position, ExpertLease lease) {
+            if (lease != null) {
+                if (this.quantum.stopRequested()) lease.close();
+                else Qwen4GraphStorage.this.moe.hold(position, lease);
+            }
+            Qwen4GraphStorage.this.arrivals[Qwen4GraphStorage.this.moe.waveOf(position)].arrived();
+        }
+
+        @Override
+        public void failed(Throwable failure) {
+            this.quantum.fail(failure);
+        }
+
+        @Override
+        public void shardDone() {
+            Qwen4GraphStorage.this.drain.done();
+        }
     }
 
     /// Most rows a quantum on this storage may have.

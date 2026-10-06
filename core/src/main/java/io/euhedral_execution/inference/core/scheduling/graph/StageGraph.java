@@ -426,28 +426,6 @@ public final class StageGraph implements AutoCloseable {
         this.live.incrementAndGet();
     }
 
-    /// Publishes a frame that a stage of this graph spawned (a part of the stage's work that runs
-    /// on its own, such as the load of one expert). It counts as live work of the quantum, which
-    /// cannot retire before [#finishChild]; a frame that is published from a driver callback thread
-    /// passes `fromCallback`. Called while the spawner is still live (a running stage or an earlier
-    /// child), so the quantum cannot retire between the two.
-    public void spawn(AbstractFrame child, boolean fromCallback) {
-        this.live.incrementAndGet();
-        try {
-            if (fromCallback) this.source.publishFromCallback(child);
-            else this.source.publish(child);
-        } catch (RuntimeException | Error failure) {
-            this.live.decrementAndGet();
-            throw failure;
-        }
-    }
-
-    /// A spawned frame ended. The caller must not touch the graph or its quantum afterwards: this
-    /// may have been the last live work.
-    public void finishChild() {
-        stageFinished();
-    }
-
     /// The source through which this graph's frames reach Euhedral.
     public FrameLake lake() {
         return this.source;

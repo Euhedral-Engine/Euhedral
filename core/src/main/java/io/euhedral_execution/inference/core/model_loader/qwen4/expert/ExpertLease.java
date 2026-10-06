@@ -10,7 +10,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// A lease may be closed from any thread. Device work that reads the slot needs no host wait before
 /// the lease is closed: close it with a [DeviceFence] instead.
 public final class ExpertLease implements AutoCloseable {
-    private final ExpertCache cache;
+
+    /// Who a lease reports to when it closes. The cache's owner decides what that means: a source
+    /// posts the release to its own mailbox (the cache is touched only there), a test releases
+    /// inline.
+    public interface Owner {
+        /// The lease of `slot` closed; `fence` (or null) orders the device work that read the slot.
+        void release(int slot, int generation, DeviceFence fence);
+
+        /// Whether `slot` still holds what `generation` leased.
+        boolean isCurrent(int slot, int generation);
+    }
+
+    private final Owner owner;
     private final ExpertBank expertBank;
     private final int bank;
     private final int expert;
@@ -21,7 +33,7 @@ public final class ExpertLease implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
 
     ExpertLease(
-            ExpertCache cache,
+            Owner owner,
             ExpertBank expertBank,
             int bank,
             int expert,
@@ -30,7 +42,7 @@ public final class ExpertLease implements AutoCloseable {
             long deviceAddress,
             long readyMarker) {
         this.readyMarker = readyMarker;
-        this.cache = cache;
+        this.owner = owner;
         this.expertBank = expertBank;
         this.bank = bank;
         this.expert = expert;
@@ -90,7 +102,7 @@ public final class ExpertLease implements AutoCloseable {
     /// Whether the lease is open and its slot still holds this expert's record: false after
     /// [#close], and after the cache closed with the lease open.
     public boolean isValid() {
-        return !this.closed.get() && this.cache.isCurrent(this.slot, this.generation);
+        return !this.closed.get() && this.owner.isCurrent(this.slot, this.generation);
     }
 
     /// Returns the slot to the cache. Idempotent.
@@ -104,7 +116,7 @@ public final class ExpertLease implements AutoCloseable {
     /// owns `fence` from here on, including when the lease was already closed (the fence is then
     /// released unused). A null fence is [#close()].
     public void close(DeviceFence fence) {
-        if (this.closed.compareAndSet(false, true)) this.cache.release(this.slot, this.generation, fence);
+        if (this.closed.compareAndSet(false, true)) this.owner.release(this.slot, this.generation, fence);
         else if (fence != null) fence.release();
     }
 

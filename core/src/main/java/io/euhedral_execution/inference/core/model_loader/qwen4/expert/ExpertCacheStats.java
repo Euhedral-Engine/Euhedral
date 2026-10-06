@@ -3,7 +3,8 @@ package io.euhedral_execution.inference.core.model_loader.qwen4.expert;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
-/// The counters of one [ExpertCache], updated without contention and read at any time with [#snapshot].
+/// The counters of one [ExpertCache], updated without contention and read at any time with
+/// [#snapshot].
 public final class ExpertCacheStats {
     private final int slotCount;
     private final long slotBytes;
@@ -23,9 +24,21 @@ public final class ExpertCacheStats {
     private final LongAdder prefetchesWasted = new LongAdder();
     private final AtomicInteger peakSlotsInUse = new AtomicInteger();
 
+    /// The counters of `parts` read as one cache.
+    private final ExpertCacheStats[] parts;
+
     ExpertCacheStats(int slotCount, long slotBytes) {
         this.slotCount = slotCount;
         this.slotBytes = slotBytes;
+        this.parts = null;
+    }
+
+    /// The sum of the counters of `parts` (the shards of one cache), which is `slotCount` slots of
+    /// `slotBytes` bytes in all.
+    ExpertCacheStats(ExpertCacheStats[] parts, int slotCount, long slotBytes) {
+        this.slotCount = slotCount;
+        this.slotBytes = slotBytes;
+        this.parts = parts.clone();
     }
 
     void hit() {
@@ -86,6 +99,46 @@ public final class ExpertCacheStats {
     }
 
     public Snapshot snapshot() {
+        if (this.parts != null) {
+            long[] sum = new long[17];
+            int peak = 0;
+            for (ExpertCacheStats part : this.parts) {
+                Snapshot s = part.snapshot();
+                sum[0] += s.hits();
+                sum[1] += s.misses();
+                sum[2] += s.evictions();
+                sum[3] += s.coalescedRequests();
+                sum[4] += s.transferBytes();
+                sum[5] += s.transferNanos();
+                sum[6] += s.slotWaitNanos();
+                sum[7] += s.loadWaitNanos();
+                sum[8] += s.failedTransfers();
+                sum[9] += s.abandonedLoads();
+                sum[10] += s.forcedLeases();
+                peak += s.peakSlotsInUse();
+                sum[14] += s.prefetchesStarted();
+                sum[15] += s.prefetchesUsed();
+                sum[16] += s.prefetchesWasted();
+            }
+            return new Snapshot(
+                    sum[0],
+                    sum[1],
+                    sum[2],
+                    sum[3],
+                    sum[4],
+                    sum[5],
+                    sum[6],
+                    sum[7],
+                    sum[8],
+                    sum[9],
+                    sum[10],
+                    peak,
+                    this.slotCount,
+                    this.slotBytes,
+                    sum[14],
+                    sum[15],
+                    sum[16]);
+        }
         return new Snapshot(
                 this.hits.sum(),
                 this.misses.sum(),
@@ -113,18 +166,20 @@ public final class ExpertCacheStats {
     /// @param evictions residents replaced to make room
     /// @param coalescedRequests requests that joined a transfer already in flight
     /// @param transferBytes record bytes that reached the device
-    /// @param transferNanos time from starting a transfer to its completion, summed over successful transfers
+    /// @param transferNanos time from starting a transfer to its completion, summed over successful
+    ///     transfers
     /// @param slotWaitNanos time acquirers spent blocked because every slot was in use
     /// @param loadWaitNanos time acquirers spent blocked on a transfer, their own or another's
     /// @param failedTransfers transfers that failed
-    /// @param abandonedLoads loads dropped before any transfer started, because the acquirer that began them was
-    ///     interrupted or timed out
+    /// @param abandonedLoads loads dropped before any transfer started, because the acquirer that
+    ///     began them was ///     interrupted or timed out
     /// @param forcedLeases leases still open when the cache closed
     /// @param peakSlotsInUse most slots at once that were loading or leased
     /// @param slotCount slots in the cache
     /// @param slotBytes bytes of one slot
-    /// @param prefetchesStarted loads started by [ExpertCache#prefetch]
-    /// @param prefetchesUsed prefetched experts that a request later found resident (or joined while loading)
+    /// @param prefetchesStarted loads started ahead of a request
+    /// @param prefetchesUsed prefetched experts that a request later found resident (or joined
+    ///     while loading)
     /// @param prefetchesWasted prefetched experts evicted before any request used them
     public record Snapshot(
             long hits,
@@ -158,7 +213,8 @@ public final class ExpertCacheStats {
             return this.hits + this.misses + this.coalescedRequests;
         }
 
-        /// Host-to-device rate over the transfers' own durations, in bytes per second (0 before any transfer).
+        /// Host-to-device rate over the transfers' own durations, in bytes per second (0 before any
+        /// transfer).
         public double transferBytesPerSecond() {
             return this.transferNanos == 0 ? 0 : this.transferBytes * 1e9 / this.transferNanos;
         }
