@@ -11,30 +11,33 @@ import java.util.concurrent.atomic.LongAdder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/// Copies expert records into device memory on one dedicated copy stream, so transfers overlap the compute
-/// streams and are ordered among themselves.
+/// Copies expert records into device memory on one dedicated copy stream, so transfers overlap the
+/// compute streams and are ordered among themselves.
 ///
-/// A transfer is one asynchronous host-to-device copy of the pinned record, followed by a retirement boundary
-/// on the stream. The boundary's listener runs on a CUDA driver thread, where it may only enqueue: it
-/// publishes the transfer's completion as a host frame ([HostFrames#runFromCallback]), and the worker that
-/// runs it confirms the boundary, closes the host record (a staging slot may be reused only after the copy
-/// that reads it retired), signals the completion. The transfer owns no thread: device retirement becomes
-/// runnable work, and no driver thread ever calls CUDA, blocks, or runs cache code.
+/// A transfer is one asynchronous host-to-device copy of the pinned record, followed by a
+/// retirement boundary on the stream. The boundary's listener runs on a CUDA driver thread, where
+/// it may only enqueue: it publishes the transfer's completion as a host frame
+/// ([HostFrames#runFromCallback]), and the worker that runs it confirms the boundary, closes the
+/// host record (a staging slot may be reused only after the copy that reads it retired), signals
+/// the completion. The transfer owns no thread: device retirement becomes runnable work, and no
+/// driver thread ever calls CUDA, blocks, or runs cache code.
 ///
-/// Submissions are serialized by a lock, since one stream's order is the order of submission. The number of
-/// copies in flight is not limited here: every copy holds a pinned staging record until its completion frame
-/// closes it, so the staging pool the requester draws from is the bound, and a requester that keeps its
-/// outstanding loads within it never waits. [#startAsync] never blocks and never queues.
+/// Submissions are serialized by a lock, since one stream's order is the order of submission. The
+/// number of copies in flight is not limited here: every copy holds a pinned staging record until
+/// its completion frame closes it, so the staging pool the requester draws from is the bound, and a
+/// requester that keeps its outstanding loads within it never waits. [#startAsync] never blocks and
+/// never queues.
 ///
-/// A [DeviceFence] is honoured on the device: before the copy is submitted, the copy stream is ordered behind
-/// the fence ([DeviceFence#awaitOn]), so a refill of a slot never overtakes the kernels that were reading it.
-/// The host never waits for the fence.
+/// A [DeviceFence] is honoured on the device: before the copy is submitted, the copy stream is
+/// ordered behind the fence ([DeviceFence#awaitOn]), so a refill of a slot never overtakes the
+/// kernels that were reading it. The host never waits for the fence.
 public final class GpuExpertTransfer implements ExpertTransfer {
     private static final Logger LOG = LoggerFactory.getLogger(GpuExpertTransfer.class);
     private static final long CLOSE_TIMEOUT_SECONDS = 30;
 
     private final ExecutionGpu gpu;
     private final GpuStream copyStream;
+    private final GpuStream[] laneStreams;
     private final HostFrames frames;
     private final AtomicInteger inFlight = new AtomicInteger();
     private final AtomicInteger inFlightHighWater = new AtomicInteger();
@@ -45,8 +48,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
     private final LongAdder busyNanos = new LongAdder();
     private boolean finished;
 
-    /// One copy from request to completion. As the host task published by the boundary's listener it
-    /// completes itself.
+    /// One copy from request to completion. As the host task published by the boundary's listener
+    /// it completes itself.
     private final class Transfer implements HostFrames.Task {
         private final HostRecord record;
         private final long deviceAddress;
@@ -77,8 +80,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
             signal(this.done, failure);
         }
 
-        /// The lattice rejected or lost the completion: the copy's outcome is unknown, so its record stays
-        /// held.
+        /// The lattice rejected or lost the completion: the copy's outcome is unknown, so its
+        /// record stays held.
         @Override
         public void failed(Throwable cause) {
             GpuExpertTransfer.this.finished();
@@ -86,11 +89,95 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         }
     }
 
-    /// A transfer with its own copy stream from `gpu`, whose completions run as host work on `frames`.
+    /// A transfer with its own copy stream from `gpu`, whose completions run as host work on
+    /// `frames`.
     public GpuExpertTransfer(ExecutionGpu gpu, HostFrames frames) {
+        this(gpu, frames, 0);
+    }
+
+    /// As above, with `lanes` more copy streams for the streaming form: each lane copies on a
+    /// stream of its own, so lanes overlap and need no lock between them.
+    public GpuExpertTransfer(ExecutionGpu gpu, HostFrames frames, int lanes) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.frames = Objects.requireNonNull(frames, "frames");
         this.copyStream = gpu.openStream();
+        if (lanes < 0) throw new IllegalArgumentException("lanes must not be negative");
+        this.laneStreams = new GpuStream[lanes];
+        try {
+            for (int lane = 0; lane < lanes; lane++) this.laneStreams[lane] = gpu.openStream();
+        } catch (RuntimeException | Error failure) {
+            closeLanes();
+            this.copyStream.close();
+            throw failure;
+        }
+    }
+
+    private void closeLanes() {
+        for (int lane = 0; lane < this.laneStreams.length; lane++) {
+            GpuStream stream = this.laneStreams[lane];
+            if (stream == null) continue;
+            this.laneStreams[lane] = null;
+            try {
+                stream.close();
+            } catch (RuntimeException failure) {
+                LOG.warn("closing an expert copy lane failed", failure);
+            }
+        }
+    }
+
+    @Override
+    public boolean streams() {
+        return this.laneStreams.length > 0;
+    }
+
+    @Override
+    public long openMarker() {
+        return this.copyStream.openMarker();
+    }
+
+    @Override
+    public void closeMarker(long marker) {
+        this.copyStream.closeMarker(marker);
+    }
+
+    @Override
+    public void stream(
+            int lane,
+            HostRecord record,
+            long deviceAddress,
+            DeviceFence waitFor,
+            long marker,
+            GpuStream.RetirementListener retired) {
+        if (this.closed.get()) throw new IllegalStateException("the expert transfer is closed");
+        GpuStream stream = this.laneStreams[lane];
+        this.inFlight.incrementAndGet();
+        boolean armed = false;
+        try {
+            if (waitFor != null) waitFor.awaitOn(stream);
+            stream.submit(
+                    () -> this.gpu.copyHostWeightsToDevice(deviceAddress, record.hostAddress(), record.byteSize()),
+                    false);
+            stream.mark(marker);
+            stream.notifyRetired(retired);
+            armed = true;
+            this.submitted.increment();
+        } finally {
+            if (!armed) finished();
+        }
+    }
+
+    @Override
+    public Throwable confirm(int lane, long ticket) {
+        try {
+            return this.laneStreams[lane].confirmRetired(ticket);
+        } finally {
+            finished();
+        }
+    }
+
+    @Override
+    public void recover(int lane, Throwable failure) {
+        this.laneStreams[lane].recover(failure);
     }
 
     @Override
@@ -105,8 +192,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         submitOrReport(new Transfer(record, deviceAddress, waitFor, done), false);
     }
 
-    /// Submits the copy and returns; the same as [#startAsync] for callers that expect a thrown failure (the
-    /// cache's blocking acquire, tests).
+    /// Submits the copy and returns; the same as [#startAsync] for callers that expect a thrown
+    /// failure (the cache's blocking acquire, tests).
     @Override
     public void start(HostRecord record, long deviceAddress, DeviceFence waitFor, Completion done) {
         Objects.requireNonNull(record, "record");
@@ -120,9 +207,9 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         submitOrReport(new Transfer(record, deviceAddress, waitFor, done), true);
     }
 
-    /// Submits the copy of a transfer. A failure before the boundary is armed closes the record; with
-    /// `throwing` it is rethrown to a blocked caller, otherwise reported through the completion. Returns
-    /// whether the copy is under way.
+    /// Submits the copy of a transfer. A failure before the boundary is armed closes the record;
+    /// with `throwing` it is rethrown to a blocked caller, otherwise reported through the
+    /// completion. Returns whether the copy is under way.
     private boolean submitOrReport(Transfer transfer, boolean throwing) {
         boolean touchedStream = false;
         boolean armed = false;
@@ -172,8 +259,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         }
     }
 
-    /// Closes the record unless the GPU could not prove that its copy stopped reading it: a poisoned GPU
-    /// retains everything its streams may still touch.
+    /// Closes the record unless the GPU could not prove that its copy stopped reading it: a
+    /// poisoned GPU retains everything its streams may still touch.
     private void closeRecord(HostRecord record) {
         if (!this.gpu.completionProven()) return;
         try {
@@ -188,8 +275,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         return this.submitted.sum();
     }
 
-    /// Time the copy stream held copies, from submission to retirement, summed over copies (copies queued
-    /// behind one another overlap in this sum).
+    /// Time the copy stream held copies, from submission to retirement, summed over copies (copies
+    /// queued behind one another overlap in this sum).
     public long copyNanos() {
         return this.busyNanos.sum();
     }
@@ -233,6 +320,8 @@ public final class GpuExpertTransfer implements ExpertTransfer {
         if (!drained)
             throw new IllegalStateException("expert transfers are still in flight; the copy stream is kept open");
         this.finished = true;
+        for (GpuStream lane : this.laneStreams) if (lane != null) lane.synchronize();
+        closeLanes();
         this.copyStream.synchronize();
         this.copyStream.close();
     }

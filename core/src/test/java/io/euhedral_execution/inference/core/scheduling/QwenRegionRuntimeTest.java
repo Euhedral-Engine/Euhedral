@@ -10,7 +10,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
-/// One runtime admits every plan view of its owner; each reusable graph publishes through its own source.
+/// One runtime admits every plan view of its owner; each reusable graph publishes through its own
+/// source.
 class QwenRegionRuntimeTest {
 
     private final QwenExecutionFixtures.ManualLattice lattice = new QwenExecutionFixtures.ManualLattice();
@@ -63,7 +64,8 @@ class QwenRegionRuntimeTest {
             sequences.forEach(QwenSequenceState::complete);
         }
         assertTrue(this.lattice.sources.stream().allMatch(LatticeSource::isComplete));
-        assertEquals(2, this.lattice.sources.size(), "one source per reusable graph, attached once");
+        assertEquals(
+                EuhedralInferenceRuntime.LAKE_SINKS, this.lattice.sources.size(), "the lake's sinks, attached once");
         assertFalse(runtime.isAttached());
     }
 

@@ -14,7 +14,17 @@ import java.util.concurrent.locks.LockSupport;
 public final class PullingLattice implements LatticeTerminal, AutoCloseable {
 
     private final List<Thread> workers = new CopyOnWriteArrayList<>();
+    private final RuntimeException completionFailure;
     private volatile boolean closed;
+
+    public PullingLattice() {
+        this(null);
+    }
+
+    /// A lattice whose downstream throws `completionFailure` when a source completes.
+    public PullingLattice(RuntimeException completionFailure) {
+        this.completionFailure = completionFailure;
+    }
 
     @Override
     public void addUpstream(LatticeSource source) {
@@ -25,7 +35,9 @@ public final class PullingLattice implements LatticeTerminal, AutoCloseable {
             }
 
             @Override
-            public void onComplete() {}
+            public void onComplete() {
+                if (PullingLattice.this.completionFailure != null) throw PullingLattice.this.completionFailure;
+            }
 
             @Override
             public void onError(Throwable failure) {

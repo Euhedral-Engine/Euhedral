@@ -328,17 +328,16 @@ final class QwenExecutionFixtures {
         }
     }
 
-    /// Euhedral's execution terminal attached with unbounded demand: each published frame runs on the
-    /// publishing thread, so a quantum on a synchronous fixture GPU finishes before `submit` returns.
+    /// Euhedral's execution terminal attached with unbounded demand: each published frame runs on
+    /// the publishing thread, so a quantum on a synchronous fixture GPU finishes before `submit`
+    /// returns.
     static LatticeTerminal inlineLattice() {
-        return source -> {
-            new DefaultExecutor().input(source);
-            source.request(Long.MAX_VALUE);
-        };
+        return new PullingLattice();
     }
 
-    /// Euhedral's execution terminal with no standing demand: `drive` pulls and runs every ready frame,
-    /// including retirement frames that a driver callback only enqueued, and leaves no demand behind.
+    /// Euhedral's execution terminal with no standing demand: `drive` pulls and runs every ready
+    /// frame, including retirement frames that a driver callback only enqueued, and leaves no
+    /// demand behind.
     static final class ManualLattice implements LatticeTerminal {
         /// Each reusable graph attaches its own source once, when it is built.
         final List<LatticeSource> sources = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -352,9 +351,15 @@ final class QwenExecutionFixtures {
             this.source = attached;
         }
 
+        /// Runs ready frames until none is left in any source: a frame may publish into a source
+        /// that was already pulled in this pass.
         void drive() {
-            for (LatticeSource attached : this.sources)
-                attached.pull(PullingLattice::run, frame -> false, Long.MAX_VALUE);
+            long pulled;
+            do {
+                pulled = 0;
+                for (LatticeSource attached : this.sources)
+                    pulled += attached.pull(PullingLattice::run, frame -> false, Long.MAX_VALUE);
+            } while (pulled > 0);
         }
 
         /// Pulls from every attached source, as Euhedral's workers cycle through their upstreams.
@@ -382,8 +387,8 @@ final class QwenExecutionFixtures {
         return new EuhedralInferenceRuntime(inlineLattice(), plan, gpu);
     }
 
-    /// A stream whose device work has finished when `submit` returns, but whose retirement boundaries
-    /// stay unannounced until the test releases them.
+    /// A stream whose device work has finished when `submit` returns, but whose retirement
+    /// boundaries stay unannounced until the test releases them.
     static final class HoldingStream implements GpuStream {
         final List<Long> tickets = new ArrayList<>();
         final List<RetirementListener> listeners = new ArrayList<>();

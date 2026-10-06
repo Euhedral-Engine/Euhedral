@@ -8,11 +8,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /// One execution stage of a reusable [StageGraph], an Euhedral frame like any other.
 ///
-/// A stage submits its device work to a lane of its graph's pool, chosen when it runs, and never runs
-/// a successor. It first awaits, on that lane, the markers of predecessors that ran on other lanes. After a
-/// successful submission it satisfies its outgoing edges; the edge that completes a successor's
-/// incoming set publishes that successor to the source. No authority places it: a worker with capacity
-/// takes it first come, first served, or the lattice routes it by the frame's hash.
+/// A stage submits its device work to a lane of its graph's pool, chosen when it runs, and never
+/// runs a successor. It first awaits, on that lane, the markers of predecessors that ran on other
+/// lanes. After a successful submission it satisfies its outgoing edges; the edge that completes a
+/// successor's incoming set publishes that successor to the source. No authority places it: a
+/// worker with capacity takes it first come, first served, or the lattice routes it by the frame's
+/// hash.
 ///
 /// Once published, a frame is handled by one thread at a time. Its incoming-edge count is the only
 /// state that concurrent predecessors touch before publication.
@@ -40,12 +41,13 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     StageFrame[] submittedPredecessors;
     /// The predecessor whose longest remaining path continues through this stage; null otherwise.
     StageFrame pathPredecessor;
-    /// Recorded on this stage's lane after it submits when it has successors (multi-lane pools only).
+    /// Recorded on this stage's lane after it submits when it has successors (multi-lane pools
+    /// only).
     long marker;
     /// The marker's mirror on the lane's shadow while the graph records a captured quantum.
     long shadowMarker;
-    /// The lane this stage submitted to in the current quantum. Successors read it after their final
-    /// arrival, which orders it after this stage's submission.
+    /// The lane this stage submitted to in the current quantum. Successors read it after their
+    /// final arrival, which orders it after this stage's submission.
     int lane;
 
     @SuppressWarnings("unused")
@@ -62,11 +64,18 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     boolean submitted;
 
     protected StageFrame(StageGraph graph, int stage) {
-        super(FrameSeeds.ID_HASH);
+        this(graph, stage, false);
+    }
+
+    /// An `ordered` stage keeps its graph's one routing hash: the lattice places the graph's
+    /// ordered stages on the same lane, so a chain of them continues where it started. Other stages
+    /// are spread over the lanes.
+    protected StageFrame(StageGraph graph, int stage, boolean ordered) {
+        super(ordered ? graph.chainHash() : FrameSeeds.ID_HASH);
         this.graph = graph;
         this.stage = stage;
         this.inDegree = graph.topology().inDegree(stage);
-        randomizeHash(graph.nextRoutingSeed());
+        if (!ordered) randomizeHash(graph.nextRoutingSeed());
     }
 
     /// Submits this stage's device work. The quantum's stream is selected on the calling thread.
@@ -204,9 +213,9 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         else this.graph.stageFinished();
     }
 
-    /// The lattice rejected this frame without running it: the worker's cache retired, or no downstream
-    /// was routable. The stage never submitted, so the quantum fails. The rejection may be an instance
-    /// the lattice shares, so it is only referenced as the cause.
+    /// The lattice rejected this frame without running it: the worker's cache retired, or no
+    /// downstream was routable. The stage never submitted, so the quantum fails. The rejection may
+    /// be an instance the lattice shares, so it is only referenced as the cause.
     @Override
     public final void doFinallyWithError(Throwable rejection) {
         this.graph.stageFailed(new IllegalStateException("the lattice rejected stage " + this.stage, rejection));
@@ -217,7 +226,8 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         return (int) ARRIVALS.getAndAdd(this, 1) + 1 == this.inDegree;
     }
 
-    /// The lane this stage continues, or -1: its path predecessor's, or the graph's home lane for a root.
+    /// The lane this stage continues, or -1: its path predecessor's, or the graph's home lane for a
+    /// root.
     private int continuedLane(LanePool pool, StageGraph owner) {
         if (pool.size() == 1) return -1;
         if (this.submittedPredecessors.length == 0) return owner.home();

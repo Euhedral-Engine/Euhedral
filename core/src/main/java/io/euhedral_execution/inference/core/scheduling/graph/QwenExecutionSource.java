@@ -17,14 +17,15 @@ import java.util.function.Function;
 /// The boundary between Qwen frame graphs and Euhedral.
 ///
 /// Admission publishes a graph's root frames and each stage publishes the successors it made ready.
-/// The source only holds ready frames: it does not know what a frame computes, which frames depend on
-/// it, or how many stages a graph has. Workers take ready frames from it through `pull` and `request`;
-/// nothing above them decides which worker takes which frame.
+/// The source only holds ready frames: it does not know what a frame computes, which frames depend
+/// on it, or how many stages a graph has. Workers take ready frames from it through `pull` and
+/// `request`; nothing above them decides which worker takes which frame.
 ///
 /// Euhedral calls `pull` and `request` one at a time. Publishers run concurrently on workers and on
-/// driver callback threads, so the ready queue has one drain owner at a time: a worker-side publication
-/// may deliver against outstanding `request` demand only while no other drain is active.
-public final class QwenExecutionSource implements LatticeSource {
+/// driver callback threads, so the ready queue has one drain owner at a time: a worker-side
+/// publication may deliver against outstanding `request` demand only while no other drain is
+/// active.
+public final class QwenExecutionSource implements LatticeSource, FrameLake {
 
     private static final int CLOSED = Integer.MIN_VALUE;
 
@@ -38,6 +39,7 @@ public final class QwenExecutionSource implements LatticeSource {
     private final CompletableFuture<Void> termination = new CompletableFuture<>();
 
     /// Accepts one graph for execution. The source cannot complete until that graph terminates.
+    @Override
     public void admit() {
         while (true) {
             int count = this.accepted.get();
@@ -47,8 +49,10 @@ public final class QwenExecutionSource implements LatticeSource {
         }
     }
 
-    /// Accepts one more unit while the source drains: allowed only while an accepted unit is still running, whose
-    /// continuation this is, so a closing source finishes the work it holds and then refuses everything.
+    /// Accepts one more unit while the source drains: allowed only while an accepted unit is still
+    /// running, whose continuation this is, so a closing source finishes the work it holds and then
+    /// refuses everything.
+    @Override
     public void admitDuringDrain() {
         while (true) {
             int count = this.accepted.get();
@@ -65,6 +69,7 @@ public final class QwenExecutionSource implements LatticeSource {
     }
 
     /// Records that an accepted graph reached its terminal state.
+    @Override
     public void terminated() {
         int remaining = this.accepted.decrementAndGet();
         if (remaining == CLOSED) signalComplete();
@@ -75,6 +80,7 @@ public final class QwenExecutionSource implements LatticeSource {
     }
 
     /// Makes a ready frame available to Euhedral from a worker or admission thread.
+    @Override
     public void publish(AbstractFrame frame) {
         offer(frame);
         // Pairs with the demand increment in request(): one side observes the other.
@@ -83,6 +89,7 @@ public final class QwenExecutionSource implements LatticeSource {
     }
 
     /// Makes a ready frame available from a driver callback thread, which must never run frames.
+    @Override
     public void publishFromCallback(AbstractFrame frame) {
         offer(frame);
     }

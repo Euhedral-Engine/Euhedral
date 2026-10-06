@@ -10,22 +10,27 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Model;
 import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.scheduling.HostTasks;
+import io.euhedral_execution.inference.core.scheduling.graph.InferenceLake;
 import java.time.Duration;
 import java.util.BitSet;
 
-/// A started lattice and the host work attached to it, for CUDA tests that measure or exercise Flash-Next as the
-/// engine runs it: the executor's steps and the expert pipeline run as frames on these workers. One per JVM.
+/// A started lattice and the host work attached to it, for CUDA tests that measure or exercise
+/// Flash-Next as the engine runs it: the executor's steps and the expert pipeline run as frames on
+/// these workers. One per JVM.
 public final class Qwen4TestLattice implements AutoCloseable {
 
     private final ControlPlaneLattice lattice;
+    private final InferenceLake lake;
     private final HostTasks tasks;
 
-    private Qwen4TestLattice(ControlPlaneLattice lattice, HostTasks tasks) {
+    private Qwen4TestLattice(ControlPlaneLattice lattice, InferenceLake lake, HostTasks tasks) {
         this.lattice = lattice;
+        this.lake = lake;
         this.tasks = tasks;
     }
 
-    /// Starts a lattice with workers on `workers` distinct physical cores (`EUHEDRAL_QWEN4_WORKERS` overrides).
+    /// Starts a lattice with workers on `workers` distinct physical cores (`EUHEDRAL_QWEN4_WORKERS`
+    /// overrides).
     public static Qwen4TestLattice start(int workers) {
         String override = System.getenv("EUHEDRAL_QWEN4_WORKERS");
         if (override != null) workers = Integer.parseInt(override);
@@ -44,7 +49,8 @@ public final class Qwen4TestLattice implements AutoCloseable {
         ControlPlaneLattice lattice = ControlPlaneLattice.getOrCreate(
                 new LatticeConfig("Qwen4TestLattice", cpus, Duration.ofSeconds(10), shard));
         lattice.start();
-        return new Qwen4TestLattice(lattice, new HostTasks(lattice));
+        InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
+        return new Qwen4TestLattice(lattice, lake, new HostTasks(lake));
     }
 
     public HostTasks tasks() {
@@ -66,7 +72,7 @@ public final class Qwen4TestLattice implements AutoCloseable {
 
     /// The execution plan of `model` on this lattice, with the runtime that runs its graphs.
     public Run run(ExecutionGpu gpu, Qwen4Model model, int maxContextTokens) {
-        EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(this.lattice, this.tasks, gpu, 2);
+        EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(this.lake, this.tasks, gpu, 2);
         try {
             return new Run(runtime, new Qwen4ExecutionPlan(gpu, model, maxContextTokens, runtime));
         } catch (RuntimeException | Error failure) {
@@ -104,6 +110,8 @@ public final class Qwen4TestLattice implements AutoCloseable {
     @Override
     public void close() {
         this.tasks.close();
+        this.lake.completeGracefully();
+        this.lake.awaitTermination();
         this.lattice.close();
     }
 }
