@@ -264,6 +264,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         var before = model.expertCache().stats().snapshot();
                         var tiersBefore = model.hierarchyStats();
+                        var loadsBefore = executor.expertTimings();
+                        long fullBefore = executor.expertFullFetches();
                         LayerStats layers = new LayerStats();
                         if (target == 4096) executor.trace(layers);
                         long start = System.nanoTime();
@@ -291,6 +293,13 @@ class Qwen4PerformanceCudaIntegrationTest {
                                         before.loadWaitNanos(),
                                         target)));
                         line("  tiers: " + tiers(model, tiersBefore, target));
+                        line("  loads: "
+                                + loads(
+                                        loadsBefore,
+                                        executor.expertTimings(),
+                                        fullBefore,
+                                        executor.expertFullFetches(),
+                                        target));
                     }
                 }
                 for (int context : Arrays.stream(new int[] {64, 4096, 16384, 32768})
