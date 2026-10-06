@@ -42,6 +42,8 @@ final class ExpertLoad {
     final ExpertLease lease;
     final RamTierShard tier;
     final TierDirective directive;
+    /// Whether the load reads the artifact (one of the disk's reads in flight until it ends).
+    final boolean reads;
     private final long seed;
     private final Part[] parts;
     private final Join join;
@@ -77,6 +79,7 @@ final class ExpertLoad {
             int buffer,
             RamTierShard tier,
             TierDirective directive,
+            boolean reads,
             long seed) {
         this.owner = owner;
         this.target = target;
@@ -87,6 +90,7 @@ final class ExpertLoad {
         this.seed = seed;
         this.fetchedAt = System.nanoTime();
         this.directive = directive;
+        this.reads = reads;
         int count = this.directive.mode() != TierDirective.Mode.HIT
                         && owner.cache.store().rangedReads()
                 ? Math.max(1, owner.readParts)
