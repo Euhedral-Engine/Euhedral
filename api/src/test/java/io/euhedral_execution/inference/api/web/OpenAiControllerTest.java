@@ -342,6 +342,8 @@ class OpenAiControllerTest {
                 .andReturn();
         String body = result.getResponse().getContentAsString();
         assertFalse(body.contains("0x7f00") || body.contains("lattice") || body.contains("Exception"), body);
+        // The session closes on the generation's thread, possibly after the response was written.
+        assertTrue(this.backend.only().awaitClosed(), "the failed generation's session must close");
         assertEquals(1, this.backend.only().closeCount.get());
     }
 
