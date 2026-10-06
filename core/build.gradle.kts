@@ -24,6 +24,7 @@ val latticeTestClasses = listOf(
     "**/QwenGenerationSessionTest.class",
     "**/QwenGenerationSessionPrefixCacheTest.class",
     "**/InferenceEngineTest.class",
+    "**/Qwen4LatticeHostTest.class",
 )
 
 val latticeTest = tasks.register<Test>("latticeTest") {
