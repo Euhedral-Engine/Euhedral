@@ -19,6 +19,14 @@ final class ExpertKeys {
         this.firstKey[banks.length] = (int) total;
     }
 
+    /// The shard that owns `key` among `shards`: a hash, so the experts of one bank spread over every
+    /// shard, and the same everywhere the key is routed (the device cache, the host tier).
+    static int shardOf(int key, int shards) {
+        int hash = key * 0x9E3779B1;
+        hash ^= hash >>> 15;
+        return (hash & Integer.MAX_VALUE) % shards;
+    }
+
     int bankCount() {
         return this.firstKey.length - 1;
     }

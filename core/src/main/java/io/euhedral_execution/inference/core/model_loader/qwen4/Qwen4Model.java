@@ -3,14 +3,13 @@ package io.euhedral_execution.inference.core.model_loader.qwen4;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.layer_weights.TensorHandle;
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ArenaExpertStore;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertCacheStats;
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertTransfer;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.FileExpertStore;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.FileRecordSource;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.GpuExpertTransfer;
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.HostExpertStore;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTier;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -35,6 +34,10 @@ public final class Qwen4Model implements AutoCloseable {
     /// Threads that read and check fixed objects while loading.
     static final int LOAD_THREADS = 8;
 
+    /// Readers that fill a resident expert tier at startup, each taking about 32 MiB of contiguous
+    /// records at a time.
+    static final int PRELOAD_READERS = 16;
+
     private final Qwen4Artifact artifact;
     private final Qwen4ResidencyPlan plan;
     private final Qwen4FixedLoader.Loaded fixed;
@@ -42,6 +45,9 @@ public final class Qwen4Model implements AutoCloseable {
     private final NgramStore ngram;
     private final ExpertCache cache;
     private final ExpertBank[] cachedBanks;
+    private final FileExpertStore fileStore;
+    private final FileRecordSource artifactSource;
+    private final GpuExpertTransfer gpuTransfer;
     private boolean closed;
 
     private Qwen4Model(
@@ -51,7 +57,10 @@ public final class Qwen4Model implements AutoCloseable {
             ExecutionGpu gpu,
             NgramStore ngram,
             ExpertCache cache,
-            ExpertBank[] cachedBanks) {
+            ExpertBank[] cachedBanks,
+            FileExpertStore fileStore,
+            FileRecordSource artifactSource,
+            GpuExpertTransfer gpuTransfer) {
         this.artifact = artifact;
         this.plan = plan;
         this.fixed = fixed;
@@ -59,6 +68,9 @@ public final class Qwen4Model implements AutoCloseable {
         this.ngram = ngram;
         this.cache = cache;
         this.cachedBanks = cachedBanks;
+        this.fileStore = fileStore;
+        this.artifactSource = artifactSource;
+        this.gpuTransfer = gpuTransfer;
     }
 
     /// Reads and validates the artifact, plans its residency for `freeDeviceBytes`, `host` and
@@ -87,28 +99,48 @@ public final class Qwen4Model implements AutoCloseable {
 
         Qwen4FixedLoader.Loaded fixed = Qwen4FixedLoader.load(path, artifact, plan, gpu, LOAD_THREADS);
         NgramStore ngram = null;
-        HostExpertStore store = null;
-        ExpertTransfer transfer = null;
+        FileRecordSource artifactSource = null;
+        RamTier tier = null;
+        FileExpertStore store = null;
+        GpuExpertTransfer transfer = null;
         try {
             ngram = NgramStore.open(path, artifact, plan.ngram(), gpu);
-            store = switch (plan.expertStore()) {
-                case PINNED_ARENA -> new ArenaExpertStore(gpu, path, cachedBanks, LOAD_THREADS);
-                case FILE_BACKED ->
-                    new FileExpertStore(
-                            gpu, path, cachedBanks, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
-            };
-            transfer = new GpuExpertTransfer(gpu, Qwen4ResidencyPlanner.fileStagingSlots(artifact.config()));
+            int lanes = Qwen4ResidencyPlanner.fileStagingSlots(artifact.config());
+            int shards = Qwen4ResidencyPlanner.expertShards(plan.expertCache().slotCount());
+            artifactSource = new FileRecordSource(path, cachedBanks);
+            if (plan.expertStore() != Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
+                tier = new RamTier(cachedBanks, plan.host().expertRamSlots(), shards, RamTier.Policy.BANK_PARTITIONED);
+                if (tier.isResident()) {
+                    long begin = System.nanoTime();
+                    tier.preload(artifactSource, PRELOAD_READERS);
+                    LOG.info(
+                            "Expert tier loaded: {} records, {} MiB in {} ms ({} MiB/s)",
+                            tier.slotCount(),
+                            tier.capacityBytes() >> 20,
+                            (System.nanoTime() - begin) / 1_000_000,
+                            (long) (tier.stats().preloadBytesPerSecond() / 1048576.0));
+                }
+            }
+            // The store owns the source and the tier from here on, and closes them.
+            FileRecordSource owned = artifactSource;
+            RamTier ownedTier = tier;
+            store = new FileExpertStore(gpu, owned, ownedTier, cachedBanks, lanes);
+            transfer = new GpuExpertTransfer(gpu, lanes);
             ExpertCache cache = new ExpertCache(
                     store,
                     transfer,
                     gpu,
                     plan.expertCache().slotCount(),
                     plan.expertCache().slotBytes(),
-                    Qwen4ResidencyPlanner.expertShards(plan.expertCache().slotCount()));
-            return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks);
+                    shards);
+            return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);
-            closeQuietly(store, failure);
+            if (store != null) closeQuietly(store, failure);
+            else {
+                closeQuietly(artifactSource, failure);
+                closeQuietly(tier, failure);
+            }
             closeQuietly(ngram, failure);
             Qwen4FixedLoader.release(fixed.handles(), fixed.hostArena(), staging(fixed), gpu, failure);
             if (failure instanceof IOException io) throw io;
@@ -204,6 +236,27 @@ public final class Qwen4Model implements AutoCloseable {
                 ngramStats.bytesStagedToDevice(),
                 ngramStats.rowsGathered(),
                 this.ngram.hostBytes());
+    }
+
+    /// A reading of every tier of the expert hierarchy.
+    public ExpertHierarchyStats hierarchyStats() {
+        RamTier tier = this.fileStore.ramTier();
+        ExpertCacheStats.Snapshot gpuStats = this.cache.stats().snapshot();
+        return new ExpertHierarchyStats(
+                gpuStats,
+                tier == null ? null : tier.stats(),
+                new ExpertHierarchyStats.Artifact(
+                        this.artifactSource.recordReads(),
+                        this.artifactSource.bytesRead(),
+                        this.artifactSource.readNanos(),
+                        this.artifactSource.concurrentReadsHighWater()),
+                new ExpertHierarchyStats.Staging(
+                        this.fileStore.lanes(),
+                        this.fileStore.recordOpens(),
+                        this.fileStore.ramCopyBytes(),
+                        this.fileStore.ramCopyNanos()),
+                new ExpertHierarchyStats.H2d(
+                        gpuStats.transferBytes(), gpuStats.transferNanos(), this.gpuTransfer.submittedCopies()));
     }
 
     /// Mapped bytes of fixed objects other than the token embedding.

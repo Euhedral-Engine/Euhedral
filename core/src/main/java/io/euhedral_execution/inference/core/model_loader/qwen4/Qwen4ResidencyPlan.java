@@ -3,11 +3,12 @@ package io.euhedral_execution.inference.core.model_loader.qwen4;
 import java.util.Locale;
 import java.util.Map;
 
-/// Where every part of a Flash-Next model lives for one device, one host and one maximum context: the outcome of
-/// [Qwen4ResidencyPlanner]. Placement is computed, never configured.
+/// Where every part of a Flash-Next model lives for one device, one host and one maximum context: the outcome
+/// of [Qwen4ResidencyPlanner]. Placement is computed, never configured.
 ///
-/// `placements` holds the storage class of every fixed object by name (device resident, host mapped, host staged
-/// or deferred); every expert bank is device cached (`cachedBanks`) or deferred; n-gram shards are host staged.
+/// `placements` holds the storage class of every fixed object by name (device resident, host mapped, host
+/// staged or deferred); every expert bank is device cached (`cachedBanks`) or deferred; n-gram shards are
+/// host staged.
 public record Qwen4ResidencyPlan(
         int maxContextTokens,
         Qwen4Mode mode,
@@ -24,11 +25,17 @@ public record Qwen4ResidencyPlan(
     /// Storage of one fixed object; `move` is set for objects that left the device.
     public record Placement(StorageClass storage, Qwen4Priority.Move move) {}
 
-    /// How the routed experts are held on the host behind the device cache.
+    /// How the routed experts are held on the host behind the device cache. In every mode records reach the
+    /// device through a small pool of pinned staging slots; what differs is where a record comes from when a
+    /// slot is filled.
     public enum ExpertStoreMode {
-        /// All expert records in one pinned huge-page arena.
-        PINNED_ARENA,
-        /// Records stay in the artifact file (and the OS page cache) and pass through pinned staging slots.
+        /// Every record sits in ordinary (pageable) memory, loaded once at startup: no routed expert is read
+        /// from the artifact during inference.
+        RAM_RESIDENT,
+        /// A bounded pageable cache of records, filled lazily from the artifact, replaced by a layer-aware
+        /// policy.
+        RAM_CACHED,
+        /// No RAM tier: every GPU miss reads its record from the artifact (and the OS page cache).
         FILE_BACKED
     }
 
@@ -39,7 +46,8 @@ public record Qwen4ResidencyPlan(
         MAPPED_FILE
     }
 
-    /// Device bytes. `expertCacheBytes` is the whole slots of the cache; `slackBytes` what is left below one slot.
+    /// Device bytes. `expertCacheBytes` is the whole slots of the cache; `slackBytes` what is left below one
+    /// slot.
     public record Device(
             long freeBytes,
             long kvBytes,
@@ -67,19 +75,28 @@ public record Qwen4ResidencyPlan(
         }
     }
 
-    /// Host bytes by use. Pinned bytes are page-locked; file-backed ones are the artifact's own pages.
+    /// Host bytes by use. Pinned bytes are page-locked; the expert tier is ordinary memory; file-backed bytes
+    /// are the artifact's own pages. The tier holds `expertRamSlots` equal records.
     public record Host(
             long mappedBytes,
             long stagedBytes,
-            long expertStorePinnedBytes,
-            long expertStoreFileBytes,
+            long expertStagingPinnedBytes,
+            long expertRamBytes,
+            int expertRamSlots,
+            long expertFileBytes,
             long ngramPinnedBytes,
             long ngramFileBytes,
             long deferredMtpBytes,
             long deferredVisionBytes) {
 
         public long pinnedBytes() {
-            return mappedBytes + stagedBytes + expertStorePinnedBytes + ngramPinnedBytes;
+            return mappedBytes + stagedBytes + expertStagingPinnedBytes + ngramPinnedBytes;
+        }
+
+        /// Ordinary memory the plan holds in all: the expert tier and everything pinned (pinned memory is
+        /// ordinary memory that cannot be paged out).
+        public long residentBytes() {
+            return pinnedBytes() + expertRamBytes;
         }
     }
 
@@ -122,12 +139,14 @@ public record Qwen4ResidencyPlan(
         line(
                 out,
                 "expert host store",
-                this.expertStore + ", " + mib(h.expertStorePinnedBytes()) + " pinned, " + mib(h.expertStoreFileBytes())
-                        + " file backed");
+                this.expertStore + ", " + mib(h.expertRamBytes()) + " RAM (" + h.expertRamSlots() + " records), "
+                        + mib(h.expertStagingPinnedBytes()) + " pinned staging, " + mib(h.expertFileBytes())
+                        + " in the artifact");
         line(out, "n-gram host storage", this.ngram + ", " + mib(h.ngramPinnedBytes() + h.ngramFileBytes()));
         line(out, "deferred MTP", mib(h.deferredMtpBytes()));
         line(out, "deferred vision", mib(h.deferredVisionBytes()));
         line(out, "pinned host memory", mib(h.pinnedBytes()));
+        line(out, "ordinary host memory", mib(h.residentBytes()));
         if (!this.fits) line(out, "does not fit", this.explanation);
         return out.toString();
     }

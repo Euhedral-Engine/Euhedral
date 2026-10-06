@@ -62,13 +62,24 @@ class Qwen4ModelTest {
     }
 
     @Test
-    void servesExpertsFromAPinnedArenaWithTheArtifactsBytes() throws Exception {
-        exercise(HostBudget.ofAvailable(64 * GIB), Qwen4ResidencyPlan.ExpertStoreMode.PINNED_ARENA);
+    void servesExpertsFromResidentRamWithTheArtifactsBytes() throws Exception {
+        exercise(HostBudget.ofAvailable(64 * GIB), Qwen4ResidencyPlan.ExpertStoreMode.RAM_RESIDENT);
+    }
+
+    @Test
+    void servesExpertsFromABoundedRamCacheWithTheArtifactsBytes() throws Exception {
+        // Room for 26 of the 32 expert records in ordinary memory: more than the 20 device slots, fewer than all.
+        var reference = Qwen4ResidencyPlanner.plan(
+                this.artifact, Qwen4Mode.TEXT, 64 * GIB, HostBudget.ofAvailable(64 * GIB), CONTEXT);
+        long recordSlot =
+                reference.host().expertRamBytes() / reference.expertCache().totalExperts();
+        long resident = reference.host().pinnedBytes() + 26 * recordSlot;
+        exercise(new HostBudget(64 * GIB, resident), Qwen4ResidencyPlan.ExpertStoreMode.RAM_CACHED);
     }
 
     @Test
     void servesExpertsFromTheFileThroughStagingSlots() throws Exception {
-        // 1 MiB pinnable holds the embedding and the staging slots, but not the 32 expert records
+        // 1 MiB holds neither the embedding nor an expert tier larger than the device cache
         exercise(new HostBudget(1 << 20), Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED);
     }
 
@@ -133,6 +144,24 @@ class Qwen4ModelTest {
                         crc.update(back.asSlice(0, lease.byteSize()).asByteBuffer());
                         assertEquals(banks[bank].crc32(expert), (int) crc.getValue());
                     }
+                }
+            }
+            var hierarchy = model.hierarchyStats();
+            assertEquals(
+                    model.expertCache().stats().snapshot().misses(),
+                    hierarchy.gpu().misses());
+            if (expectedStore == Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
+                assertNull(hierarchy.ram());
+                assertEquals(hierarchy.gpu().misses(), hierarchy.artifact().recordReads());
+            } else {
+                assertTrue(hierarchy.ram().totalHits() + hierarchy.ram().totalMisses() > 0);
+                assertEquals(hierarchy.gpu().misses(), hierarchy.staging().recordsStaged());
+                if (expectedStore == Qwen4ResidencyPlan.ExpertStoreMode.RAM_RESIDENT) {
+                    assertEquals(32, hierarchy.ram().residentExperts());
+                    assertEquals(0, hierarchy.ram().totalMisses(), "a resident tier reads nothing from the artifact");
+                    assertEquals(hierarchy.gpu().misses(), hierarchy.ram().totalHits());
+                } else {
+                    assertTrue(hierarchy.ram().residentExperts() <= 26);
                 }
             }
             var telemetry = model.telemetry();

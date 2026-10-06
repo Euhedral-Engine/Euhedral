@@ -28,6 +28,20 @@ public interface HostExpertStore extends AutoCloseable {
     /// @throws IndexOutOfBoundsException when `bank`, `expert` or `lane` is out of range
     HostRecord open(int bank, int expert, int lane) throws IOException, InterruptedException;
 
+    /// As [#open(int, int, int)], as the host tier's `directive` says: a hit copies the record out of
+    /// the tier, a fill reads the artifact into the tier's slot and copies it out, anything else reads
+    /// into the staging slot. A store without a tier ignores the directive.
+    default HostRecord open(int bank, int expert, int lane, TierDirective directive)
+            throws IOException, InterruptedException {
+        return open(bank, expert, lane);
+    }
+
+    /// The host tier's bookkeeping for the device cache shard `shard`, owned by that shard's source, or
+    /// null when the store has no tier.
+    default RamTierShard tier(int shard) {
+        return null;
+    }
+
     /// Bytes read from the artifact file so far.
     long bytesRead();
 

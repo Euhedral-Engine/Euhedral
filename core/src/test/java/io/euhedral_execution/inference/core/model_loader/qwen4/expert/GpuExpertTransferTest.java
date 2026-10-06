@@ -29,7 +29,7 @@ class GpuExpertTransferTest {
     private final HostBackedGpu gpu = new HostBackedGpu();
     private final List<FakeStream> streams = new ArrayList<>();
     private ExpertFixture fixture;
-    private ArenaExpertStore store;
+    private FileExpertStore store;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -41,7 +41,7 @@ class GpuExpertTransferTest {
             }
             return stream;
         });
-        this.store = new ArenaExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 2);
+        this.store = new FileExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 2);
     }
 
     private FakeStream lane(int lane) {

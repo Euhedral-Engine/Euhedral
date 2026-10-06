@@ -10,8 +10,8 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-/// The context/residency matrix: for a range of device budgets and contexts at the real model's object sizes, the
-/// plan's invariants (not particular placements, which several layouts could satisfy).
+/// The context/residency matrix: for a range of device budgets and contexts at the real model's object sizes,
+/// the plan's invariants (not particular placements, which several layouts could satisfy).
 class Qwen4ResidencyPlannerTest {
 
     static final long GIB = 1L << 30;
@@ -246,15 +246,23 @@ class Qwen4ResidencyPlannerTest {
     void hostPlacementFollowsTheHostBudget() {
         var roomy = Qwen4ResidencyPlanner.plan(
                 artifact, Qwen4Mode.TEXT, 15 * GIB, HostBudget.ofAvailable(256 * GIB), 32768);
-        assertEquals(Qwen4ResidencyPlan.ExpertStoreMode.PINNED_ARENA, roomy.expertStore());
+        assertEquals(Qwen4ResidencyPlan.ExpertStoreMode.RAM_RESIDENT, roomy.expertStore());
         assertEquals(Qwen4ResidencyPlan.NgramMode.PINNED_ARENA, roomy.ngram());
-        var tight =
+        // Pinned memory stays a small tier however much memory there is: staging, never the experts.
+        assertTrue(roomy.host().expertStagingPinnedBytes() < roomy.host().expertRamBytes() / 100);
+        var cached =
                 Qwen4ResidencyPlanner.plan(artifact, Qwen4Mode.TEXT, 15 * GIB, HostBudget.ofAvailable(40 * GIB), 32768);
+        assertEquals(Qwen4ResidencyPlan.ExpertStoreMode.RAM_CACHED, cached.expertStore());
+        assertEquals(Qwen4ResidencyPlan.NgramMode.MAPPED_FILE, cached.ngram());
+        assertTrue(cached.host().expertRamSlots() > cached.expertCache().slotCount());
+        assertTrue(cached.host().expertRamSlots() < cached.expertCache().totalExperts());
+        assertTrue(cached.host().expertStagingPinnedBytes() < (1L << 30));
+        assertTrue(cached.host().residentBytes()
+                <= HostBudget.ofAvailable(40 * GIB).residentBytes());
+        var tight =
+                Qwen4ResidencyPlanner.plan(artifact, Qwen4Mode.TEXT, 15 * GIB, HostBudget.ofAvailable(8 * GIB), 32768);
         assertEquals(Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED, tight.expertStore());
-        assertEquals(Qwen4ResidencyPlan.NgramMode.MAPPED_FILE, tight.ngram());
-        assertTrue(tight.host().expertStorePinnedBytes() < (1L << 30));
-        assertTrue(
-                tight.host().pinnedBytes() <= HostBudget.ofAvailable(40 * GIB).pinnableBytes());
+        assertEquals(0, tight.host().expertRamSlots());
     }
 
     @Test

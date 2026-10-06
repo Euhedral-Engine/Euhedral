@@ -53,7 +53,10 @@ class ExpertSourceTest {
     }
 
     private void build(int slots, int lanes) throws IOException {
-        var store = new ArenaExpertStore(this.gpu, this.fixture.file, this.fixture.banks, 2);
+        build(slots, lanes, new FileExpertStore(this.gpu, this.fixture.file, this.fixture.banks, lanes));
+    }
+
+    private void build(int slots, int lanes, FileExpertStore store) {
         var transfer = new GpuExpertTransfer(this.gpu, lanes);
         this.cache = new ExpertCache(store, transfer, this.gpu, slots, this.fixture.slotBytes(), 1);
         this.source = new ExpertSource(this.cache, 0);
@@ -261,5 +264,86 @@ class ExpertSourceTest {
         drive(() -> this.cache.openLeaseCount() == 0);
         assertFalse(lease.isValid());
         assertNotNull(this.cache.shard(0));
+    }
+
+    @Test
+    void aDeviceMissAfterItsEvictionIsAnsweredFromTheRamTierWithoutReadingTheArtifact() throws Exception {
+        build(2, 2, ExpertTestSupport.ramStore(this.gpu, this.fixture.file, this.fixture.banks, 2, 10, 1));
+        var tier = ((FileExpertStore) this.cache.store()).ramTier();
+        Block first = new Block(2, 0, 1, 2, 3);
+        this.source.submit(first.work());
+        // Four experts through two device slots: close each lease as it arrives so the walk goes on.
+        boolean[] closed = new boolean[4];
+        drive(() -> {
+            for (int position = 0; position < 4; position++) {
+                ExpertLease lease = first.lease(position);
+                if (lease != null && !closed[position]) {
+                    closed[position] = true;
+                    lease.close();
+                }
+            }
+            return first.done.get() == 1 && this.cache.openLeaseCount() == 0;
+        });
+        assertEquals(4, tier.stats().totalMisses(), "every first touch fills a slot");
+        assertEquals(0, tier.stats().totalHits());
+        long artifactReads = this.cache.store().bytesRead();
+
+        Block again = new Block(2, 0);
+        this.source.submit(again.work());
+        drive(() -> again.done.get() == 1);
+        ExpertLease lease = again.lease(0);
+        assertNotEquals(0, lease.readyMarker(), "the device missed: a copy was made");
+        assertArrayEquals(this.fixture.record(2, 0), this.gpu.readDevice(lease.deviceAddress(), lease.byteSize()));
+        lease.close();
+        drive(() -> this.cache.openLeaseCount() == 0);
+        assertEquals(1, tier.stats().totalHits(), "the device miss was a RAM hit");
+        assertEquals(artifactReads, this.cache.store().bytesRead(), "and read nothing from the artifact");
+        this.cache.checkQuiescent();
+        tier.checkInvariants();
+        assertEquals(0, this.cache.store().tier(0).pinnedSlots(), "every tier slot was released");
+    }
+
+    @Test
+    void aReadThatFailsGivesItsTierSlotBackAndAFailedCopyKeepsTheRecordItRead() throws Exception {
+        var failingReads = new RecordSource() {
+            private final FileRecordSource real = new FileRecordSource(fixture.file, fixture.banks);
+            private int calls;
+
+            @Override
+            public void read(ExpertBank bank, int expert, java.lang.foreign.MemorySegment destination)
+                    throws IOException, InterruptedException {
+                if (this.calls++ == 0) throw new IOException("injected");
+                this.real.read(bank, expert, destination);
+            }
+
+            @Override
+            public long bytesRead() {
+                return this.real.bytesRead();
+            }
+
+            @Override
+            public void close() {
+                this.real.close();
+            }
+        };
+        var tier = new RamTier(this.fixture.banks, 10, 1, RamTier.Policy.BANK_PARTITIONED);
+        build(4, 2, new FileExpertStore(this.gpu, failingReads, tier, this.fixture.banks, 2));
+
+        Block failed = new Block(2, 0);
+        this.source.submit(failed.work());
+        drive(() -> failed.done.get() == 1);
+        assertEquals(1, failed.failures.size());
+        assertEquals(0, tier.stats().residentExperts(), "the failed read left nothing in its slot");
+        assertEquals(0, tier.shard(0).pinnedSlots());
+        tier.checkInvariants();
+
+        this.gpu.failNextHostCopies(1);
+        Block copy = new Block(2, 1);
+        this.source.submit(copy.work());
+        drive(() -> copy.done.get() == 1);
+        assertEquals(1, copy.failures.size());
+        assertTrue(tier.shard(0).isResident(2, 1), "the record was read: the tier keeps it");
+        tier.checkInvariants();
+        assertEquals(0, tier.shard(0).pinnedSlots());
     }
 }

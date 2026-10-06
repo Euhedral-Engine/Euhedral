@@ -131,10 +131,7 @@ public final class ExpertCache implements AutoCloseable {
 
     /// The shard whose slots can hold the expert: the same for every request for it.
     public int shardOf(int bank, int expert) {
-        int key = this.keys.key(bank, expert);
-        int hash = key * 0x9E3779B1;
-        hash ^= hash >>> 15;
-        return (hash & Integer.MAX_VALUE) % this.shards.length;
+        return ExpertKeys.shardOf(this.keys.key(bank, expert), this.shards.length);
     }
 
     /// The first copy lane of `shard`; it owns [#laneCount] lanes from there.
