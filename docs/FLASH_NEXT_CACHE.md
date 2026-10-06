@@ -85,3 +85,22 @@ Quick screens (one process each, about 50 s; the decode phases feed the prompt's
 
 The warm decode repeats the same 32 tokens, which suits recency; S3-FIFO costs it 0.5-0.8 ms there and gains 6 ms in
 cold decode at 4096 context, where its device hit rate rises from 71.8% to 77.4%.
+
+## Before the PR
+
+Paired benchmark, 6 forks, control #94's head (`28b8e51`), candidate this branch (`6bf4295`):
+
+| scenario | #94 | this branch | change | forks ahead |
+|---|---|---|---|---|
+| prefill 512 (tokens/s) | 148 | 139 | -6.1% | 2/6 |
+| prefill 4096 (tokens/s) | 487 | 486.5 | -0.1% | 3/6 |
+| decode cold at 64 (ms/token) | 47.5 | 47.55 | +0.1% | 2/6 |
+| decode cold at 4096 (ms/token) | 51.7 | 47.0 | -9.1% | 6/6 |
+| decode warm at 64 (ms/token) | 38.7 | 36.25 | -6.3% | 6/6 |
+| decode warm at 4096 (ms/token) | 42.8 | 37.45 | -12.5% | 6/6 |
+
+The prefill of 512 tokens that the benchmark runs first, right after a 64-token warm-up on the same prompt, is slower:
+the partitioned tier admits the warm-up's records into the slots of their own layers, and the next prefill of the same
+prefix finds them there. Repeated (3 iterations), the later prefills of 512 tokens run at 151-155 tokens/s under every
+policy and the control (153). Variants that did not help that first prefill: preloaded records replaced only by records
+of their own layer (109 tokens/s), and preloaded records counted as never asked for (109).
