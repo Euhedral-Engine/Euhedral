@@ -138,6 +138,7 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     private final LongAdder stepsRun = new LongAdder();
     private volatile Timings timings;
     private volatile ExpertTrace trace;
+    private volatile ExpertDemand demand;
     private volatile Observer observer;
     private volatile Observer midObserver;
     private volatile boolean closed;
@@ -445,6 +446,24 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
 
     public Qwen4MoeLayer.Counters moeCounters() {
         return this.metrics.counters();
+    }
+
+    /// The experts each MoE block asks for, in the order the blocks are planned: a recording of the cache's demand
+    /// that a simulator can replay. `experts[0..count)` are the block's distinct experts (ascending) in bank `bank`
+    /// (the cache's ordinal of the layer's experts), and `pairs` the routed rows of each; the listener may keep the
+    /// arrays.
+    @FunctionalInterface
+    public interface ExpertDemand {
+        void block(int layer, int bank, int rows, int[] experts, int[] pairs, int count);
+    }
+
+    /// Reports every MoE block's demand to `demand` (null stops it). Diagnostics, never production.
+    public void demand(ExpertDemand demand) {
+        this.demand = demand;
+    }
+
+    ExpertDemand demandListener() {
+        return this.demand;
     }
 
     /// Reports every MoE block's use of the expert cache to `trace` (null stops it).
