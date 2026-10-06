@@ -198,7 +198,8 @@ public final class Qwen4Model implements AutoCloseable {
                     gpu,
                     plan.expertCache().slotCount(),
                     plan.expertCache().slotBytes(),
-                    1);
+                    1,
+                    DEVICE_POLICY);
             return new Qwen4Model(artifact, plan, fixed, gpu, ngram, cache, cachedBanks, store, owned, transfer, reads);
         } catch (Throwable failure) {
             closeQuietly(transfer, failure);
