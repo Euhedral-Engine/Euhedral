@@ -70,6 +70,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     private static final MethodHandle CQE_SEEN;
     private static final MethodHandle OPEN;
     private static final MethodHandle CLOSE;
+    private static final MethodHandle PREAD;
     private static final Throwable UNAVAILABLE;
 
     static {
@@ -82,7 +83,8 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                 peek = null,
                 seen = null,
                 open = null,
-                close = null;
+                close = null,
+                pread = null;
         Throwable unavailable = null;
         try {
             SymbolLookup uring = SymbolLookup.libraryLookup("liburing-ffi.so.2", Arena.global());
@@ -121,6 +123,14 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
             close = LINKER.downcallHandle(
                     libc.find("close").orElseThrow(),
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+            pread = LINKER.downcallHandle(
+                    libc.find("pread").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
         } catch (Throwable missing) {
             unavailable = missing;
         }
@@ -134,6 +144,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         CQE_SEEN = seen;
         OPEN = open;
         CLOSE = close;
+        PREAD = pread;
         UNAVAILABLE = unavailable;
     }
 
@@ -185,6 +196,25 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     /// Whether this machine can read asynchronously.
     public static boolean available() {
         return UNAVAILABLE == null;
+    }
+
+    /// Reads `length` bytes at `offset` of `fd` into `address`, blocking the calling thread until they are in. For
+    /// threads that may block (the startup fill), never a lattice worker. A descriptor opened past the page cache
+    /// needs the offset, the length and the address aligned to the device's block.
+    public static void readBlocking(int fd, long address, long length, long offset) throws IOException {
+        long done = 0;
+        while (done < length) {
+            long read;
+            try {
+                read = (long)
+                        PREAD.invokeExact(fd, MemorySegment.ofAddress(address + done), length - done, offset + done);
+            } catch (Throwable failure) {
+                throw new IOException("pread failed", failure);
+            }
+            if (read < 0) throw new IOException("pread of " + length + " bytes at " + offset + " failed");
+            if (read == 0) throw new IOException("the file ends before byte " + (offset + length));
+            done += read;
+        }
     }
 
     /// A descriptor of `file`, open for reading, for [#submit]. Closed with [#closeFile].

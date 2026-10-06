@@ -242,6 +242,13 @@ class Qwen4PerformanceCudaIntegrationTest {
                     Qwen4ExecutionPlan executor = run.plan()) {
                 line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));
                 line("workers: " + lattice.cpus().cardinality() + " on processors " + lattice.cpus());
+                var startTier = model.hierarchyStats().ram();
+                if (startTier != null)
+                    line(String.format(
+                            "tier at startup: %d records, %.1f GiB read at %.2f GB/s",
+                            startTier.residentExperts(),
+                            startTier.preloadBytes() / (double) (1L << 30),
+                            startTier.preloadBytesPerSecond() / 1e9));
                 line("expert cache: " + model.expertCache().slotCount() + " slots; plan:\n"
                         + model.plan().report());
                 int chunk = Math.min(executor.maxRows(), intEnv("EUHEDRAL_QWEN4_CHUNK", executor.maxRows()));
@@ -302,8 +309,10 @@ class Qwen4PerformanceCudaIntegrationTest {
                                         target));
                     }
                 }
+                // `EUHEDRAL_QWEN4_PERF_PREFILL_ONLY=1` stops after the prefills, for screening the expert path.
+                boolean decode = !"1".equals(System.getenv("EUHEDRAL_QWEN4_PERF_PREFILL_ONLY"));
                 for (int context : Arrays.stream(new int[] {64, 4096, 16384, 32768})
-                        .filter(t -> t <= MAX)
+                        .filter(t -> decode && t <= MAX)
                         .toArray()) {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         int at = 0;
@@ -363,7 +372,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                     }
                 }
                 // Component times: decode at 4K and a 512-token prefill chunk, each step followed by a device wait.
-                for (int[] shape : new int[][] {{4096, 1}, {4096, 512}}) {
+                for (int[] shape : decode ? new int[][] {{4096, 1}, {4096, 512}} : new int[0][]) {
                     try (Qwen4Sequence sequence = executor.newSequence()) {
                         int at = 0;
                         while (at < shape[0]) {

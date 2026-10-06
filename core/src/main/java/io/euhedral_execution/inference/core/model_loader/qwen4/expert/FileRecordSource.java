@@ -95,6 +95,32 @@ public final class FileRecordSource implements RecordSource {
         readRange(bank, expert, 0, destination);
     }
 
+    /// One read past the page cache when the records lie end to end and everything is block-aligned; otherwise
+    /// record by record.
+    @Override
+    public void readRun(ExpertBank bank, int first, int count, MemorySegment destination)
+            throws IOException, InterruptedException {
+        long start = bank.fileOffset(first);
+        long size = 0;
+        boolean contiguous = true;
+        for (int expert = first; expert < first + count; expert++) {
+            contiguous &= bank.fileOffset(expert) == start + size;
+            size += bank.recordBytes(expert);
+        }
+        if (destination.byteSize() != size)
+            throw new IllegalArgumentException("destination holds " + destination.byteSize() + " bytes, run " + size);
+        if (!this.direct || !contiguous || ((start | size | destination.address()) % BLOCK != 0)) {
+            RecordSource.super.readRun(bank, first, count, destination);
+            return;
+        }
+        if (this.closed.get()) throw new IllegalStateException("the record source is closed");
+        long begin = System.nanoTime();
+        AsyncReads.readBlocking(this.fd, destination.address(), size, start);
+        this.readNanos.add(System.nanoTime() - begin);
+        this.reads.add(count);
+        this.bytesRead.add(size);
+    }
+
     @Override
     public boolean ranged() {
         return true;

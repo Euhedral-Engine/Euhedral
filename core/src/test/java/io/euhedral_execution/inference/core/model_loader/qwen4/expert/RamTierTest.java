@@ -131,13 +131,34 @@ class RamTierTest {
         tier.checkInvariants();
     }
 
+    /// A bounded tier starts with each layer's share of its slots filled by the layer's lowest experts, so the
+    /// first pass finds them in memory.
     @Test
-    void preloadRefusesATierThatCannotHoldEverything() throws Exception {
-        store(20, 2, ReplacementPolicy.GLOBAL_LRU);
-        assertFalse(this.store.ramTier().isResident());
-        assertThrows(
-                IllegalStateException.class,
-                () -> this.store.ramTier().preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 2));
+    void aBoundedTierPreloadsEachLayersShare() throws Exception {
+        for (int shards : new int[] {1, 2}) {
+            if (this.store != null) this.store.close();
+            store(20, shards, ReplacementPolicy.BANK_PARTITIONED);
+            RamTier tier = this.store.ramTier();
+            assertFalse(tier.isResident());
+            tier.preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 3);
+            tier.checkInvariants();
+            var stats = tier.stats();
+            int[] experts = {8, 3, 16, 1, 12};
+            int preloaded = stats.residentExperts();
+            assertTrue(preloaded <= 20 && preloaded >= 20 - 5 * shards, "the shares fill the tier: " + preloaded);
+            for (int bank = 0; bank < 5; bank++)
+                assertTrue(
+                        Math.abs(stats.residentPerBank()[bank] - 20.0 * experts[bank] / 40) <= shards,
+                        "bank " + bank + " has its share: " + stats.residentPerBank()[bank]);
+            long before = this.store.bytesRead();
+            for (int bank = 0; bank < 5; bank++)
+                for (int expert = 0; expert < experts[bank]; expert++)
+                    if (this.store.tier(shardOf(bank, expert)).isResident(bank, expert))
+                        assertArrayEquals(this.fixture.record(bank, expert), load(bank, expert, 0));
+            assertEquals(before, this.store.bytesRead(), "a preloaded record is not read again");
+            assertEquals(preloaded, tier.stats().totalHits());
+            tier.checkInvariants();
+        }
     }
 
     @Test
