@@ -21,3 +21,45 @@ serves 63-66% of device misses (the engine: 50-65%).
 - Per-layer LRU at 70 slots (the device's share) hits 76%; 120 slots 87%; 200 slots 93%.
 - Static popularity (the most requested records of the whole run) is poor for decode (42% device miss): which experts
   are hot depends on the request.
+
+## Policies
+
+Each level was replayed with the other at today's policy (device LRU, tier TinyLFU), without the startup fill:
+
+| device policy | prefill device miss | decode device miss |
+|---|---|---|
+| LRU (today) | 98.4% | 24.0% |
+| scan-resistant LRU (a prefill's records enter cold) | 86.3% | 24.0% |
+| per-layer LRU | 86.2% | 24.5% |
+| layer-aware recency (age in the layer's visits) | 96.5% | 23.6% |
+| ARC | 89.8% | 23.3% |
+| S3-FIFO | 88.3% | 22.3% |
+| LFU / TinyLFU / W-TinyLFU | 87.6 / 84.6 / 84.8% | 26.5 / 37.3 / 36.3% |
+| SIEVE | 92.5% | 45.3% |
+| Belady (offline) | 82.4% | 10.6% |
+
+| tier policy | prefill disk (MB/token) | decode disk (MB/token) |
+|---|---|---|
+| LRU | 24.6 | 110.7 |
+| per-layer LRU | 18.1 | 118.7 |
+| TinyLFU (today) | 16.6 | 110.1 |
+| W-TinyLFU | 17.1 | 107.8 |
+| LFU | 18.5 | 102.2 |
+| ARC / S3-FIFO | 21.8 / 21.2 | 104.3 / 109.7 |
+| static popularity (offline) | 14.7 | 106.2 |
+| Belady (offline) | 17.3 | 52.4 |
+
+The tier sees only the device's misses, from which recency is already filtered: frequency serves decode best there, and
+admission keeps a prefill's sweeps from replacing what decode uses. Combining them, LFU eviction (a sample of 32 held
+records, the least requested, the least recent among equals) with admission only for the records a prefill chunk asks
+for (`slfu-scan`), and S3-FIFO on the device:
+
+| recording | tier slots | today (LRU / TinyLFU) | S3-FIFO / slfu-scan | decode disk MB/token | decode device misses/token |
+|---|---|---|---|---|---|
+| 1 (8 requests, 256 decode) | 7,852 | 412.7 GB | 382.9 GB (-7.2%) | 110.4 to 99.1 | 115.2 to 107.2 |
+| 2 (10 requests, 400 decode) | 7,852 | 713.5 GB | 640.2 GB (-10.3%) | 123.5 to 107.0 | 142.5 to 130.2 |
+| 1 | 12,000 | 231.4 GB | 213.1 GB (-7.9%) | 57.8 to 46.5 | 115.2 to 107.2 |
+| 2 | 12,000 | 349.5 GB | 306.2 GB (-12.4%) | | 142.5 to 130.2 |
+
+(with the startup fill). The online policies differ by a few percent; the tier's capacity and knowledge of the future
+differ by far more: 12,000 tier slots halve the disk bytes, and Belady halves decode's again.

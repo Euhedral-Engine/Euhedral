@@ -489,6 +489,11 @@ final class Qwen4Stages {
         }
 
         @Override
+        public boolean scan() {
+            return rows() > 1;
+        }
+
+        @Override
         public void arrived(ExpertLease lease) {
             if (stopped()) lease.close();
             else storage().moe().hold(this.index, lease);

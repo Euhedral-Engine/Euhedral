@@ -334,7 +334,9 @@ class ExpertCacheShardTest {
     @Test
     void aLayerAwarePolicyKeepsWhatACyclicPassWouldEvictFromAGlobalRecencyOrder() throws Exception {
         long[] hits = new long[2];
-        for (ReplacementPolicy policy : ReplacementPolicy.values()) {
+        // The device cache replaces by recency: the frequency policy is the host tier's.
+        for (ReplacementPolicy policy :
+                new ReplacementPolicy[] {ReplacementPolicy.BANK_PARTITIONED, ReplacementPolicy.GLOBAL_LRU}) {
             if (this.cache != null) this.cache.close();
             cache(10, 1, policy);
             int[] hotPerBank = {3, 3, 3, 1, 3};

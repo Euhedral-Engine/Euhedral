@@ -48,6 +48,14 @@ public final class RamTierShard {
     private final boolean partitioned;
     private final boolean resident;
     private final boolean admission;
+    /// [ReplacementPolicy#FREQUENCY]: the victim is the least requested of a sample of ready slots.
+    private final boolean frequency;
+    /// Slots sampled for a victim under [ReplacementPolicy#FREQUENCY].
+    static final int SAMPLE = 32;
+    /// Each slot's latest plan, by [#clock], under [ReplacementPolicy#FREQUENCY].
+    private final long[] lastUse;
+    private long clock;
+    private final java.util.SplittableRandom random = new java.util.SplittableRandom(0x5eed);
     /// Requests of each record since the counts were last halved, when admission is on.
     private final int[] requests;
     private int sinceAging;
@@ -78,6 +86,7 @@ public final class RamTierShard {
             int firstSlot,
             int slots,
             boolean partitioned,
+            boolean frequency,
             boolean admission) {
         this.tier = tier;
         this.keys = keys;
@@ -116,7 +125,9 @@ public final class RamTierShard {
         }
         this.resident = slots >= ownedTotal;
         this.admission = admission && !this.resident;
-        this.requests = this.admission ? new int[keys.keyCount()] : null;
+        this.frequency = frequency && !this.resident;
+        this.requests = this.admission || this.frequency ? new int[keys.keyCount()] : null;
+        this.lastUse = this.frequency ? new long[slots] : null;
         if (partitioned && ownedTotal > 0)
             for (int bank = 0; bank < banks; bank++) this.quota[bank] = (int) ((long) slots * owned[bank] / ownedTotal);
     }
@@ -141,16 +152,25 @@ public final class RamTierShard {
 
     // ---------------------------------------------------------------- planning a load
 
-    /// Decides what the load of `(bank, expert)` does with the tier, and writes it to `out`. A hit or a
-    /// fill pins the slot until [#used], [#filled] or [#abandoned].
+    /// Decides what the load of `(bank, expert)` does with the tier, and writes it to `out`, for a load a prefill
+    /// chunk asked for. A hit or a fill pins the slot until [#used], [#filled] or [#abandoned].
     public void plan(int bank, int expert, TierDirective out) {
+        plan(bank, expert, true, out);
+    }
+
+    /// As above, for a load a prefill chunk (`scan`) or a decode step asked for: under
+    /// [ReplacementPolicy#FREQUENCY] only a scan's records are subject to admission.
+    public void plan(int bank, int expert, boolean scan, TierDirective out) {
         int key = this.keys.key(bank, expert);
-        int asked = this.admission ? request(key) : 0;
+        int asked = this.requests != null ? request(key) : 0;
+        boolean admit = this.admission && (scan || !this.frequency);
+        this.clock++;
         int slot = this.directory[key];
         if (slot != NONE) {
             if (this.state[slot] == READY) {
                 this.pins[slot]++;
                 if (!this.resident) touch(slot, bank);
+                if (this.frequency) this.lastUse[slot] = this.clock;
                 count(this.hits, bank);
                 out.set(TierDirective.Mode.HIT, this.firstSlot + slot, this.tier.address(this.firstSlot + slot));
             } else {
@@ -159,7 +179,7 @@ public final class RamTierShard {
             }
             return;
         }
-        slot = this.resident ? NONE : take(bank, asked);
+        slot = this.resident ? NONE : take(bank, asked, admit);
         if (slot == NONE) {
             count(this.bypasses, bank);
             out.set(TierDirective.Mode.BYPASS, -1, 0);
@@ -171,6 +191,7 @@ public final class RamTierShard {
         this.slotKey[slot] = key;
         this.directory[key] = slot;
         this.used[list(bank)]++;
+        if (this.frequency) this.lastUse[slot] = this.clock;
         out.set(TierDirective.Mode.FILL, this.firstSlot + slot, this.tier.address(this.firstSlot + slot));
     }
 
@@ -218,8 +239,38 @@ public final class RamTierShard {
     /// A free slot, or the slot of a victim chosen by the policy, or [#NONE] when every slot is filling or
     /// pinned, or (with admission) when the victim was asked for at least as often as the record was before
     /// this request (`asked`).
-    private int take(int bank, int asked) {
+    private int take(int bank, int asked, boolean admit) {
         if (this.freeTop > 0) return this.free[--this.freeTop];
+        int victim = this.frequency ? leastRequested() : leastRecent(bank);
+        if (victim == NONE) return NONE;
+        if (admit && this.requests[this.slotKey[victim]] >= asked) return NONE;
+        evict(victim);
+        return victim;
+    }
+
+    /// The least requested of [#SAMPLE] ready, unpinned slots drawn at random, the least recently planned among
+    /// equals; when the sample finds none, the first such slot; [#NONE] when every slot is filling or pinned.
+    private int leastRequested() {
+        int victim = NONE;
+        for (int i = 0; i < SAMPLE; i++) {
+            int slot = this.random.nextInt(this.slots);
+            if (this.state[slot] != READY || this.pins[slot] != 0) continue;
+            if (victim == NONE || before(slot, victim)) victim = slot;
+        }
+        if (victim != NONE) return victim;
+        for (int slot = 0; slot < this.slots; slot++)
+            if (this.state[slot] == READY && this.pins[slot] == 0) return slot;
+        return NONE;
+    }
+
+    private boolean before(int slot, int other) {
+        int a = this.requests[this.slotKey[slot]];
+        int b = this.requests[this.slotKey[other]];
+        return a < b || (a == b && this.lastUse[slot] < this.lastUse[other]);
+    }
+
+    /// The victim the recency policies choose, or [#NONE].
+    private int leastRecent(int bank) {
         int own = list(bank);
         int victim = NONE;
         if (this.used[own] > 0 && this.used[own] >= this.quota[own]) victim = unpinned(own);
@@ -234,9 +285,6 @@ public final class RamTierShard {
                 victim = candidate;
             }
         }
-        if (victim == NONE) return NONE;
-        if (this.admission && this.requests[this.slotKey[victim]] >= asked) return NONE;
-        evict(victim);
         return victim;
     }
 
@@ -332,7 +380,7 @@ public final class RamTierShard {
             this.state[slot] = READY;
             this.pins[slot] = 0;
             this.used[list(bank)]++;
-            if (this.admission) this.requests[key] = -1;
+            if (this.requests != null) this.requests[key] = -1;
             link(slot, bank);
             this.readyPerBank.lazySet(bank, this.readyPerBank.get(bank) + 1);
             slot++;

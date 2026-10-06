@@ -251,6 +251,37 @@ class RamTierTest {
         tier.checkInvariants();
     }
 
+    private int planned(RamTierShard shard, int bank, int expert, boolean scan) {
+        TierDirective directive = new TierDirective();
+        shard.plan(bank, expert, scan, directive);
+        TierDirective.Mode mode = directive.mode();
+        if (mode == TierDirective.Mode.FILL) shard.filled(directive);
+        else if (mode == TierDirective.Mode.HIT) shard.used(directive);
+        return mode.ordinal();
+    }
+
+    /// Under the frequency policy the victim is the least requested record; a decode step's record always enters,
+    /// and a prefill's only in place of a record requested less often.
+    @Test
+    void theFrequencyPolicyEvictsTheLeastRequestedAndAdmitsOnlyAPrefillsRecords() throws Exception {
+        RamTier tier = new RamTier(this.fixture.banks, 2, 1, ReplacementPolicy.FREQUENCY, null, true);
+        this.store = new FileExpertStore(
+                this.gpu, new FileRecordSource(this.fixture.file, this.fixture.banks), tier, this.fixture.banks, 4);
+        RamTierShard shard = this.store.tier(0);
+        for (int i = 0; i < 3; i++) planned(shard, 2, 0, false);
+        planned(shard, 2, 1, false);
+        assertTrue(shard.isResident(2, 0) && shard.isResident(2, 1));
+        // A prefill's first request of a record: the victim (2, 1) was requested once, more than never.
+        planned(shard, 2, 2, true);
+        assertFalse(shard.isResident(2, 2), "a prefill's record does not replace one requested more often");
+        // A decode step's record enters, in place of the least requested record.
+        planned(shard, 2, 3, false);
+        assertTrue(shard.isResident(2, 3));
+        assertTrue(shard.isResident(2, 0), "the most requested record stays");
+        assertFalse(shard.isResident(2, 1));
+        tier.checkInvariants();
+    }
+
     /// A record asked for more often than the victim replaces it; until then it is read around the tier.
     @Test
     void aRecordAskedForMoreOftenThanTheVictimReplacesIt() throws Exception {

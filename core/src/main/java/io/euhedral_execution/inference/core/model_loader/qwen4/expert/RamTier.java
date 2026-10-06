@@ -101,6 +101,7 @@ public final class RamTier implements AutoCloseable {
                     first,
                     sizes[shard],
                     policy == ReplacementPolicy.BANK_PARTITIONED,
+                    policy == ReplacementPolicy.FREQUENCY,
                     admission);
             first += sizes[shard];
         }

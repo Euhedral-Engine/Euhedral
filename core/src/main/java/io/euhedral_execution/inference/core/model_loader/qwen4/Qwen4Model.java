@@ -40,6 +40,11 @@ public final class Qwen4Model implements AutoCloseable {
     /// such reads in flight keep the disk at its sequential rate.
     static final int PRELOAD_READERS = 4;
 
+    /// How the host tier chooses its victims: `EUHEDRAL_QWEN4_TIER_POLICY` (`partitioned` or `frequency`).
+    static final ReplacementPolicy TIER_POLICY = "frequency".equals(System.getenv("EUHEDRAL_QWEN4_TIER_POLICY"))
+            ? ReplacementPolicy.FREQUENCY
+            : ReplacementPolicy.BANK_PARTITIONED;
+
     /// Whether a bounded tier is filled with each layer's share of records at startup;
     /// `EUHEDRAL_QWEN4_TIER_PRELOAD=0` leaves it empty until loads fill it, for benchmarks.
     static final boolean TIER_PRELOAD = !"0".equals(System.getenv("EUHEDRAL_QWEN4_TIER_PRELOAD"));
@@ -164,12 +169,7 @@ public final class Qwen4Model implements AutoCloseable {
                         && plan.budget().pinnableBytes() - plan.host().pinnedBytes()
                                 >= plan.host().expertRamBytes();
                 tier = new RamTier(
-                        cachedBanks,
-                        plan.host().expertRamSlots(),
-                        1,
-                        ReplacementPolicy.BANK_PARTITIONED,
-                        pin ? gpu : null,
-                        TIER_ADMISSION);
+                        cachedBanks, plan.host().expertRamSlots(), 1, TIER_POLICY, pin ? gpu : null, TIER_ADMISSION);
                 LOG.info("Expert tier: {} MiB of {} memory", tier.capacityBytes() >> 20, pin ? "pinned" : "pageable");
                 if (tier.isResident() || TIER_PRELOAD) {
                     long begin = System.nanoTime();
