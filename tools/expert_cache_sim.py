@@ -34,6 +34,8 @@ class Trace:
     record_bytes: list[int]
     # Each event: ("block", bank, rows, [experts]) or ("mark", kind, request, tokens).
     events: list = field(default_factory=list)
+    # (index of the next event, bank, ranked keys): the next layer's router on a decode step's input, see the recorder.
+    predictions: list = field(default_factory=list)
 
     def key(self, bank: int, expert: int) -> int:
         return bank * 4096 + expert
@@ -60,6 +62,10 @@ def read_trace(path: str) -> Trace:
         elif tag == 2:
             trace.events.append(("mark",) + tuple(ints[at + 1 : at + 4]))
             at += 4
+        elif tag == 3:
+            _layer, bank, count = ints[at + 1 : at + 4]
+            trace.predictions.append((len(trace.events), bank, [bank * 4096 + e for e in ints[at + 4 : at + 4 + count]]))
+            at += 4 + count
         else:
             sys.exit(f"bad record tag {tag} at {at}")
     return trace

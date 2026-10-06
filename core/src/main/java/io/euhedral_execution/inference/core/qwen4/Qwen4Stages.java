@@ -401,6 +401,9 @@ final class Qwen4Stages {
             storage.moeBlock = moe.scratch(storage.moeScratch(), rows());
             if (plan.traceOn()) storage.traceBefore = plan.expertStats().snapshot();
             moe.submitRouting(plan.weights().moe(this.layer), storage.mixed(), rows(), storage.moeBlock);
+            Qwen4ExecutionPlan.ExpertDemand demand = plan.demandListener();
+            if (demand != null && demand.predicts() && rows() == 1 && this.layer + 1 < plan.layers())
+                moe.submitPrediction(plan.weights().moe(this.layer + 1), storage.mixed());
             storage.routeArmedNanos = System.nanoTime();
         }
     }
@@ -435,7 +438,12 @@ final class Qwen4Stages {
             storage.plannedNanos = now;
             storage.experts = moe.plan(storage.bank, rows());
             Qwen4ExecutionPlan.ExpertDemand demand = plan().demandListener();
-            if (demand != null) moe.reportDemand(demand, this.layer, rows());
+            if (demand != null)
+                moe.reportDemand(
+                        demand,
+                        this.layer,
+                        this.layer + 1 < plan().layers() ? plan().bankOrdinal(this.layer + 1) : -1,
+                        rows());
             moe.submitPlan();
         }
     }
