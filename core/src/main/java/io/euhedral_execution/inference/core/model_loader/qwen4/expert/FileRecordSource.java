@@ -28,6 +28,14 @@ public final class FileRecordSource implements RecordSource {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AsyncReads async;
     private final int fd;
+    /// Whether the asynchronous reads go past the page cache (every record is block-aligned in the file).
+    private final boolean direct;
+
+    /// Asynchronous reads past the page cache, where the records allow them; `EUHEDRAL_QWEN4_DIRECT_READS=0` keeps
+    /// them in the page cache, for benchmarks.
+    static final boolean DIRECT_READS = !"0".equals(System.getenv("EUHEDRAL_QWEN4_DIRECT_READS"));
+
+    private static final long BLOCK = 4096;
 
     public FileRecordSource(Path file, ExpertBank[] banks) throws IOException {
         this(file, banks, null);
@@ -40,7 +48,20 @@ public final class FileRecordSource implements RecordSource {
             ExpertFiles.validate(banks, channel.size());
         }
         this.async = async;
-        this.fd = async == null ? -1 : async.openFile(file);
+        this.direct = async != null && DIRECT_READS && aligned(banks);
+        this.fd = async == null ? -1 : async.openFile(file, this.direct);
+    }
+
+    private static boolean aligned(ExpertBank[] banks) {
+        for (ExpertBank bank : banks)
+            for (int expert = 0; expert < bank.expertCount(); expert++)
+                if (bank.fileOffset(expert) % BLOCK != 0 || bank.recordBytes(expert) % BLOCK != 0) return false;
+        return true;
+    }
+
+    /// Whether asynchronous reads go past the page cache.
+    public boolean direct() {
+        return this.direct;
     }
 
     @Override
@@ -48,6 +69,8 @@ public final class FileRecordSource implements RecordSource {
             ExpertBank bank, int expert, long from, MemorySegment destination, AsyncReads.Read done) {
         if (this.async == null || this.closed.get()) return false;
         long size = destination.byteSize();
+        // A read past the page cache must be block-aligned; anything else is read through it, synchronously.
+        if (this.direct && ((from | size | destination.address()) % BLOCK != 0)) return false;
         if (from < 0 || from > bank.recordBytes(expert) - size)
             throw new IllegalArgumentException(
                     "bytes " + from + ".." + (from + size) + " are outside record " + bank.recordBytes(expert));

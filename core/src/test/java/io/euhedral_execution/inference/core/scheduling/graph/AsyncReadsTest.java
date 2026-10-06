@@ -155,6 +155,36 @@ class AsyncReadsTest {
     }
 
     @Test
+    void aDirectReadGoesPastThePageCacheAndReadsTheSameBytes() throws Exception {
+        byte[] content = new byte[8 * 4096];
+        new SplittableRandom(7).nextBytes(content);
+        Path file = this.directory.resolve("direct");
+        Files.write(file, content);
+        try (AsyncReads reads = open();
+                Arena arena = Arena.ofConfined()) {
+            int fd;
+            try {
+                fd = reads.openFile(file, true);
+            } catch (java.io.IOException unsupported) {
+                assumeTrue(false, "the temporary directory's file system has no direct reads");
+                return;
+            }
+            try {
+                MemorySegment destination = arena.allocate(4 * 4096, 4096);
+                Done done = new Done(11);
+                assertTrue(reads.submit(fd, destination.address(), destination.byteSize(), 2 * 4096, done));
+                poll(reads, 1);
+                assertNull(done.failure);
+                assertArrayEquals(
+                        java.util.Arrays.copyOfRange(content, 2 * 4096, 6 * 4096),
+                        destination.toArray(ValueLayout.JAVA_BYTE));
+            } finally {
+                reads.closeFile(fd);
+            }
+        }
+    }
+
+    @Test
     void aReadPastTheEndOfTheFileFails() throws Exception {
         Path file = this.directory.resolve("short");
         Files.write(file, new byte[100]);

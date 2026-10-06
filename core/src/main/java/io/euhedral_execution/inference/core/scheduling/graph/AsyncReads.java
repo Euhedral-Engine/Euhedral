@@ -189,9 +189,18 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
 
     /// A descriptor of `file`, open for reading, for [#submit]. Closed with [#closeFile].
     public int openFile(Path file) throws IOException {
+        return openFile(file, false);
+    }
+
+    /// Linux's `O_DIRECT`: reads go from the device to the destination, past the page cache. Every read of such a
+    /// descriptor must be aligned to the device's logical block (offset, length and address).
+    private static final int O_DIRECT = 0x4000;
+
+    /// A descriptor of `file`, open for reading, past the page cache when `direct`.
+    public int openFile(Path file, boolean direct) throws IOException {
         int fd;
         try (Arena path = Arena.ofConfined()) {
-            fd = (int) OPEN.invokeExact(path.allocateFrom(file.toString()), 0);
+            fd = (int) OPEN.invokeExact(path.allocateFrom(file.toString()), direct ? O_DIRECT : 0);
         } catch (Throwable failure) {
             throw new IOException("opening " + file + " failed", failure);
         }
