@@ -43,7 +43,8 @@ public interface HostExpertStore extends AutoCloseable {
     }
 
     /// Reads part `part` of `parts` of the record's bytes from the artifact into where the
-    /// `directive` puts them (the tier slot of a fill, otherwise the lane's staging slot). The parts
+    /// `directive` puts them (the tier slot of a fill, which also copies its range into the lane's
+    /// staging slot; otherwise the staging slot itself). The parts
     /// are disjoint, so callers read them side by side; when all have returned,
     /// [#completeOpen] makes the record addressable. Only for a directive that reads the artifact
     /// and a store with `readParts() > 1`.
@@ -52,8 +53,8 @@ public interface HostExpertStore extends AutoCloseable {
         throw new UnsupportedOperationException("this store reads whole records");
     }
 
-    /// The record read by [#readPart] in all its parts, addressable in pinned host memory (a fill
-    /// copies it out of its tier slot).
+    /// The record read by [#readPart] in all its parts, addressable in pinned host memory (a fill's
+    /// parts copied their ranges into staging as they read them).
     default HostRecord completeOpen(int bank, int expert, int lane, TierDirective directive) {
         throw new UnsupportedOperationException("this store reads whole records");
     }
