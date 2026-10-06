@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTier.Policy;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -49,13 +48,14 @@ class RamTierTest {
         this.gpu.assertAllReleased();
     }
 
-    private FileExpertStore store(int slots, int shards, Policy policy, RecordSource source) throws IOException {
+    private FileExpertStore store(int slots, int shards, ReplacementPolicy policy, RecordSource source)
+            throws IOException {
         RamTier tier = new RamTier(this.fixture.banks, slots, shards, policy);
         this.store = new FileExpertStore(this.gpu, source, tier, this.fixture.banks, 4);
         return this.store;
     }
 
-    private FileExpertStore store(int slots, int shards, Policy policy) throws IOException {
+    private FileExpertStore store(int slots, int shards, ReplacementPolicy policy) throws IOException {
         return store(slots, shards, policy, new FileRecordSource(this.fixture.file, this.fixture.banks));
     }
 
@@ -88,7 +88,7 @@ class RamTierTest {
 
     @Test
     void aRecordIsReadFromTheArtifactOnceAndThenFromMemory() throws Exception {
-        store(10, 1, Policy.BANK_PARTITIONED);
+        store(10, 1, ReplacementPolicy.BANK_PARTITIONED);
         assertArrayEquals(this.fixture.record(2, 5), load(2, 5, 0));
         long afterFirst = this.store.bytesRead();
         assertEquals(this.fixture.banks[2].recordBytes(5), afterFirst);
@@ -106,7 +106,7 @@ class RamTierTest {
 
     @Test
     void aResidentTierPreloadsEverythingAndReadsNothingAfterwards() throws Exception {
-        store(40, 3, Policy.BANK_PARTITIONED);
+        store(40, 3, ReplacementPolicy.BANK_PARTITIONED);
         RamTier tier = this.store.ramTier();
         assertTrue(tier.isResident());
         tier.preload(new FileRecordSource(this.fixture.file, this.fixture.banks), 4);
@@ -126,7 +126,7 @@ class RamTierTest {
 
     @Test
     void preloadRefusesATierThatCannotHoldEverything() throws Exception {
-        store(20, 2, Policy.GLOBAL_LRU);
+        store(20, 2, ReplacementPolicy.GLOBAL_LRU);
         assertFalse(this.store.ramTier().isResident());
         assertThrows(
                 IllegalStateException.class,
@@ -135,7 +135,7 @@ class RamTierTest {
 
     @Test
     void aBoundedTierStaysWithinItsSlotsAndReturnsTheArtifactsBytes() throws Exception {
-        for (Policy policy : Policy.values()) {
+        for (ReplacementPolicy policy : ReplacementPolicy.values()) {
             if (this.store != null) this.store.close();
             store(12, 2, policy);
             SplittableRandom random = new SplittableRandom(7);
@@ -158,15 +158,15 @@ class RamTierTest {
     /// again, while a quota per bank keeps the experts of the banks that fit.
     @Test
     void aLayerAwarePolicyKeepsWhatACyclicPassWouldEvictFromAGlobalLru() throws Exception {
-        double global = cyclicHitRate(Policy.GLOBAL_LRU);
+        double global = cyclicHitRate(ReplacementPolicy.GLOBAL_LRU);
         this.store.close();
-        double partitioned = cyclicHitRate(Policy.BANK_PARTITIONED);
+        double partitioned = cyclicHitRate(ReplacementPolicy.BANK_PARTITIONED);
         System.out.printf("cyclic trace, 10 slots: global LRU %.3f, bank partitioned %.3f%n", global, partitioned);
         assertTrue(global < 0.05, "a global LRU thrashes on the cycle: " + global);
         assertTrue(partitioned > 0.3, "the partitioned policy keeps a share of every pass: " + partitioned);
     }
 
-    private double cyclicHitRate(Policy policy) throws Exception {
+    private double cyclicHitRate(ReplacementPolicy policy) throws Exception {
         store(10, 1, policy);
         int[] hotPerBank = {3, 3, 3, 1, 3};
         for (int pass = 0; pass < 50; pass++)
@@ -177,7 +177,7 @@ class RamTierTest {
 
     @Test
     void aPinnedSlotIsNeverTakenAndALoadWithoutASlotBypasses() throws Exception {
-        store(1, 1, Policy.GLOBAL_LRU);
+        store(1, 1, ReplacementPolicy.GLOBAL_LRU);
         RamTierShard shard = this.store.tier(0);
         assertArrayEquals(this.fixture.record(0, 0), load(0, 0, 0));
 
@@ -203,7 +203,7 @@ class RamTierTest {
 
     @Test
     void aFillingSlotIsUnavailableUntilItsFillIsSettled() throws Exception {
-        store(1, 1, Policy.GLOBAL_LRU);
+        store(1, 1, ReplacementPolicy.GLOBAL_LRU);
         RamTierShard shard = this.store.tier(0);
         TierDirective fill = new TierDirective();
         shard.plan(0, 0, fill);
@@ -243,7 +243,7 @@ class RamTierTest {
                 this.real.close();
             }
         };
-        store(2, 1, Policy.GLOBAL_LRU, failing);
+        store(2, 1, ReplacementPolicy.GLOBAL_LRU, failing);
         assertThrows(IOException.class, () -> load(0, 0, 0));
         RamTierShard shard = this.store.tier(0);
         shard.checkInvariants();
@@ -257,7 +257,7 @@ class RamTierTest {
     @Test
     void shardsAreIndependentAndEachRunsOnItsOwnThread() throws Exception {
         int shards = 3;
-        store(24, shards, Policy.BANK_PARTITIONED);
+        store(24, shards, ReplacementPolicy.BANK_PARTITIONED);
         for (int shard = 0; shard < shards; shard++) {
             int mine = shard;
             assertTrue(

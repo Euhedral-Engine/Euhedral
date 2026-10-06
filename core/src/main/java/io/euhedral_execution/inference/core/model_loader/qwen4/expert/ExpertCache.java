@@ -59,6 +59,18 @@ public final class ExpertCache implements AutoCloseable {
             int slotCount,
             long slotBytes,
             int shards) {
+        this(store, transfer, memory, slotCount, slotBytes, shards, ReplacementPolicy.GLOBAL_LRU);
+    }
+
+    /// As above, with the shards replacing their experts by `policy`.
+    public ExpertCache(
+            HostExpertStore store,
+            ExpertTransfer transfer,
+            GpuMemory memory,
+            int slotCount,
+            long slotBytes,
+            int shards,
+            ReplacementPolicy policy) {
         this.store = Objects.requireNonNull(store, "store");
         this.transfer = Objects.requireNonNull(transfer, "transfer");
         this.memory = Objects.requireNonNull(memory, "memory");
@@ -100,7 +112,9 @@ public final class ExpertCache implements AutoCloseable {
                         slots,
                         slotBytes,
                         java.util.Arrays.copyOfRange(this.markers, firstSlot, firstSlot + slots),
-                        parts[shard]);
+                        parts[shard],
+                        policy,
+                        shards);
                 this.laneBase[shard] = firstLane;
                 this.laneCount[shard] = shardLanes;
                 firstSlot += slots;

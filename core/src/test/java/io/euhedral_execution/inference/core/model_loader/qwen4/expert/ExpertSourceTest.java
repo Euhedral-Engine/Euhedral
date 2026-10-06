@@ -326,7 +326,7 @@ class ExpertSourceTest {
                 this.real.close();
             }
         };
-        var tier = new RamTier(this.fixture.banks, 10, 1, RamTier.Policy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
         build(4, 2, new FileExpertStore(this.gpu, failingReads, tier, this.fixture.banks, 2));
 
         Block failed = new Block(2, 0);
@@ -349,7 +349,7 @@ class ExpertSourceTest {
 
     @Test
     void anArtifactReadSplitIntoPartsLoadsTheSameBytesWithAndWithoutATierSlot() throws Exception {
-        var tier = new RamTier(this.fixture.banks, 10, 1, RamTier.Policy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
         build(
                 3,
                 4,
@@ -433,7 +433,7 @@ class ExpertSourceTest {
                 this.real.close();
             }
         };
-        var tier = new RamTier(this.fixture.banks, 10, 1, RamTier.Policy.BANK_PARTITIONED);
+        var tier = new RamTier(this.fixture.banks, 10, 1, ReplacementPolicy.BANK_PARTITIONED);
         build(4, 4, new FileExpertStore(this.gpu, failingPart, tier, this.fixture.banks, 4, 4));
         Block block = new Block(2, 1, 2, 3);
         this.source.submit(block.work());

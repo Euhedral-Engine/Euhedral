@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.model_loader.qwen4.expert.FileExpert
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.FileRecordSource;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.GpuExpertTransfer;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.RamTier;
+import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ReplacementPolicy;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -37,6 +38,12 @@ public final class Qwen4Model implements AutoCloseable {
     /// Readers that fill a resident expert tier at startup, each taking about 32 MiB of contiguous
     /// records at a time.
     static final int PRELOAD_READERS = 16;
+
+    /// How the device cache shares its slots among the layers. `EUHEDRAL_QWEN4_GPU_POLICY`
+    /// (`global` or `partitioned`) overrides it for benchmarks.
+    static final ReplacementPolicy DEVICE_POLICY = "partitioned".equals(System.getenv("EUHEDRAL_QWEN4_GPU_POLICY"))
+            ? ReplacementPolicy.BANK_PARTITIONED
+            : ReplacementPolicy.GLOBAL_LRU;
 
     /// Parts one record's artifact read is split into, read side by side as frames of the lattice.
     /// `euhedral.qwen4.read-parts` (or `EUHEDRAL_QWEN4_READ_PARTS`) overrides it for benchmarks.
@@ -115,7 +122,8 @@ public final class Qwen4Model implements AutoCloseable {
             int shards = Qwen4ResidencyPlanner.expertShards(plan.expertCache().slotCount());
             artifactSource = new FileRecordSource(path, cachedBanks);
             if (plan.expertStore() != Qwen4ResidencyPlan.ExpertStoreMode.FILE_BACKED) {
-                tier = new RamTier(cachedBanks, plan.host().expertRamSlots(), shards, RamTier.Policy.BANK_PARTITIONED);
+                tier = new RamTier(
+                        cachedBanks, plan.host().expertRamSlots(), shards, ReplacementPolicy.BANK_PARTITIONED);
                 if (tier.isResident()) {
                     long begin = System.nanoTime();
                     tier.preload(artifactSource, PRELOAD_READERS);

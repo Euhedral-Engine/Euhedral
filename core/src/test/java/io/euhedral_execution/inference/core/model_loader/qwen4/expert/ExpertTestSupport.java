@@ -17,7 +17,7 @@ public final class ExpertTestSupport {
     public static FileExpertStore ramStore(
             GpuMemory memory, Path file, ExpertBank[] banks, int lanes, int ramSlots, int shards) throws IOException {
         FileRecordSource source = new FileRecordSource(file, banks);
-        RamTier tier = new RamTier(banks, ramSlots, shards, RamTier.Policy.BANK_PARTITIONED);
+        RamTier tier = new RamTier(banks, ramSlots, shards, ReplacementPolicy.BANK_PARTITIONED);
         try {
             if (tier.isResident()) tier.preload(source, 4);
         } catch (InterruptedException interrupted) {

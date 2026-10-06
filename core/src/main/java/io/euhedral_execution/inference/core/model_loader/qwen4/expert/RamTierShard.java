@@ -19,11 +19,11 @@ import java.util.concurrent.atomic.AtomicLongArray;
 /// ## Replacement
 ///
 /// The model visits layer 0 to the last and starts again, so the reuse distance of an expert is a whole
-/// pass and a global LRU evicts exactly what the next pass needs. [RamTier.Policy#BANK_PARTITIONED]
+/// pass and a global LRU evicts exactly what the next pass needs. [ReplacementPolicy#BANK_PARTITIONED]
 /// gives each layer (bank) a quota of the shard's slots in proportion to its experts. A layer under its
 /// quota that needs a slot takes it from the layer furthest over its own quota, and a layer at its quota
 /// replaces its own least recently used record, so a layer cannot flush the others. Slots no layer is
-/// using are borrowed freely. [RamTier.Policy#GLOBAL_LRU] is the baseline.
+/// using are borrowed freely. [ReplacementPolicy#GLOBAL_LRU] is the baseline.
 public final class RamTierShard {
     private static final byte FREE = 0;
     private static final byte FILLING = 1;
