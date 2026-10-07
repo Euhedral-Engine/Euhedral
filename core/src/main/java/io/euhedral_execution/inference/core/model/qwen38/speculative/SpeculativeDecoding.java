@@ -1,12 +1,13 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
+import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 
@@ -28,24 +29,27 @@ public interface SpeculativeDecoding extends AutoCloseable {
     }
 
     /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk, once the
-    /// strategy's own state covers it and before the next chunk changes it. The future completes when the cache
-    /// is done with the sequence's state.
+    /// strategy's own state covers it and before the next chunk changes it. `done` runs once the cache is
+    /// finished with the sequence's state, with the failure that stopped it or null, on any thread; it must not
+    /// block.
     @FunctionalInterface
     interface PrefixHooks {
-        CompletableFuture<Void> afterChunk(int end);
+        void afterChunk(int end, Consumer<Throwable> done);
     }
 
-    /// Prefills `prompt` from `startPosition` (0 for a fresh sequence, or the position a prefix-cache restore
-    /// left the sequence at, with this strategy's state restored too) and generates up to `maxNewTokens`,
-    /// reporting each committed token to `onToken`. The steps run as continuations on the workers that retire
-    /// the quanta; `onToken` and `timing` are called there, one at a time, in order.
-    CompletableFuture<List<Integer>> generateAsync(
+    /// The first step of a speculative generation: prefills `prompt` from `startPosition` (0 for a fresh
+    /// sequence, or the position a prefix-cache restore left the sequence at, with this strategy's state restored
+    /// too) and generates up to `maxNewTokens`, reporting each committed token to `onToken`; its last step hands
+    /// every token to `ended` and names no next port. The steps run as generation frames: `onToken`, `timing` and
+    /// `ended` are called on the workers that run them, one at a time, in order.
+    StepPort start(
             int[] prompt,
             int maxNewTokens,
             IntConsumer onToken,
             GenerationTimingListener timing,
             PrefixHooks hooks,
-            int startPosition);
+            int startPosition,
+            Consumer<List<Integer>> ended);
 
     /// The strategy's state as prefix checkpoints store it.
     SpeculativeCheckpoint checkpoint();

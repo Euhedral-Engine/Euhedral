@@ -1,8 +1,12 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.inference.core.generation.Generation;
+import io.euhedral_execution.inference.core.generation.GenerationFrames;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
+import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.Execution;
@@ -10,13 +14,14 @@ import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 
@@ -25,7 +30,8 @@ import java.util.function.IntPredicate;
 /// decides how many tokens one verification commits.
 ///
 /// The drafter conditions on the target's hidden rows after five of its layers (the taps), projected into each
-/// draft layer's keys and values of the committed positions (its context). Each step is a chain of quanta:
+/// draft layer's keys and values of the committed positions (its context). Each step is a sequence of quanta,
+/// run as generation frames through the decoder's step ports:
 /// 1. a DRAFT block: the anchor (the last committed token, not yet fed to the target) and 7 mask tokens at its
 ///    position and the next 7, through the 5 draft layers together, the target's output head, the top 16
 ///    candidates per position and the selector's path, which is the proposal;
@@ -158,12 +164,22 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         return this.checkpoint;
     }
 
-    /// Prefills `prompt` and generates up to `maxNewTokens` tokens, exactly as greedy decode would, blocking until
-    /// done (tests and tools).
+    /// Prefills `prompt` and generates up to `maxNewTokens` tokens, exactly as greedy decode would. The steps run
+    /// as generation frames on the lattice; the calling thread waits for them (tests and tools).
     public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
+        Generation generation = new Generation(new GenerationFrames(this.runtime.lake()));
+        StepPort first;
         try {
-            return generateAsync(prompt, maxNewTokens, onToken, timing, null, 0).get();
+            first = start(prompt, maxNewTokens, onToken, timing, null, 0, generation::complete);
+        } catch (RuntimeException | Error refused) {
+            generation.fail(refused);
+            generation.finishNow();
+            throw refused;
+        }
+        generation.start(first);
+        try {
+            return generation.result().get();
         } catch (ExecutionException failure) {
             if (failure.getCause() instanceof RuntimeException runtimeFailure) throw runtimeFailure;
             if (failure.getCause() instanceof Error error) throw error;
@@ -174,221 +190,326 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
     /// A sequence restored at `startPosition` holds the target state and the drafter's context for `[0,
     /// startPosition)`; prefilling resumes there.
     @Override
-    public CompletableFuture<List<Integer>> generateAsync(
+    public StepPort start(
             int[] prompt,
             int maxNewTokens,
             IntConsumer onToken,
             GenerationTimingListener timing,
             PrefixHooks hooks,
-            int startPosition) {
+            int startPosition,
+            Consumer<List<Integer>> ended) {
         if (prompt.length == 0 || maxNewTokens <= 0) throw new IllegalArgumentException("empty generation");
         if (startPosition < 0 || startPosition >= prompt.length)
             throw new IllegalArgumentException("startPosition must lie within the prompt");
         this.statistics = new Statistics(drafts());
-        return new Run(prompt, maxNewTokens, onToken, timing, hooks).prefill(startPosition);
+        return new Run(prompt, maxNewTokens, onToken, timing, hooks, ended).prefillFrom(startPosition);
     }
 
-    /// One generation's continuations, in the order of the sequential algorithm.
+    /// One generation's steps, in the order of the sequential algorithm: each port admits one quantum and, when it
+    /// retired, names the next.
     private final class Run {
+        /// What a finished context quantum goes on to.
+        private enum Context {
+            PROMPT,
+            AFTER_VERIFY
+        }
+
         private final int[] prompt;
         private final int maxNewTokens;
         private final IntConsumer onToken;
         private final GenerationTimingListener timing;
         private final PrefixHooks hooks;
+        private final Consumer<List<Integer>> ended;
         private final List<Integer> output = new ArrayList<>();
         private boolean firstBlock = true;
 
-        Run(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing, PrefixHooks hooks) {
+        // The prefill chunk in flight.
+        private int offset;
+        private int end;
+        private boolean last;
+        private long started;
+        private int[] chunk;
+
+        // The context quantum in flight.
+        private long contextPosition;
+        private int[] contextTokens;
+        private long contextStarted;
+        private Context context;
+
+        // The block and verification in flight.
+        private int anchor;
+        private long position;
+        private long drafting;
+        private int[] rows;
+        private int[] candidates;
+        private SpeculativeAcceptance acceptance;
+        private int finalToken;
+        private volatile Throwable captureFailure;
+
+        Run(
+                int[] prompt,
+                int maxNewTokens,
+                IntConsumer onToken,
+                GenerationTimingListener timing,
+                PrefixHooks hooks,
+                Consumer<List<Integer>> ended) {
             this.prompt = prompt;
             this.maxNewTokens = maxNewTokens;
             this.onToken = onToken;
             this.timing = timing;
             this.hooks = hooks;
+            this.ended = ended;
         }
 
-        /// Prompt: prefill chunks that tap their rows, each followed by its context quantum.
-        CompletableFuture<List<Integer>> prefill(int offset) {
-            if (offset >= this.prompt.length) return afterPrompt();
-            int end = Math.min(this.prompt.length, offset + DFlash2Decoder.this.prefillChunk);
-            boolean last = end == this.prompt.length;
-            long started = System.nanoTime();
-            int[] chunk = Arrays.copyOfRange(this.prompt, offset, end);
-            return execute(new Quantum(
-                                    DFlash2Decoder.this.plan,
-                                    DFlash2Decoder.this.sequence,
-                                    Quantum.ExecutionKind.PREFILL,
-                                    offset,
-                                    chunk,
-                                    last ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                                    last ? DFlash2Decoder.this.baseLogits : null)
-                            .seedingDraft())
-                    .thenCompose(ignored -> {
-                        long executed = System.nanoTime();
-                        DFlash2Decoder.this.statistics.prefillNanos += executed - started;
-                        if (this.timing != null) this.timing.prefillQuantum(started, executed, end - offset);
-                        long contextStarted = System.nanoTime();
-                        return context(offset, chunk).thenCompose(done -> {
-                            long contextDone = System.nanoTime();
-                            DFlash2Decoder.this.statistics.promptContextNanos += contextDone - contextStarted;
-                            if (this.timing != null)
-                                this.timing.draftQuantum("prompt-context", contextStarted, contextDone);
-                            CompletableFuture<Void> stored = this.hooks == null
-                                    ? CompletableFuture.completedFuture(null)
-                                    : this.hooks.afterChunk(end);
-                            return stored.thenCompose(ignoredStore -> prefill(end));
-                        });
-                    });
+        StepPort prefillFrom(int from) {
+            this.offset = from;
+            return this.offset >= this.prompt.length ? afterPrompt() : this.prefill;
         }
 
-        private CompletableFuture<List<Integer>> afterPrompt() {
-            int first = DFlash2Decoder.this.baseLogits.selectedToken();
+        /// Prompt: a prefill chunk that taps its rows; its context quantum follows.
+        private final StepPort prefill = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                end = Math.min(prompt.length, offset + prefillChunk);
+                last = end == prompt.length;
+                started = System.nanoTime();
+                chunk = Arrays.copyOfRange(prompt, offset, end);
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.PREFILL,
+                                        offset,
+                                        chunk,
+                                        last ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
+                                        last ? baseLogits : null)
+                                .seedingDraft(),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                long executed = System.nanoTime();
+                statistics.prefillNanos += executed - started;
+                if (timing != null) timing.prefillQuantum(started, executed, end - offset);
+                return contextOf(offset, chunk, Context.PROMPT);
+            }
+        };
+
+        private StepPort contextOf(long at, int[] tokens, Context then) {
+            this.contextPosition = at;
+            this.contextTokens = tokens;
+            this.context = then;
+            this.contextStarted = System.nanoTime();
+            return this.contextStep;
+        }
+
+        /// The drafter's keys and values of the committed rows, from the tap rows the latest target quantum left.
+        private final StepPort contextStep = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                runtime.admit(
+                        new Quantum(
+                                plan,
+                                sequence,
+                                Quantum.ExecutionKind.DRAFT_CONTEXT,
+                                contextPosition,
+                                contextTokens,
+                                LogitsRequirement.NONE),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                long contextDone = System.nanoTime();
+                if (context == Context.PROMPT) {
+                    statistics.promptContextNanos += contextDone - contextStarted;
+                    if (timing != null) timing.draftQuantum("prompt-context", contextStarted, contextDone);
+                    return hooks == null ? prefillFrom(end) : capture;
+                }
+                statistics.contextNanos += contextDone - contextStarted;
+                if (timing != null) timing.draftQuantum("context", contextStarted, contextDone);
+                return blockFrom(anchor);
+            }
+        };
+
+        private final StepPort capture = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                hooks.afterChunk(end, failure -> {
+                    captureFailure = failure;
+                    runtime.lake().publish(select);
+                });
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                Throwable failure = captureFailure;
+                captureFailure = null;
+                if (failure != null) throw new IllegalStateException("the prefix checkpoint failed", failure);
+                return prefillFrom(end);
+            }
+        };
+
+        private StepPort afterPrompt() {
+            int first = baseLogits.selectedToken();
             if (this.timing != null) this.timing.firstTokenSelected(System.nanoTime(), first);
             this.output.add(first);
             this.onToken.accept(first);
-            DFlash2Decoder.this.statistics.outputTokens++;
-            if (DFlash2Decoder.this.endOfGeneration.test(first)) return CompletableFuture.completedFuture(this.output);
-            if (this.maxNewTokens == 1) return feedFinal(first).thenApply(ignored -> this.output);
-            return step(first);
+            statistics.outputTokens++;
+            if (endOfGeneration.test(first)) return done();
+            if (this.maxNewTokens == 1) {
+                this.finalToken = first;
+                return this.feedFinal;
+            }
+            return blockFrom(first);
         }
 
-        /// One draft block from `anchor`, its verification, and the context of what it committed.
-        private CompletableFuture<List<Integer>> step(int anchor) {
-            long position = DFlash2Decoder.this.sequence.currentTokenPosition();
+        /// One draft block from `anchor`; its verification and the context of what it committed follow.
+        private StepPort blockFrom(int anchor) {
+            this.anchor = anchor;
+            this.position = sequence.currentTokenPosition();
             DFlash2State state = state();
-            if (state == null || state.contextLength() != position)
-                return CompletableFuture.failedFuture(
-                        new IllegalStateException("the drafter's context does not reach the anchor at " + position));
-            int[] block = new int[DFlash2Decoder.this.config.blockSize()];
-            Arrays.fill(block, DFlash2Decoder.this.config.maskToken());
-            block[0] = anchor;
-            long drafting = System.nanoTime();
-            return execute(new Quantum(
-                                    DFlash2Decoder.this.plan,
-                                    DFlash2Decoder.this.sequence,
-                                    Quantum.ExecutionKind.DRAFT,
-                                    position,
-                                    block,
-                                    LogitsRequirement.ALL_TOKENS)
-                            .withProposal(DFlash2Decoder.this.proposal))
-                    .thenCompose(ignored -> {
-                        long draftedAt = System.nanoTime();
-                        long drafted = draftedAt - drafting;
-                        if (this.timing != null) this.timing.draftQuantum("block", drafting, draftedAt);
-                        if (this.firstBlock) DFlash2Decoder.this.statistics.firstBlockNanos += drafted;
-                        else DFlash2Decoder.this.statistics.blockNanos += drafted;
-                        this.firstBlock = false;
-                        int[] rows = new int[DFlash2Decoder.this.verified + 1];
-                        rows[0] = anchor;
-                        System.arraycopy(DFlash2Decoder.this.proposal.tokens(), 0, rows, 1, rows.length - 1);
-                        int[] candidates =
-                                DFlash2Decoder.this.steps == null ? null : DFlash2Decoder.this.proposal.candidates();
-                        return verify(position, rows, candidates);
-                    });
+            if (state == null || state.contextLength() != this.position)
+                throw new IllegalStateException("the drafter's context does not reach the anchor at " + this.position);
+            return this.blockStep;
         }
 
-        private CompletableFuture<List<Integer>> verify(long position, int[] rows, int[] candidates) {
-            var acceptance = new SpeculativeAcceptance(
-                    rows, DFlash2Decoder.this.endOfGeneration, this.maxNewTokens - this.output.size());
-            long started = System.nanoTime();
-            return execute(new Quantum(
-                                    DFlash2Decoder.this.plan,
-                                    DFlash2Decoder.this.sequence,
-                                    Quantum.ExecutionKind.VERIFY,
-                                    position,
-                                    rows,
-                                    LogitsRequirement.ALL_TOKENS,
-                                    DFlash2Decoder.this.baseLogits)
-                            .withAcceptance(acceptance)
-                            .seedingDraft())
-                    .thenCompose(ignored -> {
-                        Statistics statistics = DFlash2Decoder.this.statistics;
-                        long executed = System.nanoTime();
-                        statistics.verifyNanos += executed - started;
-                        statistics.verifications++;
-                        statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
-                        StepListener listener = DFlash2Decoder.this.steps;
-                        if (listener != null)
-                            listener.verified(
-                                    position,
-                                    rows[0],
-                                    Arrays.copyOfRange(rows, 1, rows.length),
-                                    candidates,
-                                    acceptance.acceptedDrafts());
-                        int[] committed = acceptance.outputs();
-                        if (this.timing != null)
-                            this.timing.speculativeStep(
-                                    started, executed, committed.length, acceptance.acceptedDrafts());
-                        for (int token : committed) {
-                            this.output.add(token);
-                            this.onToken.accept(token);
-                        }
-                        statistics.outputTokens += committed.length;
-                        int next = committed[committed.length - 1];
-                        if (DFlash2Decoder.this.endOfGeneration.test(next))
-                            return CompletableFuture.completedFuture(this.output);
-                        if (this.output.size() >= this.maxNewTokens)
-                            return feedFinal(next).thenApply(done -> this.output);
-                        // The committed rows' taps are the verified rows 0 .. committed - 1: the anchor and the
-                        // accepted drafts, at the positions the target just committed.
-                        int[] contextRows = Arrays.copyOf(rows, acceptance.committedRows());
-                        long contextStarted = System.nanoTime();
-                        return context(position, contextRows).thenCompose(done -> {
-                            long contextDone = System.nanoTime();
-                            DFlash2Decoder.this.statistics.contextNanos += contextDone - contextStarted;
-                            if (this.timing != null) this.timing.draftQuantum("context", contextStarted, contextDone);
-                            return step(next);
-                        });
-                    });
-        }
+        private final StepPort blockStep = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                int[] block = new int[config.blockSize()];
+                Arrays.fill(block, config.maskToken());
+                block[0] = anchor;
+                drafting = System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.DRAFT,
+                                        position,
+                                        block,
+                                        LogitsRequirement.ALL_TOKENS)
+                                .withProposal(proposal),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                long draftedAt = System.nanoTime();
+                long drafted = draftedAt - drafting;
+                if (timing != null) timing.draftQuantum("block", drafting, draftedAt);
+                if (firstBlock) statistics.firstBlockNanos += drafted;
+                else statistics.blockNanos += drafted;
+                firstBlock = false;
+                rows = new int[verified + 1];
+                rows[0] = anchor;
+                System.arraycopy(proposal.tokens(), 0, rows, 1, rows.length - 1);
+                candidates = steps == null ? null : proposal.candidates();
+                return verify;
+            }
+        };
+
+        private final StepPort verify = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                acceptance = new SpeculativeAcceptance(rows, endOfGeneration, maxNewTokens - output.size());
+                started = System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.VERIFY,
+                                        position,
+                                        rows,
+                                        LogitsRequirement.ALL_TOKENS,
+                                        baseLogits)
+                                .withAcceptance(acceptance)
+                                .seedingDraft(),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                Statistics statistics = DFlash2Decoder.this.statistics;
+                long executed = System.nanoTime();
+                statistics.verifyNanos += executed - started;
+                statistics.verifications++;
+                statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
+                StepListener listener = steps;
+                if (listener != null)
+                    listener.verified(
+                            position,
+                            rows[0],
+                            Arrays.copyOfRange(rows, 1, rows.length),
+                            candidates,
+                            acceptance.acceptedDrafts());
+                int[] committed = acceptance.outputs();
+                if (timing != null)
+                    timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts());
+                for (int token : committed) {
+                    output.add(token);
+                    onToken.accept(token);
+                }
+                statistics.outputTokens += committed.length;
+                int next = committed[committed.length - 1];
+                if (endOfGeneration.test(next)) return done();
+                if (output.size() >= maxNewTokens) {
+                    finalToken = next;
+                    return feedFinal;
+                }
+                // The committed rows' taps are the verified rows 0 .. committed - 1: the anchor and the accepted
+                // drafts, at the positions the target just committed.
+                anchor = next;
+                return contextOf(position, Arrays.copyOf(rows, acceptance.committedRows()), Context.AFTER_VERIFY);
+            }
+        };
 
         /// Ordinary decode feeds the last allowed token without sampling; so does the decoder, so both leave the
         /// same target state.
-        private CompletableFuture<Void> feedFinal(int token) {
-            long started = System.nanoTime();
-            return execute(new Quantum(
-                            DFlash2Decoder.this.plan,
-                            DFlash2Decoder.this.sequence,
-                            Quantum.ExecutionKind.DECODE,
-                            DFlash2Decoder.this.sequence.currentTokenPosition(),
-                            new int[] {token},
-                            LogitsRequirement.NONE))
-                    .thenApply(ignored -> {
-                        long executed = System.nanoTime();
-                        if (this.timing != null) this.timing.decodeQuantum(started, executed, executed, false, -1);
-                        return null;
-                    });
+        private final StepPort feedFinal = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                started = System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                plan,
+                                sequence,
+                                Quantum.ExecutionKind.DECODE,
+                                sequence.currentTokenPosition(),
+                                new int[] {finalToken},
+                                LogitsRequirement.NONE),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                long executed = System.nanoTime();
+                if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
+                return done();
+            }
+        };
+
+        private StepPort done() {
+            this.ended.accept(this.output);
+            return null;
         }
     }
 
-    /// The drafter's keys and values of the committed rows at `position`, from the tap rows the latest target
-    /// quantum left.
-    private CompletableFuture<Void> context(long position, int[] tokens) {
-        return execute(new Quantum(
-                this.plan,
-                this.sequence,
-                Quantum.ExecutionKind.DRAFT_CONTEXT,
-                position,
-                tokens,
-                LogitsRequirement.NONE));
+    /// A speculative step must succeed: anything else ends the run.
+    private static void succeeded(AbstractQuantum step) {
+        Quantum.Outcome outcome = ((Quantum) step).conclusion();
+        if (outcome.status() != Quantum.Status.SUCCESS)
+            throw new IllegalStateException("speculative quantum " + outcome.status(), outcome.failure());
     }
 
     private DFlash2State state() {
         return this.sequence.kvCacheState() instanceof AttentionStates attention ? attention.dflash2() : null;
-    }
-
-    /// Admits `context`; the future completes on the worker that retired it, failing unless it succeeded.
-    private CompletableFuture<Void> execute(Quantum context) {
-        CompletableFuture<Quantum.Outcome> outcome;
-        try {
-            outcome = this.runtime.submit(context);
-        } catch (RuntimeException | Error failure) {
-            return CompletableFuture.failedFuture(failure);
-        }
-        return outcome.thenApply(completed -> {
-            if (completed.status() != Quantum.Status.SUCCESS)
-                throw new IllegalStateException("speculative quantum " + completed.status(), completed.failure());
-            return null;
-        });
     }
 
     @Override
