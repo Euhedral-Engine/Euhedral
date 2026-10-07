@@ -54,6 +54,7 @@ subprojects {
             exclude("**/TeacherForcedQualityCudaIntegrationTest.class")
             exclude("**/DFlash2*CudaIntegrationTest.class")
             exclude("**/Qwen4*CudaIntegrationTest.class")
+            exclude("**/TokenIdentityCudaIntegrationTest.class")
             useJUnitPlatform()
             // Constrained decoding is CPU work; its tests load the host's llguidance build.
             llguidanceTasks[hostProductId]?.let { build ->
@@ -96,6 +97,7 @@ subprojects {
             include("**/TeacherForcedQualityCudaIntegrationTest.class")
             include("**/DFlash2*CudaIntegrationTest.class")
             include("**/Qwen4*CudaIntegrationTest.class")
+            include("**/TokenIdentityCudaIntegrationTest.class")
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
@@ -131,6 +133,14 @@ subprojects {
                     providers.gradleProperty("euhedral.qwen.q3-compressed-artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3_compressed.edrl")
                             .get())
+            // Optional compressed NVFP4 artifact; the token-identity gate covers it.
+            systemProperty(
+                    "euhedral.qwen.nvfp4-compressed-artifact",
+                    providers.gradleProperty("euhedral.qwen.nvfp4-compressed-artifact")
+                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl")
+                            .get())
+            // Token-identity gate: `-Peuhedral.identity.record=true` rewrites the goldens instead of comparing.
+            providers.gradleProperty("euhedral.identity.record").orNull?.let { systemProperty("euhedral.identity.record", it) }
             // Teacher-forced relaxed-numerics drift: decode length, prefill prefix, an optional per-step CSV
             // report, and `exact` to run the oracle on both sequences.
             for (name in listOf("steps", "prefix", "report", "candidate"))
