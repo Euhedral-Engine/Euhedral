@@ -1,18 +1,17 @@
 package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 
 /// Launches of the routing and shared-expert kernels of the MoE block.
 public final class Qwen4MoeOps {
 
-    private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
-            ThreadLocal.withInitial(Qwen4KernelArguments::new);
+    private static final ThreadLocal<KernelArguments> ARGUMENTS = ThreadLocal.withInitial(KernelArguments::new);
 
     private Qwen4MoeOps() {}
 
-    private static Qwen4KernelArguments arguments() {
+    private static KernelArguments arguments() {
         return ARGUMENTS.get().clear();
     }
 
@@ -21,7 +20,7 @@ public final class Qwen4MoeOps {
     public static void router(ExecutionGpu gpu, long logits, long ids, long weights, int rows, int experts, int k) {
         if (rows <= 0 || experts <= 0 || experts > 1024 || k <= 0 || k > 16 || k > experts)
             throw new IllegalArgumentException("router shape " + rows + " x " + experts + " top " + k);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.ROUTER_BF16,
                 rows,
                 1,
@@ -42,7 +41,7 @@ public final class Qwen4MoeOps {
     /// `output = bf16(bf16(silu(gate)) * up)` over `count` values.
     public static void swiGlu(ExecutionGpu gpu, long gate, long up, long output, int count) {
         if (count <= 0) throw new IllegalArgumentException("count must be positive");
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.SWIGLU_BF16,
                 (count + 255) / 256,
                 1,
@@ -58,7 +57,7 @@ public final class Qwen4MoeOps {
     /// and past `cols` are 0.
     public static void swiGluPadded(ExecutionGpu gpu, long gate, long up, long output, int rows, int cols, int padded) {
         if (rows <= 0 || cols <= 0 || padded < cols) throw new IllegalArgumentException("invalid padded SwiGLU shape");
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.SWIGLU_PADDED_BF16,
                 (padded + 255) / 256,
                 rows,
@@ -80,7 +79,7 @@ public final class Qwen4MoeOps {
     public static void nvfp4PadK(ExecutionGpu gpu, long source, long target, int rows, int k, int padded) {
         if (rows <= 0 || k <= 0 || k % 128 != 0 || padded % 128 != 0 || padded < k)
             throw new IllegalArgumentException("invalid NVFP4 padding " + k + " to " + padded);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.NVFP4_PAD_K,
                 rows + 1,
                 1,
@@ -106,7 +105,7 @@ public final class Qwen4MoeOps {
     /// `output = routed + sigmoid(gate) * shared` per row, in BF16 as upstream rounds it.
     public static void finish(ExecutionGpu gpu, long routed, long shared, long gate, long output, int rows, int width) {
         if (rows <= 0 || width <= 0) throw new IllegalArgumentException("extents must be positive");
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.MOE_FINISH_BF16,
                 (width + 255) / 256,
                 rows,

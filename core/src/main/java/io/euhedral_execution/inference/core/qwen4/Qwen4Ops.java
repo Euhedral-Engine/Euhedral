@@ -2,7 +2,7 @@ package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 
 /// Typed launches of the Flash-Next kernels (native/src/qwen4): the geometry each kernel is written for and the
 /// argument checks the native launcher cannot make (alignment, extents). Every method queues on the GPU's selected
@@ -12,12 +12,12 @@ import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 /// (docs/FLASH_NEXT_EXECUTION.md).
 public final class Qwen4Ops {
 
-    private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
-            ThreadLocal.withInitial(Qwen4KernelArguments::new);
+    private static final ThreadLocal<KernelArguments> ARGUMENTS =
+            ThreadLocal.withInitial(KernelArguments::new);
 
     private Qwen4Ops() {}
 
-    private static Qwen4KernelArguments arguments() {
+    private static KernelArguments arguments() {
         return ARGUMENTS.get().clear();
     }
 
@@ -61,7 +61,7 @@ public final class Qwen4Ops {
             Qwen4Kernel kernel = split
                     ? (tiles ? Qwen4Kernel.LINEAR_TC_ROWS_SPLIT_BF16 : Qwen4Kernel.LINEAR_TC_SPLIT_BF16)
                     : (tiles ? Qwen4Kernel.LINEAR_TC_ROWS_BF16 : Qwen4Kernel.LINEAR_TC_BF16);
-            gpu.launchQwen4(
+            gpu.launchTableKernel(
                     kernel,
                     split ? n / 8 : n / 32,
                     ceilDiv(rows, tiles ? 64 : 16),
@@ -81,7 +81,7 @@ public final class Qwen4Ops {
         }
         int slices = rows < TC_MIN_ROWS && LINEAR_SPLIT && !gpu.exactNumerics() ? slices(k, n) : 1;
         if (slices > 1) {
-            gpu.launchQwen4(
+            gpu.launchTableKernel(
                     slices == 8 ? Qwen4Kernel.LINEAR_SPLIT8_BF16 : Qwen4Kernel.LINEAR_SPLIT4_BF16,
                     ceilDiv(n, 8 / slices),
                     ceilDiv(rows, 8),
@@ -99,7 +99,7 @@ public final class Qwen4Ops {
                             .int32(n));
             return;
         }
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.LINEAR_BF16,
                 ceilDiv(n, 8),
                 ceilDiv(rows, 8),
@@ -122,7 +122,7 @@ public final class Qwen4Ops {
     public static void groupedRmsNorm(
             ExecutionGpu gpu, long input, long weight, long output, int rows, int groups, int width, float epsilon) {
         requirePositive(rows, groups, width);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.GROUPED_RMS_NORM_BF16,
                 Math.multiplyExact(rows, groups),
                 1,
@@ -144,7 +144,7 @@ public final class Qwen4Ops {
     /// `output = bf16(silu(bf16(input / divisor)))` over `count` values.
     public static void scaledSilu(ExecutionGpu gpu, long input, long output, int count, float divisor) {
         requirePositive(count);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.SCALED_SILU_BF16,
                 ceilDiv(count, 256),
                 1,
@@ -159,7 +159,7 @@ public final class Qwen4Ops {
     /// The mixed block input of a gated residual: `mean over streams of bf16(sigmoid(up) * normed)`.
     public static void hcMix(ExecutionGpu gpu, long normed, long up, long mixed, int rows, int streams, int width) {
         requirePositive(rows, streams, width);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.HC_MIX_BF16,
                 ceilDiv(width, 256),
                 rows,
@@ -188,7 +188,7 @@ public final class Qwen4Ops {
             int streams,
             int width) {
         requirePositive(rows, streams, width);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.HC_INJECT_BF16,
                 ceilDiv(width, 256),
                 rows,
@@ -211,7 +211,7 @@ public final class Qwen4Ops {
     public static void repeatStreams(ExecutionGpu gpu, long input, long output, int rows, int streams, int width) {
         requirePositive(rows, streams, width);
         long total = (long) rows * streams * width;
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.REPEAT_STREAMS_BF16,
                 Math.toIntExact(ceilDiv(total, 256)),
                 1,
@@ -233,7 +233,7 @@ public final class Qwen4Ops {
     public static void ngramExpand(ExecutionGpu gpu, long records, long output, int count, int width, int recordBytes) {
         requirePositive(count, width, recordBytes);
         if (recordBytes % 4 != 0) throw new IllegalArgumentException("records are multiples of four bytes");
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.NGRAM_EXPAND_BF16,
                 count,
                 1,
@@ -255,7 +255,7 @@ public final class Qwen4Ops {
     public static void pleGate(
             ExecutionGpu gpu, long key, long query, long value, long output, int rows, int streams, int width) {
         requirePositive(rows, streams, width);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.PLE_GATE_BF16,
                 Math.multiplyExact(rows, streams),
                 1,
@@ -288,7 +288,7 @@ public final class Qwen4Ops {
             int taps,
             int dilation) {
         requirePositive(rows, channels, taps, dilation);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.PLE_CONV_BF16,
                 ceilDiv(channels, 256),
                 rows,
@@ -313,7 +313,7 @@ public final class Qwen4Ops {
     public static void convHistory(ExecutionGpu gpu, long x, long historyRows, int rows, int channels, int history) {
         requirePositive(rows, channels, history);
         if (history > 32) throw new IllegalArgumentException("the history kernel keeps at most 32 rows");
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.CONV_HISTORY_BF16,
                 ceilDiv(channels, 256),
                 1,
@@ -337,7 +337,7 @@ public final class Qwen4Ops {
         requirePositive(rows, width, vocabulary);
         if (width % 8 != 0) throw new IllegalArgumentException("embedding rows are multiples of 8 values");
         requireAligned(16, table, output);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.EMBEDDING_BF16,
                 rows,
                 1,

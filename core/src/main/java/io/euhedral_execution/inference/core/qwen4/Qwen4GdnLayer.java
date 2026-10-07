@@ -1,8 +1,8 @@
 package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 
 /// The Gated DeltaNet token mixer of a Flash-Next layer (Qwen4ExpTextGatedDeltaNet), over the dense engine's
 /// delta-rule recurrence:
@@ -205,14 +205,13 @@ public final class Qwen4GdnLayer {
 
     /// Launch wrappers of the layer's own kernels.
     static final class Qwen4GdnOps {
-        private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
-                ThreadLocal.withInitial(Qwen4KernelArguments::new);
+        private static final ThreadLocal<KernelArguments> ARGUMENTS = ThreadLocal.withInitial(KernelArguments::new);
 
         private Qwen4GdnOps() {}
 
         static void convolution(
                 ExecutionGpu gpu, long x, long history, long weights, long output, int rows, int channels, int taps) {
-            gpu.launchQwen4(
+            gpu.launchTableKernel(
                     Qwen4Kernel.GDN_CONV_BF16,
                     (channels + 255) / 256,
                     rows,
@@ -235,7 +234,7 @@ public final class Qwen4GdnLayer {
 
         static void control(
                 ExecutionGpu gpu, long a, long b, long aLog, long dtBias, long alpha, long beta, int rows, int heads) {
-            gpu.launchQwen4(
+            gpu.launchTableKernel(
                     Qwen4Kernel.GDN_CONTROL_BF16,
                     (rows * heads + 255) / 256,
                     1,
@@ -268,7 +267,7 @@ public final class Qwen4GdnLayer {
                 int headDim,
                 float epsilon,
                 int activation) {
-            gpu.launchQwen4(
+            gpu.launchTableKernel(
                     Qwen4Kernel.GDN_GATED_NORM_BF16,
                     rows * heads,
                     1,

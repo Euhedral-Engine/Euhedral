@@ -1,8 +1,8 @@
 package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 
 /// Typed launches of the routed-expert kernels (native/src/qwen4/experts.cuh, docs/FLASH_NEXT_EXPERTS.md): the
@@ -21,12 +21,11 @@ public final class Qwen4ExpertOps {
     private static final int DOWN_ROWS = 128;
     private static final int COMBINE_THREADS = 256;
 
-    private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
-            ThreadLocal.withInitial(Qwen4KernelArguments::new);
+    private static final ThreadLocal<KernelArguments> ARGUMENTS = ThreadLocal.withInitial(KernelArguments::new);
 
     private Qwen4ExpertOps() {}
 
-    private static Qwen4KernelArguments arguments() {
+    private static KernelArguments arguments() {
         return ARGUMENTS.get().clear();
     }
 
@@ -97,7 +96,7 @@ public final class Qwen4ExpertOps {
             ExecutionGpu gpu, Geometry geometry, long slots, long items, int itemCount, long pairs, long x, long act) {
         if (itemCount <= 0) throw new IllegalArgumentException("an expert has at least one work item");
         requireAligned(slots, items, pairs, x, act);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.EXPERT_GATE_UP_SWIGLU_BF16,
                 geometry.inter() / GATE_UP_COLUMNS,
                 itemCount,
@@ -130,7 +129,7 @@ public final class Qwen4ExpertOps {
             long weighted) {
         if (itemCount <= 0) throw new IllegalArgumentException("an expert has at least one work item");
         requireAligned(slots, items, pairs, act, weighted);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.EXPERT_DOWN_BF16,
                 geometry.hidden() / DOWN_ROWS,
                 itemCount,
@@ -167,7 +166,7 @@ public final class Qwen4ExpertOps {
             throw new IllegalArgumentException("combine needs positive rows and hidden divisible by 8");
         requireAligned(weighted, rowOffsets, rowPairs, out);
         int vectors = hidden / 8;
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.EXPERT_COMBINE_BF16,
                 (vectors + COMBINE_THREADS - 1) / COMBINE_THREADS,
                 rows,

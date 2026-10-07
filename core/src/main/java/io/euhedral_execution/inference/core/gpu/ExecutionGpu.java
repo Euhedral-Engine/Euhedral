@@ -600,10 +600,11 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("DFlash2 selector is not implemented by this GPU");
     }
 
-    /// Launches a Flash-Next kernel with the given geometry on the selected stream (or synchronously when none is
+    /// Launches a kernel of the native kernel table with the given geometry on the selected stream (or synchronously
+    /// when none is
     /// selected). The arguments must match the kernel's signature in count and width.
-    public void launchQwen4(
-            Qwen4Kernel kernel,
+    public void launchTableKernel(
+            TableKernel kernel,
             int gridX,
             int gridY,
             int gridZ,
@@ -611,8 +612,8 @@ public abstract class ExecutionGpu implements GpuMemory {
             int blockY,
             int blockZ,
             int sharedBytes,
-            Qwen4KernelArguments arguments) {
-        throw new UnsupportedOperationException("Flash-Next kernels are not implemented by this GPU");
+            KernelArguments arguments) {
+        throw new UnsupportedOperationException("table kernels are not implemented by this GPU");
     }
 
     public void zeroDeviceMemory(long address, long byteSize) {
