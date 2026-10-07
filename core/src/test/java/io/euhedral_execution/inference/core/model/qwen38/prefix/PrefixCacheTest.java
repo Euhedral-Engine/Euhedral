@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.GdnStates;
+import io.euhedral_execution.inference.core.model.qwen38.HeldWork;
 import io.euhedral_execution.inference.core.model.qwen38.MemoryGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
@@ -57,7 +58,7 @@ class PrefixCacheTest {
     /// A sequence with `rows` committed rows and recognizable state, as a prefill leaves it.
     private Sequence sequence(int rows, int seed) {
         var sequence = new Sequence(1);
-        sequence.admit(0, 0);
+        var held = HeldWork.admit(sequence);
         Quantum.attachSequenceState(plan(), sequence, this.gpu);
         var attention = (AttentionStates) sequence.kvCacheState();
         var gdn = (GdnStates) sequence.recurrentState();
@@ -71,7 +72,7 @@ class PrefixCacheTest {
                 gdn.forLayer(0).convolutionStateAddress(), (int) gdn.forLayer(0).convolutionBytes(), seed + 1);
         for (int i = 0; i < kv.pageAddresses().size(); i++)
             this.gpu.fill(kv.pageAddresses().get(i), (int) (2 * kv.planePageBytes()), seed + 2 + i);
-        sequence.commit(rows);
+        held.commit(rows);
         return sequence;
     }
 
@@ -321,7 +322,7 @@ class PrefixCacheTest {
     /// A sequence as a speculative prefill leaves it: `rows` base rows, `mtpRows` MTP rows, recognizable bytes.
     private Sequence sequenceWithMtp(int rows, int mtpRows, int seed) {
         var sequence = new Sequence(1);
-        sequence.admit(0, 0);
+        var held = HeldWork.admit(sequence);
         attachMtpStates(sequence);
         var attention = (AttentionStates) sequence.kvCacheState();
         var gdn = (GdnStates) sequence.recurrentState();
@@ -341,7 +342,7 @@ class PrefixCacheTest {
             this.gpu.fill(kv.pageAddresses().get(i), (int) (2 * kv.planePageBytes()), seed + 2 + i);
         for (int i = 0; i < mtp.pageAddresses().size(); i++)
             this.gpu.fill(mtp.pageAddresses().get(i), (int) (2 * mtp.planePageBytes()), seed + 50 + i);
-        sequence.commit(rows);
+        held.commit(rows);
         return sequence;
     }
 
@@ -383,9 +384,9 @@ class PrefixCacheTest {
         var hit = cache.lookup(tokens, new MtpCheckpoint(CONFIG));
         assertNotNull(hit);
         var target = new Sequence(2);
-        target.admit(0, 0);
+        var held = HeldWork.admit(target);
         attachMtpStates(target);
-        target.commit(0);
+        held.commit(0);
         assertTrue(cache.restore(INLINE, plan(), target, hit, new MtpCheckpoint(CONFIG))
                 .get());
         cache.release(hit);

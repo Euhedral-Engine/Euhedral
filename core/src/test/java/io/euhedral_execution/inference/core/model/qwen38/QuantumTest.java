@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu.UploadBuffer;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
 import java.util.ArrayList;
@@ -239,12 +240,12 @@ class QuantumTest {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
         var sequence = new Sequence(901);
-        sequence.admit(0, 0);
+        var held = HeldWork.admit(sequence);
         var attempts = new AtomicInteger();
         sequence.setRecurrentState((AutoCloseable) () -> {
             if (attempts.incrementAndGet() == 1) throw new IllegalStateException("transient free failure");
         });
-        sequence.commit(0);
+        held.commit(0);
         var context = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         gpu.afterEmbedding = context::cancel;
         var runtime = ExecutionFixtures.runtime(plan, gpu);
@@ -257,6 +258,128 @@ class QuantumTest {
         assertEquals(2, attempts.get());
         runtime.close();
         assertFalse(runtime.isAttached());
+    }
+
+    @Test
+    @Timeout(10)
+    void aReleaseFailureAfterACancellationFailsTheQuantumAndTheSequence() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.weights());
+        var releaseFailure = new IllegalStateException("injected upload release failure");
+        var gpu = new ExecutionFixtures.RecordingGpu() {
+            @Override
+            public UploadBuffer allocateUploadBuffer(long bytes) {
+                var arena = java.lang.foreign.Arena.ofShared();
+                return new UploadBuffer(arena.allocate(bytes, Integer.BYTES), () -> {
+                    arena.close();
+                    throw releaseFailure;
+                });
+            }
+        };
+        var sequence = new Sequence(906);
+        var context = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
+        gpu.afterEmbedding = context::cancel;
+        var runtime = ExecutionFixtures.runtime(plan, gpu);
+        var outcome = runtime.submit(context).get(5, TimeUnit.SECONDS);
+        assertEquals(Quantum.Status.FAILED, outcome.status(), "the failed release is not lost in the cancellation");
+        assertSame(releaseFailure, outcome.failure());
+        assertEquals(Sequence.TerminalState.FAILED, sequence.terminalState());
+        assertFalse(sequence.inFlight());
+        runtime.close();
+    }
+
+    @Test
+    @Timeout(10)
+    void quantaOfOneSequenceInFlightConcludeInAdmissionOrderWhateverOrderTheyRetire() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.weights());
+        var stream = new ExecutionFixtures.HoldingStream();
+        var gpu = new ExecutionFixtures.RecordingGpu() {
+            @Override
+            public GpuStream openStream() {
+                return stream;
+            }
+        };
+        var lattice = new ExecutionFixtures.ManualLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var sequence = new Sequence(907);
+        List<String> concluded = new ArrayList<>();
+        var first = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
+        var second = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 1, new int[] {2});
+        try {
+            var firstOutcome = runtime.submit(first, quantum -> concluded.add("first"));
+            lattice.drive();
+            assertTrue(sequence.inFlight());
+            assertEquals(1, sequence.submittedFrontier(), "the next quantum starts where the first will leave it");
+            var secondOutcome = runtime.submit(second, quantum -> concluded.add("second"));
+            lattice.drive();
+            assertEquals(2, stream.held());
+
+            stream.releaseNewest(null);
+            lattice.drive();
+            assertEquals(List.of(), concluded, "the second retired first but waits for the first");
+            assertFalse(secondOutcome.isDone());
+            assertEquals(0, sequence.committedFrontier());
+
+            stream.release(null);
+            lattice.drive();
+            assertEquals(List.of("first", "second"), concluded);
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    firstOutcome.get(2, TimeUnit.SECONDS).status());
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    secondOutcome.get(2, TimeUnit.SECONDS).status());
+            assertEquals(2, sequence.committedFrontier());
+            assertFalse(sequence.inFlight());
+        } finally {
+            releaseAndClose(stream, lattice, runtime);
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    void aQuantumAdmittedBehindAFailedOneFailsWithoutCommitting() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.weights());
+        var stream = new ExecutionFixtures.HoldingStream();
+        var gpu = new ExecutionFixtures.RecordingGpu() {
+            @Override
+            public GpuStream openStream() {
+                return stream;
+            }
+        };
+        var lattice = new ExecutionFixtures.ManualLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var sequence = new Sequence(908);
+        var first = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
+        var second = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 1, new int[] {2});
+        try {
+            var firstOutcome = runtime.submit(first);
+            lattice.drive();
+            var secondOutcome = runtime.submit(second);
+            lattice.drive();
+            var deviceFailure = new IllegalStateException("injected device failure");
+            stream.release(deviceFailure);
+            stream.release(null);
+            lattice.drive();
+            assertEquals(
+                    Quantum.Status.FAILED, firstOutcome.get(2, TimeUnit.SECONDS).status());
+            var blocked = secondOutcome.get(2, TimeUnit.SECONDS);
+            assertEquals(Quantum.Status.FAILED, blocked.status());
+            assertSame(deviceFailure, blocked.failure().getCause(), "it names the failure before it");
+            assertEquals(0, sequence.committedFrontier());
+            assertEquals(Sequence.TerminalState.FAILED, sequence.terminalState());
+            assertFalse(sequence.inFlight());
+        } finally {
+            releaseAndClose(stream, lattice, runtime);
+        }
+    }
+
+    /// Lets every boundary the stream still holds retire before closing: a test that failed mid-way must not leave
+    /// close waiting on a quantum whose device work never retires.
+    private static void releaseAndClose(
+            ExecutionFixtures.HoldingStream stream, ExecutionFixtures.ManualLattice lattice, Execution runtime) {
+        while (stream.held() > 0) stream.release(null);
+        lattice.drive();
+        runtime.close();
     }
 
     @Test

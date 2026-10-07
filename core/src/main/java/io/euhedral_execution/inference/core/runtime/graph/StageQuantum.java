@@ -35,4 +35,20 @@ public interface StageQuantum {
 
     /// Publishes the terminal outcome. The graph is already recycled when this runs.
     void publishOutcome();
+
+    /// Runs `conclusion`, the quantum's terminal work once its device-completion boundary was confirmed (the
+    /// stages' retirement hooks, [#retire], recycling, [#publishOutcome]), in the order the quantum's owner
+    /// concludes its work: a sequence concludes its quanta in admission order, whatever order their device work
+    /// retired in. By default it runs now.
+    default void concludeInOrder(Runnable conclusion) {
+        conclusion.run();
+    }
+
+    /// Concludes a quantum whose stages never started: retires it and publishes its outcome, in its owner's order.
+    default void concludeUnstarted() {
+        concludeInOrder(() -> {
+            retire(null);
+            publishOutcome();
+        });
+    }
 }

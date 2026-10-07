@@ -164,8 +164,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         } catch (RuntimeException | Error failure) {
             quantum.lanesJoined(null);
             quantum.fail(failure);
-            quantum.retire(null);
-            quantum.publishOutcome();
+            quantum.concludeUnstarted();
             throw failure;
         }
         StageGraph graph = pooled.graph();
@@ -175,8 +174,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             pool.recycle(pooled);
             quantum.lanesJoined(null);
             quantum.fail(failure);
-            quantum.retire(null);
-            quantum.publishOutcome();
+            quantum.concludeUnstarted();
             throw failure;
         }
         boolean started = false;
@@ -190,7 +188,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 // The stream failed around the preparation; prove it idle before storage is released.
                 stream.recover(failure);
                 quantum.fail(failure);
-                quantum.retire(null);
                 throw failure;
             }
             if (proceeds[0]) {
@@ -201,10 +198,18 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         } finally {
             if (!started) {
                 quantum.lanesJoined(null);
-                pool.recycle(pooled);
-                this.quanta.terminated();
-                // Outcome callbacks never run with the graph's stream selected.
-                quantum.publishOutcome();
+                // The quantum concludes in its owner's order; the graph and its storage stay held until its
+                // retirement released the workspace binding.
+                quantum.concludeInOrder(() -> {
+                    try {
+                        quantum.retire(null);
+                    } finally {
+                        pool.recycle(pooled);
+                        this.quanta.terminated();
+                        // Outcome callbacks never run with the graph's stream selected.
+                        quantum.publishOutcome();
+                    }
+                });
             }
         }
     }

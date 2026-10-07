@@ -1,20 +1,26 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.inference.core.runtime.graph.Sequencer;
+import java.lang.invoke.VarHandle;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 
 /// Request-lifetime state shared by successive Qwen execution quanta.
 ///
-/// The generation chain orders a sequence's work: it admits one quantum at a time and retires it before the next.
-/// A sequence keeps two frontiers. The submitted frontier is where the quantum in flight will leave the sequence;
-/// the committed frontier is where the last retired quantum left it. Admission and retirement are written only by
-/// that chain, and read by any thread, so the fields are volatile and there is no execution lease.
+/// Parallel execution, ordered completion. Work on the sequence (its quanta, and the prefix cache's captures and
+/// restores) is admitted in order at the submitted frontier and may be in flight together. Each piece completes in
+/// any order and concludes in admission order, through a [Sequencer]: whichever thread finds the oldest piece
+/// complete concludes the ready ones, one thread at a time. A piece concludes by settling: it commits (the committed
+/// frontier moves to where it left the sequence) or it is abandoned. A piece is told at its conclusion when it can no
+/// longer commit: a piece before it failed the sequence, or committed short of where it starts.
 ///
-/// Cancellation comes from any thread. Admission publishes the quantum in flight before it reads the cancellation
-/// flag, and [#cancel()] publishes the flag before it reads the quantum in flight, so one of the two always sees
-/// the other: either the admission backs out, or the quantum's retirement concludes the cancellation. The terminal
-/// state is first-writer-wins. Persistent state (GDN buffers, KV pages) closes only in [#complete()], which the
-/// session's lifecycle runs after its generation ended.
+/// The frontiers are written by one writer each: admission (the generation chain) moves the submitted frontier, and
+/// the conclusion of a piece, which runs on one thread at a time, moves the committed one. Any thread reads them, so
+/// they are volatile; there is no lock and no CAS state machine. Cancellation comes from any thread: [#cancel()]
+/// publishes its flag and then reads whether work is in flight, and settlement publishes the settled count and then
+/// reads the flag, so one of the two ends the sequence CANCELLED. The terminal state is first-writer-wins.
+/// Persistent state (GDN buffers, KV pages) closes only in [#complete()], which the session's lifecycle runs after
+/// its generation ended.
 public final class Sequence {
 
     public enum TerminalState {
@@ -24,6 +30,16 @@ public final class Sequence {
         COMPLETED
     }
 
+    /// A piece of work on the sequence, concluded in admission order.
+    public interface Work extends Sequencer.Entry {
+        /// The position it was admitted at.
+        long admittedAt();
+
+        /// Concludes the work once everything admitted before it concluded; it then calls [#commit(long)] or
+        /// [#abandon()] once. `blocked` is null, or why it can no longer commit (it must abandon).
+        void concluded(Throwable blocked);
+    }
+
     private record Terminal(TerminalState state, Throwable failure) {}
 
     private static final Terminal ACTIVE = new Terminal(TerminalState.ACTIVE, null);
@@ -31,9 +47,13 @@ public final class Sequence {
     private static final Terminal COMPLETED = new Terminal(TerminalState.COMPLETED, null);
 
     private final long sequenceId;
-    private volatile long committed;
+    private final Order order = new Order();
+    /// Written by admission only.
     private volatile long submitted;
-    private volatile boolean inFlight;
+    private volatile long admitted;
+    /// Written by the conclusion of a piece only.
+    private volatile long committed;
+    private volatile long settled;
     private volatile boolean cancellationRequested;
     private final AtomicReference<Terminal> terminal = new AtomicReference<>(ACTIVE);
     private volatile Object kvCacheState;
@@ -60,7 +80,7 @@ public final class Sequence {
         return this.sequenceId;
     }
 
-    /// The committed frontier: where the last retired quantum left the sequence.
+    /// The committed frontier: where the last concluded work left the sequence.
     public long currentTokenPosition() {
         return this.committed;
     }
@@ -69,14 +89,15 @@ public final class Sequence {
         return this.committed;
     }
 
-    /// Where the quantum in flight will leave the sequence; the committed frontier when none is.
+    /// Where the work in flight will leave the sequence, where the next work starts; the committed frontier when
+    /// nothing is in flight.
     public long submittedFrontier() {
-        return this.submitted;
+        return inFlight() ? this.submitted : this.committed;
     }
 
-    /// Whether a quantum has been admitted and not yet retired.
+    /// Whether some admitted work has not settled yet.
     public boolean inFlight() {
-        return this.inFlight;
+        return this.admitted != this.settled;
     }
 
     public boolean cancellationRequested() {
@@ -95,7 +116,7 @@ public final class Sequence {
         return this.kvCacheState;
     }
 
-    /// Sets the KV state; only the quantum in flight does.
+    /// Sets the KV state; only work in flight does.
     public void setKvCacheState(Object kvCacheState) {
         requireInFlight();
         this.kvCacheState = kvCacheState;
@@ -105,93 +126,18 @@ public final class Sequence {
         return this.recurrentState;
     }
 
-    /// Sets the recurrent state; only the quantum in flight does.
+    /// Sets the recurrent state; only work in flight does.
     public void setRecurrentState(Object recurrentState) {
         requireInFlight();
         this.recurrentState = recurrentState;
     }
 
-    /// Admits the quantum covering positions `[start, end)`. It must start at the committed frontier, with none in
-    /// flight, on an active sequence whose cancellation was not requested. A draft quantum admits `[committed,
-    /// committed)`: it is still the one quantum in flight, and leaves the frontiers where they are.
-    public void admit(long start, long end) {
-        if (this.inFlight) {
-            throw new IllegalStateException("Sequence already has a quantum in flight");
-        }
-        requireActive();
-        if (start != this.committed) {
-            throw new IllegalArgumentException(
-                    "Execution starts at " + start + " but sequence is at " + this.committed);
-        }
-        if (end < start) {
-            throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
-        }
-        this.inFlight = true;
-        // Published before the flag is read; cancel() writes the flag before it reads this.
-        if (this.cancellationRequested) {
-            this.inFlight = false;
-            this.terminal.compareAndSet(ACTIVE, CANCELLED);
-            throw new IllegalStateException("Sequence cancellation was requested");
-        }
-        this.submitted = end;
-    }
-
-    /// Retires the quantum in flight successfully: both frontiers move to `next`, unless a cancellation was
-    /// requested first. Returns true when the sequence ends cancelled.
-    public boolean commit(long next) {
-        requireInFlight();
-        if (next < this.committed) {
-            throw new IllegalArgumentException("the committed frontier cannot move backwards");
-        }
-        if (!this.cancellationRequested) {
-            this.committed = next;
-            this.submitted = next;
-        } else {
-            this.submitted = this.committed;
-        }
-        return retireInFlight();
-    }
-
-    /// Retires the quantum in flight without its work: the submitted frontier returns to the committed one. The
-    /// quantum failed (after [#fail(Throwable)]) or was cancelled.
-    public void abandon() {
-        requireInFlight();
-        this.submitted = this.committed;
-        retireInFlight();
-    }
-
-    /// Ends the sequence FAILED, unless it already ended.
-    public void fail(Throwable failure) {
-        this.terminal.compareAndSet(ACTIVE, new Terminal(TerminalState.FAILED, Objects.requireNonNull(failure)));
-    }
-
-    /// Requests cancellation. With no quantum in flight the sequence ends CANCELLED now; otherwise that quantum's
-    /// retirement ends it. Closes nothing: [#complete()] does.
-    public void cancel() {
-        this.cancellationRequested = true;
-        // Published before the quantum in flight is read; admission and retirement write that before the flag.
-        if (!this.inFlight) this.terminal.compareAndSet(ACTIVE, CANCELLED);
-    }
-
-    /// Ends the sequence COMPLETED, unless it already ended, and closes its persistent state. Lifecycle: the
-    /// session runs it after its generation ended. A failed close is reported and retried by the next call.
-    public void complete() {
-        if (this.inFlight) {
-            throw new IllegalStateException("Cannot complete a sequence during execution");
-        }
-        this.terminal.compareAndSet(ACTIVE, COMPLETED);
-        this.cleanup.close(this.recurrentState, this.kvCacheState, terminalFailure());
-    }
-
-    private boolean retireInFlight() {
-        this.inFlight = false;
-        // Published before the flag is read; cancel() writes the flag before it reads this.
-        if (!this.cancellationRequested) return false;
-        this.terminal.compareAndSet(ACTIVE, CANCELLED);
-        return this.terminal.get().state() == TerminalState.CANCELLED;
-    }
-
-    private void requireActive() {
+    /// Admits `work` covering positions `[start, end)`: it starts at the submitted frontier, on an active
+    /// sequence whose cancellation was not requested, and moves the submitted frontier to `end`. Work that
+    /// leaves the frontiers where they are (a draft, a capture) admits `[submitted, submitted)`. Admissions
+    /// come from one chain of work.
+    public void admit(Work work, long start, long end) {
+        Objects.requireNonNull(work, "work");
         TerminalState state = terminalState();
         if (state != TerminalState.ACTIVE) {
             throw new IllegalStateException("Sequence is terminal: " + state);
@@ -199,11 +145,104 @@ public final class Sequence {
         if (this.cancellationRequested) {
             throw new IllegalStateException("Sequence cancellation was requested");
         }
+        long frontier = submittedFrontier();
+        if (start != frontier) {
+            throw new IllegalArgumentException("Execution starts at " + start + " but the sequence is at " + frontier);
+        }
+        if (end < start) {
+            throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
+        }
+        this.submitted = end;
+        this.admitted = this.admitted + 1;
+        this.order.offer(work);
+    }
+
+    /// Concludes the complete work at the head of the order, in order. Called by a piece of work after it became
+    /// ready.
+    public void drain() {
+        this.order.drain();
+    }
+
+    /// Settles the concluding work by committing it: the committed frontier moves to `next`. Called from
+    /// [Work#concluded] only.
+    public void commit(long next) {
+        requireInFlight();
+        if (next < this.committed) {
+            throw new IllegalArgumentException("the committed frontier cannot move backwards");
+        }
+        this.committed = next;
+        settle();
+    }
+
+    /// Settles the concluding work without its result: the committed frontier stays. The work failed (after
+    /// [#fail(Throwable)]), was cancelled, or was blocked. Called from [Work#concluded] only.
+    public void abandon() {
+        requireInFlight();
+        settle();
+    }
+
+    /// Ends the sequence FAILED, unless it already ended.
+    public void fail(Throwable failure) {
+        this.terminal.compareAndSet(ACTIVE, new Terminal(TerminalState.FAILED, Objects.requireNonNull(failure)));
+    }
+
+    /// Requests cancellation. With nothing in flight the sequence ends CANCELLED now; otherwise the settlement of the
+    /// work in flight ends it. Closes nothing: [#complete()] does.
+    public void cancel() {
+        this.cancellationRequested = true;
+        // The flag is published before the settled count is read; settlement publishes the count before it reads the
+        // flag, so one of the two sees the other.
+        VarHandle.fullFence();
+        if (!inFlight()) this.terminal.compareAndSet(ACTIVE, CANCELLED);
+    }
+
+    /// Ends the sequence COMPLETED, unless it already ended, and closes its persistent state. Lifecycle: the
+    /// session runs it after its generation ended. A failed close is reported and retried by the next call.
+    public void complete() {
+        if (inFlight()) {
+            throw new IllegalStateException("Cannot complete a sequence during execution");
+        }
+        this.terminal.compareAndSet(ACTIVE, COMPLETED);
+        this.cleanup.close(this.recurrentState, this.kvCacheState, terminalFailure());
+    }
+
+    private void settle() {
+        this.settled = this.settled + 1;
+        VarHandle.fullFence();
+        if (this.cancellationRequested) this.terminal.compareAndSet(ACTIVE, CANCELLED);
+    }
+
+    /// Why work admitted at `start` can no longer commit, or null: a cancellation concludes it instead.
+    private Throwable blocked(long start) {
+        if (this.cancellationRequested) return null;
+        Terminal ended = this.terminal.get();
+        if (ended.state() == TerminalState.FAILED) {
+            return new IllegalStateException("a preceding quantum failed the sequence", ended.failure());
+        }
+        if (start != this.committed) {
+            return new IllegalStateException(
+                    "admitted at " + start + " but the sequence committed only to " + this.committed);
+        }
+        return null;
     }
 
     private void requireInFlight() {
-        if (!this.inFlight) {
-            throw new IllegalStateException("Sequence state changes only under its quantum in flight");
+        if (!inFlight()) {
+            throw new IllegalStateException("Sequence state changes only under its work in flight");
+        }
+    }
+
+    /// The sequence's admission order.
+    private final class Order extends Sequencer<Work> {
+        @Override
+        protected void drained(Work work) {
+            long before = Sequence.this.settled;
+            try {
+                work.concluded(blocked(work.admittedAt()));
+            } finally {
+                // Work that concluded without settling would hold the sequence in flight for good.
+                if (Sequence.this.settled == before) settle();
+            }
         }
     }
 }

@@ -20,7 +20,7 @@ import java.util.function.Consumer;
 ///
 /// While it runs, the quantum is bound to a reusable stage graph whose frames perform the operations.
 /// Its sequence reference retains sequence-lifetime state, which is published only at retirement.
-public final class Quantum extends AbstractQuantum {
+public final class Quantum extends AbstractQuantum implements Sequence.Work {
 
     /// Decode quanta that start below this position overlap registered kernels with their predecessor
     /// (programmatic dependent launch). It won 12 of 12 paired forks, about +1% decode, at a 64-token
@@ -72,6 +72,12 @@ public final class Quantum extends AbstractQuantum {
     private final AtomicReference<java.util.function.Consumer<GpuStream>> stagingRelease = new AtomicReference<>();
     /// Whether the sequence admitted this quantum; only an admitted quantum retires the sequence's work.
     private boolean admitted;
+    /// The position the sequence admitted this quantum at.
+    private long admittedAt;
+    /// Whether its device work retired, so that it may conclude once the quanta admitted before it concluded.
+    private volatile boolean ready;
+    /// The conclusion it runs in the sequence's admission order.
+    private Runnable pendingConclusion;
     private Workspace workspace;
     /// The pinned staging of the quantum's input record, held until its device work retired.
     private ExecutionGpu.UploadBuffer inputUpload;
@@ -85,8 +91,6 @@ public final class Quantum extends AbstractQuantum {
     private int draftCommittedRows;
     /// Base quanta of a speculative session also keep every row's post-final-norm hidden for drafting.
     private boolean seedsDraft;
-    /// The committed frontier a draft quantum leaves the sequence at.
-    private long draftPosition;
     /// A DFlash2 block's host copy of its proposal, queued by its selector stage.
     private DFlash2Proposal proposal;
 
@@ -388,13 +392,13 @@ public final class Quantum extends AbstractQuantum {
     /// Package-private hook to deterministically exercise cancellation at the sequence-admission boundary.
     void begin(ExecutionGpu gpu, Runnable beforeClaim) {
         claim();
-        if (!begin(gpu, null, null, new WorkspaceStorage(gpu), beforeClaim)) publishOutcome();
+        if (!begin(gpu, null, null, new WorkspaceStorage(gpu), beforeClaim)) concludeUnstarted();
     }
 
-    /// Claims the sequence and binds the executing graph's `storage` with `stream` selected, so any
-    /// initialization it queues precedes every stage of the quantum. Returns whether the quantum
-    /// proceeds to its stages. Otherwise its terminal outcome is prepared, and the caller publishes it
-    /// once the stream is no longer selected.
+    /// Joins the sequence's admission order and binds the executing graph's `storage` with `stream` selected, so
+    /// any initialization it queues precedes every stage of the quantum. Returns whether the quantum proceeds to
+    /// its stages. Otherwise the caller concludes it ([#concludeUnstarted()]) once the stream is no longer
+    /// selected.
     public boolean begin(
             ExecutionGpu gpu, GpuStream stream, Consumer<? super Quantum> terminalConsumer, WorkspaceStorage storage) {
         return begin(gpu, stream, terminalConsumer, storage, NO_OP);
@@ -411,7 +415,6 @@ public final class Quantum extends AbstractQuantum {
         this.terminalConsumer = terminalConsumer;
         if (this.sequence.cancellationRequested()) {
             // Cancelled before it began: it concludes without a stage.
-            retire(null);
             return false;
         }
         try {
@@ -428,17 +431,12 @@ public final class Quantum extends AbstractQuantum {
             beforeClaim.run();
             try {
                 // Drafting runs at MTP positions and leaves the frontiers where they are.
-                if (drafting()) {
-                    this.draftPosition = this.sequence.committedFrontier();
-                    this.sequence.admit(this.draftPosition, this.draftPosition);
-                } else {
-                    this.sequence.admit(this.startPosition, end);
-                }
+                this.admittedAt = drafting() ? this.sequence.submittedFrontier() : this.startPosition;
+                this.sequence.admit(this, this.admittedAt, drafting() ? this.admittedAt : end);
                 this.admitted = true;
             } catch (IllegalStateException admissionFailure) {
                 if (this.sequence.cancellationRequested()
                         || this.sequence.terminalState() == Sequence.TerminalState.CANCELLED) {
-                    retire(null);
                     return false;
                 }
                 throw admissionFailure;
@@ -459,7 +457,6 @@ public final class Quantum extends AbstractQuantum {
             // when the stream cannot prove that those writes stopped.
             if (stream != null) stream.recover(error);
             fail(error);
-            retire(null);
             return false;
         }
     }
@@ -558,6 +555,40 @@ public final class Quantum extends AbstractQuantum {
         return this.sequence.cancellationRequested();
     }
 
+    /// A quantum the sequence admitted concludes in the sequence's admission order: it marks itself ready and
+    /// drains the sequence, which runs `conclusion` once every quantum admitted before it concluded, on whichever
+    /// thread finds it ready at the head. Any other quantum concludes now.
+    @Override
+    public void concludeInOrder(Runnable conclusion) {
+        if (!this.admitted) {
+            conclusion.run();
+            return;
+        }
+        this.pendingConclusion = conclusion;
+        this.ready = true;
+        this.sequence.drain();
+    }
+
+    @Override
+    public boolean ready() {
+        return this.ready;
+    }
+
+    @Override
+    public long admittedAt() {
+        return this.admittedAt;
+    }
+
+    /// Runs the conclusion in admission order. A quantum that can no longer commit (a quantum before it failed the
+    /// sequence, or committed short of where it starts) fails first, so that its stages discard their work.
+    @Override
+    public void concluded(Throwable blocked) {
+        if (blocked != null) fail(blocked);
+        Runnable conclusion = this.pendingConclusion;
+        this.pendingConclusion = null;
+        conclusion.run();
+    }
+
     /// Keeps the final logits (when no host row takes them) and hands the quantum to the terminal consumer while
     /// its workspace is still held.
     @Override
@@ -588,17 +619,29 @@ public final class Quantum extends AbstractQuantum {
         }
     }
 
-    /// The sequence follows the outcome: a failure fails it and abandons the quantum's work, a cancellation abandons
-    /// it, and a success commits it at its next position (unless a cancellation won the race). A quantum the
-    /// sequence never admitted leaves it alone. Then the host row and the proposal become readable for a success,
-    /// and the outcome is recorded for the continuation.
+    /// The sequence follows the outcome, in admission order: a failure fails it and abandons the quantum's work, a
+    /// cancellation of the sequence abandons it, and a success commits it at its next position. Only a cancellation
+    /// the sequence requested is CANCELLED; a failure that came with it (a release that failed after the
+    /// cancellation) still fails the quantum. A quantum the sequence never admitted leaves it alone. Then the host
+    /// row and the proposal become readable for a success, and the outcome is recorded for the continuation.
     @Override
     protected void settle() {
         Throwable error = failure();
-        boolean cancelled = error instanceof CancellationException;
-        Throwable failed = cancelled ? null : error;
+        Throwable failed = error;
+        boolean cancelled = false;
+        if (error instanceof CancellationException cancellation && this.sequence.cancellationRequested()) {
+            Throwable[] suppressed = cancellation.getSuppressed();
+            if (suppressed.length == 0) {
+                cancelled = true;
+                failed = null;
+            } else {
+                failed = suppressed[0];
+                for (int index = 1; index < suppressed.length; index++) failed.addSuppressed(suppressed[index]);
+            }
+        }
         if (error != null) failed = releaseLogits(failed);
         Outcome completed;
+        // Each branch settles the quantum's admission last, so a throw means it is not settled yet.
         try {
             if (failed != null) {
                 if (this.admitted) {
@@ -610,40 +653,33 @@ public final class Quantum extends AbstractQuantum {
                 if (this.admitted) this.sequence.abandon();
                 completed = new Outcome(Status.CANCELLED, null);
             } else {
-                boolean lost = this.sequence.commit(
-                        drafting() ? this.draftPosition : this.startPosition + committedRowCount());
-                completed = new Outcome(lost ? Status.CANCELLED : Status.SUCCESS, null);
+                if (!this.admitted) throw new IllegalStateException("the sequence never admitted the quantum");
+                this.sequence.commit(drafting() ? this.admittedAt : this.startPosition + committedRowCount());
+                completed = new Outcome(Status.SUCCESS, null);
             }
         } catch (RuntimeException | Error retirementFailure) {
-            // Never strand the continuation: a sequence that refuses the retirement fails the quantum.
+            // Never strand the continuation: a sequence that refuses the retirement fails the quantum, and the
+            // sequence, which can no longer resume from its state.
             if (failed == null) failed = retirementFailure;
             else if (failed != retirementFailure) failed.addSuppressed(retirementFailure);
-            completed = new Outcome(Status.FAILED, releaseLogits(failed));
+            failed = releaseLogits(failed);
+            if (this.admitted) {
+                this.sequence.fail(failed);
+                this.sequence.abandon();
+            }
+            completed = new Outcome(Status.FAILED, failed);
         }
         this.admitted = false;
         // The row was copied before the retirement boundary; only a successful quantum exposes it.
         if (this.hostLogits != null) this.hostLogits.retired(completed.status() == Status.SUCCESS);
         if (this.proposal != null) this.proposal.retired(completed.status() == Status.SUCCESS);
         if (completed.failure() != null) fail(completed.failure());
-        else if (completed.status() == Status.CANCELLED && failure() == null)
-            fail(new CancellationException("a cancellation won the race with the quantum's completion"));
         this.conclusion = completed;
-    }
-
-    /// Whether this quantum has reached its terminal outcome.
-    boolean terminal() {
-        return retired();
     }
 
     /// The quantum's outcome once it retired, or null before: what a continuation reads.
     public Outcome conclusion() {
         return this.conclusion;
-    }
-
-    /// Retires a quantum that never started stages, then publishes its outcome.
-    void finish() {
-        retire(null);
-        publishOutcome();
     }
 
     private void retainLogits(ExecutionGpu gpu) {
