@@ -15,7 +15,6 @@ import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -51,7 +50,7 @@ class StageGraphReuseTest {
                 };
             }
         };
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         var context = context(plan, 507);
         runtime.submit(context);
         AbstractFrame frame = pullOne();
@@ -96,7 +95,7 @@ class StageGraphReuseTest {
                 ExecutionFixtures.norm(),
                 List.of(ExecutionFixtures.q3("projection-a", 64, 201), ExecutionFixtures.q3("projection-b", 64, 202)));
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
 
         List<AbstractFrame> firstRun = runQuantum(runtime, plan, 301);
         List<AbstractFrame> secondRun = runQuantum(runtime, plan, 302);
@@ -122,7 +121,7 @@ class StageGraphReuseTest {
     void failedStageIsReboundToTheNextQuantum() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         RuntimeException failure = new IllegalStateException("injected embedding failure");
         gpu.afterEmbedding = () -> {
             throw failure;
@@ -172,7 +171,7 @@ class StageGraphReuseTest {
             }
         };
         // One lane: the quantum's single stream is the one that must prove idleness.
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu, 1);
+        var runtime = new Execution(this.lattice, plan, gpu, 1);
         var first = context(plan, 501);
         runtime.submit(first);
         AbstractFrame stage = pullOne();
@@ -215,7 +214,7 @@ class StageGraphReuseTest {
                 });
             }
         };
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         var context = context(plan, 506);
         runtime.submit(context);
         this.lattice.drive();
@@ -235,7 +234,7 @@ class StageGraphReuseTest {
     void unprovableRetirementPoisonsGpuAndNeverReleasesUnprovenBuffers() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new UnrecoverableGpu(false);
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         var context = context(plan, 503);
         runtime.submit(context);
         AbstractFrame stage = pullOne();
@@ -257,7 +256,7 @@ class StageGraphReuseTest {
     void failedRegistrationAndRecoveryFailsTheQuantumWithoutReleasingBuffers() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new UnrecoverableGpu(true);
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         var context = context(plan, 505);
         runtime.submit(context);
         AbstractFrame stage = pullOne();
@@ -348,7 +347,7 @@ class StageGraphReuseTest {
     void cancelledQuantumsQueuedRootRetiresWithoutSubmittingWork() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         var cancelled = context(plan, 403);
         var cancelledOutcome = runtime.submit(cancelled);
         assertEquals(0, this.lattice.pull(ignored -> {}, frame -> true, 1), "the stop predicate holds the root");
@@ -369,7 +368,7 @@ class StageGraphReuseTest {
     void concurrentFinishersRecycleGraphsForLaterQuanta() throws Exception {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+        var runtime = new Execution(this.lattice, plan, gpu);
         var firstContexts = List.of(context(plan, 409), context(plan, 410));
         List<AbstractFrame> firstRoots = admitAndPull(runtime, firstContexts);
         assertNotSame(firstRoots.getFirst(), firstRoots.getLast(), "concurrent quanta use separate graphs");
@@ -394,7 +393,7 @@ class StageGraphReuseTest {
         runtime.close();
     }
 
-    private List<AbstractFrame> admitAndPull(EuhedralInferenceRuntime runtime, List<Quantum> contexts) {
+    private List<AbstractFrame> admitAndPull(Execution runtime, List<Quantum> contexts) {
         for (Quantum context : contexts) runtime.submit(context);
         List<AbstractFrame> frames = new ArrayList<>(contexts.size());
         assertEquals(contexts.size(), this.lattice.pull(frames::add, frame -> false, contexts.size()));
@@ -426,7 +425,7 @@ class StageGraphReuseTest {
     }
 
     /// Pulls one frame at a time, as a worker would, and returns the quantum's stage frames in order.
-    private List<AbstractFrame> runQuantum(EuhedralInferenceRuntime runtime, ExecutionPlan plan, long sequenceId) {
+    private List<AbstractFrame> runQuantum(Execution runtime, ExecutionPlan plan, long sequenceId) {
         var context = context(plan, sequenceId);
         var outcome = runtime.submit(context);
         List<AbstractFrame> stages = new ArrayList<>();

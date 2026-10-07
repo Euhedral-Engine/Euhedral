@@ -12,7 +12,6 @@ import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Proposal;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
@@ -70,7 +69,7 @@ class DFlash2FixtureCudaIntegrationTest {
                 Qwen38Model model = DFlash2SpeculativeDecodeCudaIntegrationTest.load(artifact, gpu, 4096);
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             DFlash2Config config = model.weights().dflash2().config();
             var sequence = new Sequence(900);
             var recorder = new Recorder(gpu, config, prompt.length);

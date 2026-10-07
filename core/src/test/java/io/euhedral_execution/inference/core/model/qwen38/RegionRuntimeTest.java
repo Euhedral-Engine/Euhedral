@@ -18,8 +18,8 @@ class RegionRuntimeTest {
 
     private final ExecutionFixtures.ManualLattice lattice = new ExecutionFixtures.ManualLattice();
 
-    private EuhedralInferenceRuntime runtime(ExecutionPlan plan, RegionGpu gpu) {
-        return new EuhedralInferenceRuntime(this.lattice, plan, gpu);
+    private Execution runtime(ExecutionPlan plan, RegionGpu gpu) {
+        return new Execution(this.lattice, plan, gpu);
     }
 
     @Test

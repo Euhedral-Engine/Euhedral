@@ -2,9 +2,9 @@ package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.IntConsumer;
@@ -19,7 +19,7 @@ public interface SpeculativeDecoding extends AutoCloseable {
     @FunctionalInterface
     interface Factory {
         SpeculativeDecoding open(
-                EuhedralInferenceRuntime runtime,
+                Execution runtime,
                 ExecutionPlan plan,
                 ExecutionGpu gpu,
                 Sequence sequence,

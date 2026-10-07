@@ -16,7 +16,6 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.GdnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.MixerWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
@@ -383,8 +382,8 @@ public final class ExecutionFixtures {
                 gpu.frees.stream().sorted().toList());
     }
 
-    public static EuhedralInferenceRuntime runtime(ExecutionPlan plan, ExecutionGpu gpu) {
-        return new EuhedralInferenceRuntime(inlineLattice(), plan, gpu);
+    public static Execution runtime(ExecutionPlan plan, ExecutionGpu gpu) {
+        return new Execution(inlineLattice(), plan, gpu);
     }
 
     /// A stream whose device work has finished when `submit` returns, but whose retirement

@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.ModelArchitecture;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
@@ -25,7 +26,6 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Deco
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
@@ -62,7 +62,7 @@ public final class InferenceEngine implements AutoCloseable {
     private final Qwen38Model model;
     private final ControlPlaneLattice lattice;
     private final ExecutionPlan plan;
-    private final EuhedralInferenceRuntime runtime;
+    private final Execution runtime;
     private final InferenceConfig config;
     private final ArtifactProfile profile;
     private final BitSet workerCoreIds;
@@ -84,7 +84,7 @@ public final class InferenceEngine implements AutoCloseable {
             Qwen38Model model,
             ControlPlaneLattice lattice,
             ExecutionPlan plan,
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             InferenceConfig config,
             ArtifactProfile profile,
             BitSet workerCoreIds,
@@ -137,7 +137,7 @@ public final class InferenceEngine implements AutoCloseable {
             ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
-            EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            Execution runtime = new Execution(lattice, plan, gpu);
             var modelIdentity = modelIdentity(config.artifactPath(), artifact, model);
             var runtimeIdentity = runtimeIdentity(config.cudaLibraryPath());
             // Last, so nothing that can fail follows the pinned arena.

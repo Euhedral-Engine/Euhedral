@@ -14,7 +14,6 @@ import io.euhedral_execution.core.control_plane.ControlPlaneShard;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
@@ -35,10 +34,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
-@Execution(ExecutionMode.SAME_THREAD)
+@org.junit.jupiter.api.parallel.Execution(ExecutionMode.SAME_THREAD)
 class SessionTest {
 
     private static final Path TOKENIZER_DIRECTORY =
@@ -61,7 +59,7 @@ class SessionTest {
         var gpu = new SamplingGpu(vocabularySize);
         gpu.selectedTokenIds = new int[] {1, 2, 3, 4, 5};
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 810, GenerationConfig.greedy(41L));
         // The final row reaches host memory on the quantum's own stream, before the quantum retires.
         gpu.onRowCopy = () -> assertEquals(1, runtime.activeQuanta(), "the row was copied outside its quantum");
@@ -151,7 +149,7 @@ class SessionTest {
         var gpu = new SamplingGpu(vocabularySize);
         gpu.selectedTokenIds = new int[] {1, 2, 3, 4};
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 815, GenerationConfig.greedy(43L));
         lattice.start();
         awaitWorker(lattice);
@@ -189,7 +187,7 @@ class SessionTest {
         var gpu = new SamplingGpu(vocabularySize);
         gpu.selectedTokenId = 1;
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 816, GenerationConfig.greedy(47L));
         String prompt = "! ".repeat(800);
         int[] encoded = tokenizer.encodeWithModelSpecialTokens(prompt);
@@ -236,7 +234,7 @@ class SessionTest {
         int xmlToken = tokenizer.encodeText("<")[0];
         gpu.selectedTokenId = xmlToken;
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 817, GenerationConfig.greedy(48L));
         int brace = tokenizer.encodeText("{")[0];
         var constraint = new TokenConstraint() {
@@ -275,7 +273,7 @@ class SessionTest {
         var plan = new ExecutionPlan(weights);
         var gpu = new SamplingGpu(vocabularySize);
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 811, GenerationConfig.greedy(42L));
         var embeddingEntered = new CountDownLatch(1);
         var releaseEmbedding = new CountDownLatch(1);
@@ -315,7 +313,7 @@ class SessionTest {
         var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);
         var plan = new ExecutionPlan(weights);
         var gpu = new SamplingGpu(vocabularySize);
-        var runtime = new EuhedralInferenceRuntime(ignored -> {}, plan, gpu);
+        var runtime = new Execution(ignored -> {}, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 812, GenerationConfig.greedy(43L));
 
         assertThrows(IllegalArgumentException.class, () -> session.generate("!", -1, ignored -> {}));
@@ -337,7 +335,7 @@ class SessionTest {
         var gpu = new SamplingGpu(vocabularySize);
         gpu.selectedTokenId = eosToken;
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 813, GenerationConfig.greedy(44L));
         lattice.start();
         awaitWorker(lattice);
@@ -382,7 +380,7 @@ class SessionTest {
         var gpu = new SamplingGpu(vocabularySize);
         gpu.invalidLogits = true;
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 814, new GenerationConfig(1.0f, 0, 1.0f, 45L, false));
         lattice.start();
         awaitWorker(lattice);
@@ -409,7 +407,7 @@ class SessionTest {
         var plan = new ExecutionPlan(weights);
         var gpu = new SamplingGpu(vocabularySize);
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 815, GenerationConfig.greedy(46L));
         var embeddingEntered = new CountDownLatch(1);
         var releaseEmbedding = new CountDownLatch(1);
@@ -454,7 +452,7 @@ class SessionTest {
         var plan = new ExecutionPlan(weights);
         var gpu = new SamplingGpu(vocabularySize);
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 816, GenerationConfig.greedy(47L));
         var embeddingEntered = new CountDownLatch(1);
         var releaseEmbedding = new CountDownLatch(1);
@@ -501,7 +499,7 @@ class SessionTest {
         var plan = new ExecutionPlan(weights);
         var gpu = new SamplingGpu(vocabularySize);
         var lattice = createLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var session = new Session(tokenizer, plan, runtime, gpu, 817, GenerationConfig.greedy(48L));
         lattice.start();
         awaitWorker(lattice);

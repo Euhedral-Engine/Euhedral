@@ -6,10 +6,10 @@ import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
+import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -86,7 +86,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
     /// Largest MTP catch-up quantum (prompt chunks are split).
     static final int CATCH_UP_ROWS = 128;
 
-    private final EuhedralInferenceRuntime runtime;
+    private final Execution runtime;
     private final ExecutionPlan plan;
     private final Sequence sequence;
     private final IntPredicate endOfGeneration;
@@ -111,7 +111,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
     }
 
     public MtpDecoder(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionPlan plan,
             ExecutionGpu gpu,
             Sequence sequence,

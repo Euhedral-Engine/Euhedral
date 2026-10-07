@@ -64,7 +64,7 @@ public final class Qwen4Runtime implements AutoCloseable {
         Storage storage = Storage.load(config);
         EuhedralInferenceRuntime runtime = null;
         try {
-            runtime = new EuhedralInferenceRuntime(lake, execution, storage.gpu(), LANES);
+            runtime = new EuhedralInferenceRuntime(lake, storage.gpu(), EuhedralInferenceRuntime.Lanes.of(LANES));
             ExecutionPlan plan = new ExecutionPlan(storage.gpu(), storage.model(), config.maxContextTokens(), runtime);
             return new Qwen4Runtime(storage, runtime, plan, lake, execution, host);
         } catch (Throwable failure) {

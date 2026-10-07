@@ -5,11 +5,11 @@ import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
+import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -84,7 +84,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         void verified(long position, int anchor, int[] proposal, int[] candidates, int acceptedDrafts);
     }
 
-    private final EuhedralInferenceRuntime runtime;
+    private final Execution runtime;
     private final ExecutionPlan plan;
     private final Sequence sequence;
     private final IntPredicate endOfGeneration;
@@ -105,7 +105,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
     }
 
     public DFlash2Decoder(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionPlan plan,
             ExecutionGpu gpu,
             Sequence sequence,
@@ -117,7 +117,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
     /// As the public constructor, verifying only the first `verified` drafts of each block; the block always proposes
     /// all of them.
     public DFlash2Decoder(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionPlan plan,
             ExecutionGpu gpu,
             Sequence sequence,

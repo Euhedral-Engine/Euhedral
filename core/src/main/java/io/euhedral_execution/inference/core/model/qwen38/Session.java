@@ -13,7 +13,6 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeCheckpoint;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeDecoding;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.IncrementalDecoder;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -45,7 +44,7 @@ public final class Session implements GenerationSession {
 
     private final QwenTokenizer tokenizer;
     private final ExecutionPlan plan;
-    private final EuhedralInferenceRuntime runtime;
+    private final Execution runtime;
     private final ExecutionGpu gpu;
     private final Sequence sequence;
     private final LogitsSampler sampler;
@@ -75,7 +74,7 @@ public final class Session implements GenerationSession {
     public Session(
             QwenTokenizer tokenizer,
             ExecutionPlan plan,
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionGpu gpu,
             long sequenceId,
             GenerationConfig config) {
@@ -88,7 +87,7 @@ public final class Session implements GenerationSession {
     public Session(
             QwenTokenizer tokenizer,
             ExecutionPlan plan,
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionGpu gpu,
             long sequenceId,
             GenerationConfig config,
@@ -101,7 +100,7 @@ public final class Session implements GenerationSession {
     public Session(
             QwenTokenizer tokenizer,
             ExecutionPlan plan,
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionGpu gpu,
             long sequenceId,
             GenerationConfig config,

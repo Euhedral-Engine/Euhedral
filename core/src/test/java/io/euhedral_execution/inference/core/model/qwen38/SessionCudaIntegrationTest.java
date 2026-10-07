@@ -17,7 +17,6 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.nio.file.Files;
@@ -32,10 +31,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
-@Execution(ExecutionMode.SAME_THREAD)
+@org.junit.jupiter.api.parallel.Execution(ExecutionMode.SAME_THREAD)
 class SessionCudaIntegrationTest {
 
     private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl");
@@ -68,7 +66,7 @@ class SessionCudaIntegrationTest {
                 long allocatedAfterWeights = gpu.allocatedBytes();
                 try {
                     ExecutionPlan plan = new ExecutionPlan(weights);
-                    EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+                    Execution runtime = new Execution(lattice, plan, gpu);
                     Session session = new Session(tokenizer, plan, runtime, gpu, 901, GenerationConfig.greedy(91L));
                     try {
                         LatticeEdge registrationProbe = new LatticeEdge(new AtomicBoolean());

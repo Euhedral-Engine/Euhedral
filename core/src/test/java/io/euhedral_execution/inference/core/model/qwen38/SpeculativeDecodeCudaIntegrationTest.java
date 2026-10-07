@@ -10,7 +10,6 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -62,7 +61,7 @@ class SpeculativeDecodeCudaIntegrationTest {
                         HostWeightSelection.select(artifactData, hostBytes));
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             try {
                 long id = 100;
                 for (int[] prompt : prompts) {
@@ -118,7 +117,7 @@ class SpeculativeDecodeCudaIntegrationTest {
     /// Ordinary greedy generation, as Session runs it: chunked prefill, then one decode
     /// quantum per token, feeding the last allowed token without sampling and never feeding the end token.
     static List<Integer> greedy(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionPlan plan,
             Sequence sequence,
             int[] prompt,
@@ -163,8 +162,7 @@ class SpeculativeDecodeCudaIntegrationTest {
 
     /// One more decode quantum with a fixed token: it applies any GDN replay a speculative sequence still
     /// holds, so both sequences' states are materialized, and returns its greedy token.
-    static int probe(EuhedralInferenceRuntime runtime, ExecutionPlan plan, Sequence sequence, HostLogits logits)
-            throws Exception {
+    static int probe(Execution runtime, ExecutionPlan plan, Sequence sequence, HostLogits logits) throws Exception {
         execute(
                 runtime,
                 new Quantum(
@@ -178,7 +176,7 @@ class SpeculativeDecodeCudaIntegrationTest {
         return logits.selectedToken();
     }
 
-    static void execute(EuhedralInferenceRuntime runtime, Quantum context) throws Exception {
+    static void execute(Execution runtime, Quantum context) throws Exception {
         var outcome = runtime.submit(context).get(600, TimeUnit.SECONDS);
         if (outcome.status() != Quantum.Status.SUCCESS) throw new AssertionError(outcome.failure());
     }

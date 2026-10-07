@@ -11,7 +11,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -295,7 +294,7 @@ class QuantumTest {
     void pullHonorsStopWithoutConsumingOrGeneratingFrame() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, new ExecutionFixtures.RecordingGpu());
+        var runtime = new Execution(lattice, plan, new ExecutionFixtures.RecordingGpu());
         var context = new Quantum(plan, new Sequence(11), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         runtime.submit(context);
         List<AbstractFrame> pulled = new ArrayList<>();
@@ -316,7 +315,7 @@ class QuantumTest {
     void pullDrainsReadyFramesWithoutBorrowingBeyondDemand() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, new ExecutionFixtures.RecordingGpu());
+        var runtime = new Execution(lattice, plan, new ExecutionFixtures.RecordingGpu());
         var first = new Quantum(plan, new Sequence(101), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var second = new Quantum(plan, new Sequence(102), Quantum.ExecutionKind.DECODE, 0, new int[] {2});
         runtime.submit(first);
@@ -447,7 +446,7 @@ class QuantumTest {
     void duplicateAdmissionDoesNotRegisterAnotherTerminalOwner() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, new ExecutionFixtures.RecordingGpu());
+        var runtime = new Execution(lattice, plan, new ExecutionFixtures.RecordingGpu());
         var context = new Quantum(plan, new Sequence(17), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var first = runtime.submit(context);
         int terminalDependents = context.completion().getNumberOfDependents();
@@ -466,7 +465,7 @@ class QuantumTest {
         var gpu = new ExecutionFixtures.RecordingGpu();
         var context = new Quantum(plan, new Sequence(18), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         var exposed = runtime.submit(context);
         exposed.complete(new Quantum.Outcome(Quantum.Status.SUCCESS, null));
         assertFalse(context.outcome().isDone());

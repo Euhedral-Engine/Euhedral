@@ -239,7 +239,6 @@ class ArchitectureTest {
     private static final Set<String> MODEL_IMPORTS_OUTSIDE_MODEL = Set.of(
             "InferenceEngine.java",
             "InferenceRunSnapshot.java",
-            "runtime/EuhedralInferenceRuntime.java",
             "benchmark:run/BenchmarkRunner.java",
             "benchmark:run/Prerequisites.java");
 

@@ -5,7 +5,6 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import org.junit.jupiter.api.Test;
 
@@ -38,7 +37,7 @@ class AttentionAppendTransactionTest {
         var context =
                 new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[64], LogitsRequirement.NONE);
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         try {
             var outcome = runtime.submit(context);
             lattice.drive();

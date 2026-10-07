@@ -10,7 +10,6 @@ import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.generation.LogitsSampler;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -76,7 +75,7 @@ class WorkspaceReuseTest {
             }
         };
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         List<List<Long>> first = new ArrayList<>();
         List<List<Long>> second = new ArrayList<>();
         List<List<Long>> third = new ArrayList<>();
@@ -232,7 +231,7 @@ class WorkspaceReuseTest {
     }
 
     private static CompletableFuture<Quantum.Outcome> submit(
-            EuhedralInferenceRuntime runtime, ExecutionPlan plan, long sequenceId, List<List<Long>> addresses) {
+            Execution runtime, ExecutionPlan plan, long sequenceId, List<List<Long>> addresses) {
         var context = new Quantum(plan, new Sequence(sequenceId), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         return runtime.submit(context, done -> addresses.add(bound(done)));
     }

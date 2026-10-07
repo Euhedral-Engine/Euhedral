@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.BufferedWriter;
@@ -47,7 +46,7 @@ class DFlash2QualityCudaIntegrationTest {
                 var lattice = new PullingLattice();
                 BufferedWriter out = Files.newBufferedWriter(Path.of(report))) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             try {
                 long id = 500;
                 for (int index = 0; index < PROMPTS.size(); index++) {

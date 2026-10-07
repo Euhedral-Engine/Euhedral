@@ -15,7 +15,6 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture.SamplingGpu;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
@@ -30,10 +29,9 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
-@Execution(ExecutionMode.SAME_THREAD)
+@org.junit.jupiter.api.parallel.Execution(ExecutionMode.SAME_THREAD)
 class SessionPrefixCacheTest {
 
     private static final Path TOKENIZER_DIRECTORY =
@@ -48,11 +46,7 @@ class SessionPrefixCacheTest {
     }
 
     private record Harness(
-            ExecutionPlan plan,
-            SamplingGpu gpu,
-            ControlPlaneLattice lattice,
-            EuhedralInferenceRuntime runtime,
-            PrefixCache cache) {}
+            ExecutionPlan plan, SamplingGpu gpu, ControlPlaneLattice lattice, Execution runtime, PrefixCache cache) {}
 
     private static int[] prompt(int tokens) {
         return IntStream.range(0, tokens).map(i -> 1 + i % 5).toArray();
@@ -77,7 +71,7 @@ class SessionPrefixCacheTest {
         var shard = ControlPlaneShard.createBaseShard("PrefixCacheSessionTestShard", workers);
         var lattice = ControlPlaneLattice.getOrCreate(new LatticeConfig(
                 "PrefixCacheSessionTestLattice-" + LATTICE_ID.incrementAndGet(), cpus, Duration.ofSeconds(10), shard));
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu);
         Arena arena = Arena.ofShared();
         var cache = new PrefixCache(gpu, weights.config(), arena.allocate(cacheBytes), arena::close, interval);
         lattice.start();
