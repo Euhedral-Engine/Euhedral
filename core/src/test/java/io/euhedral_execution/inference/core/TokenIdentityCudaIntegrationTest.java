@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
@@ -22,6 +23,10 @@ import org.junit.jupiter.params.provider.MethodSource;
 /// The refactor's identity gate: greedy generation through the public engine surface produces exactly the tokens
 /// recorded on the base commit, for every artifact. Prompts cross many 512-token prefill chunks. Run with
 /// `-Peuhedral.identity.record=true` to record instead of compare.
+///
+/// Run one artifact per JVM (`-Peuhedral.identity.artifacts=q3`, then `nvfp4`, `nvfp4-compressed`, `flash-next`), each
+/// `./gradlew --no-daemon` inside a capped scope with a stated host budget (`EUHEDRAL_HOST_MEMORY_MIB`), so the host is
+/// never over-committed. A filter that names no artifact, or a missing baseline, fails instead of skipping.
 class TokenIdentityCudaIntegrationTest {
 
     private static final int NEW_TOKENS = 32;
@@ -31,7 +36,14 @@ class TokenIdentityCudaIntegrationTest {
 
     /// Flash-Next first: it pins host memory from the process's cgroup headroom, which the page cache of the dense
     /// artifacts read later would take.
+    private static final List<String> NAMES = List.of("flash-next", "q3", "nvfp4", "nvfp4-compressed");
+
     static Stream<Arguments> artifacts() {
+        String only = System.getProperty("euhedral.identity.artifacts");
+        if (only != null)
+            for (String name : only.split(","))
+                if (!NAMES.contains(name.strip()))
+                    throw new IllegalArgumentException("euhedral.identity.artifacts names no artifact: " + name);
         return Stream.of(
                 Arguments.of(
                         "flash-next",
@@ -90,7 +102,7 @@ class TokenIdentityCudaIntegrationTest {
     void greedyTokensMatchTheRecordedBaseline(String name, String artifact, String tokenizer) throws Exception {
         // `-Peuhedral.identity.artifacts=q3,flash-next` runs only those, so each artifact can load in its own JVM.
         String only = System.getProperty("euhedral.identity.artifacts");
-        assumeTrue(only == null || List.of(only.split(",")).contains(name), "not selected: " + name);
+        assumeTrue(only == null || List.of(only.strip().split("\\s*,\\s*")).contains(name), "not selected: " + name);
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
@@ -118,7 +130,7 @@ class TokenIdentityCudaIntegrationTest {
             Files.write(golden, lines);
             return;
         }
-        assumeTrue(Files.isRegularFile(golden), "no recorded baseline for " + name);
+        assertTrue(Files.isRegularFile(golden), "no recorded baseline for " + name);
         assertEquals(Files.readAllLines(golden), lines, name + " generated different tokens than the baseline");
     }
 }
