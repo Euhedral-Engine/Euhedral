@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
@@ -17,6 +18,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// Runs the dense model's quanta: the runtime it admits them to, the lake that runtime publishes into, the host
 /// work around a request, and the weight staging ring's hand-over between quanta.
@@ -24,6 +27,8 @@ import java.util.function.Supplier;
 /// Quanta whose view stages weights hold the ring from admission until their last stage submitted (a later change
 /// replaces this hold with frames routed to the ring's owner).
 public final class Execution implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(Execution.class);
 
     private static final Consumer<Quantum> NO_TERMINAL_CONSUMER = ignored -> {};
 
@@ -104,6 +109,21 @@ public final class Execution implements AutoCloseable {
     public CompletableFuture<Quantum.Outcome> submit(Quantum context, Consumer<? super Quantum> terminalConsumer) {
         Objects.requireNonNull(context, "context");
         Objects.requireNonNull(terminalConsumer, "terminalConsumer");
+        accept(context, terminalConsumer, true);
+        return context.completion().copy();
+    }
+
+    /// Admits `context` on the generation path: once its outcome is published it throws `continuation` into the
+    /// lake. Throws only when the quantum never reached the runtime (another plan's, already admitted); then
+    /// `continuation` is never thrown. The runtime's refusal is not thrown: the runtime published the quantum's
+    /// failed outcome, which `continuation` carries.
+    public void admit(Quantum context, AbstractFrame continuation) {
+        Objects.requireNonNull(context, "context");
+        context.continueWith(this.lake, continuation);
+        accept(context, NO_TERMINAL_CONSUMER, false);
+    }
+
+    private void accept(Quantum context, Consumer<? super Quantum> terminalConsumer, boolean refusalThrows) {
         ExecutionPlan view = context.plan();
         if (view.executionOwner() != this.plan) {
             throw new IllegalArgumentException("quantum belongs to another execution plan");
@@ -122,12 +142,16 @@ public final class Execution implements AutoCloseable {
                     home -> releaseStaging(home, prefetches && home != null && !context.hasFailureOrCancellation()));
         }
         boolean ordered = staging;
-        this.runtime.admit(
-                view,
-                context,
-                ordered ? stream -> stream.await(this.runtime.transferMarker()) : null,
-                (stream, storage) -> context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage));
-        return context.completion().copy();
+        try {
+            this.runtime.admit(
+                    view,
+                    context,
+                    ordered ? stream -> stream.await(this.runtime.transferMarker()) : null,
+                    (stream, storage) -> context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage));
+        } catch (RuntimeException | Error refused) {
+            if (refusalThrows) throw refused;
+            LOG.debug("a quantum was refused; its continuation carries the failure", refused);
+        }
     }
 
     /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when its lanes

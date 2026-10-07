@@ -23,7 +23,7 @@ public final class Blocking {
             int rows,
             ExecutionPlan.LogitsSink sink)
             throws InterruptedException {
-        var done = new FutureContinuation<Throwable>(AbstractQuantum::outcome);
+        var done = new FutureContinuation<Throwable>(AbstractQuantum::terminalFailure);
         executor.start(sequence, tokens, offset, rows, sink, done);
         await(done.future());
     }
@@ -40,7 +40,7 @@ public final class Blocking {
             MemorySegment.copy(stateIn, 0, upload.segment(), ValueLayout.JAVA_SHORT, 0, stateIn.length);
             try (Arena arena = Arena.ofShared()) {
                 var back = arena.allocate(bytes, 16);
-                var done = new FutureContinuation<Throwable>(AbstractQuantum::outcome);
+                var done = new FutureContinuation<Throwable>(AbstractQuantum::terminalFailure);
                 plan.startLayer(
                         sequence,
                         layer,
