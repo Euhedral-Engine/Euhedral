@@ -6,8 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import io.euhedral_execution.inference.core.generation.GenerationSession;
+import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.GenerationSession;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -59,7 +60,7 @@ class Qwen4EngineCudaIntegrationTest {
                             CONTINUATION.length,
                             text::append,
                             null,
-                            new io.euhedral_execution.inference.core.scheduling.GenerationTimingListener() {
+                            new io.euhedral_execution.inference.core.generation.GenerationTimingListener() {
                                 @Override
                                 public void promptEncoded(long nanos, int promptTokens) {}
 

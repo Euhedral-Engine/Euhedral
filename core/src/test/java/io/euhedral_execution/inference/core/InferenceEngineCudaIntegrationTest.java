@@ -6,8 +6,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -39,7 +39,7 @@ class InferenceEngineCudaIntegrationTest {
             long loaded = engine.allocatedDeviceBytes();
             assertTrue(loaded > (1L << 30), "real model was not resident");
             StringBuilder output = new StringBuilder();
-            try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(91L))) {
+            try (Session session = engine.createSession(GenerationConfig.greedy(91L))) {
                 var tokens = session.generate("The capital of France is", 5, output::append);
                 assertEquals(5, tokens.size(), "expected multiple real decode quanta for the fixed prompt");
                 assertFalse(output.isEmpty());

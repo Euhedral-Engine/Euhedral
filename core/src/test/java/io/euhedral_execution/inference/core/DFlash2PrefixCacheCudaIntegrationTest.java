@@ -7,11 +7,11 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
+import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.EngineExecutionFixture;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
-import io.euhedral_execution.inference.core.scheduling.SequenceStateProbe;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -61,7 +61,7 @@ class DFlash2PrefixCacheCudaIntegrationTest {
     }
 
     private static List<Integer> greedy(InferenceEngine engine, int[] prompt, int newTokens) throws Exception {
-        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+        try (Session session = engine.createSession(GenerationConfig.greedy(1))) {
             return session.generate(prompt, newTokens, text -> {}, null);
         }
     }
@@ -132,7 +132,7 @@ class DFlash2PrefixCacheCudaIntegrationTest {
             assertTrue(engine.prefixCacheStats().evictions() > 0, "the small cache evicted");
             long settled = engine.allocatedDeviceBytes();
             // A generation cancelled from its text callback ends with its sequence released.
-            try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+            try (Session session = engine.createSession(GenerationConfig.greedy(1))) {
                 AtomicInteger texts = new AtomicInteger();
                 try {
                     session.generate(
@@ -153,7 +153,7 @@ class DFlash2PrefixCacheCudaIntegrationTest {
 
     /// The digests of the target state and the drafter's ring after a one-token generation.
     private static List<String> digests(InferenceEngine engine, ExecutionGpu gpu, int[] prompt) throws Exception {
-        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+        try (Session session = engine.createSession(GenerationConfig.greedy(1))) {
             session.generate(prompt, 1, text -> {}, null);
             var sequence = EngineExecutionFixture.sequence(session);
             List<String> digests = new ArrayList<>(SequenceStateProbe.committedDigests(

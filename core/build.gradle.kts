@@ -20,11 +20,11 @@ dependencies {
 // Euhedral's ControlPlaneLattice is a process-wide singleton. Every test class that starts one runs in
 // its own JVM, so no lattice, worker, or static edge state can leak between classes.
 val latticeTestClasses = listOf(
-    "**/EuhedralInferenceRuntimeLatticeTest.class",
-    "**/QwenGenerationSessionTest.class",
-    "**/QwenGenerationSessionPrefixCacheTest.class",
+    "**/runtime/EuhedralInferenceRuntimeLatticeTest.class",
+    "**/model/qwen38/SessionTest.class",
+    "**/model/qwen38/SessionPrefixCacheTest.class",
     "**/InferenceEngineTest.class",
-    "**/Qwen4LatticeHostTest.class",
+    "**/model/qwen4/LatticeHostTest.class",
 )
 
 val latticeTest = tasks.register<Test>("latticeTest") {

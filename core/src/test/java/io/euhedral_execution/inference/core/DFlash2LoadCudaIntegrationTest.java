@@ -6,7 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;

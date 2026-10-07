@@ -1,7 +1,7 @@
 package io.euhedral_execution.inference.api.metrics;
 
 import io.euhedral_execution.inference.core.InferenceEngine;
-import io.euhedral_execution.inference.core.scheduling.PrefixCache;
+import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;

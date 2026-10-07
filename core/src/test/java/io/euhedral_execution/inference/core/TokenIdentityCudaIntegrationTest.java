@@ -4,8 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.GenerationSession;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
