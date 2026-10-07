@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
+import io.euhedral_execution.inference.core.runtime.PromptSink;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.runtime.graph.LanePool;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -145,6 +146,11 @@ public final class Execution implements AutoCloseable {
     /// tokenizer_config.json when `modelSpecialTokens`. The future completes on a worker.
     public CompletableFuture<int[]> tokenize(QwenTokenizer tokenizer, String text, boolean modelSpecialTokens) {
         return this.hostTasks.tokenize(tokenizer, text, modelSpecialTokens);
+    }
+
+    /// As [#tokenize(QwenTokenizer, String, boolean)]; the worker that joins the tokenization hands the IDs to `sink`.
+    public void tokenize(QwenTokenizer tokenizer, String text, boolean modelSpecialTokens, PromptSink sink) {
+        this.hostTasks.tokenize(tokenizer, text, modelSpecialTokens, sink);
     }
 
     /// Runs `work` as one frame on the lattice's workers; the future completes on that worker.
