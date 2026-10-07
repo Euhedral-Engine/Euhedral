@@ -9,9 +9,10 @@ import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 
 /// A session's recycled generation frames: one [FrameManager] per frame type, and the lake they are thrown into.
-/// The frame that throws the next one checks it out, and a session's chain has one frame live at a time, so each
-/// manager keeps its single checkout owner. The factories randomize each frame's routing hash on create and on every
-/// reuse.
+/// Each manager keeps its single checkout owner: a frame type is checked out only by the frame that throws it
+/// (an Admit by the generation's start or a Select, a Select by an Admit, a Finish by whichever ends the chain),
+/// and those hand-offs order the checkouts. The frames start unordered, so the factories draw a new routing seed
+/// on create and on every reuse.
 public final class GenerationFrames {
 
     private static final int RECYCLED = 4;
@@ -61,8 +62,9 @@ public final class GenerationFrames {
         return this.finishes.getOrCreate(generation, this.password);
     }
 
+    /// Throws `frame` into the lake; a lake that refuses it runs it here, so a generation always reaches its Finish.
     void publish(AbstractFrame frame) {
-        this.lake.publish(frame);
+        this.lake.publishOrRun(frame);
     }
 
     private <F extends AbstractFrame> F counted(F frame) {

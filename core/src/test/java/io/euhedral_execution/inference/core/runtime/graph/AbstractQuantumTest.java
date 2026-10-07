@@ -61,7 +61,7 @@ class AbstractQuantumTest {
         }
     }
 
-    private static final class Told extends AbstractFrame implements AbstractQuantum.Continuation {
+    private static class Told extends AbstractFrame implements AbstractQuantum.Continuation {
         AbstractQuantum quantum;
         int executions;
 
@@ -136,6 +136,29 @@ class AbstractQuantumTest {
         assertTrue(sealed.seal());
         sealed.fail(new IllegalStateException("late"));
         assertNull(sealed.failure());
+    }
+
+    @Test
+    void aRefusedContinuationRunsOnceEvenWhenItsEndFails() {
+        var lake = new Kept();
+        lake.refuse = true;
+        var quantum = new Probe();
+        var next = new Told() {
+            @Override
+            public void doFinally() {
+                throw new IllegalStateException("its end failed");
+            }
+
+            /// As the generation frames do: a rejected frame runs here.
+            @Override
+            public void doFinallyWithError(Throwable rejection) {
+                execute();
+            }
+        };
+        quantum.continueWith(lake, next);
+        quantum.retire(null);
+        quantum.publishOutcome();
+        assertEquals(1, next.executions, "a failed end is not a rejection: the frame must not run again");
     }
 
     @Test
