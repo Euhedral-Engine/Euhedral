@@ -7,11 +7,11 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
+import io.euhedral_execution.inference.core.model.qwen38.Session;
+import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.EngineExecutionFixture;
-import io.euhedral_execution.inference.core.scheduling.PrefixCache;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
-import io.euhedral_execution.inference.core.scheduling.SequenceStateProbe;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -66,14 +66,14 @@ class PrefixCacheCudaIntegrationTest {
 
     private static List<Integer> generate(InferenceEngine engine, int[] prompt, int newTokens, long seed)
             throws Exception {
-        try (QwenGenerationSession session = engine.createSession(sampling(seed))) {
+        try (Session session = engine.createSession(sampling(seed))) {
             return session.generate(prompt, newTokens, text -> {}, null);
         }
     }
 
     private static List<String> stateAfterPrefill(InferenceEngine engine, ExecutionGpu gpu, int[] prompt)
             throws Exception {
-        try (QwenGenerationSession session = engine.createSession(sampling(1))) {
+        try (Session session = engine.createSession(sampling(1))) {
             session.generate(prompt, 0, text -> {}, null);
             return SequenceStateProbe.committedDigests(
                     gpu,
@@ -236,7 +236,7 @@ class PrefixCacheCudaIntegrationTest {
     /// The digests of the base state and of the MTP cache after a one-token speculative generation.
     private static List<String> mtpAndBaseDigests(InferenceEngine engine, ExecutionGpu gpu, int[] prompt)
             throws Exception {
-        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+        try (Session session = engine.createSession(GenerationConfig.greedy(1))) {
             session.generate(prompt, 1, text -> {}, null);
             var sequence = EngineExecutionFixture.sequence(session);
             List<String> digests = new ArrayList<>(SequenceStateProbe.committedDigests(
@@ -250,7 +250,7 @@ class PrefixCacheCudaIntegrationTest {
     }
 
     private static List<Integer> greedy(InferenceEngine engine, int[] prompt, int newTokens) throws Exception {
-        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1))) {
+        try (Session session = engine.createSession(GenerationConfig.greedy(1))) {
             return session.generate(prompt, newTokens, text -> {}, null);
         }
     }

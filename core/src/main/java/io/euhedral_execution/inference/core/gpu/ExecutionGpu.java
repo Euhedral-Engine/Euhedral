@@ -1,6 +1,6 @@
 package io.euhedral_execution.inference.core.gpu;
 
-import io.euhedral_execution.inference.core.model_loader.layer_weights.WeightLayout;
+import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;

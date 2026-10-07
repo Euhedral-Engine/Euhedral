@@ -1,6 +1,6 @@
 package io.euhedral_execution.inference.core;
 
-import io.euhedral_execution.inference.core.scheduling.PrefixCache;
+import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;

@@ -2,9 +2,9 @@ package io.euhedral_execution.inference.core;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
-import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
-import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
+import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.LayerType;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -92,7 +92,7 @@ public record InferenceRunSnapshot(
         }
     }
 
-    /// Scalar projection of [QwenConfig]; layer kinds are counted rather than copying its array.
+    /// Scalar projection of [Qwen38Config]; layer kinds are counted rather than copying its array.
     public record Dimensions(
             int vocabSize,
             int hiddenSize,
@@ -108,14 +108,14 @@ public record InferenceRunSnapshot(
             int linearKeyHeadDim,
             int linearValueHeadDim,
             int maxPositionEmbeddings) {
-        public static Dimensions of(QwenConfig config) {
+        public static Dimensions of(Qwen38Config config) {
             int attention = 0;
             int gdn = 0;
-            QwenLayerType[] layers = config.layerTypes();
+            LayerType[] layers = config.layerTypes();
             if (layers != null) {
-                for (QwenLayerType layer : layers) {
-                    if (layer == QwenLayerType.FULL_ATTENTION) attention++;
-                    else if (layer == QwenLayerType.GATED_DELTA_NET) gdn++;
+                for (LayerType layer : layers) {
+                    if (layer == LayerType.FULL_ATTENTION) attention++;
+                    else if (layer == LayerType.GATED_DELTA_NET) gdn++;
                 }
             }
             return new Dimensions(

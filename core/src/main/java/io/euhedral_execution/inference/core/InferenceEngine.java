@@ -8,23 +8,24 @@ import io.euhedral_execution.core.control_plane.ControlPlaneShard;
 import io.euhedral_execution.core.generics.AbstractExecutor;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
+import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
-import io.euhedral_execution.inference.core.model_loader.ModelArchitecture;
-import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.ResidencyPlanner;
-import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
-import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
-import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
-import io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4Config;
+import io.euhedral_execution.inference.core.model.ModelArchitecture;
+import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
+import io.euhedral_execution.inference.core.model.qwen38.Session;
+import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner;
+import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
+import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
+import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
+import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.DFlash2Decoder;
-import io.euhedral_execution.inference.core.scheduling.EuhedralInferenceRuntime;
-import io.euhedral_execution.inference.core.scheduling.GenerationSession;
-import io.euhedral_execution.inference.core.scheduling.PrefixCache;
-import io.euhedral_execution.inference.core.scheduling.QwenExecutionPlan;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -57,9 +58,9 @@ public final class InferenceEngine implements AutoCloseable {
     private final Bootstrap bootstrap;
     private final QwenTokenizer tokenizer;
     private final ExecutionGpu gpu;
-    private final QwenModel model;
+    private final Qwen38Model model;
     private final ControlPlaneLattice lattice;
-    private final QwenExecutionPlan plan;
+    private final ExecutionPlan plan;
     private final EuhedralInferenceRuntime runtime;
     private final InferenceConfig config;
     private final ArtifactProfile profile;
@@ -79,9 +80,9 @@ public final class InferenceEngine implements AutoCloseable {
             Bootstrap bootstrap,
             QwenTokenizer tokenizer,
             ExecutionGpu gpu,
-            QwenModel model,
+            Qwen38Model model,
             ControlPlaneLattice lattice,
-            QwenExecutionPlan plan,
+            ExecutionPlan plan,
             EuhedralInferenceRuntime runtime,
             InferenceConfig config,
             ArtifactProfile profile,
@@ -124,15 +125,15 @@ public final class InferenceEngine implements AutoCloseable {
         if (!LATTICE_OWNED.compareAndSet(false, true))
             throw new IllegalStateException("an inference engine already owns the process-wide Euhedral lattice");
         ExecutionGpu gpu = null;
-        QwenModel model = null;
+        Qwen38Model model = null;
         ControlPlaneLattice lattice = null;
         try {
             QwenTokenizer tokenizer = QwenTokenizer.load(config.tokenizerDirectory());
-            QwenArtifact artifact = bootstrap.readArtifact(config.artifactPath());
+            Artifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath());
             ArtifactProfile profile = artifact == null ? null : ArtifactProfile.of(artifact);
             model = bootstrap.loadModel(config.artifactPath(), artifact, profile, gpu, config.maxContextTokens());
-            QwenExecutionPlan plan = new QwenExecutionPlan(model.weights(), model.staging());
+            ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging());
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             EuhedralInferenceRuntime runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
@@ -160,7 +161,7 @@ public final class InferenceEngine implements AutoCloseable {
                     failure,
                     bootstrap,
                     gpu,
-                    failure instanceof QwenModel.LoadFailure partial ? partial : model,
+                    failure instanceof Qwen38Model.LoadFailure partial ? partial : model,
                     lattice);
             try {
                 pending.close();
@@ -256,7 +257,7 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// The cache is an optimisation: when it is off, the plan is not a full model, or its host memory cannot be
     /// pinned, the engine serves without it.
-    private static PrefixCache openPrefixCache(InferenceConfig config, ExecutionGpu gpu, QwenExecutionPlan plan) {
+    private static PrefixCache openPrefixCache(InferenceConfig config, ExecutionGpu gpu, ExecutionPlan plan) {
         if (config.prefixCacheBytes() == 0 || plan.weights().layers().length <= 1) return null;
         try {
             PrefixCache cache = PrefixCache.create(
@@ -340,18 +341,18 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// Creates independent sequence/sampler/decoder state borrowing this engine's shared runtime. Dense models only;
     /// [#createGenerationSession] serves both.
-    public synchronized QwenGenerationSession createSession(GenerationConfig config) {
+    public synchronized Session createSession(GenerationConfig config) {
         if (this.qwen4 != null)
             throw new UnsupportedOperationException("a Flash-Next engine opens sessions with createGenerationSession");
-        return createSession(config, QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS);
+        return createSession(config, Session.DEFAULT_PREFILL_CHUNK_TOKENS);
     }
 
     /// As [#createSession(GenerationConfig)] with a smaller prefill chunk, so tests can exercise several
     /// prefill quanta on short prompts.
-    synchronized QwenGenerationSession createSession(GenerationConfig config, int prefillChunkTokens) {
+    synchronized Session createSession(GenerationConfig config, int prefillChunkTokens) {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
         this.gpu.ensureHealthy();
-        var session = new QwenGenerationSession(
+        var session = new Session(
                 this.tokenizer,
                 this.plan,
                 this.runtime,
@@ -371,7 +372,7 @@ public final class InferenceEngine implements AutoCloseable {
         return session;
     }
 
-    private synchronized void releaseSession(QwenGenerationSession session) {
+    private synchronized void releaseSession(Session session) {
         this.sessions.remove(session);
     }
 
@@ -403,7 +404,7 @@ public final class InferenceEngine implements AutoCloseable {
     }
 
     /// The dense model's configuration; a Flash-Next engine has none (see [#vocabularySize], [#maxPositionEmbeddings]).
-    public QwenConfig modelConfig() {
+    public Qwen38Config modelConfig() {
         if (this.qwen4 != null)
             throw new UnsupportedOperationException("a Flash-Next model has no dense configuration");
         return this.model.weights().config();
@@ -430,7 +431,7 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// Returns what the loaded artifact is, or null when the engine was started without a profiled artifact.
     /// The loaded plan family (tests).
-    QwenExecutionPlan plan() {
+    ExecutionPlan plan() {
         return this.plan;
     }
 
@@ -517,7 +518,7 @@ public final class InferenceEngine implements AutoCloseable {
         List<GenerationSession> owned;
         synchronized (this) {
             for (var session : this.sessions) {
-                if (session instanceof QwenGenerationSession dense && dense.isGeneratingOnCurrentThread())
+                if (session instanceof Session dense && dense.isGeneratingOnCurrentThread())
                     throw new IllegalStateException("cannot close the engine from its generation callback");
             }
             this.closing = true;
@@ -574,7 +575,7 @@ public final class InferenceEngine implements AutoCloseable {
         }
     }
 
-    private static InferenceRunSnapshot.Model modelIdentity(Path path, QwenArtifact artifact, QwenModel model) {
+    private static InferenceRunSnapshot.Model modelIdentity(Path path, Artifact artifact, Qwen38Model model) {
         Long bytes;
         try {
             bytes = Files.size(path);
@@ -636,8 +637,8 @@ public final class InferenceEngine implements AutoCloseable {
             }
         }
 
-        QwenArtifact readArtifact(Path path) throws IOException {
-            return QwenArtifactReader.read(path);
+        Artifact readArtifact(Path path) throws IOException {
+            return ArtifactReader.read(path);
         }
 
         ExecutionGpu openGpu(Path path) {
@@ -646,8 +647,8 @@ public final class InferenceEngine implements AutoCloseable {
 
         /// Loads the artifact's executed objects, keeping in host memory only as many weights as a context
         /// of `maxContextTokens` needs to fit in the device's free memory.
-        QwenModel loadModel(
-                Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContextTokens)
+        Qwen38Model loadModel(
+                Path path, Artifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContextTokens)
                 throws IOException {
             int positions = artifact.config().maxPositionEmbeddings();
             if (maxContextTokens > positions)
@@ -668,7 +669,7 @@ public final class InferenceEngine implements AutoCloseable {
                     plan.deviceBytes() >> 20,
                     free >> 20,
                     hostBytes >> 20);
-            return QwenModel.load(path, artifact, gpu, profile.speculation(), plan.hostBacked());
+            return Qwen38Model.load(path, artifact, gpu, profile.speculation(), plan.hostBacked());
         }
 
         /// Fragment defaults with fixed idle timing: an idle worker parks for the default 15 us. The adaptive

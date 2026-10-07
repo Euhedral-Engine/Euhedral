@@ -8,8 +8,8 @@ import io.euhedral_execution.inference.benchmark.measure.Metrics;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.BenchmarkResult;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
+import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
 import java.io.IOException;
 import java.time.Clock;
 import java.util.List;
@@ -102,7 +102,7 @@ public final class BenchmarkRunner {
         if (options.gpuMemory()) target.resetPeakMemory();
         long[] before = options.gpuMemory() ? target.memory() : null;
         var timing = new IterationTiming(
-                Math.ceilDiv(prompt.actualTokens(), QwenGenerationSession.DEFAULT_PREFILL_CHUNK_TOKENS),
+                Math.ceilDiv(prompt.actualTokens(), Session.DEFAULT_PREFILL_CHUNK_TOKENS),
                 scenario.requestedNewTokens());
         List<Integer> tokens = null;
         Throwable failure = null;

@@ -7,7 +7,7 @@ import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.ResultStore;
 import io.euhedral_execution.inference.core.ProcessorTopology;
 import io.euhedral_execution.inference.core.WorkerProcessorSelection;
-import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifactReader;
+import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -35,7 +35,7 @@ public final class Prerequisites {
         WorkerProcessorSelection workers =
                 resolveWorkers(options.cpus(), options.excludeCpus(), options.excludeCores(), topology);
 
-        int modelContext = QwenArtifactReader.read(options.artifact()).config().maxPositionEmbeddings();
+        int modelContext = ArtifactReader.read(options.artifact()).config().maxPositionEmbeddings();
         int context = Math.min(modelContext, options.maxContextTokens());
         QwenTokenizer tokenizer = QwenTokenizer.load(options.tokenizer());
         // One prompt per scenario (words), or one per corpus task (chat): iteration i runs prompt i mod size.

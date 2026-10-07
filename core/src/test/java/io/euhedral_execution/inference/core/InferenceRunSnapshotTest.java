@@ -3,26 +3,23 @@ package io.euhedral_execution.inference.core;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import io.euhedral_execution.inference.core.model_loader.config.QwenConfig;
-import io.euhedral_execution.inference.core.model_loader.config.QwenLayerType;
+import io.euhedral_execution.inference.core.model.qwen38.LayerType;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class InferenceRunSnapshotTest {
-    static QwenConfig config(QwenLayerType[] layers) {
-        return new QwenConfig(
+    static Qwen38Config config(LayerType[] layers) {
+        return new Qwen38Config(
                 248320, 5120, 4, 24, 4, 256, 17408, 16, 48, 128, 128, 4, 1e-6, 1e7, 0.25, 262144, "silu", layers, 0, 0,
                 0, 0, false, true, 1);
     }
 
     static InferenceRunSnapshot snapshot(GenerationConfig generation) {
-        QwenLayerType[] layers = {
-            QwenLayerType.GATED_DELTA_NET,
-            QwenLayerType.GATED_DELTA_NET,
-            QwenLayerType.GATED_DELTA_NET,
-            QwenLayerType.FULL_ATTENTION
+        LayerType[] layers = {
+            LayerType.GATED_DELTA_NET, LayerType.GATED_DELTA_NET, LayerType.GATED_DELTA_NET, LayerType.FULL_ATTENTION
         };
         return new InferenceRunSnapshot(
                 InferenceRunSnapshot.SCHEMA_VERSION,
@@ -74,9 +71,9 @@ class InferenceRunSnapshotTest {
 
     @Test
     void projectsQwenConfigWithoutRetainingItsMutableLayerArray() {
-        QwenLayerType[] layers = {QwenLayerType.FULL_ATTENTION, QwenLayerType.GATED_DELTA_NET};
+        LayerType[] layers = {LayerType.FULL_ATTENTION, LayerType.GATED_DELTA_NET};
         var dimensions = InferenceRunSnapshot.Dimensions.of(config(layers));
-        layers[1] = QwenLayerType.FULL_ATTENTION;
+        layers[1] = LayerType.FULL_ATTENTION;
         assertEquals(1, dimensions.fullAttentionLayers());
         assertEquals(1, dimensions.gatedDeltaNetLayers());
     }

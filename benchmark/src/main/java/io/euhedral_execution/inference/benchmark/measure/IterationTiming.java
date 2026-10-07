@@ -1,6 +1,6 @@
 package io.euhedral_execution.inference.benchmark.measure;
 
-import io.euhedral_execution.inference.core.scheduling.GenerationTimingListener;
+import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import java.util.Arrays;
 
 /// Raw boundaries for one `generate` call. `entry`/`returned` are taken immediately around

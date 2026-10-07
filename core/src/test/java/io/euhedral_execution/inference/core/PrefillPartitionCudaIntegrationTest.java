@@ -6,10 +6,10 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
+import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.EngineExecutionFixture;
-import io.euhedral_execution.inference.core.scheduling.QwenGenerationSession;
-import io.euhedral_execution.inference.core.scheduling.SequenceStateProbe;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -58,7 +58,7 @@ class PrefillPartitionCudaIntegrationTest {
 
     private static List<String> stateAfterPrefill(InferenceEngine engine, ExecutionGpu gpu, int[] prompt, int chunk)
             throws Exception {
-        try (QwenGenerationSession session = engine.createSession(GenerationConfig.greedy(1L), chunk)) {
+        try (Session session = engine.createSession(GenerationConfig.greedy(1L), chunk)) {
             session.generate(prompt, 0, text -> {}, null);
             return SequenceStateProbe.committedDigests(
                     gpu,

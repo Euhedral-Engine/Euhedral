@@ -3,14 +3,14 @@ package io.euhedral_execution.inference.core;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.model_loader.ArtifactProfile;
-import io.euhedral_execution.inference.core.model_loader.EngineModelFixture;
-import io.euhedral_execution.inference.core.model_loader.QwenModel;
-import io.euhedral_execution.inference.core.model_loader.artifact.QwenArtifact;
+import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
+import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.loader.EngineModelFixture;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
-import io.euhedral_execution.inference.core.scheduling.EngineExecutionFixture;
-import io.euhedral_execution.inference.core.scheduling.GenerationTimingListener;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -352,7 +352,7 @@ class InferenceEngineTest {
             final int selected = stage;
             var bootstrap = new FakeBootstrap() {
                 @Override
-                QwenArtifact readArtifact(Path path) {
+                Artifact readArtifact(Path path) {
                     if (selected == 0) throw new IllegalStateException("artifact");
                     return super.readArtifact(path);
                 }
@@ -364,14 +364,14 @@ class InferenceEngineTest {
                 }
 
                 @Override
-                QwenModel loadModel(
-                        Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
+                Qwen38Model loadModel(
+                        Path path, Artifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
                         throws java.io.IOException {
                     if (selected == 2) throw new IllegalStateException("model");
                     if (selected == 3)
                         return EngineModelFixture.load(
                                 gpu,
-                                new io.euhedral_execution.inference.core.model_loader.QwenWeights(
+                                new io.euhedral_execution.inference.core.model.qwen38.loader.Weights(
                                         null, null, null, null, null, null));
                     return super.loadModel(path, artifact, profile, gpu, maxContext);
                 }
@@ -397,13 +397,12 @@ class InferenceEngineTest {
 
     @Test
     void refusesAContextLongerThanTheModelsPositions() {
-        var layers = new io.euhedral_execution.inference.core.model_loader.config.QwenLayerType[4];
-        java.util.Arrays.fill(
-                layers, io.euhedral_execution.inference.core.model_loader.config.QwenLayerType.FULL_ATTENTION);
-        var artifact = new QwenArtifact(
+        var layers = new io.euhedral_execution.inference.core.model.qwen38.LayerType[4];
+        java.util.Arrays.fill(layers, io.euhedral_execution.inference.core.model.qwen38.LayerType.FULL_ATTENTION);
+        var artifact = new Artifact(
                 null,
                 InferenceRunSnapshotTest.config(layers),
-                new io.euhedral_execution.inference.core.model_loader.artifact.TensorDescriptor[0]);
+                new io.euhedral_execution.inference.core.artifact.TensorDescriptor[0]);
         var failure = assertThrows(
                 IllegalArgumentException.class,
                 () -> new InferenceEngine.Bootstrap().loadModel(Path.of("model.edrl"), artifact, null, null, 262145));
@@ -696,7 +695,7 @@ class InferenceEngineTest {
         int artifactReads;
 
         @Override
-        QwenArtifact readArtifact(Path path) {
+        Artifact readArtifact(Path path) {
             artifactReads++;
             return null;
         }
@@ -707,7 +706,7 @@ class InferenceEngineTest {
         }
 
         @Override
-        QwenModel loadModel(Path path, QwenArtifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
+        Qwen38Model loadModel(Path path, Artifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
                 throws java.io.IOException {
             modelLoads++;
             return EngineModelFixture.load(gpu, EngineExecutionFixture.weights());
