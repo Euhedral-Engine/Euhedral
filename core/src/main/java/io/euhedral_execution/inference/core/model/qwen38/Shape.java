@@ -101,7 +101,7 @@ public final class Shape implements GraphShape {
 
     @Override
     public StageFrame createStage(StageGraph graph, int stage, ExecutionGpu gpu) {
-        return InstructionFrame.create(graph, this.instructions.get(stage), gpu);
+        return Stages.create(graph, this.instructions.get(stage), gpu);
     }
 
     @Override

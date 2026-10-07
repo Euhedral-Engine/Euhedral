@@ -284,17 +284,11 @@ class CompactCudaExecutionIntegrationTest {
         assertEquals(tokenCount, sequence.currentTokenPosition());
         assertTrue(captured.get() != null, "terminal frame outputs were not captured");
         assertBf16Close(
-                "frame EmbeddingFrame T=" + tokenCount,
-                expectedEmbedding,
-                captured.get().embedding(),
-                0.001f);
+                "stage Embed T=" + tokenCount, expectedEmbedding, captured.get().embedding(), 0.001f);
         assertBf16Close(
-                "frame RmsNormFrame T=" + tokenCount,
-                expectedNorm,
-                captured.get().normalized(),
-                0.02f);
+                "stage RmsNorm T=" + tokenCount, expectedNorm, captured.get().normalized(), 0.02f);
         assertBf16Close(
-                "frame LinearFrame T=" + tokenCount,
+                "stage Linear T=" + tokenCount,
                 expectedProjection,
                 prefixOutputRows(captured.get().projection(), tokenCount, outputWidth, referenceOutputWidth),
                 0.05f);

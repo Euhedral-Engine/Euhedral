@@ -98,7 +98,7 @@ class DFlash2FixtureCudaIntegrationTest {
                     recorder.copy("taps", drafter.taps(chunk.length), chunk.length, config.tapWidth(), "bf16", 0, 0);
                     taps = Recorder.concat(taps, recorder.data.remove("taps"));
                     // Only the last chunk's context stages are recorded (the reference's names cover one call).
-                    if (last) DFlash2Frame.observe(recorder);
+                    if (last) Stages.DFlash2.observe(recorder);
                     SpeculativeDecodeCudaIntegrationTest.execute(
                             runtime,
                             new Quantum(
@@ -126,7 +126,7 @@ class DFlash2FixtureCudaIntegrationTest {
                                             LogitsRequirement.ALL_TOKENS)
                                     .withProposal(proposal));
                 } finally {
-                    DFlash2Frame.observe(null);
+                    Stages.DFlash2.observe(null);
                 }
                 recorder.write(dump, prompt.length, anchor);
                 System.out.println("DFLASH2_FIXTURE dump " + dump + " anchor " + anchor + " proposal "
@@ -140,7 +140,7 @@ class DFlash2FixtureCudaIntegrationTest {
     }
 
     /// Records the drafter's stages under the reference's names.
-    private static final class Recorder implements DFlash2Frame.Observer {
+    private static final class Recorder implements Stages.DFlash2.Observer {
         private final CudaGpuMemory gpu;
         private final DFlash2Config config;
         private final int contextRows;

@@ -44,7 +44,7 @@ class StageGraphReuseTest {
                     public void submit(Runnable launches, boolean overlapPredecessor) {
                         launches.run();
                         // Admission's own preparation succeeds; the stage's launch hits the host failure.
-                        if (launches instanceof InstructionFrame)
+                        if (launches instanceof Stages.Stage)
                             throw new OutOfMemoryError("injected post-launch host exhaustion");
                     }
                 };
@@ -102,10 +102,10 @@ class StageGraphReuseTest {
 
         assertEquals(
                 List.of(
-                        "io.euhedral_execution.inference.core.model.qwen38.EmbeddingFrame",
-                        "io.euhedral_execution.inference.core.model.qwen38.RmsNormFrame",
-                        "io.euhedral_execution.inference.core.model.qwen38.LinearFrame",
-                        "io.euhedral_execution.inference.core.model.qwen38.LinearFrame"),
+                        "io.euhedral_execution.inference.core.model.qwen38.Stages$Embed",
+                        "io.euhedral_execution.inference.core.model.qwen38.Stages$RmsNorm",
+                        "io.euhedral_execution.inference.core.model.qwen38.Stages$Linear",
+                        "io.euhedral_execution.inference.core.model.qwen38.Stages$Linear"),
                 firstRun.stream().map(frame -> frame.getClass().getName()).toList());
         assertNotSame(firstRun.get(2), firstRun.get(3));
         for (int index = 0; index < firstRun.size(); index++) {
@@ -287,7 +287,7 @@ class StageGraphReuseTest {
                 @Override
                 public void submit(Runnable launches, boolean overlapPredecessor) {
                     launches.run();
-                    if (!failRegistration && launches instanceof InstructionFrame)
+                    if (!failRegistration && launches instanceof Stages.Stage)
                         throw new IllegalStateException("post-launch host error");
                 }
 
@@ -431,7 +431,7 @@ class StageGraphReuseTest {
         List<AbstractFrame> stages = new ArrayList<>();
         while (!outcome.isDone()) {
             AbstractFrame frame = pullOne();
-            if (frame instanceof InstructionFrame) stages.add(frame);
+            if (frame instanceof Stages.Stage) stages.add(frame);
             frame.execute();
             frame.doFinally();
         }
