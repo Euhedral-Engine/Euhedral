@@ -7,6 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -231,6 +232,57 @@ class ArchitectureTest {
                 if (line.startsWith("import io.euhedral_execution.inference.core.model."))
                     violations.add(relative(file) + ": " + line);
         assertTrue(violations.isEmpty(), "shared artifact code imports a model:\n" + String.join("\n", violations));
+    }
+
+    /// Shared code knows no model: only the engine, which chooses a model's runtime, imports one. The other entries
+    /// are what PR 2 is removing; each task deletes the ones it fixes.
+    private static final Set<String> MODEL_IMPORTS_OUTSIDE_MODEL = Set.of(
+            "InferenceEngine.java",
+            "InferenceConfig.java",
+            "InferenceRunSnapshot.java",
+            "runtime/EuhedralInferenceRuntime.java",
+            "runtime/HostTasks.java",
+            "api:metrics/EngineMetrics.java",
+            "benchmark:run/BenchmarkRunner.java",
+            "benchmark:run/Prerequisites.java");
+
+    private static final Path API = Path.of("../api/src/main/java/io/euhedral_execution/inference/api");
+    private static final Path BENCHMARK =
+            Path.of("../benchmark/src/main/java/io/euhedral_execution/inference/benchmark");
+
+    private static boolean importsAModel(Path file) throws IOException {
+        return Files.readAllLines(file).stream()
+                .anyMatch(line -> line.startsWith("import io.euhedral_execution.inference.core.model."));
+    }
+
+    @Test
+    void sharedCodeImportsNoModel() throws IOException {
+        List<String> violations = new ArrayList<>();
+        for (var tree : List.of(Map.entry(MAIN, ""), Map.entry(API, "api:"), Map.entry(BENCHMARK, "benchmark:"))) {
+            try (Stream<Path> walk = Files.walk(tree.getKey())) {
+                for (Path file :
+                        walk.filter(p -> p.toString().endsWith(".java")).toList()) {
+                    String path = tree.getKey().relativize(file).toString().replace('\\', '/');
+                    if (tree.getValue().isEmpty() && path.startsWith("model/")) continue;
+                    String name = tree.getValue() + path;
+                    if (importsAModel(file) && !MODEL_IMPORTS_OUTSIDE_MODEL.contains(name)) violations.add(name);
+                }
+            }
+        }
+        assertTrue(violations.isEmpty(), "shared code imports a model: " + violations);
+    }
+
+    /// Entries in the exception list that no longer import a model must leave it, so it only shrinks.
+    @Test
+    void theExceptionListOnlyNamesRealImports() throws IOException {
+        List<String> stale = new ArrayList<>();
+        for (String name : MODEL_IMPORTS_OUTSIDE_MODEL) {
+            Path file = name.startsWith("api:")
+                    ? API.resolve(name.substring(4))
+                    : name.startsWith("benchmark:") ? BENCHMARK.resolve(name.substring(10)) : MAIN.resolve(name);
+            if (!Files.exists(file) || !importsAModel(file)) stale.add(name);
+        }
+        assertTrue(stale.isEmpty(), "no longer imports a model, remove from the list: " + stale);
     }
 
     /// A source path relative to the main tree, with forward slashes on every platform.
