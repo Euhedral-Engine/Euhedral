@@ -29,7 +29,7 @@ class StageGraphCaptureTest {
     private static final StageTopology DIAMOND =
             StageTopology.submitted(dependencies(new int[0], new int[] {0}, new int[] {0}, new int[] {1, 2}));
 
-    private final QwenExecutionSource source = new QwenExecutionSource();
+    private final TestLake source = new TestLake();
     private final Recycler recycler = new Recycler();
     private final List<CapturingStream> shadows = Collections.synchronizedList(new ArrayList<>());
     private final AtomicLong graphs = new AtomicLong();

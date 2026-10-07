@@ -28,14 +28,14 @@ final class StageGraphFixtures {
     }
 
     /// Frames the source currently exposes, taken without running them.
-    static List<AbstractFrame> take(QwenExecutionSource source) {
+    static List<AbstractFrame> take(TestLake source) {
         List<AbstractFrame> frames = new ArrayList<>();
         source.pull(frames::add, frame -> false, Long.MAX_VALUE);
         return frames;
     }
 
     /// Pulls and runs every exposed frame, including those that running them makes ready.
-    static int drain(QwenExecutionSource source) {
+    static int drain(TestLake source) {
         return (int) source.pull(StageGraphFixtures::run, frame -> false, Long.MAX_VALUE);
     }
 
@@ -255,8 +255,7 @@ final class StageGraphFixtures {
         }
     }
 
-    static StageGraph graph(
-            StageTopology topology, RecordingStream stream, QwenExecutionSource source, Recycler recycler) {
+    static StageGraph graph(StageTopology topology, RecordingStream stream, TestLake source, Recycler recycler) {
         return new StageGraph(topology, TestStage::new, stream, source, recycler);
     }
 

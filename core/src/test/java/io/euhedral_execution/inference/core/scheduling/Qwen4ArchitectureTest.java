@@ -164,7 +164,6 @@ class Qwen4ArchitectureTest {
                     // The asynchronous reads' sink is how the disk's completions reach the lattice, as driver
                     // callbacks publish the device's.
                     if (name.equals("InferenceLake.java")
-                            || name.equals("QwenExecutionSource.java")
                             || name.equals("FrameLake.java")
                             || name.equals("AsyncReads.java")) continue;
                     List<String> lines = Files.readAllLines(file);

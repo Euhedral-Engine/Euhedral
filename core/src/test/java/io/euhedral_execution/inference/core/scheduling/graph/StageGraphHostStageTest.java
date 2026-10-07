@@ -25,7 +25,7 @@ class StageGraphHostStageTest {
     private static final StageTopology CHAIN =
             StageTopology.submitted(dependencies(new int[0], new int[] {0}, new int[] {1}));
 
-    private final QwenExecutionSource source = new QwenExecutionSource();
+    private final TestLake source = new TestLake();
     private final RecordingStream stream = new RecordingStream();
     private final Recycler recycler = new Recycler();
 
