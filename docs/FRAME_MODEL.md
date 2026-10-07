@@ -234,17 +234,22 @@ admission order and a work-in-progress count, so whichever thread finds the olde
 ready prefix, one thread at a time, without a lock. Concluding settles a piece: it commits (the committed
 frontier moves) or it is abandoned. A piece is told at its conclusion when it can no longer commit (a piece before
 it failed the sequence, or committed short of where it starts, as a partly accepted verification does); a quantum
-then fails and discards its stages' work. A draft quantum and a capture leave both frontiers where they are.
+then fails, discards its stages' work and ends the sequence FAILED, because its stages may already have changed
+GDN state in place. A draft quantum and a capture leave both frontiers where they are.
 
 Admission (the generation chain) writes the submitted frontier, and the conclusion (one thread at a time) writes
 the committed one, so they are volatile, with no lock and no CAS state machine. `cancel()` may come from any
-thread: it publishes its flag before it reads whether work is in flight, and settlement publishes its count
-before it reads the flag, so one of the two ends the sequence CANCELLED. The terminal state is first-writer-wins.
+thread: it publishes its flag before it reads whether work is in flight, and admission and settlement publish their
+counts before they read the flag, so an admission either backs out or is in flight when the cancellation looks, and
+one of the cancellation or the settlement ends the sequence CANCELLED. A quantum that decided to commit before the
+cancellation still commits (SUCCESS), and the sequence then ends CANCELLED. The terminal state is
+first-writer-wins.
 The persistent state closes only in `complete()`, which the session's lifecycle runs after its generation ended.
 
 The sequence allows several quanta in flight; the state they share does not yet. `AttentionKvState` takes one
 append at a time, the decode scratch and the session's host logits row are one per sequence, and quanta on
-different lanes have no device edge between them, so today's sessions admit one quantum of a sequence at a time.
+different lanes have no device edge between them, so a quantum that touches that state is refused while other work
+on its sequence is in flight, and today's sessions admit one quantum of a sequence at a time.
 
 ## Failure and cancellation
 

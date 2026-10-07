@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu.UploadBuffer;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
@@ -332,6 +333,45 @@ class QuantumTest {
             assertFalse(sequence.inFlight());
         } finally {
             releaseAndClose(stream, lattice, runtime);
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    void aQuantumThatSharesSequenceStateIsRefusedWhileAnotherIsInFlight() throws Exception {
+        var weights = EngineExecutionFixture.weights();
+        var plan = new ExecutionPlan(weights);
+        var stream = new ExecutionFixtures.HoldingStream();
+        var gpu = new EngineExecutionFixture.SamplingGpu(weights.config().vocabSize()) {
+            @Override
+            public GpuStream openStream() {
+                return stream;
+            }
+        };
+        var lattice = new ExecutionFixtures.ManualLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var sequence = new Sequence(909);
+        var first = new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[64], LogitsRequirement.NONE);
+        var second = new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 64, new int[1], LogitsRequirement.NONE);
+        try {
+            var firstOutcome = runtime.submit(first);
+            lattice.drive();
+            var secondOutcome = runtime.submit(second);
+            lattice.drive();
+            var refused = secondOutcome.get(2, TimeUnit.SECONDS);
+            assertEquals(Quantum.Status.FAILED, refused.status());
+            assertInstanceOf(IllegalStateException.class, refused.failure());
+            assertEquals(Sequence.TerminalState.ACTIVE, sequence.terminalState(), "the refusal leaves the sequence");
+
+            stream.release(null);
+            lattice.drive();
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    firstOutcome.get(2, TimeUnit.SECONDS).status());
+            assertEquals(64, sequence.committedFrontier());
+        } finally {
+            releaseAndClose(stream, lattice, runtime);
+            sequence.complete();
         }
     }
 
