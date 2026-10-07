@@ -213,14 +213,25 @@ public final class ExpertCacheOwner {
         return Outcome.LOADING;
     }
 
-    /// Records the prefetch reads per layer at most (`EUHEDRAL_QWEN4_PREFETCH=K,B`: the next layer's router's best `K`,
-    /// at most `B` read; `0` or unset: none).
+    /// The prefetch (`EUHEDRAL_QWEN4_PREFETCH=K,B[,D]`: the router of the layer `D` ahead (1) applied to a decode
+    /// step's input, its best `K` experts, at most `B` of them read per layer; `0`: none). By default the next
+    /// layer's best 10, one read per layer (docs/FLASH_NEXT_PREFETCH.md).
     static final int[] PREFETCH = prefetchSetting(System.getenv("EUHEDRAL_QWEN4_PREFETCH"));
 
     private static int[] prefetchSetting(String value) {
-        if (value == null || value.isBlank() || value.equals("0")) return new int[] {0, 0};
+        if (value == null || value.isBlank()) value = "10,1,1";
+        if (value.equals("0")) return new int[] {0, 0, 1};
         String[] parts = value.split(",");
-        return new int[] {Integer.parseInt(parts[0].trim()), Integer.parseInt(parts[1].trim())};
+        return new int[] {
+            Integer.parseInt(parts[0].trim()),
+            Integer.parseInt(parts[1].trim()),
+            parts.length > 2 ? Integer.parseInt(parts[2].trim()) : 1
+        };
+    }
+
+    /// How many layers ahead the prefetch predicts.
+    public static int prefetchDistance() {
+        return PREFETCH.length > 2 ? PREFETCH[2] : 1;
     }
 
     /// The best experts of the next layer's router to consider, and how many of them a prefetch reads at most.

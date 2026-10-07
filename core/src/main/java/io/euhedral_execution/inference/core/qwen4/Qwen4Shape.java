@@ -49,6 +49,8 @@ final class Qwen4Shape implements GraphShape {
         ROUTE,
         SHARED,
         PLAN,
+        PREDICT,
+        PREFETCH,
         FETCH,
         EXPERT,
         FINISH,
@@ -147,6 +149,15 @@ final class Qwen4Shape implements GraphShape {
             int shared = add(Kind.SHARED, layer, -1, after(route));
             // The plan reads the route copy on the host: it waits for the device to retire it.
             int planned = add(Kind.PLAN, layer, -1, retired(route));
+            // A decode step predicts the experts of a later layer from this one's input, behind the route on its lane
+            // so the plan does not wait for it, and its prefetch is a host stage after it retires: a side branch.
+            if (this.key.rows() == 1
+                    && !diagnostic
+                    && ExpertCacheOwner.prefetchCandidates() > 0
+                    && layer + ExpertCacheOwner.prefetchDistance() < this.plan.layers()) {
+                int predict = add(Kind.PREDICT, layer, -1, after(route));
+                add(Kind.PREFETCH, layer, -1, retired(predict));
+            }
             // Every expert the block can name: its fetch, then its kernels. The finish's combine adds their outputs
             // in ascending expert order, after all of them.
             Edge[] combined = new Edge[this.expertCap + 1];

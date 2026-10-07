@@ -69,11 +69,12 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     private final int maxRows;
     private final Qwen4ExpertRouting routing;
     private final ExecutionGpu.ReadbackBuffer routeIds;
-    // The next layer's router applied to this layer's input, for one row (allocated on first use): the prediction
-    // a prefetch reads ahead by, and that a demand recording reports.
-    private ExecutionGpu.ReadbackBuffer predictedLogits;
-    private long predictedDevice;
-    private boolean predicted;
+    // Per layer, a later layer's router applied to the layer's input, for one row (allocated on first use): the
+    // prediction a prefetch reads ahead by, and that a demand recording reports. One buffer per layer, as the
+    // predictions of several layers may be in flight at once.
+    private final java.util.Map<Integer, ExecutionGpu.ReadbackBuffer> predictedLogits =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<Integer, Long> predictedDevice = new java.util.concurrent.ConcurrentHashMap<>();
     private final ExecutionGpu.ReadbackBuffer routeWeights;
     private final ExecutionGpu.UploadBuffer hostDescriptor;
     private final long deviceDescriptor;
@@ -356,10 +357,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
     }
 
     private void release() {
-        if (this.predictedLogits != null) {
-            this.predictedLogits.close();
-            this.gpu.free(this.predictedDevice);
-        }
+        for (ExecutionGpu.ReadbackBuffer buffer : this.predictedLogits.values()) buffer.close();
+        for (long device : this.predictedDevice.values()) this.gpu.free(device);
         this.gpu.free(this.deviceDescriptor);
         this.hostDescriptor.close();
         this.routeIds.close();
@@ -370,29 +369,24 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         return Float.intBitsToFloat((bits & 0xFFFF) << 16);
     }
 
-    /// Queues, behind this block's routing, the next layer's router (`next`) applied to this block's single row: a
-    /// prediction of the experts the next layer will ask for, read back for [#takePrediction].
-    void submitPrediction(Weights next, long input) {
-        if (this.predictedLogits == null) {
-            this.predictedLogits = this.gpu.allocateReadbackBuffer(2L * this.experts);
-            this.predictedDevice = this.gpu.allocate(2L * this.experts);
-        }
-        Qwen4Ops.linearBf16(
-                this.gpu, input, next.router().address(), this.predictedDevice, 1, this.hidden, this.experts);
-        this.gpu.copyDeviceToReadback(this.predictedLogits, this.predictedDevice, 2L * this.experts);
-        this.predicted = true;
+    /// Queues a later layer's router (`ahead`) applied to `layer`'s single row: a prediction of the experts that
+    /// layer will ask for, read back for [#takePrediction].
+    void submitPrediction(int layer, Weights ahead, long input) {
+        long device = this.predictedDevice.computeIfAbsent(layer, l -> this.gpu.allocate(2L * this.experts));
+        ExecutionGpu.ReadbackBuffer logits =
+                this.predictedLogits.computeIfAbsent(layer, l -> this.gpu.allocateReadbackBuffer(2L * this.experts));
+        Qwen4Ops.linearBf16(this.gpu, input, ahead.router().address(), device, 1, this.hidden, this.experts);
+        this.gpu.copyDeviceToReadback(logits, device, 2L * this.experts);
     }
 
-    /// The `k` experts the prediction [#submitPrediction] queued ranks best, best first, or null when none was
-    /// queued; each prediction is taken once. A selection over the read-back logits: no sort, no boxing.
-    int[] takePrediction(int k) {
-        if (!this.predicted) return null;
-        this.predicted = false;
+    /// The `k` experts `layer`'s prediction ([#submitPrediction], retired) ranks best, best first. A selection over
+    /// the read-back logits: no sort, no boxing.
+    int[] takePrediction(int layer, int k) {
         k = Math.min(k, this.experts);
         int[] best = new int[k];
         float[] value = new float[k];
         int held = 0;
-        MemorySegment logits = this.predictedLogits.segment();
+        MemorySegment logits = this.predictedLogits.get(layer).segment();
         for (int e = 0; e < this.experts; e++) {
             float v = bf16(logits.getAtIndex(SHORT, e));
             if (held == k && v <= value[k - 1]) continue;
@@ -410,8 +404,9 @@ public final class Qwen4MoeLayer implements AutoCloseable {
 
     /// Reports the latest block's distinct experts and their routed rows to `demand`, and `prediction` (the next
     /// layer's experts ranked by its router) when there is one.
-    void reportDemand(Qwen4ExecutionPlan.ExpertDemand demand, int layer, int nextBank, int rows, int[] prediction) {
-        if (prediction != null) demand.prediction(layer + 1, nextBank, prediction);
+    void reportDemand(
+            Qwen4ExecutionPlan.ExpertDemand demand, int layer, int ahead, int nextBank, int rows, int[] prediction) {
+        if (prediction != null) demand.prediction(ahead, nextBank, prediction);
         int bank = this.bank;
         int count = this.routing.activeExperts();
         int[] experts = new int[count];
