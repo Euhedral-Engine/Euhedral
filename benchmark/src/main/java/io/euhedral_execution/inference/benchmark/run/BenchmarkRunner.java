@@ -7,8 +7,8 @@ import io.euhedral_execution.inference.benchmark.measure.IterationTiming;
 import io.euhedral_execution.inference.benchmark.measure.Metrics;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.BenchmarkResult;
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
-import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.io.IOException;
 import java.time.Clock;
@@ -31,6 +31,11 @@ public final class BenchmarkRunner {
                 throws Exception;
 
         boolean isEos(int tokenId);
+
+        /// Prompt tokens per prefill quantum of the target's model.
+        default int prefillChunkTokens() {
+            return InferenceConfig.PREFILL_CHUNK_TOKENS;
+        }
 
         /// Returns `{freeBytes, totalBytes}` for the device.
         /// {free, total, allocated, peak allocated, retained workspace} device bytes.
@@ -102,8 +107,7 @@ public final class BenchmarkRunner {
         if (options.gpuMemory()) target.resetPeakMemory();
         long[] before = options.gpuMemory() ? target.memory() : null;
         var timing = new IterationTiming(
-                Math.ceilDiv(prompt.actualTokens(), Session.DEFAULT_PREFILL_CHUNK_TOKENS),
-                scenario.requestedNewTokens());
+                Math.ceilDiv(prompt.actualTokens(), target.prefillChunkTokens()), scenario.requestedNewTokens());
         List<Integer> tokens = null;
         Throwable failure = null;
         try {

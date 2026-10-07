@@ -6,8 +6,8 @@ import io.euhedral_execution.inference.benchmark.measure.IterationTiming;
 import io.euhedral_execution.inference.benchmark.prompt.PromptMaterial;
 import io.euhedral_execution.inference.benchmark.result.BenchmarkResult;
 import io.euhedral_execution.inference.benchmark.run.BenchmarkRunner;
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
-import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -24,7 +24,7 @@ public final class BenchmarkFixtures {
 
     public static final int EOS = 7;
     /// The prefill chunk the real session uses.
-    public static final int CHUNK = Session.DEFAULT_PREFILL_CHUNK_TOKENS;
+    public static final int CHUNK = InferenceConfig.PREFILL_CHUNK_TOKENS;
 
     public static java.util.BitSet bits(int... ids) {
         var set = new java.util.BitSet();

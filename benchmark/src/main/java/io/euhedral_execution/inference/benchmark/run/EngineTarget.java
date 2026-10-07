@@ -87,6 +87,11 @@ public final class EngineTarget implements BenchmarkRunner.Target {
     }
 
     @Override
+    public int prefillChunkTokens() {
+        return this.engine.prefillChunkTokens();
+    }
+
+    @Override
     public boolean isEos(int tokenId) {
         return this.engine.tokenizer().isGenerationEosToken(tokenId);
     }
