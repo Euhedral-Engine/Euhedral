@@ -17,7 +17,7 @@ committed), the screens give the most any prefetch could buy:
 
 ## Predictors
 
-Measured on recordings of real requests (`Qwen4DemandRecordingCudaIntegrationTest`, `tools/expert_prefetch_eval.py`):
+Measured on recordings of real requests (`DemandRecordingCudaIntegrationTest`, `tools/expert_prefetch_eval.py`):
 the share of the next layer's experts a prediction names (recall).
 
 | predictor | top 10 | top 20 | top 32 |

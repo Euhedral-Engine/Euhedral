@@ -20,13 +20,13 @@ for depth 3):
    post-final-norm hiddens. Its last row drafts d′₁.
 3. **Two recursive DRAFT rows**, each seeded by the previous MTP hidden.
 
-The MTP layer is a plan view (`QwenExecutionPlan.mtpDraft`):
+The MTP layer is a plan view (`ExecutionPlan.mtpDraft`):
 - embedding, then `MTP_STEM` (the two norms and the `fc` projection);
 - one full-attention layer with its own KV slot;
 - `mtp.norm`, then the 131,072-row draft head.
 
 The prompt prefills in chunks, each followed by its MTP catch-up (in pieces of at most 128 rows). Speculative decoding applies to
-greedy, unconstrained generations from a fresh sequence (`QwenGenerationSession.enableSpeculativeDecoding`).
+greedy, unconstrained generations from a fresh sequence (`Session.enableSpeculativeDecoding`).
 
 **GDN rollback is ReplaySSM.** VERIFY checkpoints the recurrent and convolution state and records each
 row's convolution inputs and α/β. On a partial accept, the next quantum restores the checkpoint and

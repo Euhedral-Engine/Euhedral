@@ -77,7 +77,7 @@ command line).
 - At 1K context the GPU is busy 16.85 of 18.76 ms (Q3, one row), so about 10% is host gaps and
   launch latency. MTP steps lose 0.8–1.2 ms per step (3–4%).
 - **Programmatic dependent launch is applied only to quanta starting below position 1024**
-  (`QwenExecutionContext`), so long-context decode runs without it.
+  (`model.qwen38.Quantum`), so long-context decode runs without it.
 
 **Implications:**
 - **Graphs remove most of the launch cost.**

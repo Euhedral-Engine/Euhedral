@@ -10,8 +10,8 @@ contract between the two.
 
 ```
 native/src/qwen4/experts.cuh        kernels (module native/src/qwen4/kernels.cu, table native/src/host/qwen4_ops.c)
-core/.../qwen4/Qwen4ExpertRouting   host planner: pairs by expert, each expert's items, the descriptor the kernels read
-core/.../qwen4/Qwen4ExpertOps       typed launches, record geometry, scratch layout
+core/.../model/qwen4/ExpertRouting host planner: pairs by expert, each expert's items, the descriptor the kernels read
+core/.../model/qwen4/ExpertOps     typed launches, record geometry, scratch layout
 ```
 
 ## Arithmetic
@@ -75,15 +75,15 @@ Limits: `hidden` and `inter` multiples of 128 (K of the two tensors), `inter` a 
 
 ## Planning and the descriptor
 
-`Qwen4ExpertRouting(experts, topK, maxRows)` preallocates everything; `plan(rows, topKIds, topKWeights)` (`[rows][topK]` row-major,
+`ExpertRouting(experts, topK, maxRows)` preallocates everything; `plan(rows, topKIds, topKWeights)` (`[rows][topK]` row-major,
 ids `int`, weights BF16 bits as `short`) groups the pairs by expert (stable: ascending row, then top-k position). The experts that
 received pairs are the chunk's *active* experts, in ascending id order; the `i`-th has its work items contiguous
 (`itemStart(i)`, `itemCount(i)`), and they name slot `i` of the descriptor's slot table. Neither `plan` nor `fill` allocates.
 
 `fill(hostDescriptor)` writes the descriptor except the slot addresses; the caller copies it to the device once. For each active
 expert, once the expert is held, the caller writes its record address with `setSlot(hostDescriptor, i, slotAddress)`, copies that
-entry to the device, and calls `Qwen4ExpertOps.runExpert(gpu, geometry, plan, i, descriptorDevice, x, scratch)`. After every expert
-ran, `Qwen4ExpertOps.combineExperts` adds the rows.
+entry to the device, and calls `ExpertOps.runExpert(gpu, geometry, plan, i, descriptorDevice, x, scratch)`. After every expert
+ran, `ExpertOps.combineExperts` adds the rows.
 
 The descriptor is one block, little-endian, 16-byte aligned sections (offsets from the planner's accessors):
 
@@ -103,7 +103,7 @@ experts one after another; an item is `(slot, first, count)` into it.
 - **Alignment.** Every device address the kernels read or write (descriptor sections, `x`, `out`, scratch) is 16-byte aligned; the
   expert slots are 4096-aligned (cache slots are) and both record offsets are multiples of 256. `x` and `out` are `[rows][hidden]`
   BF16, rows contiguous, `rows <= maxRows`.
-- **Scratch.** `Qwen4ExpertRouting.scratchBytes(rows * topK)` bytes of device memory: `act` `[pairs][640]` at offset 0, then
+- **Scratch.** `ExpertRouting.scratchBytes(rows * topK)` bytes of device memory: `act` `[pairs][640]` at offset 0, then
   `weighted` `[pairs][2560]` at the next 16-byte boundary after `act`, where `pairs` is the chunk's pair count (6,400 bytes per
   pair: 64 KB for a decode token, 32.8 MB for the 5,120 pairs of a 512-row chunk). Every expert writes its own pairs' rows, so
   experts may run side by side on different streams.
@@ -118,13 +118,13 @@ experts one after another; an item is `(slot, first, count)` into it.
 
 - `native/tests/test_qwen4_experts.py` (numpy venv): both projections against float64 over the exactly expanded weights, bit equality
   of a pair across work items of 16, 8, 5, 3 and 1 pairs and in reverse order, and the combine order and `zeroFirst`.
-- `Qwen4ExpertRoutingTest` (CPU): every pair appears once, in its expert's contiguous items that name the expert's slot, each
+- `ExpertRoutingTest` (CPU): every pair appears once, in its expert's contiguous items that name the expert's slot, each
   row's addition list ascends in expert id, padding ids and repeated experts.
-- `Qwen4ExpertCudaIntegrationTest` (synthetic NVFP4 experts): `act` and `weighted` of every pair against a CPU reference written from
+- `ExpertCudaIntegrationTest` (synthetic NVFP4 experts): `act` and `weighted` of every pair against a CPU reference written from
   upstream; the routed sum equals, bit for bit, the BF16 chain over the kernels' own `weighted` values; results are **bit-identical**
   for a 70-row chunk whichever order the experts run in and through 1 to 12 slots, in chunks of 7 and 1 rows and in one piece; a
   512-row skewed chunk (up to 347 pairs per expert) is bit-identical in either order and agrees with the CPU on three rows.
-- `Qwen4ExpertFixtureCudaIntegrationTest`: real layer-0 experts, records read straight from the artifact into 16 device slots reused
+- `ExpertFixtureCudaIntegrationTest`: real layer-0 experts, records read straight from the artifact into 16 device slots reused
   from expert to expert, against the upstream fixtures `layer_moe` (`c0` 1 row, `c1` 8 rows, `c2` 64 rows). The upstream
   product is an FP32 matmul over exactly expanded weights, the kernels accumulate in FP32 in another order, so values agree to BF16
   rounding:

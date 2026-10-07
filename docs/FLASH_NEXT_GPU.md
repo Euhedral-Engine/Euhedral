@@ -46,7 +46,7 @@ The plan now pads each layer's shared down projection to 768 input columns on th
 scales: every product they add is exactly 0; 53 MiB, reserved by the residency planner), and a prefill's SwiGLU writes
 its activation in rows of 768 with zero padding (`euhedral_q4_swiglu_padded_bf16`), so the native kernels take it.
 Decode keeps the unpadded weights and kernels. On the exact route the padded projection is bit for bit the unpadded one;
-on the native route it is within 0.86% relative RMS of it (`Qwen4SharedDownPaddingCudaIntegrationTest`), and the MoE
+on the native route it is within 0.86% relative RMS of it (`SharedDownPaddingCudaIntegrationTest`), and the MoE
 fixtures' shared expert within 5e-5 to 1.5e-2 of upstream.
 
 | scenario | before | after |
@@ -63,7 +63,7 @@ down (10,240 to 320) and up (320 to 10,240) projections, two each per layer, at 
 (about 7.5 and 4.5 TFLOPS on FP32 FMAs). `euhedral_q4_linear_tc_*` run them on m16n8k16 tensor cores (dflash's scheme:
 K split in four for outputs up to 1536 wide, chosen by the shape alone; one or four row tiles of 16 per weight load,
 which never change a row's bits). Their results differ from the FP32 kernel's in summation order only: 4e-6 to 8e-5
-relative RMS on the model's shapes (`Qwen4LinearTensorCoreCudaIntegrationTest`).
+relative RMS on the model's shapes (`LinearTensorCoreCudaIntegrationTest`).
 
 They run for 9 rows and more. At one row an MMA uses one of its 16 rows, and the FP32 kernel is faster on most decode
 shapes (profiled per launch: hyper-connection down 19.1 against 29.0 us, router 6.0 against 7.4 us, output head 1.49
@@ -114,7 +114,7 @@ tokens/s: within noise.
 ## Device memory left for the system
 
 The plan filled the device: 84 MiB stayed free at the lowest point of a run. It now keeps 700 MiB for the rest of the
-system beside the runtime's 1 GiB (`Qwen4ResidencyPlanner.SYSTEM_RESERVE_BYTES`, `EUHEDRAL_GPU_SYSTEM_RESERVE_MIB`):
+system beside the runtime's 1 GiB (`ResidencyPlanner.SYSTEM_RESERVE_BYTES`, `EUHEDRAL_GPU_SYSTEM_RESERVE_MIB`):
 774 MiB stayed free at the lowest point. The expert cache has 3,102 slots instead of about 3,385; decode cold 64 / 4096
 23.0 / 22.7 tokens/s (23.6 / 23.6 before), warm 30.1 / 29.9 (30.0-30.5 / 29.9), prefill unchanged.
 

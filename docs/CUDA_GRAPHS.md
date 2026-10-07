@@ -3,7 +3,7 @@
 Decode, speculative verification (VERIFY) and MTP draft (DRAFT) quanta of at most 8 rows replay CUDA graphs captured from earlier
 quanta with the same shape. A replayed quantum costs one graph launch on its home lane instead of one host submission per launch
 (about 1260 launches for a 3-row Q3 verification, 26 for a one-row draft). `EUHEDRAL_CUDA_GRAPHS=0` turns capture off; every
-quantum then submits stage by stage. Sources: `StageGraph` (record and replay), `QwenExecutionContext.captureKey`,
+quantum then submits stage by stage. Sources: `StageGraph` (record and replay), `Quantum.captureKey`,
 `native/src/host/submission.c`. Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session
 running.
 

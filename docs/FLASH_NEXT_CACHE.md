@@ -1,7 +1,7 @@
 # Flash-Next expert cache policy
 
 Which records the device cache and the RAM tier keep. The engine's demand is recorded once
-(`Qwen4DemandRecordingCudaIntegrationTest`, `EUHEDRAL_QWEN4_TRACE=FILE`) and replayed offline through policies
+(`DemandRecordingCudaIntegrationTest`, `EUHEDRAL_QWEN4_TRACE=FILE`) and replayed offline through policies
 (`tools/expert_cache_sim.py`), so a policy is judged in seconds on the same demand.
 
 ## The recording

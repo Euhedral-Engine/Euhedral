@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replays a recording of the expert cache's demand through cache policies.
 
-The recording comes from `Qwen4DemandRecordingCudaIntegrationTest` (`EUHEDRAL_QWEN4_TRACE=FILE`). Each block of
+The recording comes from `model.qwen4.DemandRecordingCudaIntegrationTest` (`EUHEDRAL_QWEN4_TRACE=FILE`). Each block of
 a layer asks for its distinct experts at once; the replay asks a device level for each, then on a device miss a
 RAM tier, then the disk. The experts of the block being served cannot be evicted while it is served (they are
 leased). Both levels hold whole records and keep their own contents (a device eviction does not evict from the

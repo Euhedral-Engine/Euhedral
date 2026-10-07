@@ -4,7 +4,7 @@ import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import java.util.Arrays;
 
 /// Raw boundaries for one `generate` call. `entry`/`returned` are taken immediately around
-/// `QwenGenerationSession.generate`; everything else comes from the session timing hook.
+/// `GenerationSession.generateAsync`; everything else comes from the session timing hook.
 /// Arrays are preallocated so recording does not allocate for typical runs.
 public final class IterationTiming implements GenerationTimingListener {
     boolean entered;
@@ -46,12 +46,12 @@ public final class IterationTiming implements GenerationTimingListener {
         this.decodeSampled = new boolean[decode];
     }
 
-    /// Marks the instant immediately before `QwenGenerationSession.generate` is called.
+    /// Marks the instant immediately before `GenerationSession.generateAsync` is called.
     public void markEntry() {
         markEntry(System.nanoTime());
     }
 
-    /// Marks the instant immediately after `QwenGenerationSession.generate` returns.
+    /// Marks the instant immediately after `GenerationSession.generateAsync` returns.
     public void markReturn() {
         markReturn(System.nanoTime());
     }

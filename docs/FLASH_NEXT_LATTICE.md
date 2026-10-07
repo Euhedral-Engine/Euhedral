@@ -34,11 +34,11 @@ embed ────────────────────────�
 
 | Piece | Role |
 | --- | --- |
-| `Qwen4ExecutionPlan` | The model-level resources the stages read (weights, the layers' operators, the expert cache) and the entry point (`start`). It builds `Qwen4Shape`s, one per row capacity (a decode token, a short chunk, a full chunk) and diagnostic variant, and serves one quantum at a time through a completion chain. |
-| `Qwen4Shape` | A `GraphShape`: the static topology, the frame of each stage, and the storage a graph of the shape owns. |
-| `Qwen4Stages` | The stage frames. Each is a `StageFrame` (the dense model's execution stage), submitting its device work to the lane it was given or doing host work. |
-| `Qwen4GraphStorage` | The device workspace of one row capacity and the MoE block resources (`Qwen4MoeLayer`); the graphs of a capacity take turns on it through leases. |
-| `Qwen4Quantum` | A `StageQuantum`: what the stages read, whether the step stopped, and the terminal work after retirement (commit the sequence, close leases a stopped block still holds, report to the listener). |
+| `ExecutionPlan` | The model-level resources the stages read (weights, the layers' operators, the expert cache) and the entry point (`start`). It builds `Shape`s, one per row capacity (a decode token, a short chunk, a full chunk) and diagnostic variant, and serves one quantum at a time through a completion chain. |
+| `Shape` | A `GraphShape`: the static topology, the frame of each stage, and the storage a graph of the shape owns. |
+| `Stages` | The stage frames. Each is a `StageFrame` (the dense model's execution stage), submitting its device work to the lane it was given or doing host work. |
+| `Workspace` | The device workspace of one row capacity and the MoE block resources (`MoeLayer`); the graphs of a capacity take turns on it through leases. |
+| `Quantum` | A `StageQuantum`: what the stages read, whether the step stopped, and the terminal work after retirement (commit the sequence, close leases a stopped block still holds, report to the listener). |
 | `EuhedralInferenceRuntime` | Unchanged lifecycle: admits a quantum to an idle graph of its shape (building one when none is idle), publishes its roots, recycles the graph at retirement. `Qwen4Runtime` uses it with no dense plan. |
 | `ExpertCache` / `ExpertCacheShard` | The slab, the markers, the host store and the transfer; the directory, the slots' states and the recency. No lock, no wait. |
 | `ExpertCacheOwner` | The owner of the cache's bookkeeping (and the host tier's): the frames that change it carry its routing hash, so the lattice runs them in order, one at a time. |
@@ -130,7 +130,7 @@ tests and measurement; production uses the plain shape.
 
 ## Tests
 
-`Qwen4LatticeHostTest` (real lattice): host work is frames on an attached source; independent work uses several workers; parked
+`LatticeHostTest` (real lattice): host work is frames on an attached source; independent work uses several workers; parked
 continuations occupy no worker; a driver-callback publication runs on a worker; close drains chains and detaches.
 `StageGraphHostStageTest`: host stages, stages completed in place, and deferred stages (what each does to the edges, the lanes and the
 quantum's retirement). `InferenceLakeTest`: sinks attach once and lazily, frames route by hash, completion waits for every admitted
@@ -139,14 +139,14 @@ unevictable until the copy retired, least-recently-used eviction, fences order a
 `ExpertCacheOwnerTest`: a hit publishes nothing, a miss is a copy and the owner's submit and retire, a read in parts fans out from
 its first part and joins into the submit, loads in flight together each have a staging buffer and the store pins more when it runs
 out, a fetch that finds every slot pinned changes nothing and succeeds once a release ran, a closed lease reaches the cache only
-through the owner's release frame, failures return the slot and the buffer. `Qwen4ExpertRoutingTest`: each expert's items are
-contiguous and every row adds its pairs in ascending expert order. `Qwen4ExpertCudaIntegrationTest`: the result is the same bits
+through the owner's release frame, failures return the slot and the buffer. `ExpertRoutingTest`: each expert's items are
+contiguous and every row adds its pairs in ascending expert order. `ExpertCudaIntegrationTest`: the result is the same bits
 whatever order the experts run in and however few slots hold them. `FileExpertStoreTest`, `GpuExpertTransferTest`: staging buffers, and one copy stream taking the copies of
 many buffers from many threads. The architecture test also guards that the expert path holds no lock, starts no thread, and has no
 source or sink of its own, queue of work, admission, waves, lane, or lock around the owner's state.
-`Qwen4ArchitectureTest`: a source guard against private executors, pools, virtual threads, async `CompletableFuture` forms and
+`ArchitectureTest`: a source guard against private executors, pools, virtual threads, async `CompletableFuture` forms and
 blocking waits in the execution path, and that a step is the shape of a graph (no executor or step machine).
 `Qwen4EngineCudaIntegrationTest`: one lattice worker generates the reference continuation; host work progresses during a generation;
 cancelling in the middle of a prefill leaves no lease, pin or step; closing leaves nothing attached.
-`Qwen4ModelFixtureCudaIntegrationTest` and `Qwen4GreedyAgreementCudaIntegrationTest` run the shape against the reference layer by layer
+`ModelFixtureCudaIntegrationTest` and `GreedyAgreementCudaIntegrationTest` run the shape against the reference layer by layer
 and token by token.

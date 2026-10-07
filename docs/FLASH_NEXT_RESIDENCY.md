@@ -6,14 +6,14 @@ routed-expert cache is, how experts reach it. No setting exposes the cache size,
 stores.
 
 ```
-artifact -> Qwen4ArtifactReader / Qwen4Validator -> Qwen4ResidencyPlanner -> Qwen4Model
+artifact -> ArtifactReader / Validator -> ResidencyPlanner -> Qwen4Model
                                                       |                         |
                                                       |                         +- fixed objects (device / staged / mapped)
                                                       |                         +- NgramStore (host)
                                                       +- expert cache budget -> +- ExpertCache <- HostExpertStore <- artifact file
 ```
 
-`Qwen4Storage.load(InferenceConfig)` runs this from the engine's own configuration (artifact path, maximum context);
+`Storage.load(InferenceConfig)` runs this from the engine's own configuration (artifact path, maximum context);
 `InferenceEngine.load` does it for a `qwen4_exp` artifact and runs the model over the result
 ([FLASH_NEXT_EXECUTION.md](FLASH_NEXT_EXECUTION.md)).
 
@@ -32,7 +32,7 @@ Fixed objects keep the dense engine's `TensorHandle` (device address, host addre
 
 ## Fixed-memory planner
 
-`Qwen4ResidencyPlanner` is the fixed-memory half. It keeps no replacement state.
+`ResidencyPlanner` is the fixed-memory half. It keeps no replacement state.
 
 ```
 free device memory
@@ -44,7 +44,7 @@ free device memory
   = expert cache, in whole slots (never more than one slot per expert)
 ```
 
-Sequence state comes from the configuration (`Qwen4SequenceState`): KV is NVFP4 pages of 256 tokens, 576 bytes per token in each
+Sequence state comes from the configuration (`SequenceState`): KV is NVFP4 pages of 256 tokens, 576 bytes per token in each
 of the 12 sparse-attention layers (1.69 GiB at 262,144 tokens); the indexer keeps one BF16 key of 128 values per 4 tokens per
 layer (192 MiB at 262,144); GDN keeps 110 MiB regardless of length. The workspace is sized from the topology (hyper-connection
 streams, the widest mixer's intermediates, router and selected-expert activations per token of every workspace the execution
@@ -56,9 +56,9 @@ A prefill chunk reads most of the experts of every layer once, whatever its leng
 its tokens and a longer chunk serves a prompt better. The planner therefore chooses the length of the full chunk as well: the
 largest power of two from 512 to 4096, no longer than the context needs (`chunk / 2 < context`), whose extra workspace over a
 512-token chunk is at most a tenth of the memory the expert cache would have had. The chunk the plan chose is
-`Qwen4ResidencyPlan.prefillChunkTokens`; the execution plan's full workspace has that many rows, a session cuts a prompt into
+`ResidencyPlan.prefillChunkTokens`; the execution plan's full workspace has that many rows, a session cuts a prompt into
 chunks of that size, and the report prints it. A decode token and a short chunk have workspaces of their own and take nothing from
-it. `Qwen4ChunkSizeCudaIntegrationTest` runs one prompt in chunks of 512, of 333 and in one chunk, and requires the same greedy
+it. `ChunkSizeCudaIntegrationTest` runs one prompt in chunks of 512, of 333 and in one chunk, and requires the same greedy
 continuation.
 
 Context has priority. A longer context takes memory from the expert cache first. Only when the cache would fall below its
@@ -128,7 +128,7 @@ never copied to the device whole. Execution gathers the rows as 96-byte records 
 
 ### Placement matrix
 
-Expert slots by free device memory and maximum context, planned at the real object sizes (`Qwen4ResidencyPlannerTest`, text mode,
+Expert slots by free device memory and maximum context, planned at the real object sizes (`ResidencyPlannerTest`, text mode,
 host with 48 GiB available); `(+N)` is the MiB of fixed objects moved to the host to make room for the minimum cache of 20 slots.
 Fixed objects that stay resident take 4,190 MiB; the cache holds at most one slot (2.64 MiB) per expert, 24,576.
 
@@ -151,7 +151,7 @@ of objects that never move, the staging ring and 20 slots (3 GiB serves 131,072 
 
 ### The GPU of this machine
 
-RTX 5070 Ti, 15,030 MiB free after the CUDA context, host with 48 GiB available (`Qwen4StorageCudaIntegrationTest`, the real
+RTX 5070 Ti, 15,030 MiB free after the CUDA context, host with 48 GiB available (`StorageCudaIntegrationTest`, the real
 artifact):
 
 | maximum context | KV | indexer | context and reserve | fixed resident | expert cache | slots |
@@ -169,7 +169,7 @@ runs a cache of the minimum 20 slots.
 
 ### Expert transfers
 
-On a real stream (`Qwen4ExpertCacheCudaIntegrationTest`: 6 banks of 64 experts, 8 slots, records of 2.7 MB): every record read back from the
+On a real stream (`ExpertCacheCudaIntegrationTest`: 6 banks of 64 experts, 8 slots, records of 2.7 MB): every record read back from the
 device equals the file's bytes and CRC-32; 369 file-backed misses moved 1.00 GB at 8.7 GB/s and 373 arena-backed misses 1.02 GB at 9.3 GB/s,
 measured as bytes over the summed start-to-completion times of single 2.7 MB copies, so each includes the retirement latency of its own
 event. Against the real artifact on the load test above, 1,820 misses (5.04 GB) took 0.27 to 0.33 s of summed transfer time, 15 to 18 GB/s.

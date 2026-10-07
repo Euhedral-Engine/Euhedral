@@ -155,7 +155,7 @@ device ring of `ResidencyPlanner.STAGING_SLOTS` = 4 slots on every use.
   preparation awaits a marker recorded after the holder's lanes joined.
 - **Prefetch:** a DFlash2 block, which leaves the transfer lane idle for its few milliseconds, also copies the decode view's
   first `STAGING_SLOTS` uses into slots 0 .. 3. A decode or verification quantum that is admitted while the ring holds them runs
-  the decode view without those transfers (`QwenExecutionPlan.preloadedVariant`); the runtime marks the ring loaded, under its
+  the decode view without those transfers (`ExecutionPlan.preloadedVariant`); the runtime marks the ring loaded, under its
   hold, only when every stage of the prefetching quantum ran, and any other staging quantum clears the mark
   ([DFLASH2.md](DFLASH2.md)).
 
@@ -183,7 +183,7 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
 ## Where it lives
 
 - `tools/convert_checkpoint.py --quantization nvfp4`: the NVFP4 artifacts, quantized on the GPU by default (`tools/README.md`).
-- Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory, and `QwenNvfp4CudaLoadIntegrationTest`.
+- Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory, and `Nvfp4CudaLoadIntegrationTest`.
 - Execution: `native/src/nvfp4` (tensor-core decode, 1 to 8 rows) and `native/src/nvfp4_native` ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)),
   `euhedral_cuda_linear_nvfp4_bf16`, `euhedral_cuda_linear_nvfp4_native_bf16` and
   `euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16`, plan and frame dispatch for NVFP4 weights.
