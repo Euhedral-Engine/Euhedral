@@ -61,11 +61,12 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// What the graphs publish through: the lake, with this runtime's quanta counted.
     private final QuantumLake quanta = new QuantumLake();
     private volatile boolean closed;
-    /// Device lanes shared by every graph, opened with the first graph.
-    private LanePool lanes;
+    /// Device lanes shared by every graph, opened with the first graph. Volatile so the transfer marker, written
+    /// before it, is read without a lock.
+    private volatile LanePool lanes;
     private final Object laneLock = new Object();
     private final Lanes lanesConfig;
-    /// A marker on the transfer lane, opened on first use and closed with the lanes.
+    /// A marker on the transfer lane, opened with the lanes and closed with them.
     private long transferMarker;
 
     /// Lanes in the shared pool: one per available processor, at most [LanePool#MAX_LANES].
@@ -87,15 +88,12 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// A marker on the transfer lane, for an owner that orders the transfers of successive quanta (a weight staging
-    /// ring). Opened once, on the first call; the runtime closes it with its lanes.
+    /// ring). It opens and closes with the lanes. Once they are open this is a plain read: every staging quantum
+    /// orders on it at admission and again at retirement.
     public long transferMarker() {
-        LanePool pool = lanes();
         if (!this.lanesConfig.transferLane()) throw new IllegalStateException("this runtime has no transfer lane");
-        synchronized (this.laneLock) {
-            if (this.transferMarker == 0)
-                this.transferMarker = pool.lane(pool.transferLane()).openMarker();
-            return this.transferMarker;
-        }
+        if (this.lanes == null) lanes();
+        return this.transferMarker;
     }
 
     /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime
@@ -113,6 +111,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 for (int lane = 0; lane < streams.length; lane++) streams[lane] = this.gpu.openStream();
                 if (transfers) {
                     pool = LanePool.withTransferLane(java.util.Arrays.copyOf(streams, compute), streams[compute]);
+                    this.transferMarker = streams[compute].openMarker();
                 } else pool = new LanePool(streams);
             } catch (RuntimeException | Error failure) {
                 for (GpuStream stream : streams) {
@@ -131,6 +130,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     return pool;
                 }
             }
+            if (transfers) streams[compute].closeMarker(this.transferMarker);
             pool.close();
             throw new IllegalStateException("inference runtime is closed");
         }
