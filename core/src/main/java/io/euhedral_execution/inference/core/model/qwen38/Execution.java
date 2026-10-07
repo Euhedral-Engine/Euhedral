@@ -59,7 +59,7 @@ public final class Execution implements AutoCloseable {
     /// A plan that stages weights gets one lane fewer for compute and a lane for its transfers.
     public Execution(
             LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount, boolean captureGraphs) {
-        this.plan = Objects.requireNonNull(plan, "plan").executionOwner();
+        this.plan = Objects.requireNonNull(plan, "plan");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
             throw new IllegalArgumentException("laneCount must be 1 to " + LanePool.MAX_LANES);
@@ -124,8 +124,8 @@ public final class Execution implements AutoCloseable {
     }
 
     private void accept(Quantum context, Consumer<? super Quantum> terminalConsumer, boolean refusalThrows) {
-        ExecutionPlan view = context.plan();
-        if (view.executionOwner() != this.plan) {
+        Shape view = context.shape();
+        if (context.plan() != this.plan) {
             throw new IllegalArgumentException("quantum belongs to another execution plan");
         }
         context.claim();

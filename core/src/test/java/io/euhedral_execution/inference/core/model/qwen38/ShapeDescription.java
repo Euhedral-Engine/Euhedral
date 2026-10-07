@@ -27,7 +27,7 @@ public final class ShapeDescription {
     public static String views(ExecutionPlan plan) {
         List<Object> seen = new ArrayList<>();
         StringBuilder text = new StringBuilder();
-        add(text, seen, "own", plan, plan);
+        add(text, seen, "own", plan, plan.shape());
         var decode = plan.forExecution(Quantum.ExecutionKind.DECODE, 1);
         add(text, seen, "decode", plan, decode);
         add(text, seen, "decode-preloaded", plan, decode.preloadedVariant());
@@ -40,8 +40,7 @@ public final class ShapeDescription {
         return text.toString();
     }
 
-    private static void add(
-            StringBuilder text, List<Object> seen, String name, ExecutionPlan owner, ExecutionPlan view) {
+    private static void add(StringBuilder text, List<Object> seen, String name, ExecutionPlan owner, Shape view) {
         for (Object earlier : seen) if (earlier == view) return;
         seen.add(view);
         text.append(describe(
@@ -141,6 +140,10 @@ public final class ShapeDescription {
             expected = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
         if (!expected.equals(actual)) {
+            // The whole description, for a diff against the golden.
+            Path written = Path.of("build/shapes", name + ".actual.txt");
+            Files.createDirectories(written.getParent());
+            Files.writeString(written, actual);
             String[] want = expected.split("\n"), got = actual.split("\n");
             int line = 0;
             while (line < Math.min(want.length, got.length) && want[line].equals(got[line])) line++;

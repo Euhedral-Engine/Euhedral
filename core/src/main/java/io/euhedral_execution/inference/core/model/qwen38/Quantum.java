@@ -59,6 +59,8 @@ public final class Quantum extends AbstractQuantum {
     }
 
     private final ExecutionPlan plan;
+    /// The view of `plan` this quantum runs.
+    private final Shape shape;
     private final Sequence sequence;
     private final ExecutionKind kind;
     private final LogitsRequirement logitsRequirement;
@@ -113,8 +115,8 @@ public final class Quantum extends AbstractQuantum {
             int[] tokenIds,
             LogitsRequirement logitsRequirement,
             HostLogits hostLogits) {
-        this.plan = Objects.requireNonNull(plan, "plan")
-                .forExecution(kind, Objects.requireNonNull(tokenIds, "tokenIds").length);
+        this.plan = Objects.requireNonNull(plan, "plan");
+        this.shape = plan.forExecution(kind, Objects.requireNonNull(tokenIds, "tokenIds").length);
         this.logitsRequirement = Objects.requireNonNull(logitsRequirement, "logitsRequirement");
         if (hostLogits != null) {
             if (logitsRequirement == LogitsRequirement.NONE)
@@ -136,8 +138,14 @@ public final class Quantum extends AbstractQuantum {
         this.tokenIds = tokenIds.clone();
     }
 
+    /// The plan whose weights this quantum runs.
     public ExecutionPlan plan() {
         return this.plan;
+    }
+
+    /// The view of [#plan] this quantum runs.
+    public Shape shape() {
+        return this.shape;
     }
 
     public Sequence sequenceState() {
@@ -315,7 +323,7 @@ public final class Quantum extends AbstractQuantum {
     public Object captureKey() {
         if (this.kind == ExecutionKind.PREFILL || this.tokenIds.length > MAX_CAPTURED_ROWS) return null;
         if (this.workspace == null || this.gpu == null || this.gpu.exactNumerics()) return null;
-        if (!this.plan.hasFirstLayer()) return null;
+        if (!this.shape.hasFirstLayer()) return null;
         if (!(this.sequence.kvCacheState() instanceof AttentionStates attention)
                 || !(this.sequence.recurrentState() instanceof GdnStates recurrent)) return null;
         // A DFlash2 quantum appends to no paged cache; its ring is fixed.
@@ -437,13 +445,13 @@ public final class Quantum extends AbstractQuantum {
                 throw claimFailure;
             }
             initializeSequenceState(gpu);
-            this.workspace = this.plan.hasFirstLayer()
-                    ? new Workspace(storage, this.tokenIds.length, this.plan, this.logitsRequirement)
+            this.workspace = this.shape.hasFirstLayer()
+                    ? new Workspace(storage, this.tokenIds.length, this.shape, this.logitsRequirement)
                     : new Workspace(
                             storage,
                             this.tokenIds.length,
                             this.plan.weights().config().hiddenSize(),
-                            this.plan.projectionWidths());
+                            this.shape.projectionWidths());
             this.workspace.allocateBuffers();
             uploadInput(gpu);
             return true;
@@ -473,14 +481,21 @@ public final class Quantum extends AbstractQuantum {
     }
 
     private void initializeSequenceState(ExecutionGpu gpu) {
-        attachSequenceState(this.plan, this.sequence, this.lease, gpu);
+        attachSequenceState(this.shape, this.sequence, this.lease, gpu);
     }
 
     /// Gives `sequence` the persistent state a first quantum allocates (GDN buffers and KV pages), or checks
     /// the state it already has. Runs under `lease`.
     public static void attachSequenceState(
             ExecutionPlan plan, Sequence sequence, Sequence.ExecutionLease lease, ExecutionGpu gpu) {
-        if (!plan.hasFirstLayer()) return;
+        attachSequenceState(plan.shape(), sequence, lease, gpu);
+    }
+
+    /// As [#attachSequenceState(ExecutionPlan, Sequence, Sequence.ExecutionLease, ExecutionGpu)] for the view
+    /// `shape`: a view without a first layer leaves the sequence's state alone.
+    static void attachSequenceState(Shape shape, Sequence sequence, Sequence.ExecutionLease lease, ExecutionGpu gpu) {
+        if (!shape.hasFirstLayer()) return;
+        ExecutionPlan plan = shape.plan();
         Object current = sequence.recurrentState();
         Object currentKv = sequence.kvCacheState();
         Qwen38Config config = plan.weights().config();

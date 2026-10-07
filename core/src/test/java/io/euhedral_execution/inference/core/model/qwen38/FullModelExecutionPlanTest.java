@@ -34,7 +34,7 @@ class FullModelExecutionPlanTest {
         ExecutionPlan plan = new ExecutionPlan(weights, staging);
         var decode = Quantum.ExecutionKind.DECODE;
         var prefill = Quantum.ExecutionKind.PREFILL;
-        for (ExecutionPlan view : java.util.List.of(
+        for (Shape view : java.util.List.of(
                 plan.forExecution(decode, 1),
                 plan.forExecution(prefill, 3),
                 plan.forExecution(prefill, 512),
