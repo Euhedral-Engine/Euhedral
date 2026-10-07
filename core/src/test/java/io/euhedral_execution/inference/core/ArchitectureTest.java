@@ -175,6 +175,53 @@ class ArchitectureTest {
         assertTrue(violations.isEmpty(), "a scheduler in the expert path:\n" + String.join("\n", violations));
     }
 
+    /// The packages of the core: shared layers and the model folders. The old split packages are gone.
+    private static final Set<String> LAYERS = Set.of(
+            "artifact",
+            "generation",
+            "gpu",
+            "guidance",
+            "model",
+            "prefix",
+            "runtime",
+            "sampling",
+            "state",
+            "tokenizer");
+
+    @Test
+    void everyClassLivesInALayerOrAModelFolder() throws IOException {
+        for (String gone : List.of("scheduling", "host", "model_loader", "qwen4"))
+            assertTrue(!Files.exists(MAIN.resolve(gone)), "an old package remains: " + gone);
+        try (Stream<Path> top = Files.list(MAIN)) {
+            List<String> unknown = top.filter(Files::isDirectory)
+                    .map(p -> p.getFileName().toString())
+                    .filter(name -> !LAYERS.contains(name))
+                    .toList();
+            assertTrue(unknown.isEmpty(), "packages outside the layout: " + unknown);
+        }
+    }
+
+    /// Only the types other packages see carry a model prefix; inside a model folder, classes are named by role.
+    private static final Set<String> PREFIXED = Set.of(
+            "QwenTokenizer",
+            "Qwen38Runtime",
+            "Qwen38Model",
+            "Qwen38Config",
+            "Qwen4Runtime",
+            "Qwen4Model",
+            "Qwen4Config");
+
+    @Test
+    void onlyEdgeTypesCarryAModelPrefix() throws IOException {
+        try (Stream<Path> walk = Files.walk(MAIN)) {
+            List<String> prefixed = walk.filter(p -> p.toString().endsWith(".java"))
+                    .map(p -> p.getFileName().toString().replace(".java", ""))
+                    .filter(name -> name.startsWith("Qwen") && !PREFIXED.contains(name))
+                    .toList();
+            assertTrue(prefixed.isEmpty(), "model-prefixed classes: " + prefixed);
+        }
+    }
+
     /// A source path relative to the main tree, with forward slashes on every platform.
     private static String relative(Path file) {
         return MAIN.relativize(file).toString().replace('\\', '/');
