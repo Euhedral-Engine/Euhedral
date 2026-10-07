@@ -88,6 +88,9 @@ class TokenIdentityCudaIntegrationTest {
     @MethodSource("artifacts")
     @Timeout(3600)
     void greedyTokensMatchTheRecordedBaseline(String name, String artifact, String tokenizer) throws Exception {
+        // `-Peuhedral.identity.artifacts=q3,flash-next` runs only those, so each artifact can load in its own JVM.
+        String only = System.getProperty("euhedral.identity.artifacts");
+        assumeTrue(only == null || List.of(only.split(",")).contains(name), "not selected: " + name);
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);
