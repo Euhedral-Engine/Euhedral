@@ -29,17 +29,11 @@ public final class EngineMetrics implements MeterBinder {
                 .tag("model", this.modelId)
                 .tag(
                         "artifact",
-                        engine.profile() == null ? "unknown" : engine.profile().artifactName())
-                .tag(
-                        "speculation",
-                        engine.profile() == null
-                                ? "none"
-                                : engine.profile().speculation().name().toLowerCase(java.util.Locale.ROOT))
-                .tag(
-                        "speculative_depth",
-                        engine.profile() == null
-                                ? "0"
-                                : Integer.toString(engine.profile().speculativeDepth()))
+                        engine.description().artifactName() == null
+                                ? "unknown"
+                                : engine.description().artifactName())
+                .tag("speculation", engine.description().speculation())
+                .tag("speculative_depth", Integer.toString(engine.description().speculativeDepth()))
                 .register(registry);
         Gauge.builder("euhedral.engine.context.tokens", () -> this.contextTokens)
                 .description("Longest prompt plus completion a request may use")

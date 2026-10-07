@@ -2,9 +2,6 @@ package io.euhedral_execution.inference.core;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
-import io.euhedral_execution.inference.core.model.qwen38.LayerType;
-import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -48,7 +45,7 @@ public record InferenceRunSnapshot(
     }
 
     /// The inputs the engine was loaded with and the policy it derived from the artifact.
-    /// `artifact` is [ArtifactProfile#artifactName()], null when no artifact was profiled.
+    /// `artifact` is [ModelDescription#artifactName()], null when no artifact was profiled.
     /// `prefixCacheBytes` is the pinned host memory configured for the prefix cache (0 when off). `speculation` is
     /// the speculative strategy the artifact selects (`none`, `mtp`, `dflash2`), drafting `speculativeDepth` tokens
     /// per verification.
@@ -72,14 +69,15 @@ public record InferenceRunSnapshot(
             this(workerProcessorIds, maxContextTokens, artifact, speculativeDepth, prefixCacheBytes, "none");
         }
 
-        public static Configuration of(InferenceConfig config, ArtifactProfile profile) {
+        public static Configuration of(InferenceConfig config, ModelDescription description) {
+            ModelDescription model = description == null ? ModelDescription.NONE : description;
             return new Configuration(
                     ids(config.workerCpus()),
                     config.maxContextTokens(),
-                    profile == null ? null : profile.artifactName(),
-                    profile == null ? 0 : profile.speculativeDepth(),
+                    model.artifactName(),
+                    model.speculativeDepth(),
                     config.prefixCacheBytes(),
-                    profile == null ? "none" : profile.speculation().name().toLowerCase(java.util.Locale.ROOT));
+                    model.speculation());
         }
     }
 
@@ -92,7 +90,7 @@ public record InferenceRunSnapshot(
         }
     }
 
-    /// Scalar projection of [Qwen38Config]; layer kinds are counted rather than copying its array.
+    /// Scalar projection of a model's configuration; layer kinds are counted rather than copying its array.
     public record Dimensions(
             int vocabSize,
             int hiddenSize,
@@ -107,34 +105,7 @@ public record InferenceRunSnapshot(
             int linearNumValueHeads,
             int linearKeyHeadDim,
             int linearValueHeadDim,
-            int maxPositionEmbeddings) {
-        public static Dimensions of(Qwen38Config config) {
-            int attention = 0;
-            int gdn = 0;
-            LayerType[] layers = config.layerTypes();
-            if (layers != null) {
-                for (LayerType layer : layers) {
-                    if (layer == LayerType.FULL_ATTENTION) attention++;
-                    else if (layer == LayerType.GATED_DELTA_NET) gdn++;
-                }
-            }
-            return new Dimensions(
-                    config.vocabSize(),
-                    config.hiddenSize(),
-                    config.numHiddenLayers(),
-                    attention,
-                    gdn,
-                    config.numAttentionHeads(),
-                    config.numKeyValueHeads(),
-                    config.attentionHeadDim(),
-                    config.intermediateSize(),
-                    config.linearNumKeyHeads(),
-                    config.linearNumValueHeads(),
-                    config.linearKeyHeadDim(),
-                    config.linearValueHeadDim(),
-                    config.maxPositionEmbeddings());
-        }
-    }
+            int maxPositionEmbeddings) {}
 
     /// `nativeRuntimeVersion` is [#UNAVAILABLE] because the CUDA library exposes no version query.
     public record RuntimeIdentity(

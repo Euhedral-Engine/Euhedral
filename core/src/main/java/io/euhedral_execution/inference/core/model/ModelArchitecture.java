@@ -21,6 +21,22 @@ public enum ModelArchitecture {
     /// embeddings (EDRL version 3).
     QWEN4_EXP;
 
+    /// The longest sequence the model in the artifact at `path` was trained for, read from its header and
+    /// configuration without loading it.
+    public static int maxPositionEmbeddings(Path path) throws IOException {
+        return switch (detect(path)) {
+            case QWEN38_DENSE ->
+                io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader.read(path)
+                        .config()
+                        .maxPositionEmbeddings();
+            case QWEN4_EXP ->
+                io.euhedral_execution.inference.core.model.qwen4.loader.ArtifactReader.read(path)
+                        .config()
+                        .text()
+                        .maxPositionEmbeddings();
+        };
+    }
+
     /// Reads the architecture from the first bytes of the artifact.
     public static ModelArchitecture detect(Path path) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {

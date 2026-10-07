@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
 import java.util.List;
@@ -27,7 +28,7 @@ class InferenceRunSnapshotTest {
                         List.of(0, 1, 8, 9), 32768, "q3-compressed", 2, 4294967296L, "mtp"),
                 List.of(0, 1),
                 new InferenceRunSnapshot.Model(
-                        "/models/model.edrl", 12859040768L, 2, InferenceRunSnapshot.Dimensions.of(config(layers))),
+                        "/models/model.edrl", 12859040768L, 2, Qwen38Runtime.dimensions(config(layers))),
                 generation,
                 new InferenceRunSnapshot.RuntimeIdentity(
                         "25.0.2+10",
@@ -72,7 +73,7 @@ class InferenceRunSnapshotTest {
     @Test
     void projectsQwenConfigWithoutRetainingItsMutableLayerArray() {
         LayerType[] layers = {LayerType.FULL_ATTENTION, LayerType.GATED_DELTA_NET};
-        var dimensions = InferenceRunSnapshot.Dimensions.of(config(layers));
+        var dimensions = Qwen38Runtime.dimensions(config(layers));
         layers[1] = LayerType.FULL_ATTENTION;
         assertEquals(1, dimensions.fullAttentionLayers());
         assertEquals(1, dimensions.gatedDeltaNetLayers());

@@ -2,15 +2,22 @@ package io.euhedral_execution.inference.core.model.qwen4;
 
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.InferenceRunSnapshot;
+import io.euhedral_execution.inference.core.ModelDescription;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
+import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.ModelRuntime;
+import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -26,7 +33,7 @@ import java.util.function.Supplier;
 /// Two attachments, so that unrelated work stays independent: `execution` carries the expert
 /// pipeline and the generation chain (everything that serves the GPU), `host` carries the work
 /// around a request (tokenizing, rendering).
-public final class Qwen4Runtime implements AutoCloseable {
+public final class Qwen4Runtime implements ModelRuntime {
 
     /// Device lanes the stages of a step spread over: the critical chain, the shared expert's side
     /// branch and the experts. `EUHEDRAL_QWEN4_LANES` overrides it for benchmarks.
@@ -38,6 +45,8 @@ public final class Qwen4Runtime implements AutoCloseable {
     private final InferenceLake lake;
     private final HostTasks execution;
     private final HostTasks host;
+    private final QwenTokenizer tokenizer;
+    private final InferenceRunSnapshot.Model identity;
     private boolean closed;
 
     private Qwen4Runtime(
@@ -46,18 +55,23 @@ public final class Qwen4Runtime implements AutoCloseable {
             ExecutionPlan plan,
             InferenceLake lake,
             HostTasks execution,
-            HostTasks host) {
+            HostTasks host,
+            QwenTokenizer tokenizer,
+            InferenceRunSnapshot.Model identity) {
         this.lake = lake;
         this.storage = storage;
         this.runtime = runtime;
         this.plan = plan;
         this.execution = execution;
         this.host = host;
+        this.tokenizer = tokenizer;
+        this.identity = identity;
     }
 
     /// Loads the `qwen4_exp` artifact of `config` as a text model whose host work runs on
     /// `lattice`, which must be started and outlive the runtime.
-    public static Qwen4Runtime load(InferenceConfig config, LatticeTerminal lattice) throws IOException {
+    public static Qwen4Runtime load(InferenceConfig config, QwenTokenizer tokenizer, LatticeTerminal lattice)
+            throws IOException {
         InferenceLake lake = EuhedralInferenceRuntime.newLake(lattice);
         HostTasks execution = new HostTasks(lake);
         HostTasks host = new HostTasks(lake);
@@ -66,7 +80,9 @@ public final class Qwen4Runtime implements AutoCloseable {
         try {
             runtime = new EuhedralInferenceRuntime(lake, storage.gpu(), EuhedralInferenceRuntime.Lanes.of(LANES));
             ExecutionPlan plan = new ExecutionPlan(storage.gpu(), storage.model(), config.maxContextTokens(), runtime);
-            return new Qwen4Runtime(storage, runtime, plan, lake, execution, host);
+            var identity =
+                    identity(config.artifactPath(), storage.model().artifact().config());
+            return new Qwen4Runtime(storage, runtime, plan, lake, execution, host, tokenizer, identity);
         } catch (Throwable failure) {
             try {
                 if (runtime != null) runtime.close();
@@ -89,6 +105,35 @@ public final class Qwen4Runtime implements AutoCloseable {
         }
     }
 
+    private static InferenceRunSnapshot.Model identity(Path path, Qwen4Config config) {
+        Long bytes;
+        try {
+            bytes = Files.size(path);
+        } catch (IOException | SecurityException unreadable) {
+            bytes = null;
+        }
+        return new InferenceRunSnapshot.Model(
+                path.toString(),
+                bytes,
+                3,
+                new InferenceRunSnapshot.Dimensions(
+                        config.text().vocabSize(),
+                        config.text().hiddenSize(),
+                        config.text().numLayers(),
+                        config.sparseAttentionLayers(),
+                        config.gdnLayers(),
+                        config.attention().numHeads(),
+                        config.attention().numKvHeads(),
+                        config.attention().headDim(),
+                        config.moe().intermediateSize(),
+                        config.gdn().numKeyHeads(),
+                        config.gdn().numValueHeads(),
+                        config.gdn().keyHeadDim(),
+                        config.gdn().valueHeadDim(),
+                        config.text().maxPositionEmbeddings()));
+    }
+
+    @Override
     public ExecutionGpu gpu() {
         return this.storage.gpu();
     }
@@ -122,18 +167,64 @@ public final class Qwen4Runtime implements AutoCloseable {
     }
 
     /// Prompt tokens per prefill step: the most the plan's workspace holds.
+    @Override
     public int prefillChunkTokens() {
         return this.plan.maxRows();
     }
 
-    public Session createSession(
-            QwenTokenizer tokenizer,
-            GenerationConfig config,
-            int prefillChunkTokens,
-            Consumer<GenerationSession> release) {
-        return new Session(tokenizer, this.plan, this.execution, gpu(), config, prefillChunkTokens, release::accept);
+    /// A session over the model; `options` change nothing, as the model has no drafter.
+    @Override
+    public Session createSession(GenerationConfig config, SessionOptions options, Consumer<GenerationSession> release) {
+        return new Session(
+                this.tokenizer, this.plan, this.execution, gpu(), config, prefillChunkTokens(), release::accept);
     }
 
+    @Override
+    public CompletableFuture<int[]> tokenizePrompt(String prompt) {
+        return this.host.onWorker(() -> this.tokenizer.encodeWithModelSpecialTokens(prompt));
+    }
+
+    @Override
+    public int vocabularySize() {
+        return config().text().vocabSize();
+    }
+
+    @Override
+    public int maxPositionEmbeddings() {
+        return config().text().maxPositionEmbeddings();
+    }
+
+    @Override
+    public ModelDescription description() {
+        return ModelDescription.NONE;
+    }
+
+    @Override
+    public InferenceRunSnapshot.Model identity() {
+        return this.identity;
+    }
+
+    @Override
+    public long hostBackedWeightBytes() {
+        return this.storage.model().telemetry().fixedHostBackedBytes();
+    }
+
+    /// The expert path's workspaces belong to the plan; the engine reports only the GPU's scratch for this model.
+    @Override
+    public long retainedWorkspaceBytes() {
+        return 0;
+    }
+
+    @Override
+    public PrefixCacheStats prefixCacheStats() {
+        return null;
+    }
+
+    /// Nothing is left to release: [#stop] closed the storage, with its GPU.
+    @Override
+    public void close() {}
+
+    @Override
     public <T> CompletableFuture<T> onWorker(Supplier<T> work) {
         return this.host.onWorker(work);
     }
@@ -146,7 +237,7 @@ public final class Qwen4Runtime implements AutoCloseable {
     /// runs their completions), then drains and detaches the host work. The owner has stopped
     /// admission and ended every generation before calling.
     @Override
-    public synchronized void close() {
+    public synchronized void stop() {
         if (this.closed) return;
         this.closed = true;
         RuntimeException failure = null;

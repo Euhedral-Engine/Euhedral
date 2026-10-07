@@ -8,6 +8,7 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
@@ -78,7 +79,7 @@ class PrefixCacheCudaIntegrationTest {
             return SequenceStateProbe.committedDigests(
                     gpu,
                     EngineExecutionFixture.sequence(session),
-                    engine.modelConfig().layerTypes());
+                    ((Qwen38Runtime) engine.modelRuntime()).config().layerTypes());
         }
     }
 
@@ -180,8 +181,7 @@ class PrefixCacheCudaIntegrationTest {
         List<Integer> restored;
         try (InferenceEngine engine =
                 InferenceEngine.load(config(property, artifact, CACHE_BYTES), new RecordingBootstrap())) {
-            assumeTrue(
-                    engine.profile() != null && engine.profile().speculative(), "needs an artifact with the MTP layer");
+            assumeTrue(engine.description().speculative(), "needs an artifact with the MTP layer");
             // Greedy and unconstrained: the engine drafts with MTP. The cold run stores MTP checkpoints at 2048,
             // 4096 and 4608; the warm run restores 4608, re-pairs its last MTP row and prefills the rest.
             int[] prompt = prompt(engine, "Kilo", 5000);
@@ -213,8 +213,7 @@ class PrefixCacheCudaIntegrationTest {
                         "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl",
                         CACHE_BYTES),
                 bootstrap)) {
-            assumeTrue(
-                    engine.profile() != null && engine.profile().speculative(), "needs an artifact with the MTP layer");
+            assumeTrue(engine.description().speculative(), "needs an artifact with the MTP layer");
             int[] prompt = prompt(engine, "Lima", 5000);
             List<String> cold = mtpAndBaseDigests(engine, bootstrap.gpu, prompt);
             List<String> warm = mtpAndBaseDigests(engine, bootstrap.gpu, prompt);
@@ -240,9 +239,14 @@ class PrefixCacheCudaIntegrationTest {
             session.generate(prompt, 1, text -> {}, null);
             var sequence = EngineExecutionFixture.sequence(session);
             List<String> digests = new ArrayList<>(SequenceStateProbe.committedDigests(
-                    gpu, sequence, engine.modelConfig().layerTypes()));
+                    gpu,
+                    sequence,
+                    ((Qwen38Runtime) engine.modelRuntime()).config().layerTypes()));
             List<String> mtp = SequenceStateProbe.mtpDigests(
-                    gpu, sequence, engine.modelConfig().layerTypes(), prompt.length);
+                    gpu,
+                    sequence,
+                    ((Qwen38Runtime) engine.modelRuntime()).config().layerTypes(),
+                    prompt.length);
             assertTrue(!mtp.isEmpty(), "the speculative sequence has an MTP cache");
             digests.addAll(mtp);
             return digests;

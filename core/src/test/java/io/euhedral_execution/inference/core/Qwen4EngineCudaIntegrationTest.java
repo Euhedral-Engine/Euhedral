@@ -98,7 +98,7 @@ class Qwen4EngineCudaIntegrationTest {
     /// Nothing a generation used is still held: no lease, no pinned slot, no transfer in flight, no step, no
     /// model-specific thread.
     private static void assertNoLeftovers(InferenceEngine engine) {
-        Qwen4Runtime runtime = engine.qwen4Runtime();
+        Qwen4Runtime runtime = (Qwen4Runtime) engine.modelRuntime();
         var cache = runtime.storage().model().expertCache();
         // A step's outcome may be published before its last copies' retirement frames ran: they end on their own.
         long deadline = System.nanoTime() + 10_000_000_000L;
@@ -170,7 +170,7 @@ class Qwen4EngineCudaIntegrationTest {
     @Test
     void closingTheEngineLeavesNoAttachedSourceAndNoActiveWork() throws Exception {
         InferenceEngine engine = InferenceEngine.load(config(4096));
-        Qwen4Runtime runtime = engine.qwen4Runtime();
+        Qwen4Runtime runtime = (Qwen4Runtime) engine.modelRuntime();
         int[] prompt = engine.tokenizePromptAsync("The capital of France is").get(30, TimeUnit.SECONDS);
         GenerationSession session = engine.createGenerationSession(GenerationConfig.greedy(1));
         session.generateAsync(prompt, 4, text -> {}, null, null).get(5, TimeUnit.MINUTES);

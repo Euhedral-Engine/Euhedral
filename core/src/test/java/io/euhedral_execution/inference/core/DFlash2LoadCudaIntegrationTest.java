@@ -6,7 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -35,8 +35,8 @@ class DFlash2LoadCudaIntegrationTest {
                 4096,
                 Duration.ofSeconds(10));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
-            assertEquals(ArtifactProfile.Speculation.DFLASH2, engine.profile().speculation());
-            var weights = engine.plan().weights();
+            assertEquals("dflash2", engine.description().speculation());
+            var weights = ((Qwen38Runtime) engine.modelRuntime()).plan().weights();
             assertNull(weights.mtp());
             assertTrue(weights.runtimeObjects().keySet().stream().noneMatch(name -> name.startsWith("mtp/")));
             var drafter = assertNotNull(weights.dflash2());
