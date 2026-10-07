@@ -32,7 +32,11 @@ public enum Qwen4Kernel {
     EXPERT_DOWN_BF16("euhedral_q4_expert_down_bf16"),
     EXPERT_COMBINE_BF16("euhedral_q4_expert_combine_bf16"),
     SWIGLU_PADDED_BF16("euhedral_q4_swiglu_padded_bf16"),
-    NVFP4_PAD_K("euhedral_q4_nvfp4_pad_k");
+    NVFP4_PAD_K("euhedral_q4_nvfp4_pad_k"),
+    LINEAR_TC_BF16("euhedral_q4_linear_tc_bf16"),
+    LINEAR_TC_SPLIT_BF16("euhedral_q4_linear_tc_split_bf16"),
+    LINEAR_TC_ROWS_BF16("euhedral_q4_linear_tc_rows_bf16"),
+    LINEAR_TC_ROWS_SPLIT_BF16("euhedral_q4_linear_tc_rows_split_bf16");
 
     private final String symbol;
 

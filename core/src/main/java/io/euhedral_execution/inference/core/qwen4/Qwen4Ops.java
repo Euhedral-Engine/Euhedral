@@ -21,11 +21,52 @@ public final class Qwen4Ops {
         return ARGUMENTS.get().clear();
     }
 
+    /// Whether BF16 linears whose shape allows it run on tensor cores; `EUHEDRAL_QWEN4_LINEAR_TC=0` keeps the
+    /// FP32 kernel, which exact numerics always use.
+    static final boolean LINEAR_TC = !"0".equals(System.getenv("EUHEDRAL_QWEN4_LINEAR_TC"));
+
+    /// Rows from which a BF16 linear runs on tensor cores: the row count from which the NVFP4 linears leave the
+    /// decode kernels too.
+    static final int TC_MIN_ROWS = 9;
+
     /// `output[r][j] = bf16(sum_k input[r][k] * weights[j][k])` for BF16 `weights` of `n` rows by `k` columns.
+
     public static void linearBf16(ExecutionGpu gpu, long input, long weights, long output, int rows, int k, int n) {
         requirePositive(rows, k, n);
         if (k % 8 != 0) throw new IllegalArgumentException("a BF16 linear needs K divisible by 8, got " + k);
         requireAligned(16, input, weights);
+        if (LINEAR_TC
+                && rows >= TC_MIN_ROWS
+                && !gpu.exactNumerics()
+                && k % 32 == 0
+                && n % 8 == 0
+                && (output & 3) == 0) {
+            // Tensor cores, for prefill chunks: a decode row would use one of an MMA's 16 rows, and the FP32 kernel
+            // streams its weights faster. K is split in four for narrow outputs (a function of the shape alone, so a
+            // row's bits do not depend on how many rows run with it), four row tiles per weight load above 16 rows.
+            boolean split = n <= 1536 || n % 32 != 0;
+            boolean tiles = rows > 16;
+            Qwen4Kernel kernel = split
+                    ? (tiles ? Qwen4Kernel.LINEAR_TC_ROWS_SPLIT_BF16 : Qwen4Kernel.LINEAR_TC_SPLIT_BF16)
+                    : (tiles ? Qwen4Kernel.LINEAR_TC_ROWS_BF16 : Qwen4Kernel.LINEAR_TC_BF16);
+            gpu.launchQwen4(
+                    kernel,
+                    split ? n / 8 : n / 32,
+                    ceilDiv(rows, tiles ? 64 : 16),
+                    1,
+                    128,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(input)
+                            .pointer(weights)
+                            .pointer(output)
+                            .int32(rows)
+                            .int32(k)
+                            .int32(n));
+            return;
+        }
         gpu.launchQwen4(
                 Qwen4Kernel.LINEAR_BF16,
                 ceilDiv(n, 8),

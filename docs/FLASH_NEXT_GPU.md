@@ -55,3 +55,27 @@ fixtures' shared expert within 5e-5 to 1.5e-2 of upstream.
 | prefill 512 (tokens/s, median of 3) | 153 | 162 |
 | decode cold 64 / 4096 (tokens/s) | 22.5 / 22.4 | 22.6 / 22.4 |
 | decode warm 64 / 4096 (tokens/s) | 28.1 / 27.9 | 28.4 / 28.1 |
+
+## BF16 linears on tensor cores in prefill
+
+After the padding, the BF16 linears were half of a prefill's kernel time (1.01 s of 2.0 s): the hyper-connection's
+down (10,240 to 320) and up (320 to 10,240) projections, two each per layer, at 3.6 and 5.9 ms per 4096-row launch
+(about 7.5 and 4.5 TFLOPS on FP32 FMAs). `euhedral_q4_linear_tc_*` run them on m16n8k16 tensor cores (dflash's scheme:
+K split in four for outputs up to 1536 wide, chosen by the shape alone; one or four row tiles of 16 per weight load,
+which never change a row's bits). Their results differ from the FP32 kernel's in summation order only: 4e-6 to 8e-5
+relative RMS on the model's shapes (`Qwen4LinearTensorCoreCudaIntegrationTest`).
+
+They run for 9 rows and more. At one row an MMA uses one of its 16 rows, and the FP32 kernel is faster on most decode
+shapes (profiled per launch: hyper-connection down 19.1 against 29.0 us, router 6.0 against 7.4 us, output head 1.49
+against 1.73 ms; only the hyper-connection up projection was faster, 12.9 against 8.8 us). Exact numerics and
+`EUHEDRAL_QWEN4_LINEAR_TC=0` keep the FP32 kernel everywhere.
+
+| scenario | FP32 kernel | tensor cores from 9 rows |
+|---|---|---|
+| prefill 4096 (tokens/s) | 582 | 661-671 |
+| prefill 512 (tokens/s) | 142-162 | 147-167 |
+| decode cold 64 / 4096 (tokens/s) | 22.0 / 21.7 | 22.9 / 21.9 |
+| decode warm 64 / 4096 (tokens/s) | 28.6 / 26.8 | 28.4 / 27.0 |
+
+Not kept: tensor cores for decode rows too (prefill as above; decode cold 22.1 / 22.7, warm 27.2 / 27.8, kernel time
+for the BF16 linears 7.5 to 9.4 ms per step).
