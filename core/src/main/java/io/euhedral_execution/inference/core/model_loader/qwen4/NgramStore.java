@@ -223,6 +223,39 @@ public final class NgramStore implements AutoCloseable {
         return checked(globalRow) % this.config.shardRows();
     }
 
+    /// Bytes of the mapped tables the operating system holds in memory now (`mincore` over each shard's pages), or
+    /// [#hostBytes] for a pinned arena: how much of a mapped table a gather finds without a read from the disk.
+    public long residentBytes() {
+        ensureOpen();
+        if (this.mode != Qwen4ResidencyPlan.NgramMode.MAPPED_FILE) return this.hostBytes;
+        long page = 4096, resident = 0;
+        try (Arena scratch = Arena.ofConfined()) {
+            for (MemorySegment shard : this.shards) {
+                long start = shard.address() & -page;
+                long length = shard.address() + shard.byteSize() - start;
+                long pages = (length + page - 1) / page;
+                MemorySegment vector = scratch.allocate(pages);
+                int status = (int) MINCORE.invokeExact(MemorySegment.ofAddress(start), length, vector);
+                if (status != 0) throw new IllegalStateException("mincore failed");
+                for (long i = 0; i < pages; i++) if ((vector.get(ValueLayout.JAVA_BYTE, i) & 1) != 0) resident++;
+            }
+        } catch (RuntimeException | Error failure) {
+            throw failure;
+        } catch (Throwable failure) {
+            throw new IllegalStateException(failure);
+        }
+        return Math.min(resident * page, this.hostBytes);
+    }
+
+    private static final java.lang.invoke.MethodHandle MINCORE = java.lang.foreign.Linker.nativeLinker()
+            .downcallHandle(
+                    java.lang.foreign.Linker.nativeLinker()
+                            .defaultLookup()
+                            .find("mincore")
+                            .orElseThrow(),
+                    java.lang.foreign.FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
     /// The table's FP32 global scale for the shard.
     public float globalScale(int shard) {
         return this.globalScales[shard];

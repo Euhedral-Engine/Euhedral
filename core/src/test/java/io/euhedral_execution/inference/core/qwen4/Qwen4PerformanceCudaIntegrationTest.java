@@ -286,7 +286,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                             Qwen4Mode.TEXT,
                             CONTEXT);
                     Qwen4TestLattice.Run run = lattice.run(gpu, model, CONTEXT);
-                    Qwen4ExecutionPlan executor = run.plan()) {
+                    Qwen4ExecutionPlan executor = run.plan();
+                    Qwen4IoProbe io = new Qwen4IoProbe(Qwen4TestSupport.artifactPath())) {
                 line(String.format("load: %.1f s (model %.1f s)", (System.nanoTime() - loadStart) / 1e9, 0.0));
                 line("workers: " + lattice.cpus().cardinality() + " on processors " + lattice.cpus());
                 var startTier = model.hierarchyStats().ram();
@@ -334,6 +335,10 @@ class Qwen4PerformanceCudaIntegrationTest {
                         long diskBefore = model.hierarchyStats().artifact().bytesRead();
                         LayerStats layers = new LayerStats();
                         if (target == 4096) executor.trace(layers);
+                        long ngramBefore = model.ngram().residentBytes();
+                        long readsBefore = model.hierarchyStats().artifact().recordReads();
+                        long prefetchedBefore = executor.expertPrefetches()[0];
+                        var ioBefore = io.snapshot();
                         long start = System.nanoTime();
                         int at = 0;
                         while (at < target) {
@@ -342,6 +347,15 @@ class Qwen4PerformanceCudaIntegrationTest {
                             at += rows;
                         }
                         double seconds = (System.nanoTime() - start) / 1e9;
+                        var ioLines = io.report(
+                                ioBefore,
+                                model,
+                                readsBefore,
+                                diskBefore,
+                                prefetchedBefore,
+                                executor.expertPrefetches()[0],
+                                ngramBefore,
+                                target);
                         executor.trace(null);
                         if (target == 4096)
                             line(layers.summary("expert cache, prefill of 4096 tokens in 512-token chunks"));
@@ -380,6 +394,7 @@ class Qwen4PerformanceCudaIntegrationTest {
                                             + " overall",
                                     100 * busy / seconds, disk / 1e9 / Math.max(busy, 1e-9), disk / 1e9 / seconds));
                         }
+                        ioLines.forEach(this::line);
                     }
                 }
                 // `EUHEDRAL_QWEN4_PERF_PREFILL_ONLY=1` stops after the prefills, for screening the expert path.
@@ -408,6 +423,12 @@ class Qwen4PerformanceCudaIntegrationTest {
                             LayerStats decodeLayers = new LayerStats();
                             if (context == 4096) executor.trace(decodeLayers);
                             int steps = 32;
+                            long ngramBefore = model.ngram().residentBytes();
+                            var artifactBefore = model.hierarchyStats().artifact();
+                            long busyBefore = model.asyncReads() == null
+                                    ? 0
+                                    : model.asyncReads().busyNanos();
+                            var ioBefore = io.snapshot();
                             long start = System.nanoTime();
                             for (int i = 0; i < steps; i++) {
                                 token[0] = prompt[(context + i * 97) % prompt.length];
@@ -416,6 +437,18 @@ class Qwen4PerformanceCudaIntegrationTest {
                                 MemorySegment.copy(readback.segment(), ValueLayout.JAVA_SHORT, 0, logits, 0, 16);
                             }
                             double seconds = (System.nanoTime() - start) / 1e9;
+                            var ioLines = io.report(
+                                    ioBefore,
+                                    model,
+                                    artifactBefore.recordReads(),
+                                    artifactBefore.bytesRead(),
+                                    prefetchBefore[0],
+                                    executor.expertPrefetches()[0],
+                                    ngramBefore,
+                                    steps);
+                            double readBusy = model.asyncReads() == null
+                                    ? 0
+                                    : (model.asyncReads().busyNanos() - busyBefore) / 1e9;
                             executor.trace(null);
                             if (context == 4096) line(decodeLayers.summary("expert cache, decode at 4096 context"));
                             var after = executor.moeCounters();
@@ -450,6 +483,8 @@ class Qwen4PerformanceCudaIntegrationTest {
                                             fullBefore,
                                             executor.expertFullFetches(),
                                             steps));
+                            line(String.format("  disk: reads in flight %.0f%% of the time", 100 * readBusy / seconds));
+                            ioLines.forEach(this::line);
                         }
                     }
                 }
