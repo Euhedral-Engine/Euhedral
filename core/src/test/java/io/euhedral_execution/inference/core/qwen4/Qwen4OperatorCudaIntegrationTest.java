@@ -9,8 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.GpuMemoryException;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -83,7 +83,7 @@ class Qwen4OperatorCudaIntegrationTest {
     @Test
     void theKernelTableMatchesTheEnum() {
         try (CudaGpuMemory gpu = open()) {
-            List<String> names = gpu.qwen4KernelNames();
+            List<String> names = gpu.tableKernelNames();
             Qwen4Kernel[] kernels = Qwen4Kernel.values();
             assertEquals(kernels.length, names.size());
             for (int i = 0; i < kernels.length; i++) assertEquals(kernels[i].symbol(), names.get(i));
@@ -94,16 +94,16 @@ class Qwen4OperatorCudaIntegrationTest {
     void theLauncherRejectsArgumentsThatDisagreeWithTheKernel() {
         try (CudaGpuMemory gpu = open()) {
             // euhedral_q4_scaled_silu_bf16 takes (ptr, ptr, u32, f32): a missing argument and a wrong width both fail.
-            Qwen4KernelArguments missing =
-                    new Qwen4KernelArguments().pointer(1).pointer(1).int32(1);
+            KernelArguments missing =
+                    new KernelArguments().pointer(1).pointer(1).int32(1);
             assertThrows(
                     GpuMemoryException.class,
-                    () -> gpu.launchQwen4(Qwen4Kernel.SCALED_SILU_BF16, 1, 1, 1, 32, 1, 1, 0, missing));
-            Qwen4KernelArguments wide =
-                    new Qwen4KernelArguments().pointer(1).pointer(1).pointer(1).float32(1);
+                    () -> gpu.launchTableKernel(Qwen4Kernel.SCALED_SILU_BF16, 1, 1, 1, 32, 1, 1, 0, missing));
+            KernelArguments wide =
+                    new KernelArguments().pointer(1).pointer(1).pointer(1).float32(1);
             assertThrows(
                     GpuMemoryException.class,
-                    () -> gpu.launchQwen4(Qwen4Kernel.SCALED_SILU_BF16, 1, 1, 1, 32, 1, 1, 0, wide));
+                    () -> gpu.launchTableKernel(Qwen4Kernel.SCALED_SILU_BF16, 1, 1, 1, 32, 1, 1, 0, wide));
         }
     }
 

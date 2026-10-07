@@ -2,7 +2,7 @@ package io.euhedral_execution.inference.core.gpu;
 
 /// The Flash-Next (qwen4_exp) kernels behind `euhedral_cuda_qwen4_launch`. The declaration order is the native
 /// table's order (native/src/host/qwen4_ops.c); a test compares the names.
-public enum Qwen4Kernel {
+public enum Qwen4Kernel implements TableKernel {
     LINEAR_BF16("euhedral_q4_linear_bf16"),
     GROUPED_RMS_NORM_BF16("euhedral_q4_grouped_rms_norm_bf16"),
     SCALED_SILU_BF16("euhedral_q4_scaled_silu_bf16"),
@@ -46,7 +46,13 @@ public enum Qwen4Kernel {
         this.symbol = symbol;
     }
 
+    @Override
+    public int index() {
+        return ordinal();
+    }
+
     /// The kernel's name in the CUDA source.
+    @Override
     public String symbol() {
         return this.symbol;
     }

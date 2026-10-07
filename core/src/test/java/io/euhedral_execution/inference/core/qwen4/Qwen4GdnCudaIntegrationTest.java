@@ -6,8 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -72,7 +72,7 @@ class Qwen4GdnCudaIntegrationTest {
                 what + ": " + differing + " of " + expected.length + " differ");
     }
 
-    private static final Qwen4KernelArguments ARGUMENTS = new Qwen4KernelArguments();
+    private static final KernelArguments ARGUMENTS = new KernelArguments();
 
     @Test
     void theConvolutionCarriesItsHistoryAcrossChunks() {
@@ -89,7 +89,7 @@ class Qwen4GdnCudaIntegrationTest {
                 int row = 0;
                 for (int rows : new int[] {1, 2, 5, 1, 12}) {
                     long offset = (long) row * channels * 2;
-                    gpu.launchQwen4(
+                    gpu.launchTableKernel(
                             Qwen4Kernel.GDN_CONV_BF16,
                             (channels + 255) / 256,
                             rows,
@@ -136,7 +136,7 @@ class Qwen4GdnCudaIntegrationTest {
                     da = upload(gpu, arena, dtBias);
             long alpha = gpu.allocate((long) rows * heads * 4), beta = gpu.allocate((long) rows * heads * 4);
             try {
-                gpu.launchQwen4(
+                gpu.launchTableKernel(
                         Qwen4Kernel.GDN_CONTROL_BF16,
                         (rows * heads + 255) / 256,
                         1,
@@ -185,7 +185,7 @@ class Qwen4GdnCudaIntegrationTest {
                 for (int activation = 0; activation < 2; activation++) {
                     short[] expected =
                             Qwen4Reference.gdnGatedNorm(core, z, weight, rows, heads, headDim, 1e-6f, activation == 1);
-                    gpu.launchQwen4(
+                    gpu.launchTableKernel(
                             Qwen4Kernel.GDN_GATED_NORM_BF16,
                             rows * heads,
                             1,

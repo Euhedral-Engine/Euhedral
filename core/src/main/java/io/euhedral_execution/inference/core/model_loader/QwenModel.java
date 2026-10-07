@@ -28,7 +28,7 @@ public final class QwenModel implements AutoCloseable {
     }
 
     /// Loads the objects named in `hostBacked` into pinned host memory, and allocates a device staging
-    /// ring of [ResidencyPlanner#STAGING_SLOTS] slots, each holding the largest of them. `speculation` also
+    /// ring of [WeightStaging#SLOTS] slots, each holding the largest of them. `speculation` also
     /// loads its drafter. The model owns both.
     public static QwenModel load(
             Path path,
@@ -40,7 +40,7 @@ public final class QwenModel implements AutoCloseable {
         return load(
                 gpu,
                 memory -> QwenWeightLoader.load(path, artifact, memory, speculation, hostBacked),
-                hostBacked.isEmpty() ? 0 : ResidencyPlanner.STAGING_SLOTS);
+                hostBacked.isEmpty() ? 0 : WeightStaging.SLOTS);
     }
 
     /// The device staging ring for host-backed weights, or null when every weight is resident.

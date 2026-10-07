@@ -1,8 +1,8 @@
 package io.euhedral_execution.inference.core.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.Qwen4Kernel;
-import io.euhedral_execution.inference.core.gpu.Qwen4KernelArguments;
 
 /// Typed launches of the QSA (Qwen Sparse Attention) kernels of native/src/qwen4/qsa_*.cuh
 /// (docs/FLASH_NEXT_QSA.md): the geometry each kernel is written for and the argument checks the
@@ -26,12 +26,11 @@ public final class Qwen4QsaOps {
     /// sum.
     static final int PARTIAL_FLOATS = 258;
 
-    private static final ThreadLocal<Qwen4KernelArguments> ARGUMENTS =
-            ThreadLocal.withInitial(Qwen4KernelArguments::new);
+    private static final ThreadLocal<KernelArguments> ARGUMENTS = ThreadLocal.withInitial(KernelArguments::new);
 
     private Qwen4QsaOps() {}
 
-    private static Qwen4KernelArguments arguments() {
+    private static KernelArguments arguments() {
         return ARGUMENTS.get().clear();
     }
 
@@ -64,7 +63,7 @@ public final class Qwen4QsaOps {
         if (position < 0 || positionStep < 0 || (long) position + (long) rows * positionStep >= 1 << 24)
             throw new IllegalArgumentException("positions must stay below 2^24");
         requireAligned(4, input, output, weight);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.HEAD_NORM_ROPE_BF16,
                 ceilDiv(Math.multiplyExact(rows, heads), 4),
                 1,
@@ -100,7 +99,7 @@ public final class Qwen4QsaOps {
         int count = completedBlocks(start, rows);
         if (count == 0) return;
         requireAligned(4, raw, tail, blocks);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_POOL_KEYS_BF16,
                 ceilDiv(count, 4),
                 1,
@@ -128,7 +127,7 @@ public final class Qwen4QsaOps {
     public static void tail(ExecutionGpu gpu, long raw, long tailIn, long tailOut, int rows, int start, int rawStride) {
         requirePositive(rows);
         requireAligned(4, raw, tailIn, tailOut);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_TAIL_BF16,
                 1,
                 1,
@@ -163,7 +162,7 @@ public final class Qwen4QsaOps {
         requirePositive(tileRows, blocksTotal);
         if (queryRowStride % 2 != 0) throw new IllegalArgumentException("queries are read in pairs");
         requireAligned(4, queries, keys);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_SCORES,
                 ceilDiv(blocksTotal, SCORE_BLOCKS_PER_CTA),
                 ceilDiv(tileRows, SCORE_ROWS_PER_CTA),
@@ -197,7 +196,7 @@ public final class Qwen4QsaOps {
             int scoreStride,
             int budget) {
         requirePositive(tileRows, budget);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_SELECT,
                 tileRows,
                 1,
@@ -247,7 +246,7 @@ public final class Qwen4QsaOps {
         if (splits > 1 && partial == 0) throw new IllegalArgumentException("split attention needs a partial buffer");
         if ((ids == 0) != (counts == 0)) throw new IllegalArgumentException("ids and counts go together");
         long units = (long) rows * keyHeads * splits;
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_ATTENTION,
                 Math.toIntExact(units),
                 1,
@@ -291,7 +290,7 @@ public final class Qwen4QsaOps {
             int gateRowStride,
             int gateHeadStride) {
         requirePositive(rows, queryHeads, splits);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_MERGE,
                 ceilDiv(Math.multiplyExact(rows, queryHeads), 4),
                 1,
@@ -328,7 +327,7 @@ public final class Qwen4QsaOps {
             int start) {
         requirePositive(rows, keyHeads);
         requireAligned(16, keys, values);
-        gpu.launchQwen4(
+        gpu.launchTableKernel(
                 Qwen4Kernel.QSA_KV_APPEND,
                 ceilDiv(Math.multiplyExact(rows, keyHeads), 4),
                 1,

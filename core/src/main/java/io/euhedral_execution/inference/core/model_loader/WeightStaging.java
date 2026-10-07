@@ -9,6 +9,9 @@ package io.euhedral_execution.inference.core.model_loader;
 /// hold the ring from preparation until their last stage submitted, so their slot uses never interleave.
 public record WeightStaging(long baseAddress, long slotBytes, int slots) {
 
+    /// Slots in a staging ring: enough for copies to queue ahead of their consumers.
+    public static final int SLOTS = 4;
+
     /// Slots start on 256-byte boundaries, like device allocations.
     public static final long SLOT_ALIGNMENT = 256;
 

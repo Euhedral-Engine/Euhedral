@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.model_loader.qwen4;
 
-import io.euhedral_execution.inference.core.model_loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model_loader.WeightStaging;
 import io.euhedral_execution.inference.core.model_loader.qwen4.expert.ExpertBank;
 import java.util.ArrayList;
@@ -79,7 +78,7 @@ public final class Qwen4ResidencyPlanner {
     private static final int CHUNK_SHARE_DIVISOR = 10;
 
     /// Staging slots for host-backed fixed objects, shared with the dense engine's ring.
-    public static final int STAGING_SLOTS = ResidencyPlanner.STAGING_SLOTS;
+    public static final int STAGING_SLOTS = WeightStaging.SLOTS;
 
     private static final long SELECTION_STEP = 64L << 20;
     private static final Pattern LAYER_INDEX = Pattern.compile("/layers/\\d+/");

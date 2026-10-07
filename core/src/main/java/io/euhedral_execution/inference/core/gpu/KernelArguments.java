@@ -2,9 +2,9 @@ package io.euhedral_execution.inference.core.gpu;
 
 import java.util.Arrays;
 
-/// The arguments of one [Qwen4Kernel] launch, as the native launcher takes them: each a 64-bit word and the byte
+/// The arguments of one [TableKernel] launch, as the native launcher takes them: each a 64-bit word and the byte
 /// size (4 or 8) the kernel declares for it. Reusable: [#clear] rewinds it, so a hot path keeps one per thread.
-public final class Qwen4KernelArguments {
+public final class KernelArguments {
 
     /// The launcher's argument limit.
     public static final int MAX = 32;
@@ -13,25 +13,25 @@ public final class Qwen4KernelArguments {
     private final byte[] sizes = new byte[MAX];
     private int count;
 
-    public Qwen4KernelArguments clear() {
+    public KernelArguments clear() {
         this.count = 0;
         return this;
     }
 
     /// A device address or another 64-bit value.
-    public Qwen4KernelArguments pointer(long address) {
+    public KernelArguments pointer(long address) {
         return add(address, 8);
     }
 
-    public Qwen4KernelArguments int32(int value) {
+    public KernelArguments int32(int value) {
         return add(value & 0xffffffffL, 4);
     }
 
-    public Qwen4KernelArguments float32(float value) {
+    public KernelArguments float32(float value) {
         return add(Float.floatToRawIntBits(value) & 0xffffffffL, 4);
     }
 
-    private Qwen4KernelArguments add(long word, int size) {
+    private KernelArguments add(long word, int size) {
         if (this.count == MAX) throw new IllegalStateException("too many kernel arguments");
         this.words[this.count] = word;
         this.sizes[this.count] = (byte) size;

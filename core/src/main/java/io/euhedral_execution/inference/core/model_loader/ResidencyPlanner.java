@@ -14,8 +14,6 @@ import java.util.Set;
 /// of one sequence of `maxContextTokens` and a fixed reserve for the per-sequence GDN state, the
 /// execution workspaces, the shared scratch and the kernel modules loaded after the model.
 public final class ResidencyPlanner {
-    /// Staging slots: enough for copies to queue ahead of their consumers.
-    public static final int STAGING_SLOTS = 4;
 
     /// Bytes of KV cache per token of one NVFP4 attention layer: K and V rows of 144 bytes per 256 values.
     private static final long KV_BYTES_PER_LAYER_TOKEN = 2L * 144;
@@ -76,7 +74,7 @@ public final class ResidencyPlanner {
             if (hostBacked) largest = Math.max(largest, tensor.byteSize());
             else resident += tensor.byteSize();
         }
-        if (largest > 0) resident += WeightStaging.slotBytesFor(largest) * STAGING_SLOTS;
+        if (largest > 0) resident += WeightStaging.slotBytesFor(largest) * WeightStaging.SLOTS;
         return new Plan(host, resident, true);
     }
 }
