@@ -424,6 +424,18 @@ public final class ExecutionFixtures {
             listener.retired(ticket, true);
         }
 
+        /// Announces the newest held boundary from a driver thread's point of view.
+        public void releaseNewest(Throwable deviceFailure) {
+            long ticket;
+            RetirementListener listener;
+            synchronized (this) {
+                ticket = this.tickets.removeLast();
+                listener = this.listeners.removeLast();
+                if (deviceFailure != null) this.failed.put(ticket, deviceFailure);
+            }
+            listener.retired(ticket, true);
+        }
+
         private final java.util.Map<Long, Throwable> failed = new java.util.HashMap<>();
 
         @Override

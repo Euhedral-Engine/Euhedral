@@ -80,6 +80,10 @@ public final class StageGraph implements AutoCloseable {
     private final StageFrame[] stages;
     private final StageFrame[] roots;
     private final Retirement retirement;
+    /// The bound quantum's conclusion, handed to it once its device boundary was confirmed; built once.
+    private final Runnable conclusion = this::conclude;
+    /// The confirmed boundary's failure, read by the conclusion.
+    private Throwable deviceFailure;
     private final AtomicInteger live = new AtomicInteger();
     private StageQuantum quantum;
     private boolean overlap;
@@ -456,14 +460,23 @@ public final class StageGraph implements AutoCloseable {
         }
     }
 
-    /// Terminal work for the bound quantum; runs on an ordinary worker after device retirement.
-    /// Every failure before recycling is recorded on the quantum, whose outcome is always
-    /// published.
+    /// Confirms the bound quantum's device boundary on an ordinary worker, then hands the quantum its conclusion,
+    /// which it runs in its owner's order ([StageQuantum#concludeInOrder]): the graph stays bound until then.
     void retire(long ticket) {
         StageQuantum retiring = this.quantum;
         Throwable deviceFailure =
                 ticket == NO_TICKET ? null : this.pool.lane(this.home).confirmRetired(ticket);
         if (deviceFailure != null) retiring.fail(deviceFailure);
+        this.deviceFailure = deviceFailure;
+        retiring.concludeInOrder(this.conclusion);
+    }
+
+    /// Terminal work for the bound quantum. Every failure before recycling is recorded on the quantum, whose
+    /// outcome is always published.
+    private void conclude() {
+        StageQuantum retiring = this.quantum;
+        Throwable deviceFailure = this.deviceFailure;
+        this.deviceFailure = null;
         boolean committed = !retiring.stopRequested();
         for (StageFrame stage : this.stages) {
             if (!stage.attempted) continue;

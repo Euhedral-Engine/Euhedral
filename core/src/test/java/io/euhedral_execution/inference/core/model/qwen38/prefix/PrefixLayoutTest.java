@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
 import io.euhedral_execution.inference.core.model.qwen38.GdnState;
 import io.euhedral_execution.inference.core.model.qwen38.GdnStates;
+import io.euhedral_execution.inference.core.model.qwen38.HeldWork;
 import io.euhedral_execution.inference.core.model.qwen38.MemoryGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
@@ -181,9 +182,9 @@ class PrefixLayoutTest {
 
     private static Sequence holding(AttentionStates attention) {
         var sequence = new Sequence(1);
-        sequence.admit(0, 0);
+        var held = HeldWork.admit(sequence);
         sequence.setKvCacheState(attention);
-        sequence.commit(0);
+        held.commit(0);
         return sequence;
     }
 

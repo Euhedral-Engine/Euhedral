@@ -147,12 +147,14 @@ public final class PrefixCache implements AutoCloseable {
             int position,
             SpeculativeCheckpoint speculative) {
         if (this.closed) return CompletableFuture.completedFuture(parent);
-        // The copies read the sequence's buffers between quanta, as its one piece of work in flight: no quantum is
-        // admitted until they retire, and the buffers close only when the session completes the sequence. A sequence
-        // already cancelled, terminal or executing is not captured.
+        // The copies read the sequence's buffers between quanta, as work on the sequence: they conclude in its
+        // admission order, and the buffers close only when the session completes the sequence. A sequence already
+        // cancelled, terminal or executing is not captured.
+        if (sequence.inFlight()) return CompletableFuture.completedFuture(parent);
         long at = sequence.committedFrontier();
+        var work = new CopyWork<PrefixNode>(sequence, at);
         try {
-            sequence.admit(at, at);
+            work.admit(at);
         } catch (RuntimeException cancelledOrBusy) {
             return CompletableFuture.completedFuture(parent);
         }
@@ -161,13 +163,23 @@ public final class PrefixCache implements AutoCloseable {
         try {
             captured = captureHeld(frames, sequence, parent, tokens, position, speculative);
         } catch (RuntimeException | Error failure) {
-            sequence.commit(at);
+            work.complete(blocked -> settleCapture(sequence, at, blocked));
             throw failure;
         }
-        return captured.whenComplete((node, failure) -> {
-            sequence.commit(at);
-            if (node != parent) this.captureNanos.addAndGet(System.nanoTime() - started);
-        });
+        return captured.handle((node, failure) -> work.complete(blocked -> {
+                    settleCapture(sequence, at, blocked);
+                    if (failure != null) throw new CompletionException(failure);
+                    if (node != parent) this.captureNanos.addAndGet(System.nanoTime() - started);
+                    return node;
+                }))
+                .thenCompose(concluded -> concluded);
+    }
+
+    /// A capture leaves the frontiers where they are; it commits unless something before it failed the sequence.
+    private static PrefixNode settleCapture(Sequence sequence, long at, Throwable blocked) {
+        if (blocked != null) sequence.abandon();
+        else sequence.commit(at);
+        return null;
     }
 
     private CompletableFuture<PrefixNode> captureHeld(
@@ -240,8 +252,9 @@ public final class PrefixCache implements AutoCloseable {
         if (this.closed) return CompletableFuture.failedFuture(new IllegalStateException("the prefix cache is closed"));
         if (cancelled(sequence)) return CompletableFuture.completedFuture(false);
         List<PrefixLayout.Copy> copies;
+        var work = new CopyWork<Boolean>(sequence, 0);
         try {
-            sequence.admit(0, position);
+            work.admit(position);
         } catch (RuntimeException failure) {
             // A cancellation that landed after the check above is the same outcome, not an error.
             return cancelled(sequence)
@@ -258,37 +271,44 @@ public final class PrefixCache implements AutoCloseable {
             if (speculative != null)
                 copies.addAll(speculative.restoreCopies(hit.match().chain(), this.layout::speculativeOffset, sequence));
         } catch (RuntimeException | Error failure) {
-            abandon(sequence, failure);
-            return CompletableFuture.failedFuture(failure);
+            return work.complete(blocked -> {
+                throw abandon(sequence, failure);
+            });
         }
         long started = System.nanoTime();
-        return runCopies(frames, copies, true).handle((done, failure) -> {
-            if (failure != null) {
-                abandon(sequence, failure);
-                throw new CompletionException(failure);
-            }
-            this.restores.incrementAndGet();
-            this.restoreNanos.addAndGet(System.nanoTime() - started);
-            try {
-                var attention = (AttentionStates) sequence.kvCacheState();
-                for (int layer : this.layout.kvLayers()) {
-                    AttentionKvState state = attention.forLayer(layer);
-                    state.appendSubmitted(position);
-                    state.commitSubmitted();
-                }
-                if (speculative != null) speculative.restored(sequence, position);
-                return !sequence.commit(position);
-            } catch (RuntimeException | Error publication) {
-                abandon(sequence, publication);
-                throw new CompletionException(publication);
-            }
-        });
+        return runCopies(frames, copies, true)
+                .handle((done, copyFailure) -> work.complete(blocked -> {
+                    Throwable failure = copyFailure != null ? copyFailure : blocked;
+                    if (failure != null) throw abandon(sequence, failure);
+                    this.restores.incrementAndGet();
+                    this.restoreNanos.addAndGet(System.nanoTime() - started);
+                    try {
+                        var attention = (AttentionStates) sequence.kvCacheState();
+                        for (int layer : this.layout.kvLayers()) {
+                            AttentionKvState state = attention.forLayer(layer);
+                            state.appendSubmitted(position);
+                            state.commitSubmitted();
+                        }
+                        if (speculative != null) speculative.restored(sequence, position);
+                    } catch (RuntimeException | Error publication) {
+                        throw abandon(sequence, publication);
+                    }
+                    // A cancellation requested meanwhile ends the sequence instead of publishing the position.
+                    if (sequence.cancellationRequested()) {
+                        sequence.abandon();
+                        return false;
+                    }
+                    sequence.commit(position);
+                    return true;
+                }))
+                .thenCompose(concluded -> concluded);
     }
 
-    /// Fails the sequence and retires the restore in flight without its work.
-    private static void abandon(Sequence sequence, Throwable failure) {
+    /// Fails the sequence and settles the restore without its work; returns the failure to throw.
+    private static CompletionException abandon(Sequence sequence, Throwable failure) {
         sequence.fail(failure);
-        if (sequence.inFlight()) sequence.abandon();
+        sequence.abandon();
+        return failure instanceof CompletionException completion ? completion : new CompletionException(failure);
     }
 
     private static boolean cancelled(Sequence sequence) {
