@@ -3,11 +3,11 @@ package io.euhedral_execution.inference.core.model.qwen4;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
+import io.euhedral_execution.inference.core.runtime.graph.ShapeBuilder;
 import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
 import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology.Boundary;
-import java.util.ArrayList;
 import java.util.List;
 
 /// The static DAG of one chunk of Flash-Next, given to the runtime to instantiate (a [GraphShape]):
@@ -70,8 +70,8 @@ final class Shape implements GraphShape {
 
     private final ExecutionPlan plan;
     private final ExecutionPlan.ShapeKey key;
-    private final List<Spec> specs = new ArrayList<>();
-    private final List<Edge[]> incoming = new ArrayList<>();
+    private final ShapeBuilder<Spec> builder = new ShapeBuilder<>();
+    private final List<Spec> specs;
     private final int expertCap;
     private final StageTopology topology;
 
@@ -80,18 +80,8 @@ final class Shape implements GraphShape {
         this.key = key;
         this.expertCap = plan.maxExperts(key.rows());
         build();
-        int[][] dependencies = new int[this.incoming.size()][];
-        Boundary[][] boundaries = new Boundary[this.incoming.size()][];
-        for (int stage = 0; stage < dependencies.length; stage++) {
-            Edge[] edges = this.incoming.get(stage);
-            dependencies[stage] = new int[edges.length];
-            boundaries[stage] = new Boundary[edges.length];
-            for (int i = 0; i < edges.length; i++) {
-                dependencies[stage][i] = edges[i].from();
-                boundaries[stage][i] = edges[i].boundary();
-            }
-        }
-        this.topology = StageTopology.of(dependencies, boundaries);
+        this.specs = this.builder.specs();
+        this.topology = this.builder.build();
     }
 
     private static Edge after(int from) {
@@ -103,9 +93,12 @@ final class Shape implements GraphShape {
     }
 
     private int add(Kind kind, int layer, int index, Edge... edges) {
-        this.specs.add(new Spec(kind, layer, index));
-        this.incoming.add(edges);
-        return this.specs.size() - 1;
+        int stage = this.builder.stage(new Spec(kind, layer, index));
+        for (Edge edge : edges) {
+            if (edge.boundary() == Boundary.SUBMITTED) this.builder.submitted(edge.from(), stage);
+            else this.builder.retired(edge.from(), stage);
+        }
+        return stage;
     }
 
     /// The edge from `from` to a device stage that starts the next piece: nothing at the first
