@@ -601,8 +601,7 @@ public abstract class ExecutionGpu implements GpuMemory {
     }
 
     /// Launches a kernel of the native kernel table with the given geometry on the selected stream (or synchronously
-    /// when none is
-    /// selected). The arguments must match the kernel's signature in count and width.
+    /// when none is selected). The arguments must match the kernel's signature in count and width.
     public void launchTableKernel(
             TableKernel kernel,
             int gridX,

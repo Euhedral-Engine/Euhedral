@@ -91,8 +91,8 @@ class ArchitectureTest {
 
     /// The work of a step is the shape of a graph that the lattice's runtime runs, not a runner of
     /// our own: no executor or step machine exists, no stage runs another or waits for one, and
-    /// every piece of the model's execution is a [StageFrame](../runtime/graph/StageFrame.java)
-    /// of the shape.
+    /// every piece of the model's execution is a
+    /// [io.euhedral_execution.inference.core.runtime.graph.StageFrame] of the shape.
     @Test
     void aStepIsTheShapeOfAStageGraphNotARunner() throws IOException {
         Path qwen4 = MAIN.resolve("model/qwen4");
@@ -188,16 +188,16 @@ class ArchitectureTest {
             "state",
             "tokenizer");
 
+    /// Directories count only when they hold sources: git does not track an empty directory a move leaves behind.
     @Test
     void everyClassLivesInALayerOrAModelFolder() throws IOException {
-        for (String gone : List.of("scheduling", "host", "model_loader", "qwen4"))
-            assertTrue(!Files.exists(MAIN.resolve(gone)), "an old package remains: " + gone);
         try (Stream<Path> top = Files.list(MAIN)) {
-            List<String> unknown = top.filter(Files::isDirectory)
-                    .map(p -> p.getFileName().toString())
-                    .filter(name -> !LAYERS.contains(name))
-                    .toList();
-            assertTrue(unknown.isEmpty(), "packages outside the layout: " + unknown);
+            List<String> unknown = new ArrayList<>();
+            for (Path directory : top.filter(Files::isDirectory).toList()) {
+                String name = directory.getFileName().toString();
+                if (!LAYERS.contains(name) && !javaFiles(name, true).isEmpty()) unknown.add(name);
+            }
+            assertTrue(unknown.isEmpty(), "packages outside the layout (old packages included): " + unknown);
         }
     }
 
