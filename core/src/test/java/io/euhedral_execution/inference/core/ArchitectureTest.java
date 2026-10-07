@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -262,6 +263,11 @@ class ArchitectureTest {
             }
         }
         assertTrue(violations.isEmpty(), "shared code imports a model: " + violations);
+    }
+
+    @Test
+    void onlyTheEngineNamesAModel() {
+        assertEquals(Set.of("InferenceEngine.java"), MODEL_IMPORTS_OUTSIDE_MODEL);
     }
 
     /// Entries in the exception list that no longer import a model must leave it, so it only shrinks.

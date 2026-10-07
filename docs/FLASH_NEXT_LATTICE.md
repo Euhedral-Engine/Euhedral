@@ -12,7 +12,7 @@ stage frames    ─┼─ publish ──>├─ ingest sink 1 ─┼─ upstream
 driver callbacks ─┘  (by hash)  └─ ingest sink n ─┘                                      (doFinally publishes what is next)
 ```
 
-`EuhedralInferenceRuntime` is the root source of the lattice. It owns an `InferenceLake`: several queue ingest sinks (EE's
+`Qwen4Runtime` owns the root source of the lattice, an `InferenceLake` (`EuhedralInferenceRuntime.newLake`): several queue ingest sinks (EE's
 `QueueIngestSink` over partitioned MPSC queues), each attached to the lattice as an upstream source of its own. Every producer
 throws frames into the lake: a stage that made its successors ready, a driver callback (which may only enqueue), a request
 thread. A frame goes into the sink its routing hash selects, so the frames of one lane keep to one sink and the frames that may run
@@ -39,7 +39,7 @@ embed ────────────────────────�
 | `Stages` | The stage frames. Each is a `StageFrame` (the dense model's execution stage), submitting its device work to the lane it was given or doing host work. |
 | `Workspace` | The device workspace of one row capacity and the MoE block resources (`MoeLayer`); the graphs of a capacity take turns on it through leases. |
 | `Quantum` | A `StageQuantum`: what the stages read, whether the step stopped, and the terminal work after retirement (commit the sequence, close leases a stopped block still holds, report to the listener). |
-| `EuhedralInferenceRuntime` | Unchanged lifecycle: admits a quantum to an idle graph of its shape (building one when none is idle), publishes its roots, recycles the graph at retirement. `Qwen4Runtime` uses it with no dense plan. |
+| `EuhedralInferenceRuntime` | Unchanged lifecycle: admits a quantum of any model to an idle graph of its shape (building one when none is idle), publishes its roots, recycles the graph at retirement. `Qwen4Runtime` builds it with `Lanes.of(LANES)`. |
 | `ExpertCache` / `ExpertCacheShard` | The slab, the markers, the host store and the transfer; the directory, the slots' states and the recency. No lock, no wait. |
 | `ExpertCacheOwner` | The owner of the cache's bookkeeping (and the host tier's): the frames that change it carry its routing hash, so the lattice runs them in order, one at a time. |
 | `ExpertLoad` | One miss as frames: the read in parts and their join, or the copy out of RAM; the owner's submit and retire. |
