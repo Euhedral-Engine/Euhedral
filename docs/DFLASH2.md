@@ -37,7 +37,7 @@ and 8 KV heads of 128, block 8, mask token 248070, sliding window 2048, RMSNorm 
 
 One step is three quanta on the existing runtime, chained as continuations (`DFlash2Decoder`):
 
-1. **DRAFT** (the block view, `QwenExecutionPlan.dflash2Block`): embedding, the 5 layers over all 8 rows at once, final norm,
+1. **DRAFT** (the block view, `ExecutionPlan.dflash2Block`): embedding, the 5 layers over all 8 rows at once, final norm,
    output head over rows 1..7, top-16 (`euhedral_dflash_topk_bf16`), selector projection and walk
    (`euhedral_dflash_select_bf16`); the 7 tokens, their candidates and scores are copied to pinned host memory before the
    quantum retires. The base position does not move.
@@ -54,7 +54,7 @@ residual-norm region writes) into the sequence's tap rows, `[row][tap][5120]`, o
 the plan after the next layer's input norm keeps the prefill and decode views' residual/norm fusion intact; it reads only the
 residual, so it does not change the target's numerics. Verification rows are row-exact, so their taps are one-row decode's.
 
-**Lifetime and ownership** (`DFlash2SequenceState`, owned by the sequence's `AttentionSequenceStates`):
+**Lifetime and ownership** (`DFlash2State`, owned by the sequence's `AttentionStates`):
 
 - Tap rows: written by the latest target quantum that seeds drafting (a prefill chunk or a verification), consumed by the
   DRAFT_CONTEXT quantum that follows it, overwritten by the next. A sequence's quanta are serial, so one buffer serves; it is
@@ -87,7 +87,7 @@ context rows) on the native Blackwell FP4 route. The output head is the target's
 **Prefetch of host-backed weights.** When some target weights are host-backed, a verification streams them through the staging
 ring ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)), and its first layers wait for the first copies. The block quantum, whose transfer
 lane is otherwise idle for its few milliseconds, copies the decode view's first ring slots; a decode or verification quantum that
-finds them loaded runs a view without those transfers (`QwenExecutionPlan.preloadedVariant`). The runtime marks the ring loaded
+finds them loaded runs a view without those transfers (`ExecutionPlan.preloadedVariant`). The runtime marks the ring loaded
 only when every stage of the prefetching quantum ran, under the ring's hold, so any other staging quantum in between (another
 sequence's prefill) clears it.
 

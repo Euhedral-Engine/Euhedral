@@ -231,7 +231,7 @@ largest selection does not fit. MTP3 is the policy for NVFP4 artifacts.
 
 ## Measurement notes
 
-- **`QwenSpeculativeDecoder.Statistics.catchUpNanos` excludes the MTP layer's catch-up over the prompt.** That catch-up (45 ms per
+- **`MtpDecoder.Statistics.catchUpNanos` excludes the MTP layer's catch-up over the prompt.** That catch-up (45 ms per
   step at 63K-token prompts) is reported in `promptCatchUpNanos`.
 
 ## Not done

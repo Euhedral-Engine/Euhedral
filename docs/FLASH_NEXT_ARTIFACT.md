@@ -78,7 +78,7 @@ or `attention/{q_proj,k_proj,v_proj,o_proj,q_norm,k_norm,indexer/{index_qk_proj,
 `moe/{router,shared_expert/{gate_proj,up_proj,down_proj},shared_expert_gate}` and the bank `moe/experts`; layer 1 also holds
 `ple/{key_proj,value_proj,conv1d,norm_*}` and `ple/ngram/shard_000..127` (the checkpoint's `ple_layer_ids` of `[2]` are
 numbered from 1). `mtp/...` mirrors a layer plus `fc_embedding`, `fc_hidden` and the pre-fusion norms; `vision/...` keeps the
-tower's names. `Qwen4Inventory.expected(config)` derives the whole list from the configuration, and the validator accepts an
+tower's names. `ExpectedInventory.expected(config)` derives the whole list from the configuration, and the validator accepts an
 artifact only when its tables are exactly that: no missing, extra, misshapen or mis-grouped object.
 
 Every fixed NVFP4 tensor is a `row-split-k128-v1` tensor of the dense format (`Nvfp4Layout`): codes, scales at the next 256-byte
@@ -138,5 +138,5 @@ tensors, 49 expert banks of 512 records), SHA-256 `c52ef26dee424671a1f852a762eca
 
 Layout counts: 1,118 contiguous BF16, 311 row-split NVFP4, 128 interleaved NVFP4 shards, 25,088 expert records. Conversion on
 this machine (checkpoint on exFAT, artifact on ext4, 4 workers) takes about 75 seconds of writing; `verify --checkpoint`
-confirmed all 104,913,171,900 payload bytes equal the checkpoint's, and `Qwen4Validator.verifyChecksums` checks every CRC-32
+confirmed all 104,913,171,900 payload bytes equal the checkpoint's, and `Validator.verifyChecksums` checks every CRC-32
 in the Java reader.

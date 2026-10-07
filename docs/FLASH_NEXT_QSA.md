@@ -3,7 +3,7 @@
 Execution of the sparse-attention layers of Qwen3.8-Flash-Next (HF `qwen4_exp`): 12 of its 48 layers (3, 7, ..., 47) run
 `Qwen4ExpTextAttention` with its `Qwen4ExpTextQSAIndexer` (upstream revision `f5ab85619d989359ef47b5efed8a91a15045627b`,
 `modular_qwen4_exp.py`). This note records what the code computes, the selection rule, the kernels, the numerics and what was
-measured. Sources: `native/src/qwen4/qsa_{norm,index,attention}.cuh`, `core/.../qwen4/Qwen4Qsa{Ops,State,Layer}.java`.
+measured. Sources: `native/src/qwen4/qsa_{norm,index,attention}.cuh`, `core/.../model/qwen4/Qsa{Ops,State,Layer}.java`.
 
 ## What upstream computes
 
@@ -60,9 +60,9 @@ x [rows, 2560]
   o_proj (NVFP4) -> out [rows, 2560]
 ```
 
-`Qwen4QsaLayer.run` executes this for a chunk of rows starting at the state's committed length and returns the attention block's
+`QsaLayer.run` executes this for a chunk of rows starting at the state's committed length and returns the attention block's
 result before the hyper-connection injection. It reserves the cache pages and marks the chunk submitted; the caller commits
-(`Qwen4QsaState.commit`) after the quantum retired or discards. The weights are device addresses (NVFP4 projections with their byte
+(`QsaState.commit`) after the quantum retired or discards. The weights are device addresses (NVFP4 projections with their byte
 sizes; the caller resolves staging); the scratch is the caller's (`scratchBytes(rows)`, `scratch(base, rows)`).
 
 **Chunk independence.** A block key is final when its block completes, from raw keys that are either in the chunk or in the
@@ -71,7 +71,7 @@ blocks that complete inside the chunk, so any chunking gives the same selection 
 summation order of the attention (the number of key splits depends on the row count). With row-exact projections (below) chunks of
 1 to 5 rows, 31, 512 and one shot of 2,300 tokens agree to a relative RMS of 1.6e-3 or better (the BF16 rounding of the output).
 
-**State** (`Qwen4QsaState`, one per layer and sequence): the KV pages (an `AttentionKvState`, pages of 256 tokens allocated as the
+**State** (`QsaState`, one per layer and sequence): the KV pages (an `AttentionKvState`, pages of 256 tokens allocated as the
 sequence grows), the pooled block keys (`[maxBlocks][128]` BF16, allocated for the maximum context), and two raw tails
 (`[3][128]` BF16): a chunk reads the committed tail and writes the other, `commit` swaps them, so a discarded chunk leaves the
 committed state intact. Per token: 576 bytes of KV (2 heads x K and V x 144) and 64 bytes of block keys (256 per block), 640 in
@@ -79,8 +79,8 @@ all; at 262,144 tokens 160 MiB per layer (144 + 16), 1.875 GiB for the 12 layers
 
 ## Kernels
 
-All in the Flash-Next module (`native/src/qwen4/kernels.cu`, table `native/src/host/qwen4_ops.c`, enum `Qwen4Kernel`), launched
-through `Qwen4QsaOps`; arguments are verified against the compiled signatures at launch.
+All in the Flash-Next module (`native/src/qwen4/kernels.cu`, table `native/src/host/qwen4_ops.c`, enum `Kernel`), launched
+through `QsaOps`; arguments are verified against the compiled signatures at launch.
 
 | kernel | geometry | what |
 |---|---|---|
@@ -117,8 +117,8 @@ Scores are tiled over rows so that the scratch stays bounded: the FP32 scores of
 
 ## Validation
 
-Tests are `Qwen4Qsa*CudaIntegrationTest` (`./gradlew :core:cudaIntegrationTest --tests '*Qwen4Qsa*'`; a Blackwell GPU, and for the
-layer tests the artifact and the fixtures). The references are in `Qwen4QsaReference`: a port of the upstream per-query indexer
+Tests are `model.qwen4.Qsa*CudaIntegrationTest` (`./gradlew :core:cudaIntegrationTest --tests '*model.qwen4.Qsa*'`; a Blackwell GPU, and for the
+layer tests the artifact and the fixtures). The references are in `QsaReference`: a port of the upstream per-query indexer
 loop and attention, written with PyTorch's rounding.
 
 - operators on synthetic data: norm and RoPE (strided, in place, positions to 16,000,000), pooling across chunkings of 97 tokens (1,
@@ -164,7 +164,7 @@ equals the reference exactly (score gap 0).
 ## Measurements
 
 RTX 5070 Ti, CUDA 13.1, layer 3 of the real artifact. The history is built by running the layer over random rows; times are the
-average of repeated runs on the stream, in milliseconds (`Qwen4QsaTimingCudaIntegrationTest`, `EUHEDRAL_QWEN4_TIMING=1`).
+average of repeated runs on the stream, in milliseconds (`QsaTimingCudaIntegrationTest`, `EUHEDRAL_QWEN4_TIMING=1`).
 "block" is one `run` including four projections, the output projection and the retirement wait; the columns are its parts.
 
 | history | rows | block | projections | select (scores, top-k) | attention | o_proj |
@@ -217,4 +217,4 @@ at 262,144 tokens, scratch for 512 rows and its weights peaked at 242 MiB of dev
 - Selection ties follow the lowest-id rule, which matched upstream's `torch.topk` in every observed tie (16 rows); `topk` does not
   promise it.
 - Rolling a committed sequence back to an earlier length is not supported (the raw tail only holds the incomplete block);
-  `Qwen4QsaState.reset` and discarding the chunk in flight are.
+  `QsaState.reset` and discarding the chunk in flight are.

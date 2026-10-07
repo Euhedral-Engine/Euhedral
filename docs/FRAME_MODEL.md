@@ -1,9 +1,9 @@
 # Qwen execution model
 
 A Qwen execution plan defines a static DAG of execution stages. A reusable runtime instance represents
-those stages as independent Euhedral frames. Admission exposes only root frames through a
-Qwen-specific `LatticeSource`. Successful stages create successor readiness and publish ready
-successors back to that source. CUDA stream order carries ordinary device dependencies; actual device
+those stages as independent Euhedral frames. Admission exposes only root frames, through the runtime's
+`InferenceLake`. Successful stages create successor readiness and publish ready
+successors to the lake. CUDA stream order carries ordinary device dependencies; actual device
 completion is reserved for state-publication and ownership boundaries.
 
 Euhedral has no central scheduler or authority; scheduling is emergent. Workers take available frames
@@ -14,7 +14,7 @@ work, or walks the graph after admission.
 
 ## Immutable plan and reusable graph
 
-`QwenExecutionPlan` is the schema. It describes the stages (instructions), their immutable weight
+`ExecutionPlan` is the schema. It describes the stages (instructions), their immutable weight
 bindings, their input and output buffers, the dependency edges, the plan views (decode and the prefill
 region views), and static metadata. It is never the live scheduler. `stageTopology()` exposes the DAG
 as a `StageTopology`: stages numbered in topological order, each edge tagged with the boundary it waits
@@ -24,15 +24,15 @@ for.
 quantum at a time:
 
 - one `StageFrame` per stage, created with its immutable instruction and weight binding
-  (`QwenStageFrame.create` chooses `EmbeddingFrame`, `WeightTransferFrame`, `RmsNormFrame`, `LinearFrame`, or
-  `QwenGpuOperationFrame`);
+  (`InstructionFrame.create` chooses `EmbeddingFrame`, `WeightTransferFrame`, `RmsNormFrame`, `LinearFrame`, or
+  `OperationFrame`);
 - successor references, wired at construction;
 - one frame per device-completion edge and one retirement frame;
-- a persistent CUDA stream and its own `QwenExecutionSource`;
-- its workspace storage (`QwenWorkspaceStorage`), which the runtime's pool keeps with the graph.
+- its home lane in the runtime's lane pool;
+- its workspace storage (`WorkspaceStorage`), which the runtime's pool keeps with the graph.
 
 Per quantum, the graph only resets fan-in counters and per-stage flags and binds the
-`QwenExecutionContext`. No frame, wrapper, successor list, graph, or device buffer is created on the hot
+`Quantum`. No frame, wrapper, successor list, graph, or device buffer is created on the hot
 path. `EuhedralInferenceRuntime` keeps a pool of idle graphs per plan view and builds another graph only
 when every existing one is running a quantum, for example for concurrent sequences.
 
@@ -40,7 +40,7 @@ when every existing one is running a quantum, for example for concurrent sequenc
 
 Each resource lives as long as its natural owner, so the token boundary neither allocates nor frees:
 
-- Workspace storage belongs to the graph. A quantum's `QwenExecutionWorkspace` acquires its buffers,
+- Workspace storage belongs to the graph. A quantum's `Workspace` acquires its buffers,
   including the token-ID buffer, from the graph's storage at admission and releases the binding at
   retirement without freeing anything; the next quantum on the graph finds the same allocations. The
   storage is a fixed table of slots, one per buffer. A slot keeps the largest allocation a binding asked
@@ -49,7 +49,7 @@ Each resource lives as long as its natural owner, so the token boundary neither 
   graph only after its quantum retired, storage is never shared by two live quanta. The runtime frees it
   when it closes, and only when the device proves completion; `retainedWorkspaceBytes()` reports it, so
   the engine's device bytes after a session closes are exactly the weights plus that storage.
-- A sampling quantum copies its final logits row into its session's pinned `QwenHostLogits` row. The
+- A sampling quantum copies its final logits row into its session's pinned `HostLogits` row. The
   logits stage queues the device-to-host copy on its own lane right after the LM head, so the
   quantum's single retirement boundary proves the row complete; the CPU reads it only after a
   successful outcome, converting into a reusable FP32 scratch row. Device logits stay in the graph's
@@ -60,7 +60,7 @@ Each resource lives as long as its natural owner, so the token boundary neither 
 - Persistent sequence state (KV pages, page tables, GDN state, decode scratch) belongs to the sequence
   and is released when it completes.
 
-`QwenExecutionContext` is the quantum: its token range, sequence lease, workspace, failure and
+`Quantum` is the quantum: its token range, sequence lease, workspace, failure and
 cancellation state, and outcome. It is the graph's `StageQuantum` binding.
 
 ## Admission
@@ -71,7 +71,7 @@ Admission is small:
 2. prepare quantum-owned resources with the graph's stream selected (sequence lease, persistent state on
    first use, the binding of the graph's workspace storage), so any initialization it queues precedes
    every stage;
-3. publish the root stages to the graph's source.
+3. publish the root stages to the lake.
 
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
 terminal outcome at admission, after the stream proves that queued initialization stopped. A quantum is
@@ -79,29 +79,12 @@ admitted at most once: if admission itself fails, the failure is thrown and the 
 too, so it can never be retried into a second lease. An outcome reached at admission is published only
 after the graph's stream is deselected, so outcome callbacks never launch onto it.
 
-## The Qwen `LatticeSource`
+## The lake
 
-`QwenExecutionSource` is the bottom boundary between a graph and Euhedral. Its ready storage is an MPSC
-queue of `AbstractFrame`; it knows nothing about what a frame computes, which frames depend on it, or
-how many stages a graph has.
-
-- `pull` hands ready frames directly to Euhedral's consumer, honours the stop condition before taking a
-  frame, and never pushes. Frames that a pulled frame makes ready are appended and delivered by the same
-  pull, without recursion.
-- `request` accumulates demand. Demand left by an empty drain is served when a successor later becomes
-  ready: a publication on a worker thread pushes against outstanding demand.
-- Euhedral never calls `pull` and `request` concurrently. Publishers run on other workers and on CUDA
-  driver threads, so the queue has one drain owner at a time; a publication delivers only while no
-  other drain is active.
-- A driver callback thread only enqueues (`publishFromCallback`); the next `pull` or `request` delivers
-  the frame.
-- `admit` and `terminated` count accepted quanta. `completeGracefully` closes admission, and the source
-  completes only after every accepted quantum has retired.
-
-Each reusable graph attaches its source to the lattice once, when the graph is built. A worker draining
-one graph's source therefore never holds another quantum's ready frames, and independent quanta
-proceed independently. A source is available to the workers registered when it is attached; graphs
-are built on first use, after the lattice has started.
+Graphs publish ready frames into the runtime's `InferenceLake`: several queue ingest sinks, each an upstream source of
+the lattice, chosen by a frame's routing hash. Publishing only enqueues, so a stage on a worker, a request thread and a
+CUDA driver callback all publish the same way. The lake counts the quanta and host tasks it was asked to carry; closing
+the runtime refuses new admissions and completes once every admitted unit terminated.
 
 ## Readiness, fan-out, and fan-in
 
@@ -110,7 +93,7 @@ A stage frame runs its operation and returns. Its finalizer, not its body, relea
 ```text
 stage A submits its kernels to its lane
   -> A's doFinally satisfies each outgoing edge
-     -> the arrival that completes B's incoming set publishes B to the source
+     -> the arrival that completes B's incoming set publishes B to the lake
         -> a worker with capacity takes B (first come, first served), or the lattice
            routes it to a worker by B's hash
 ```
@@ -156,7 +139,7 @@ random lanes. Every graph spreads its stages, decode and prefill alike. There ar
 
 With stages on different lanes the stream no longer orders every write after earlier reads and
 writes of the same storage, so the plan adds those edges explicitly
-(`QwenExecutionPlan.withStorageHazards`, counting aliased region storage as one buffer) wherever the
+(`ExecutionPlan.withStorageHazards`, counting aliased region storage as one buffer) wherever the
 data dependencies do not already imply them. Decode keeps the GDN Q4 and Q5 projections as separate
 leaf frames, and every view keeps the attention producers as four leaf frames (Q projection -> QK norm
 and RoPE, KV projection -> cache append), so those branches can run on different lanes.
@@ -197,7 +180,7 @@ enqueues the retirement frame, and that frame:
 
 1. confirms the boundary (and on failure proves the device idle or poisons it);
 2. runs each attempted stage's retirement hook: commit on success, release temporaries always;
-3. releases the quantum's workspace binding and publishes sequence state (`QwenExecutionContext.retire`);
+3. releases the quantum's workspace binding and publishes sequence state (`Quantum.retire`);
 4. returns the graph to its pool and ends the quantum's admission count;
 5. publishes the outcome.
 
@@ -238,7 +221,7 @@ quantum that does not succeed leaves its sequence terminal, so no partial update
   until the process restarts.
 - A CUDA driver callback never calls CUDA, runs a frame, or releases memory.
 - No frame throws into Euhedral. A failed submission, an `Error` included, is recorded on the quantum:
-  an escaping `Error` would complete the graph's source or end the worker.
+  an escaping `Error` would complete the lake's sink or end the worker.
 - Euhedral finalizes a frame it rejected without running it (its worker cache retired, or nothing was
   routable) through `doFinallyWithError`. A rejected stage fails its quantum. A rejected
   device-completion or retirement frame is finished on the rejecting thread, which is never a driver
@@ -321,7 +304,7 @@ constraint still copies the row. After the LM head the 0.5 MB logits row reaches
 
 ## Plan views
 
-For a complete model, `QwenExecutionPlan.forExecution(kind, rows)` selects the topology per quantum. There is no runtime or serving
+For a complete model, `ExecutionPlan.forExecution(kind, rows)` selects the topology per quantum. There is no runtime or serving
 switch; the plan owns its fixed views and any view requalifies through its owner.
 
 ```text
@@ -359,7 +342,7 @@ Decode and VERIFY quanta that start below 1024 tokens launch their kernels with 
 (about +1%) at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches. Quanta replayed from
 captured CUDA graphs ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)) carry programmatic edges at every position instead.
 
-`QwenExecutionPlan.reference(weights)` is the unfused oracle used by tests; staged plans (`prefix`,
+`ExecutionPlan.reference(weights)` is the unfused oracle used by tests; staged plans (`prefix`,
 `embeddingOnly`, operator slices) are also reference-only.
 
 ## Kernel leaves

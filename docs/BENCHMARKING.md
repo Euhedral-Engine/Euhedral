@@ -1,7 +1,7 @@
 # Benchmarking
 
 The `benchmark` Gradle module is an end-to-end harness. It loads `InferenceEngine`, creates a fresh
-`QwenGenerationSession` for every iteration, and runs the real tokenizer -> Euhedral lattice -> CUDA
+`Session` for every iteration, and runs the real tokenizer -> Euhedral lattice -> CUDA
 path. It is not part of `core` or `api` and is not packaged in the API JAR. The `run` command writes
 end-to-end engine measurements. The engine derives its execution policy (kernels, speculative
 depth, host-backed weight residency) from the artifact, and prefill runs in 512-token chunks, so
@@ -153,7 +153,7 @@ prepared count; a mismatch fails the row.
 All timestamps are `System.nanoTime()` on the generating thread. Each duration comes from its own
 boundary pair; none is derived by subtracting one phase from an aggregate.
 
-Boundaries come from an opt-in `GenerationTimingListener` on `QwenGenerationSession.generate`. Without
+Boundaries come from an opt-in `GenerationTimingListener` on `Session.generate`. Without
 a listener the session records nothing and calls nothing extra.
 
 - **generate entry / return:** taken immediately around `session.generate`. Session creation and

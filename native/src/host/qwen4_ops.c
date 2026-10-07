@@ -18,7 +18,7 @@
  * index, its geometry and its arguments as 8-byte words with the byte size (4 or 8) each argument has in the kernel's
  * signature. The launcher checks the argument count and every size against the compiled kernel
  * (cuFuncGetParamInfo), so a mismatch between the Java caller and the CUDA source fails the call instead of
- * corrupting it. The order of EUHEDRAL_QWEN4_KERNELS is the ABI: Qwen4Kernel on the Java side lists the same names in
+ * corrupting it. The order of EUHEDRAL_QWEN4_KERNELS is the ABI: model.qwen4.Kernel on the Java side lists the same names in
  * the same order and a test compares them. */
 #define QWEN4_MAX_PARAMETERS 32
 

@@ -9,8 +9,8 @@ import org.slf4j.LoggerFactory;
 /// the directory of the experts that hash to it.
 ///
 /// A shard has one owner, and every method but [#isCurrent] and the inspection methods is called
-/// only by it. The owner confines it
-/// ([io.euhedral_execution.inference.core.scheduling.graph.Confined]): one thread at a time applies
+/// only by it. The owner confines it ([io.euhedral_execution.inference.core.model.qwen4.ExpertCacheOwner]: its
+/// frames carry the owner's routing hash): one thread at a time applies
 /// its transitions, so the shard's state is plain fields with no lock, no atomic and no condition. A
 /// lease closed on any thread reports to its [ExpertLease.Owner], which posts the release to the
 /// owner; nothing here waits or is waited for.

@@ -18,7 +18,7 @@ import java.util.regex.Pattern;
 /// pinnable memory, the requested maximum context and the artifact's actual object sizes it decides
 /// what lives on the device for good, what is host-backed, what is mapped, what stays unloaded, and
 /// how many bytes are left for the routed-expert cache. It keeps no replacement state; the cache
-/// ([io.euhedral_execution.inference.core.model_loader.qwen4.expert]) manages the budget this
+/// ([io.euhedral_execution.inference.core.model.qwen4.expert]) manages the budget this
 /// planner hands it.
 ///
 /// ```

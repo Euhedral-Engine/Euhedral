@@ -15,11 +15,11 @@ token -> embedding row -> repeated over 4 residual streams
 
 Flash-Next's operators are many small kernels that differ in their arguments. They live in one NVRTC module
 (`native/src/qwen4/kernels.cu`) behind one native entry point, `euhedral_cuda_qwen4_launch(kernel, grid, block, shared,
-words, sizes, count)`: a table of kernel names in `native/src/host/qwen4_ops.c` and the enum `Qwen4Kernel` list the same
+words, sizes, count)`: a table of kernel names in `native/src/host/qwen4_ops.c` and the enum `Kernel` list the same
 names in the same order (a test compares them). The launcher checks the number and width (4 or 8 bytes) of every argument
 against the compiled kernel with `cuFuncGetParamInfo`, so a mismatch between a Java caller and the CUDA source fails the
 call. Launches go through `euhedral_launch_kernel`, so they are hashed and recorded like every other submission. Adding a
-kernel is a `.cuh`, an entry in the table and the enum, and a typed wrapper in `Qwen4Ops`.
+kernel is a `.cuh`, an entry in the table and the enum, and a typed wrapper in `Ops`.
 
 ## Numerics contract
 
@@ -46,7 +46,7 @@ Relative RMS is `sqrt(mean((engine - reference)^2) / mean(reference^2))`; one BF
 ## Four-stream gated residual
 
 The residual state of a token is four rows of 2560 values, `[stream][2560]`, started as the embedding repeated four times and
-never collapsed into one. Before the attention block and before the MoE block `Qwen4HyperConnection.mix` normalizes each
+never collapsed into one. Before the attention block and before the MoE block `HyperConnection.mix` normalizes each
 stream (grouped RMSNorm with `1 + weight`), projects the 10,240 values to a rank-320 vector, applies `silu(x / 4)`, projects
 back and gates the normalized streams with `sigmoid`; the block's input is the mean over streams. A third projection yields four
 injection weights, `2 * sigmoid(x / 4)`; after the block, `inject` adds the block's result to every stream scaled by its weight.
@@ -55,7 +55,7 @@ injection weights in its scratch for the injection that follows.
 
 ## Per-layer embedding and n-gram state
 
-Layer 1 adds per-layer embeddings before its hyper-connection. The ids come from `Qwen4NgramIds`: for each token the 2-gram and
+Layer 1 adds per-layer embeddings before its hyper-connection. The ids come from `NgramIds`: for each token the 2-gram and
 3-gram heads hash the token with its one or two predecessors (64-bit multiplies by the artifact's multipliers, XOR, modulus of
 the head's prime vocabulary, plus the head's offset), a predecessor beyond an end-of-sequence token or the start of the
 sequence reads as end-of-sequence. The two tokens before the next position are the state a sequence carries between prefill
@@ -101,7 +101,7 @@ routed experts (NVFP4 records in the expert cache), BF16 products, summed in asc
 out = routed + gated shared
 ```
 
-`Qwen4MoeLayer` runs one block. The router and the shared expert are queued on the layer's stream, followed by the copy of the
+`MoeLayer` runs one block. The router and the shared expert are queued on the layer's stream, followed by the copy of the
 routing (ids and weights) to the host. That is the block's one host wait: which experts to bring in is known only on the host.
 
 **Expert waves.** A chunk of 512 tokens names up to 512 distinct experts, more than a minimal cache (20 slots) holds, and the
@@ -121,14 +121,14 @@ the cache's own copy stream and the acquirer waits for that copy, not for any co
 
 **Exactness.** The expert kernels read NVFP4 weights in place and take BF16 activations at every row count (no FP4 activation
 quantization): the bits of a (token, expert) pair depend only on the token's own activations, never on how many other tokens
-the expert saw, which wave it ran in or what was in the cache. `Qwen4MoeFixtureCudaIntegrationTest` runs layer 0 with the
+the expert saw, which wave it ran in or what was in the cache. `MoeFixtureCudaIntegrationTest` runs layer 0 with the
 20-slot minimum cache (every chunk evicts) and with 520 slots and requires identical bits.
 
 Kernel contract and measurements of the expert kernels: [FLASH_NEXT_EXPERTS.md](FLASH_NEXT_EXPERTS.md).
 
 ## Execution plan, sequence state, prefill and decode
 
-`Qwen4ExecutionPlan` describes how a loaded `Qwen4Model` runs one chunk of up to 512 tokens: the embedding gather (the table may be in
+`ExecutionPlan` describes how a loaded `Qwen4Model` runs one chunk of up to 512 tokens: the embedding gather (the table may be in
 device memory or host-mapped), the repetition over four streams, 48 layers, then, when logits are wanted, the final mix of the
 last row and the output head. Prefill chunks and decode steps are the same code over different row counts; the output of a step
 is the logits row of its last token, offered to a `LogitsSink` that queues its copy behind the head. A chunk is a quantum of a
@@ -138,11 +138,11 @@ loaded by a stage that completes when they are resident, the wave's kernels foll
 runtime arms after the output head. Each graph owns a workspace (state, mixer, block output, hyper-connection, layer and MoE
 scratch, about 260 MiB at 512 rows), allocated once with the plan.
 
-**Sequence state** (`Qwen4Sequence`) is what one sequence carries between steps: the FP32 recurrent state and three rows of
+**Sequence state** (`Sequence`) is what one sequence carries between steps: the FP32 recurrent state and three rows of
 convolution history of each of the 36 GDN layers (114 MiB, independent of length), the NVFP4 key/value pages and pooled indexer
 keys of each of the 12 attention layers (640 bytes per token, pages reserved as the sequence grows), the per-layer embedding's
 convolution history and n-gram context, and the position. Expert residency is not in it: it belongs to the model's cache, so any
-number of sequences share it and none retains a slot. The residency plan's accounting (`Qwen4SequenceState`) is what a sequence
+number of sequences share it and none retains a slot. The residency plan's accounting (`SequenceState`) is what a sequence
 actually allocates (`aSequenceHoldsWhatThePlanReserved`). The KV chunk of a step is committed when the step has retired and discarded
 when it failed, so a failed step leaves the sequence where it was; closing releases every buffer.
 
@@ -150,7 +150,7 @@ when it failed, so a failed step leaves the sequence where it was; closing relea
 token-by-token run would reach), through attention with per-row selection, and through the MoE block in expert waves. Any
 chunking gives the same result up to BF16 noise, because the engine's NVFP4 linears switch kernels at nine rows (activations are
 quantized from nine rows on): the logits of one prompt differ by about 7% to 10% relative RMS between chunkings, the reference's own
-chunk-to-chunk difference being 9%, with the same greedy token (`Qwen4InvarianceCudaIntegrationTest`). The expert cache is another
+chunk-to-chunk difference being 9%, with the same greedy token (`InvarianceCudaIntegrationTest`). The expert cache is another
 matter: the experts' kernels are row-exact and independent of what is resident, so a cold cache, a warm cache and the 20-slot
 minimum cache with 10,019 evictions produce identical bits.
 
@@ -167,9 +167,9 @@ written per layer without changing the graph, and fences stay device-ordered eit
 ## Engine and API
 
 A Flash-Next artifact is selected by the artifact alone: `InferenceEngine` recognises the `qwen4_exp` architecture, opens the
-storage, planner, expert cache and `Qwen4ExecutionPlan` (`Qwen4Runtime`), and hands the API a `GenerationSession`. The session
+storage, planner, expert cache and `ExecutionPlan` (`Qwen4Runtime`), and hands the API a `GenerationSession`. The session
 interface is the part of generation the API needs (prefill chunks, decode steps, cancellation, the sampler's logits); the dense
-model's session and `Qwen4GenerationSession` both implement it, and the API's request handling contains no model-specific
+model's session and `Session` both implement it, and the API's request handling contains no model-specific
 branches. A generation is a chain of continuations on the lattice, not a loop on a thread: each step's end samples, emits text and starts the
 next step; the plan runs one step at a time and a step admitted meanwhile starts when the running one concludes. Cancellation stops the
 running step at its next stage. The runtime owns no executor, pool or thread; prompt tokenization and the host work a request needs
@@ -178,7 +178,7 @@ from several: the expert reads of one wave run on as many workers as the staging
 
 ## End-to-end agreement
 
-`Qwen4GreedyAgreementCudaIntegrationTest` compares the engine's greedy continuation with the reference's, both reading the KV
+`GreedyAgreementCudaIntegrationTest` compares the engine's greedy continuation with the reference's, both reading the KV
 cache through the NVFP4 codec (`tools/flash_next_reference/cli.py greedy`, fixture `core/src/test/resources/qwen4/greedy-reference.json`).
 Teacher-forced (the engine fed the reference's tokens) and free-running (the engine fed its own), 72 of 72 positions agree, and the
 engine's tokenisation of every prompt matches the reference tokenizer's. A position where the reference's top two logits are within
@@ -186,7 +186,7 @@ the BF16 noise of the comparison (1.0 logit) is not counted as a disagreement; n
 
 ## Measured performance
 
-Measured by `Qwen4PerformanceCudaIntegrationTest` (`EUHEDRAL_QWEN4_PERF=1`, report in `core/build/qwen4-performance.txt`) on a
+Measured by `PerformanceCudaIntegrationTest` (`EUHEDRAL_QWEN4_PERF=1`, report in `core/build/qwen4-performance.txt`) on a
 16 GB GPU with the artifact on a file-backed expert store (52 MiB pinned host memory), a 5120-token context plan, 3547 of 24576
 expert slots resident (9366 MiB), 4190 MiB of fixed weights, and the step uncaptured. The decode figures are at 64 and at 4096
 tokens of context; 16K and 32K were not measured.
