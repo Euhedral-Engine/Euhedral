@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.prefix;
 
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
@@ -7,9 +8,10 @@ import io.euhedral_execution.inference.core.model.qwen38.GdnStates;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
-import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeCheckpoint;
 import io.euhedral_execution.inference.core.prefix.HostExtents;
+import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
+import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.prefix.PrefixTree;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
@@ -19,13 +21,13 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Supplier;
 
 /// Sequence state kept across requests, in one pinned host arena: checkpoints of the KV pages and GDN state
 /// that prefill produced, found again by the token prefix they cover.
 ///
 /// A checkpoint sits on the prefill chunk grid, because prefill state depends on how the prompt was split
-/// into chunks: a sequence restored at a multiple of [#CHUNK_TOKENS] prefills the rest in the chunks a cold
+/// into chunks: a sequence restored at a multiple of [InferenceConfig#PREFILL_CHUNK_TOKENS] prefills the rest in the
+/// chunks a cold
 /// run would use, and ends up with the state a cold run has. Checkpoints are taken every `intervalTokens`
 /// and at the last chunk boundary before a prompt ends (see [#wantsCheckpoint]).
 ///
@@ -33,16 +35,9 @@ import java.util.function.Supplier;
 /// a long copy. A capture reserves its bytes first (evicting the least recently used nodes), copies, then
 /// publishes; a failed copy gives the bytes back. A restore pins the chain it reads until the copies ran.
 public final class PrefixCache implements AutoCloseable {
-    /// The prefill chunk the cache's checkpoints are aligned to; sessions that use the cache prefill in it.
-    public static final int CHUNK_TOKENS = Session.DEFAULT_PREFILL_CHUNK_TOKENS;
 
     /// The most bytes of copies one frame runs.
     static final long PIECE_BYTES = 16L << 20;
-
-    /// Runs a piece of host work as one frame and completes with its result.
-    public interface Frames {
-        <T> CompletableFuture<T> run(Supplier<T> work);
-    }
 
     /// A pinned match: its chain stays in the cache until [#release].
     public record Hit(PrefixTree.Match match) {
@@ -55,21 +50,6 @@ public final class PrefixCache implements AutoCloseable {
             return this.match.leaf();
         }
     }
-
-    public record Stats(
-            long lookups,
-            long hits,
-            long reusedTokens,
-            long captured,
-            long skipped,
-            long failed,
-            long evictions,
-            long usedBytes,
-            long totalBytes,
-            int nodes,
-            long captureNanos,
-            long restores,
-            long restoreNanos) {}
 
     private final ExecutionGpu gpu;
     private final PrefixLayout layout;
@@ -99,9 +79,9 @@ public final class PrefixCache implements AutoCloseable {
 
     public PrefixCache(
             ExecutionGpu gpu, Qwen38Config config, MemorySegment arena, Runnable release, int intervalTokens) {
-        if (intervalTokens <= 0 || intervalTokens % CHUNK_TOKENS != 0)
+        if (intervalTokens <= 0 || intervalTokens % InferenceConfig.PREFILL_CHUNK_TOKENS != 0)
             throw new IllegalArgumentException(
-                    "the checkpoint interval must be a positive multiple of " + CHUNK_TOKENS);
+                    "the checkpoint interval must be a positive multiple of " + InferenceConfig.PREFILL_CHUNK_TOKENS);
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.layout = PrefixLayout.of(config);
         this.arena = Objects.requireNonNull(arena, "arena");
@@ -125,7 +105,7 @@ public final class PrefixCache implements AutoCloseable {
     /// it, skip all but the last chunk.
     public boolean wantsCheckpoint(int end, int promptLength) {
         if (end % this.intervalTokens == 0) return true;
-        return end < promptLength && promptLength - end <= CHUNK_TOKENS;
+        return end < promptLength && promptLength - end <= InferenceConfig.PREFILL_CHUNK_TOKENS;
     }
 
     /// The longest stored prefix of `prompt` that leaves a token to prefill, pinned; null on a miss.
@@ -152,15 +132,15 @@ public final class PrefixCache implements AutoCloseable {
     /// `parent` when the sequence does not hold `position` rows, the cache is full, or a copy failed. Never
     /// fails.
     public CompletableFuture<PrefixNode> capture(
-            Frames frames, Sequence sequence, PrefixNode parent, int[] tokens, int position) {
+            PrefixFrames frames, Sequence sequence, PrefixNode parent, int[] tokens, int position) {
         return capture(frames, sequence, parent, tokens, position, null);
     }
 
-    /// As [#capture(Frames, Sequence, PrefixNode, int[], int)], also keeping the state of a speculative
+    /// As [#capture(PrefixFrames, Sequence, PrefixNode, int[], int)], also keeping the state of a speculative
     /// prompt's strategy. Without that state in the parent chain or in the sequence, the node is stored without
     /// it.
     public CompletableFuture<PrefixNode> capture(
-            Frames frames,
+            PrefixFrames frames,
             Sequence sequence,
             PrefixNode parent,
             int[] tokens,
@@ -192,7 +172,7 @@ public final class PrefixCache implements AutoCloseable {
     }
 
     private CompletableFuture<PrefixNode> captureHeld(
-            Frames frames,
+            PrefixFrames frames,
             Sequence sequence,
             PrefixNode parent,
             int[] tokens,
@@ -241,7 +221,7 @@ public final class PrefixCache implements AutoCloseable {
         });
     }
 
-    public CompletableFuture<Boolean> restore(Frames frames, ExecutionPlan plan, Sequence sequence, Hit hit) {
+    public CompletableFuture<Boolean> restore(PrefixFrames frames, ExecutionPlan plan, Sequence sequence, Hit hit) {
         return restore(frames, plan, sequence, hit, null);
     }
 
@@ -251,7 +231,7 @@ public final class PrefixCache implements AutoCloseable {
     /// the sequence was cancelled meanwhile; it fails on any other error, leaving the sequence failed for the
     /// caller to close.
     public CompletableFuture<Boolean> restore(
-            Frames frames, ExecutionPlan plan, Sequence sequence, Hit hit, SpeculativeCheckpoint speculative) {
+            PrefixFrames frames, ExecutionPlan plan, Sequence sequence, Hit hit, SpeculativeCheckpoint speculative) {
         int position = hit.position();
         if (speculative != null)
             for (PrefixNode node : hit.match().chain())
@@ -311,8 +291,8 @@ public final class PrefixCache implements AutoCloseable {
         return sequence.cancellationRequested() || sequence.terminalState() == Sequence.TerminalState.CANCELLED;
     }
 
-    public Stats stats() {
-        return new Stats(
+    public PrefixCacheStats stats() {
+        return new PrefixCacheStats(
                 this.lookups.get(),
                 this.hits.get(),
                 this.reusedTokens.get(),
@@ -336,7 +316,7 @@ public final class PrefixCache implements AutoCloseable {
     }
 
     /// Runs `copies` in frames of at most [#PIECE_BYTES], one after another. `toDevice` selects the direction.
-    private CompletableFuture<Void> runCopies(Frames frames, List<PrefixLayout.Copy> copies, boolean toDevice) {
+    private CompletableFuture<Void> runCopies(PrefixFrames frames, List<PrefixLayout.Copy> copies, boolean toDevice) {
         CompletableFuture<Void> done = CompletableFuture.completedFuture(null);
         int from = 0;
         while (from < copies.size()) {

@@ -238,11 +238,8 @@ class ArchitectureTest {
     /// are what PR 2 is removing; each task deletes the ones it fixes.
     private static final Set<String> MODEL_IMPORTS_OUTSIDE_MODEL = Set.of(
             "InferenceEngine.java",
-            "InferenceConfig.java",
             "InferenceRunSnapshot.java",
             "runtime/EuhedralInferenceRuntime.java",
-            "runtime/HostTasks.java",
-            "api:metrics/EngineMetrics.java",
             "benchmark:run/BenchmarkRunner.java",
             "benchmark:run/Prerequisites.java");
 

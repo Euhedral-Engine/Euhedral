@@ -8,7 +8,7 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.WorkspaceStorage;
-import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
+import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
@@ -324,7 +324,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// Host work for the prefix cache: each piece runs as one frame on the lattice's workers.
-    public PrefixCache.Frames frames() {
+    public PrefixFrames frames() {
         return this.hostTasks.prefixFrames();
     }
 

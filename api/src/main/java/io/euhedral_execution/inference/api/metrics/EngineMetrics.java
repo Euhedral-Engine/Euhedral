@@ -1,7 +1,7 @@
 package io.euhedral_execution.inference.api.metrics;
 
 import io.euhedral_execution.inference.core.InferenceEngine;
-import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
+import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -65,26 +65,26 @@ public final class EngineMetrics implements MeterBinder {
                 .baseUnit("bytes")
                 .register(registry);
         if (engine.prefixCacheStats() == null) return;
-        cacheCounter(registry, "euhedral.prefix.lookups", "Prefix cache lookups", PrefixCache.Stats::lookups);
+        cacheCounter(registry, "euhedral.prefix.lookups", "Prefix cache lookups", PrefixCacheStats::lookups);
         cacheCounter(
                 registry,
                 "euhedral.prefix.hits",
                 "Prefix cache lookups that restored a prefix",
-                PrefixCache.Stats::hits);
+                PrefixCacheStats::hits);
         cacheCounter(
                 registry,
                 "euhedral.prefix.restored.tokens",
                 "Prompt tokens restored instead of prefilled",
-                PrefixCache.Stats::reusedTokens);
-        cacheCounter(registry, "euhedral.prefix.captures", "Checkpoints stored", PrefixCache.Stats::captured);
+                PrefixCacheStats::reusedTokens);
+        cacheCounter(registry, "euhedral.prefix.captures", "Checkpoints stored", PrefixCacheStats::captured);
         cacheCounter(
                 registry,
                 "euhedral.prefix.skipped",
                 "Checkpoints not stored for lack of room",
-                PrefixCache.Stats::skipped);
-        cacheCounter(registry, "euhedral.prefix.failed", "Checkpoints whose copies failed", PrefixCache.Stats::failed);
-        cacheCounter(registry, "euhedral.prefix.evictions", "Checkpoints evicted", PrefixCache.Stats::evictions);
-        cacheCounter(registry, "euhedral.prefix.restores", "Restores completed", PrefixCache.Stats::restores);
+                PrefixCacheStats::skipped);
+        cacheCounter(registry, "euhedral.prefix.failed", "Checkpoints whose copies failed", PrefixCacheStats::failed);
+        cacheCounter(registry, "euhedral.prefix.evictions", "Checkpoints evicted", PrefixCacheStats::evictions);
+        cacheCounter(registry, "euhedral.prefix.restores", "Restores completed", PrefixCacheStats::restores);
         cacheCounter(
                 registry,
                 "euhedral.prefix.capture.seconds",
@@ -95,20 +95,20 @@ public final class EngineMetrics implements MeterBinder {
                 "euhedral.prefix.restore.seconds",
                 "Time spent restoring prefixes",
                 stats -> stats.restoreNanos() / 1e9);
-        cacheGauge(registry, "euhedral.prefix.nodes", "Checkpoints held", PrefixCache.Stats::nodes);
-        cacheGauge(registry, "euhedral.prefix.used.bytes", "Pinned arena bytes in use", PrefixCache.Stats::usedBytes);
-        cacheGauge(registry, "euhedral.prefix.capacity.bytes", "Pinned arena bytes", PrefixCache.Stats::totalBytes);
+        cacheGauge(registry, "euhedral.prefix.nodes", "Checkpoints held", PrefixCacheStats::nodes);
+        cacheGauge(registry, "euhedral.prefix.used.bytes", "Pinned arena bytes in use", PrefixCacheStats::usedBytes);
+        cacheGauge(registry, "euhedral.prefix.capacity.bytes", "Pinned arena bytes", PrefixCacheStats::totalBytes);
     }
 
     private void cacheCounter(
-            MeterRegistry registry, String name, String description, ToDoubleFunction<PrefixCache.Stats> value) {
+            MeterRegistry registry, String name, String description, ToDoubleFunction<PrefixCacheStats> value) {
         FunctionCounter.builder(name, this.engine, engine -> value.applyAsDouble(engine.prefixCacheStats()))
                 .description(description)
                 .register(registry);
     }
 
     private void cacheGauge(
-            MeterRegistry registry, String name, String description, ToDoubleFunction<PrefixCache.Stats> value) {
+            MeterRegistry registry, String name, String description, ToDoubleFunction<PrefixCacheStats> value) {
         Gauge.builder(name, this.engine, engine -> value.applyAsDouble(engine.prefixCacheStats()))
                 .description(description)
                 .register(registry);
