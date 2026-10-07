@@ -178,6 +178,34 @@ class ArchitectureTest {
     }
 
     /// The packages of the core: shared layers and the model folders. The old split packages are gone.
+    /// The generation path runs as frames: no future chains and no locks. A session's `close` may wait (lifecycle),
+    /// `completeClose` is `synchronized` as a method, not a block, and the prefix cache's futures are met by one
+    /// `whenComplete` each until the cache becomes frames.
+    @Test
+    void generationRunsAsFramesWithoutFutureChainsOrLocks() throws IOException {
+        Pattern forbidden =
+                Pattern.compile("\\.then(Compose|Apply|Accept|Run|Combine)(Async)?\\(|\\bsynchronized\\s*\\("
+                        + "|\\bReentrantLock\\b|\\bSemaphore\\b|\\bBlockingQueue\\b|\\.wait\\(");
+        List<Path> files = new ArrayList<>(javaFiles("generation", false));
+        files.add(MAIN.resolve("model/qwen38/Session.java"));
+        files.add(MAIN.resolve("model/qwen38/Emission.java"));
+        files.add(MAIN.resolve("model/qwen4/Session.java"));
+        files.add(MAIN.resolve("model/qwen38/speculative/MtpDecoder.java"));
+        files.add(MAIN.resolve("model/qwen38/speculative/DFlash2Decoder.java"));
+        List<String> violations = new ArrayList<>();
+        for (Path file : files) {
+            List<String> lines = Files.readAllLines(file);
+            for (int i = 0; i < lines.size(); i++) {
+                String code = lines.get(i).strip();
+                if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
+                if (forbidden.matcher(code).find()) violations.add(relative(file) + ":" + (i + 1) + ": " + code);
+            }
+        }
+        assertTrue(
+                violations.isEmpty(),
+                "future chains or locks on the generation path:\n" + String.join("\n", violations));
+    }
+
     private static final Set<String> LAYERS = Set.of(
             "artifact",
             "generation",

@@ -35,7 +35,7 @@ and 8 KV heads of 128, block 8, mask token 248070, sliding window 2048, RMSNorm 
 
 ## 2. Execution
 
-One step is three quanta on the existing runtime, chained as continuations (`DFlash2Decoder`):
+One step is three quanta on the existing runtime, run as generation frames through `DFlash2Decoder`'s step ports:
 
 1. **DRAFT** (the block view, `ExecutionPlan.dflash2Block`): embedding, the 5 layers over all 8 rows at once, final norm,
    output head over rows 1..7, top-16 (`euhedral_dflash_topk_bf16`), selector projection and walk

@@ -46,7 +46,7 @@ embed ────────────────────────�
 | `Join` | The fan-in of frames spawned at run time: the last arrival publishes the continuation. |
 | `AsyncReads` | File reads that hold no worker: a frame submits the read to io_uring, and the read's completion is a frame that the reads' sink emits when the workers poll it. |
 | `InferenceLake` / `FrameLake` | The pool of ready work: queue ingest sinks, each an upstream source of the lattice, that every producer publishes into. It counts the units it carries and completes once they all ended. |
-| `HostFrames` / `HostTasks` | Where the work around the graph runs: the generation chain, tokenization, the expert hierarchy's other asynchronous work. `run` from a worker or ordinary thread, `runFromCallback` from a CUDA driver thread (enqueue only). |
+| `HostFrames` / `HostTasks` | Where the work around the graph runs: tokenization, the expert hierarchy's other asynchronous work. The generation's own frames (`Admit`, `Select`, `Finish`) are thrown into the lake by the session's `GenerationFrames`. `run` from a worker or ordinary thread, `runFromCallback` from a CUDA driver thread (enqueue only). |
 
 ### The step is a stream
 
@@ -118,7 +118,7 @@ Each load counts as a unit of the lake until its copy retired, so closing the ru
 
 A failure or cancellation stops new stages (a stage that has not started does not run) and lets what is in flight end: outstanding
 expert loads still complete (their leases are closed on arrival), submitted kernels retire at the quantum's single boundary, the
-chunk's KV state is discarded by the attention stage's retirement hook, uploads are released, and the listener sees the failure.
+chunk's KV state is discarded by the attention stage's retirement hook, uploads are released, and the session's `Select` frame sees the failure.
 Nothing is interrupted. Closing the runtime stops admission, waits for every accepted step to retire, then releases the graphs and
 their workspaces and the storage (the lattice still runs the copies' completions) before the host work drains and detaches.
 
