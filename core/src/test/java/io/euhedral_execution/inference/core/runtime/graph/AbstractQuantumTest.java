@@ -92,7 +92,7 @@ class AbstractQuantumTest {
         assertEquals(List.of(next), lake.frames, "thrown once, never run inline");
         assertSame(quantum, next.quantum);
         assertEquals(0, next.executions);
-        assertEquals(List.of("release", "commit", "published", "published"), quantum.calls);
+        assertEquals(List.of("commit", "release", "published", "published"), quantum.calls);
         assertNull(quantum.terminalFailure());
     }
 
@@ -159,6 +159,15 @@ class AbstractQuantumTest {
         quantum.retire(null);
         quantum.publishOutcome();
         assertEquals(1, next.executions, "a failed end is not a rejection: the frame must not run again");
+    }
+
+    @Test
+    void retireRunsOnceAndASecondCallChangesNothing() {
+        var quantum = new Probe();
+        quantum.retire(null);
+        quantum.retire(new IllegalStateException("late device failure"));
+        assertEquals(List.of("commit", "release"), quantum.calls);
+        assertNull(quantum.terminalFailure());
     }
 
     @Test

@@ -11,7 +11,7 @@ import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -70,7 +70,6 @@ public final class Quantum extends AbstractQuantum {
     private final AtomicBoolean submitted = new AtomicBoolean();
     /// Releases the staging ring this quantum holds; null when it holds none.
     private final AtomicReference<java.util.function.Consumer<GpuStream>> stagingRelease = new AtomicReference<>();
-    private final CompletableFuture<Outcome> outcome = new CompletableFuture<>();
     private Sequence.ExecutionLease lease;
     private Workspace workspace;
     /// The pinned staging of the quantum's input record, held until its device work retired.
@@ -78,7 +77,6 @@ public final class Quantum extends AbstractQuantum {
     private DeviceLogits logitsOutput;
     private ExecutionGpu gpu;
     private Consumer<? super Quantum> terminalConsumer;
-    private Outcome pendingOutcome;
     private volatile Outcome conclusion;
     /// DRAFT: the device rows of base (or MTP) hidden state that seed this quantum's MTP rows, and how
     /// many of its rows the MTP cache commits (catch-up rows commit, recursive draft rows do not).
@@ -180,10 +178,6 @@ public final class Quantum extends AbstractQuantum {
         return current;
     }
 
-    public CompletableFuture<Outcome> outcome() {
-        return this.outcome.copy();
-    }
-
     /// Returns GPU-resident logits after successful completion; the caller owns and must close them.
     /// Empty for a quantum that samples on the host.
     public Optional<DeviceLogits> logitsOutput() {
@@ -272,10 +266,6 @@ public final class Quantum extends AbstractQuantum {
         if (this.hostLogits == null) return;
         if (this.kind == ExecutionKind.VERIFY) this.hostLogits.queueRowSelections(address, logitsRowCount());
         else this.hostLogits.queueFinalRow(address, logitsRowCount());
-    }
-
-    public CompletableFuture<Outcome> completion() {
-        return this.outcome;
     }
 
     @Override
@@ -418,7 +408,8 @@ public final class Quantum extends AbstractQuantum {
         Objects.requireNonNull(storage, "storage");
         this.terminalConsumer = terminalConsumer;
         if (this.sequence.cancellationRequested()) {
-            this.pendingOutcome = new Outcome(Status.CANCELLED, null);
+            // Cancelled before it began: it concludes without a stage.
+            retire(null);
             return false;
         }
         try {
@@ -439,7 +430,7 @@ public final class Quantum extends AbstractQuantum {
                 this.lease = this.sequence.claimExecution(this.leasePosition);
             } catch (IllegalStateException claimFailure) {
                 if (this.sequence.terminalState() == Sequence.TerminalState.CANCELLED) {
-                    this.pendingOutcome = new Outcome(Status.CANCELLED, null);
+                    retire(null);
                     return false;
                 }
                 throw claimFailure;
@@ -554,105 +545,87 @@ public final class Quantum extends AbstractQuantum {
         }
     }
 
-    /// Terminal work for a quantum whose device work has retired. Releases quantum storage, publishes
-    /// sequence state, and prepares the outcome that [#publishOutcome] reports.
+    /// A quantum is cancelled through its sequence.
     @Override
-    public void retire(Throwable deviceFailure) {
-        if (this.outcome.isDone() || this.pendingOutcome != null) {
-            return;
-        }
-        if (deviceFailure != null) fail(deviceFailure);
-        ExecutionGpu gpu = this.gpu;
-        if (this.hostLogits == null
-                && this.proposal == null
-                && failure() == null
-                && !this.sequence.cancellationRequested()) {
-            try {
-                retainLogits(gpu);
-            } catch (Throwable retentionFailure) {
-                fail(retentionFailure);
-            }
-        }
-        if (failure() == null && !this.sequence.cancellationRequested() && this.terminalConsumer != null) {
-            try {
-                this.terminalConsumer.accept(this);
-            } catch (Throwable consumerFailure) {
-                fail(consumerFailure);
-            }
-        }
+    protected boolean cancelRequested() {
+        return this.sequence.cancellationRequested();
+    }
+
+    /// Keeps the final logits (when no host row takes them) and hands the quantum to the terminal consumer while
+    /// its workspace is still held.
+    @Override
+    protected void commit() {
+        if (this.hostLogits == null && this.proposal == null) retainLogits(this.gpu);
+        if (this.terminalConsumer != null) this.terminalConsumer.accept(this);
+    }
+
+    /// Releases the input upload and the workspace, whatever the outcome.
+    @Override
+    protected void release() {
         try {
             releaseInputUpload();
-        } catch (Throwable releaseFailure) {
+        } catch (RuntimeException | Error releaseFailure) {
             fail(releaseFailure);
         }
         if (this.workspace != null) {
             try {
                 this.workspace.close();
-            } catch (Throwable cleanupFailure) {
+            } catch (RuntimeException | Error cleanupFailure) {
                 fail(cleanupFailure);
                 try {
                     this.workspace.close();
-                } catch (Throwable retryFailure) {
+                } catch (RuntimeException | Error retryFailure) {
                     fail(retryFailure);
                 }
             }
         }
+    }
+
+    /// The sequence follows the outcome: a failure marks it failed, a cancellation cancelled, and a success
+    /// releases it at its next position (unless a cancellation won the race). Then the host row and the proposal
+    /// become readable for a success, and the outcome is recorded for the continuation.
+    @Override
+    protected void settle() {
         Throwable error = failure();
-        if (error == null && !seal()) error = failure();
-        if (error != null || this.sequence.cancellationRequested()) {
-            error = releaseLogits(error);
-        }
+        boolean cancelled = error instanceof CancellationException;
+        Throwable failed = cancelled ? null : error;
+        if (error != null) failed = releaseLogits(failed);
         Outcome completed;
         try {
-            if (error != null) {
-                if (this.lease != null) {
-                    this.sequence.markFailed(this.lease, error);
-                }
-                completed = new Outcome(Status.FAILED, error);
-            } else if (this.sequence.cancellationRequested()) {
-                if (this.lease != null) {
-                    this.sequence.markCancelled(this.lease);
-                }
+            if (failed != null) {
+                if (this.lease != null) this.sequence.markFailed(this.lease, failed);
+                completed = new Outcome(Status.FAILED, failed);
+            } else if (cancelled) {
+                if (this.lease != null) this.sequence.markCancelled(this.lease);
                 completed = new Outcome(Status.CANCELLED, null);
             } else {
-                boolean cancelled = this.sequence.releaseExecutionAndCheckCancellation(
+                boolean lost = this.sequence.releaseExecutionAndCheckCancellation(
                         this.lease, drafting() ? this.leasePosition : this.startPosition + committedRowCount());
-                completed = new Outcome(cancelled ? Status.CANCELLED : Status.SUCCESS, null);
+                completed = new Outcome(lost ? Status.CANCELLED : Status.SUCCESS, null);
             }
         } catch (Throwable cleanupFailure) {
-            // Terminal state is published before persistent cleanup. Never strand the caller's future
-            // if a device free fails; the sequence owner can retry cleanup after observing this failure.
-            if (error == null) error = cleanupFailure;
-            else if (error != cleanupFailure) error.addSuppressed(cleanupFailure);
-            completed = new Outcome(Status.FAILED, releaseLogits(error));
+            // Terminal state is published before persistent cleanup. Never strand the continuation if a device free
+            // fails; the sequence owner can retry cleanup after observing this failure.
+            if (failed == null) failed = cleanupFailure;
+            else if (failed != cleanupFailure) failed.addSuppressed(cleanupFailure);
+            completed = new Outcome(Status.FAILED, releaseLogits(failed));
         }
         this.lease = null;
         // The row was copied before the retirement boundary; only a successful quantum exposes it.
         if (this.hostLogits != null) this.hostLogits.retired(completed.status() == Status.SUCCESS);
         if (this.proposal != null) this.proposal.retired(completed.status() == Status.SUCCESS);
-        this.pendingOutcome = completed;
-    }
-
-    /// Whether this quantum has reached its terminal outcome, published or not.
-    boolean terminal() {
-        return this.pendingOutcome != null || this.outcome.isDone();
-    }
-
-    /// Completes the caller-visible outcome prepared by [#retire]; the continuation is thrown after it.
-    @Override
-    protected void published() {
-        Outcome completed = this.pendingOutcome;
-        if (completed == null) {
-            if (this.outcome.isDone()) return;
-            throw new IllegalStateException("quantum has not retired");
-        }
-        this.pendingOutcome = null;
+        if (completed.failure() != null) fail(completed.failure());
+        else if (completed.status() == Status.CANCELLED && failure() == null)
+            fail(new CancellationException("a cancellation won the race with the quantum's completion"));
         this.conclusion = completed;
-        concluded(completed.failure());
-        this.outcome.complete(completed);
     }
 
-    /// The published outcome, or null before publication: what a continuation reads.
+    /// Whether this quantum has reached its terminal outcome.
+    boolean terminal() {
+        return retired();
+    }
+
+    /// The quantum's outcome once it retired, or null before: what a continuation reads.
     public Outcome conclusion() {
         return this.conclusion;
     }

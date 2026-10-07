@@ -81,8 +81,8 @@ class StageGraphReuseTest {
         // Escaping into Euhedral, the Error would complete the graph's source or end the worker.
         assertDoesNotThrow(() -> receiver.get().push(frame));
         this.lattice.drive();
-        assertTrue(context.outcome().isDone(), "an Error must not strand the quantum");
-        var outcome = context.outcome().join();
+        assertTrue((context.conclusion() != null), "an Error must not strand the quantum");
+        var outcome = context.conclusion();
         assertEquals(Quantum.Status.FAILED, outcome.status());
         assertInstanceOf(OutOfMemoryError.class, outcome.failure());
         runtime.close();
@@ -133,7 +133,7 @@ class StageGraphReuseTest {
         failedStage.execute();
         failedStage.doFinally();
         this.lattice.drive();
-        var failed = first.outcome().join();
+        var failed = first.conclusion();
         assertEquals(Quantum.Status.FAILED, failed.status());
         assertSame(failure, failed.failure());
 
@@ -146,7 +146,7 @@ class StageGraphReuseTest {
         reused.execute();
         reused.doFinally();
         this.lattice.drive();
-        assertEquals(Quantum.Status.SUCCESS, second.outcome().join().status());
+        assertEquals(Quantum.Status.SUCCESS, second.conclusion().status());
         runtime.close();
     }
 
@@ -180,7 +180,7 @@ class StageGraphReuseTest {
         this.lattice.drive();
 
         assertEquals(1, recoveries[0], "the stream proves idleness before storage is released");
-        assertEquals(Quantum.Status.FAILED, first.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, first.conclusion().status());
         var second = context(plan, 502);
         runtime.submit(second);
         AbstractFrame reused = pullOne();
@@ -188,7 +188,7 @@ class StageGraphReuseTest {
         reused.execute();
         reused.doFinally();
         this.lattice.drive();
-        assertEquals(Quantum.Status.FAILED, second.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, second.conclusion().status());
         runtime.close();
         ExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
@@ -221,12 +221,12 @@ class StageGraphReuseTest {
 
         assertEquals(1, uploads[0]);
         assertEquals(0, uploads[1], "the device may still read the staged token IDs");
-        assertFalse(context.outcome().isDone());
+        assertFalse((context.conclusion() != null));
         stream.release(null);
         assertEquals(0, uploads[1], "the driver callback only enqueues the retirement");
         this.lattice.drive();
         assertEquals(1, uploads[1]);
-        assertEquals(Quantum.Status.SUCCESS, context.outcome().join().status());
+        assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         runtime.close();
     }
 
@@ -242,7 +242,7 @@ class StageGraphReuseTest {
         stage.doFinally();
         this.lattice.drive();
 
-        assertEquals(Quantum.Status.FAILED, context.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
         assertTrue(gpu.poisoned);
         assertEquals(0, gpu.nativeFrees, "uncertain GPU work may still use every submitted buffer");
         assertEquals(0, gpu.hostReleases, "uncertain DMA may still read the pinned upload");
@@ -265,7 +265,7 @@ class StageGraphReuseTest {
         this.lattice.drive();
 
         assertTrue(gpu.poisoned);
-        assertEquals(Quantum.Status.FAILED, context.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
         assertEquals(0, gpu.nativeFrees);
         runtime.close();
     }
@@ -376,7 +376,7 @@ class StageGraphReuseTest {
         runConcurrently(firstRoots, AbstractFrame::doFinally);
         this.lattice.drive();
         for (Quantum context : firstContexts) {
-            assertEquals(Quantum.Status.SUCCESS, context.outcome().join().status());
+            assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         }
 
         var secondContexts = List.of(context(plan, 411), context(plan, 412));
@@ -388,7 +388,7 @@ class StageGraphReuseTest {
         });
         this.lattice.drive();
         for (Quantum context : secondContexts) {
-            assertEquals(Quantum.Status.SUCCESS, context.outcome().join().status());
+            assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         }
         runtime.close();
     }
