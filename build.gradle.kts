@@ -92,6 +92,7 @@ subprojects {
                             .get())
             // Token-identity gate: `-Peuhedral.identity.record=true` rewrites the goldens instead of comparing.
             providers.gradleProperty("euhedral.identity.record").orNull?.let { systemProperty("euhedral.identity.record", it) }
+            providers.gradleProperty("euhedral.identity.artifacts").orNull?.let { systemProperty("euhedral.identity.artifacts", it) }
             // Teacher-forced relaxed-numerics drift: decode length, prefill prefix, an optional per-step CSV
             // report, and `exact` to run the oracle on both sequences.
             for (name in listOf("steps", "prefix", "report", "candidate"))
