@@ -185,7 +185,10 @@ the graph joins its used lanes into its home lane, records one event there and r
 callback. The callback
 enqueues the retirement frame, and that frame:
 
-1. confirms the boundary (and on failure proves the device idle or poisons it);
+1. confirms the boundary (and on failure proves the device idle or poisons it), then hands the quantum its
+   conclusion, steps 2 to 5, which the quantum runs in its owner's order (`StageQuantum.concludeInOrder`): a
+   sequence's quanta conclude in admission order, whatever order their device work retired in, and the graph
+   stays bound until then;
 2. runs each attempted stage's retirement hook: commit on success, release temporaries always;
 3. retires the quantum (`AbstractQuantum.retire`): commits its work, releases its workspace binding, and
    settles the sequence's frontiers;
@@ -222,16 +225,26 @@ quantum never commits (`discardSubmitted`). GDN recurrent and convolution state 
 stream-ordered kernels; a quantum that does not succeed leaves its sequence terminal, so no partial update
 is ever resumed.
 
-The `Sequence` keeps the same two frontiers for its position, in place of an execution lease. The
-generation chain admits one quantum of a sequence at a time: `admit(start, end)` requires the start at the
-committed frontier and nothing in flight, and moves the submitted frontier to `end`; the quantum's
-retirement then commits (both frontiers move) or abandons (submitted returns to committed). A draft quantum,
-and a prefix-cache capture, are in flight without moving either frontier. The fields are written only by
-that chain and by lifecycle, so they are volatile, with no lock and no CAS state machine. `cancel()` may come
-from any thread: it publishes its flag before it reads whether a quantum is in flight, and admission and
-retirement publish that before they read the flag, so either the admission backs out or the retirement
-concludes the cancellation. The terminal state is first-writer-wins. The persistent state closes only in
-`complete()`, which the session's lifecycle runs after its generation ended.
+The `Sequence` keeps the same two frontiers for its position, in place of an execution lease, and is a
+sequencer: parallel execution, ordered completion, as Euhedral-Execution's `FrameSequencer` and its Kafka offset
+collector do it. `admit(work, start, end)` takes work (a quantum, or a prefix-cache capture or restore) at the
+submitted frontier and moves that frontier to `end`; several pieces may be in flight. Each piece completes in
+any order, marks itself ready, and drains the sequence's `Sequencer` (`runtime/graph`): an MPSC queue in
+admission order and a work-in-progress count, so whichever thread finds the oldest piece ready concludes the
+ready prefix, one thread at a time, without a lock. Concluding settles a piece: it commits (the committed
+frontier moves) or it is abandoned. A piece is told at its conclusion when it can no longer commit (a piece before
+it failed the sequence, or committed short of where it starts, as a partly accepted verification does); a quantum
+then fails and discards its stages' work. A draft quantum and a capture leave both frontiers where they are.
+
+Admission (the generation chain) writes the submitted frontier, and the conclusion (one thread at a time) writes
+the committed one, so they are volatile, with no lock and no CAS state machine. `cancel()` may come from any
+thread: it publishes its flag before it reads whether work is in flight, and settlement publishes its count
+before it reads the flag, so one of the two ends the sequence CANCELLED. The terminal state is first-writer-wins.
+The persistent state closes only in `complete()`, which the session's lifecycle runs after its generation ended.
+
+The sequence allows several quanta in flight; the state they share does not yet. `AttentionKvState` takes one
+append at a time, the decode scratch and the session's host logits row are one per sequence, and quanta on
+different lanes have no device edge between them, so today's sessions admit one quantum of a sequence at a time.
 
 ## Failure and cancellation
 

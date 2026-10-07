@@ -125,6 +125,7 @@ class ArchitectureTest {
         hot.addAll(javaFiles("model/qwen4", false));
         hot.addAll(javaFiles("model/qwen4/expert", true));
         hot.add(MAIN.resolve("runtime/graph/Join.java"));
+        hot.add(MAIN.resolve("runtime/graph/Sequencer.java"));
         for (String dense : List.of("Sequence", "Quantum", "Stages", "Shape", "SequenceCleanup"))
             hot.add(MAIN.resolve("model/qwen38/" + dense + ".java"));
         List<String> violations = new ArrayList<>();
