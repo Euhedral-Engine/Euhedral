@@ -8,6 +8,8 @@ import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.PromptSink;
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
+import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.runtime.graph.LanePool;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -109,8 +111,37 @@ public final class Execution implements AutoCloseable {
     public CompletableFuture<Quantum.Outcome> submit(Quantum context, Consumer<? super Quantum> terminalConsumer) {
         Objects.requireNonNull(context, "context");
         Objects.requireNonNull(terminalConsumer, "terminalConsumer");
+        Completion done = new Completion();
+        context.continueWith(this.lake, done);
         accept(context, terminalConsumer, true);
-        return context.completion().copy();
+        return done.outcome;
+    }
+
+    /// The continuation of a quantum submitted by a caller that waits (tests, tools): completes a future with its
+    /// outcome.
+    private static final class Completion extends AbstractFrame implements AbstractQuantum.Continuation {
+        final CompletableFuture<Quantum.Outcome> outcome = new CompletableFuture<>();
+        private Quantum quantum;
+
+        Completion() {
+            super(FrameSeeds.ID_HASH);
+            randomizeHash(FrameSeeds.forHostWork().next());
+        }
+
+        @Override
+        public void concluded(AbstractQuantum quantum) {
+            this.quantum = (Quantum) quantum;
+        }
+
+        @Override
+        public void execute() {
+            this.outcome.complete(this.quantum.conclusion());
+        }
+
+        @Override
+        public void doFinallyWithError(Throwable rejection) {
+            execute();
+        }
     }
 
     /// Admits `context` on the generation path: once its outcome is published it throws `continuation` into the

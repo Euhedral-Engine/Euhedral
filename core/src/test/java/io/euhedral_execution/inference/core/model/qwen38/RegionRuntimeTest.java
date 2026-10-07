@@ -139,13 +139,11 @@ class RegionRuntimeTest {
             this.lattice.drive();
             assertEquals(1, gpu.stream.held());
             assertTrue(caller.cancel(false));
-            assertFalse(context.outcome().isDone(), "caller cancellation must not retire internal GPU work");
+            assertFalse((context.conclusion() != null), "caller cancellation must not retire internal GPU work");
             assertEquals(1, runtime.activeQuanta());
             gpu.stream.release(null);
             this.lattice.drive();
-            assertEquals(
-                    Quantum.Status.SUCCESS,
-                    context.outcome().get(2, TimeUnit.SECONDS).status());
+            assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
             assertTrue(caller.isCancelled());
             assertEquals(0, runtime.activeQuanta());
         } finally {

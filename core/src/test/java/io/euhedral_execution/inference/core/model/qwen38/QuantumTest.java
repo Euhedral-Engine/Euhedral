@@ -82,8 +82,8 @@ class QuantumTest {
         var context = new Quantum(plan, new Sequence(899), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         assertThrows(IllegalStateException.class, () -> runtime.submit(context));
         assertTrue(gpu.poisoned);
-        assertTrue(context.outcome().isDone());
-        assertEquals(Quantum.Status.FAILED, context.outcome().join().status());
+        assertTrue((context.conclusion() != null));
+        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
         assertTrue(gpu.frees.isEmpty());
         assertEquals(0, runtime.activeQuanta());
         runtime.close();
@@ -111,7 +111,7 @@ class QuantumTest {
         var context = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
 
         assertSame(selectionFailure, assertThrows(IllegalStateException.class, () -> runtime.submit(context)));
-        assertEquals(Quantum.Status.FAILED, context.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
         failSelection.set(false);
         // A retry would claim a second lease and workspace that the finished outcome never releases.
         assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
@@ -153,11 +153,13 @@ class QuantumTest {
         var invalid =
                 new Quantum(plan, new Sequence(907), Quantum.ExecutionKind.DECODE, 0, new int[] {Integer.MAX_VALUE});
         List<Integer> selectedAtOutcome = new ArrayList<>();
-        cancelled.outcome().whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
-        invalid.outcome().whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        var cancelledOutcome = runtime.submit(cancelled);
+        cancelledOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        var invalidOutcome = runtime.submit(invalid);
+        invalidOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
 
-        assertEquals(Quantum.Status.CANCELLED, runtime.submit(cancelled).join().status());
-        assertEquals(Quantum.Status.FAILED, runtime.submit(invalid).join().status());
+        assertEquals(Quantum.Status.CANCELLED, cancelledOutcome.join().status());
+        assertEquals(Quantum.Status.FAILED, invalidOutcome.join().status());
         // An outcome callback that launched work would otherwise land on the graph's stream.
         assertEquals(List.of(0, 0), selectedAtOutcome);
         runtime.close();
@@ -171,7 +173,7 @@ class QuantumTest {
         var context = new Quantum(plan, new Sequence(908), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
 
         assertThrows(IllegalStateException.class, () -> runtime.submit(context));
-        assertEquals(Quantum.Status.FAILED, context.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
         assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
     }
 
@@ -211,7 +213,7 @@ class QuantumTest {
             assertInstanceOf(IllegalStateException.class, failure.getCause());
         }
         assertTrue(streamClosed.get(), "close() never saw this graph, so its build must release the stream");
-        assertEquals(Quantum.Status.FAILED, context.outcome().join().status());
+        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
     }
 
     @Test
@@ -305,9 +307,9 @@ class QuantumTest {
         // The caller owns the pulled frame, including its execution and terminal notification.
         pulled.getFirst().execute();
         pulled.getFirst().doFinally();
-        assertFalse(context.outcome().isDone(), "the retirement frame still waits for Euhedral");
+        assertFalse((context.conclusion() != null), "the retirement frame still waits for Euhedral");
         lattice.drive();
-        assertEquals(Quantum.Status.SUCCESS, context.outcome().join().status());
+        assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         runtime.close();
     }
 
@@ -328,8 +330,8 @@ class QuantumTest {
             frame.doFinally();
         }
         lattice.drive();
-        assertEquals(Quantum.Status.SUCCESS, first.outcome().join().status());
-        assertEquals(Quantum.Status.SUCCESS, second.outcome().join().status());
+        assertEquals(Quantum.Status.SUCCESS, first.conclusion().status());
+        assertEquals(Quantum.Status.SUCCESS, second.conclusion().status());
         runtime.close();
     }
 
@@ -422,7 +424,7 @@ class QuantumTest {
 
         context.begin(gpu, sequence::cancel);
 
-        assertEquals(Quantum.Status.CANCELLED, context.outcome().join().status());
+        assertEquals(Quantum.Status.CANCELLED, context.conclusion().status());
         assertEquals(Sequence.TerminalState.CANCELLED, sequence.terminalState());
         assertTrue(gpu.allocations.isEmpty());
     }
@@ -449,9 +451,8 @@ class QuantumTest {
         var runtime = new Execution(lattice, plan, new ExecutionFixtures.RecordingGpu());
         var context = new Quantum(plan, new Sequence(17), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var first = runtime.submit(context);
-        int terminalDependents = context.completion().getNumberOfDependents();
+        // The quantum has one continuation; a second admission is refused before it could bind another.
         assertThrows(IllegalStateException.class, () -> runtime.submit(context));
-        assertEquals(terminalDependents, context.completion().getNumberOfDependents());
         assertEquals(1, runtime.activeQuanta());
         lattice.drive();
         assertEquals(Quantum.Status.SUCCESS, first.join().status());
@@ -468,10 +469,10 @@ class QuantumTest {
         var runtime = new Execution(lattice, plan, gpu);
         var exposed = runtime.submit(context);
         exposed.complete(new Quantum.Outcome(Quantum.Status.SUCCESS, null));
-        assertFalse(context.outcome().isDone());
+        assertFalse((context.conclusion() != null));
         assertEquals(1, runtime.activeQuanta());
         lattice.drive();
-        assertEquals(Quantum.Status.SUCCESS, context.outcome().join().status());
+        assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         assertTrue(context.workspace().isClosed());
         runtime.close();
         assertTrue(lattice.source.isComplete());

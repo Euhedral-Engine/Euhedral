@@ -24,6 +24,7 @@ public abstract class AbstractQuantum implements StageQuantum {
     private FrameLake lake;
     private AbstractFrame continuation;
     private Throwable outcome;
+    private boolean retired;
 
     /// Binds the frame thrown into `lake` once the outcome is published. Called once, before admission.
     public final void continueWith(FrameLake lake, AbstractFrame continuation) {
@@ -39,13 +40,14 @@ public abstract class AbstractQuantum implements StageQuantum {
         this.cancelled = true;
     }
 
-    protected final boolean cancelRequested() {
+    /// Whether the quantum was asked to stop; a model whose cancellation lives elsewhere (a sequence's) answers here.
+    protected boolean cancelRequested() {
         return this.cancelled;
     }
 
     @Override
     public boolean stopRequested() {
-        return this.cancelled || failure() != null;
+        return cancelRequested() || failure() != null;
     }
 
     @Override
@@ -67,18 +69,16 @@ public abstract class AbstractQuantum implements StageQuantum {
         return this.failure.compareAndSet(null, SEALED);
     }
 
-    /// Runs on a worker after the device work retired: a device failure or a cancellation becomes the quantum's
-    /// failure, [#release] always runs, and [#commit] runs only when nothing failed. [#terminalFailure] then
-    /// holds the failure that ended the quantum, or null when it committed.
+    /// Runs on a worker after the device work retired, once: a device failure or a cancellation becomes the
+    /// quantum's failure; [#commit] runs only when nothing failed, then [#release] and [#settle] always. A
+    /// quantum that concluded without failure is sealed, and [#terminalFailure] then holds the failure that ended
+    /// it, or null when it committed.
     @Override
-    public void retire(Throwable deviceFailure) {
+    public final void retire(Throwable deviceFailure) {
+        if (this.retired) return;
+        this.retired = true;
         if (deviceFailure != null) fail(deviceFailure);
-        if (this.cancelled && failure() == null) fail(new CancellationException("the step was cancelled"));
-        try {
-            release();
-        } catch (RuntimeException | Error cleanup) {
-            fail(cleanup);
-        }
+        if (cancelRequested() && failure() == null) fail(new CancellationException("the step was cancelled"));
         if (failure() == null) {
             try {
                 commit();
@@ -86,18 +86,33 @@ public abstract class AbstractQuantum implements StageQuantum {
                 fail(commitFailure);
             }
         }
-        concluded(failure());
+        try {
+            release();
+        } catch (RuntimeException | Error cleanup) {
+            fail(cleanup);
+        }
+        try {
+            settle();
+        } catch (RuntimeException | Error settleFailure) {
+            fail(settleFailure);
+        }
+        seal();
+        this.outcome = failure();
     }
 
-    /// Publishes externally visible state of a quantum that did not fail.
+    /// Publishes externally visible state of a quantum that did not fail, while its storage is still held.
     protected void commit() {}
 
     /// Releases what the quantum holds, whatever its outcome.
     protected void release() {}
 
-    /// Records the outcome of a quantum that retires by its own rules.
-    protected final void concluded(Throwable outcome) {
-        this.outcome = outcome;
+    /// The quantum's terminal bookkeeping, whatever its outcome, after its storage is released (a sequence's
+    /// state follows the outcome here). It may still fail the quantum.
+    protected void settle() {}
+
+    /// Whether [#retire] ran.
+    protected final boolean retired() {
+        return this.retired;
     }
 
     /// The failure that ended the quantum, or null when it committed; read by the continuation.
