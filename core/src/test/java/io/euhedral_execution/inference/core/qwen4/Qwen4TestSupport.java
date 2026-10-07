@@ -98,6 +98,10 @@ final class Qwen4TestSupport {
             return Qwen4Weight.of(handle.deviceAddress(), handle.byteSize());
         }
 
+        CudaGpuMemory gpu() {
+            return this.gpu;
+        }
+
         @Override
         public void close() {
             for (TensorHandle handle : this.loaded.values()) this.gpu.free(handle.deviceAddress());

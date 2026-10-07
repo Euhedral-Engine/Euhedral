@@ -92,6 +92,48 @@ extern "C" __global__ void euhedral_q4_swiglu_bf16(
     output[i] = q4::bfr(q4::round_bf(q4::silu(q4::bf(gate[i]))) * q4::bf(up[i]));
 }
 
+// The shared expert's SwiGLU (as euhedral_q4_swiglu_bf16) in rows of `padded` values: columns at and past `cols` are 0,
+// the input of a down projection whose weights are padded to `padded` columns (euhedral_q4_nvfp4_pad_k).
+//   grid (ceil(padded / 256), rows), block 256.
+extern "C" __global__ __launch_bounds__(256) void euhedral_q4_swiglu_padded_bf16(
+        const unsigned short* __restrict__ gate, const unsigned short* __restrict__ up,
+        unsigned short* __restrict__ output, unsigned int cols, unsigned int padded) {
+    const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= padded) return;
+    const unsigned long long row = blockIdx.y;
+    unsigned short value = 0;
+    if (c < cols) {
+        const unsigned long long i = row * cols + c;
+        value = q4::bfr(q4::round_bf(q4::silu(q4::bf(gate[i]))) * q4::bf(up[i]));
+    }
+    output[row * padded + c] = value;
+}
+
+// Copies a plain NVFP4 tensor (nvfp4/nvfp4.cuh) of `rows` rows of `k` values into one of `padded` values per row: the
+// new columns have code 0 and scale 0, so every product they add is exactly 0. `k` and `padded` are multiples of 128.
+//   grid rows (+ 1: the last block copies the global scale), block 128.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q4_nvfp4_pad_k(
+        const unsigned char* __restrict__ source, unsigned char* __restrict__ target, unsigned int rows,
+        unsigned int k, unsigned int padded) {
+    const unsigned long long row = blockIdx.x;
+    const unsigned int row_bytes = k / 2u, padded_bytes = padded / 2u, row_scales = k / 16u, padded_scales = padded / 16u;
+    const unsigned long long source_scales = ((unsigned long long)rows * row_bytes + 255ull) & ~255ull;
+    const unsigned long long target_scales = ((unsigned long long)rows * padded_bytes + 255ull) & ~255ull;
+    if (row == rows) {
+        if (threadIdx.x < 4) {
+            const unsigned long long source_global = (source_scales + (unsigned long long)rows * row_scales + 255ull) & ~255ull;
+            const unsigned long long target_global =
+                    (target_scales + (unsigned long long)rows * padded_scales + 255ull) & ~255ull;
+            target[target_global + threadIdx.x] = source[source_global + threadIdx.x];
+        }
+        return;
+    }
+    for (unsigned int b = threadIdx.x; b < padded_bytes; b += blockDim.x)
+        target[row * padded_bytes + b] = b < row_bytes ? source[row * row_bytes + b] : 0;
+    for (unsigned int b = threadIdx.x; b < padded_scales; b += blockDim.x)
+        target[target_scales + row * padded_scales + b] = b < row_scales ? source[source_scales + row * row_scales + b] : 0;
+}
+
 // The MoE block's result: out = bf16(routed + bf16(bf16(sigmoid(gate)) * shared)), `gate` being the shared expert
 // gate's raw BF16 projection, one value per row.
 //   grid (ceil(width / 256), rows), block 256.

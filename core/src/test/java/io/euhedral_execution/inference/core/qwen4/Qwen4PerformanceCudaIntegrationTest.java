@@ -193,27 +193,74 @@ class Qwen4PerformanceCudaIntegrationTest {
         return out.toString();
     }
 
-    /// A window for a profiler: warm decode at 64 context, then two idle seconds that mark the window's start in a
-    /// timeline, then 32 decode steps, and nothing after them.
-    private void profileWindow(Qwen4ExecutionPlan executor, int[] prompt, Qwen4ExecutionPlan.LogitsSink sink)
+    /// A window for a profiler: some work, two idle seconds that mark the window's start in a timeline, then the
+    /// measured work and nothing after it. `EUHEDRAL_QWEN4_PERF_PROFILE` chooses it: `decode` (or `1`), 32 decode
+    /// steps at 64 context after 64 warm ones; `decode4k`, 32 decode steps after a prefill of 4096 tokens;
+    /// `prefill`, a prefill of 4096 tokens in the plan's chunks after a warm one of 512.
+    private void profileWindow(
+            Qwen4ExecutionPlan executor, int[] prompt, Qwen4ExecutionPlan.LogitsSink sink, String mode, int chunk)
             throws Exception {
+        if (mode.equals("prefill")) {
+            try (Qwen4Sequence warm = executor.newSequence()) {
+                prefill(executor, warm, prompt, 512, chunk, sink);
+            }
+        }
         try (Qwen4Sequence sequence = executor.newSequence()) {
-            Qwen4Blocking.step(executor, sequence, prompt, 0, 64, null);
             int[] token = new int[1];
-            for (int i = 0; i < 64; i++) {
-                token[0] = prompt[(64 + i * 97) % prompt.length];
-                Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+            long start;
+            String what;
+            int count;
+            switch (mode) {
+                case "prefill" -> {
+                    Thread.sleep(2000);
+                    start = System.nanoTime();
+                    prefill(executor, sequence, prompt, 4096, chunk, sink);
+                    count = 4096;
+                    what = "prefill tokens";
+                }
+                case "decode4k" -> {
+                    prefill(executor, sequence, prompt, 4096, chunk, null);
+                    Thread.sleep(2000);
+                    start = System.nanoTime();
+                    count = 32;
+                    for (int i = 0; i < count; i++) {
+                        token[0] = prompt[(4096 + i * 89) % prompt.length];
+                        Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+                    }
+                    what = "decode steps at 4096 context";
+                }
+                default -> {
+                    Qwen4Blocking.step(executor, sequence, prompt, 0, 64, null);
+                    for (int i = 0; i < 64; i++) {
+                        token[0] = prompt[(64 + i * 97) % prompt.length];
+                        Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+                    }
+                    Thread.sleep(2000);
+                    start = System.nanoTime();
+                    count = 32;
+                    for (int i = 0; i < count; i++) {
+                        token[0] = prompt[(64 + i * 89) % prompt.length];
+                        Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
+                    }
+                    what = "decode steps at 64 context";
+                }
             }
-            Thread.sleep(2000);
-            long start = System.nanoTime();
-            int steps = 32;
-            for (int i = 0; i < steps; i++) {
-                token[0] = prompt[(64 + i * 89) % prompt.length];
-                Qwen4Blocking.step(executor, sequence, token, 0, 1, sink);
-            }
-            line(String.format(
-                    "profile window: %d decode steps at 64 context, %.1f ms/token",
-                    steps, (System.nanoTime() - start) / 1e6 / steps));
+            double seconds = (System.nanoTime() - start) / 1e9;
+            line(String.format("profile window: %d %s, %.1f per second", count, what, count / seconds));
+        }
+    }
+
+    private static void prefill(
+            Qwen4ExecutionPlan executor,
+            Qwen4Sequence sequence,
+            int[] prompt,
+            int tokens,
+            int chunk,
+            Qwen4ExecutionPlan.LogitsSink sink)
+            throws Exception {
+        for (int at = 0; at < tokens; at += chunk) {
+            int rows = Math.min(chunk, tokens - at);
+            Qwen4Blocking.step(executor, sequence, prompt, at, rows, at + rows == tokens ? sink : null);
         }
     }
 
@@ -261,8 +308,10 @@ class Qwen4PerformanceCudaIntegrationTest {
                 try (Qwen4Sequence warm = executor.newSequence()) {
                     Qwen4Blocking.step(executor, warm, prompt, 0, 64, sink);
                 }
-                if (System.getenv("EUHEDRAL_QWEN4_PERF_PROFILE") != null) {
-                    profileWindow(executor, prompt, sink);
+                String profile = System.getenv("EUHEDRAL_QWEN4_PERF_PROFILE");
+                if (profile != null) {
+                    profileWindow(executor, prompt, sink, profile, chunk);
+                    Files.writeString(Path.of("build", "qwen4-performance.txt"), String.join("\n", this.report) + "\n");
                     return;
                 }
                 // `EUHEDRAL_QWEN4_PERF_ITERATIONS` repeats the prefills, for screens that need more samples.
