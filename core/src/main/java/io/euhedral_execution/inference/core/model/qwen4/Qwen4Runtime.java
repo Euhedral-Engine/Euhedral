@@ -25,13 +25,13 @@ import java.util.function.Supplier;
 /// What a Flash-Next engine runs on: the storage the residency plan produced, the execution plan
 /// over it, the lattice runtime that instantiates and runs the plan's stage graphs, and the lattice
 /// attachments its host work is published through. It owns resources, not execution threads and not
-/// a scheduler: a generation is a chain of continuations ([Session]), a step is a
+/// a scheduler: a generation is a chain of frames ([Session]), a step is a
 /// quantum of a static stage graph ([ExecutionPlan]) that the lattice runs, the expert
 /// hierarchy's reads, copies and completions are frames too, and every one of them runs on the
 /// lattice's workers. Nothing here waits for the device or the artifact with a thread of its own.
 ///
 /// Two attachments, so that unrelated work stays independent: `execution` carries the expert
-/// pipeline and the generation chain (everything that serves the GPU), `host` carries the work
+/// pipeline (everything that serves the GPU), `host` carries the work
 /// around a request (tokenizing, rendering).
 public final class Qwen4Runtime implements ModelRuntime {
 
@@ -176,7 +176,7 @@ public final class Qwen4Runtime implements ModelRuntime {
     @Override
     public Session createSession(GenerationConfig config, SessionOptions options, Consumer<GenerationSession> release) {
         return new Session(
-                this.tokenizer, this.plan, this.execution, gpu(), config, prefillChunkTokens(), release::accept);
+                this.tokenizer, this.plan, this.host, this.lake, gpu(), config, prefillChunkTokens(), release::accept);
     }
 
     @Override

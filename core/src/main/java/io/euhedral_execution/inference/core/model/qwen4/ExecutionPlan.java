@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertCacheStats;
@@ -70,13 +71,6 @@ public final class ExecutionPlan implements AutoCloseable {
     /// Test hook: the residual state after each layer, read after the device finished it.
     public interface Observer {
         void layerFinished(int layer, long stateAddress, int rows) throws InterruptedException;
-    }
-
-    /// Receives the end of a step, on the worker that retired it (or that found it failed):
-    /// `failure` is null when the step committed. It must not block.
-    @FunctionalInterface
-    public interface Listener {
-        void finished(Throwable failure);
     }
 
     /// Stops a step at its next stage.
@@ -236,11 +230,13 @@ public final class ExecutionPlan implements AutoCloseable {
     /// Starts `rows` tokens (`tokens[offset ..]`) at the sequence's position as one quantum and
     /// returns a handle that can cancel it. With a `sink` the last row's logits are computed and
     /// offered to it; the quantum commits (the sequence advances past the rows) when its device
-    /// work retired, and then `listener` runs, on the worker that retired it. Nothing blocks the
-    /// caller: when another quantum is running this one starts when that one concludes.
+    /// work retired, and then `continuation` is thrown into the lake (an [AbstractQuantum.Continuation] is told
+    /// which quantum concluded). Nothing blocks the caller: when another quantum is running this one starts when
+    /// that one concludes.
     ///
-    /// `tokens` must stay unchanged until the listener ran.
-    public Handle start(Sequence sequence, int[] tokens, int offset, int rows, LogitsSink sink, Listener listener) {
+    /// `tokens` must stay unchanged until the continuation ran.
+    public Handle start(
+            Sequence sequence, int[] tokens, int offset, int rows, LogitsSink sink, AbstractFrame continuation) {
         return begin(
                 sequence,
                 tokens,
@@ -249,7 +245,7 @@ public final class ExecutionPlan implements AutoCloseable {
                 sink,
                 new Range(0, this.sparse.length, true, true, true),
                 null,
-                listener);
+                continuation);
     }
 
     /// Starts one layer of a chunk on the residual state `exchange` provides (tests: each layer fed
@@ -262,7 +258,7 @@ public final class ExecutionPlan implements AutoCloseable {
             int offset,
             int rows,
             StateExchange exchange,
-            Listener listener) {
+            AbstractFrame continuation) {
         begin(
                 sequence,
                 tokens,
@@ -271,7 +267,7 @@ public final class ExecutionPlan implements AutoCloseable {
                 null,
                 new Range(layer, layer + 1, false, false, false),
                 Objects.requireNonNull(exchange, "exchange"),
-                listener);
+                continuation);
     }
 
     /// Advances `sequence` past a chunk whose layers ran through [#startLayer].
@@ -287,7 +283,7 @@ public final class ExecutionPlan implements AutoCloseable {
             LogitsSink sink,
             Range range,
             StateExchange exchange,
-            Listener listener) {
+            AbstractFrame continuation) {
         if (this.closed) throw new IllegalStateException("the plan is closed");
         if (rows <= 0 || rows > this.maxRows) throw new IllegalArgumentException("rows " + rows);
         if (range.advances() && sequence.position() + rows > sequence.maxTokens())
@@ -295,7 +291,8 @@ public final class ExecutionPlan implements AutoCloseable {
         boolean diagnostic = timingsOn() || hasObserver() || hasMidObserver();
         Shape shape = this.shapes.computeIfAbsent(
                 new ShapeKey(range, rowBucket(rows), diagnostic), key -> new Shape(this, key));
-        Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, sink, exchange, listener);
+        Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, sink, exchange);
+        quantum.continueWith(this.runtime.lake(), Objects.requireNonNull(continuation, "continuation"));
         quantum.enter();
         return quantum;
     }

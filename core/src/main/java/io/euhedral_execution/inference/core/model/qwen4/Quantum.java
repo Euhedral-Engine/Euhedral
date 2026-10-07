@@ -1,10 +1,9 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
-import io.euhedral_execution.inference.core.runtime.graph.StageQuantum;
 import java.lang.foreign.ValueLayout;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,14 +11,14 @@ import org.slf4j.LoggerFactory;
 /// One prefill chunk or decode token as the quantum of a [Shape] graph: what the stages read
 /// (the sequence, the tokens, where the logits go), whether it stopped, and what happens when its
 /// device work has retired. The graph never inspects what the stages compute; this class owns the
-/// quantum's terminal work: committing the sequence, closing the leases a stopped block still
-/// holds, and reporting to the listener.
+/// quantum's terminal work: committing the sequence and closing the leases a stopped block still
+/// holds. Its continuation, thrown when the outcome is published, carries the result to the generation.
 ///
 /// Quanta of a plan form a chain. A graph's expert window is sized to the cache's slots and staging
 /// slots, so one quantum runs at a time; a quantum that is admitted while another runs registers as
 /// the other's successor, and the predecessor's conclusion publishes it. Nothing waits: registering
 /// is a compare-and-set.
-final class Quantum implements StageQuantum, ExecutionPlan.Handle {
+final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
 
     private static final Logger LOG = LoggerFactory.getLogger(Quantum.class);
     private static final Object FINISHED = new Object();
@@ -33,12 +32,8 @@ final class Quantum implements StageQuantum, ExecutionPlan.Handle {
     private final int rows;
     private final ExecutionPlan.LogitsSink sink;
     private final ExecutionPlan.StateExchange exchange;
-    private final ExecutionPlan.Listener listener;
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final AtomicReference<Object> successor = new AtomicReference<>();
-    private volatile boolean cancelled;
     private Workspace storage;
-    private Throwable outcome;
     private boolean prepared;
 
     // The diagnostic shape's clock: the component running and when it began.
@@ -53,8 +48,7 @@ final class Quantum implements StageQuantum, ExecutionPlan.Handle {
             int offset,
             int rows,
             ExecutionPlan.LogitsSink sink,
-            ExecutionPlan.StateExchange exchange,
-            ExecutionPlan.Listener listener) {
+            ExecutionPlan.StateExchange exchange) {
         this.plan = plan;
         this.shape = shape;
         this.sequence = sequence;
@@ -63,7 +57,6 @@ final class Quantum implements StageQuantum, ExecutionPlan.Handle {
         this.rows = rows;
         this.sink = sink;
         this.exchange = exchange;
-        this.listener = listener;
     }
 
     // ---------------------------------------------------------------- what the stages read
@@ -137,72 +130,33 @@ final class Quantum implements StageQuantum, ExecutionPlan.Handle {
         return true;
     }
 
-    /// Asks the quantum to stop at its next stage.
-    @Override
-    public void cancel() {
-        this.cancelled = true;
-    }
-
-    // ---------------------------------------------------------------- StageQuantum
-
-    @Override
-    public boolean stopRequested() {
-        return this.cancelled || this.failure.get() != null;
-    }
-
-    @Override
-    public void fail(Throwable cause) {
-        if (this.failure.compareAndSet(null, cause)) return;
-        Throwable first = this.failure.get();
-        if (first != cause) first.addSuppressed(cause);
-    }
-
     @Override
     public boolean overlapLaunches() {
         return false;
     }
 
-    /// Runs on an ordinary worker after the device work retired and every stage's retirement hook
-    /// ran.
+    /// Leases of waves that never ran (the quantum stopped); no load is outstanding and no kernel reads them.
     @Override
-    public void retire(Throwable deviceFailure) {
-        if (deviceFailure != null) fail(deviceFailure);
-        if (this.cancelled && this.failure.get() == null) fail(new CancellationException("the step was cancelled"));
-        if (this.prepared) {
-            tick(-1);
-            try {
-                // Leases of waves that never ran (the quantum stopped); no load is outstanding and no kernel reads
-                // them.
-                this.storage.moe().abandon();
-            } catch (RuntimeException | Error cleanup) {
-                fail(cleanup);
-            }
-        }
-        Throwable error = this.failure.get();
-        if (error == null && this.prepared) {
-            try {
-                if (this.exchange != null) this.exchange.collect(this.plan.gpu(), this.storage.state());
-                if (this.shape.advances()) this.sequence.advance(this.rows);
-                this.plan.stepCompleted(this.rows);
-            } catch (RuntimeException | Error commit) {
-                fail(commit);
-                error = commit;
-            }
-        }
-        this.outcome = error != null ? this.failure.get() : null;
+    protected void release() {
+        if (!this.prepared) return;
+        tick(-1);
+        this.storage.moe().abandon();
     }
 
-    /// The graph is recycled: the next quantum of the chain starts, then the listener runs.
     @Override
-    public void publishOutcome() {
+    protected void commit() {
+        if (!this.prepared) return;
+        if (this.exchange != null) this.exchange.collect(this.plan.gpu(), this.storage.state());
+        if (this.shape.advances()) this.sequence.advance(this.rows);
+        this.plan.stepCompleted(this.rows);
+    }
+
+    /// The graph is recycled: the next quantum of the plan's chain starts before the continuation is thrown.
+    @Override
+    protected void published() {
         this.plan.quantumEnded();
         Object next = this.successor.getAndSet(FINISHED);
         if (next != null) ((Quantum) next).go();
-        try {
-            this.listener.finished(this.outcome);
-        } catch (Throwable listenerFailure) {
-            LOG.error("a step's listener failed", listenerFailure);
-        }
     }
 
     // ---------------------------------------------------------------- diagnostics
