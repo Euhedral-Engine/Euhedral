@@ -138,13 +138,7 @@ public final class Sequence {
     /// come from one chain of work.
     public void admit(Work work, long start, long end) {
         Objects.requireNonNull(work, "work");
-        TerminalState state = terminalState();
-        if (state != TerminalState.ACTIVE) {
-            throw new IllegalStateException("Sequence is terminal: " + state);
-        }
-        if (this.cancellationRequested) {
-            throw new IllegalStateException("Sequence cancellation was requested");
-        }
+        requireAdmissible();
         long frontier = submittedFrontier();
         if (start != frontier) {
             throw new IllegalArgumentException("Execution starts at " + start + " but the sequence is at " + frontier);
@@ -152,9 +146,54 @@ public final class Sequence {
         if (end < start) {
             throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
         }
+        enter(work, end);
+    }
+
+    /// Admits `work` that leaves the frontiers where they are (a draft) at the submitted frontier, and returns
+    /// that position: the one it was admitted at.
+    public long admitAtFrontier(Work work) {
+        Objects.requireNonNull(work, "work");
+        requireAdmissible();
+        long frontier = submittedFrontier();
+        enter(work, frontier);
+        return frontier;
+    }
+
+    private void requireAdmissible() {
+        TerminalState state = terminalState();
+        if (state != TerminalState.ACTIVE) {
+            throw new IllegalStateException("Sequence is terminal: " + state);
+        }
+        if (this.cancellationRequested) {
+            throw new IllegalStateException("Sequence cancellation was requested");
+        }
+    }
+
+    /// Counts `work` in flight, then reads the cancellation flag: [#cancel()] publishes the flag before it reads
+    /// the count, so either the admission sees the cancellation and backs out, or the cancellation sees the work
+    /// in flight and leaves its settlement to end the sequence. Work refused here, or by the queue, settles at
+    /// once.
+    private void enter(Work work, long end) {
+        long previous = this.submitted;
         this.submitted = end;
         this.admitted = this.admitted + 1;
-        this.order.offer(work);
+        VarHandle.fullFence();
+        TerminalState state = terminalState();
+        if (this.cancellationRequested || state != TerminalState.ACTIVE) {
+            this.submitted = previous;
+            settle();
+            throw new IllegalStateException(
+                    this.cancellationRequested
+                            ? "Sequence cancellation was requested"
+                            : "Sequence is terminal: " + state);
+        }
+        try {
+            this.order.offer(work);
+        } catch (RuntimeException | Error refused) {
+            this.submitted = previous;
+            settle();
+            throw refused;
+        }
     }
 
     /// Concludes the complete work at the head of the order, in order. Called by a piece of work after it became

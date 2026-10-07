@@ -256,6 +256,55 @@ class SequenceTest {
     }
 
     @Test
+    void anAdmissionRacingWithACancellationIsNeverAdmittedOntoACancelledSequence() throws Exception {
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            for (int round = 0; round < 2_000; round++) {
+                var sequence = new Sequence(34);
+                var work = committing(sequence, 0, 1);
+                var start = new CountDownLatch(1);
+                var admit = executor.submit(() -> {
+                    start.await();
+                    try {
+                        sequence.admit(work, 0, 1);
+                        return sequence.terminalState();
+                    } catch (IllegalStateException cancelled) {
+                        return null;
+                    }
+                });
+                var cancel = executor.submit(() -> {
+                    start.await();
+                    sequence.cancel();
+                    return null;
+                });
+                start.countDown();
+                var afterAdmission = admit.get(5, TimeUnit.SECONDS);
+                cancel.get(5, TimeUnit.SECONDS);
+                if (afterAdmission != null) {
+                    assertEquals(
+                            Sequence.TerminalState.ACTIVE,
+                            afterAdmission,
+                            "round " + round + ": admitted onto a cancelled sequence");
+                    work.complete(sequence);
+                }
+                assertEquals(Sequence.TerminalState.CANCELLED, sequence.terminalState(), "round " + round);
+                assertFalse(sequence.inFlight(), "round " + round);
+            }
+        }
+    }
+
+    @Test
+    void aDraftAdmittedAtTheFrontierIsToldWhereItStarts() {
+        var sequence = new Sequence(35, 3);
+        var base = admitted(sequence, 3, 4);
+        var draft = committing(sequence, 4, 4);
+        assertEquals(4, sequence.admitAtFrontier(draft));
+        base.complete(sequence);
+        draft.complete(sequence);
+        assertNull(draft.blocked);
+        assertEquals(4, sequence.committedFrontier());
+    }
+
+    @Test
     void aDraftWorkLeavesTheFrontiersAlone() {
         var sequence = new Sequence(30, 6);
         var draft = admitted(sequence, 6, 6);

@@ -39,7 +39,8 @@ public interface StageQuantum {
     /// Runs `conclusion`, the quantum's terminal work once its device-completion boundary was confirmed (the
     /// stages' retirement hooks, [#retire], recycling, [#publishOutcome]), in the order the quantum's owner
     /// concludes its work: a sequence concludes its quanta in admission order, whatever order their device work
-    /// retired in. By default it runs now.
+    /// retired in. By default it runs now. The conclusion may then run on another thread, one that drains the
+    /// owner's order, so nothing that runs inside it may wait for a later quantum of the same owner.
     default void concludeInOrder(Runnable conclusion) {
         conclusion.run();
     }

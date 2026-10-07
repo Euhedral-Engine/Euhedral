@@ -429,10 +429,20 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 }
             }
             beforeClaim.run();
+            // The sequence takes several quanta in flight, but the state it shares with them does not yet: GDN
+            // state updated in place, the KV cache's one append, the decode scratch, the host row and the proposal.
+            // A quantum that touches it is refused while other work on the sequence is in flight.
+            if (sharesSequenceState() && this.sequence.inFlight())
+                throw new IllegalStateException(
+                        "another quantum of the sequence is in flight, and its state takes one quantum at a time");
             try {
                 // Drafting runs at MTP positions and leaves the frontiers where they are.
-                this.admittedAt = drafting() ? this.sequence.submittedFrontier() : this.startPosition;
-                this.sequence.admit(this, this.admittedAt, drafting() ? this.admittedAt : end);
+                if (drafting()) {
+                    this.admittedAt = this.sequence.admitAtFrontier(this);
+                } else {
+                    this.admittedAt = this.startPosition;
+                    this.sequence.admit(this, this.startPosition, end);
+                }
                 this.admitted = true;
             } catch (IllegalStateException admissionFailure) {
                 if (this.sequence.cancellationRequested()
@@ -549,6 +559,12 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
     }
 
+    /// Whether the quantum touches state its sequence shares with every quantum: its layers' GDN and KV state, the
+    /// draft's state, the session's host row, or a proposal.
+    private boolean sharesSequenceState() {
+        return this.shape.hasFirstLayer() || drafting() || this.hostLogits != null || this.proposal != null;
+    }
+
     /// A quantum is cancelled through its sequence.
     @Override
     protected boolean cancelRequested() {
@@ -636,7 +652,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 failed = null;
             } else {
                 failed = suppressed[0];
-                for (int index = 1; index < suppressed.length; index++) failed.addSuppressed(suppressed[index]);
+                for (int index = 1; index < suppressed.length; index++)
+                    if (suppressed[index] != failed) failed.addSuppressed(suppressed[index]);
             }
         }
         if (error != null) failed = releaseLogits(failed);
