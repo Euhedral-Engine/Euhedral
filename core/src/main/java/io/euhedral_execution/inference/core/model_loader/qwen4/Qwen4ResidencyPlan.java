@@ -123,7 +123,9 @@ public record Qwen4ResidencyPlan(
                 mib(d.contextBytes() + d.workspaceBytes() + d.runtimeReserveBytes())
                         + " (KV " + mib(d.kvBytes()) + ", indexer " + mib(d.indexerBytes()) + ", GDN "
                         + mib(d.gdnStateBytes())
-                        + ", workspace " + mib(d.workspaceBytes()) + ", runtime " + mib(d.runtimeReserveBytes()) + ")");
+                        + ", workspace " + mib(d.workspaceBytes()) + ", runtime " + mib(d.runtimeReserveBytes())
+                        + ", of which "
+                        + mib(Qwen4ResidencyPlanner.SYSTEM_RESERVE_BYTES) + " left free for the system)");
         line(out, "fixed resident", mib(d.fixedResidentBytes()));
         line(
                 out,
