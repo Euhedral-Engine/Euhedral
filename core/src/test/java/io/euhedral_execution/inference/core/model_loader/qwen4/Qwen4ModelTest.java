@@ -52,6 +52,7 @@ class Qwen4ModelTest {
                 - roomy.device().expertCacheBytes()
                 - roomy.device().workspaceBytes()
                 + Qwen4SequenceState.workspaceBytes(this.artifact.config())
+                + Qwen4ResidencyPlanner.sharedDownPaddingBytes(this.artifact.config())
                 + slots * roomy.expertCache().slotBytes();
     }
 

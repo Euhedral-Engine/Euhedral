@@ -42,6 +42,26 @@ public final class Qwen4ResidencyPlanner {
     /// measured on the dense model's engine, docs/NVFP4_RESIDENCY.md).
     public static final long KERNEL_RESERVE_BYTES = 1024L << 20;
 
+    /// The shared expert's width as a prefill's down projection reads it: a multiple of 256, as the native NVFP4
+    /// kernels need for more than 64 rows (they fetch the weight scales 256 values at a time).
+    public static int paddedSharedWidth(int width) {
+        return (width + 255) / 256 * 256;
+    }
+
+    /// Device bytes of the shared expert's down projections padded to [#paddedSharedWidth] (one per
+    /// layer, plain NVFP4: codes, 256-aligned scales, the 256-aligned global) and of the padding in the
+    /// activation of the longest prefill chunk; 0 when the width needs none.
+    public static long sharedDownPaddingBytes(Qwen4Config config) {
+        int width = config.moe().sharedExpertIntermediateSize();
+        int padded = paddedSharedWidth(width);
+        if (padded == width) return 0;
+        long hidden = config.text().hiddenSize();
+        long scales = (hidden * padded / 2 + 255) & ~255L;
+        long tensor = ((scales + hidden * padded / 16 + 255) & ~255L) + 4;
+        long activation = (long) LARGEST_PREFILL_CHUNK_TOKENS * (padded - width) * 2L;
+        return config.text().numLayers() * ((tensor + 255) & ~255L) + activation;
+    }
+
     /// The largest prefill chunk the planner will make room for.
     public static final int LARGEST_PREFILL_CHUNK_TOKENS = 4096;
 
@@ -136,7 +156,9 @@ public final class Qwen4ResidencyPlanner {
         long kv = Qwen4SequenceState.kvBytes(config, maxContextTokens);
         long indexer = Qwen4SequenceState.indexerBytes(config, maxContextTokens);
         long gdn = Qwen4SequenceState.gdnStateBytes(config);
-        long workspace = Qwen4SequenceState.workspaceBytes(config);
+        // The workspace counts the shared expert's padded down projections, which the plan keeps beside it.
+        long padding = sharedDownPaddingBytes(config);
+        long workspace = Qwen4SequenceState.workspaceBytes(config) + padding;
         long reserved = KERNEL_RESERVE_BYTES + workspace + kv + indexer + gdn;
 
         // The token embedding is a gather: its rows are read in place from pinned host memory.
@@ -229,7 +251,7 @@ public final class Qwen4ResidencyPlanner {
             if (extra > budget512 / CHUNK_SHARE_DIVISOR || budget512 - extra < minimumCache) break;
             chunk = candidate;
         }
-        workspace = Qwen4SequenceState.workspaceBytes(config, chunk);
+        workspace = Qwen4SequenceState.workspaceBytes(config, chunk) + padding;
         reserved = KERNEL_RESERVE_BYTES + workspace + kv + indexer + gdn;
         long cacheBudget = freeBytes - need - reserved;
         ExpertCacheGeometry geometry = ExpertCacheGeometry.derive(cacheBudget, slotBytes, totalExperts, minimumSlots);

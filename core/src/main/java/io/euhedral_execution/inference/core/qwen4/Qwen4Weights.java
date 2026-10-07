@@ -115,7 +115,37 @@ public final class Qwen4Weights {
                 of(p + "shared_expert/gate_proj"),
                 of(p + "shared_expert/up_proj"),
                 of(p + "shared_expert/down_proj"),
-                of(p + "shared_expert_gate"));
+                of(p + "shared_expert_gate"),
+                this.paddedSharedDown.get(layer));
+    }
+
+    /// Each layer's shared-expert down projection padded to [Qwen4MoeLayer#paddedWidth] input columns, for prefill;
+    /// none when the width needs no padding or the tensor is not plain NVFP4 on the device.
+    private final java.util.Map<Integer, Qwen4Weight> paddedSharedDown = new java.util.HashMap<>();
+    private final java.util.List<Long> owned = new java.util.ArrayList<>();
+
+    /// Builds the padded shared-expert down projections of `layers` layers (`hidden` outputs, `width` inputs) on
+    /// the device and waits for them. Before any graph runs.
+    void padSharedDown(int layers, int hidden, int width) {
+        int padded = Qwen4MoeLayer.paddedWidth(width);
+        if (padded == width) return;
+        for (int layer = 0; layer < layers; layer++) {
+            TensorHandle handle = this.model.tensor(layer(layer) + "moe/shared_expert/down_proj");
+            if (handle.deviceAddress() == 0 || handle.byteSize() != Qwen4MoeOps.nvfp4Bytes(hidden, width)) continue;
+            long bytes = Qwen4MoeOps.nvfp4Bytes(hidden, padded);
+            long target = this.gpu.allocate(bytes);
+            this.owned.add(target);
+            Qwen4MoeOps.nvfp4PadK(this.gpu, handle.deviceAddress(), target, hidden, width, padded);
+            this.paddedSharedDown.put(layer, Qwen4Weight.of(target, bytes));
+        }
+        this.gpu.synchronize();
+    }
+
+    /// Frees the padded copies. After every graph retired.
+    void close() {
+        for (long address : this.owned) this.gpu.free(address);
+        this.owned.clear();
+        this.paddedSharedDown.clear();
     }
 
     public Qwen4Ple.Weights ple(int layer) {

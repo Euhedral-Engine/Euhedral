@@ -57,6 +57,8 @@ static const Qwen4KernelEntry kernels[] = {
     {"euhedral_q4_expert_gate_up_swiglu_bf16", 0},
     {"euhedral_q4_expert_down_bf16", 0},
     {"euhedral_q4_expert_combine_bf16", 0},
+    {"euhedral_q4_swiglu_padded_bf16", 0},
+    {"euhedral_q4_nvfp4_pad_k", 0},
 };
 #define KERNEL_COUNT ((int)(sizeof(kernels) / sizeof(kernels[0])))
 

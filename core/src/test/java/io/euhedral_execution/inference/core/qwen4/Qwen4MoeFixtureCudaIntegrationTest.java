@@ -107,15 +107,28 @@ class Qwen4MoeFixtureCudaIntegrationTest {
         return all;
     }
 
+    /// The layer's weights, with the shared expert's down projection padded for prefill as the plan pads it, so the
+    /// chunks of more than 8 rows run the padded native route.
     private static Qwen4MoeLayer.Weights weights_for(Qwen4TestSupport.Weights weights, int layerIndex)
             throws Exception {
         String p = "text/layers/" + layerIndex + "/moe/";
+        Qwen4Weight down = weights.weight(p + "shared_expert/down_proj");
+        int padded = Qwen4MoeLayer.paddedWidth(640);
+        Qwen4Weight paddedDown = null;
+        if (padded != 640 && down.bytes() == Qwen4MoeOps.nvfp4Bytes(2560, 640)) {
+            long bytes = Qwen4MoeOps.nvfp4Bytes(2560, padded);
+            long target = weights.gpu().allocate(bytes);
+            Qwen4MoeOps.nvfp4PadK(weights.gpu(), down.address(), target, 2560, 640, padded);
+            weights.gpu().synchronize();
+            paddedDown = Qwen4Weight.of(target, bytes);
+        }
         return new Qwen4MoeLayer.Weights(
                 weights.weight(p + "router"),
                 weights.weight(p + "shared_expert/gate_proj"),
                 weights.weight(p + "shared_expert/up_proj"),
-                weights.weight(p + "shared_expert/down_proj"),
-                weights.weight(p + "shared_expert_gate"));
+                down,
+                weights.weight(p + "shared_expert_gate"),
+                paddedDown);
     }
 
     /// The router's choice as a set per row, with the reference's weights per expert. A row whose

@@ -36,13 +36,23 @@ import java.util.concurrent.atomic.LongAdder;
 /// descriptor while the lease is held, and the fence orders their completion before the slot's next use.
 public final class Qwen4MoeLayer implements AutoCloseable {
 
-    /// The block's weights: the BF16 router and shared-expert gate, the NVFP4 shared expert.
+    /// The block's weights: the BF16 router and shared-expert gate, the NVFP4 shared expert, and (null when the
+    /// shared expert's width suits the native prefill kernels as it is) its down projection with its input width
+    /// padded to [#paddedWidth], zero columns, for prefill.
     public record Weights(
             Qwen4Weight router,
             Qwen4Weight sharedGateProj,
             Qwen4Weight sharedUpProj,
             Qwen4Weight sharedDownProj,
-            Qwen4Weight sharedExpertGate) {}
+            Qwen4Weight sharedExpertGate,
+            Qwen4Weight sharedDownPadded) {}
+
+    /// The shared expert's width as a prefill's down projection reads it: a multiple of 256, as the native NVFP4
+    /// kernels need for more than 64 rows (their weight scales are fetched 256 values at a time). The added columns
+    /// are zeros in the activation and in the padded weights, so every product they add is 0.
+    public static int paddedWidth(int width) {
+        return io.euhedral_execution.inference.core.model_loader.qwen4.Qwen4ResidencyPlanner.paddedSharedWidth(width);
+    }
 
     /// The device buffers of one block ([#scratchBytes]).
     public record Scratch(
@@ -162,7 +172,8 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         return align(rows * (long) this.experts * bf16) // logits
                 + align(maxPairs * 4) // ids
                 + align(maxPairs * bf16) // route weights
-                + 3 * align(rows * (long) this.sharedInter * bf16) // shared gate, up, act
+                + 2 * align(rows * (long) this.sharedInter * bf16) // shared gate, up
+                + align(rows * (long) paddedWidth(this.sharedInter) * bf16) // shared act, padded for prefill
                 + 2 * align(rows * (long) this.hidden * bf16) // shared, routed
                 + align(rows * bf16) // shared expert gate
                 + align(Qwen4ExpertRouting.scratchBytes((int) maxPairs, this.geometry.inter(), this.hidden));
@@ -177,7 +188,7 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         long sharedGate = routeWeightsAddress + align(maxPairs * bf16);
         long sharedUp = sharedGate + align(rows * (long) this.sharedInter * bf16);
         long sharedAct = sharedUp + align(rows * (long) this.sharedInter * bf16);
-        long shared = sharedAct + align(rows * (long) this.sharedInter * bf16);
+        long shared = sharedAct + align(rows * (long) paddedWidth(this.sharedInter) * bf16);
         long routed = shared + align(rows * (long) this.hidden * bf16);
         long gateRaw = routed + align(rows * (long) this.hidden * bf16);
         long expertScratch = gateRaw + align(rows * bf16);
@@ -218,16 +229,11 @@ public final class Qwen4MoeLayer implements AutoCloseable {
         sharedExpert(weights, input, rows, scratch);
     }
 
-    /// The shared expert and its gate: the SwiGLU MLP of every row, and the gate's raw projection.
-    private void sharedExpert(Weights weights, long input, int rows, Scratch scratch) {
-        Qwen4Weight gate = weights.sharedGateProj();
-        this.gpu.linearNvfp4Bf16(
-                input, gate.address(), scratch.sharedGate(), rows, this.hidden, this.sharedInter, gate.bytes());
-        Qwen4Weight up = weights.sharedUpProj();
-        this.gpu.linearNvfp4Bf16(
-                input, up.address(), scratch.sharedUp(), rows, this.hidden, this.sharedInter, up.bytes());
-        Qwen4MoeOps.swiGlu(
-                this.gpu, scratch.sharedGate(), scratch.sharedUp(), scratch.sharedAct(), rows * this.sharedInter);
+    /// Rows above which a block is a prefill: the decode kernels take 1 to 8 rows.
+    private static final int PREFILL_ROWS = 8;
+
+    /// The shared expert's down projection at its own width.
+    private void sharedDown(Weights weights, int rows, Scratch scratch) {
         Qwen4Weight down = weights.sharedDownProj();
         this.gpu.linearNvfp4Bf16(
                 scratch.sharedAct(),
@@ -237,6 +243,36 @@ public final class Qwen4MoeLayer implements AutoCloseable {
                 this.sharedInter,
                 this.hidden,
                 down.bytes());
+    }
+
+    /// The shared expert and its gate: the SwiGLU MLP of every row, and the gate's raw projection.
+    private void sharedExpert(Weights weights, long input, int rows, Scratch scratch) {
+        Qwen4Weight gate = weights.sharedGateProj();
+        this.gpu.linearNvfp4Bf16(
+                input, gate.address(), scratch.sharedGate(), rows, this.hidden, this.sharedInter, gate.bytes());
+        Qwen4Weight up = weights.sharedUpProj();
+        this.gpu.linearNvfp4Bf16(
+                input, up.address(), scratch.sharedUp(), rows, this.hidden, this.sharedInter, up.bytes());
+        Qwen4Weight padded = weights.sharedDownPadded();
+        if (rows > PREFILL_ROWS && padded != null) {
+            // A prefill: the native kernels take the padded width, where the unpadded one would run the scalar
+            // reference (more than 64 rows need input widths in multiples of 256).
+            int width = paddedWidth(this.sharedInter);
+            Qwen4MoeOps.swiGluPadded(
+                    this.gpu,
+                    scratch.sharedGate(),
+                    scratch.sharedUp(),
+                    scratch.sharedAct(),
+                    rows,
+                    this.sharedInter,
+                    width);
+            this.gpu.linearNvfp4Bf16(
+                    scratch.sharedAct(), padded.address(), scratch.shared(), rows, width, this.hidden, padded.bytes());
+        } else {
+            Qwen4MoeOps.swiGlu(
+                    this.gpu, scratch.sharedGate(), scratch.sharedUp(), scratch.sharedAct(), rows * this.sharedInter);
+            sharedDown(weights, rows, scratch);
+        }
         Qwen4Ops.linearBf16(
                 this.gpu, input, weights.sharedExpertGate().address(), scratch.gateRaw(), rows, this.hidden, 1);
     }

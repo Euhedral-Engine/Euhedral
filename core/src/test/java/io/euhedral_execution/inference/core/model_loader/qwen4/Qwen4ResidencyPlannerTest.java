@@ -245,7 +245,8 @@ class Qwen4ResidencyPlannerTest {
     @Test
     void theCacheGivesUpAtMostATenthOfItsMemoryToALongerPrefillChunk() {
         var config = artifact.config();
-        long base = Qwen4SequenceState.workspaceBytes(config);
+        long padding = Qwen4ResidencyPlanner.sharedDownPaddingBytes(config);
+        long base = Qwen4SequenceState.workspaceBytes(config) + padding;
         for (long free : DEVICES) {
             for (int context : CONTEXTS) {
                 var plan = plan(free, context);
@@ -254,9 +255,10 @@ class Qwen4ResidencyPlannerTest {
                 assertTrue(chunk >= Qwen4SequenceState.PREFILL_CHUNK_TOKENS, report(plan, free, context));
                 assertTrue(chunk <= Qwen4ResidencyPlanner.LARGEST_PREFILL_CHUNK_TOKENS);
                 assertEquals(Integer.bitCount(chunk), 1, "a power of two: " + chunk);
-                // The workspace the plan reserves is every workspace the execution plan allocates.
+                // The workspace the plan reserves is every workspace the execution plan allocates, and the shared
+                // expert's padded down projections.
                 assertEquals(
-                        Qwen4SequenceState.workspaceBytes(config, chunk),
+                        Qwen4SequenceState.workspaceBytes(config, chunk) + padding,
                         plan.device().workspaceBytes());
                 if (chunk > Qwen4SequenceState.PREFILL_CHUNK_TOKENS) {
                     long extra = plan.device().workspaceBytes() - base;

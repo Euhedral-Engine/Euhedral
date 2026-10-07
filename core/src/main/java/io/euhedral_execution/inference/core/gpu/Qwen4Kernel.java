@@ -30,7 +30,9 @@ public enum Qwen4Kernel {
     EMBEDDING_BF16("euhedral_q4_embedding_bf16"),
     EXPERT_GATE_UP_SWIGLU_BF16("euhedral_q4_expert_gate_up_swiglu_bf16"),
     EXPERT_DOWN_BF16("euhedral_q4_expert_down_bf16"),
-    EXPERT_COMBINE_BF16("euhedral_q4_expert_combine_bf16");
+    EXPERT_COMBINE_BF16("euhedral_q4_expert_combine_bf16"),
+    SWIGLU_PADDED_BF16("euhedral_q4_swiglu_padded_bf16"),
+    NVFP4_PAD_K("euhedral_q4_nvfp4_pad_k");
 
     private final String symbol;
 

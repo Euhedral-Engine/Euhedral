@@ -159,6 +159,10 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
         this.streams = this.config.hyperConnection().count();
         this.vocabulary = this.config.text().vocabSize();
         this.weights = new Qwen4Weights(model, gpu);
+        this.weights.padSharedDown(
+                this.config.text().numLayers(),
+                this.config.text().hiddenSize(),
+                this.config.moe().sharedExpertIntermediateSize());
         float epsilon = (float) this.config.text().rmsNormEpsilon();
         this.hyperConnection = new Qwen4HyperConnection(
                 this.streams, this.hidden, this.config.hyperConnection().lowrank(), epsilon);
@@ -573,5 +577,6 @@ public final class Qwen4ExecutionPlan implements AutoCloseable {
     public void close() {
         this.closed = true;
         closeWorkspaces();
+        this.weights.close();
     }
 }
