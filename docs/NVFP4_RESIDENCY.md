@@ -134,7 +134,7 @@ no kernel work can close the gap at batch 1. Greedy generation answers "The capi
 ## Host-backed weights
 
 When the planned weights do not fit, `HostWeightSelection` keeps layer projections in pinned host memory and stages them into a
-device ring of `ResidencyPlanner.STAGING_SLOTS` = 4 slots on every use.
+device ring of `WeightStaging.SLOTS` = 4 slots on every use.
 
 - **Planner:** the device budget is the resident weights, the staging ring (4 slots of the largest selected tensor), the KV pages
   of one sequence of `maxContextTokens` (`euhedral.inference.max-context-tokens`, default 32768), and a fixed 1280 MiB reserve for
@@ -154,7 +154,7 @@ device ring of `ResidencyPlanner.STAGING_SLOTS` = 4 slots on every use.
 - **Concurrency:** a quantum that stages weights holds the ring from admission until its last stage submitted. The next one's
   preparation awaits a marker recorded after the holder's lanes joined.
 - **Prefetch:** a DFlash2 block, which leaves the transfer lane idle for its few milliseconds, also copies the decode view's
-  first `STAGING_SLOTS` uses into slots 0 .. 3. A decode or verification quantum that is admitted while the ring holds them runs
+  first `WeightStaging.SLOTS` uses into slots 0 .. 3. A decode or verification quantum that is admitted while the ring holds them runs
   the decode view without those transfers (`ExecutionPlan.preloadedVariant`); the runtime marks the ring loaded, under its
   hold, only when every stage of the prefetching quantum ran, and any other staging quantum clears the mark
   ([DFLASH2.md](DFLASH2.md)).

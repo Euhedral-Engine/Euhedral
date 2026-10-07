@@ -1,4 +1,4 @@
-package io.euhedral_execution.inference.core.model.qwen4.loader;
+package io.euhedral_execution.inference.core.model.qwen4;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -7,10 +7,19 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
-import io.euhedral_execution.inference.core.model.qwen4.Qwen4Model;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertTestSupport;
+import io.euhedral_execution.inference.core.model.qwen4.loader.Artifact;
+import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
+import io.euhedral_execution.inference.core.model.qwen4.loader.HostMemoryGpu;
+import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
+import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlan;
+import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlanner;
+import io.euhedral_execution.inference.core.model.qwen4.loader.SequenceState;
+import io.euhedral_execution.inference.core.model.qwen4.loader.StorageClass;
+import io.euhedral_execution.inference.core.model.qwen4.loader.Tensor;
+import io.euhedral_execution.inference.core.model.qwen4.loader.TestArtifact;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
