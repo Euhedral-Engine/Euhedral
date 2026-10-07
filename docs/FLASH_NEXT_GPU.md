@@ -110,3 +110,10 @@ critical path; each layer waits for its slowest expert's record. Worth retrying 
 
 More lanes (`EUHEDRAL_QWEN4_LANES`): 2 / 4 / 8 lanes, decode warm 64 30.5 / 31.0 / 31.2, cold 64 23.6 / 24.0 / 23.6
 tokens/s: within noise.
+
+## Device memory left for the system
+
+The plan filled the device: 84 MiB stayed free at the lowest point of a run. It now keeps 700 MiB for the rest of the
+system beside the runtime's 1 GiB (`Qwen4ResidencyPlanner.SYSTEM_RESERVE_BYTES`, `EUHEDRAL_GPU_SYSTEM_RESERVE_MIB`):
+774 MiB stayed free at the lowest point. The expert cache has 3,102 slots instead of about 3,385; decode cold 64 / 4096
+23.0 / 22.7 tokens/s (23.6 / 23.6 before), warm 30.1 / 29.9 (30.0-30.5 / 29.9), prefill unchanged.

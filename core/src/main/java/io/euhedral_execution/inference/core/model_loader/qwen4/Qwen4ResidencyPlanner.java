@@ -42,6 +42,14 @@ public final class Qwen4ResidencyPlanner {
     /// measured on the dense model's engine, docs/NVFP4_RESIDENCY.md).
     public static final long KERNEL_RESERVE_BYTES = 1024L << 20;
 
+    /// Device memory left free for the rest of the system (the desktop and other programs on the GPU), which the
+    /// plan never fills: 700 MiB, or `EUHEDRAL_GPU_SYSTEM_RESERVE_MIB`.
+    public static final long SYSTEM_RESERVE_BYTES =
+            Long.parseLong(System.getenv().getOrDefault("EUHEDRAL_GPU_SYSTEM_RESERVE_MIB", "700")) << 20;
+
+    /// What the plan keeps beside the model: the runtime's own memory and the system's share.
+    static final long RUNTIME_RESERVE_BYTES = KERNEL_RESERVE_BYTES + SYSTEM_RESERVE_BYTES;
+
     /// The shared expert's width as a prefill's down projection reads it: a multiple of 256, as the native NVFP4
     /// kernels need for more than 64 rows (they fetch the weight scales 256 values at a time).
     public static int paddedSharedWidth(int width) {
@@ -159,7 +167,7 @@ public final class Qwen4ResidencyPlanner {
         // The workspace counts the shared expert's padded down projections, which the plan keeps beside it.
         long padding = sharedDownPaddingBytes(config);
         long workspace = Qwen4SequenceState.workspaceBytes(config) + padding;
-        long reserved = KERNEL_RESERVE_BYTES + workspace + kv + indexer + gdn;
+        long reserved = RUNTIME_RESERVE_BYTES + workspace + kv + indexer + gdn;
 
         // The token embedding is a gather: its rows are read in place from pinned host memory.
         long pinnedLeft = host.pinnableBytes();
@@ -213,7 +221,7 @@ public final class Qwen4ResidencyPlanner {
                             + "takes %d MiB: %d MiB in all against %d MiB free",
                     maxContextTokens,
                     (kv + indexer + gdn + workspace) >> 20,
-                    KERNEL_RESERVE_BYTES >> 20,
+                    RUNTIME_RESERVE_BYTES >> 20,
                     (fixedBytes - movableBytes) >> 20,
                     need >> 20,
                     ring >> 20,
@@ -252,7 +260,7 @@ public final class Qwen4ResidencyPlanner {
             chunk = candidate;
         }
         workspace = Qwen4SequenceState.workspaceBytes(config, chunk) + padding;
-        reserved = KERNEL_RESERVE_BYTES + workspace + kv + indexer + gdn;
+        reserved = RUNTIME_RESERVE_BYTES + workspace + kv + indexer + gdn;
         long cacheBudget = freeBytes - need - reserved;
         ExpertCacheGeometry geometry = ExpertCacheGeometry.derive(cacheBudget, slotBytes, totalExperts, minimumSlots);
         long cacheBytes = geometry.bytes();
@@ -302,7 +310,7 @@ public final class Qwen4ResidencyPlanner {
         }
 
         var device = new Qwen4ResidencyPlan.Device(
-                freeBytes, kv, indexer, gdn, workspace, KERNEL_RESERVE_BYTES, resident, ring, cacheBytes, slack);
+                freeBytes, kv, indexer, gdn, workspace, RUNTIME_RESERVE_BYTES, resident, ring, cacheBytes, slack);
         var hostPlan = new Qwen4ResidencyPlan.Host(
                 mapped,
                 staged,

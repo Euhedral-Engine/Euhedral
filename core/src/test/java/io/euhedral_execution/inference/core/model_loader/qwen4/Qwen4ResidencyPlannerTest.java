@@ -105,13 +105,22 @@ class Qwen4ResidencyPlannerTest {
                     assertTrue(
                             plan.device().slackBytes() < cache.slotBytes(),
                             "unused " + plan.device().slackBytes() + " " + report(plan, free, context));
-                // Host-backed bytes only grow with the context. While they do not change, a longer context leaves the
-                // cache less; when a fixed object moves to the host the room it frees may enlarge the cache again.
+                // Host-backed bytes only grow with the context. While they and the prefill chunk do not change, a
+                // longer
+                // context leaves the cache less; when a fixed object moves to the host, or the chunk shrinks, the room
+                // it
+                // frees may enlarge the cache again.
                 if (previous != null) {
                     assertTrue(hostBackedFixedBytes(plan) >= hostBackedFixedBytes(previous), "host-backed bytes fell");
-                    if (hostBackedFixedBytes(plan) == hostBackedFixedBytes(previous))
+                    if (hostBackedFixedBytes(plan) == hostBackedFixedBytes(previous)
+                            && plan.prefillChunkTokens() == previous.prefillChunkTokens())
                         assertTrue(
-                                cache.slotCount() <= previous.expertCache().slotCount(), "cache grew with the context");
+                                cache.slotCount() <= previous.expertCache().slotCount(),
+                                "cache grew with the context: " + free / (1 << 20) + " MiB, context " + context
+                                        + ", chunk "
+                                        + previous.prefillChunkTokens() + " to " + plan.prefillChunkTokens()
+                                        + ", slots "
+                                        + previous.expertCache().slotCount() + " to " + cache.slotCount());
                 }
                 previous = plan;
             }
