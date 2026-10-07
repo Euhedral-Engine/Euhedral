@@ -259,7 +259,7 @@ public final class Session implements GenerationSession {
         /// with `stopped`; any other failure fails it.
         private boolean succeeded(AbstractQuantum step, List<Integer> stopped) throws Exception {
             Session.this.activeStep = null;
-            Throwable failure = step.outcome();
+            Throwable failure = step.terminalFailure();
             if (samples) Session.this.hostLogits.retired(failure == null);
             if (failure == null) return true;
             if (failure instanceof CancellationException && isStopRequested()) {

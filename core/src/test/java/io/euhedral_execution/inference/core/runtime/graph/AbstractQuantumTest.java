@@ -93,7 +93,7 @@ class AbstractQuantumTest {
         assertSame(quantum, next.quantum);
         assertEquals(0, next.executions);
         assertEquals(List.of("release", "commit", "published", "published"), quantum.calls);
-        assertNull(quantum.outcome());
+        assertNull(quantum.terminalFailure());
     }
 
     @Test
@@ -102,7 +102,7 @@ class AbstractQuantumTest {
         var device = new IllegalStateException("device");
         quantum.retire(device);
         assertEquals(List.of("release"), quantum.calls);
-        assertSame(device, quantum.outcome());
+        assertSame(device, quantum.terminalFailure());
     }
 
     @Test
@@ -111,7 +111,7 @@ class AbstractQuantumTest {
         quantum.cancel();
         assertTrue(quantum.stopRequested());
         quantum.retire(null);
-        assertInstanceOf(CancellationException.class, quantum.outcome());
+        assertInstanceOf(CancellationException.class, quantum.terminalFailure());
         assertEquals(List.of("release"), quantum.calls);
     }
 
@@ -120,7 +120,7 @@ class AbstractQuantumTest {
         var quantum = new Probe();
         quantum.commitFailure = new IllegalStateException("commit");
         quantum.retire(null);
-        assertSame(quantum.commitFailure, quantum.outcome());
+        assertSame(quantum.commitFailure, quantum.terminalFailure());
     }
 
     @Test

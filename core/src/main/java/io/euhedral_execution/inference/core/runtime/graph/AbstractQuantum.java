@@ -72,8 +72,8 @@ public abstract class AbstractQuantum implements StageQuantum {
     }
 
     /// Runs on a worker after the device work retired: a device failure or a cancellation becomes the quantum's
-    /// failure, [#release] always runs, and [#commit] runs only when nothing failed. [#outcome] then holds the
-    /// failure that ended the quantum, or null when it committed.
+    /// failure, [#release] always runs, and [#commit] runs only when nothing failed. [#terminalFailure] then
+    /// holds the failure that ended the quantum, or null when it committed.
     @Override
     public void retire(Throwable deviceFailure) {
         if (deviceFailure != null) fail(deviceFailure);
@@ -105,7 +105,7 @@ public abstract class AbstractQuantum implements StageQuantum {
     }
 
     /// The failure that ended the quantum, or null when it committed; read by the continuation.
-    public final Throwable outcome() {
+    public final Throwable terminalFailure() {
         return this.outcome;
     }
 

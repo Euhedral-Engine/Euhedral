@@ -7,8 +7,8 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Proposal;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeAcceptance;
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
-import io.euhedral_execution.inference.core.runtime.graph.StageQuantum;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -20,14 +20,13 @@ import java.util.function.Consumer;
 ///
 /// While it runs, the quantum is bound to a reusable stage graph whose frames perform the operations.
 /// Its sequence reference retains sequence-lifetime state, which is published only at retirement.
-public final class Quantum implements StageQuantum {
+public final class Quantum extends AbstractQuantum {
 
     /// Decode quanta that start below this position overlap registered kernels with their predecessor
     /// (programmatic dependent launch). It won 12 of 12 paired forks, about +1% decode, at a 64-token
     /// context and only 10 of 12 at 1024, so longer contexts keep ordinary launches.
     static final long OVERLAP_MAX_START_POSITION = 1024;
 
-    private static final Throwable TERMINAL_SUCCESS = new IllegalStateException("quantum already finalized");
     private static final Runnable NO_OP = () -> {};
 
     public enum ExecutionKind {
@@ -67,7 +66,6 @@ public final class Quantum implements StageQuantum {
     private final long startPosition;
     private final int[] tokenIds;
     private final AtomicBoolean submitted = new AtomicBoolean();
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
     /// Releases the staging ring this quantum holds; null when it holds none.
     private final AtomicReference<java.util.function.Consumer<GpuStream>> stagingRelease = new AtomicReference<>();
     private final CompletableFuture<Outcome> outcome = new CompletableFuture<>();
@@ -79,6 +77,7 @@ public final class Quantum implements StageQuantum {
     private ExecutionGpu gpu;
     private Consumer<? super Quantum> terminalConsumer;
     private Outcome pendingOutcome;
+    private volatile Outcome conclusion;
     /// DRAFT: the device rows of base (or MTP) hidden state that seed this quantum's MTP rows, and how
     /// many of its rows the MTP cache commits (catch-up rows commit, recursive draft rows do not).
     private long draftSeedAddress;
@@ -271,20 +270,14 @@ public final class Quantum implements StageQuantum {
         return this.outcome;
     }
 
+    @Override
     public void cancel() {
         this.sequence.cancel();
     }
 
-    public void fail(Throwable cause) {
-        Objects.requireNonNull(cause, "cause");
-        if (this.failure.compareAndSet(null, cause)) return;
-        Throwable first = this.failure.get();
-        if (first != TERMINAL_SUCCESS && first != cause) first.addSuppressed(cause);
-    }
-
     /// Reports whether this quantum must stop admitting dependent instructions.
     public boolean hasFailureOrCancellation() {
-        return this.failure.get() != null || this.sequence.cancellationRequested();
+        return failure() != null || this.sequence.cancellationRequested();
     }
 
     @Override
@@ -378,11 +371,6 @@ public final class Quantum implements StageQuantum {
         public int hashCode() {
             return this.hash;
         }
-    }
-
-    /// Returns the first operation failure, if one has been recorded.
-    public Throwable failure() {
-        return this.failure.get();
     }
 
     public ExecutionKind kind() {
@@ -562,7 +550,7 @@ public final class Quantum implements StageQuantum {
         ExecutionGpu gpu = this.gpu;
         if (this.hostLogits == null
                 && this.proposal == null
-                && this.failure.get() == null
+                && failure() == null
                 && !this.sequence.cancellationRequested()) {
             try {
                 retainLogits(gpu);
@@ -570,7 +558,7 @@ public final class Quantum implements StageQuantum {
                 fail(retentionFailure);
             }
         }
-        if (this.failure.get() == null && !this.sequence.cancellationRequested() && this.terminalConsumer != null) {
+        if (failure() == null && !this.sequence.cancellationRequested() && this.terminalConsumer != null) {
             try {
                 this.terminalConsumer.accept(this);
             } catch (Throwable consumerFailure) {
@@ -594,11 +582,8 @@ public final class Quantum implements StageQuantum {
                 }
             }
         }
-        Throwable error = this.failure.get();
-        if (error == null && !this.failure.compareAndSet(null, TERMINAL_SUCCESS)) {
-            error = this.failure.get();
-        }
-        if (error == TERMINAL_SUCCESS) error = null;
+        Throwable error = failure();
+        if (error == null && !seal()) error = failure();
         if (error != null || this.sequence.cancellationRequested()) {
             error = releaseLogits(error);
         }
@@ -638,16 +623,23 @@ public final class Quantum implements StageQuantum {
         return this.pendingOutcome != null || this.outcome.isDone();
     }
 
-    /// Completes the caller-visible outcome prepared by [#retire].
+    /// Completes the caller-visible outcome prepared by [#retire]; the continuation is thrown after it.
     @Override
-    public void publishOutcome() {
+    protected void published() {
         Outcome completed = this.pendingOutcome;
         if (completed == null) {
             if (this.outcome.isDone()) return;
             throw new IllegalStateException("quantum has not retired");
         }
         this.pendingOutcome = null;
+        this.conclusion = completed;
+        concluded(completed.failure());
         this.outcome.complete(completed);
+    }
+
+    /// The published outcome, or null before publication: what a continuation reads.
+    public Outcome conclusion() {
+        return this.conclusion;
     }
 
     /// Retires a quantum that never started stages, then publishes its outcome.
