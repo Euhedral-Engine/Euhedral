@@ -368,7 +368,7 @@ public final class Session implements GenerationSession {
     /// was active at close ends.
     private synchronized void completeClose() {
         this.sequence.complete();
-        // The sequence completes only once no quantum holds its lease, and a quantum releases the lease
+        // The sequence completes only once no quantum is in flight, and a quantum retires from the sequence
         // after its retirement boundary, so no copy into the host row can still be queued.
         this.hostLogits.close();
         if (this.speculative != null) this.speculative.close();

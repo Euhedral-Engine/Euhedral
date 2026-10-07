@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
-/// Mutable state for one inference quantum: its token range, sequence lease, workspace, and outcome.
+/// Mutable state for one inference quantum: its token range, its admission to the sequence, workspace, and outcome.
 ///
 /// While it runs, the quantum is bound to a reusable stage graph whose frames perform the operations.
 /// Its sequence reference retains sequence-lifetime state, which is published only at retirement.
@@ -70,7 +70,8 @@ public final class Quantum extends AbstractQuantum {
     private final AtomicBoolean submitted = new AtomicBoolean();
     /// Releases the staging ring this quantum holds; null when it holds none.
     private final AtomicReference<java.util.function.Consumer<GpuStream>> stagingRelease = new AtomicReference<>();
-    private Sequence.ExecutionLease lease;
+    /// Whether the sequence admitted this quantum; only an admitted quantum retires the sequence's work.
+    private boolean admitted;
     private Workspace workspace;
     /// The pinned staging of the quantum's input record, held until its device work retired.
     private ExecutionGpu.UploadBuffer inputUpload;
@@ -84,7 +85,8 @@ public final class Quantum extends AbstractQuantum {
     private int draftCommittedRows;
     /// Base quanta of a speculative session also keep every row's post-final-norm hidden for drafting.
     private boolean seedsDraft;
-    private long leasePosition;
+    /// The committed frontier a draft quantum leaves the sequence at.
+    private long draftPosition;
     /// A DFlash2 block's host copy of its proposal, queued by its selector stage.
     private DFlash2Proposal proposal;
 
@@ -376,14 +378,14 @@ public final class Quantum extends AbstractQuantum {
     }
 
     /// Claims this quantum's single admission. A claimed quantum always reaches a terminal outcome, so
-    /// a failed admission can never be retried into a second lease or workspace.
+    /// a failed admission can never be retried into a second sequence admission or workspace.
     public void claim() {
         if (!this.submitted.compareAndSet(false, true)) {
             throw new DuplicateAdmissionException();
         }
     }
 
-    /// Package-private hook to deterministically exercise cancellation at the lease-claim boundary.
+    /// Package-private hook to deterministically exercise cancellation at the sequence-admission boundary.
     void begin(ExecutionGpu gpu, Runnable beforeClaim) {
         claim();
         if (!begin(gpu, null, null, new WorkspaceStorage(gpu), beforeClaim)) publishOutcome();
@@ -425,15 +427,21 @@ public final class Quantum extends AbstractQuantum {
             }
             beforeClaim.run();
             try {
-                // Drafting runs at MTP positions and leaves the base position where it is.
-                this.leasePosition = drafting() ? this.sequence.currentTokenPosition() : this.startPosition;
-                this.lease = this.sequence.claimExecution(this.leasePosition);
-            } catch (IllegalStateException claimFailure) {
-                if (this.sequence.terminalState() == Sequence.TerminalState.CANCELLED) {
+                // Drafting runs at MTP positions and leaves the frontiers where they are.
+                if (drafting()) {
+                    this.draftPosition = this.sequence.committedFrontier();
+                    this.sequence.admit(this.draftPosition, this.draftPosition);
+                } else {
+                    this.sequence.admit(this.startPosition, end);
+                }
+                this.admitted = true;
+            } catch (IllegalStateException admissionFailure) {
+                if (this.sequence.cancellationRequested()
+                        || this.sequence.terminalState() == Sequence.TerminalState.CANCELLED) {
                     retire(null);
                     return false;
                 }
-                throw claimFailure;
+                throw admissionFailure;
             }
             initializeSequenceState(gpu);
             this.workspace = this.shape.hasFirstLayer()
@@ -472,19 +480,18 @@ public final class Quantum extends AbstractQuantum {
     }
 
     private void initializeSequenceState(ExecutionGpu gpu) {
-        attachSequenceState(this.shape, this.sequence, this.lease, gpu);
+        attachSequenceState(this.shape, this.sequence, gpu);
     }
 
     /// Gives `sequence` the persistent state a first quantum allocates (GDN buffers and KV pages), or checks
-    /// the state it already has. Runs under `lease`.
-    public static void attachSequenceState(
-            ExecutionPlan plan, Sequence sequence, Sequence.ExecutionLease lease, ExecutionGpu gpu) {
-        attachSequenceState(plan.shape(), sequence, lease, gpu);
+    /// the state it already has. Runs while the sequence has its quantum in flight.
+    public static void attachSequenceState(ExecutionPlan plan, Sequence sequence, ExecutionGpu gpu) {
+        attachSequenceState(plan.shape(), sequence, gpu);
     }
 
-    /// As [#attachSequenceState(ExecutionPlan, Sequence, Sequence.ExecutionLease, ExecutionGpu)] for the view
-    /// `shape`: a view without a first layer leaves the sequence's state alone.
-    static void attachSequenceState(Shape shape, Sequence sequence, Sequence.ExecutionLease lease, ExecutionGpu gpu) {
+    /// As [#attachSequenceState(ExecutionPlan, Sequence, ExecutionGpu)] for the view `shape`: a view without a
+    /// first layer leaves the sequence's state alone.
+    static void attachSequenceState(Shape shape, Sequence sequence, ExecutionGpu gpu) {
         if (!shape.hasFirstLayer()) return;
         ExecutionPlan plan = shape.plan();
         Object current = sequence.recurrentState();
@@ -517,8 +524,8 @@ public final class Quantum extends AbstractQuantum {
                             config.linearValueHeadDim(),
                             config.linearConvKernelDim());
                 }
-                sequence.setRecurrentState(lease, createdRecurrent);
-                if (createdKv != null) sequence.setKvCacheState(lease, createdKv);
+                sequence.setRecurrentState(createdRecurrent);
+                if (createdKv != null) sequence.setKvCacheState(createdKv);
             } catch (RuntimeException | Error attachmentFailure) {
                 closeCreatedState(createdKv, attachmentFailure);
                 closeCreatedState(createdRecurrent, attachmentFailure);
@@ -581,9 +588,10 @@ public final class Quantum extends AbstractQuantum {
         }
     }
 
-    /// The sequence follows the outcome: a failure marks it failed, a cancellation cancelled, and a success
-    /// releases it at its next position (unless a cancellation won the race). Then the host row and the proposal
-    /// become readable for a success, and the outcome is recorded for the continuation.
+    /// The sequence follows the outcome: a failure fails it and abandons the quantum's work, a cancellation abandons
+    /// it, and a success commits it at its next position (unless a cancellation won the race). A quantum the
+    /// sequence never admitted leaves it alone. Then the host row and the proposal become readable for a success,
+    /// and the outcome is recorded for the continuation.
     @Override
     protected void settle() {
         Throwable error = failure();
@@ -593,24 +601,26 @@ public final class Quantum extends AbstractQuantum {
         Outcome completed;
         try {
             if (failed != null) {
-                if (this.lease != null) this.sequence.markFailed(this.lease, failed);
+                if (this.admitted) {
+                    this.sequence.fail(failed);
+                    this.sequence.abandon();
+                }
                 completed = new Outcome(Status.FAILED, failed);
             } else if (cancelled) {
-                if (this.lease != null) this.sequence.markCancelled(this.lease);
+                if (this.admitted) this.sequence.abandon();
                 completed = new Outcome(Status.CANCELLED, null);
             } else {
-                boolean lost = this.sequence.releaseExecutionAndCheckCancellation(
-                        this.lease, drafting() ? this.leasePosition : this.startPosition + committedRowCount());
+                boolean lost = this.sequence.commit(
+                        drafting() ? this.draftPosition : this.startPosition + committedRowCount());
                 completed = new Outcome(lost ? Status.CANCELLED : Status.SUCCESS, null);
             }
-        } catch (Throwable cleanupFailure) {
-            // Terminal state is published before persistent cleanup. Never strand the continuation if a device free
-            // fails; the sequence owner can retry cleanup after observing this failure.
-            if (failed == null) failed = cleanupFailure;
-            else if (failed != cleanupFailure) failed.addSuppressed(cleanupFailure);
+        } catch (RuntimeException | Error retirementFailure) {
+            // Never strand the continuation: a sequence that refuses the retirement fails the quantum.
+            if (failed == null) failed = retirementFailure;
+            else if (failed != retirementFailure) failed.addSuppressed(retirementFailure);
             completed = new Outcome(Status.FAILED, releaseLogits(failed));
         }
-        this.lease = null;
+        this.admitted = false;
         // The row was copied before the retirement boundary; only a successful quantum exposes it.
         if (this.hostLogits != null) this.hostLogits.retired(completed.status() == Status.SUCCESS);
         if (this.proposal != null) this.proposal.retired(completed.status() == Status.SUCCESS);

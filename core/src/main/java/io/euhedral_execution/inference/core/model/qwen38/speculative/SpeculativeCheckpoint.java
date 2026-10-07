@@ -26,7 +26,7 @@ public interface SpeculativeCheckpoint {
     /// The copies that save this state of `sequence` into `node`'s extent, from host offset `at`.
     List<PrefixLayout.Copy> captureCopies(PrefixNode node, long at, Sequence sequence);
 
-    /// Readies `sequence` (its state allocated, held under its lease) to receive this state at the leaf's
+    /// Readies `sequence` (its state allocated, with the restore in flight) to receive this state at the leaf's
     /// position, and returns the copies that load it from `chain`; `at` gives each node's offset of this state.
     List<PrefixLayout.Copy> restoreCopies(List<PrefixNode> chain, ToLongFunction<PrefixNode> at, Sequence sequence);
 

@@ -57,8 +57,8 @@ class PrefixCacheTest {
     /// A sequence with `rows` committed rows and recognizable state, as a prefill leaves it.
     private Sequence sequence(int rows, int seed) {
         var sequence = new Sequence(1);
-        var lease = sequence.claimExecution(0);
-        Quantum.attachSequenceState(plan(), sequence, lease, this.gpu);
+        sequence.admit(0, 0);
+        Quantum.attachSequenceState(plan(), sequence, this.gpu);
         var attention = (AttentionStates) sequence.kvCacheState();
         var gdn = (GdnStates) sequence.recurrentState();
         AttentionKvState kv = attention.forLayer(1);
@@ -71,7 +71,7 @@ class PrefixCacheTest {
                 gdn.forLayer(0).convolutionStateAddress(), (int) gdn.forLayer(0).convolutionBytes(), seed + 1);
         for (int i = 0; i < kv.pageAddresses().size(); i++)
             this.gpu.fill(kv.pageAddresses().get(i), (int) (2 * kv.planePageBytes()), seed + 2 + i);
-        sequence.releaseExecution(lease, rows);
+        sequence.commit(rows);
         return sequence;
     }
 
@@ -94,7 +94,7 @@ class PrefixCacheTest {
         assertTrue(cache.restore(INLINE, plan(), target, hit).get());
         cache.release(hit);
         assertEquals(1024, target.currentTokenPosition());
-        assertFalse(target.isExecutionClaimed());
+        assertFalse(target.inFlight());
         var restoredKv = ((AttentionStates) target.kvCacheState()).forLayer(1);
         var sourceKv = ((AttentionStates) source.kvCacheState()).forLayer(1);
         assertEquals(1024, restoredKv.length());
@@ -196,7 +196,7 @@ class PrefixCacheTest {
         assertFalse(cache.restore(INLINE, plan(), target, hit).get(), "cancelled: no restore, and no failure");
         cache.release(hit);
         assertEquals(Sequence.TerminalState.CANCELLED, target.terminalState());
-        assertFalse(target.isExecutionClaimed());
+        assertFalse(target.inFlight());
     }
 
     @Test
@@ -218,7 +218,7 @@ class PrefixCacheTest {
                 cache.capture(cancelling, source, cache.root(), tokens, 1024).get();
         assertFalse(released.get(), "the sequence's state was released while the capture copied it");
         assertEquals(1024, node.position(), "the copies finished before the release, so the node is whole");
-        assertFalse(source.isExecutionClaimed());
+        assertFalse(source.inFlight());
         assertEquals(Sequence.TerminalState.CANCELLED, source.terminalState(), "released after the copies");
     }
 
@@ -240,13 +240,13 @@ class PrefixCacheTest {
     }
 
     @Test
-    void aCancellationRequestedWhileTheLeaseIsFreeStopsTheRestoreWithoutAnError() throws Exception {
+    void aCancellationDuringTheRestoreStopsItWithoutAnError() throws Exception {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
         var hit = cache.lookup(tokens);
         var target = new Sequence(3);
-        // Cancelled once the restore's copies began: the sequence held the lease, so cancel() only flags it.
+        // Cancelled once the restore's copies began: the restore is in flight, so cancel() only flags the sequence.
         PrefixFrames cancelling = new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
@@ -256,12 +256,12 @@ class PrefixCacheTest {
         };
         assertFalse(cache.restore(cancelling, plan(), target, hit).get());
         cache.release(hit);
-        assertFalse(target.isExecutionClaimed(), "the lease was released");
+        assertFalse(target.inFlight(), "the restore retired");
         assertEquals(Sequence.TerminalState.CANCELLED, target.terminalState());
     }
 
     @Test
-    void aFailedRestoreCopyFailsTheSequenceAndReleasesItsLease() throws Exception {
+    void aFailedRestoreCopyFailsTheSequenceAndRetiresTheRestore() throws Exception {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
@@ -278,7 +278,7 @@ class PrefixCacheTest {
                 () -> cache.restore(failing, plan(), target, hit).get());
         cache.release(hit);
         assertEquals(Sequence.TerminalState.FAILED, target.terminalState());
-        assertFalse(target.isExecutionClaimed());
+        assertFalse(target.inFlight());
     }
 
     @Test
@@ -321,8 +321,8 @@ class PrefixCacheTest {
     /// A sequence as a speculative prefill leaves it: `rows` base rows, `mtpRows` MTP rows, recognizable bytes.
     private Sequence sequenceWithMtp(int rows, int mtpRows, int seed) {
         var sequence = new Sequence(1);
-        var lease = sequence.claimExecution(0);
-        attachMtpStates(sequence, lease);
+        sequence.admit(0, 0);
+        attachMtpStates(sequence);
         var attention = (AttentionStates) sequence.kvCacheState();
         var gdn = (GdnStates) sequence.recurrentState();
         AttentionKvState kv = attention.forLayer(1);
@@ -341,13 +341,12 @@ class PrefixCacheTest {
             this.gpu.fill(kv.pageAddresses().get(i), (int) (2 * kv.planePageBytes()), seed + 2 + i);
         for (int i = 0; i < mtp.pageAddresses().size(); i++)
             this.gpu.fill(mtp.pageAddresses().get(i), (int) (2 * mtp.planePageBytes()), seed + 50 + i);
-        sequence.releaseExecution(lease, rows);
+        sequence.commit(rows);
         return sequence;
     }
 
-    private void attachMtpStates(Sequence sequence, Sequence.ExecutionLease lease) {
+    private void attachMtpStates(Sequence sequence) {
         sequence.setRecurrentState(
-                lease,
                 GdnStates.allocate(
                         this.gpu,
                         CONFIG.layerTypes(),
@@ -357,7 +356,6 @@ class PrefixCacheTest {
                         CONFIG.linearValueHeadDim(),
                         CONFIG.linearConvKernelDim()));
         sequence.setKvCacheState(
-                lease,
                 AttentionStates.allocate(
                         this.gpu, CONFIG.layerTypes(), CONFIG.numKeyValueHeads() * CONFIG.attentionHeadDim(), true));
     }
@@ -387,9 +385,9 @@ class PrefixCacheTest {
         var hit = cache.lookup(tokens, new MtpCheckpoint(CONFIG));
         assertNotNull(hit);
         var target = new Sequence(2);
-        var lease = target.claimExecution(0);
-        attachMtpStates(target, lease);
-        target.releaseExecution(lease, 0);
+        target.admit(0, 0);
+        attachMtpStates(target);
+        target.commit(0);
         assertTrue(cache.restore(INLINE, plan(), target, hit, new MtpCheckpoint(CONFIG))
                 .get());
         cache.release(hit);
@@ -462,7 +460,7 @@ class PrefixCacheTest {
                 ExecutionException.class,
                 () -> cache.restore(INLINE, plan(), target, hit).get());
         assertEquals(Sequence.TerminalState.ACTIVE, target.terminalState(), "nothing was claimed");
-        assertFalse(target.isExecutionClaimed());
+        assertFalse(target.inFlight());
     }
 
     @Test

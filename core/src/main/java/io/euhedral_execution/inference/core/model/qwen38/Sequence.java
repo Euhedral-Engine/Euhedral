@@ -6,8 +6,16 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /// Request-lifetime state shared by successive Qwen execution quanta.
 ///
-/// The execution lease is intentionally exclusive: one submitted chain may mutate this state at a
-/// time. Sequence-owned recurrent resources are closed when the sequence reaches a terminal state.
+/// The generation chain orders a sequence's work: it admits one quantum at a time and retires it before the next.
+/// A sequence keeps two frontiers. The submitted frontier is where the quantum in flight will leave the sequence;
+/// the committed frontier is where the last retired quantum left it. Admission and retirement are written only by
+/// that chain, and read by any thread, so the fields are volatile and there is no execution lease.
+///
+/// Cancellation comes from any thread. Admission publishes the quantum in flight before it reads the cancellation
+/// flag, and [#cancel()] publishes the flag before it reads the quantum in flight, so one of the two always sees
+/// the other: either the admission backs out, or the quantum's retirement concludes the cancellation. The terminal
+/// state is first-writer-wins. Persistent state (GDN buffers, KV pages) closes only in [#complete()], which the
+/// session's lifecycle runs after its generation ended.
 public final class Sequence {
 
     public enum TerminalState {
@@ -17,19 +25,21 @@ public final class Sequence {
         COMPLETED
     }
 
-    /// Capability held by the one chain currently allowed to mutate sequence state.
-    public static final class ExecutionLease {
+    private record Terminal(TerminalState state, Throwable failure) {}
 
-        private final Sequence owner;
-
-        private ExecutionLease(Sequence owner) {
-            this.owner = owner;
-        }
-    }
+    private static final Terminal ACTIVE = new Terminal(TerminalState.ACTIVE, null);
+    private static final Terminal CANCELLED = new Terminal(TerminalState.CANCELLED, null);
+    private static final Terminal COMPLETED = new Terminal(TerminalState.COMPLETED, null);
 
     private final long sequenceId;
-    private final AtomicReference<State> state;
-    // Only terminal resource cleanup is serialized; lease and position transitions remain CAS-based.
+    private volatile long committed;
+    private volatile long submitted;
+    private volatile boolean inFlight;
+    private volatile boolean cancellationRequested;
+    private final AtomicReference<Terminal> terminal = new AtomicReference<>(ACTIVE);
+    private volatile Object kvCacheState;
+    private volatile Object recurrentState;
+    // Only terminal resource cleanup, which is lifecycle, is serialized.
     private final ReentrantLock cleanupLock = new ReentrantLock();
     private boolean recurrentReleased;
     private boolean kvReleased;
@@ -46,314 +56,180 @@ public final class Sequence {
             throw new IllegalArgumentException("initialTokenPosition must be non-negative");
         }
         this.sequenceId = sequenceId;
-        this.state = new AtomicReference<>(
-                new State(initialTokenPosition, null, false, TerminalState.ACTIVE, null, null, null));
+        this.committed = initialTokenPosition;
+        this.submitted = initialTokenPosition;
     }
 
     public long sequenceId() {
         return this.sequenceId;
     }
 
+    /// The committed frontier: where the last retired quantum left the sequence.
     public long currentTokenPosition() {
-        return this.state.get().currentTokenPosition();
+        return this.committed;
     }
 
-    public boolean isExecutionClaimed() {
-        return this.state.get().activeLease() != null;
+    public long committedFrontier() {
+        return this.committed;
+    }
+
+    /// Where the quantum in flight will leave the sequence; the committed frontier when none is.
+    public long submittedFrontier() {
+        return this.submitted;
+    }
+
+    /// Whether a quantum has been admitted and not yet retired.
+    public boolean inFlight() {
+        return this.inFlight;
     }
 
     public boolean cancellationRequested() {
-        return this.state.get().cancellationRequested();
+        return this.cancellationRequested;
     }
 
     public TerminalState terminalState() {
-        return this.state.get().terminalState();
+        return this.terminal.get().state();
     }
 
     public Throwable terminalFailure() {
-        return this.state.get().terminalFailure();
+        return this.terminal.get().failure();
     }
 
     public Object kvCacheState() {
-        return this.state.get().kvCacheState();
+        return this.kvCacheState;
     }
 
-    public void setKvCacheState(ExecutionLease lease, Object kvCacheState) {
-        while (true) {
-            State current = this.state.get();
-            requireLease(current, lease);
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    current.activeLease(),
-                    current.cancellationRequested(),
-                    current.terminalState(),
-                    current.terminalFailure(),
-                    kvCacheState,
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                return;
-            }
-        }
+    /// Sets the KV state; only the quantum in flight does.
+    public void setKvCacheState(Object kvCacheState) {
+        requireInFlight();
+        this.kvCacheState = kvCacheState;
     }
 
     public Object recurrentState() {
-        return this.state.get().recurrentState();
+        return this.recurrentState;
     }
 
-    public void setRecurrentState(ExecutionLease lease, Object recurrentState) {
-        while (true) {
-            State current = this.state.get();
-            requireLease(current, lease);
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    current.activeLease(),
-                    current.cancellationRequested(),
-                    current.terminalState(),
-                    current.terminalFailure(),
-                    current.kvCacheState(),
-                    recurrentState);
-            if (this.state.compareAndSet(current, updated)) {
-                return;
-            }
+    /// Sets the recurrent state; only the quantum in flight does.
+    public void setRecurrentState(Object recurrentState) {
+        requireInFlight();
+        this.recurrentState = recurrentState;
+    }
+
+    /// Admits the quantum covering positions `[start, end)`. It must start at the committed frontier, with none in
+    /// flight, on an active sequence whose cancellation was not requested. A draft quantum admits `[committed,
+    /// committed)`: it is still the one quantum in flight, and leaves the frontiers where they are.
+    public void admit(long start, long end) {
+        if (this.inFlight) {
+            throw new IllegalStateException("Sequence already has a quantum in flight");
         }
+        requireActive();
+        if (start != this.committed) {
+            throw new IllegalArgumentException(
+                    "Execution starts at " + start + " but sequence is at " + this.committed);
+        }
+        if (end < start) {
+            throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
+        }
+        this.inFlight = true;
+        // Published before the flag is read; cancel() writes the flag before it reads this.
+        if (this.cancellationRequested) {
+            this.inFlight = false;
+            this.terminal.compareAndSet(ACTIVE, CANCELLED);
+            throw new IllegalStateException("Sequence cancellation was requested");
+        }
+        this.submitted = end;
     }
 
-    /// Requests cancellation of the active or next execution quantum.
+    /// Retires the quantum in flight successfully: both frontiers move to `next`, unless a cancellation was
+    /// requested first. Returns true when the sequence ends cancelled.
+    public boolean commit(long next) {
+        requireInFlight();
+        if (next < this.committed) {
+            throw new IllegalArgumentException("the committed frontier cannot move backwards");
+        }
+        if (!this.cancellationRequested) {
+            this.committed = next;
+            this.submitted = next;
+        } else {
+            this.submitted = this.committed;
+        }
+        return retireInFlight();
+    }
+
+    /// Retires the quantum in flight without its work: the submitted frontier returns to the committed one. The
+    /// quantum failed (after [#fail(Throwable)]) or was cancelled.
+    public void abandon() {
+        requireInFlight();
+        this.submitted = this.committed;
+        retireInFlight();
+    }
+
+    /// Ends the sequence FAILED, unless it already ended.
+    public void fail(Throwable failure) {
+        this.terminal.compareAndSet(ACTIVE, new Terminal(TerminalState.FAILED, Objects.requireNonNull(failure)));
+    }
+
+    /// Requests cancellation. With no quantum in flight the sequence ends CANCELLED now; otherwise that quantum's
+    /// retirement ends it. Closes nothing: [#complete()] does.
     public void cancel() {
-        while (true) {
-            State current = this.state.get();
-            if (current.terminalState() != TerminalState.ACTIVE) {
-                return;
-            }
-            TerminalState terminal = current.activeLease() == null ? TerminalState.CANCELLED : TerminalState.ACTIVE;
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    current.activeLease(),
-                    true,
-                    terminal,
-                    current.terminalFailure(),
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                if (terminal == TerminalState.CANCELLED) {
-                    closePersistentRecurrentState(updated);
-                }
-                return;
-            }
-        }
+        this.cancellationRequested = true;
+        // Published before the quantum in flight is read; admission and retirement write that before the flag.
+        if (!this.inFlight) this.terminal.compareAndSet(ACTIVE, CANCELLED);
     }
 
-    /// Marks the sequence terminal after its owner has stopped admitting work.
+    /// Ends the sequence COMPLETED, unless it already ended, and closes its persistent state. Lifecycle: the
+    /// session runs it after its generation ended. A failed close is reported and retried by the next call.
     public void complete() {
-        while (true) {
-            State current = this.state.get();
-            if (current.activeLease() != null) {
-                throw new IllegalStateException("Cannot complete a sequence during execution");
-            }
-            if (current.terminalState() != TerminalState.ACTIVE) {
-                closePersistentState(current, true);
-                return;
-            }
-            State updated = current.withTerminal(TerminalState.COMPLETED, current.terminalFailure());
-            if (this.state.compareAndSet(current, updated)) {
-                closePersistentState(updated, true);
-                return;
-            }
+        if (this.inFlight) {
+            throw new IllegalStateException("Cannot complete a sequence during execution");
+        }
+        this.terminal.compareAndSet(ACTIVE, COMPLETED);
+        closePersistentState();
+    }
+
+    private boolean retireInFlight() {
+        this.inFlight = false;
+        // Published before the flag is read; cancel() writes the flag before it reads this.
+        if (!this.cancellationRequested) return false;
+        this.terminal.compareAndSet(ACTIVE, CANCELLED);
+        return this.terminal.get().state() == TerminalState.CANCELLED;
+    }
+
+    private void requireActive() {
+        TerminalState state = terminalState();
+        if (state != TerminalState.ACTIVE) {
+            throw new IllegalStateException("Sequence is terminal: " + state);
+        }
+        if (this.cancellationRequested) {
+            throw new IllegalStateException("Sequence cancellation was requested");
         }
     }
 
-    /// Claims exclusive mutation for one execution quantum.
-    public ExecutionLease claimExecution(long expectedStartPosition) {
-        while (true) {
-            State current = this.state.get();
-            if (current.activeLease() != null) {
-                throw new IllegalStateException("Sequence already has an executing Qwen chain");
-            }
-            if (current.terminalState() != TerminalState.ACTIVE) {
-                throw new IllegalStateException("Sequence is terminal: " + current.terminalState());
-            }
-            if (current.cancellationRequested()) {
-                throw new IllegalStateException("Sequence cancellation was requested");
-            }
-            if (expectedStartPosition != current.currentTokenPosition()) {
-                throw new IllegalArgumentException("Execution starts at " + expectedStartPosition
-                        + " but sequence is at " + current.currentTokenPosition());
-            }
-            ExecutionLease lease = new ExecutionLease(this);
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    lease,
-                    false,
-                    TerminalState.ACTIVE,
-                    null,
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                return lease;
-            }
+    private void requireInFlight() {
+        if (!this.inFlight) {
+            throw new IllegalStateException("Sequence state changes only under its quantum in flight");
         }
     }
 
-    /// Releases the lease, atomically resolving cancellation against successful completion.
-    public void releaseExecution(ExecutionLease lease, long nextTokenPosition) {
-        releaseExecutionAndCheckCancellation(lease, nextTokenPosition);
-    }
-
-    /// Releases the lease and reports whether cancellation won before token-position publication.
-    ///
-    /// Returns true when a cancellation request won before release.
-    public boolean releaseExecutionAndCheckCancellation(ExecutionLease lease, long nextTokenPosition) {
-        while (true) {
-            State current = this.state.get();
-            requireLease(current, lease);
-            if (nextTokenPosition < current.currentTokenPosition()) {
-                throw new IllegalArgumentException("nextTokenPosition cannot move backwards");
-            }
-            boolean cancelled = current.cancellationRequested();
-            State updated = new State(
-                    cancelled ? current.currentTokenPosition() : nextTokenPosition,
-                    null,
-                    current.cancellationRequested(),
-                    cancelled ? TerminalState.CANCELLED : current.terminalState(),
-                    current.terminalFailure(),
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                if (cancelled) {
-                    closePersistentRecurrentState(updated);
-                }
-                return cancelled;
-            }
-        }
-    }
-
-    void markCancelled(ExecutionLease lease) {
-        while (true) {
-            State current = this.state.get();
-            requireLease(current, lease);
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    null,
-                    true,
-                    TerminalState.CANCELLED,
-                    current.terminalFailure(),
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                closePersistentRecurrentState(updated);
-                return;
-            }
-        }
-    }
-
-    void markCancelledBeforeClaim() {
-        while (true) {
-            State current = this.state.get();
-            if (current.terminalState() != TerminalState.ACTIVE) {
-                return;
-            }
-            if (current.activeLease() != null) {
-                throw new IllegalStateException("Sequence execution is already claimed");
-            }
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    null,
-                    true,
-                    TerminalState.CANCELLED,
-                    current.terminalFailure(),
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                closePersistentRecurrentState(updated);
-                return;
-            }
-        }
-    }
-
-    public void markFailed(ExecutionLease lease, Throwable failure) {
-        Objects.requireNonNull(failure, "failure");
-        while (true) {
-            State current = this.state.get();
-            requireLease(current, lease);
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    null,
-                    current.cancellationRequested(),
-                    TerminalState.FAILED,
-                    failure,
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                closePersistentRecurrentState(updated);
-                return;
-            }
-        }
-    }
-
-    void markFailedBeforeClaim(Throwable failure) {
-        Objects.requireNonNull(failure, "failure");
-        while (true) {
-            State current = this.state.get();
-            if (current.activeLease() != null) {
-                throw new IllegalStateException("Sequence execution is already claimed");
-            }
-            boolean wasActive = current.terminalState() == TerminalState.ACTIVE;
-            State updated = new State(
-                    current.currentTokenPosition(),
-                    null,
-                    current.cancellationRequested(),
-                    TerminalState.FAILED,
-                    failure,
-                    current.kvCacheState(),
-                    current.recurrentState());
-            if (this.state.compareAndSet(current, updated)) {
-                if (wasActive) {
-                    closePersistentRecurrentState(updated);
-                }
-                return;
-            }
-        }
-    }
-
-    void markFailedAfterRelease(Throwable failure) {
-        Objects.requireNonNull(failure, "failure");
-        while (true) {
-            State current = this.state.get();
-            if (current.activeLease() != null) {
-                throw new IllegalStateException("Sequence execution is still claimed");
-            }
-            boolean wasActive = current.terminalState() == TerminalState.ACTIVE;
-            State updated = current.withTerminal(TerminalState.FAILED, failure);
-            if (this.state.compareAndSet(current, updated)) {
-                if (wasActive) {
-                    closePersistentRecurrentState(updated);
-                }
-                return;
-            }
-        }
-    }
-
-    private void closePersistentRecurrentState(State terminalState) {
-        closePersistentState(terminalState, false);
-    }
-
-    private void closePersistentState(State terminalState, boolean reportCleanupFailure) {
+    private void closePersistentState() {
         this.cleanupLock.lock();
         try {
+            Object recurrent = this.recurrentState;
+            Object kv = this.kvCacheState;
             Throwable failure = null;
             if (!this.recurrentReleased) {
                 try {
-                    closeResource(terminalState.recurrentState());
+                    closeResource(recurrent);
                     this.recurrentReleased = true;
                 } catch (Throwable cleanup) {
                     failure = cleanup;
                 }
             }
-            if (terminalState.kvCacheState() == terminalState.recurrentState()) {
+            if (kv == recurrent) {
                 this.kvReleased = this.recurrentReleased;
             } else if (!this.kvReleased) {
                 try {
-                    closeResource(terminalState.kvCacheState());
+                    closeResource(kv);
                     this.kvReleased = true;
                 } catch (Throwable cleanup) {
                     if (failure == null) failure = cleanup;
@@ -361,10 +237,9 @@ public final class Sequence {
                 }
             }
             if (failure == null) return;
-            Throwable terminalFailure = terminalState.terminalFailure();
+            Throwable terminalFailure = terminalFailure();
             if (terminalFailure != null && terminalFailure != failure) terminalFailure.addSuppressed(failure);
-            if (terminalFailure == null || reportCleanupFailure)
-                throw new IllegalStateException("Unable to release persistent Qwen sequence state", failure);
+            throw new IllegalStateException("Unable to release persistent Qwen sequence state", failure);
         } finally {
             this.cleanupLock.unlock();
         }
@@ -372,32 +247,5 @@ public final class Sequence {
 
     private static void closeResource(Object resource) throws Exception {
         if (resource instanceof AutoCloseable closeable) closeable.close();
-    }
-
-    private void requireLease(State current, ExecutionLease lease) {
-        if (lease == null || lease.owner != this || current.activeLease() != lease) {
-            throw new IllegalStateException("Sequence mutation requires its active execution lease");
-        }
-    }
-
-    private record State(
-            long currentTokenPosition,
-            ExecutionLease activeLease,
-            boolean cancellationRequested,
-            TerminalState terminalState,
-            Throwable terminalFailure,
-            Object kvCacheState,
-            Object recurrentState) {
-
-        private State withTerminal(TerminalState terminal, Throwable failure) {
-            return new State(
-                    this.currentTokenPosition,
-                    this.activeLease,
-                    this.cancellationRequested,
-                    terminal,
-                    failure,
-                    this.kvCacheState,
-                    this.recurrentState);
-        }
     }
 }
