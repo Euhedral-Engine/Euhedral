@@ -72,15 +72,16 @@ class RegionRuntimeTest {
         var owner = new ExecutionPlan(weights);
         var view = owner.forExecution(Quantum.ExecutionKind.PREFILL, 256);
         var gpu = new RegionGpu(weights.config().vocabSize());
-        var runtime = runtime(view, gpu);
+        var runtime = runtime(view.plan(), gpu);
         try {
             for (var kind : List.of(Quantum.ExecutionKind.PREFILL, Quantum.ExecutionKind.DECODE)) {
                 for (int rows : new int[] {1, 64}) {
                     if (kind == Quantum.ExecutionKind.DECODE && rows != 1) continue;
                     var sequence = new Sequence(700 + kind.ordinal() * 100 + rows);
                     try {
-                        var context = new Quantum(view, sequence, kind, 0, new int[rows], LogitsRequirement.NONE);
-                        assertSame(owner.forExecution(kind, rows), context.plan());
+                        var context =
+                                new Quantum(view.plan(), sequence, kind, 0, new int[rows], LogitsRequirement.NONE);
+                        assertSame(owner.forExecution(kind, rows), context.shape());
                         var completion = runtime.submit(context);
                         this.lattice.drive();
                         assertEquals(

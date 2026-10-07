@@ -70,13 +70,7 @@ class P2e2CudaIntegrationTest {
             var sequence = new Sequence(71);
             try {
                 logits.add(run(
-                        gpu,
-                        plan.forExecution(Quantum.ExecutionKind.PREFILL, PROMPT),
-                        sequence,
-                        Quantum.ExecutionKind.PREFILL,
-                        0,
-                        prompt,
-                        LogitsRequirement.ALL_TOKENS));
+                        gpu, plan, sequence, Quantum.ExecutionKind.PREFILL, 0, prompt, LogitsRequirement.ALL_TOKENS));
                 int token = 1814;
                 for (int step = 0; step < DECODE_STEPS; step++) {
                     short[] row = run(
@@ -110,7 +104,7 @@ class P2e2CudaIntegrationTest {
             try {
                 logits.add(run(
                         gpu,
-                        plan.forExecution(Quantum.ExecutionKind.PREFILL, SHORT_PROMPT),
+                        plan,
                         shortSequence,
                         Quantum.ExecutionKind.PREFILL,
                         0,

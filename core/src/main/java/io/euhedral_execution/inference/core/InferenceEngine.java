@@ -518,7 +518,11 @@ public final class InferenceEngine implements AutoCloseable {
             if (maxContextTokens > positions)
                 throw new IllegalArgumentException("a context of " + maxContextTokens + " tokens is longer than the "
                         + positions + " positions the model supports; set a smaller max context");
-            long free = memoryInfo(gpu).freeBytes();
+            // Tests pin residency with a device budget below the free memory, which other processes shift between
+            // loads.
+            long free = Math.min(
+                    memoryInfo(gpu).freeBytes(),
+                    Long.getLong("euhedral.residency.device-budget-bytes", Long.MAX_VALUE));
             var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens);
             if (!plan.fits())
                 throw new IOException("a context of " + maxContextTokens + " tokens does not fit in the "

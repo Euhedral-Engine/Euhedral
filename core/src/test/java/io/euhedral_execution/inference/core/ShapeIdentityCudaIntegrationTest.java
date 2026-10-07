@@ -23,6 +23,8 @@ class ShapeIdentityCudaIntegrationTest {
     private static final Path GOLDENS = Path.of("src/test/resources/shapes");
     private static final String TOKENIZER = "/mnt/shared/qwen38-quant/source/qwen";
     private static final List<String> NAMES = List.of("q3", "nvfp4", "nvfp4-compressed");
+    /// The device memory the residency planner sees: below what is free on the 16 GB card, whatever else runs.
+    private static final long DEVICE_BUDGET = 14L << 30;
 
     static Stream<Arguments> artifacts() {
         String only = System.getProperty("euhedral.shapes.artifacts");
@@ -62,6 +64,9 @@ class ShapeIdentityCudaIntegrationTest {
                 Path.of(library),
                 SystemInfo.getPCpuSet(),
                 Duration.ofSeconds(30));
+        // Residency follows the GPU's free memory at load; a fixed budget below it makes every load place the same
+        // weights in host memory, so the staged views compare.
+        System.setProperty("euhedral.residency.device-budget-bytes", Long.toString(DEVICE_BUDGET));
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var plan = ((Qwen38Runtime) engine.modelRuntime()).plan();
             ShapeDescription.check(GOLDENS, name, ShapeDescription.views(plan));

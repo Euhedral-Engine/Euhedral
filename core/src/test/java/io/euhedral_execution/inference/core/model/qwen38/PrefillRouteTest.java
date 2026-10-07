@@ -29,7 +29,7 @@ class PrefillRouteTest {
         assertTrue(has(decode, Kind.RESIDUAL_RMS_NORM));
         assertTrue(has(decode, Kind.GDN_PROJECT_CONTROL));
         assertFalse(decode.reusePrefillStorage());
-        assertEquals(kinds(reference), kinds(plan));
+        assertEquals(kinds(reference.shape()), kinds(plan.shape()));
         assertEquals(reference.bufferSpecs(), plan.bufferSpecs());
         assertFalse(plan.reusePrefillStorage());
     }
@@ -39,12 +39,12 @@ class PrefillRouteTest {
         var weights = ExecutionFixtures.statefulCompactWeights(8, 5120, 17408);
         var plan = new ExecutionPlan(weights);
         for (var view : List.of(
-                plan,
+                plan.shape(),
                 plan.forExecution(ExecutionKind.DECODE, 1),
                 plan.forExecution(ExecutionKind.PREFILL, 1),
                 plan.forExecution(ExecutionKind.PREFILL, 512),
                 plan.forExecution(ExecutionKind.PREFILL, 1024))) {
-            var topology = view.stageTopology();
+            var topology = view.topology();
             int count = topology.size();
             var reach = new java.util.BitSet[count];
             for (int stage = 0; stage < count; stage++) reach[stage] = new java.util.BitSet(count);
@@ -96,7 +96,7 @@ class PrefillRouteTest {
     void referencePlanIsNeverSpecialized() {
         var reference = ExecutionPlan.reference(ExecutionFixtures.statefulCompactWeights(8, 5120, 17408));
         for (int rows : new int[] {1, 63, 64, 256, 512, 1024})
-            assertSame(reference, reference.forExecution(ExecutionKind.PREFILL, rows));
+            assertSame(reference.shape(), reference.forExecution(ExecutionKind.PREFILL, rows));
         assertTrue(reference.executionVariants().isEmpty());
     }
 
@@ -156,12 +156,12 @@ class PrefillRouteTest {
         for (int rows : new int[] {1, 63, 64, 256, 512}) {
             var sequence = new Sequence(rows);
             try {
-                var context = new Quantum(view, sequence, ExecutionKind.PREFILL, 0, new int[rows]);
-                assertSame(owner.forExecution(ExecutionKind.PREFILL, rows), context.plan());
+                var context = new Quantum(view.plan(), sequence, ExecutionKind.PREFILL, 0, new int[rows]);
+                assertSame(owner.forExecution(ExecutionKind.PREFILL, rows), context.shape());
                 assertSame(
                         owner.forExecution(ExecutionKind.DECODE, 1),
                         context.plan().forExecution(ExecutionKind.DECODE, 1));
-                assertSame(owner, context.plan().executionOwner());
+                assertSame(owner, context.plan());
             } finally {
                 sequence.complete();
             }
@@ -174,7 +174,7 @@ class PrefillRouteTest {
         var prefix = ExecutionPlan.prefix(weights, 1);
         var embedding = ExecutionPlan.embeddingOnly(weights);
         for (var plan : List.of(prefix, embedding)) {
-            assertSame(plan, plan.forExecution(ExecutionKind.PREFILL, 256));
+            assertSame(plan.shape(), plan.forExecution(ExecutionKind.PREFILL, 256));
             assertTrue(plan.executionVariants().isEmpty());
         }
     }
@@ -218,7 +218,7 @@ class PrefillRouteTest {
         }
     }
 
-    private static void assertCombined(int layers, ExecutionPlan plan) {
+    private static void assertCombined(int layers, Shape plan) {
         assertEquals(layers, count(plan, Kind.Q3_GATE_UP_SWIGLU));
         assertFalse(has(plan, Kind.SWIGLU));
         // The attention producers stay leaf frames: Q4 -> QK norm/RoPE and Q5 -> cache append.
@@ -243,23 +243,23 @@ class PrefillRouteTest {
         assertEquals(workspace.address(owner), workspace.address(view), owner + "/" + view);
     }
 
-    private static List<Kind> kinds(ExecutionPlan plan) {
+    private static List<Kind> kinds(Shape plan) {
         return plan.instructions().stream().map(ExecutionPlan.Instruction::kind).toList();
     }
 
-    private static boolean has(ExecutionPlan plan, Kind kind) {
+    private static boolean has(Shape plan, Kind kind) {
         return count(plan, kind) > 0;
     }
 
-    private static long count(ExecutionPlan plan, Kind kind) {
+    private static long count(Shape plan, Kind kind) {
         return plan.instructions().stream().filter(i -> i.kind() == kind).count();
     }
 
-    private static boolean hasBuffer(ExecutionPlan plan, Buffer buffer) {
+    private static boolean hasBuffer(Shape plan, Buffer buffer) {
         return plan.bufferSpecs().stream().anyMatch(s -> s.buffer() == buffer);
     }
 
-    private static int firstId(ExecutionPlan plan, Kind kind) {
+    private static int firstId(Shape plan, Kind kind) {
         return plan.instructions().stream()
                 .filter(i -> i.kind() == kind)
                 .findFirst()
@@ -267,7 +267,7 @@ class PrefillRouteTest {
                 .id();
     }
 
-    private static void assertTopology(ExecutionPlan plan) {
+    private static void assertTopology(Shape plan) {
         for (int index = 0; index < plan.instructions().size(); index++) {
             var instruction = plan.instructions().get(index);
             assertEquals(index, instruction.id());

@@ -16,10 +16,10 @@ public final class LinearFrame extends InstructionFrame {
         boolean logits = instruction.outputBuffers().contains(ExecutionPlan.Buffer.LOGITS);
         int rows = logits ? context.logitsRowCount() : context.inputTokenCount();
         if (rows == 0) return;
-        long input = context.plan().hasFirstLayer()
+        long input = context.shape().hasFirstLayer()
                 ? context.workspace().address(instruction.inputBuffers().getFirst())
                 : context.workspace().normalizedStateAddress();
-        long output = context.plan().hasFirstLayer()
+        long output = context.shape().hasFirstLayer()
                 ? context.workspace().address(instruction.outputBuffers().getFirst())
                 : context.workspace().projectionAddress(instruction.outputBufferIndex());
         if (instruction.weights().size() == 1

@@ -6,7 +6,6 @@ import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
-import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.loader.AttentionWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Weights;
@@ -15,10 +14,6 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.GdnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.MtpWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
-import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
-import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
-import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
-import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -28,7 +23,7 @@ import java.util.Objects;
 
 /// Immutable operation instructions and dependency edges for the loaded Qwen text model.
 /// Model weights are borrowed; sequence state and quantum workspace have separate owners.
-public final class ExecutionPlan implements GraphShape {
+public final class ExecutionPlan {
 
     public enum Kind {
         EMBEDDING,
@@ -245,7 +240,7 @@ public final class ExecutionPlan implements GraphShape {
         }
     }
 
-    private record PlanData(
+    record PlanData(
             List<Instruction> instructions,
             List<Integer> projectionWidths,
             List<BufferSpec> bufferSpecs,
@@ -271,28 +266,21 @@ public final class ExecutionPlan implements GraphShape {
     private static final int REGION_MIN_ROWS = 64;
 
     private final Weights weights;
-    private final List<Instruction> instructions;
-    private final List<List<Integer>> successors;
-    private final StageTopology stageTopology;
-    private final List<Integer> projectionWidths;
-    private final List<BufferSpec> bufferSpecs;
-    private final boolean firstLayer;
-    private final boolean reuseStorage;
-    private final ExecutionPlan owner;
-    private final ExecutionPlan smallPrefill;
-    private final ExecutionPlan decode;
+    /// The plan's own topology.
+    private final Shape shape;
+    private final WeightStaging staging;
+    // The views of a full model; null otherwise.
+    private final Shape smallPrefill;
+    private final Shape decode;
     /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded by the
     /// prefetch of a DFlash2 block (null when no weight is host-backed).
-    private final ExecutionPlan decodePreloaded;
-    private final ExecutionPlan regionPrefill;
-    private final WeightStaging staging;
+    private final Shape decodePreloaded;
+    private final Shape regionPrefill;
     /// The MTP draft view; null without loaded MTP weights and draft head.
-    private final ExecutionPlan mtpDraft;
+    private final Shape mtpDraft;
     /// The DFlash2 views, null without the loaded drafter: its block (DRAFT) and its context rows (DRAFT_CONTEXT).
-    private final ExecutionPlan dflashBlock;
-    private final ExecutionPlan dflashContext;
-    /// Whether this view copies the decode view's first ring slots ahead of the next verification.
-    private final boolean prefetchesRing;
+    private final Shape dflashBlock;
+    private final Shape dflashContext;
 
     /// Fixed storage lifetime pairs of the region prefill views: each value lives in its owner's storage.
     static final List<Map.Entry<Buffer, Buffer>> REGION_STORAGE = List.of(
@@ -366,7 +354,7 @@ public final class ExecutionPlan implements GraphShape {
     /// Builds the production plan for weights that may be host-backed: every executed view stages
     /// them through `staging`, which must be present when any weight is host-backed.
     public ExecutionPlan(Weights weights, WeightStaging staging) {
-        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), null, false, staging);
+        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), staging);
     }
 
     /// Unfused reference topology for every execution kind. This is a correctness oracle for tests
@@ -377,8 +365,7 @@ public final class ExecutionPlan implements GraphShape {
         return new ExecutionPlan(
                 weights,
                 new PlanData(data.instructions(), data.projectionWidths(), data.bufferSpecs(), data.firstLayer()),
-                null,
-                false);
+                null);
     }
 
     /// The staging ring of this plan family, or null when no weight is host-backed.
@@ -386,17 +373,12 @@ public final class ExecutionPlan implements GraphShape {
         return this.staging;
     }
 
-    /// Owning plan whose views belong to one family; runners admit any view of their owner.
-    public ExecutionPlan executionOwner() {
-        return this.owner;
-    }
-
-    /// Selects the qualified topology for a quantum. Any view requalifies through its owner.
-    public ExecutionPlan forExecution(Quantum.ExecutionKind kind, int rows) {
+    /// Selects the view a quantum of `kind` over `rows` rows runs. A plan without views runs its own topology.
+    public Shape forExecution(Quantum.ExecutionKind kind, int rows) {
         Objects.requireNonNull(kind, "kind");
         if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
-        ExecutionPlan family = this.owner;
-        if (family.regionPrefill == null) return family;
+        ExecutionPlan family = this;
+        if (family.regionPrefill == null) return family.shape;
         // Decode runs its own instance of the small topology: rounded residual add + RMSNorm and the
         // joint GDN A/B projection + control are single region launches, as in short prefill quanta.
         if (kind == Quantum.ExecutionKind.DRAFT) {
@@ -418,12 +400,12 @@ public final class ExecutionPlan implements GraphShape {
 
     /// Whether this plan's family can draft with MTP.
     public boolean drafts() {
-        return this.owner.mtpDraft != null;
+        return this.mtpDraft != null;
     }
 
     /// Whether this plan's family can draft with DFlash2.
     public boolean draftsWithDFlash2() {
-        return this.owner.dflashBlock != null;
+        return this.dflashBlock != null;
     }
 
     /// Rows of the draft head: the draft view's logits width.
@@ -550,7 +532,7 @@ public final class ExecutionPlan implements GraphShape {
         }
         ExecutionPlan fullPlan = new ExecutionPlan(weights);
         int terminalId = -1;
-        for (Instruction instruction : fullPlan.instructions) {
+        for (Instruction instruction : fullPlan.instructions()) {
             if (instruction.layerIndex() == layerCount - 1
                     && instruction.kind() == Kind.RESIDUAL_ADD
                     && instruction.outputBuffers().contains(Buffer.FINAL_HIDDEN_STATE)) {
@@ -558,13 +540,13 @@ public final class ExecutionPlan implements GraphShape {
             }
         }
         if (terminalId < 0) throw new IllegalArgumentException("requested layer prefix has no final residual");
-        List<Instruction> instructions = List.copyOf(fullPlan.instructions.subList(0, terminalId + 1));
+        List<Instruction> instructions = List.copyOf(fullPlan.instructions().subList(0, terminalId + 1));
         boolean[] usedBuffers = new boolean[Buffer.values().length];
         for (Instruction instruction : instructions) {
             for (Buffer buffer : instruction.inputBuffers()) usedBuffers[buffer.ordinal()] = true;
             for (Buffer buffer : instruction.outputBuffers()) usedBuffers[buffer.ordinal()] = true;
         }
-        List<BufferSpec> buffers = fullPlan.bufferSpecs.stream()
+        List<BufferSpec> buffers = fullPlan.bufferSpecs().stream()
                 .filter(spec -> usedBuffers[spec.buffer().ordinal()])
                 .toList();
         return new ExecutionPlan(weights, new PlanData(instructions, List.of(), buffers, true));
@@ -576,57 +558,15 @@ public final class ExecutionPlan implements GraphShape {
     }
 
     private ExecutionPlan(Weights weights, PlanData data) {
-        this(weights, data, null, false);
+        this(weights, data, null);
     }
 
-    private ExecutionPlan(Weights weights, PlanData data, ExecutionPlan owner, boolean reuseStorage) {
-        this(weights, data, owner, reuseStorage, null);
-    }
-
-    private ExecutionPlan(
-            Weights weights, PlanData data, ExecutionPlan owner, boolean reuseStorage, WeightStaging staging) {
-        this(weights, data, owner, reuseStorage, staging, false);
-    }
-
-    private ExecutionPlan(
-            Weights weights,
-            PlanData data,
-            ExecutionPlan owner,
-            boolean reuseStorage,
-            WeightStaging staging,
-            boolean prefetchesRing) {
-        this.owner = owner == null ? this : owner;
-        this.prefetchesRing = prefetchesRing;
-        this.staging = owner == null ? staging : owner.staging;
+    /// The plan of `data`; a full model also builds its views, which stage host-backed weights through `staging`.
+    private ExecutionPlan(Weights weights, PlanData data, WeightStaging staging) {
         this.weights = weights;
-        this.instructions = List.copyOf(data.instructions());
-        this.projectionWidths = List.copyOf(data.projectionWidths());
-        this.bufferSpecs = List.copyOf(data.bufferSpecs());
-        this.firstLayer = data.firstLayer();
-        this.reuseStorage = reuseStorage;
-        List<List<Integer>> edges = new ArrayList<>();
-        for (int index = 0; index < this.instructions.size(); index++) {
-            edges.add(new ArrayList<>());
-        }
-        for (Instruction instruction : this.instructions) {
-            for (int dependency : instruction.dependencies()) {
-                if (dependency < 0 || dependency >= instruction.id()) {
-                    throw new IllegalArgumentException("instruction dependencies must point to earlier work");
-                }
-                edges.get(dependency).add(instruction.id());
-            }
-        }
-        this.successors = edges.stream().map(List::copyOf).toList();
-        int[][] dependencies = new int[this.instructions.size()][];
-        for (Instruction instruction : this.instructions) {
-            dependencies[instruction.id()] = instruction.dependencies().stream()
-                    .mapToInt(Integer::intValue)
-                    .toArray();
-        }
-        // Stages may run on different device lanes, so the topology also orders every pair of stages
-        // that touch the same storage (one of them writing) which the data dependencies leave unordered.
-        this.stageTopology = StageTopology.submitted(withStorageHazards(this.instructions, dependencies, reuseStorage));
-        if (owner != null || !data.fullModel()) {
+        this.staging = staging;
+        this.shape = new Shape(Shape.View.OWN, this, data, false, false);
+        if (!data.fullModel()) {
             this.smallPrefill = null;
             this.decode = null;
             this.decodePreloaded = null;
@@ -641,61 +581,63 @@ public final class ExecutionPlan implements GraphShape {
                         && weights.mtp().layer().mixer()
                                 instanceof io.euhedral_execution.inference.core.model.qwen38.loader.AttentionWeights
                         && weights.runtimeObjects().containsKey(DRAFT_HEAD)
-                ? new ExecutionPlan(weights, staged(mtpDraft(weights), this.staging), this, false)
+                ? new Shape(Shape.View.MTP_DRAFT, this, staged(mtpDraft(weights), staging), false, false)
                 : null;
         DFlash2Weights drafter = weights.dflash2();
         // A DFlash2 block leaves the host-backed transfer lane idle for milliseconds before every verification, so it
         // copies the decode view's first ring slots, and a verification that finds them loaded skips their transfers.
-        List<TensorHandle> firstUses = this.staging == null
+        List<TensorHandle> firstUses = staging == null
                 ? List.of()
-                : firstHostBackedUses(prefillView(data, PrefillView.SMALL), this.staging.slots());
+                : firstHostBackedUses(prefillView(data, PrefillView.SMALL), staging.slots());
         this.dflashBlock = drafter == null
                 ? null
                 : firstUses.isEmpty()
-                        ? new ExecutionPlan(weights, staged(dflash2Block(weights, drafter), this.staging), this, false)
-                        : new ExecutionPlan(
-                                weights,
-                                withPrefetch(staged(dflash2Block(weights, drafter), this.staging), firstUses),
+                        ? new Shape(
+                                Shape.View.DFLASH_BLOCK,
                                 this,
+                                staged(dflash2Block(weights, drafter), staging),
                                 false,
-                                null,
+                                false)
+                        : new Shape(
+                                Shape.View.DFLASH_BLOCK,
+                                this,
+                                withPrefetch(staged(dflash2Block(weights, drafter), staging), firstUses),
+                                false,
                                 true);
         this.dflashContext = drafter == null
                 ? null
-                : new ExecutionPlan(weights, staged(dflash2Context(drafter), this.staging), this, false);
-        this.smallPrefill = prefillPlan(weights, data, PrefillView.SMALL, this);
-        this.decode = prefillPlan(weights, data, PrefillView.SMALL, this);
-        this.decodePreloaded = this.dflashBlock != null && this.dflashBlock.prefetchesRing
-                ? new ExecutionPlan(
-                        weights, staged(prefillView(data, PrefillView.SMALL), this.staging, true), this, false)
+                : new Shape(Shape.View.DFLASH_CONTEXT, this, staged(dflash2Context(drafter), staging), false, false);
+        this.smallPrefill = prefillShape(Shape.View.SMALL_PREFILL, data, PrefillView.SMALL);
+        this.decode = prefillShape(Shape.View.DECODE, data, PrefillView.SMALL);
+        this.decodePreloaded = this.dflashBlock != null && this.dflashBlock.prefetchesRing()
+                ? new Shape(
+                        Shape.View.DECODE_PRELOADED,
+                        this,
+                        staged(prefillView(data, PrefillView.SMALL), staging, true),
+                        false,
+                        false)
                 : null;
-        this.regionPrefill = prefillPlan(weights, data, PrefillView.REGIONS, this);
+        this.regionPrefill = prefillShape(Shape.View.REGION_PREFILL, data, PrefillView.REGIONS);
     }
 
-    private static ExecutionPlan prefillPlan(Weights weights, PlanData data, PrefillView view, ExecutionPlan owner) {
-        PlanData selected = prefillView(data, view);
+    private Shape prefillShape(Shape.View view, PlanData data, PrefillView prefill) {
+        PlanData selected = prefillView(data, prefill);
         // The named lifetime pairs are qualified only for the region views with a fused FFN, not for
         // a shape that falls back to ordinary FFN.
-        boolean regions = view == PrefillView.REGIONS;
+        boolean regions = prefill == PrefillView.REGIONS;
         boolean hasFusedFfn = selected.instructions().stream().anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU);
-        return new ExecutionPlan(weights, staged(selected, owner.staging), owner, regions && hasFusedFfn);
+        return new Shape(view, this, staged(selected, this.staging), regions && hasFusedFfn, false);
     }
 
-    /// Whether this view copies host-backed weights into the staging ring.
-    public boolean stagesWeights() {
-        return this.instructions.stream().anyMatch(i -> i.kind() == Kind.WEIGHT_TRANSFER);
+    /// The view to run when the ring holds what [Shape#prefetchesRing] loads: the decode view without the transfers of
+    /// its first slots, or `view` when it has no such variant.
+    Shape preloadedVariant(Shape view) {
+        return view == this.decode && this.decodePreloaded != null ? this.decodePreloaded : view;
     }
 
-    /// Whether this view (a DFlash2 block) leaves the decode view's first ring slots loaded when it completes.
-    public boolean prefetchesRing() {
-        return this.prefetchesRing;
-    }
-
-    /// The view to run when the ring holds what [#prefetchesRing] loads: the decode view without the transfers of
-    /// its first slots, or this view when it has no such variant.
-    public ExecutionPlan preloadedVariant() {
-        ExecutionPlan family = this.owner;
-        return this == family.decode && family.decodePreloaded != null ? family.decodePreloaded : this;
+    /// The plan's own topology: the reference or unfused form it was built as, which a plan without views runs.
+    public Shape shape() {
+        return this.shape;
     }
 
     /// The host-backed weights of `data`'s first `slots` staging uses, in use order: the weights its staged view
@@ -1005,73 +947,52 @@ public final class ExecutionPlan implements GraphShape {
                 .toList();
     }
 
+    /// The stage specs of the plan's own topology ([#shape]).
     public List<Instruction> instructions() {
-        return this.instructions;
+        return this.shape.instructions();
     }
 
-    /// The stage DAG a reusable frame graph instantiates. Every instruction dependency is a submission
-    /// edge: the consumer's operation is ordered after the producer's by the quantum's stream, so it
-    /// may launch as soon as the producer's launch succeeded. A quantum's only device-completion
-    /// boundary is its retirement, where sequence state is published and quantum storage released.
+    /// The topology of the plan's own shape ([#shape]).
     public StageTopology stageTopology() {
-        return this.stageTopology;
+        return this.shape.topology();
     }
 
-    @Override
     public StageTopology topology() {
-        return this.stageTopology;
-    }
-
-    @Override
-    public StageFrame createStage(StageGraph graph, int stage, ExecutionGpu gpu) {
-        return InstructionFrame.create(graph, this.instructions.get(stage), gpu);
-    }
-
-    @Override
-    public GraphStorage newStorage(ExecutionGpu gpu) {
-        return new WorkspaceStorage(gpu);
+        return this.shape.topology();
     }
 
     public List<Integer> successors(int instructionId) {
-        return this.successors.get(instructionId);
+        return this.shape.successors(instructionId);
     }
 
     List<Integer> projectionWidths() {
-        return this.projectionWidths;
+        return this.shape.projectionWidths();
     }
 
     public List<BufferSpec> bufferSpecs() {
-        return this.bufferSpecs;
+        return this.shape.bufferSpecs();
     }
 
-    /// The views this plan owns besides its own topology; empty for a view or a reference plan.
-    List<ExecutionPlan> executionVariants() {
-        if (this.owner != this || this.regionPrefill == null) return List.of();
+    /// The views this plan owns besides its own topology; empty for a plan without views.
+    List<Shape> executionVariants() {
+        if (this.regionPrefill == null) return List.of();
         return List.of(this.decode, this.smallPrefill, this.regionPrefill);
     }
 
     boolean reusePrefillStorage() {
-        return this.reuseStorage;
+        return this.shape.reusePrefillStorage();
     }
 
     public boolean hasFirstLayer() {
-        return this.firstLayer;
+        return this.shape.hasFirstLayer();
     }
 
     public int bufferWidth(Buffer buffer) {
-        return this.bufferSpecs.stream()
-                .filter(spec -> spec.buffer() == buffer)
-                .mapToInt(BufferSpec::width)
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("buffer is not in this plan: " + buffer));
+        return this.shape.bufferWidth(buffer);
     }
 
     public ElementType bufferElementType(Buffer buffer) {
-        return this.bufferSpecs.stream()
-                .filter(spec -> spec.buffer() == buffer)
-                .map(BufferSpec::elementType)
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("buffer is not in this plan: " + buffer));
+        return this.shape.bufferElementType(buffer);
     }
 
     public Weights weights() {

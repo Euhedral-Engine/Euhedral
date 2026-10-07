@@ -524,7 +524,7 @@ class FullModelCudaIntegrationTest {
         try {
             RunResult prefill = execute(
                     gpu,
-                    plan.forExecution(Quantum.ExecutionKind.PREFILL, rows),
+                    plan,
                     sequence,
                     Quantum.ExecutionKind.PREFILL,
                     0,

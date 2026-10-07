@@ -27,13 +27,13 @@ public final class RmsNormFrame extends InstructionFrame {
                     (float) context.plan().weights().config().rmsNormEpsilon());
         }
         if (rows == 0) return;
-        long input = context.plan().hasFirstLayer()
+        long input = context.shape().hasFirstLayer()
                 ? context.workspace().address(instruction.inputBuffers().getFirst())
                 : context.workspace().hiddenStateAddress();
         if (finalNorm && rows != context.inputTokenCount()) {
             input += (long) (context.inputTokenCount() - 1) * instruction.inputWidth() * Short.BYTES;
         }
-        long output = context.plan().hasFirstLayer()
+        long output = context.shape().hasFirstLayer()
                 ? context.workspace().address(instruction.outputBuffers().getFirst())
                 : context.workspace().normalizedStateAddress();
         float epsilon = (float) context.plan().weights().config().rmsNormEpsilon();

@@ -63,15 +63,19 @@ public final class Workspace implements AutoCloseable {
     }
 
     Workspace(GpuMemory gpuMemory, int tokenCount, ExecutionPlan plan) {
-        this(gpuMemory, tokenCount, plan, LogitsRequirement.ALL_TOKENS);
+        this(gpuMemory, tokenCount, plan.shape(), LogitsRequirement.ALL_TOKENS);
     }
 
     Workspace(GpuMemory gpuMemory, int tokenCount, ExecutionPlan plan, LogitsRequirement logitsRequirement) {
+        this(gpuMemory, tokenCount, plan.shape(), logitsRequirement);
+    }
+
+    Workspace(GpuMemory gpuMemory, int tokenCount, Shape plan, LogitsRequirement logitsRequirement) {
         this(ownedStorage(gpuMemory), true, tokenCount, plan, logitsRequirement);
     }
 
-    /// Borrows `storage` for a first-layer plan.
-    Workspace(WorkspaceStorage storage, int tokenCount, ExecutionPlan plan, LogitsRequirement logitsRequirement) {
+    /// Borrows `storage` for a first-layer view.
+    Workspace(WorkspaceStorage storage, int tokenCount, Shape plan, LogitsRequirement logitsRequirement) {
         this(storage, false, tokenCount, plan, logitsRequirement);
     }
 
@@ -79,13 +83,13 @@ public final class Workspace implements AutoCloseable {
             WorkspaceStorage storage,
             boolean ownsStorage,
             int tokenCount,
-            ExecutionPlan plan,
+            Shape plan,
             LogitsRequirement logitsRequirement) {
         this(
                 storage,
                 ownsStorage,
                 tokenCount,
-                plan.weights().config().hiddenSize(),
+                plan.plan().weights().config().hiddenSize(),
                 List.of(),
                 plan.bufferSpecs(),
                 logitsRequirement);
