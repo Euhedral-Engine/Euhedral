@@ -84,6 +84,32 @@ class PromptTokenizationTest {
     }
 
     @Test
+    void theJoinHandsTheIdsToTheSinkOnceAfterTheJobTerminated() throws Exception {
+        String text = texts().getFirst();
+        List<AbstractFrame> queue = new ArrayList<>();
+        AtomicInteger terminations = new AtomicInteger();
+        List<Object> calls = new ArrayList<>();
+        PromptTokenization.start(tokenizer, text, true, queue::add, terminations::incrementAndGet, new PromptSink() {
+            @Override
+            public void encoded(int[] ids) {
+                calls.add(terminations.get() == 1 ? ids : "encoded before the job terminated");
+            }
+
+            @Override
+            public void failed(Throwable failure) {
+                calls.add(failure);
+            }
+        });
+        while (!queue.isEmpty()) {
+            AbstractFrame frame = queue.removeFirst();
+            frame.execute();
+            frame.doFinally();
+        }
+        assertEquals(1, calls.size(), "the sink is called once");
+        assertArrayEquals(tokenizer.encodeWithModelSpecialTokens(text), (int[]) calls.getFirst());
+    }
+
+    @Test
     void framesInAnyOrderEncodeExactlyAsTheTokenizer() throws Exception {
         for (String text : texts()) {
             for (boolean special : new boolean[] {false, true}) {

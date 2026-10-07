@@ -56,8 +56,15 @@ public final class HostTasks implements HostFrames, AutoCloseable {
     /// Tokenizes `text` on the lattice's workers (PromptTokenization), with the BOS/EOS tokens of
     /// tokenizer_config.json when `modelSpecialTokens`. The future completes on a worker.
     public CompletableFuture<int[]> tokenize(QwenTokenizer tokenizer, String text, boolean modelSpecialTokens) {
+        CompletableFuture<int[]> result = new CompletableFuture<>();
+        tokenize(tokenizer, text, modelSpecialTokens, PromptTokenization.completing(result));
+        return result;
+    }
+
+    /// As [#tokenize(QwenTokenizer, String, boolean)]; the worker that joins the tokenization hands the IDs to `sink`.
+    public void tokenize(QwenTokenizer tokenizer, String text, boolean modelSpecialTokens, PromptSink sink) {
         admit();
-        return PromptTokenization.start(tokenizer, text, modelSpecialTokens, this.lake::publish, this::terminated);
+        PromptTokenization.start(tokenizer, text, modelSpecialTokens, this.lake::publish, this::terminated, sink);
     }
 
     /// Runs `work` as one frame on the lattice's workers; the future completes on that worker.

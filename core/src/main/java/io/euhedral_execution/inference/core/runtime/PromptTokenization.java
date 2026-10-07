@@ -19,6 +19,8 @@ import java.util.function.Consumer;
 /// per-piece BPE.
 final class PromptTokenization {
 
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(PromptTokenization.class);
+
     /// Pre-tokens per leaf frame: about 40 us of BPE. Measured in the model, 1 to 4 per frame tokenize a
     /// 16K-token prompt in 23-35 ms; 64 per frame took 140-250 ms.
     static final int CHUNK_PRETOKENS = 2;
@@ -28,7 +30,7 @@ final class PromptTokenization {
     private final boolean modelSpecialTokens;
     private final Consumer<AbstractFrame> publisher;
     private final Runnable terminated;
-    private final CompletableFuture<int[]> result = new CompletableFuture<>();
+    private final PromptSink sink;
     /// Routing seeds of the job's frames, consecutive from one base (FrameSeeds); frames are built on many workers.
     private final long seedBase = FrameSeeds.forHostWork().next();
     private final AtomicLong nextSeed = new AtomicLong();
@@ -43,28 +45,58 @@ final class PromptTokenization {
             String text,
             boolean modelSpecialTokens,
             Consumer<AbstractFrame> publisher,
-            Runnable terminated) {
+            Runnable terminated,
+            PromptSink sink) {
         this.tokenizer = Objects.requireNonNull(tokenizer, "tokenizer");
         this.text = Objects.requireNonNull(text, "text");
         this.modelSpecialTokens = modelSpecialTokens;
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.terminated = Objects.requireNonNull(terminated, "terminated");
+        this.sink = Objects.requireNonNull(sink, "sink");
     }
 
-    /// Publishes the tokenization of `text` and returns its token IDs' future.
+    /// Publishes the tokenization of `text`; the frame that joins it hands the token IDs to `sink`.
+    static void start(
+            QwenTokenizer tokenizer,
+            String text,
+            boolean modelSpecialTokens,
+            Consumer<AbstractFrame> publisher,
+            Runnable terminated,
+            PromptSink sink) {
+        PromptTokenization job =
+                new PromptTokenization(tokenizer, text, modelSpecialTokens, publisher, terminated, sink);
+        try {
+            publisher.accept(job.new Split());
+        } catch (RuntimeException | Error failure) {
+            job.fail(failure);
+        }
+    }
+
+    /// As [#start(QwenTokenizer, String, boolean, Consumer, Runnable, PromptSink)], returning the IDs' future.
     static CompletableFuture<int[]> start(
             QwenTokenizer tokenizer,
             String text,
             boolean modelSpecialTokens,
             Consumer<AbstractFrame> publisher,
             Runnable terminated) {
-        PromptTokenization job = new PromptTokenization(tokenizer, text, modelSpecialTokens, publisher, terminated);
-        try {
-            publisher.accept(job.new Split());
-        } catch (RuntimeException | Error failure) {
-            job.fail(failure);
-        }
-        return job.result.copy();
+        CompletableFuture<int[]> result = new CompletableFuture<>();
+        start(tokenizer, text, modelSpecialTokens, publisher, terminated, completing(result));
+        return result;
+    }
+
+    /// A sink that completes `result`.
+    static PromptSink completing(CompletableFuture<int[]> result) {
+        return new PromptSink() {
+            @Override
+            public void encoded(int[] ids) {
+                result.complete(ids);
+            }
+
+            @Override
+            public void failed(Throwable failure) {
+                result.completeExceptionally(failure);
+            }
+        };
     }
 
     private void split() {
@@ -110,8 +142,12 @@ final class PromptTokenization {
         try {
             this.terminated.run();
         } finally {
-            if (failure != null) this.result.completeExceptionally(failure);
-            else this.result.complete(ids);
+            try {
+                if (failure != null) this.sink.failed(failure);
+                else this.sink.encoded(ids);
+            } catch (Throwable sinkFailure) {
+                LOG.error("a prompt's sink failed", sinkFailure);
+            }
         }
     }
 
