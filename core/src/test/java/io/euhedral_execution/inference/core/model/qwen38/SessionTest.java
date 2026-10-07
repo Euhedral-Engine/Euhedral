@@ -267,6 +267,118 @@ class SessionTest {
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void cancellingFromTheTextCallbackAdmitsNoFurtherQuantum() throws Exception {
+        int vocabularySize = testVocabularySize();
+        var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);
+        var plan = new ExecutionPlan(weights);
+        var gpu = new SamplingGpu(vocabularySize);
+        gpu.selectedTokenIds = new int[] {1, 2, 3, 4, 5, 6, 7, 8};
+        var lattice = createLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var session = new Session(tokenizer, plan, runtime, gpu, 820, GenerationConfig.greedy(50L));
+        lattice.start();
+        awaitWorker(lattice);
+        try {
+            int[] prompt = tokenizer.encodeWithModelSpecialTokens("Hello");
+            var texts = new java.util.concurrent.atomic.AtomicInteger();
+            List<Integer> tokens = session.generateAsync(
+                            prompt,
+                            16,
+                            text -> {
+                                if (texts.incrementAndGet() == 1) session.cancel();
+                            },
+                            null)
+                    .get(30, TimeUnit.SECONDS);
+            assertEquals(1, texts.get(), "no text after the cancel");
+            assertEquals(1, tokens.size(), "the token whose text was emitted, and no decode quantum after it");
+            assertEquals(0, runtime.activeQuanta());
+            assertTrue(session.isCancelled());
+            assertThrows(IllegalStateException.class, () -> session.generateAsync(prompt, 1, text -> {}, null));
+        } finally {
+            session.close();
+            runtime.close();
+            lattice.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void closingFromTheOutputCallbackCompletesWhenTheGenerationEnds() throws Exception {
+        int vocabularySize = testVocabularySize();
+        var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);
+        var plan = new ExecutionPlan(weights);
+        var gpu = new SamplingGpu(vocabularySize);
+        gpu.selectedTokenIds = new int[] {1, 2, 3, 4, 5, 6, 7, 8};
+        var lattice = createLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var released = new java.util.concurrent.atomic.AtomicInteger();
+        var session = new Session(
+                tokenizer,
+                plan,
+                runtime,
+                gpu,
+                821,
+                GenerationConfig.greedy(51L),
+                ignored -> released.incrementAndGet());
+        lattice.start();
+        awaitWorker(lattice);
+        try {
+            var closedFromCallback = new java.util.concurrent.atomic.AtomicBoolean();
+            session.generate(
+                    "Hello",
+                    8,
+                    text -> {
+                        if (closedFromCallback.compareAndSet(false, true)) session.close();
+                    },
+                    null);
+            assertTrue(closedFromCallback.get());
+            assertTrue(session.isClosed());
+            assertEquals(1, released.get(), "the generation completed the close when it ended");
+            assertEquals(0, runtime.activeQuanta());
+        } finally {
+            runtime.close();
+            lattice.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void aGenerationStartedFromThePreviousResultsCallbackRuns() throws Exception {
+        int vocabularySize = testVocabularySize();
+        var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);
+        var plan = new ExecutionPlan(weights);
+        var gpu = new SamplingGpu(vocabularySize);
+        gpu.selectedTokenIds = new int[] {1, 2, 3, 4, 5, 6, 7, 8};
+        var lattice = createLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var session = new Session(tokenizer, plan, runtime, gpu, 822, GenerationConfig.greedy(52L));
+        lattice.start();
+        awaitWorker(lattice);
+        try {
+            int[] first = tokenizer.encodeWithModelSpecialTokens("Hello");
+            int[] continuation = tokenizer.encodeText(" again");
+            var second = new java.util.concurrent.CompletableFuture<List<Integer>>();
+            session.generateAsync(first, 2, text -> {}, null).whenComplete((tokens, failure) -> {
+                try {
+                    session.generateAsync(continuation, 2, text -> {}, null).whenComplete((more, f) -> {
+                        if (f != null) second.completeExceptionally(f);
+                        else second.complete(more);
+                    });
+                } catch (Throwable thrown) {
+                    second.completeExceptionally(thrown);
+                }
+            });
+            assertEquals(2, second.get(30, TimeUnit.SECONDS).size());
+            assertEquals(4, session.generatedTokenIds().size());
+        } finally {
+            session.close();
+            runtime.close();
+            lattice.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void rejectsAConcurrentGenerateCallForTheSameSequence() throws Exception {
         int vocabularySize = testVocabularySize();
         var weights = ExecutionFixtures.statefulCompactWeights(vocabularySize);

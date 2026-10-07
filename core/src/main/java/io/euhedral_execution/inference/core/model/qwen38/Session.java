@@ -1,18 +1,25 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
+import io.euhedral_execution.inference.core.generation.Generation;
+import io.euhedral_execution.inference.core.generation.GenerationFrames;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.generation.LogitsSampler;
+import io.euhedral_execution.inference.core.generation.StepPort;
+import io.euhedral_execution.inference.core.generation.TokenRecord;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeCheckpoint;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeDecoding;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
+import io.euhedral_execution.inference.core.runtime.PromptSink;
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.IncrementalDecoder;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -23,10 +30,9 @@ import java.util.List;
 import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /// Coordinates prompt and decode quanta for one persistent Qwen sequence.
@@ -34,6 +40,9 @@ import java.util.function.Consumer;
 /// The tokenizer, plan, runtime, and GPU are borrowed. The session owns its sequence, one sampler, and
 /// the pinned host row into which each sampling quantum copies its final logits before it retires; each
 /// completed prompt-to-output stream is flushed before the decoder is replaced for a later prompt.
+///
+/// A generation is a chain of frames (docs/FRAME_MODEL.md): each step's quantum throws a Select frame when it
+/// retires, which samples, emits text and throws the next step's Admit. No thread waits for a quantum.
 public final class Session implements GenerationSession {
 
     /// Default prompt tokens per prefill quantum. Bounds per-quantum GPU workspace while the
@@ -49,12 +58,14 @@ public final class Session implements GenerationSession {
     private final Sequence sequence;
     private final LogitsSampler sampler;
     private final HostLogits hostLogits;
-    private final List<Integer> generatedTokenIds = new ArrayList<>();
+    private final GenerationFrames frames;
+    /// Every token the session generated, across its prompts.
+    private final TokenRecord generatedTokenIds = new TokenRecord();
     private final AtomicBoolean generationActive = new AtomicBoolean();
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
-    /// The current or latest generation; completes after its cleanup.
-    private volatile CompletableFuture<List<Integer>> activeGeneration;
+    /// The current or latest generation.
+    private volatile Call active;
     /// The thread draining the blocking form's text, while it does.
     private volatile Thread drainingThread;
     private Consumer<? super Session> closeListener;
@@ -117,6 +128,7 @@ public final class Session implements GenerationSession {
         this.sequence = new Sequence(sequenceId);
         this.sampler = new LogitsSampler(config, plan.weights().config().vocabSize());
         this.hostLogits = new HostLogits(gpu, plan.weights().config().vocabSize());
+        this.frames = new GenerationFrames(runtime.lake());
         this.decoder = tokenizer.newIncrementalDecoder();
     }
 
@@ -178,6 +190,11 @@ public final class Session implements GenerationSession {
         return generate(null, promptTokenIds.clone(), maxNewTokens, output, constraint, null);
     }
 
+    public List<Integer> generate(String prompt, int maxNewTokens, Consumer<String> output)
+            throws InterruptedException, ExecutionException {
+        return generate(prompt, maxNewTokens, output, null);
+    }
+
     /// Whether the session's next prompt is its first, which carries the model special tokens.
     @Override
     public boolean expectsFirstPrompt() {
@@ -186,11 +203,10 @@ public final class Session implements GenerationSession {
 
     /// Starts a generation without blocking: the future completes, on a lattice worker, with the IDs this
     /// call sampled. Encoding (for a text prompt), every quantum and token selection run on the lattice's
-    /// workers as continuations of quantum retirement. `text` receives newly decoded, non-empty text on those
-    /// workers, one call at a time and in order, before the next quantum is admitted, so a [#cancel] from it
-    /// stops the generation before another quantum runs. It must not block: queue blocking work (a network
-    /// write) as further work for the workers. The session runs one generation at a time; a failed or cancelled
-    /// generation leaves it cancelled.
+    /// workers as frames. `text` receives newly decoded, non-empty text on those workers, one call at a time
+    /// and in order, before the next quantum is admitted, so a [#cancel] from it stops the generation before
+    /// another quantum runs. It must not block: queue blocking work (a network write) as further work for the
+    /// workers. The session runs one generation at a time; a failed or cancelled generation leaves it cancelled.
     @Override
     public CompletableFuture<List<Integer>> generateAsync(
             String prompt,
@@ -199,7 +215,7 @@ public final class Session implements GenerationSession {
             TokenConstraint constraint,
             GenerationTimingListener timing) {
         Objects.requireNonNull(prompt, "prompt");
-        return begin(prompt, null, maxNewTokens, text, constraint, timing, null);
+        return begin(prompt, null, maxNewTokens, text, constraint, timing, null).result();
     }
 
     /// As [#generateAsync(String, int, Consumer, TokenConstraint, GenerationTimingListener)] from a prompt
@@ -220,10 +236,11 @@ public final class Session implements GenerationSession {
             TokenConstraint constraint,
             GenerationTimingListener timing) {
         Objects.requireNonNull(promptTokenIds, "promptTokenIds");
-        return begin(null, promptTokenIds.clone(), maxNewTokens, text, constraint, timing, null);
+        return begin(null, promptTokenIds.clone(), maxNewTokens, text, constraint, timing, null)
+                .result();
     }
 
-    private CompletableFuture<List<Integer>> begin(
+    private Call begin(
             String prompt,
             int[] encoded,
             int maxNewTokens,
@@ -236,51 +253,28 @@ public final class Session implements GenerationSession {
         if (!this.generationActive.compareAndSet(false, true)) {
             throw new IllegalStateException("a generation is already active for this Qwen session");
         }
-        CompletableFuture<List<Integer>> finished = new CompletableFuture<>();
-        this.activeGeneration = finished;
-        CompletableFuture<List<Integer>> done;
+        Call call;
         try {
             ensureUsable();
             if (this.decoderFinished) {
                 this.decoder = this.tokenizer.newIncrementalDecoder();
                 this.decoderFinished = false;
             }
-            CompletableFuture<int[]> promptTokenIds = encoded != null
-                    ? CompletableFuture.completedFuture(encoded)
-                    : this.runtime.tokenize(this.tokenizer, prompt, !this.promptPrefilled);
-            done = promptTokenIds.thenCompose(ids -> {
-                if (ids.length == 0) throw new IllegalArgumentException("prompt must encode to at least one token");
-                if (timing != null) timing.promptEncoded(System.nanoTime(), ids.length);
-                return startGeneration(ids, maxNewTokens, constraint, timing, text);
-            });
+            call = new Call(maxNewTokens, text, constraint, timing, heldBy);
         } catch (RuntimeException | Error failure) {
             this.generationActive.set(false);
-            finished.completeExceptionally(failure);
             throw failure;
         }
-        done.whenComplete((tokens, failure) -> {
-            if (failure != null && this.sequence.terminalState() == Sequence.TerminalState.ACTIVE)
-                requestCancellation();
-            if (heldBy == null) end(finished, tokens, failure);
-            else {
-                // The blocking form's caller still hands out text: the generation stays active until it drained.
-                // The end is registered before the caller can see the last text, so the caller's own completion
-                // of `drained` ends the generation and `generate` returns only once another may start.
-                heldBy.drained.whenComplete((ignored, unused) -> end(finished, tokens, failure));
-                heldBy.end(tokens, failure);
+        this.active = call;
+        if (encoded != null) call.encoded(encoded);
+        else {
+            try {
+                this.runtime.tokenize(this.tokenizer, prompt, !this.promptPrefilled, call);
+            } catch (RuntimeException | Error refused) {
+                call.failed(refused);
             }
-        });
-        return finished;
-    }
-
-    private void end(CompletableFuture<List<Integer>> finished, List<Integer> tokens, Throwable failure) {
-        try {
-            this.generationActive.set(false);
-            if (this.closed.get()) completeClose();
-        } finally {
-            if (failure != null) finished.completeExceptionally(failure);
-            else finished.complete(tokens);
         }
+        return call;
     }
 
     /// The blocking form: generates on the lattice's workers as [#generateAsync] does, and hands the text to
@@ -295,20 +289,15 @@ public final class Session implements GenerationSession {
             throws InterruptedException, ExecutionException {
         Objects.requireNonNull(output, "output");
         Emission emission = new Emission();
-        begin(prompt, encoded, maxNewTokens, emission::text, constraint, timing, emission);
+        Call call = begin(prompt, encoded, maxNewTokens, emission::text, constraint, timing, emission);
         this.drainingThread = Thread.currentThread();
         try {
             return emission.drain(output, this::requestCancellation);
         } finally {
             this.drainingThread = null;
             // Ends the generation on this thread, so it returns once another may start.
-            emission.drained.complete(null);
+            call.settle();
         }
-    }
-
-    public List<Integer> generate(String prompt, int maxNewTokens, Consumer<String> output)
-            throws InterruptedException, ExecutionException {
-        return generate(prompt, maxNewTokens, output, null);
     }
 
     /// Requests cancellation of the current quantum or prevents the next one from starting.
@@ -328,9 +317,7 @@ public final class Session implements GenerationSession {
     /// Returns an immutable snapshot of tokens sampled by all prompts in this session.
     @Override
     public List<Integer> generatedTokenIds() {
-        synchronized (this.generatedTokenIds) {
-            return List.copyOf(this.generatedTokenIds);
-        }
+        return this.generatedTokenIds.snapshot();
     }
 
     /// Prompt tokens the session's last generation restored from the prefix cache; 0 when it prefilled all of them.
@@ -371,8 +358,8 @@ public final class Session implements GenerationSession {
         if (this.generationActive.get()) {
             if (firstClose) requestCancellation();
             if (Thread.currentThread() == this.drainingThread) return;
-            CompletableFuture<List<Integer>> active = this.activeGeneration;
-            if (active != null) active.handle((tokens, failure) -> null).join();
+            Call call = this.active;
+            if (call != null) call.settled.join();
         }
         completeClose();
     }
@@ -391,427 +378,449 @@ public final class Session implements GenerationSession {
         }
     }
 
-    private CompletableFuture<List<Integer>> startGeneration(
-            int[] promptTokenIds,
-            int maxNewTokens,
-            TokenConstraint constraint,
-            GenerationTimingListener timing,
-            Consumer<String> text) {
-        if (isStopRequested()) return CompletableFuture.completedFuture(List.of());
-        // A greedy, unconstrained call selects each token on the device and reads back only its ID.
-        this.hostLogits.selectOnDevice(this.sampler.greedy() && constraint == null);
-        if (this.speculation != null
-                && this.sampler.greedy()
-                && constraint == null
-                && !this.promptPrefilled
-                && this.sequence.currentTokenPosition() == 0
-                && maxNewTokens > 0) {
-            return generateSpeculative(promptTokenIds, maxNewTokens, text, timing);
-        }
-        Chain chain = new Chain(promptTokenIds, maxNewTokens, constraint, timing, text);
-        PrefixCache cache = this.prefixCache;
-        if (cache == null || this.promptPrefilled || this.sequence.currentTokenPosition() != 0) chain.prefillNext();
-        else chain.startFromCache(cache);
-        return chain.result;
-    }
-
-    /// One-row decode as continuations: the prefill chunks, then one decode quantum per token, each started
-    /// by the previous quantum's outcome. The steps are the blocking loop's, in its order.
-    private final class Chain {
-        private final int[] promptTokenIds;
+    /// One call: prefix restore, prefill chunks with their checkpoints, then one decode quantum per token (or a
+    /// speculative strategy's steps), in the order of the sequential loop.
+    private final class Call extends Generation implements PromptSink {
         private final int maxNewTokens;
+        private final Consumer<String> text;
         private final TokenConstraint constraint;
         private final GenerationTimingListener timing;
-        private final Consumer<String> text;
+        private final Emission heldBy;
+        /// Completes once the session accepts another generation: for the blocking form, after the caller drained.
+        final CompletableFuture<Void> settled = new CompletableFuture<>();
+
         private final List<Integer> callTokenIds = new ArrayList<>();
-        private final CompletableFuture<List<Integer>> result = new CompletableFuture<>();
+        private int[] promptTokenIds;
         private int offset;
+        private int end;
+        private boolean samples;
+        private long started;
         private OptionalInt nextToken = OptionalInt.empty();
         private int generated;
+        private int decodeToken;
+        private boolean anotherTokenAllowed;
         private boolean endedNormally;
         /// Where this prompt's next checkpoint attaches: the deepest stored node of its prefix. Null unless the
         /// prompt started a fresh sequence through the cache: the offsets of a continuation prompt are not
         /// positions of the sequence, so nothing it holds may be stored under its tokens.
-        private PrefixNode cursor;
+        private volatile PrefixNode cursor;
 
-        Chain(
-                int[] promptTokenIds,
+        private PrefixCache.Hit hit;
+        private SpeculativeCheckpoint speculativeState;
+        private long restoreStarted;
+        // Written by a copy's completion, then read by the Select it throws.
+        private volatile boolean restored;
+        private volatile Throwable copyFailure;
+        private volatile PrefixNode captured;
+
+        Call(
                 int maxNewTokens,
+                Consumer<String> text,
                 TokenConstraint constraint,
                 GenerationTimingListener timing,
-                Consumer<String> text) {
-            this.promptTokenIds = promptTokenIds;
+                Emission heldBy) {
+            super(Session.this.frames);
             this.maxNewTokens = maxNewTokens;
+            this.text = text;
             this.constraint = constraint;
             this.timing = timing;
-            this.text = text;
+            this.heldBy = heldBy;
         }
 
-        /// Restores the longest stored prefix of the prompt, then prefills what is left.
-        void startFromCache(PrefixCache cache) {
-            PrefixCache.Hit hit = cache.lookup(this.promptTokenIds);
-            this.cursor = hit == null ? cache.root() : hit.cursor();
-            if (hit == null) {
-                prefillNext();
+        @Override
+        public void encoded(int[] ids) {
+            try {
+                if (ids.length == 0) throw new IllegalArgumentException("prompt must encode to at least one token");
+                if (this.timing != null) this.timing.promptEncoded(System.nanoTime(), ids.length);
+                this.promptTokenIds = ids;
+                startGeneration();
+            } catch (Throwable failure) {
+                failed(failure);
+            }
+        }
+
+        @Override
+        public void failed(Throwable failure) {
+            fail(failure);
+            finishNow();
+        }
+
+        /// Chooses the first step; its last statement starts the chain or finishes it.
+        private void startGeneration() {
+            if (isStopRequested()) {
+                complete(List.of());
+                finishNow();
                 return;
             }
-            long started = System.nanoTime();
-            cache.restore(Session.this.runtime.frames(), Session.this.plan, Session.this.sequence, hit)
-                    .whenComplete((restored, failure) -> {
-                        cache.release(hit);
-                        try {
-                            if (failure != null) {
-                                this.result.completeExceptionally(failure);
-                                return;
-                            }
-                            if (!restored || isStopRequested()) {
-                                this.result.complete(List.of());
-                                return;
-                            }
-                            if (this.timing != null)
-                                this.timing.prefixRestored(hit.position(), System.nanoTime() - started);
-                            this.offset = hit.position();
-                            Session.this.restoredPromptTokens = hit.position();
-                            prefillNext();
-                        } catch (Throwable continuationFailure) {
-                            this.result.completeExceptionally(continuationFailure);
-                        }
-                    });
+            // A greedy, unconstrained call selects each token on the device and reads back only its ID.
+            hostLogits.selectOnDevice(sampler.greedy() && this.constraint == null);
+            if (speculation != null
+                    && sampler.greedy()
+                    && this.constraint == null
+                    && !promptPrefilled
+                    && sequence.currentTokenPosition() == 0
+                    && this.maxNewTokens > 0) {
+                startSpeculative();
+                return;
+            }
+            PrefixCache cache = prefixCache;
+            if (cache == null || promptPrefilled || sequence.currentTokenPosition() != 0) {
+                start(this.prompt);
+                return;
+            }
+            this.hit = cache.lookup(this.promptTokenIds);
+            this.cursor = this.hit == null ? cache.root() : this.hit.cursor();
+            start(this.hit == null ? this.prompt : this.restore);
         }
 
-        /// After a prefill chunk that ended at `end`: store a checkpoint when the cache wants one, then go on.
-        private void checkpointThen(int end, Runnable next) {
-            PrefixCache cache = Session.this.prefixCache;
+        /// Restores the longest stored prefix of the prompt; the copy's completion throws the Select.
+        private final StepPort restore = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                PrefixCache cache = prefixCache;
+                PrefixCache.Hit stored = hit;
+                restoreStarted = System.nanoTime();
+                cache.restore(runtime.frames(), plan, sequence, stored).whenComplete((done, failure) -> {
+                    cache.release(stored);
+                    restored = Boolean.TRUE.equals(done);
+                    copyFailure = failure;
+                    skip(select);
+                });
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) throws Exception {
+                if (copyFailure != null) throw rethrown(copyFailure);
+                if (!restored || isStopRequested()) {
+                    complete(List.of());
+                    return null;
+                }
+                if (timing != null) timing.prefixRestored(hit.position(), System.nanoTime() - restoreStarted);
+                offset = hit.position();
+                restoredPromptTokens = hit.position();
+                return prefillNext();
+            }
+        };
+
+        /// A prefill chunk; the last one samples the first token.
+        private final StepPort prompt = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                end = Math.min(offset + prefillChunkTokens, promptTokenIds.length);
+                started = timing == null ? 0L : System.nanoTime();
+                samples = end == promptTokenIds.length && maxNewTokens > 0;
+                runtime.admit(
+                        new Quantum(
+                                plan,
+                                sequence,
+                                Quantum.ExecutionKind.PREFILL,
+                                sequence.currentTokenPosition(),
+                                Arrays.copyOfRange(promptTokenIds, offset, end),
+                                samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
+                                samples ? hostLogits : null),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) throws Exception {
+                nextToken = select((Quantum) step, samples, true);
+                if (isStopRequested()) {
+                    complete(List.of());
+                    return null;
+                }
+                offset = end;
+                return checkpointThen(end);
+            }
+        };
+
+        /// Stores the state after a chunk when the cache wants a checkpoint there; a failed capture is ignored.
+        private final StepPort capture = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                prefixCache
+                        .capture(runtime.frames(), sequence, cursor, promptTokenIds, end)
+                        .whenComplete((node, failure) -> {
+                            captured = failure == null ? node : null;
+                            skip(select);
+                        });
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                if (captured != null) cursor = captured;
+                captured = null;
+                return prefillNext();
+            }
+        };
+
+        /// One decode token; it samples the next unless the budget is spent.
+        private final StepPort decode = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                started = timing == null ? 0L : System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                plan,
+                                sequence,
+                                Quantum.ExecutionKind.DECODE,
+                                sequence.currentTokenPosition(),
+                                new int[] {decodeToken},
+                                anotherTokenAllowed ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
+                                anotherTokenAllowed ? hostLogits : null),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) throws Exception {
+                // Commit the final non-terminal token for continuation without sampling beyond the limit.
+                nextToken = select((Quantum) step, anotherTokenAllowed, false);
+                if (!anotherTokenAllowed) endedNormally = !isStopRequested();
+                if (isStopRequested() || !anotherTokenAllowed) return finish();
+                generated++;
+                return decodeNext();
+            }
+        };
+
+        private StepPort checkpointThen(int end) {
+            PrefixCache cache = prefixCache;
             if (cache == null
                     || this.cursor == null
                     || end <= this.cursor.position()
-                    || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) {
-                next.run();
-                return;
-            }
-            cache.capture(Session.this.runtime.frames(), Session.this.sequence, this.cursor, this.promptTokenIds, end)
-                    .whenComplete((node, failure) -> {
-                        try {
-                            if (failure == null) this.cursor = node;
-                            next.run();
-                        } catch (Throwable continuationFailure) {
-                            this.result.completeExceptionally(continuationFailure);
-                        }
-                    });
+                    || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) return prefillNext();
+            return this.capture;
         }
 
-        void prefillNext() {
-            if (this.offset >= this.promptTokenIds.length) {
-                afterPrefill();
-                return;
-            }
+        private StepPort prefillNext() {
+            if (this.offset >= this.promptTokenIds.length) return afterPrefill();
             if (isStopRequested()) {
-                this.result.complete(List.of());
-                return;
+                complete(List.of());
+                return null;
             }
-            int end = Math.min(this.offset + Session.this.prefillChunkTokens, this.promptTokenIds.length);
-            long started = this.timing == null ? 0L : System.nanoTime();
-            boolean samples = end == this.promptTokenIds.length && this.maxNewTokens > 0;
-            Quantum prefill = new Quantum(
-                    Session.this.plan,
-                    Session.this.sequence,
-                    Quantum.ExecutionKind.PREFILL,
-                    Session.this.sequence.currentTokenPosition(),
-                    Arrays.copyOfRange(this.promptTokenIds, this.offset, end),
-                    samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                    samples ? Session.this.hostLogits : null);
-            executeAndSelect(prefill, samples, this.constraint, this.timing, started, true, this.result, next -> {
-                this.nextToken = next;
-                if (isStopRequested()) {
-                    this.result.complete(List.of());
-                    return;
-                }
-                this.offset = end;
-                checkpointThen(end, this::prefillNext);
-            });
+            return this.prompt;
         }
 
-        private void afterPrefill() {
-            Session.this.promptPrefilled = true;
+        private StepPort afterPrefill() {
+            promptPrefilled = true;
             if (this.maxNewTokens == 0) {
                 finishDecoder(this.text);
-                this.result.complete(List.of());
-                return;
+                complete(List.of());
+                return null;
             }
-            decodeNext();
+            return decodeNext();
         }
 
-        /// One iteration of the decode loop: commit the selected token, and sample the next unless the
-        /// budget is spent.
-        private void decodeNext() {
-            if (this.generated >= this.maxNewTokens || isStopRequested() || this.nextToken.isEmpty()) {
-                finish();
-                return;
-            }
+        /// One iteration of the decode loop: commit the selected token, and sample the next unless the budget is
+        /// spent.
+        private StepPort decodeNext() {
+            if (this.generated >= this.maxNewTokens || isStopRequested() || this.nextToken.isEmpty()) return finish();
             int tokenId = this.nextToken.getAsInt();
-            if (Session.this.tokenizer.isGenerationEosToken(tokenId)) {
+            if (tokenizer.isGenerationEosToken(tokenId)) {
                 record(tokenId);
                 // EOS terminates the generation and is not a model input quantum.
                 this.endedNormally = true;
-                finish();
-                return;
+                return finish();
             }
-            if (isStopRequested()) {
-                finish();
-                return;
-            }
-            boolean anotherTokenAllowed = this.generated + 1 < this.maxNewTokens;
+            if (isStopRequested()) return finish();
+            this.anotherTokenAllowed = this.generated + 1 < this.maxNewTokens;
             record(tokenId);
-            emit(this.text, Session.this.decoder.append(tokenId));
+            emit(this.text, decoder.append(tokenId));
             // Cancellation makes the session terminal; do not admit another quantum to preserve history.
-            if (isStopRequested()) {
-                finish();
-                return;
-            }
-            long started = this.timing == null ? 0L : System.nanoTime();
-            Quantum decode = new Quantum(
-                    Session.this.plan,
-                    Session.this.sequence,
-                    Quantum.ExecutionKind.DECODE,
-                    Session.this.sequence.currentTokenPosition(),
-                    new int[] {tokenId},
-                    anotherTokenAllowed ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                    anotherTokenAllowed ? Session.this.hostLogits : null);
-            // Commit the final non-terminal token for continuation without sampling beyond the limit.
-            executeAndSelect(
-                    decode, anotherTokenAllowed, this.constraint, this.timing, started, false, this.result, next -> {
-                        this.nextToken = next;
-                        if (!anotherTokenAllowed) this.endedNormally = !isStopRequested();
-                        if (isStopRequested() || !anotherTokenAllowed) {
-                            finish();
-                            return;
-                        }
-                        this.generated++;
-                        decodeNext();
-                    });
+            if (isStopRequested()) return finish();
+            this.decodeToken = tokenId;
+            return this.decode;
         }
 
         private void record(int tokenId) {
             this.callTokenIds.add(tokenId);
-            synchronized (Session.this.generatedTokenIds) {
-                Session.this.generatedTokenIds.add(tokenId);
+            generatedTokenIds.add(tokenId);
+        }
+
+        private StepPort finish() {
+            if (this.endedNormally && !isStopRequested()) finishDecoder(this.text);
+            complete(List.copyOf(this.callTokenIds));
+            return null;
+        }
+
+        /// Reads a retired quantum's published outcome and selects its next token when `selectToken`.
+        private OptionalInt select(Quantum context, boolean selectToken, boolean prefill) throws ExecutionException {
+            Quantum.Outcome outcome = context.conclusion();
+            DeviceLogits logits = null;
+            Throwable executionFailure = null;
+            try {
+                if (outcome == null) throw new IllegalStateException("the quantum's outcome was not published");
+                if (outcome.status() == Quantum.Status.CANCELLED) {
+                    cancelled.set(true);
+                    return OptionalInt.empty();
+                }
+                if (outcome.status() == Quantum.Status.FAILED) {
+                    throw new IllegalStateException("Qwen execution quantum failed", outcome.failure());
+                }
+                if (outcome.status() != Quantum.Status.SUCCESS) {
+                    throw new IllegalStateException("runtime returned an unknown quantum outcome");
+                }
+                long executedNanos = this.timing == null ? 0L : System.nanoTime();
+                if (!selectToken || isStopRequested()) {
+                    if (this.timing != null)
+                        reportQuantum(
+                                this.timing, context, prefill, this.started, executedNanos, false, executedNanos, -1);
+                    return OptionalInt.empty();
+                }
+                // The quantum copied its final row into the host logits before it retired.
+                int selected = sampler.selectToken(hostLogits, this.constraint);
+                if (this.constraint != null) this.constraint.accept(selected);
+                if (this.timing != null)
+                    reportQuantum(
+                            this.timing,
+                            context,
+                            prefill,
+                            this.started,
+                            executedNanos,
+                            true,
+                            System.nanoTime(),
+                            selected);
+                return OptionalInt.of(selected);
+            } catch (RuntimeException | Error failure) {
+                executionFailure = failure;
+                throw failure;
+            } finally {
+                logits = context.logitsOutput().orElse(null);
+                if (logits != null) {
+                    try {
+                        logits.close();
+                    } catch (RuntimeException | Error cleanupFailure) {
+                        if (executionFailure != null) executionFailure.addSuppressed(cleanupFailure);
+                        else throw cleanupFailure;
+                    }
+                }
             }
         }
 
-        private void finish() {
-            if (this.endedNormally && !isStopRequested()) finishDecoder(this.text);
-            this.result.complete(List.copyOf(this.callTokenIds));
-        }
-    }
+        // ---------------------------------------------------------------- speculation
 
-    private CompletableFuture<List<Integer>> generateSpeculative(
-            int[] promptTokenIds, int maxNewTokens, Consumer<String> text, GenerationTimingListener timing) {
-        if (this.speculative == null)
-            this.speculative = this.speculation.open(
-                    this.runtime,
-                    this.plan,
-                    this.gpu,
-                    this.sequence,
-                    this.tokenizer::isGenerationEosToken,
-                    this.prefillChunkTokens);
-        PrefixCache cache = this.prefixCache;
-        if (cache == null) return runSpeculative(promptTokenIds, maxNewTokens, text, timing, null, 0);
-        // A speculative prompt restores only through checkpoints that hold its strategy's state, and stores them.
-        SpeculativeCheckpoint state = this.speculative.checkpoint();
-        PrefixCache.Hit hit = cache.lookup(promptTokenIds, state);
-        AtomicReference<PrefixNode> cursor = new AtomicReference<>(hit == null ? cache.root() : hit.cursor());
-        SpeculativeDecoding.PrefixHooks hooks = end -> {
-            PrefixNode attachedTo = cursor.get();
-            if (end <= attachedTo.position() || !cache.wantsCheckpoint(end, promptTokenIds.length))
-                return CompletableFuture.completedFuture(null);
-            return cache.capture(this.runtime.frames(), this.sequence, attachedTo, promptTokenIds, end, state)
-                    .thenAccept(cursor::set);
-        };
-        if (hit == null) return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, 0);
-        long started = System.nanoTime();
-        return cache.restore(this.runtime.frames(), this.plan, this.sequence, hit, state)
-                .whenComplete((restored, failure) -> cache.release(hit))
-                .thenCompose(restored -> {
-                    if (!restored || isStopRequested()) return CompletableFuture.completedFuture(List.<Integer>of());
-                    if (timing != null) timing.prefixRestored(hit.position(), System.nanoTime() - started);
-                    this.restoredPromptTokens = hit.position();
-                    return runSpeculative(promptTokenIds, maxNewTokens, text, timing, hooks, hit.position());
-                });
-    }
-
-    private CompletableFuture<List<Integer>> runSpeculative(
-            int[] promptTokenIds,
-            int maxNewTokens,
-            Consumer<String> text,
-            GenerationTimingListener timing,
-            SpeculativeDecoding.PrefixHooks hooks,
-            int startPosition) {
-        return this.speculative
-                .generateAsync(
-                        promptTokenIds,
-                        maxNewTokens,
-                        token -> {
-                            synchronized (this.generatedTokenIds) {
-                                this.generatedTokenIds.add(token);
-                            }
-                            // As in ordinary decode, a generation terminator is returned but never decoded into text.
-                            if (!this.tokenizer.isGenerationEosToken(token)) emit(text, this.decoder.append(token));
-                        },
-                        timing,
-                        hooks,
-                        startPosition)
-                .thenApply(tokens -> {
-                    this.promptPrefilled = true;
-                    if (!isStopRequested()) finishDecoder(text);
-                    return tokens;
-                });
-    }
-
-    /// Admits `context` and, once its outcome is published, selects its next token (when `selectToken`) and
-    /// passes it to `next` on the worker that retired the quantum. A failure completes `result` instead.
-    private void executeAndSelect(
-            Quantum context,
-            boolean selectToken,
-            TokenConstraint constraint,
-            GenerationTimingListener timing,
-            long startedNanos,
-            boolean prefill,
-            CompletableFuture<List<Integer>> result,
-            Consumer<OptionalInt> next) {
-        CompletableFuture<Quantum.Outcome> outcome;
-        try {
-            outcome = this.runtime.submit(context);
-        } catch (RuntimeException | Error failure) {
-            result.completeExceptionally(failure);
-            return;
-        }
-        outcome.whenComplete((completed, failure) -> {
-            OptionalInt selected;
-            try {
-                selected = select(context, completed, failure, selectToken, constraint, timing, startedNanos, prefill);
-            } catch (Throwable selectionFailure) {
-                result.completeExceptionally(selectionFailure);
+        private void startSpeculative() {
+            if (speculative == null)
+                speculative = speculation.open(
+                        runtime, plan, gpu, sequence, tokenizer::isGenerationEosToken, prefillChunkTokens);
+            PrefixCache cache = prefixCache;
+            if (cache == null) {
+                start(speculative.start(
+                        this.promptTokenIds,
+                        this.maxNewTokens,
+                        this::speculativeToken,
+                        this.timing,
+                        null,
+                        0,
+                        this::speculativeEnded));
                 return;
             }
+            // A speculative prompt restores only through checkpoints that hold its strategy's state, and stores them.
+            this.speculativeState = speculative.checkpoint();
+            this.hit = cache.lookup(this.promptTokenIds, this.speculativeState);
+            this.cursor = this.hit == null ? cache.root() : this.hit.cursor();
+            if (this.hit == null) {
+                start(speculative.start(
+                        this.promptTokenIds,
+                        this.maxNewTokens,
+                        this::speculativeToken,
+                        this.timing,
+                        this::checkpoint,
+                        0,
+                        this::speculativeEnded));
+                return;
+            }
+            start(this.speculativeRestore);
+        }
+
+        private final StepPort speculativeRestore = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                PrefixCache cache = prefixCache;
+                PrefixCache.Hit stored = hit;
+                restoreStarted = System.nanoTime();
+                cache.restore(runtime.frames(), plan, sequence, stored, speculativeState)
+                        .whenComplete((done, failure) -> {
+                            cache.release(stored);
+                            restored = Boolean.TRUE.equals(done);
+                            copyFailure = failure;
+                            skip(select);
+                        });
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) throws Exception {
+                if (copyFailure != null) throw rethrown(copyFailure);
+                if (!restored || isStopRequested()) {
+                    complete(List.of());
+                    return null;
+                }
+                if (timing != null) timing.prefixRestored(hit.position(), System.nanoTime() - restoreStarted);
+                restoredPromptTokens = hit.position();
+                return speculative.start(
+                        promptTokenIds,
+                        maxNewTokens,
+                        Call.this::speculativeToken,
+                        timing,
+                        Call.this::checkpoint,
+                        hit.position(),
+                        Call.this::speculativeEnded);
+            }
+        };
+
+        /// The prefix cache's hook after a speculative chunk: stores a checkpoint when the cache wants one there.
+        private void checkpoint(int end, Consumer<Throwable> done) {
+            PrefixCache cache = prefixCache;
+            PrefixNode attachedTo = this.cursor;
+            if (end <= attachedTo.position() || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) {
+                done.accept(null);
+                return;
+            }
+            cache.capture(runtime.frames(), sequence, attachedTo, this.promptTokenIds, end, this.speculativeState)
+                    .whenComplete((node, failure) -> {
+                        if (failure == null) this.cursor = node;
+                        done.accept(failure);
+                    });
+        }
+
+        private void speculativeToken(int token) {
+            generatedTokenIds.add(token);
+            // As in ordinary decode, a generation terminator is returned but never decoded into text.
+            if (!tokenizer.isGenerationEosToken(token)) emit(this.text, decoder.append(token));
+        }
+
+        private void speculativeEnded(List<Integer> tokens) {
+            promptPrefilled = true;
+            if (!isStopRequested()) finishDecoder(this.text);
+            complete(tokens);
+        }
+
+        // ---------------------------------------------------------------- the end
+
+        /// A failure leaves the sequence cancelled. The session accepts another generation before the caller's
+        /// result completes, or, for the blocking form, once its caller drained the text.
+        @Override
+        protected void ended(List<Integer> tokens, Throwable failure) {
+            if (failure != null && sequence.terminalState() == Sequence.TerminalState.ACTIVE) requestCancellation();
+            if (this.heldBy == null) settle();
+            else this.heldBy.end(tokens, failure);
+        }
+
+        /// The session may accept another generation.
+        void settle() {
             try {
-                next.accept(selected);
-            } catch (Throwable continuationFailure) {
-                result.completeExceptionally(continuationFailure);
-            }
-        });
-    }
-
-    private OptionalInt select(
-            Quantum context,
-            Quantum.Outcome outcome,
-            Throwable outcomeFailure,
-            boolean selectToken,
-            TokenConstraint constraint,
-            GenerationTimingListener timing,
-            long startedNanos,
-            boolean prefill)
-            throws ExecutionException {
-        DeviceLogits logits = null;
-        Throwable executionFailure = null;
-        try {
-            if (outcomeFailure != null) throw new ExecutionException(outcomeFailure);
-            if (outcome.status() == Quantum.Status.CANCELLED) {
-                this.cancelled.set(true);
-                return OptionalInt.empty();
-            }
-            if (outcome.status() == Quantum.Status.FAILED) {
-                throw new IllegalStateException("Qwen execution quantum failed", outcome.failure());
-            }
-            if (outcome.status() != Quantum.Status.SUCCESS) {
-                throw new IllegalStateException("runtime returned an unknown quantum outcome");
-            }
-            long executedNanos = timing == null ? 0L : System.nanoTime();
-            if (!selectToken || isStopRequested()) {
-                if (timing != null)
-                    reportQuantum(timing, context, prefill, startedNanos, executedNanos, false, executedNanos, -1);
-                return OptionalInt.empty();
-            }
-            // The quantum copied its final row into the host logits before it retired.
-            int selected = this.sampler.selectToken(this.hostLogits, constraint);
-            if (constraint != null) constraint.accept(selected);
-            if (timing != null)
-                reportQuantum(timing, context, prefill, startedNanos, executedNanos, true, System.nanoTime(), selected);
-            return OptionalInt.of(selected);
-        } catch (ExecutionException | RuntimeException | Error failure) {
-            executionFailure = failure;
-            throw failure;
-        } finally {
-            if (logits == null) logits = context.logitsOutput().orElse(null);
-            if (logits != null) {
-                try {
-                    logits.close();
-                } catch (RuntimeException | Error cleanupFailure) {
-                    if (executionFailure != null) executionFailure.addSuppressed(cleanupFailure);
-                    else throw cleanupFailure;
-                }
+                generationActive.set(false);
+                if (closed.get()) completeClose();
+            } finally {
+                this.settled.complete(null);
             }
         }
     }
 
-    /// Decoded text on its way from the generating workers to the calling thread. Workers never block on it.
-    private static final class Emission {
-        private static final Object END = new Object();
-        private final LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>();
-        /// Completed by the caller after the last text; the generation ends then.
-        final CompletableFuture<Void> drained = new CompletableFuture<>();
-        private List<Integer> tokens;
-        private Throwable failure;
-
-        void text(String text) {
-            if (!text.isEmpty()) this.queue.add(text);
-        }
-
-        /// The quanta are done; the queue publishes the result to the draining thread.
-        void end(List<Integer> tokens, Throwable failure) {
-            this.tokens = tokens;
-            this.failure = failure;
-            this.queue.add(END);
-        }
-
-        /// Hands every text to `output` until the generation ended, then returns its tokens. When `output`
-        /// throws or the calling thread is interrupted, `cancel` stops the generation, which is still awaited.
-        List<Integer> drain(Consumer<String> output, Runnable cancel) throws InterruptedException, ExecutionException {
-            Throwable outputFailure = null;
-            boolean interrupted = false;
-            while (true) {
-                Object item;
-                try {
-                    item = this.queue.take();
-                } catch (InterruptedException interruption) {
-                    if (!interrupted) cancel.run();
-                    interrupted = true;
-                    continue;
-                }
-                if (item == END) break;
-                if (outputFailure != null || interrupted) continue;
-                try {
-                    output.accept((String) item);
-                } catch (RuntimeException | Error failure) {
-                    outputFailure = failure;
-                    cancel.run();
-                }
-            }
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-                throw new InterruptedException("generation was interrupted");
-            }
-            if (outputFailure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
-            if (outputFailure instanceof Error error) throw error;
-            if (this.failure == null) return this.tokens;
-            Throwable cause = this.failure instanceof java.util.concurrent.CompletionException wrapped
-                            && wrapped.getCause() != null
-                    ? wrapped.getCause()
-                    : this.failure;
-            if (cause instanceof ExecutionException executionFailure) throw executionFailure;
-            if (cause instanceof RuntimeException runtimeFailure) throw runtimeFailure;
-            if (cause instanceof Error error) throw error;
-            throw new ExecutionException(cause);
-        }
+    private static Exception rethrown(Throwable failure) {
+        Throwable cause = failure instanceof CompletionException wrapped && wrapped.getCause() != null
+                ? wrapped.getCause()
+                : failure;
+        if (cause instanceof Error error) throw error;
+        return cause instanceof Exception exception ? exception : new ExecutionException(cause);
     }
 
     private static void reportQuantum(

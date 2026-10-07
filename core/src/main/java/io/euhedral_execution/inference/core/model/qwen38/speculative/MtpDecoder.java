@@ -1,15 +1,20 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
+import io.euhedral_execution.inference.core.generation.Generation;
+import io.euhedral_execution.inference.core.generation.GenerationFrames;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
+import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -18,8 +23,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 
@@ -27,7 +32,7 @@ import java.util.function.IntPredicate;
 /// the token ordinary greedy decode produces, and the committed state is the state it leaves: drafts
 /// only decide how many tokens one verification commits.
 ///
-/// Each step is a chain of quanta, each on the existing runtime:
+/// Each step is a sequence of quanta, run as generation frames through the decoder's step ports:
 /// 1. A VERIFY quantum over `[t₀, d₁ .. d_n]`: row-exact, with greedy selections and acceptance on retirement.
 /// 2. A DRAFT catch-up over the committed outputs, seeded by the verified rows' hidden states. It commits
 ///    those MTP cache rows, and its last row drafts d′₁.
@@ -169,12 +174,22 @@ public final class MtpDecoder implements SpeculativeDecoding {
     }
 
     /// As [#generate(int[], int, IntConsumer)], reporting prefill chunks, the first token, every
-    /// verification step and a final commit-only quantum to `timing` (when not null). Blocks the caller
-    /// until [#generateAsync] completes.
+    /// verification step and a final commit-only quantum to `timing` (when not null). The steps run as
+    /// generation frames on the lattice; the calling thread waits for them (tests and tools).
     public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
+        Generation generation = new Generation(new GenerationFrames(this.runtime.lake()));
+        StepPort first;
         try {
-            return generateAsync(prompt, maxNewTokens, onToken, timing).get();
+            first = start(prompt, maxNewTokens, onToken, timing, null, 0, generation::complete);
+        } catch (RuntimeException | Error refused) {
+            generation.fail(refused);
+            generation.finishNow();
+            throw refused;
+        }
+        generation.start(first);
+        try {
+            return generation.result().get();
         } catch (ExecutionException failure) {
             if (failure.getCause() instanceof RuntimeException runtimeFailure) throw runtimeFailure;
             if (failure.getCause() instanceof Error error) throw error;
@@ -182,46 +197,81 @@ public final class MtpDecoder implements SpeculativeDecoding {
         }
     }
 
-    /// Generates as [#generate(int[], int, IntConsumer, GenerationTimingListener)] as a chain of
-    /// continuations: each quantum's outcome, on the worker that retired it, admits the next quantum.
-    /// `onToken` and `timing` run on those workers, one call at a time, in generation order.
-    public CompletableFuture<List<Integer>> generateAsync(
-            int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing) {
-        return generateAsync(prompt, maxNewTokens, onToken, timing, null, 0);
-    }
-
-    /// As [#generateAsync(int[], int, IntConsumer, GenerationTimingListener)] for a sequence restored from the
-    /// prefix cache at `startPosition` (0 for a fresh one): its base state holds `[0, startPosition)`, its MTP
-    /// cache `[0, startPosition - 1)`, and its draft seed buffer the hidden row of position `startPosition - 1`.
-    /// `hooks`, when not null, is called after each prefill chunk and its MTP catch-up, before the next chunk
-    /// overwrites the draft seed rows.
+    /// The first step of a generation for a sequence restored from the prefix cache at `startPosition` (0 for a
+    /// fresh one): its base state holds `[0, startPosition)`, its MTP cache `[0, startPosition - 1)`, and its draft
+    /// seed buffer the hidden row of position `startPosition - 1`. `hooks`, when not null, is called after each
+    /// prefill chunk and its MTP catch-up, before the next chunk overwrites the draft seed rows.
     @Override
-    public CompletableFuture<List<Integer>> generateAsync(
+    public StepPort start(
             int[] prompt,
             int maxNewTokens,
             IntConsumer onToken,
             GenerationTimingListener timing,
             PrefixHooks hooks,
-            int startPosition) {
+            int startPosition,
+            Consumer<List<Integer>> ended) {
         if (prompt.length == 0 || maxNewTokens <= 0) throw new IllegalArgumentException("empty generation");
         if (startPosition < 0 || startPosition >= prompt.length)
             throw new IllegalArgumentException("startPosition must lie within the prompt");
         this.statistics = new Statistics(this.depth);
         this.timing = timing;
-        return new Run(prompt, maxNewTokens, onToken, timing, hooks, startPosition).start();
+        return new Run(prompt, maxNewTokens, onToken, timing, hooks, startPosition, ended).first();
     }
 
-    /// One generation's continuations. The steps are those of the sequential algorithm, in its order.
+    /// One generation's steps, in the order of the sequential algorithm: each port admits one quantum and, when it
+    /// retired, names the next.
     private final class Run {
+        /// What a finished catch-up goes on to.
+        private enum Then {
+            PREFILL_AT_BOUNDARY,
+            AFTER_CHUNK,
+            VERIFY
+        }
+
         private final int[] prompt;
         private final int maxNewTokens;
         private final IntConsumer onToken;
         private final GenerationTimingListener timing;
         private final PrefixHooks hooks;
         private final int startPosition;
+        private final Consumer<List<Integer>> ended;
         private final List<Integer> output = new ArrayList<>();
         private int first = -1;
         private int[] drafts;
+
+        // The prefill chunk in flight.
+        private int offset;
+        private int end;
+        private boolean last;
+        private long started;
+        private long promptCatchUpStarted;
+
+        // The catch-up in flight.
+        private long catchUpPosition;
+        private int[] catchUpTokens;
+        private boolean catchUpDraft;
+        private long catchUpSeeds;
+        private int catchUpFirst;
+        private int catchUpCount;
+        private boolean catchUpTimed;
+        private boolean catchUpOfPrompt;
+        private long catchUpStarted;
+        private Then then;
+
+        // The recursion in flight.
+        private int[] recursionDrafts;
+        private int recursionIndex;
+        private long recursionBase;
+        private long recursionStarted;
+        private AttentionStates recursionStates;
+
+        // The verification in flight.
+        private int current;
+        private int[] rows;
+        private long position;
+        private SpeculativeAcceptance acceptance;
+        private int finalToken;
+        private volatile Throwable captureFailure;
 
         Run(
                 int[] prompt,
@@ -229,212 +279,318 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 IntConsumer onToken,
                 GenerationTimingListener timing,
                 PrefixHooks hooks,
-                int startPosition) {
+                int startPosition,
+                Consumer<List<Integer>> ended) {
             this.prompt = prompt;
             this.maxNewTokens = maxNewTokens;
             this.onToken = onToken;
             this.timing = timing;
             this.hooks = hooks;
             this.startPosition = startPosition;
+            this.ended = ended;
         }
 
-        /// A restored sequence's MTP cache stops one row short of its position; its seed buffer holds that
-        /// row's base hidden. Pair it with the token that follows the stored prefix, as the catch-up after
-        /// that chunk would have, then prefill the rest.
-        CompletableFuture<List<Integer>> start() {
-            if (this.startPosition == 0) return prefill(0);
-            int boundary = this.startPosition;
-            long seeds = states().draftSeedRows(1, MtpDecoder.this.hidden);
-            return catchUpPiece(boundary - 1, new int[] {this.prompt[boundary]}, false, seeds, 0)
-                    .thenCompose(ignored -> prefill(boundary));
+        /// A restored sequence's MTP cache stops one row short of its position; its seed buffer holds that row's
+        /// base hidden. Pair it with the token that follows the stored prefix, as the catch-up after that chunk
+        /// would have, then prefill the rest.
+        StepPort first() {
+            if (this.startPosition == 0) return prefillFrom(0);
+            this.offset = this.startPosition;
+            long seeds = states().draftSeedRows(1, hidden);
+            return catchUp(
+                    this.startPosition - 1,
+                    new int[] {this.prompt[this.startPosition]},
+                    false,
+                    seeds,
+                    false,
+                    Then.PREFILL_AT_BOUNDARY);
         }
 
-        /// Gives the prefix cache the state after a chunk, then goes on.
-        private CompletableFuture<Void> afterChunk(int offset, int end) {
-            if (this.hooks == null) return CompletableFuture.completedFuture(null);
-            int hidden = MtpDecoder.this.hidden;
-            long seeds = states().draftSeedRows(end - offset, hidden);
-            MtpDecoder.this.checkpoint.seedRow(seeds + (long) (end - offset - 1) * hidden * Short.BYTES);
-            return this.hooks.afterChunk(end);
+        private StepPort prefillFrom(int from) {
+            this.offset = from;
+            return this.offset >= this.prompt.length ? afterPrompt() : this.prefill;
         }
 
-        /// Prompt: prefill chunks that seed drafting, each followed by its MTP catch-up.
-        CompletableFuture<List<Integer>> prefill(int offset) {
-            if (offset >= this.prompt.length) return afterPrompt();
-            int end = Math.min(this.prompt.length, offset + MtpDecoder.this.prefillChunk);
-            boolean last = end == this.prompt.length;
-            long started = System.nanoTime();
-            return execute(new Quantum(
-                                    MtpDecoder.this.plan,
-                                    MtpDecoder.this.sequence,
-                                    Quantum.ExecutionKind.PREFILL,
-                                    offset,
-                                    Arrays.copyOfRange(this.prompt, offset, end),
-                                    last ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                                    last ? MtpDecoder.this.baseLogits : null)
-                            .seedingDraft())
-                    .thenCompose(ignored -> {
-                        long executed = System.nanoTime();
-                        MtpDecoder.this.statistics.prefillNanos += executed - started;
-                        if (this.timing != null) this.timing.prefillQuantum(started, executed, end - offset);
-                        int[] next = new int[end - offset];
-                        System.arraycopy(this.prompt, offset + 1, next, 0, end - offset - 1);
-                        if (last) {
-                            this.first = MtpDecoder.this.baseLogits.selectedToken();
-                            if (this.timing != null) this.timing.firstTokenSelected(System.nanoTime(), this.first);
-                            next[next.length - 1] = this.first;
-                        } else next[next.length - 1] = this.prompt[end];
-                        long catchingUp = System.nanoTime();
-                        return catchUp(offset, next, last).thenCompose(chunkDrafts -> {
-                            MtpDecoder.this.statistics.promptCatchUpNanos += System.nanoTime() - catchingUp;
-                            if (last) this.drafts = chunkDrafts;
-                            return afterChunk(offset, end).thenCompose(stored -> prefill(end));
-                        });
-                    });
+        /// Prompt: a prefill chunk that seeds drafting; its MTP catch-up follows.
+        private final StepPort prefill = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                end = Math.min(prompt.length, offset + prefillChunk);
+                last = end == prompt.length;
+                started = System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.PREFILL,
+                                        offset,
+                                        Arrays.copyOfRange(prompt, offset, end),
+                                        last ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
+                                        last ? baseLogits : null)
+                                .seedingDraft(),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                long executed = System.nanoTime();
+                statistics.prefillNanos += executed - started;
+                if (timing != null) timing.prefillQuantum(started, executed, end - offset);
+                int[] next = new int[end - offset];
+                System.arraycopy(prompt, offset + 1, next, 0, end - offset - 1);
+                if (last) {
+                    first = baseLogits.selectedToken();
+                    if (timing != null) timing.firstTokenSelected(System.nanoTime(), first);
+                    next[next.length - 1] = first;
+                } else next[next.length - 1] = prompt[end];
+                promptCatchUpStarted = System.nanoTime();
+                return catchUp(offset, next, last, states().draftSeedRows(next.length, hidden), true, Then.AFTER_CHUNK);
+            }
+        };
+
+        /// MTP catch-up over the base hidden rows just seeded, paired with `tokens` (the token each row
+        /// predicted), at MTP positions from `position`, in pieces of at most CATCH_UP_ROWS rows: the
+        /// draft view's workspace is retained at the largest quantum it ran, and MTP cache appends are
+        /// contiguous, so the pieces equal one catch-up. With `draft`, its last row drafts d₁ and the
+        /// recursive rows draft the rest.
+        private StepPort catchUp(long position, int[] tokens, boolean draft, long seeds, boolean timed, Then then) {
+            this.catchUpPosition = position;
+            this.catchUpTokens = tokens;
+            this.catchUpDraft = draft;
+            this.catchUpSeeds = seeds;
+            this.catchUpFirst = 0;
+            this.catchUpTimed = timed;
+            this.catchUpOfPrompt = statistics.outputTokens == 0;
+            this.catchUpStarted = System.nanoTime();
+            this.then = then;
+            return this.catchUpPiece;
         }
 
-        private CompletableFuture<List<Integer>> afterPrompt() {
+        private final StepPort catchUpPiece = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                catchUpCount = Math.min(CATCH_UP_ROWS, catchUpTokens.length - catchUpFirst);
+                boolean lastPiece = catchUpFirst + catchUpCount == catchUpTokens.length;
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.DRAFT,
+                                        catchUpPosition + catchUpFirst,
+                                        Arrays.copyOfRange(catchUpTokens, catchUpFirst, catchUpFirst + catchUpCount),
+                                        catchUpDraft && lastPiece
+                                                ? LogitsRequirement.LAST_TOKEN
+                                                : LogitsRequirement.NONE,
+                                        catchUpDraft && lastPiece ? draftLogits : null)
+                                .withDraftSeed(catchUpSeeds + (long) catchUpFirst * hidden * Short.BYTES, catchUpCount),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                catchUpFirst += catchUpCount;
+                return catchUpFirst < catchUpTokens.length ? this : caughtUp();
+            }
+        };
+
+        private StepPort caughtUp() {
+            if (!this.catchUpTimed) return afterCatchUp(null);
+            long caughtUpAt = System.nanoTime();
+            if (!this.catchUpOfPrompt) statistics.catchUpNanos += caughtUpAt - this.catchUpStarted;
+            if (this.timing != null)
+                this.timing.draftQuantum(
+                        this.catchUpOfPrompt ? "prompt-catch-up" : "catch-up", this.catchUpStarted, caughtUpAt);
+            if (!this.catchUpDraft) return afterCatchUp(null);
+            this.recursionDrafts = new int[depth];
+            this.recursionDrafts[0] = draftTokens[draftLogits.selectedToken()];
+            this.recursionIndex = 1;
+            this.recursionBase = this.catchUpPosition + this.catchUpTokens.length;
+            this.recursionStates = states();
+            this.recursionStarted = System.nanoTime();
+            return this.recursionIndex < depth ? this.recurse : recursed();
+        }
+
+        /// Recursive draft rows, each seeded by the MTP's own hidden of the previous row.
+        private final StepPort recurse = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.DRAFT,
+                                        recursionBase + recursionIndex - 1,
+                                        new int[] {recursionDrafts[recursionIndex - 1]},
+                                        LogitsRequirement.LAST_TOKEN,
+                                        draftLogits)
+                                .withDraftSeed(recursionStates.draftRecursionHidden(hidden), 1),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                recursionDrafts[recursionIndex] = draftTokens[draftLogits.selectedToken()];
+                recursionIndex++;
+                return recursionIndex < depth ? this : recursed();
+            }
+        };
+
+        private StepPort recursed() {
+            long recursedAt = System.nanoTime();
+            if (!this.catchUpOfPrompt) statistics.recursionNanos += recursedAt - this.recursionStarted;
+            if (this.timing != null && depth > 1)
+                this.timing.draftQuantum("recursion", this.recursionStarted, recursedAt);
+            return afterCatchUp(this.recursionDrafts);
+        }
+
+        private StepPort afterCatchUp(int[] newDrafts) {
+            switch (this.then) {
+                case PREFILL_AT_BOUNDARY:
+                    return prefillFrom(this.offset);
+                case AFTER_CHUNK:
+                    statistics.promptCatchUpNanos += System.nanoTime() - this.promptCatchUpStarted;
+                    if (this.last) this.drafts = newDrafts;
+                    if (this.hooks == null) return prefillFrom(this.end);
+                    // Gives the prefix cache the state after the chunk, before the next chunk overwrites the seeds.
+                    long seeds = states().draftSeedRows(this.end - this.offset, hidden);
+                    checkpoint.seedRow(seeds + (long) (this.end - this.offset - 1) * hidden * Short.BYTES);
+                    return this.capture;
+                default:
+                    this.drafts = newDrafts;
+                    return this.verify;
+            }
+        }
+
+        private final StepPort capture = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                hooks.afterChunk(end, failure -> {
+                    captureFailure = failure;
+                    runtime.lake().publish(select);
+                });
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                Throwable failure = captureFailure;
+                captureFailure = null;
+                if (failure != null) throw new IllegalStateException("the prefix checkpoint failed", failure);
+                return prefillFrom(end);
+            }
+        };
+
+        private StepPort afterPrompt() {
             this.output.add(this.first);
             this.onToken.accept(this.first);
-            MtpDecoder.this.statistics.outputTokens++;
-            if (MtpDecoder.this.endOfGeneration.test(this.first)) return CompletableFuture.completedFuture(this.output);
-            if (this.maxNewTokens == 1)
-                return feedFinal(this.first, this.timing).thenApply(ignored -> this.output);
-            return verify(this.first);
+            statistics.outputTokens++;
+            if (endOfGeneration.test(this.first)) return done();
+            if (this.maxNewTokens == 1) {
+                this.finalToken = this.first;
+                return this.feedFinal;
+            }
+            this.current = this.first;
+            return this.verify;
         }
 
         /// One verification of `current` and the drafts, then the catch-up and drafting of the next step.
-        private CompletableFuture<List<Integer>> verify(int current) {
-            int[] rows = new int[MtpDecoder.this.depth + 1];
-            rows[0] = current;
-            System.arraycopy(this.drafts, 0, rows, 1, MtpDecoder.this.depth);
-            long position = MtpDecoder.this.sequence.currentTokenPosition();
-            var acceptance = new SpeculativeAcceptance(
-                    rows, MtpDecoder.this.endOfGeneration, this.maxNewTokens - this.output.size());
-            long started = System.nanoTime();
-            return execute(new Quantum(
-                                    MtpDecoder.this.plan,
-                                    MtpDecoder.this.sequence,
-                                    Quantum.ExecutionKind.VERIFY,
-                                    position,
-                                    rows,
-                                    LogitsRequirement.ALL_TOKENS,
-                                    MtpDecoder.this.baseLogits)
-                            .withAcceptance(acceptance)
-                            .seedingDraft())
-                    .thenCompose(ignored -> {
-                        Statistics statistics = MtpDecoder.this.statistics;
-                        long executed = System.nanoTime();
-                        statistics.verifyNanos += executed - started;
-                        statistics.verifications++;
-                        statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
-                        int[] committed = acceptance.outputs();
-                        int rejected = acceptance.rejectedBaseToken();
-                        boolean[] shortlist = MtpDecoder.this.inShortlist;
-                        int rejection = rejected < 0 ? -1 : rejected < shortlist.length && shortlist[rejected] ? 0 : 1;
-                        if (rejection == 0) statistics.rejectionsInShortlist++;
-                        if (rejection == 1) statistics.rejectionsOutsideShortlist++;
-                        if (this.timing != null)
-                            this.timing.speculativeStep(
-                                    started, executed, committed.length, acceptance.acceptedDrafts(), rejection);
-                        for (int token : committed) {
-                            this.output.add(token);
-                            this.onToken.accept(token);
-                        }
-                        statistics.outputTokens += committed.length;
-                        int next = committed[committed.length - 1];
-                        if (MtpDecoder.this.endOfGeneration.test(next))
-                            return CompletableFuture.completedFuture(this.output);
-                        if (this.output.size() >= this.maxNewTokens)
-                            return feedFinal(next, this.timing).thenApply(done -> this.output);
-                        // Discard the previous step's recursive draft rows, then catch the MTP cache up.
-                        mtpCache().truncate(Math.toIntExact(position));
-                        return catchUp(position, committed, true).thenCompose(drafts -> {
-                            this.drafts = drafts;
-                            return verify(next);
-                        });
-                    });
+        private final StepPort verify = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                rows = new int[depth + 1];
+                rows[0] = current;
+                System.arraycopy(drafts, 0, rows, 1, depth);
+                position = sequence.currentTokenPosition();
+                acceptance = new SpeculativeAcceptance(rows, endOfGeneration, maxNewTokens - output.size());
+                started = System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.VERIFY,
+                                        position,
+                                        rows,
+                                        LogitsRequirement.ALL_TOKENS,
+                                        baseLogits)
+                                .withAcceptance(acceptance)
+                                .seedingDraft(),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                Statistics statistics = MtpDecoder.this.statistics;
+                long executed = System.nanoTime();
+                statistics.verifyNanos += executed - started;
+                statistics.verifications++;
+                statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
+                int[] committed = acceptance.outputs();
+                int rejected = acceptance.rejectedBaseToken();
+                boolean[] shortlist = inShortlist;
+                int rejection = rejected < 0 ? -1 : rejected < shortlist.length && shortlist[rejected] ? 0 : 1;
+                if (rejection == 0) statistics.rejectionsInShortlist++;
+                if (rejection == 1) statistics.rejectionsOutsideShortlist++;
+                if (timing != null)
+                    timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts(), rejection);
+                for (int token : committed) {
+                    output.add(token);
+                    onToken.accept(token);
+                }
+                statistics.outputTokens += committed.length;
+                int next = committed[committed.length - 1];
+                if (endOfGeneration.test(next)) return done();
+                if (output.size() >= maxNewTokens) {
+                    finalToken = next;
+                    return feedFinal;
+                }
+                // Discard the previous step's recursive draft rows, then catch the MTP cache up.
+                mtpCache().truncate(Math.toIntExact(position));
+                current = next;
+                return catchUp(
+                        position, committed, true, states().draftSeedRows(committed.length, hidden), true, Then.VERIFY);
+            }
+        };
+
+        /// Ordinary decode feeds the last allowed token without sampling; so does the decoder, so both leave the
+        /// same state.
+        private final StepPort feedFinal = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                started = System.nanoTime();
+                runtime.admit(
+                        new Quantum(
+                                plan,
+                                sequence,
+                                Quantum.ExecutionKind.DECODE,
+                                sequence.currentTokenPosition(),
+                                new int[] {finalToken},
+                                LogitsRequirement.NONE),
+                        select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                succeeded(step);
+                long executed = System.nanoTime();
+                if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
+                return done();
+            }
+        };
+
+        private StepPort done() {
+            this.ended.accept(this.output);
+            return null;
         }
     }
 
-    /// MTP catch-up over the base hidden rows just seeded, paired with `tokens` (the token each row
-    /// predicted), at MTP positions from `position`. When `draft` is set, its last row drafts d₁ and the
-    /// recursive rows draft the rest; the future then holds the drafts, else null.
-    private CompletableFuture<int[]> catchUp(long position, int[] tokens, boolean draft) {
-        AttentionStates states = states();
-        long seeds = states.draftSeedRows(tokens.length, this.hidden);
-        long started = System.nanoTime();
-        boolean prompt = this.statistics.outputTokens == 0;
-        return catchUpPiece(position, tokens, draft, seeds, 0).thenCompose(ignored -> {
-            long caughtUp = System.nanoTime();
-            if (!prompt) this.statistics.catchUpNanos += caughtUp - started;
-            if (this.timing != null)
-                this.timing.draftQuantum(prompt ? "prompt-catch-up" : "catch-up", started, caughtUp);
-            if (!draft) return CompletableFuture.completedFuture(null);
-            int[] drafts = new int[this.depth];
-            drafts[0] = this.draftTokens[this.draftLogits.selectedToken()];
-            long recursion = System.nanoTime();
-            return recurse(position + tokens.length, drafts, 1, states).thenApply(done -> {
-                long recursed = System.nanoTime();
-                if (!prompt) this.statistics.recursionNanos += recursed - recursion;
-                if (this.timing != null && this.depth > 1) this.timing.draftQuantum("recursion", recursion, recursed);
-                return drafts;
-            });
-        });
-    }
-
-    /// Pieces of at most CATCH_UP_ROWS rows: the draft view's workspace is retained at the largest quantum it
-    /// ran, and MTP cache appends are contiguous, so the pieces equal one catch-up.
-    private CompletableFuture<Void> catchUpPiece(long position, int[] tokens, boolean draft, long seeds, int first) {
-        if (first >= tokens.length) return CompletableFuture.completedFuture(null);
-        int count = Math.min(CATCH_UP_ROWS, tokens.length - first);
-        boolean last = first + count == tokens.length;
-        return execute(new Quantum(
-                                this.plan,
-                                this.sequence,
-                                Quantum.ExecutionKind.DRAFT,
-                                position + first,
-                                Arrays.copyOfRange(tokens, first, first + count),
-                                draft && last ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                                draft && last ? this.draftLogits : null)
-                        .withDraftSeed(seeds + (long) first * this.hidden * Short.BYTES, count))
-                .thenCompose(ignored -> catchUpPiece(position, tokens, draft, seeds, first + count));
-    }
-
-    /// Recursive draft rows `index` and on, each seeded by the MTP's own hidden of the previous row.
-    private CompletableFuture<Void> recurse(long base, int[] drafts, int index, AttentionStates states) {
-        if (index >= this.depth) return CompletableFuture.completedFuture(null);
-        return execute(new Quantum(
-                                this.plan,
-                                this.sequence,
-                                Quantum.ExecutionKind.DRAFT,
-                                base + index - 1,
-                                new int[] {drafts[index - 1]},
-                                LogitsRequirement.LAST_TOKEN,
-                                this.draftLogits)
-                        .withDraftSeed(states.draftRecursionHidden(this.hidden), 1))
-                .thenCompose(ignored -> {
-                    drafts[index] = this.draftTokens[this.draftLogits.selectedToken()];
-                    return recurse(base, drafts, index + 1, states);
-                });
-    }
-
-    /// Ordinary decode feeds the last allowed token without sampling; so does the decoder, so both leave
-    /// the same state.
-    private CompletableFuture<Void> feedFinal(int token, GenerationTimingListener timing) {
-        long started = System.nanoTime();
-        return execute(new Quantum(
-                        this.plan,
-                        this.sequence,
-                        Quantum.ExecutionKind.DECODE,
-                        this.sequence.currentTokenPosition(),
-                        new int[] {token},
-                        LogitsRequirement.NONE))
-                .thenApply(ignored -> {
-                    long executed = System.nanoTime();
-                    if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
-                    return null;
-                });
+    /// A speculative step must succeed: anything else ends the run.
+    private static void succeeded(AbstractQuantum step) {
+        Quantum.Outcome outcome = ((Quantum) step).conclusion();
+        if (outcome.status() != Quantum.Status.SUCCESS)
+            throw new IllegalStateException("speculative quantum " + outcome.status(), outcome.failure());
     }
 
     private AttentionStates states() {
@@ -443,21 +599,6 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
     private AttentionKvState mtpCache() {
         return states().forLayer(this.plan.weights().config().numHiddenLayers());
-    }
-
-    /// Admits `context`; the future completes on the worker that retired it, failing unless it succeeded.
-    private CompletableFuture<Void> execute(Quantum context) {
-        CompletableFuture<Quantum.Outcome> outcome;
-        try {
-            outcome = this.runtime.submit(context);
-        } catch (RuntimeException | Error failure) {
-            return CompletableFuture.failedFuture(failure);
-        }
-        return outcome.thenApply(completed -> {
-            if (completed.status() != Quantum.Status.SUCCESS)
-                throw new IllegalStateException("speculative quantum " + completed.status(), completed.failure());
-            return null;
-        });
     }
 
     @Override
