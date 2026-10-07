@@ -30,6 +30,8 @@ final class Qwen4Stages {
             case ROUTE -> new Route(graph, stage, shape, layer);
             case SHARED -> new Shared(graph, stage, shape, layer);
             case PLAN -> new Plan(graph, stage, shape, layer);
+            case PREDICT -> new Predict(graph, stage, shape, layer);
+            case PREFETCH -> new Prefetch(graph, stage, shape, layer);
             case FETCH -> new Fetch(graph, stage, shape, layer, index);
             case EXPERT -> new Expert(graph, stage, shape, layer, index);
             case FINISH -> new Finish(graph, stage, shape, layer);
@@ -401,11 +403,49 @@ final class Qwen4Stages {
             storage.moeBlock = moe.scratch(storage.moeScratch(), rows());
             if (plan.traceOn()) storage.traceBefore = plan.expertStats().snapshot();
             moe.submitRouting(plan.weights().moe(this.layer), storage.mixed(), rows(), storage.moeBlock);
-            Qwen4ExecutionPlan.ExpertDemand demand = plan.demandListener();
-            boolean predict = ExpertCacheOwner.prefetchCandidates() > 0 || (demand != null && demand.predicts());
-            if (predict && rows() == 1 && this.layer + 1 < plan.layers())
-                moe.submitPrediction(plan.weights().moe(this.layer + 1), storage.mixed());
             storage.routeArmedNanos = System.nanoTime();
+        }
+    }
+
+    /// A later layer's router applied to this decode step's input: the prediction a prefetch reads ahead by.
+    private static final class Predict extends Base {
+        Predict(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
+            super(graph, stage, shape, layer);
+        }
+
+        @Override
+        protected void submit() {
+            int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
+            storage()
+                    .moe()
+                    .submitPrediction(
+                            this.layer, plan().weights().moe(ahead), storage().mixed());
+        }
+    }
+
+    /// Reads the prediction back on the host and hands it to the cache's owner, which reads what the device and the
+    /// host tier lack into the tier; a demand recording also gets it.
+    private static final class Prefetch extends Base {
+        Prefetch(StageGraph graph, int stage, Qwen4Shape shape, int layer) {
+            super(graph, stage, shape, layer);
+        }
+
+        @Override
+        protected boolean host() {
+            return true;
+        }
+
+        @Override
+        protected void submit() {
+            Qwen4ExecutionPlan plan = plan();
+            int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
+            int bank = plan.bankOrdinal(ahead);
+            Qwen4ExecutionPlan.ExpertDemand demand = plan.demandListener();
+            int candidates = ExpertCacheOwner.prefetchCandidates();
+            int[] ranked = storage().moe().takePrediction(this.layer, Math.max(candidates, demand != null ? 64 : 0));
+            plan.expertOwner()
+                    .publishPrefetch(bank, java.util.Arrays.copyOf(ranked, Math.min(ranked.length, candidates)));
+            if (demand != null) demand.prediction(ahead, bank, ranked);
         }
     }
 
@@ -439,17 +479,7 @@ final class Qwen4Stages {
             storage.plannedNanos = now;
             storage.experts = moe.plan(storage.bank, rows());
             Qwen4ExecutionPlan.ExpertDemand demand = plan().demandListener();
-            int candidates = Math.max(ExpertCacheOwner.prefetchCandidates(), demand != null ? 64 : 0);
-            int[] prediction = candidates > 0 ? moe.takePrediction(candidates) : null;
-            int nextBank = this.layer + 1 < plan().layers() ? plan().bankOrdinal(this.layer + 1) : -1;
-            if (prediction != null && ExpertCacheOwner.prefetchCandidates() > 0)
-                plan().expertOwner()
-                        .publishPrefetch(
-                                nextBank,
-                                java.util.Arrays.copyOf(
-                                        prediction,
-                                        Math.min(prediction.length, ExpertCacheOwner.prefetchCandidates())));
-            if (demand != null) moe.reportDemand(demand, this.layer, nextBank, rows(), prediction);
+            if (demand != null) moe.reportDemand(demand, this.layer, -1, -1, rows(), null);
             moe.submitPlan();
         }
     }
