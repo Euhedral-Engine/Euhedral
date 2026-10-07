@@ -236,11 +236,8 @@ class ArchitectureTest {
 
     /// Shared code knows no model: only the engine, which chooses a model's runtime, imports one. The other entries
     /// are what PR 2 is removing; each task deletes the ones it fixes.
-    private static final Set<String> MODEL_IMPORTS_OUTSIDE_MODEL = Set.of(
-            "InferenceEngine.java",
-            "InferenceRunSnapshot.java",
-            "benchmark:run/BenchmarkRunner.java",
-            "benchmark:run/Prerequisites.java");
+    private static final Set<String> MODEL_IMPORTS_OUTSIDE_MODEL =
+            Set.of("InferenceEngine.java", "benchmark:run/BenchmarkRunner.java", "benchmark:run/Prerequisites.java");
 
     private static final Path API = Path.of("../api/src/main/java/io/euhedral_execution/inference/api");
     private static final Path BENCHMARK =

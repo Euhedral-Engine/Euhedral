@@ -7,8 +7,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
@@ -47,7 +47,7 @@ class DFlash2PrefixCacheCudaIntegrationTest {
 
     private static InferenceEngine load(InferenceConfig config, RecordingBootstrap bootstrap) throws Exception {
         InferenceEngine engine = InferenceEngine.load(config, bootstrap);
-        if (engine.profile().speculation() != ArtifactProfile.Speculation.DFLASH2) {
+        if (!"dflash2".equals(engine.description().speculation())) {
             engine.close();
             assumeTrue(false, "not a DFlash2 artifact");
         }
@@ -157,7 +157,9 @@ class DFlash2PrefixCacheCudaIntegrationTest {
             session.generate(prompt, 1, text -> {}, null);
             var sequence = EngineExecutionFixture.sequence(session);
             List<String> digests = new ArrayList<>(SequenceStateProbe.committedDigests(
-                    gpu, sequence, engine.modelConfig().layerTypes()));
+                    gpu,
+                    sequence,
+                    ((Qwen38Runtime) engine.modelRuntime()).config().layerTypes()));
             digests.addAll(SequenceStateProbe.dflash2Digests(gpu, sequence));
             return digests;
         }

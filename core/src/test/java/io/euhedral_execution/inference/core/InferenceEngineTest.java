@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.EngineModelFixture;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
@@ -571,7 +572,7 @@ class InferenceEngineTest {
                     directory.resolve("model.edrl").toString(), snapshot.model().artifactPath());
             assertNull(snapshot.model().artifactBytes(), "missing artifact file has no measured size");
             assertEquals(
-                    InferenceRunSnapshot.Dimensions.of(engine.modelConfig()),
+                    Qwen38Runtime.dimensions(((Qwen38Runtime) engine.modelRuntime()).config()),
                     snapshot.model().dimensions());
             var runtime = snapshot.runtime();
             assertEquals(Runtime.version().toString(), runtime.javaVersion());

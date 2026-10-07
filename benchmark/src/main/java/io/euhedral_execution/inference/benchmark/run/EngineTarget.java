@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.benchmark.measure.IterationTiming;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.InferenceEngine;
 import io.euhedral_execution.inference.core.InferenceRunSnapshot;
+import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -66,9 +67,8 @@ public final class EngineTarget implements BenchmarkRunner.Target {
     @Override
     public List<Integer> generate(String prompt, int maxNewTokens, GenerationConfig generation, IterationTiming timing)
             throws Exception {
-        try (var session = this.engine.createSession(generation)) {
-            // The control arm decodes one token per quantum whatever drafter the artifact carries.
-            if (!this.speculate) session.useSpeculativeDecoding(null);
+        // The control arm decodes one token per quantum whatever drafter the artifact carries.
+        try (var session = this.engine.createGenerationSession(generation, new SessionOptions(this.speculate))) {
             timing.markEntry();
             // The asynchronous form, as the server drives it: the workers run the generation in a closed loop
             // and no other thread is woken until it completes.

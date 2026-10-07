@@ -7,6 +7,7 @@ import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
@@ -63,7 +64,7 @@ class PrefillPartitionCudaIntegrationTest {
             return SequenceStateProbe.committedDigests(
                     gpu,
                     EngineExecutionFixture.sequence(session),
-                    engine.modelConfig().layerTypes());
+                    ((Qwen38Runtime) engine.modelRuntime()).config().layerTypes());
         }
     }
 
