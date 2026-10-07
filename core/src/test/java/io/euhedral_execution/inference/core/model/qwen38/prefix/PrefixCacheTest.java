@@ -346,18 +346,16 @@ class PrefixCacheTest {
     }
 
     private void attachMtpStates(Sequence sequence) {
-        sequence.setRecurrentState(
-                GdnStates.allocate(
-                        this.gpu,
-                        CONFIG.layerTypes(),
-                        CONFIG.linearNumKeyHeads(),
-                        CONFIG.linearNumValueHeads(),
-                        CONFIG.linearKeyHeadDim(),
-                        CONFIG.linearValueHeadDim(),
-                        CONFIG.linearConvKernelDim()));
-        sequence.setKvCacheState(
-                AttentionStates.allocate(
-                        this.gpu, CONFIG.layerTypes(), CONFIG.numKeyValueHeads() * CONFIG.attentionHeadDim(), true));
+        sequence.setRecurrentState(GdnStates.allocate(
+                this.gpu,
+                CONFIG.layerTypes(),
+                CONFIG.linearNumKeyHeads(),
+                CONFIG.linearNumValueHeads(),
+                CONFIG.linearKeyHeadDim(),
+                CONFIG.linearValueHeadDim(),
+                CONFIG.linearConvKernelDim()));
+        sequence.setKvCacheState(AttentionStates.allocate(
+                this.gpu, CONFIG.layerTypes(), CONFIG.numKeyValueHeads() * CONFIG.attentionHeadDim(), true));
     }
 
     private static MtpCheckpoint mtp(long seedRow) {

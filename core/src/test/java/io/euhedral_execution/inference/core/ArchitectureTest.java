@@ -51,7 +51,9 @@ class ArchitectureTest {
             "model/qwen4/Qwen4Runtime.java",
             "model/qwen4/Qwen4Model.java",
             "model/qwen4/Storage.java",
-            "model/qwen4/Session.java");
+            "model/qwen4/Session.java",
+            // A sequence's persistent state closes once, when its session's lifecycle completes it.
+            "model/qwen38/SequenceCleanup.java");
 
     private static List<Path> javaFiles(String directory, boolean recursive) throws IOException {
         try (Stream<Path> walk =
@@ -112,16 +114,19 @@ class ArchitectureTest {
         assertTrue(offenders.isEmpty(), "host work outside the graph: " + offenders);
     }
 
-    /// The path through the cache and back holds no lock: its bookkeeping is changed only by frames
-    /// routed to its owner, and everything else reaches it as such a frame.
+    /// The hot paths hold no lock. Qwen4's path through the expert cache and back changes its bookkeeping only by
+    /// frames routed to its owner, and everything else reaches it as such a frame. Qwen3.8's quantum, stages and
+    /// shapes run on the generation chain, which admits one quantum of a sequence at a time.
     @Test
-    void theExpertHotPathHoldsNoLockAndStartsNoThread() throws IOException {
+    void theHotPathHoldsNoLockAndStartsNoThread() throws IOException {
         Pattern lock = Pattern.compile(
                 "\\bsynchronized\\b|\\bReentrantLock\\b|\\bReadWriteLock\\b|\\bCondition\\b|\\bSemaphore\\b|\\.wait\\(|\\bnew Thread\\(|\\bExecutors\\b");
         List<Path> hot = new ArrayList<>();
         hot.addAll(javaFiles("model/qwen4", false));
         hot.addAll(javaFiles("model/qwen4/expert", true));
         hot.add(MAIN.resolve("runtime/graph/Join.java"));
+        for (String dense : List.of("Sequence", "Quantum", "Stages", "Shape", "SequenceCleanup"))
+            hot.add(MAIN.resolve("model/qwen38/" + dense + ".java"));
         List<String> violations = new ArrayList<>();
         for (Path file : hot) {
             // The resident tier is read by loader threads that end with the load, before any request exists.

@@ -14,18 +14,21 @@ work, or walks the graph after admission.
 
 ## Immutable plan and reusable graph
 
-`ExecutionPlan` is the schema. It describes the stages (instructions), their immutable weight
-bindings, their input and output buffers, the dependency edges, the plan views (decode and the prefill
-region views), and static metadata. It is never the live scheduler. `stageTopology()` exposes the DAG
-as a `StageTopology`: stages numbered in topological order, each edge tagged with the boundary it waits
-for.
+`ExecutionPlan` owns the weights, the staging, and its `Shape`s: its own shape and the views (decode and
+the prefill region views, the drafts). It is never the live scheduler. A `Shape` (`model/qwen38`, a
+`GraphShape`) is the schema of one view: the stages, each an immutable stage spec (an instruction with its
+weight bindings and its input and output buffers), the dependency edges, and static metadata. It is built
+through `ShapeBuilder` (`runtime/graph`), the same builder Qwen4's shape uses, and `stageTopology()` exposes
+its DAG as a `StageTopology`: stages numbered in topological order, each edge tagged with the boundary it
+waits for.
 
 `StageGraph` is one reusable runtime instance of a plan view. It is built once and then rebound to one
 quantum at a time:
 
-- one `StageFrame` per stage, created with its immutable instruction and weight binding
-  (`InstructionFrame.create` chooses `EmbeddingFrame`, `WeightTransferFrame`, `RmsNormFrame`, `LinearFrame`, or
-  `OperationFrame`);
+- one `StageFrame` per stage, created with its immutable stage spec: `Shape.createStage` builds the typed
+  frame for the spec's kind from `Stages` (`Stages.Embed`, `WeightTransfer`, `RmsNorm`, `Linear`,
+  `CausalAttention`, `KvAppend`, the GDN stages, and the DFlash2 kinds under `Stages.DFlash2`), so a stage
+  body is one small class instead of a switch over operations;
 - successor references, wired at construction;
 - one frame per device-completion edge and one retirement frame;
 - its home lane in the runtime's lane pool;
@@ -62,23 +65,25 @@ Each resource lives as long as its natural owner, so the token boundary neither 
 - Persistent sequence state (KV pages, page tables, GDN state, decode scratch) belongs to the sequence
   and is released when it completes.
 
-`Quantum` is the quantum: its token range, sequence lease, workspace, failure and
-cancellation state, and outcome. It is the graph's `StageQuantum` binding.
+`Quantum` is the quantum: its plan and the shape it runs, its token range, its admission to the
+sequence, workspace, failure and cancellation state, and outcome. It is the graph's `StageQuantum`
+binding and an `AbstractQuantum`: one template retirement (commit if nothing failed, release, settle,
+seal) that runs once.
 
 ## Admission
 
 Admission is small:
 
 1. acquire an idle graph for the quantum's shape;
-2. prepare quantum-owned resources with the graph's stream selected (sequence lease, persistent state on
-   first use, the binding of the graph's workspace storage), so any initialization it queues precedes
-   every stage;
+2. prepare quantum-owned resources with the graph's stream selected (the sequence's admission,
+   persistent state on first use, the binding of the graph's workspace storage), so any initialization it
+   queues precedes every stage;
 3. publish the root stages to the lake.
 
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
 terminal outcome at admission, after the stream proves that queued initialization stopped. A quantum is
 admitted at most once: if admission itself fails, the failure is thrown and the quantum's outcome fails
-too, so it can never be retried into a second lease. An outcome reached at admission is published only
+too, so it can never be retried into a second sequence admission. An outcome reached at admission is published only
 after the graph's stream is deselected, so outcome callbacks never launch onto it.
 
 ## The lake
@@ -182,12 +187,19 @@ enqueues the retirement frame, and that frame:
 
 1. confirms the boundary (and on failure proves the device idle or poisons it);
 2. runs each attempted stage's retirement hook: commit on success, release temporaries always;
-3. releases the quantum's workspace binding and publishes sequence state (`Quantum.retire`);
+3. retires the quantum (`AbstractQuantum.retire`): commits its work, releases its workspace binding, and
+   settles the sequence's frontiers;
 4. returns the graph to its pool and ends the quantum's admission count;
-5. publishes the outcome.
+5. publishes the outcome by throwing the quantum's continuation into the lake.
 
 The graph is reusable before the caller observes the outcome, so the next token finds an idle graph.
 There is one CUDA host callback per quantum, not one per kernel.
+
+The generation is an ouroboros. State and frame generation sit at the top: a generation's `Admit` frame
+admits a quantum into a graph. Execution sits at the bottom: the stages and the device. The completion at
+the bottom throws an action back to the top: the retired quantum's continuation is the generation's
+`Select`, which samples the next token and admits the next quantum (or `Finish`). Nothing waits on a
+future between the two.
 
 ## Pending and committed persistent state
 
@@ -206,9 +218,20 @@ append is committed or discarded, after retirement: nothing in the quantum refer
 but freeing it mid-quantum would synchronize with the queued work.
 
 Other quanta and external readers never see beyond the committed frontier. A failed or cancelled
-quantum never commits (`discardSubmitted`). The sequence position is likewise published only at
-retirement. GDN recurrent and convolution state is updated in place by stream-ordered kernels; a
-quantum that does not succeed leaves its sequence terminal, so no partial update is ever resumed.
+quantum never commits (`discardSubmitted`). GDN recurrent and convolution state is updated in place by
+stream-ordered kernels; a quantum that does not succeed leaves its sequence terminal, so no partial update
+is ever resumed.
+
+The `Sequence` keeps the same two frontiers for its position, in place of an execution lease. The
+generation chain admits one quantum of a sequence at a time: `admit(start, end)` requires the start at the
+committed frontier and nothing in flight, and moves the submitted frontier to `end`; the quantum's
+retirement then commits (both frontiers move) or abandons (submitted returns to committed). A draft quantum,
+and a prefix-cache capture, are in flight without moving either frontier. The fields are written only by
+that chain and by lifecycle, so they are volatile, with no lock and no CAS state machine. `cancel()` may come
+from any thread: it publishes its flag before it reads whether a quantum is in flight, and admission and
+retirement publish that before they read the flag, so either the admission backs out or the retirement
+concludes the cancellation. The terminal state is first-writer-wins. The persistent state closes only in
+`complete()`, which the session's lifecycle runs after its generation ended.
 
 ## Failure and cancellation
 

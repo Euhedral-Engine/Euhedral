@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantLock;
 
 /// Request-lifetime state shared by successive Qwen execution quanta.
 ///
@@ -39,10 +38,7 @@ public final class Sequence {
     private final AtomicReference<Terminal> terminal = new AtomicReference<>(ACTIVE);
     private volatile Object kvCacheState;
     private volatile Object recurrentState;
-    // Only terminal resource cleanup, which is lifecycle, is serialized.
-    private final ReentrantLock cleanupLock = new ReentrantLock();
-    private boolean recurrentReleased;
-    private boolean kvReleased;
+    private final SequenceCleanup cleanup = new SequenceCleanup();
 
     public Sequence(long sequenceId) {
         this(sequenceId, 0L);
@@ -184,7 +180,7 @@ public final class Sequence {
             throw new IllegalStateException("Cannot complete a sequence during execution");
         }
         this.terminal.compareAndSet(ACTIVE, COMPLETED);
-        closePersistentState();
+        this.cleanup.close(this.recurrentState, this.kvCacheState, terminalFailure());
     }
 
     private boolean retireInFlight() {
@@ -209,43 +205,5 @@ public final class Sequence {
         if (!this.inFlight) {
             throw new IllegalStateException("Sequence state changes only under its quantum in flight");
         }
-    }
-
-    private void closePersistentState() {
-        this.cleanupLock.lock();
-        try {
-            Object recurrent = this.recurrentState;
-            Object kv = this.kvCacheState;
-            Throwable failure = null;
-            if (!this.recurrentReleased) {
-                try {
-                    closeResource(recurrent);
-                    this.recurrentReleased = true;
-                } catch (Throwable cleanup) {
-                    failure = cleanup;
-                }
-            }
-            if (kv == recurrent) {
-                this.kvReleased = this.recurrentReleased;
-            } else if (!this.kvReleased) {
-                try {
-                    closeResource(kv);
-                    this.kvReleased = true;
-                } catch (Throwable cleanup) {
-                    if (failure == null) failure = cleanup;
-                    else if (failure != cleanup) failure.addSuppressed(cleanup);
-                }
-            }
-            if (failure == null) return;
-            Throwable terminalFailure = terminalFailure();
-            if (terminalFailure != null && terminalFailure != failure) terminalFailure.addSuppressed(failure);
-            throw new IllegalStateException("Unable to release persistent Qwen sequence state", failure);
-        } finally {
-            this.cleanupLock.unlock();
-        }
-    }
-
-    private static void closeResource(Object resource) throws Exception {
-        if (resource instanceof AutoCloseable closeable) closeable.close();
     }
 }
