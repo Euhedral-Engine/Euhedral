@@ -24,6 +24,7 @@ import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
+import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -457,7 +458,7 @@ public final class InferenceEngine implements AutoCloseable {
 
     /// True as soon as shutdown begins; no further sessions can be admitted.
     /// Counters of the prefix cache, or null when the engine runs without one.
-    public PrefixCache.Stats prefixCacheStats() {
+    public PrefixCacheStats prefixCacheStats() {
         return this.prefixCache == null ? null : this.prefixCache.stats();
     }
 

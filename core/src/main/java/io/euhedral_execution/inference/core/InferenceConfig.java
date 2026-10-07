@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core;
 
-import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
@@ -22,6 +21,9 @@ public record InferenceConfig(
         Duration shutdownTimeout,
         long prefixCacheBytes,
         int prefixCacheCheckpointTokens) {
+    /// Prompt tokens per prefill quantum, and the grain the prefix cache's checkpoints are aligned to.
+    public static final int PREFILL_CHUNK_TOKENS = 512;
+
     public static final int DEFAULT_MAX_CONTEXT_TOKENS = 32768;
     public static final long DEFAULT_PREFIX_CACHE_BYTES = 4L << 30;
     public static final int DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS = 2048;
@@ -38,9 +40,9 @@ public record InferenceConfig(
             throw new IllegalArgumentException("shutdownTimeout must be positive");
         shutdownTimeout.toNanos();
         if (prefixCacheBytes < 0) throw new IllegalArgumentException("prefixCacheBytes must not be negative");
-        if (prefixCacheCheckpointTokens <= 0 || prefixCacheCheckpointTokens % PrefixCache.CHUNK_TOKENS != 0)
+        if (prefixCacheCheckpointTokens <= 0 || prefixCacheCheckpointTokens % PREFILL_CHUNK_TOKENS != 0)
             throw new IllegalArgumentException(
-                    "prefixCacheCheckpointTokens must be a positive multiple of " + PrefixCache.CHUNK_TOKENS);
+                    "prefixCacheCheckpointTokens must be a positive multiple of " + PREFILL_CHUNK_TOKENS);
     }
 
     /// Without a prefix cache: programmatic callers (tests, the benchmark) opt in explicitly.

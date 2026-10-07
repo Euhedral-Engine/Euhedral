@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
@@ -38,7 +39,7 @@ public final class Session implements GenerationSession {
 
     /// Default prompt tokens per prefill quantum. Bounds per-quantum GPU workspace while the
     /// persistent sequence retains KV and GDN state.
-    public static final int DEFAULT_PREFILL_CHUNK_TOKENS = 512;
+    public static final int DEFAULT_PREFILL_CHUNK_TOKENS = InferenceConfig.PREFILL_CHUNK_TOKENS;
 
     private final int prefillChunkTokens;
 
@@ -124,9 +125,9 @@ public final class Session implements GenerationSession {
     /// the first prompt. The cache's checkpoints sit on the prefill chunk grid, so the session must prefill in
     /// that chunk size.
     public void usePrefixCache(PrefixCache cache) {
-        if (cache != null && this.prefillChunkTokens != PrefixCache.CHUNK_TOKENS)
+        if (cache != null && this.prefillChunkTokens != InferenceConfig.PREFILL_CHUNK_TOKENS)
             throw new IllegalStateException(
-                    "the prefix cache needs prefill chunks of " + PrefixCache.CHUNK_TOKENS + " tokens");
+                    "the prefix cache needs prefill chunks of " + InferenceConfig.PREFILL_CHUNK_TOKENS + " tokens");
         this.prefixCache = cache;
     }
 

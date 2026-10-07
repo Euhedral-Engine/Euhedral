@@ -10,7 +10,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.EngineExecutionFixture;
 import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
-import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
+import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -162,7 +162,7 @@ class PrefixCacheCudaIntegrationTest {
                 last = prompt(engine, lead, 5000);
                 generate(engine, last, 4, 1);
             }
-            PrefixCache.Stats stats = engine.prefixCacheStats();
+            PrefixCacheStats stats = engine.prefixCacheStats();
             assertTrue(stats.evictions() > 0, "five prompts do not fit 400 MiB");
             assertTrue(stats.usedBytes() <= stats.totalBytes());
             long hits = stats.hits();

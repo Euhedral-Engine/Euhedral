@@ -18,6 +18,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpCheckpoint;
+import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import java.lang.foreign.Arena;
@@ -31,7 +32,7 @@ import org.junit.jupiter.api.Test;
 class PrefixCacheTest {
     private static final Qwen38Config CONFIG =
             ExecutionFixtures.statefulCompactWeights(8).config();
-    private static final PrefixCache.Frames INLINE = new PrefixCache.Frames() {
+    private static final PrefixFrames INLINE = new PrefixFrames() {
         @Override
         public <T> CompletableFuture<T> run(Supplier<T> work) {
             try {
@@ -170,7 +171,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         Sequence source = sequence(1024, 4);
-        PrefixCache.Frames failing = new PrefixCache.Frames() {
+        PrefixFrames failing = new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
                 return CompletableFuture.failedFuture(new IllegalStateException("lattice rejected the frame"));
@@ -205,7 +206,7 @@ class PrefixCacheTest {
         Sequence source = sequence(1024, 4);
         var released = new java.util.concurrent.atomic.AtomicBoolean();
         // Cancelled while the capture's copies run, as a client that leaves mid-prefill does.
-        PrefixCache.Frames cancelling = new PrefixCache.Frames() {
+        PrefixFrames cancelling = new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
                 source.cancel();
@@ -246,7 +247,7 @@ class PrefixCacheTest {
         var hit = cache.lookup(tokens);
         var target = new Sequence(3);
         // Cancelled once the restore's copies began: the sequence held the lease, so cancel() only flags it.
-        PrefixCache.Frames cancelling = new PrefixCache.Frames() {
+        PrefixFrames cancelling = new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
                 target.cancel();
@@ -266,7 +267,7 @@ class PrefixCacheTest {
         cache.capture(INLINE, sequence(1024, 4), cache.root(), tokens, 1024).get();
         var hit = cache.lookup(tokens);
         var target = new Sequence(3);
-        PrefixCache.Frames failing = new PrefixCache.Frames() {
+        PrefixFrames failing = new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
                 return CompletableFuture.failedFuture(new IllegalStateException("lattice rejected the frame"));
@@ -471,7 +472,7 @@ class PrefixCacheTest {
         PrefixCache cache = new PrefixCache(this.gpu, CONFIG, arena.allocate(8L << 20), () -> {}, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         Sequence source = sequence(1024, 4);
-        PrefixCache.Frames closing = new PrefixCache.Frames() {
+        PrefixFrames closing = new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
                 cache.close();

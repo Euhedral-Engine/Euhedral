@@ -2,7 +2,7 @@ package io.euhedral_execution.inference.core.runtime;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
-import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
+import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
 import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
@@ -79,8 +79,8 @@ public final class HostTasks implements HostFrames, AutoCloseable {
     }
 
     /// Host work for the prefix cache: each piece runs as one frame on the lattice's workers.
-    public PrefixCache.Frames prefixFrames() {
-        return new PrefixCache.Frames() {
+    public PrefixFrames prefixFrames() {
+        return new PrefixFrames() {
             @Override
             public <T> CompletableFuture<T> run(Supplier<T> work) {
                 return onWorker(work);
