@@ -70,7 +70,7 @@ public final class ArtifactReader {
         if (header.metadataOffset() != ArtifactHeader.BYTE_SIZE) {
             throw new ArtifactFormatException("metadata must immediately follow the header");
         }
-        long metadataEnd = ArtifactCodec.checkedEnd(header.metadataOffset(), header.metadataSize(), "metadata");
+        long metadataEnd = ArtifactFileAccess.checkedEnd(header.metadataOffset(), header.metadataSize(), "metadata");
         if (metadataEnd > fileSize) {
             throw new ArtifactFormatException("metadata extends beyond the file");
         }
@@ -123,7 +123,7 @@ public final class ArtifactReader {
             if (dataOffset < header.tensorDataOffset()) {
                 throw new ArtifactFormatException("tensor data offset precedes tensor data section");
             }
-            long dataEnd = ArtifactCodec.checkedEnd(dataOffset, byteSize, "tensor data");
+            long dataEnd = ArtifactFileAccess.checkedEnd(dataOffset, byteSize, "tensor data");
             if (dataEnd > fileSize) {
                 throw new ArtifactFormatException("tensor data extends beyond the file: " + name);
             }

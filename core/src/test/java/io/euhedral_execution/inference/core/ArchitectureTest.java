@@ -222,6 +222,17 @@ class ArchitectureTest {
         }
     }
 
+    /// The shared artifact layer reads containers and tensors for every model; it knows no model.
+    @Test
+    void theSharedArtifactLayerKnowsNoModel() throws IOException {
+        List<String> violations = new ArrayList<>();
+        for (Path file : javaFiles("artifact", true))
+            for (String line : Files.readAllLines(file))
+                if (line.startsWith("import io.euhedral_execution.inference.core.model."))
+                    violations.add(relative(file) + ": " + line);
+        assertTrue(violations.isEmpty(), "shared artifact code imports a model:\n" + String.join("\n", violations));
+    }
+
     /// A source path relative to the main tree, with forward slashes on every platform.
     private static String relative(Path file) {
         return MAIN.relativize(file).toString().replace('\\', '/');

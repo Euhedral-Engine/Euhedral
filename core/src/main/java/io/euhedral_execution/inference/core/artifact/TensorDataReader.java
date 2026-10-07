@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.artifact;
 
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactCodec;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -23,7 +22,7 @@ public final class TensorDataReader {
         if (arena == null) {
             throw new ArtifactFormatException("arena is null");
         }
-        long payloadEnd = ArtifactCodec.checkedEnd(tensor.dataOffset(), tensor.byteSize(), "tensor data");
+        long payloadEnd = ArtifactFileAccess.checkedEnd(tensor.dataOffset(), tensor.byteSize(), "tensor data");
 
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             if (payloadEnd > channel.size()) {

@@ -11,6 +11,14 @@ public final class ArtifactFileAccess {
 
     private ArtifactFileAccess() {}
 
+    /// The end of the byte range `[offset, offset + size)` of `field`, rejecting a negative or overflowing range.
+    public static long checkedEnd(long offset, long size, String field) throws ArtifactFormatException {
+        if (offset < 0 || size < 0 || offset > Long.MAX_VALUE - size) {
+            throw new ArtifactFormatException(field + " range overflows or is negative");
+        }
+        return offset + size;
+    }
+
     public static void readFully(FileChannel channel, long offset, ByteBuffer destination, String field)
             throws IOException {
         long position = offset;
