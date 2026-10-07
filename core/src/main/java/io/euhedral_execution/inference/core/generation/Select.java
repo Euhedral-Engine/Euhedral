@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.generation;
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.impl.FrameManager;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
+import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
 
 /// Reads a concluded step through its port (sampling, acceptance, text, timing, the stop and budget checks) and
 /// throws the next [Admit], or [Finish] once the generation is done or failed.
@@ -16,7 +17,8 @@ final class Select extends AbstractFrame implements AbstractQuantum.Continuation
 
     Select(long idHash, FrameManager<Generation, Select> recycler, GenerationFrames frames, Generation generation) {
         super(idHash, recycler, null);
-        randomizeHash(0);
+        // Unordered, so the factory draws a fresh seed on create and on every reuse.
+        randomizeHash(FrameSeeds.forHostWork().next());
         this.frames = frames;
         this.generation = generation;
     }
@@ -46,7 +48,7 @@ final class Select extends AbstractFrame implements AbstractQuantum.Continuation
         this.frames.publish(next == null ? this.frames.finish(generation) : this.frames.admit(generation, next));
     }
 
-    /// The lattice rejected the frame without running it: the step's result is still read, here.
+    /// `execute` never throws, so this is a frame the lattice rejected without running it: it runs here.
     @Override
     public void doFinallyWithError(Throwable rejection) {
         execute();

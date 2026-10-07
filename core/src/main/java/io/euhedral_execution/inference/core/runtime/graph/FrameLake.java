@@ -27,4 +27,27 @@ public interface FrameLake {
 
     /// An admitted unit reached its terminal state.
     void terminated();
+
+    /// Publishes `frame`; a lake that refuses it (closing, or a full partition) does not strand it: it runs here, on
+    /// this thread, as a worker would run it (`execute`, then `doFinally`, or `doFinallyWithError` when `execute`
+    /// threw).
+    default void publishOrRun(AbstractFrame frame) {
+        try {
+            publish(frame);
+        } catch (RuntimeException refused) {
+            try {
+                frame.execute();
+            } catch (Throwable failed) {
+                frame.doFinallyWithError(failed);
+                return;
+            }
+            try {
+                frame.doFinally();
+            } catch (RuntimeException | Error ended) {
+                // As a worker does: a frame's end that fails is logged, never rethrown into its producer.
+                org.slf4j.LoggerFactory.getLogger(FrameLake.class)
+                        .error("a frame run in place failed at its end", ended);
+            }
+        }
+    }
 }

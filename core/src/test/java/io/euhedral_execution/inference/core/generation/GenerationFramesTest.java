@@ -20,9 +20,11 @@ class GenerationFramesTest {
         final ArrayDeque<AbstractFrame> ready = new ArrayDeque<>();
         int admitted;
         int terminated;
+        boolean refuse;
 
         @Override
         public void publish(AbstractFrame frame) {
+            if (this.refuse) throw new IllegalStateException("the lake refuses frames");
             this.ready.add(frame);
         }
 
@@ -90,6 +92,42 @@ class GenerationFramesTest {
             }
             return this;
         }
+    }
+
+    @Test
+    void everyFrameRoutesOnItsOwnHashAndDrawsANewOneOnReuse() {
+        var lake = new Lake();
+        var frames = new GenerationFrames(lake);
+        var generation = new Generation(frames);
+        StepPort port = new Counting(lake, generation, 1, new ArrayList<>());
+        List<AbstractFrame> firsts =
+                List.of(frames.admit(generation, port), frames.select(generation, port), frames.finish(generation));
+        List<Long> hashes = new ArrayList<>();
+        for (AbstractFrame frame : firsts) {
+            org.junit.jupiter.api.Assertions.assertFalse(
+                    frame.isOrdered(), frame.getClass().getSimpleName());
+            hashes.add(frame.getRoutingHash());
+            frame.recycle();
+        }
+        List<AbstractFrame> reused =
+                List.of(frames.admit(generation, port), frames.select(generation, port), frames.finish(generation));
+        for (int i = 0; i < 3; i++) {
+            assertSame(firsts.get(i), reused.get(i), "recycled");
+            org.junit.jupiter.api.Assertions.assertFalse(reused.get(i).isOrdered());
+            org.junit.jupiter.api.Assertions.assertNotEquals(
+                    hashes.get(i), reused.get(i).getRoutingHash(), "a reused frame draws a new seed");
+        }
+    }
+
+    @Test
+    void aLakeThatRefusesFramesStillConcludesTheGeneration() throws Exception {
+        var lake = new Lake();
+        lake.refuse = true;
+        var generation = new Generation(new GenerationFrames(lake));
+        generation.start(new Counting(lake, generation, 3, new ArrayList<>()));
+        assertTrue(generation.result().isDone(), "every frame ran where the lake refused it");
+        assertEquals(List.of(3), generation.result().get());
+        assertEquals(lake.admitted, lake.terminated);
     }
 
     @Test

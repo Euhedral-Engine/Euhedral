@@ -4,16 +4,12 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicReference;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /// What every model's quantum shares: the first failure (later ones suppressed into it), a cancel flag, the terminal
 /// template, and the continuation. When the graph publishes the outcome, the quantum throws its continuation frame
 /// into the lake: whatever reads the outcome runs there, on whichever worker takes it, never inside the graph's
 /// retirement.
 public abstract class AbstractQuantum implements StageQuantum {
-
-    private static final Logger LOG = LoggerFactory.getLogger(AbstractQuantum.class);
 
     /// Marks a quantum that concluded without failure: later failures are ignored, not suppressed into it.
     private static final Throwable SEALED = new Throwable("the quantum concluded", null, false, false) {};
@@ -118,17 +114,7 @@ public abstract class AbstractQuantum implements StageQuantum {
         if (next == null) return;
         this.continuation = null;
         if (next instanceof Continuation told) told.concluded(this);
-        try {
-            this.lake.publish(next);
-        } catch (RuntimeException refused) {
-            LOG.debug("the lake refused a continuation; running it here", refused);
-            try {
-                next.execute();
-                next.doFinally();
-            } catch (Throwable failed) {
-                next.doFinallyWithError(failed);
-            }
-        }
+        this.lake.publishOrRun(next);
     }
 
     /// The model's own publication, before the continuation is thrown.
