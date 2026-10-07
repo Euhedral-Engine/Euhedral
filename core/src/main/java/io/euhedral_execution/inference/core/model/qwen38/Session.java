@@ -191,6 +191,7 @@ public final class Session implements GenerationSession {
     /// stops the generation before another quantum runs. It must not block: queue blocking work (a network
     /// write) as further work for the workers. The session runs one generation at a time; a failed or cancelled
     /// generation leaves it cancelled.
+    @Override
     public CompletableFuture<List<Integer>> generateAsync(
             String prompt,
             int maxNewTokens,
@@ -351,6 +352,7 @@ public final class Session implements GenerationSession {
     }
 
     /// Allows the owning engine to reject reentrant shutdown from the blocking form's output callback.
+    @Override
     public boolean isGeneratingOnCurrentThread() {
         return this.generationActive.get() && Thread.currentThread() == this.drainingThread;
     }

@@ -85,6 +85,30 @@ public final class Session implements GenerationSession {
 
     @Override
     public CompletableFuture<List<Integer>> generateAsync(
+            String prompt,
+            int maxNewTokens,
+            Consumer<String> text,
+            TokenConstraint constraint,
+            GenerationTimingListener timing) {
+        Objects.requireNonNull(prompt, "prompt");
+        CompletableFuture<List<Integer>> result = new CompletableFuture<>();
+        boolean first = !this.promptPrefilled;
+        this.frames.run(HostFrames.of(
+                () -> {
+                    int[] ids = first
+                            ? this.tokenizer.encodeWithModelSpecialTokens(prompt)
+                            : this.tokenizer.encodeText(prompt);
+                    generateAsync(ids, maxNewTokens, text, constraint, timing).whenComplete((tokens, failure) -> {
+                        if (failure != null) result.completeExceptionally(failure);
+                        else result.complete(tokens);
+                    });
+                },
+                result::completeExceptionally));
+        return result;
+    }
+
+    @Override
+    public CompletableFuture<List<Integer>> generateAsync(
             int[] promptTokenIds,
             int maxNewTokens,
             Consumer<String> text,

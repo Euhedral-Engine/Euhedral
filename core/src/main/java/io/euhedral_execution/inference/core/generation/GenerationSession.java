@@ -22,6 +22,21 @@ public interface GenerationSession extends AutoCloseable {
             TokenConstraint constraint,
             GenerationTimingListener timing);
 
+    /// As [#generateAsync(int[], int, Consumer, TokenConstraint, GenerationTimingListener)] from text: the session's
+    /// first prompt is encoded with the model special tokens, later ones as plain text, on the lattice's workers.
+    CompletableFuture<List<Integer>> generateAsync(
+            String prompt,
+            int maxNewTokens,
+            Consumer<String> text,
+            TokenConstraint constraint,
+            GenerationTimingListener timing);
+
+    /// Whether the calling thread is running this session's text callback (closing the engine from it would wait
+    /// for itself).
+    default boolean isGeneratingOnCurrentThread() {
+        return false;
+    }
+
     /// Requests cancellation of the current quantum or prevents the next one from starting.
     void cancel();
 
