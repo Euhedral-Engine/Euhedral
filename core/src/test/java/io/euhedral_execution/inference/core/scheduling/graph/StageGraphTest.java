@@ -43,7 +43,7 @@ class StageGraphTest {
     private static final StageTopology DIAMOND =
             StageTopology.submitted(dependencies(new int[0], new int[] {0}, new int[] {0}, new int[] {1, 2}));
 
-    private final QwenExecutionSource source = new QwenExecutionSource();
+    private final TestLake source = new TestLake();
     private final RecordingStream stream = new RecordingStream();
     private final Recycler recycler = new Recycler();
 
