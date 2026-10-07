@@ -34,7 +34,9 @@ quantum at a time:
 Per quantum, the graph only resets fan-in counters and per-stage flags and binds the
 `Quantum`. No frame, wrapper, successor list, graph, or device buffer is created on the hot
 path. `EuhedralInferenceRuntime` keeps a pool of idle graphs per plan view and builds another graph only
-when every existing one is running a quantum, for example for concurrent sequences.
+when every existing one is running a quantum, for example for concurrent sequences. The runtime knows no
+model: the dense model's `Execution` (`model/qwen38`) owns the lake and the staging hand-over and admits
+through it.
 
 ## Resource lifetimes
 
@@ -67,7 +69,7 @@ cancellation state, and outcome. It is the graph's `StageQuantum` binding.
 
 Admission is small:
 
-1. acquire an idle graph for the quantum's plan view;
+1. acquire an idle graph for the quantum's shape;
 2. prepare quantum-owned resources with the graph's stream selected (sequence lease, persistent state on
    first use, the binding of the graph's workspace storage), so any initialization it queues precedes
    every stage;
@@ -241,7 +243,7 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   the token, hands its text to the caller's callback, and admits the next quantum. The callback runs before that admission,
   so a cancellation from it (a stop sequence, an invalid tool call) stops the generation before another quantum starts.
 - **The server** (`ChatCompletionService`): a container thread turns a request into a `DeferredResult` and returns.
-  Rendering and validation run as one frame (`EuhedralInferenceRuntime.onWorker`), encoding as tokenization frames. One
+  Rendering and validation run as one frame (`Execution.onWorker`), encoding as tokenization frames. One
   generation runs; a bounded list waits, and the worker that finishes a generation starts the next. Stop-sequence matching
   and tool-call parsing run in the text callback. Network writes are queued per request (`SerialTasks`) and run on workers
   one at a time in output order: a write that blocks holds only its worker, and the other workers take the remaining

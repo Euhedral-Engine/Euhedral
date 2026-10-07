@@ -1,7 +1,7 @@
 # Benchmarking
 
 The `benchmark` Gradle module is an end-to-end harness. It loads `InferenceEngine`, creates a fresh
-`Session` for every iteration, and runs the real tokenizer -> Euhedral lattice -> CUDA
+session for every iteration (`createGenerationSession`), for either model, and runs the real tokenizer -> Euhedral lattice -> CUDA
 path. It is not part of `core` or `api` and is not packaged in the API JAR. The `run` command writes
 end-to-end engine measurements. The engine derives its execution policy (kernels, speculative
 depth, host-backed weight residency) from the artifact, and prefill runs in 512-token chunks, so
