@@ -36,7 +36,9 @@ public enum Qwen4Kernel {
     LINEAR_TC_BF16("euhedral_q4_linear_tc_bf16"),
     LINEAR_TC_SPLIT_BF16("euhedral_q4_linear_tc_split_bf16"),
     LINEAR_TC_ROWS_BF16("euhedral_q4_linear_tc_rows_bf16"),
-    LINEAR_TC_ROWS_SPLIT_BF16("euhedral_q4_linear_tc_rows_split_bf16");
+    LINEAR_TC_ROWS_SPLIT_BF16("euhedral_q4_linear_tc_rows_split_bf16"),
+    LINEAR_SPLIT4_BF16("euhedral_q4_linear_split4_bf16"),
+    LINEAR_SPLIT8_BF16("euhedral_q4_linear_split8_bf16");
 
     private final String symbol;
 

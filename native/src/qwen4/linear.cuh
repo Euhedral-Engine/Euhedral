@@ -45,6 +45,75 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_q4_linear_bf16(
     }
 }
 
+// BF16 linear for 1 to 8 rows with K split across warps: each of a CTA's 8 / S columns is summed by S warps over
+// contiguous slices of K (the per-warp scheme of euhedral_q4_linear_bf16 within a slice), and the slices add in order,
+// so the result is deterministic. For outputs too narrow, or reductions too long, for one warp per column to fill the
+// device (a different summation order from euhedral_q4_linear_bf16, which stays the exact route).
+//   grid (ceil(n / (8 / S)), ceil(rows / 8)), block 256; k a multiple of 8, pointers 16-byte aligned.
+template <int S>
+static __device__ __forceinline__ void linear_split(
+        const unsigned short* __restrict__ input, const unsigned short* __restrict__ weights,
+        unsigned short* __restrict__ output, unsigned int rows, unsigned int k, unsigned int n) {
+    constexpr unsigned int kColumns = 8u / S;
+    __shared__ float partial[kColumns][S][8];
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int slot = warp / S, slice = warp % S;
+    const unsigned int column = blockIdx.x * kColumns + slot;
+    const bool valid = column < n;
+    const unsigned int row0 = blockIdx.y * 8u;
+    const unsigned int active = min(8u, rows - row0);
+    const unsigned int vectors = k >> 3;
+    const unsigned int begin = vectors * slice / S, end = vectors * (slice + 1u) / S;
+    float accumulator[8];
+#pragma unroll
+    for (int r = 0; r < 8; r++) accumulator[r] = 0.0f;
+    if (valid) {
+        const uint4* weight_row = reinterpret_cast<const uint4*>(weights + (unsigned long long)column * k);
+        for (unsigned int v = begin + lane; v < end; v += 32u) {
+            const uint4 packed = weight_row[v];
+            float w[8];
+            w[0] = __uint_as_float(packed.x << 16); w[1] = __uint_as_float(packed.x & 0xffff0000u);
+            w[2] = __uint_as_float(packed.y << 16); w[3] = __uint_as_float(packed.y & 0xffff0000u);
+            w[4] = __uint_as_float(packed.z << 16); w[5] = __uint_as_float(packed.z & 0xffff0000u);
+            w[6] = __uint_as_float(packed.w << 16); w[7] = __uint_as_float(packed.w & 0xffff0000u);
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                if ((unsigned int)r < active) {
+                    const uint4 x = reinterpret_cast<const uint4*>(input + (unsigned long long)(row0 + r) * k)[v];
+                    float a = accumulator[r];
+                    a = fmaf(w[0], __uint_as_float(x.x << 16), a); a = fmaf(w[1], __uint_as_float(x.x & 0xffff0000u), a);
+                    a = fmaf(w[2], __uint_as_float(x.y << 16), a); a = fmaf(w[3], __uint_as_float(x.y & 0xffff0000u), a);
+                    a = fmaf(w[4], __uint_as_float(x.z << 16), a); a = fmaf(w[5], __uint_as_float(x.z & 0xffff0000u), a);
+                    a = fmaf(w[6], __uint_as_float(x.w << 16), a); a = fmaf(w[7], __uint_as_float(x.w & 0xffff0000u), a);
+                    accumulator[r] = a;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        const float total = q4::warp_sum(accumulator[r]);
+        if (lane == 0) partial[slot][slice][r] = total;
+    }
+    __syncthreads();
+    if (slice != 0 || !valid || lane >= active) return;
+    float sum = 0.0f;
+#pragma unroll
+    for (int part = 0; part < S; part++) sum += partial[slot][part][lane];
+    output[(unsigned long long)(row0 + lane) * n + column] = q4::bfr(sum);
+}
+
+extern "C" __global__ __launch_bounds__(256) void euhedral_q4_linear_split4_bf16(
+        const unsigned short* input, const unsigned short* weights, unsigned short* output, unsigned int rows,
+        unsigned int k, unsigned int n) {
+    linear_split<4>(input, weights, output, rows, k, n);
+}
+extern "C" __global__ __launch_bounds__(256) void euhedral_q4_linear_split8_bf16(
+        const unsigned short* input, const unsigned short* weights, unsigned short* output, unsigned int rows,
+        unsigned int k, unsigned int n) {
+    linear_split<8>(input, weights, output, rows, k, n);
+}
+
 // BF16 linear on m16n8k16 tensor cores (the scheme of dflash's linear, docs/DFLASH2.md): out = bf16(sum_k in * w)
 // with FP32 accumulation, in a different summation order from euhedral_q4_linear_bf16, which stays the exact route.
 // A CTA's four warps own 32 output columns over the whole K (KS = 1), or 8 columns with K in four contiguous parts

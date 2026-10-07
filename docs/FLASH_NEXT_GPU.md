@@ -79,3 +79,22 @@ against 1.73 ms; only the hyper-connection up projection was faster, 12.9 agains
 
 Not kept: tensor cores for decode rows too (prefill as above; decode cold 22.1 / 22.7, warm 27.2 / 27.8, kernel time
 for the BF16 linears 7.5 to 9.4 ms per step).
+
+## Decode's BF16 linears with K split across warps
+
+One warp per output column left decode's narrow projections short of the device: the hyper-connection's down
+projection (320 outputs) ran 40 CTAs, and the one- and four-output projections (the shared expert's gate, the
+injection) ran one and four warps over K of 2560 and 10,240. `euhedral_q4_linear_split4/8_bf16` give each column 4 or 8
+warps over contiguous slices of K, summed in slice order (deterministic), by the shape alone: 8 slices for fewer than
+64 outputs or K of 8192 and more, 4 for K of 2048 and more. Summation-order noise only: 0 to 1.5e-6 relative RMS on the
+model's shapes. The exact route and `EUHEDRAL_QWEN4_LINEAR_SPLIT=0` keep one warp per column.
+
+Profiled, per decode step at 64 context: BF16 linears 7.5 to 4.8 ms (hyper-connection down 19.1 to 10.4 us per launch,
+injection 13.2 to 3.0, shared gate 13.2 to 1.7, GDN gates 5.4 to 1.9, router 6.0 to 5.0); the step 36.4 to 34.1 ms.
+
+| scenario (tokens/s) | split off (two runs) | split on (two runs) |
+|---|---|---|
+| decode cold 64 | 21.9 / 22.5 | 23.6 / 23.6 |
+| decode cold 4096 | 22.3 / 22.8 | 22.8 / 23.8 |
+| decode warm 64 | 28.3 / 28.7 | 30.2 / 30.8 |
+| decode warm 4096 | 26.7 / 28.7 | 29.5 / 30.3 |

@@ -29,6 +29,18 @@ public final class Qwen4Ops {
     /// decode kernels too.
     static final int TC_MIN_ROWS = 9;
 
+    /// Whether decode's BF16 linears split K across warps where one warp per column would leave the device idle
+    /// (`EUHEDRAL_QWEN4_LINEAR_SPLIT=0`: one warp per column, the exact route's kernel).
+    static final boolean LINEAR_SPLIT = !"0".equals(System.getenv("EUHEDRAL_QWEN4_LINEAR_SPLIT"));
+
+    /// The K slices of a decode linear of `k` inputs and `n` outputs, by its shape alone: 8 for outputs too few to
+    /// fill the device or reductions of 8192 and more, 4 for reductions of 2048 and more, else 1.
+    static int slices(int k, int n) {
+        if (n < 64 || k >= 8192) return 8;
+        if (k >= 2048 && n < 4096) return 4;
+        return 1;
+    }
+
     /// `output[r][j] = bf16(sum_k input[r][k] * weights[j][k])` for BF16 `weights` of `n` rows by `k` columns.
 
     public static void linearBf16(ExecutionGpu gpu, long input, long weights, long output, int rows, int k, int n) {
@@ -55,6 +67,26 @@ public final class Qwen4Ops {
                     ceilDiv(rows, tiles ? 64 : 16),
                     1,
                     128,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(input)
+                            .pointer(weights)
+                            .pointer(output)
+                            .int32(rows)
+                            .int32(k)
+                            .int32(n));
+            return;
+        }
+        int slices = rows < TC_MIN_ROWS && LINEAR_SPLIT && !gpu.exactNumerics() ? slices(k, n) : 1;
+        if (slices > 1) {
+            gpu.launchQwen4(
+                    slices == 8 ? Qwen4Kernel.LINEAR_SPLIT8_BF16 : Qwen4Kernel.LINEAR_SPLIT4_BF16,
+                    ceilDiv(n, 8 / slices),
+                    ceilDiv(rows, 8),
+                    1,
+                    256,
                     1,
                     1,
                     0,
