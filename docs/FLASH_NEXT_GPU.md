@@ -98,3 +98,15 @@ injection 13.2 to 3.0, shared gate 13.2 to 1.7, GDN gates 5.4 to 1.9, router 6.0
 | decode cold 4096 | 22.3 / 22.8 | 22.8 / 23.8 |
 | decode warm 64 | 28.3 / 28.7 | 30.2 / 30.8 |
 | decode warm 4096 | 26.7 / 28.7 | 29.5 / 30.3 |
+
+## Not kept: narrower expert CTAs in decode
+
+A decode expert's kernels ran 20 CTAs per launch (32 act columns and 128 output rows per CTA). Narrower CTAs (16
+columns and 32 rows, the same K split, so bit for bit the same outputs; verified against the wide kernels) cut the
+expert kernels from 7.82 to 5.73 ms per step (gate/up 9.8 to 6.6 us, down 6.5 to 5.3 us per launch), but the step stayed
+at 34.0 ms profiled and the screens were flat (decode warm 64 31.3 / 31.2 against 29.1 / 30.5 tokens/s, cold 64 23.3 /
+24.0 against 23.5 / 22.7): the time moved to the waits for missed experts. In decode the experts' kernels are not on the
+critical path; each layer waits for its slowest expert's record. Worth retrying once those waits shrink.
+
+More lanes (`EUHEDRAL_QWEN4_LANES`): 2 / 4 / 8 lanes, decode warm 64 30.5 / 31.0 / 31.2, cold 64 23.6 / 24.0 / 23.6
+tokens/s: within noise.
