@@ -174,15 +174,25 @@ public final class Qwen38Runtime implements ModelRuntime {
                 Objects.requireNonNull(config, "config"),
                 prefillChunkTokens,
                 release::accept);
-        boolean speculate = options.speculation() && this.profile != null;
-        if (speculate && this.profile.speculation() == ArtifactProfile.Speculation.MTP && this.plan.drafts())
-            session.enableSpeculativeDecoding(this.profile.speculativeDepth());
-        if (speculate
-                && this.profile.speculation() == ArtifactProfile.Speculation.DFLASH2
-                && this.plan.draftsWithDFlash2())
-            session.useSpeculativeDecoding(DFlash2Decoder.factory(this.profile.speculativeDepth()));
+        switch (speculation(options, this.profile, this.plan.drafts(), this.plan.draftsWithDFlash2())) {
+            case MTP -> session.enableSpeculativeDecoding(this.profile.speculativeDepth());
+            case DFLASH2 -> session.useSpeculativeDecoding(DFlash2Decoder.factory(this.profile.speculativeDepth()));
+            case NONE -> {}
+        }
         if (this.prefixCache != null) session.usePrefixCache(this.prefixCache);
         return session;
+    }
+
+    /// The speculative strategy a session runs: the profile's, when `options` allow speculation and the plan can draft
+    /// it (`mtp`, `dflash2`); otherwise none.
+    static ArtifactProfile.Speculation speculation(
+            SessionOptions options, ArtifactProfile profile, boolean mtp, boolean dflash2) {
+        if (!options.speculation() || profile == null) return ArtifactProfile.Speculation.NONE;
+        return switch (profile.speculation()) {
+            case MTP -> mtp ? ArtifactProfile.Speculation.MTP : ArtifactProfile.Speculation.NONE;
+            case DFLASH2 -> dflash2 ? ArtifactProfile.Speculation.DFLASH2 : ArtifactProfile.Speculation.NONE;
+            case NONE -> ArtifactProfile.Speculation.NONE;
+        };
     }
 
     @Override
