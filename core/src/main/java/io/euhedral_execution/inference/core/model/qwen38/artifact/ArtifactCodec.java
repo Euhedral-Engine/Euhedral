@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.artifact;
 
+import io.euhedral_execution.inference.core.artifact.ArtifactFileAccess;
 import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
 import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
@@ -21,7 +22,7 @@ import java.nio.charset.StandardCharsets;
 /// floating-point fields, a length-prefixed UTF-8 activation name, a counted sequence of layer-type
 /// ordinals, the remaining int32 fields, two boolean bytes, and the MTP layer count.
 /// `DataOutputStream` and `ByteBuffer` both use the explicit big-endian order selected here.
-public final class ArtifactCodec {
+final class ArtifactCodec {
 
     static final int MAX_COUNT = 1_000_000;
     static final int MAX_RANK = 64;
@@ -225,26 +226,19 @@ public final class ArtifactCodec {
         return value == 1;
     }
 
-    public static long checkedEnd(long offset, long size, String field) throws ArtifactFormatException {
-        if (offset < 0 || size < 0 || offset > Long.MAX_VALUE - size) {
-            throw invalid(field + " range overflows or is negative");
-        }
-        return offset + size;
-    }
-
     static void validateNonOverlapping(TensorDescriptor[] tensors) throws ArtifactFormatException {
         for (int i = 0; i < tensors.length; i++) {
             TensorDescriptor first = tensors[i];
             if (first.byteSize() == 0) {
                 continue;
             }
-            long firstEnd = checkedEnd(first.dataOffset(), first.byteSize(), "tensor data");
+            long firstEnd = ArtifactFileAccess.checkedEnd(first.dataOffset(), first.byteSize(), "tensor data");
             for (int j = i + 1; j < tensors.length; j++) {
                 TensorDescriptor second = tensors[j];
                 if (second.byteSize() == 0) {
                     continue;
                 }
-                long secondEnd = checkedEnd(second.dataOffset(), second.byteSize(), "tensor data");
+                long secondEnd = ArtifactFileAccess.checkedEnd(second.dataOffset(), second.byteSize(), "tensor data");
                 if (first.dataOffset() < secondEnd && second.dataOffset() < firstEnd) {
                     throw invalid("tensor data ranges overlap: " + first.name() + " and " + second.name());
                 }
@@ -352,7 +346,7 @@ public final class ArtifactCodec {
         if (tensor.dataOffset() < 0 || tensor.byteSize() < 0) {
             throw invalid("tensor data offset and byte size must be non-negative");
         }
-        checkedEnd(tensor.dataOffset(), tensor.byteSize(), "tensor data");
+        ArtifactFileAccess.checkedEnd(tensor.dataOffset(), tensor.byteSize(), "tensor data");
     }
 
     private static void validateTensorLayout(TensorDescriptor tensor) throws ArtifactFormatException {

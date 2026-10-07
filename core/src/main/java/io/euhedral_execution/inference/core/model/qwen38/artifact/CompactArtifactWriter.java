@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.artifact;
 
+import io.euhedral_execution.inference.core.artifact.ArtifactFileAccess;
 import io.euhedral_execution.inference.core.artifact.ArtifactFormatException;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
@@ -49,12 +50,12 @@ public final class CompactArtifactWriter {
         }
         byte[] metadata = ArtifactCodec.encodeMetadata(artifact.config());
         byte[] table = ArtifactCodec.encodeTensorTable(tensors);
-        long expectedMetadataEnd = ArtifactCodec.checkedEnd(ArtifactHeader.BYTE_SIZE, metadata.length, "metadata");
+        long expectedMetadataEnd = ArtifactFileAccess.checkedEnd(ArtifactHeader.BYTE_SIZE, metadata.length, "metadata");
         if (artifact.header().metadataOffset() != ArtifactHeader.BYTE_SIZE
                 || artifact.header().metadataSize() != metadata.length
                 || artifact.header().tensorTableOffset() != expectedMetadataEnd
                 || artifact.header().tensorDataOffset()
-                        != ArtifactCodec.checkedEnd(artifact.header().tensorTableOffset(), table.length, "table")
+                        != ArtifactFileAccess.checkedEnd(artifact.header().tensorTableOffset(), table.length, "table")
                 || artifact.header().tensorCount() != tensors.length) {
             throw new ArtifactFormatException("compact header does not match encoded metadata and table");
         }
@@ -70,7 +71,8 @@ public final class CompactArtifactWriter {
                 throw new ArtifactFormatException("compact payload precedes data section");
             }
             fileSize = Math.max(
-                    fileSize, ArtifactCodec.checkedEnd(descriptor.dataOffset(), descriptor.byteSize(), "tensor data"));
+                    fileSize,
+                    ArtifactFileAccess.checkedEnd(descriptor.dataOffset(), descriptor.byteSize(), "tensor data"));
         }
 
         ByteBuffer header = ByteBuffer.allocate(ArtifactHeader.BYTE_SIZE).order(ArtifactCodec.BYTE_ORDER);
