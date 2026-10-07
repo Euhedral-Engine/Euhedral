@@ -82,7 +82,7 @@ class CapturedQuantaCudaIntegrationTest {
             int depth,
             boolean capture)
             throws Exception {
-        var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu, EuhedralInferenceRuntime.laneCount(), capture);
+        var runtime = new Execution(lattice, plan, gpu, EuhedralInferenceRuntime.laneCount(), capture);
         List<List<Integer>> tokens = new ArrayList<>();
         List<long[]> accepted = new ArrayList<>();
         try {

@@ -8,7 +8,6 @@ import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
@@ -49,7 +48,7 @@ class SpeculativeVerifyCudaIntegrationTest {
                 Qwen38Model model = load(artifact, gpu);
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             var sequential = new Sequence(1);
             var verified = new Sequence(2);
             try {
@@ -107,7 +106,7 @@ class SpeculativeVerifyCudaIntegrationTest {
                 Qwen38Model model = load(artifact, gpu);
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             try {
                 for (int first = 1; first <= 3; first++) {
                     var sequential = new Sequence(10 + first);
@@ -169,12 +168,7 @@ class SpeculativeVerifyCudaIntegrationTest {
 
     /// A VERIFY quantum that commits only its first `committed` rows; returns all its logits rows.
     static List<short[]> verify(
-            EuhedralInferenceRuntime runtime,
-            ExecutionPlan plan,
-            Sequence sequence,
-            int[] rows,
-            int committed,
-            CudaGpuMemory gpu)
+            Execution runtime, ExecutionPlan plan, Sequence sequence, int[] rows, int committed, CudaGpuMemory gpu)
             throws Exception {
         AtomicReference<List<short[]>> captured = new AtomicReference<>(List.of());
         var context = new Quantum(
@@ -224,8 +218,7 @@ class SpeculativeVerifyCudaIntegrationTest {
     }
 
     /// Prefills in the session's 512-row chunks.
-    static void prefill(
-            EuhedralInferenceRuntime runtime, ExecutionPlan plan, Sequence sequence, int[] prompt, CudaGpuMemory gpu)
+    static void prefill(Execution runtime, ExecutionPlan plan, Sequence sequence, int[] prompt, CudaGpuMemory gpu)
             throws Exception {
         for (int offset = 0; offset < prompt.length; offset += 512) {
             run(
@@ -241,7 +234,7 @@ class SpeculativeVerifyCudaIntegrationTest {
 
     /// Runs one quantum; returns its logits rows when `logits` asks for them.
     static List<short[]> run(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             ExecutionPlan plan,
             Sequence sequence,
             Quantum.ExecutionKind kind,

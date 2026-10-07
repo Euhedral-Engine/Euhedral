@@ -7,7 +7,6 @@ import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.BufferedOutputStream;
@@ -62,7 +61,7 @@ class TeacherForcedQualityCudaIntegrationTest {
                 OutputStream file = Files.newOutputStream(Path.of(report));
                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(file, 1 << 22))) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             var sequence = new Sequence(1);
             int vocabulary = model.weights().config().vocabSize();
             out.writeInt(Integer.reverseBytes(steps));
@@ -106,7 +105,7 @@ class TeacherForcedQualityCudaIntegrationTest {
     }
 
     private static short[] run(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             CudaGpuMemory gpu,
             ExecutionPlan plan,
             Sequence sequence,

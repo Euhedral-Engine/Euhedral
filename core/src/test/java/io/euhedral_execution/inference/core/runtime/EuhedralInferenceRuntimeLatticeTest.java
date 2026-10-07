@@ -16,6 +16,7 @@ import io.euhedral_execution.core.impl.DefaultExecutor;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
+import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.GdnState;
@@ -45,10 +46,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
-@Execution(ExecutionMode.SAME_THREAD)
+@org.junit.jupiter.api.parallel.Execution(ExecutionMode.SAME_THREAD)
 class EuhedralInferenceRuntimeLatticeTest {
 
     private static final Path DEFAULT_COMPACT_ARTIFACT =
@@ -67,7 +67,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 List.of(ExecutionFixtures.q3("projection", 64, 201)));
         try {
             lattice.start();
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             try {
                 long sequenceId = 5800;
                 for (var kind : List.of(Quantum.ExecutionKind.PREFILL, Quantum.ExecutionKind.DECODE)) {
@@ -113,7 +113,7 @@ class EuhedralInferenceRuntimeLatticeTest {
             var gpu = new ConcurrentGpu();
             gpu.embeddingGate = new WorkGate(2);
             var attachments = new AtomicInteger();
-            var runtime = new EuhedralInferenceRuntime(
+            var runtime = new Execution(
                     source -> {
                         attachments.incrementAndGet();
                         lattice.addUpstream(source);
@@ -170,7 +170,7 @@ class EuhedralInferenceRuntimeLatticeTest {
     void foreignPlanIsRejectedBeforeAnyGraphIsBuilt() throws Exception {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var attachments = new AtomicInteger();
-        var runtime = new EuhedralInferenceRuntime(source -> attachments.incrementAndGet(), plan, new ConcurrentGpu());
+        var runtime = new Execution(source -> attachments.incrementAndGet(), plan, new ConcurrentGpu());
         var wrongPlan = new ExecutionPlan(ExecutionFixtures.weights());
         var context = new Quantum(wrongPlan, new Sequence(702), Quantum.ExecutionKind.PREFILL, 0, new int[] {1});
 
@@ -187,7 +187,7 @@ class EuhedralInferenceRuntimeLatticeTest {
     void closeReportsADownstreamCompletionFailureAfterTheGraphsRetired() throws Exception {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var completionFailure = new IllegalStateException("injected downstream completion failure");
-        var runtime = new EuhedralInferenceRuntime(new PullingLattice(completionFailure), plan, new ConcurrentGpu());
+        var runtime = new Execution(new PullingLattice(completionFailure), plan, new ConcurrentGpu());
         var outcome = runtime.execute(
                 List.of(new Quantum(plan, new Sequence(703), Quantum.ExecutionKind.DECODE, 0, new int[] {1})));
         assertEquals(Quantum.Status.SUCCESS, outcome.getFirst().status());
@@ -218,7 +218,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                             .mapToObj(index -> ExecutionFixtures.q3("projection-" + index, 64, 201 + index))
                             .toList());
             var gpu = new ConcurrentGpu();
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             List<Sequence> sequences = new ArrayList<>();
             List<CompletableFuture<Quantum.Outcome>> completions = new ArrayList<>();
             try {
@@ -284,7 +284,7 @@ class EuhedralInferenceRuntimeLatticeTest {
             var weights = ExecutionFixtures.statefulCompactWeights();
             var plan = ExecutionPlan.prefix(weights, 2);
             var gpu = new SequenceGpu();
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             var sequence = new Sequence(700);
             long embeddingAddress = weights.tokenEmbedding().deviceAddress();
             try {
@@ -362,7 +362,7 @@ class EuhedralInferenceRuntimeLatticeTest {
         try {
             lattice.start();
             awaitWorkers(lattice, 2, registrationProbe, registeredWorkersBeforeStart + 2);
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             try {
                 var prefill = runtime.submit(
                         new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[] {1814, 1815}));

@@ -9,7 +9,6 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.nio.file.Files;
@@ -57,7 +56,7 @@ class DFlash2SpeculativeDecodeCudaIntegrationTest {
                 Qwen38Model model = load(artifact, gpu, 8192);
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             try {
                 long id = 300;
                 for (int[] prompt : prompts) {

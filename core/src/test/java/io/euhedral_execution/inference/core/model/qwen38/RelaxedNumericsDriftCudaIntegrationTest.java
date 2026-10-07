@@ -7,7 +7,6 @@ import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
@@ -67,7 +66,7 @@ class RelaxedNumericsDriftCudaIntegrationTest {
                 Qwen38Model model = Qwen38Model.load(artifact, ArtifactReader.read(artifact), gpu);
                 var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights());
-            var runtime = new EuhedralInferenceRuntime(lattice, plan, gpu);
+            var runtime = new Execution(lattice, plan, gpu);
             var exact = new Sequence(1);
             var contiguous = new Sequence(2);
             try {
@@ -151,7 +150,7 @@ class RelaxedNumericsDriftCudaIntegrationTest {
     }
 
     private static Step run(
-            EuhedralInferenceRuntime runtime,
+            Execution runtime,
             CudaGpuMemory gpu,
             ExecutionPlan plan,
             Sequence sequence,
