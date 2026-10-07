@@ -170,8 +170,8 @@ A Flash-Next artifact is selected by the artifact alone: `InferenceEngine` recog
 storage, planner, expert cache and `ExecutionPlan` (`Qwen4Runtime`), and hands the API a `GenerationSession`. The session
 interface is the part of generation the API needs (prefill chunks, decode steps, cancellation, the sampler's logits); the dense
 model's session and `Session` both implement it, and the API's request handling contains no model-specific
-branches. A generation is a chain of continuations on the lattice, not a loop on a thread: each step's end samples, emits text and starts the
-next step; the plan runs one step at a time and a step admitted meanwhile starts when the running one concludes. Cancellation stops the
+branches. A generation is a chain of frames on the lattice, not a loop on a thread: each step's quantum throws a `Select` frame that samples, emits
+text and throws the next step's `Admit`; the plan runs one step at a time and a step admitted meanwhile starts when the running one concludes. Cancellation stops the
 running step at its next stage. The runtime owns no executor, pool or thread; prompt tokenization and the host work a request needs
 are frames on the same lattice. The engine therefore needs worker CPUs like the dense model, and a Flash-Next deployment benefits
 from several: the expert reads of one wave run on as many workers as the staging pool allows. Chat completions on the real artifact are covered by `Qwen4ChatCompletionsCudaIntegrationTest`.

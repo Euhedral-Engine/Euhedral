@@ -239,9 +239,15 @@ Every piece of host work a request needs runs as frames on the lattice's workers
 - **Tokenization** (`PromptTokenization`): one frame splits the prompt into pre-tokens (control tokens, NFC, the split
   expression), then publishes one frame per two pre-tokens of BPE; the last to finish joins the chunks in order. Each frame
   takes a consecutive routing seed (`FrameSeeds`), so the chunks spread across workers. Encoding equals the tokenizer's own.
-- **Generation** advances in continuations of quantum retirement: the worker that publishes a quantum's outcome selects
-  the token, hands its text to the caller's callback, and admits the next quantum. The callback runs before that admission,
-  so a cancellation from it (a stop sequence, an invalid tool call) stops the generation before another quantum starts.
+- **Generation** is a chain of frames. `Admit` starts a step through the model's `StepPort` (a prompt chunk, a decode
+  token, an MTP or DFlash2 step); when the step's quantum publishes its outcome it throws its continuation, the `Select`
+  frame, into the lake (`AbstractQuantum.publishOutcome`), so nothing that reads an outcome runs inside the graph's
+  retirement. `Select` samples, applies acceptance, records the token, hands its text to the caller's callback and throws
+  the next `Admit`, or `Finish`, which completes the caller's result. The callback runs before that `Admit`, so a
+  cancellation from it (a stop sequence, an invalid tool call) stops the generation before another quantum starts. Each
+  session's `GenerationFrames` recycles the three frame types through `FrameManager`s, one frame of a chain live at a
+  time. Tokenization's join throws the first `Admit`. Only tests, tools and the blocking `generate` wait, each on its own
+  thread.
 - **The server** (`ChatCompletionService`): a container thread turns a request into a `DeferredResult` and returns.
   Rendering and validation run as one frame (`Execution.onWorker`), encoding as tokenization frames. One
   generation runs; a bounded list waits, and the worker that finishes a generation starts the next. Stop-sequence matching

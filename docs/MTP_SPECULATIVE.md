@@ -9,7 +9,8 @@ how exactness is proven, and what it measured. The depth, the exact multi-row ke
 Each artifact gets one policy, read from its tensors (`ArtifactProfile`): MTP is on when the artifact carries the MTP layer and
 the draft head (all four artifacts do), at depth 2 for Q3 and 3 for NVFP4. There is no option for it.
 
-One speculative step is a chain of quanta on the existing runtime, with no central dispatcher and no host loop over layers (shown
+One speculative step is a sequence of quanta on the existing runtime, run as generation frames through `MtpDecoder`'s step
+ports, with no central dispatcher and no host loop over layers (shown
 for depth 3):
 
 1. **VERIFY** over `[t₀, d₁, d₂, d₃]`. This is the decode topology with ALL_TOKENS logits and a device
