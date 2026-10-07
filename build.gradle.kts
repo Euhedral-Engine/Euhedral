@@ -33,6 +33,8 @@ subprojects {
             // Every *IntegrationTest needs a GPU (and usually an artifact); cudaIntegrationTest runs them.
             exclude("**/*IntegrationTest.class")
             useJUnitPlatform()
+            // Shape goldens: `-Peuhedral.shapes.record=true` rewrites them instead of comparing.
+            providers.gradleProperty("euhedral.shapes.record").orNull?.let { systemProperty("euhedral.shapes.record", it) }
             // Constrained decoding is CPU work; its tests load the host's llguidance build.
             llguidanceTasks[hostProductId]?.let { build ->
                 dependsOn(build)
@@ -93,6 +95,8 @@ subprojects {
             // Token-identity gate: `-Peuhedral.identity.record=true` rewrites the goldens instead of comparing.
             providers.gradleProperty("euhedral.identity.record").orNull?.let { systemProperty("euhedral.identity.record", it) }
             providers.gradleProperty("euhedral.identity.artifacts").orNull?.let { systemProperty("euhedral.identity.artifacts", it) }
+            providers.gradleProperty("euhedral.shapes.record").orNull?.let { systemProperty("euhedral.shapes.record", it) }
+            providers.gradleProperty("euhedral.shapes.artifacts").orNull?.let { systemProperty("euhedral.shapes.artifacts", it) }
             // Teacher-forced relaxed-numerics drift: decode length, prefill prefix, an optional per-step CSV
             // report, and `exact` to run the oracle on both sequences.
             for (name in listOf("steps", "prefix", "report", "candidate"))
