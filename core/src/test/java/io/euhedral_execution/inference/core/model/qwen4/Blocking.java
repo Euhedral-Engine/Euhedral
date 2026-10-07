@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
+import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
+import io.euhedral_execution.inference.core.runtime.graph.FutureContinuation;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -21,12 +23,9 @@ public final class Blocking {
             int rows,
             ExecutionPlan.LogitsSink sink)
             throws InterruptedException {
-        CompletableFuture<Void> done = new CompletableFuture<>();
-        executor.start(sequence, tokens, offset, rows, sink, failure -> {
-            if (failure == null) done.complete(null);
-            else done.completeExceptionally(failure);
-        });
-        await(done);
+        var done = new FutureContinuation<Throwable>(AbstractQuantum::outcome);
+        executor.start(sequence, tokens, offset, rows, sink, done);
+        await(done.future());
     }
 
     /// Runs one layer of a chunk on a residual state the caller supplies and returns the state
@@ -41,7 +40,7 @@ public final class Blocking {
             MemorySegment.copy(stateIn, 0, upload.segment(), ValueLayout.JAVA_SHORT, 0, stateIn.length);
             try (Arena arena = Arena.ofShared()) {
                 var back = arena.allocate(bytes, 16);
-                CompletableFuture<Void> done = new CompletableFuture<>();
+                var done = new FutureContinuation<Throwable>(AbstractQuantum::outcome);
                 plan.startLayer(
                         sequence,
                         layer,
@@ -60,11 +59,8 @@ public final class Blocking {
                                 g.copyDeviceToHost(back, state, bytes);
                             }
                         },
-                        failure -> {
-                            if (failure == null) done.complete(null);
-                            else done.completeExceptionally(failure);
-                        });
-                await(done);
+                        done);
+                await(done.future());
                 MemorySegment.copy(back, ValueLayout.JAVA_SHORT, 0, out, 0, out.length);
             }
         }
@@ -106,14 +102,19 @@ public final class Blocking {
         stream.submit(() -> moe.submitFinish(output, rows, scratch), false);
     }
 
-    private static void await(CompletableFuture<Void> done) throws InterruptedException {
+    /// Waits for a step's continuation; a step that failed throws its failure.
+    private static void await(CompletableFuture<Throwable> done) throws InterruptedException {
+        Throwable failed;
         try {
-            done.get();
+            failed = done.get();
         } catch (ExecutionException failure) {
             Throwable cause = failure.getCause();
             if (cause instanceof RuntimeException runtime) throw runtime;
             if (cause instanceof Error error) throw error;
             throw new IllegalStateException(cause);
         }
+        if (failed instanceof RuntimeException runtime) throw runtime;
+        if (failed instanceof Error error) throw error;
+        if (failed != null) throw new IllegalStateException(failed);
     }
 }
