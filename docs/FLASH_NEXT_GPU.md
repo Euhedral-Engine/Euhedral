@@ -117,3 +117,32 @@ The plan filled the device: 84 MiB stayed free at the lowest point of a run. It 
 system beside the runtime's 1 GiB (`Qwen4ResidencyPlanner.SYSTEM_RESERVE_BYTES`, `EUHEDRAL_GPU_SYSTEM_RESERVE_MIB`):
 774 MiB stayed free at the lowest point. The expert cache has 3,102 slots instead of about 3,385; decode cold 64 / 4096
 23.0 / 22.7 tokens/s (23.6 / 23.6 before), warm 30.1 / 29.9 (30.0-30.5 / 29.9), prefill unchanged.
+
+## Against main
+
+Paired benchmark, 6 forks, control main (`21180be`), candidate `b672403` (before the system reserve):
+
+| scenario | main | this branch | change | forks ahead |
+|---|---|---|---|---|
+| prefill 512 (tokens/s) | 139 | 148 | +6.5% | 6/6 |
+| prefill 4096 (tokens/s) | 484.5 | 664 | +37.1% | 6/6 |
+| decode cold 64 (tokens/s) | 22.4 | 23.6 | +5.3% | 6/6 |
+| decode cold 4096 (tokens/s) | 22.1 | 23.6 | +7% | 6/6 |
+| decode warm 64 (tokens/s) | 28.2 | 30.0 | +6.3% | 6/6 |
+| decode warm 4096 (tokens/s) | 27.5 | 29.9 | +8.4% | 6/6 |
+| disk median while prefilling (GB/s) | 4.53 | 6.23 | +37% | 6/6 |
+
+Profiled per step, main against this branch: decode at 64 context 36.1 to 34.0 ms (kernels busy 18.8 to 16.2 ms,
+nothing on the GPU 14.1 to 14.6 ms, copy only 3.2 to 3.3 ms, 2,639 launches both); decode at 4096 context 57.9 to 58.3
+ms (kernels 19.3 to 16.7 ms; waiting for missed experts 29.6 to 30.7 ms); prefill of 4096 tokens 8.59 to 6.31 s
+(kernels 3.59 to 1.21 s, 44,376 to 44,432 launches; the rest is waiting for expert records from the disk).
+
+## What limits it now
+
+- Prefill: the disk. Kernels run 1.21 s of 6.31 s; the disk reads at 7 GB/s whenever records are asked for and 37 GB
+  per 4096 tokens at this tier size bounds a prefill at about 775 tokens/s.
+- Decode: waiting for missed experts' records, 10 ms per step at 64 context and 31 ms at 4096 (each layer waits for its
+  slowest expert). GPU-side changes that shortened kernels (narrower expert CTAs: 2.1 ms of kernel time) or removed
+  a stage hop (the routing merged into the block stage) moved the time into those waits and left the step flat.
+- Remaining software bubbles in decode, each a few percent: the router's round trip through the host (about 50 us per
+  layer, 1.6 ms per step), the token boundary (about 1.3 ms), launch gaps in the dense chain (about 2.6 ms).
