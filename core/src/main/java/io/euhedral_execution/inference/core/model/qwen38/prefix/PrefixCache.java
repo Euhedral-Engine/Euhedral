@@ -147,13 +147,12 @@ public final class PrefixCache implements AutoCloseable {
             int position,
             SpeculativeCheckpoint speculative) {
         if (this.closed) return CompletableFuture.completedFuture(parent);
-        // The copies read the sequence's buffers between quanta. Holding its lease for them keeps a cancellation
-        // from releasing those buffers mid-copy: cancel() then only flags the sequence, and the release after the
-        // copies frees them. A sequence already cancelled, terminal or executing is not captured.
-        long at = sequence.currentTokenPosition();
-        Sequence.ExecutionLease lease;
+        // The copies read the sequence's buffers between quanta, as its one piece of work in flight: no quantum is
+        // admitted until they retire, and the buffers close only when the session completes the sequence. A sequence
+        // already cancelled, terminal or executing is not captured.
+        long at = sequence.committedFrontier();
         try {
-            lease = sequence.claimExecution(at);
+            sequence.admit(at, at);
         } catch (RuntimeException cancelledOrBusy) {
             return CompletableFuture.completedFuture(parent);
         }
@@ -162,11 +161,11 @@ public final class PrefixCache implements AutoCloseable {
         try {
             captured = captureHeld(frames, sequence, parent, tokens, position, speculative);
         } catch (RuntimeException | Error failure) {
-            sequence.releaseExecution(lease, at);
+            sequence.commit(at);
             throw failure;
         }
         return captured.whenComplete((node, failure) -> {
-            sequence.releaseExecution(lease, at);
+            sequence.commit(at);
             if (node != parent) this.captureNanos.addAndGet(System.nanoTime() - started);
         });
     }
@@ -240,10 +239,9 @@ public final class PrefixCache implements AutoCloseable {
                             new IllegalArgumentException("the hit does not hold " + speculative.kind() + " state"));
         if (this.closed) return CompletableFuture.failedFuture(new IllegalStateException("the prefix cache is closed"));
         if (cancelled(sequence)) return CompletableFuture.completedFuture(false);
-        Sequence.ExecutionLease lease;
         List<PrefixLayout.Copy> copies;
         try {
-            lease = sequence.claimExecution(0);
+            sequence.admit(0, position);
         } catch (RuntimeException failure) {
             // A cancellation that landed after the check above is the same outcome, not an error.
             return cancelled(sequence)
@@ -251,7 +249,7 @@ public final class PrefixCache implements AutoCloseable {
                     : CompletableFuture.failedFuture(failure);
         }
         try {
-            Quantum.attachSequenceState(plan, sequence, lease, this.gpu);
+            Quantum.attachSequenceState(plan, sequence, this.gpu);
             var attention = (AttentionStates) sequence.kvCacheState();
             var gdn = (GdnStates) sequence.recurrentState();
             for (int layer : this.layout.kvLayers()) attention.forLayer(layer).prepareAppend(0, position);
@@ -260,13 +258,13 @@ public final class PrefixCache implements AutoCloseable {
             if (speculative != null)
                 copies.addAll(speculative.restoreCopies(hit.match().chain(), this.layout::speculativeOffset, sequence));
         } catch (RuntimeException | Error failure) {
-            sequence.markFailed(lease, failure);
+            abandon(sequence, failure);
             return CompletableFuture.failedFuture(failure);
         }
         long started = System.nanoTime();
         return runCopies(frames, copies, true).handle((done, failure) -> {
             if (failure != null) {
-                sequence.markFailed(lease, failure);
+                abandon(sequence, failure);
                 throw new CompletionException(failure);
             }
             this.restores.incrementAndGet();
@@ -279,12 +277,18 @@ public final class PrefixCache implements AutoCloseable {
                     state.commitSubmitted();
                 }
                 if (speculative != null) speculative.restored(sequence, position);
-                return !sequence.releaseExecutionAndCheckCancellation(lease, position);
+                return !sequence.commit(position);
             } catch (RuntimeException | Error publication) {
-                sequence.markFailed(lease, publication);
+                abandon(sequence, publication);
                 throw new CompletionException(publication);
             }
         });
+    }
+
+    /// Fails the sequence and retires the restore in flight without its work.
+    private static void abandon(Sequence sequence, Throwable failure) {
+        sequence.fail(failure);
+        if (sequence.inFlight()) sequence.abandon();
     }
 
     private static boolean cancelled(Sequence sequence) {

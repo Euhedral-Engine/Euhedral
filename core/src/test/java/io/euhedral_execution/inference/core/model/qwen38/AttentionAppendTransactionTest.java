@@ -59,7 +59,11 @@ class AttentionAppendTransactionTest {
                     : cancel ? Quantum.Status.CANCELLED : Quantum.Status.SUCCESS;
             assertEquals(expected, result.status());
             if (expected == Quantum.Status.SUCCESS) assertEquals(64, gpu.cache.length());
-            else assertEquals(0, gpu.lengthAtFree, "an unsuccessful quantum never publishes its append");
+            else {
+                // The sequence's state closes when its owner completes it.
+                sequence.complete();
+                assertEquals(0, gpu.lengthAtFree, "an unsuccessful quantum never publishes its append");
+            }
             context.logitsOutput().ifPresent(DeviceLogits::close);
         } finally {
             runtime.close();

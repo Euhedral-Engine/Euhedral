@@ -113,9 +113,9 @@ class QuantumTest {
         assertSame(selectionFailure, assertThrows(IllegalStateException.class, () -> runtime.submit(context)));
         assertEquals(Quantum.Status.FAILED, context.conclusion().status());
         failSelection.set(false);
-        // A retry would claim a second lease and workspace that the finished outcome never releases.
+        // A retry would take a second sequence admission and workspace that the finished outcome never releases.
         assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
-        assertFalse(sequence.isExecutionClaimed());
+        assertFalse(sequence.inFlight());
         assertTrue(gpu.allocations.isEmpty());
         assertEquals(0, runtime.activeQuanta());
 
@@ -235,25 +235,24 @@ class QuantumTest {
     }
 
     @Test
-    void cancellationCleanupFailureStillPublishesOutcomeAndCanBeRetried() throws Exception {
+    void aCancelledQuantumLeavesCleanupToCompleteWhichReportsAndRetriesAFailedFree() throws Exception {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
         var sequence = new Sequence(901);
-        var lease = sequence.claimExecution(0);
+        sequence.admit(0, 0);
         var attempts = new AtomicInteger();
-        sequence.setRecurrentState(lease, (AutoCloseable) () -> {
+        sequence.setRecurrentState((AutoCloseable) () -> {
             if (attempts.incrementAndGet() == 1) throw new IllegalStateException("transient free failure");
         });
-        sequence.releaseExecution(lease, 0);
+        sequence.commit(0);
         var context = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         gpu.afterEmbedding = context::cancel;
         var runtime = ExecutionFixtures.runtime(plan, gpu);
         var outcome = runtime.submit(context);
-        assertEquals(
-                Quantum.Status.FAILED,
-                outcome.get(10, TimeUnit.SECONDS).status(),
-                "terminal cleanup failure stranded the generation future");
-        assertFalse(sequence.isExecutionClaimed());
+        assertEquals(Quantum.Status.CANCELLED, outcome.get(10, TimeUnit.SECONDS).status());
+        assertFalse(sequence.inFlight());
+        assertEquals(0, attempts.get(), "the sequence's state closes only when its owner completes it");
+        assertThrows(IllegalStateException.class, sequence::complete);
         sequence.complete();
         assertEquals(2, attempts.get());
         runtime.close();
@@ -276,7 +275,7 @@ class QuantumTest {
         var outcome = runtime.submit(context, completed -> {
             outputs.add(completed.workspace().projectionAddress(0));
             outputs.add(completed.workspace().projectionAddress(1));
-            assertTrue(sequence.isExecutionClaimed());
+            assertTrue(sequence.inFlight());
             assertFalse(completed.workspace().isClosed());
         });
 
@@ -416,7 +415,7 @@ class QuantumTest {
     }
 
     @Test
-    void cancellationBetweenAdmissionCheckAndLeaseClaimPublishesCancelled() {
+    void cancellationBetweenAdmissionCheckAndSequenceAdmissionPublishesCancelled() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
         var gpu = new ExecutionFixtures.RecordingGpu();
         var sequence = new Sequence(104);

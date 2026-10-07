@@ -181,9 +181,9 @@ class PrefixLayoutTest {
 
     private static Sequence holding(AttentionStates attention) {
         var sequence = new Sequence(1);
-        var lease = sequence.claimExecution(0);
-        sequence.setKvCacheState(lease, attention);
-        sequence.releaseExecution(lease, 0);
+        sequence.admit(0, 0);
+        sequence.setKvCacheState(attention);
+        sequence.commit(0);
         return sequence;
     }
 

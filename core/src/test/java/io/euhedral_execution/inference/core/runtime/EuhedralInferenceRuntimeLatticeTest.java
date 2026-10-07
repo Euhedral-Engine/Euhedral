@@ -331,7 +331,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 assertFalse(gpu.freed.contains(embeddingAddress));
             } finally {
                 runtime.close();
-                if (sequence.terminalState() == Sequence.TerminalState.ACTIVE && !sequence.isExecutionClaimed())
+                if (sequence.terminalState() == Sequence.TerminalState.ACTIVE && !sequence.inFlight())
                     sequence.complete();
             }
         } finally {
@@ -398,7 +398,7 @@ class EuhedralInferenceRuntimeLatticeTest {
             }
             awaitDrained(lattice);
         } finally {
-            if (sequence.terminalState() == Sequence.TerminalState.ACTIVE && !sequence.isExecutionClaimed()) {
+            if (sequence.terminalState() == Sequence.TerminalState.ACTIVE && !sequence.inFlight()) {
                 sequence.complete();
             }
             lattice.close();

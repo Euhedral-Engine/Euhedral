@@ -249,7 +249,7 @@ class SessionPrefixCacheTest {
 
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
-    void aCancelledGenerationLeavesNoQuantumOrLeaseBehind() throws Exception {
+    void aCancelledGenerationLeavesNoQuantumInFlightBehind() throws Exception {
         Harness h = harness(32L << 20, 1024);
         try {
             int[] prompt = prompt(2000);
@@ -263,7 +263,7 @@ class SessionPrefixCacheTest {
                     second.cancel();
                     // Cancelling before, during or after the restore ends the generation normally, never in an error.
                     future.get(30, TimeUnit.SECONDS);
-                    assertFalse(second.sequenceState().isExecutionClaimed());
+                    assertFalse(second.sequenceState().inFlight());
                 }
             }
             assertEquals(0, h.runtime().activeQuanta());

@@ -21,7 +21,7 @@ public final class AttentionStates implements AutoCloseable {
     private DFlash2State dflash2;
     /// Split-KV decode scratch shared by every attention layer of the sequence: a quantum's attention
     /// layers run one after another (each needs the previous layer's output) and the sequence's quanta are
-    /// serialized by its lease, so one area serves them all.
+    /// serialized by the generation chain, one quantum in flight at a time, so one area serves them all.
     private long decodeScratch;
     private int decodeScratchHeads;
     private int decodeScratchRows;
