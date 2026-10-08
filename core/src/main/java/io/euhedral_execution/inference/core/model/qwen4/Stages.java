@@ -15,6 +15,17 @@ final class Stages {
     private Stages() {}
 
     static StageFrame create(StageGraph graph, int stage, Shape shape, Shape.Spec spec) {
+        return create(graph, stage, shape, spec, 0);
+    }
+
+    /// The frame of `spec` in chunk `chunk` of a prompt graph, at stage `stage`.
+    static StageFrame create(StageGraph graph, int stage, Shape shape, Shape.Spec spec, int chunk) {
+        StageFrame frame = of(graph, stage, shape, spec);
+        ((Base) frame).chunk = chunk;
+        return frame;
+    }
+
+    private static StageFrame of(StageGraph graph, int stage, Shape shape, Shape.Spec spec) {
         int layer = spec.layer();
         int index = spec.index();
         return switch (spec.kind()) {
@@ -45,6 +56,8 @@ final class Stages {
     private abstract static class Base extends StageFrame {
         final Shape shape;
         final int layer;
+        /// The chunk of a prompt graph this stage belongs to; 0 in any other graph.
+        int chunk;
 
         Base(StageGraph graph, int stage, Shape shape, int layer) {
             this(graph, stage, shape, layer, false);
@@ -61,6 +74,16 @@ final class Stages {
             super(graph, stage, ordered);
             this.shape = shape;
             this.layer = layer;
+        }
+
+        /// The chunk of the quantum this stage runs.
+        final Quantum.Chunk chunk() {
+            return quantum().chunk(this.chunk);
+        }
+
+        /// The n-gram rows of this stage's chunk.
+        final Quantum.PleRows pleRows() {
+            return quantum().pleRows(this.chunk);
         }
 
         final Quantum quantum() {
@@ -94,7 +117,7 @@ final class Stages {
         }
 
         final int rows() {
-            return quantum().rows();
+            return chunk().rows();
         }
 
         final HyperConnection.Scratch hyperScratch() {
@@ -182,7 +205,9 @@ final class Stages {
             tick(ExecutionPlan.Timings.EMBEDDING);
             ExecutionPlan plan = plan();
             Workspace storage = storage();
-            gpu().copyUploadToDevice(storage.tokensDevice(), storage.tokenUpload());
+            Quantum quantum = quantum();
+            if (quantum.chunkCount() == 1) gpu().copyUploadToDevice(storage.tokensDevice(), storage.tokenUpload());
+            else gpu().copyHostToDeviceAsync(storage.tokensDevice(), quantum.promptTokens(this.chunk), 4L * rows());
             Ops.embedding(
                     gpu(),
                     plan.embedding().address(),
@@ -213,18 +238,19 @@ final class Stages {
             ExecutionPlan plan = plan();
             Workspace storage = storage();
             Quantum quantum = quantum();
-            storage.pleUpload = null;
-            storage.pleCount = plan.ple()
-                    .prepare(quantum.sequence().ple(), quantum.tokens(), quantum.offset(), rows(), storage.pleRowIds);
-            storage.pleUpload = gpu().allocateUploadBuffer(plan.ple().recordsBytes(rows()));
+            Quantum.PleRows ple = pleRows();
+            ple.upload = null;
+            ple.count = plan.ple()
+                    .prepare(quantum.sequence().ple(), quantum.tokens(), chunk().offset(), rows(), ple.rowIds);
+            ple.upload = gpu().allocateUploadBuffer(plan.ple().recordsBytes(rows()));
         }
 
         /// The device stopped reading the staging buffer, or the quantum ended without reading it.
         @Override
         protected void retired(boolean committed) {
-            Workspace storage = storage();
-            ExecutionGpu.UploadBuffer finished = storage.pleUpload;
-            storage.pleUpload = null;
+            Quantum.PleRows ple = pleRows();
+            ExecutionGpu.UploadBuffer finished = ple.upload;
+            ple.upload = null;
             if (finished != null) finished.close();
         }
     }
@@ -250,15 +276,15 @@ final class Stages {
         private static final int MIN_PART_ROWS = 64;
 
         private int parts() {
-            return (int) Math.max(1, Math.min(Shape.PLE_PARTS, storage().pleCount / MIN_PART_ROWS));
+            return (int) Math.max(1, Math.min(Shape.PLE_PARTS, pleRows().count / MIN_PART_ROWS));
         }
 
         private int from() {
-            return this.part >= parts() ? 0 : (int) ((long) storage().pleCount * this.part / parts());
+            return this.part >= parts() ? 0 : (int) ((long) pleRows().count * this.part / parts());
         }
 
         private int to() {
-            return this.part >= parts() ? 0 : (int) ((long) storage().pleCount * (this.part + 1) / parts());
+            return this.part >= parts() ? 0 : (int) ((long) pleRows().count * (this.part + 1) / parts());
         }
 
         @Override
@@ -269,7 +295,8 @@ final class Stages {
         @Override
         protected void submit() {
             Workspace storage = storage();
-            plan().ple().gather(storage.pleRowIds, from(), to(), storage.pleUpload.segment());
+            Quantum.PleRows ple = pleRows();
+            plan().ple().gather(ple.rowIds, from(), to(), ple.upload.segment());
         }
     }
 
@@ -300,7 +327,7 @@ final class Stages {
                             storage.state(),
                             scratch,
                             storage.pleOutput(),
-                            storage.pleUpload);
+                            pleRows().upload);
             gpu().residualAddBf16(
                             storage.state(),
                             storage.pleOutput(),
@@ -661,7 +688,7 @@ final class Stages {
 
         @Override
         protected boolean skips() {
-            return quantum().sink() == null;
+            return quantum().sink() == null || !chunk().last();
         }
 
         @Override

@@ -215,6 +215,29 @@ final class Shape implements GraphShape {
         return 1;
     }
 
+    /// The sequence state a stage of `kind` at `layer` carries from one chunk of a prompt to the next: its
+    /// layer's GDN or QSA state (key `layer`), the PLE's host n-gram context (key `layers`) and its convolution
+    /// history (key `layers + 1`).
+    static int[] carriedKeys(Kind kind, int layer, int layers) {
+        return switch (kind) {
+            case BLOCK, ATTENTION -> new int[] {layer};
+            case PLEIDS -> new int[] {layers};
+            case PLE -> new int[] {layers + 1};
+            default -> NO_BUFFERS;
+        };
+    }
+
+    @Override
+    public int[] carriedState(int stage) {
+        Spec spec = this.specs.get(stage);
+        return carriedKeys(spec.kind(), spec.layer(), this.plan.layers());
+    }
+
+    @Override
+    public int carriedStateCount() {
+        return this.plan.layers() + 2;
+    }
+
     @Override
     public StageTopology topology() {
         return this.topology;

@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
@@ -36,6 +37,28 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
     private Workspace storage;
     private MoeLayer moe;
     private boolean prepared;
+    /// The quantum's rows in chunks: a prompt's chunks, or one chunk of all its rows.
+    private final Chunk[] chunks;
+    /// A prompt's own pinned copy of its tokens (one chunk's go through the workspace's), and the n-gram rows of
+    /// each of its chunks, whose host stages may run ahead of the previous chunk.
+    private ExecutionGpu.UploadBuffer promptUpload;
+    private PleRows[] pleRows;
+
+    /// One chunk of a quantum's rows: its place, the index of its first token in the quantum's token array, its
+    /// rows. Only the last chunk produces logits.
+    record Chunk(int index, int offset, int rows, boolean last) {}
+
+    /// A chunk's n-gram rows, their staging buffer and how many there are: written by the stage that computes the
+    /// ids, read by the stages that gather and copy them.
+    static final class PleRows {
+        final long[] rowIds;
+        ExecutionGpu.UploadBuffer upload;
+        int count;
+
+        PleRows(int rows) {
+            this.rowIds = new long[rows];
+        }
+    }
 
     // The diagnostic shape's clock: the component running and when it began.
     private int component = -1;
@@ -58,6 +81,54 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         this.rows = rows;
         this.sink = sink;
         this.exchange = exchange;
+        this.chunks = new Chunk[] {new Chunk(0, offset, rows, true)};
+    }
+
+    /// A prompt quantum: `rows` tokens from `offset` in chunks of `chunkRows` (the remainder last), run as one
+    /// graph whose chunks are copies of `shape`'s chunk template.
+    Quantum(
+            ExecutionPlan plan,
+            Shape shape,
+            Sequence sequence,
+            int[] tokens,
+            int offset,
+            int rows,
+            int chunkRows,
+            ExecutionPlan.LogitsSink sink) {
+        if (chunkRows <= 0) throw new IllegalArgumentException("chunkRows must be positive");
+        this.plan = plan;
+        this.shape = shape;
+        this.sequence = sequence;
+        this.tokens = tokens;
+        this.offset = offset;
+        this.rows = rows;
+        this.sink = sink;
+        this.exchange = null;
+        int count = (rows + chunkRows - 1) / chunkRows;
+        this.chunks = new Chunk[count];
+        for (int index = 0; index < count; index++) {
+            int first = index * chunkRows;
+            this.chunks[index] =
+                    new Chunk(index, offset + first, Math.min(chunkRows, rows - first), index == count - 1);
+        }
+    }
+
+    Chunk chunk(int index) {
+        return this.chunks[index];
+    }
+
+    int chunkCount() {
+        return this.chunks.length;
+    }
+
+    /// Chunk `chunk`'s n-gram rows: the workspace's for a quantum of one chunk.
+    PleRows pleRows(int chunk) {
+        return this.chunks.length == 1 ? this.storage.ple() : this.pleRows[chunk];
+    }
+
+    /// The pinned host address of chunk `chunk`'s tokens in a prompt's own copy.
+    long promptTokens(int chunk) {
+        return this.promptUpload.segment().address() + 4L * (this.chunks[chunk].offset() - this.offset);
     }
 
     // ---------------------------------------------------------------- what the stages read
@@ -124,8 +195,17 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         this.storage = lease.storage();
         this.moe = lease.moe();
         this.prepared = true;
-        for (int i = 0; i < this.rows; i++)
-            this.storage.tokenUpload().segment().set(INT, 4L * i, this.tokens[this.offset + i]);
+        if (this.chunks.length == 1) {
+            for (int i = 0; i < this.rows; i++)
+                this.storage.tokenUpload().segment().set(INT, 4L * i, this.tokens[this.offset + i]);
+        } else {
+            this.promptUpload = this.plan.gpu().allocateUploadBuffer(4L * this.rows);
+            for (int i = 0; i < this.rows; i++)
+                this.promptUpload.segment().set(INT, 4L * i, this.tokens[this.offset + i]);
+            this.pleRows = new PleRows[this.chunks.length];
+            int perToken = this.plan.ple().rowsPerToken();
+            for (Chunk chunk : this.chunks) this.pleRows[chunk.index()] = new PleRows(chunk.rows() * perToken);
+        }
         if (stopRequested()) {
             // Stopped before it began: no stage will run, so the runtime publishes the outcome this prepares.
             retire(null);
@@ -146,6 +226,11 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         if (!this.prepared) return;
         tick(-1);
         this.moe.abandon();
+        // The device stopped reading the prompt's tokens: every chunk's embedding retired.
+        if (this.promptUpload != null) {
+            this.promptUpload.close();
+            this.promptUpload = null;
+        }
     }
 
     @Override
