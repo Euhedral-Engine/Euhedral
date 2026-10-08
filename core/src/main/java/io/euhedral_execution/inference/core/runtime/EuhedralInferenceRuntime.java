@@ -210,7 +210,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         try {
             this.gpu.ensureHealthy();
             pool = pool(shape);
-            pooled = pool.acquire();
+            pooled = pool.idleOrNew();
         } catch (RuntimeException | Error failure) {
             quantum.lanesJoined(null);
             quantum.fail(failure);
@@ -435,7 +435,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             this.use = WorkspaceUse.of(view);
         }
 
-        PooledGraph acquire() {
+        PooledGraph idleOrNew() {
             PooledGraph graph = this.idle.poll();
             return graph != null ? graph : build();
         }

@@ -138,6 +138,8 @@ class ArchitectureTest {
     static final Pattern BLOCKING = Pattern.compile("\\bsynchronized\\b"
             + "|\\b(ReentrantLock|ReadWriteLock|StampedLock|Semaphore|Condition)\\b|\\.wait\\(|LockSupport\\.park"
             + "|\\.join\\(\\)|\\bnew Thread\\b|Thread\\.of(Platform|Virtual)|\\bExecutors\\b|\\bExecutorService\\b"
+            + "|\\.(lock|lockInterruptibly)\\(\\)|\\.tryLock\\(|\\.(acquire|acquireUninterruptibly)\\(\\d*\\)"
+            + "|\\.await\\(\\)|\\.await\\(\\d+\\s*,"
             + "|(result|future|outcome|done|settled|completion)\\w*\\(\\)\\.get\\(|\\.get\\(\\d+\\s*,\\s*TimeUnit");
 
     /// The lifecycle and tool methods that may lock, wait or start threads, as `path#method`.
@@ -149,6 +151,7 @@ class ArchitectureTest {
             "runtime/graph/InferenceLake.java#attach",
             "runtime/graph/InferenceLake.java#awaitTermination",
             "runtime/HostTasks.java#close",
+            "gpu/CudaGpuMemory.java#close",
             "model/qwen38/Execution.java#execute",
             "model/qwen38/Execution.java#close",
             "model/qwen38/Session.java#close",
@@ -169,7 +172,7 @@ class ArchitectureTest {
 
     private static List<Path> hotPathSources() throws IOException {
         List<Path> files = new ArrayList<>();
-        for (String directory : List.of("model/qwen38", "model/qwen4", "runtime", "generation", "prefix", "state"))
+        for (String directory : List.of("model/qwen38", "model/qwen4", "runtime", "generation", "prefix", "state", "gpu"))
             files.addAll(javaFiles(directory, true));
         return files;
     }
