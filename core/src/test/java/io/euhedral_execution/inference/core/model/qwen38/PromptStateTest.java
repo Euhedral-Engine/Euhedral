@@ -20,7 +20,7 @@ class PromptStateTest {
     void gdnAndKvStagesCarryTheirLayersState() {
         Shape view = PLAN.forExecution(Quantum.ExecutionKind.PREFILL, 64);
         int layers = PLAN.weights().config().numHiddenLayers();
-        assertEquals(2 * (layers + 1), view.carriedStateCount());
+        assertEquals(Shape.seedRowsKey(layers) + 3, view.carriedStateCount());
         boolean gdn = false, kv = false;
         for (int stage = 0; stage < view.topology().size(); stage++) {
             ExecutionPlan.Instruction instruction = view.instructions().get(stage);
@@ -48,6 +48,30 @@ class PromptStateTest {
             }
         }
         assertTrue(gdn && kv, "the fixture has GDN and attention layers");
+    }
+
+    @Test
+    void aDraftingPlansSeedRowsAndMtpCacheAreCarriedState() {
+        var plan = new ExecutionPlan(ExecutionFixtures.mtpCompactWeights(8));
+        int layers = plan.weights().config().numHiddenLayers();
+        int seed = Shape.seedRowsKey(layers);
+        Shape prefill = plan.forExecution(Quantum.ExecutionKind.PREFILL, 64);
+        assertTrue(carries(prefill, ExecutionPlan.Kind.RMS_NORM, seed), "the base final norm writes the seed rows");
+        Shape draft = plan.forExecution(Quantum.ExecutionKind.DRAFT, 1);
+        assertTrue(carries(draft, ExecutionPlan.Kind.MTP_STEM, seed), "the MTP stem reads them");
+        assertTrue(carries(draft, ExecutionPlan.Kind.RMS_NORM, seed), "the MTP final norm writes the recursion row");
+        assertTrue(
+                carries(draft, ExecutionPlan.Kind.ATTENTION_KV_APPEND, 2 * layers + 1),
+                "the MTP layer appends to its own cache");
+    }
+
+    private static boolean carries(Shape view, ExecutionPlan.Kind kind, int key) {
+        for (int stage = 0; stage < view.topology().size(); stage++)
+            if (view.instructions().get(stage).kind() == kind
+                    || kind == ExecutionPlan.Kind.RMS_NORM
+                            && view.instructions().get(stage).kind() == ExecutionPlan.Kind.RMS_NORM_UNIT_OFFSET)
+                for (int carried : view.carriedState(stage)) if (carried == key) return true;
+        return false;
     }
 
     @Test

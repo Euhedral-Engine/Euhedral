@@ -53,7 +53,8 @@ public final class AttentionStates implements AutoCloseable {
     public long draftSeedRows(int rows, int hidden) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
         if (rows > this.draftSeedCapacity) {
-            // Grown in stream order inside a stage: the outgrown rows' readers are retired quanta.
+            // Grown in stream order inside a stage: the outgrown rows' readers precede it, through the carried
+            // seed-row edges or by retiring first.
             if (this.draftSeedRows != 0) this.gpu.freeAsync(this.draftSeedRows);
             this.draftSeedRows = 0;
             this.draftSeedCapacity = 0;
@@ -61,6 +62,14 @@ public final class AttentionStates implements AutoCloseable {
             this.draftSeedRows = this.gpu.allocateAsync((long) capacity * hidden * Short.BYTES);
             this.draftSeedCapacity = capacity;
         }
+        return this.draftSeedRows;
+    }
+
+    /// The draft seed rows as they are now, without growing them: what a catch-up reads, from its stage, after the
+    /// seeding quantum's writer.
+    public long seedRows() {
+        if (this.closed) throw new IllegalStateException("attention sequence states are closed");
+        if (this.draftSeedRows == 0) throw new IllegalStateException("no quantum seeded drafting");
         return this.draftSeedRows;
     }
 

@@ -806,7 +806,7 @@ public final class Session implements GenerationSession {
                         maxNewTokens,
                         Call.this::speculativeToken,
                         timing,
-                        Call.this::checkpoint,
+                        prefixHooks,
                         0,
                         Call.this::speculativeEnded);
             }
@@ -833,9 +833,22 @@ public final class Session implements GenerationSession {
                         maxNewTokens,
                         Call.this::speculativeToken,
                         timing,
-                        Call.this::checkpoint,
+                        prefixHooks,
                         hit.position(),
                         Call.this::speculativeEnded);
+            }
+        };
+
+        /// The prefix cache's hooks in a speculative prompt: where it checkpoints, and the checkpoint itself.
+        private final SpeculativeDecoding.PrefixHooks prefixHooks = new SpeculativeDecoding.PrefixHooks() {
+            @Override
+            public boolean wants(int end) {
+                return end > cursor.position() && prefixCache.wantsCheckpoint(end, promptTokenIds.length);
+            }
+
+            @Override
+            public void afterChunk(int end, Consumer<Throwable> failed, AbstractFrame next) {
+                checkpoint(end, failed, next);
             }
         };
 

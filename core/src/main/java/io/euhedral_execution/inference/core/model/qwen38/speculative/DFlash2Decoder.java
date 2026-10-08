@@ -38,8 +38,10 @@ import java.util.function.IntPredicate;
 /// 2. a VERIFY of `[anchor, proposal]`: the target's exact row-by-row verification, which also taps every row;
 /// 3. a DRAFT_CONTEXT over the committed rows' taps, so the next block sees them.
 ///
-/// The prompt is prefilled in chunks that tap their rows, each followed by its context quantum. Not thread-safe;
-/// one decoder per sequence.
+/// The prompt is prefilled in chunks that tap their rows, each followed by its context quantum. The chunks before
+/// the last run ahead ([Run#ahead]): they are admitted with their context quanta at once, up to the next prefix
+/// checkpoint, and the sequence's carried state (the taps, the context ring) orders them. Not thread-safe; one
+/// decoder per sequence.
 public final class DFlash2Decoder implements SpeculativeDecoding {
 
     /// Per-generation measurements. `acceptedDrafts[a]` counts verifications that accepted `a` drafts.
@@ -230,6 +232,11 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         private long started;
         private int[] chunk;
 
+        // The run-ahead in flight: chunks [offset, aheadEnd) with their context quanta.
+        private int aheadEnd;
+        private Throwable aheadRefusal;
+        private Throwable drainFailure;
+
         // The context quantum in flight.
         private long contextPosition;
         private int[] contextTokens;
@@ -263,8 +270,77 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
         StepPort prefillFrom(int from) {
             this.offset = from;
-            return this.offset >= this.prompt.length ? afterPrompt() : this.prefill;
+            if (this.offset >= this.prompt.length) return afterPrompt();
+            int lastStart = from + (this.prompt.length - from - 1) / prefillChunk * prefillChunk;
+            if (from == lastStart) return this.prefill;
+            // Up to the last chunk, whose prefill fills the host row, or to the first checkpoint the cache wants.
+            int stop = from + prefillChunk;
+            while (stop < lastStart && (this.hooks == null || !this.hooks.wants(stop))) stop += prefillChunk;
+            this.aheadEnd = stop;
+            return this.ahead;
         }
+
+        /// Prompt chunks before the last, each with its context quantum, admitted at once. A chunk's tap
+        /// writers follow the previous context's readers through the carried taps, its context's ring writes
+        /// follow the previous context's, and the rest of the chunk runs ahead. Only the last context's
+        /// conclusion comes back: the sequence concludes the quanta in admission order, and one that failed
+        /// blocks the rest.
+        private final StepPort ahead = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                started = System.nanoTime();
+                aheadRefusal = null;
+                for (int at = offset; at < aheadEnd; at += prefillChunk) {
+                    int[] tokens = Arrays.copyOfRange(prompt, at, at + prefillChunk);
+                    refused(runtime.admitAhead(new Quantum(
+                                    plan, sequence, Quantum.ExecutionKind.PREFILL, at, tokens, LogitsRequirement.NONE)
+                            .seedingDraft()));
+                    Quantum context = new Quantum(
+                            plan, sequence, Quantum.ExecutionKind.DRAFT_CONTEXT, at, tokens, LogitsRequirement.NONE);
+                    if (at + prefillChunk == aheadEnd) runtime.admit(context, select);
+                    else refused(runtime.admitAhead(context));
+                }
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                // A refused last context leaves the earlier quanta in flight: the run ends after them.
+                if (sequence.inFlight()) {
+                    drainFailure = ((Quantum) step).conclusion().failure();
+                    return drain;
+                }
+                succeeded(step);
+                if (aheadRefusal != null) throw new IllegalStateException("a prompt chunk was refused", aheadRefusal);
+                DFlash2State state = state();
+                if (sequence.committedFrontier() != aheadEnd || state == null || state.contextLength() != aheadEnd)
+                    throw new IllegalStateException("the prompt's chunks stopped short of " + aheadEnd);
+                long executed = System.nanoTime();
+                statistics.prefillNanos += executed - started;
+                if (timing != null) timing.prefillQuantum(started, executed, aheadEnd - offset);
+                end = aheadEnd;
+                return hooks == null || !hooks.wants(end) ? prefillFrom(end) : capture;
+            }
+        };
+
+        private void refused(Throwable refusal) {
+            if (refusal == null) return;
+            if (this.aheadRefusal == null) this.aheadRefusal = refusal;
+            else if (this.aheadRefusal != refusal) this.aheadRefusal.addSuppressed(refusal);
+        }
+
+        /// Waits, one thrown frame at a time, for quanta a refused step left in flight, then fails the run.
+        private final StepPort drain = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                runtime.lake().publishOrRun(select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                if (sequence.inFlight()) return this;
+                throw new IllegalStateException("a speculative quantum was refused", drainFailure);
+            }
+        };
 
         /// Prompt: a prefill chunk that taps its rows; its context quantum follows.
         private final StepPort prefill = new StepPort() {
@@ -327,7 +403,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                 if (context == Context.PROMPT) {
                     statistics.promptContextNanos += contextDone - contextStarted;
                     if (timing != null) timing.draftQuantum("prompt-context", contextStarted, contextDone);
-                    return hooks == null ? prefillFrom(end) : capture;
+                    return hooks == null || !hooks.wants(end) ? prefillFrom(end) : capture;
                 }
                 statistics.contextNanos += contextDone - contextStarted;
                 if (timing != null) timing.draftQuantum("context", contextStarted, contextDone);

@@ -53,7 +53,8 @@ public final class DFlash2State implements AutoCloseable {
     public long taps(int rows) {
         if (this.closed) throw new IllegalStateException("DFlash2 state is closed");
         if (rows > this.tapCapacity) {
-            // Grown in stream order inside a stage: the outgrown taps' readers are retired quanta.
+            // Grown in stream order inside a stage: the outgrown taps' readers precede it, through the carried tap
+            // edges or by retiring first.
             if (this.taps != 0) this.gpu.freeAsync(this.taps);
             this.taps = 0;
             this.tapCapacity = 0;
