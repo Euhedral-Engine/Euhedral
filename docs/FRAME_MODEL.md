@@ -32,7 +32,8 @@ quantum at a time:
 - successor references, wired at construction;
 - one frame per device-completion edge and one retirement frame;
 - its home lane in the runtime's lane pool;
-- its workspace storage (`WorkspaceStorage`), which the runtime's pool keeps with the graph.
+- its own storage (`WorkspaceStorage`): the input record and the logits, which the runtime's pool keeps with the
+  graph. Every other buffer is a slot of the runtime's one workspace (below).
 
 Per quantum, the graph only resets fan-in counters and per-stage flags and binds the
 `Quantum`. No frame, wrapper, successor list, graph, or device buffer is created on the hot
@@ -45,15 +46,12 @@ through it.
 
 Each resource lives as long as its natural owner, so the token boundary neither allocates nor frees:
 
-- Workspace storage belongs to the graph. A quantum's `Workspace` acquires its buffers,
-  including the token-ID buffer, from the graph's storage at admission and releases the binding at
-  retirement without freeing anything; the next quantum on the graph finds the same allocations. The
-  storage is a fixed table of slots, one per buffer. A slot keeps the largest allocation a binding asked
-  for, so storage is bounded by the graph's largest quantum, never by token count. A larger quantum
-  replaces only its undersized slots, at admission, while the graph is idle. Because the pool recycles a
-  graph only after its quantum retired, storage is never shared by two live quanta. The runtime frees it
-  when it closes, and only when the device proves completion; `retainedWorkspaceBytes()` reports it, so
-  the engine's device bytes after a session closes are exactly the weights plus that storage.
+- The workspace belongs to the runtime. One `SharedWorkspace` per dense runtime (one `Workspace` per Qwen4 plan) is
+  allocated at load, sized for the largest quantum any view runs (`maxRows`, the prefill chunk), and every graph binds
+  the same buffers. Nothing grows while quanta run: a quantum larger than the workspace is refused at admission. The
+  runtime frees it when it closes, and only when the device proves completion; `retainedWorkspaceBytes()` reports it,
+  so the engine's device bytes after a session closes are exactly the weights plus that storage. Graphs share it
+  through edges, not turns: see [The workspace and its owner](#the-workspace-and-its-owner).
 - A sampling quantum copies its final logits row into its session's pinned `HostLogits` row. The
   logits stage queues the device-to-host copy on its own lane right after the LM head, so the
   quantum's single retirement boundary proves the row complete; the CPU reads it only after a
@@ -72,19 +70,45 @@ seal) that runs once.
 
 ## Admission
 
-Admission is small:
+Admission is a frame on the workspace's owner: its `idHash` is `WorkspaceOwner.HASH` and it stays ordered on it,
+so admissions run one at a time, in the order they were published (`publishOnOwner`). It is small:
 
 1. acquire an idle graph for the quantum's shape;
 2. prepare quantum-owned resources with the graph's stream selected (the sequence's admission,
    persistent state on first use, the binding of the graph's workspace storage), so any initialization it
    queues precedes every stage;
-3. publish the root stages to the lake.
+3. bind the graph behind the previous users of each workspace buffer it touches (`WorkspaceOwner.bind`), then publish
+   the root stages to the lake.
 
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
 terminal outcome at admission, after the stream proves that queued initialization stopped. A quantum is
 admitted at most once: if admission itself fails, the failure is thrown and the quantum's outcome fails
 too, so it can never be retried into a second sequence admission. An outcome reached at admission is published only
 after the graph's stream is deselected, so outcome callbacks never launch onto it.
+
+## The workspace and its owner
+
+A shape declares, for each stage, the workspace buffers it reads or writes (`GraphShape.workspaceBuffers`).
+`WorkspaceUse` finds each buffer's entries (the stages that touch it first) and exits (the ones that touch it last).
+The workspace's owner keeps, for each buffer, the graph that used it last and that graph's exits. When it binds a new
+graph, each entry of a buffer waits on an external edge (`ExternalEdge`) for the previous graph's exits of that buffer
+to be submitted. These edges are lock-free: each stage keeps a stack of its external waiters, and a stage that was
+already submitted, or swept when its graph went idle, satisfies a late waiter at once. Two quanta therefore run at once
+on two graphs wherever their buffers do not overlap, and reuse of a buffer follows stream order across graphs. A graph
+never waits on its own previous binding: it was recycled only after its device work retired.
+
+Two kinds of buffer that used to take locks are now ordinary workspace buffers:
+
+- **The expansion scratch** (P2E2, MX and native NVFP4 activations) is one buffer. A stage that takes it declares a
+  `ScratchUse`, and the shape chains the declared users with hazard edges. The stage binds the region around its
+  submission (`ExecutionGpu.withScratch`). An undeclared use takes a private region in stream order (`allocateAsync`)
+  and counts a fallback.
+- **Staging slots** for host-backed weights are buffers. The transfer that fills a slot writes it, and the weight's
+  consumer reads it. The owner's records tell admission whether a DFlash2 block's slots still hold what its preloaded
+  variant needs (`Execution.preloadHolds`).
+
+Qwen4 declares its one workspace as a single buffer on every device stage. Its plan-wide completion chain runs one
+quantum at a time, so the edge only orders a graph behind the previous one.
 
 ## The lake
 
@@ -214,11 +238,11 @@ Persistent sequence state has distinct frontiers. For NVFP4 attention KV (`Atten
   because stream order runs their reads after the writes;
 - committed: `length()`, published only at the quantum's retirement (`commitSubmitted`).
 
-Reservation runs inside the owning quantum with its stream selected. A grown page table is filled into
-pinned staging and uploaded by a copy queued on that stream, ahead of the stages that read it, so
-reservation never waits for the device. The staging and any outgrown table are released when the
-append is committed or discarded, after retirement: nothing in the quantum references the old table,
-but freeing it mid-quantum would synchronize with the queued work.
+Reservation runs inside the owning quantum with its stream selected. A grown page table is allocated in stream order
+(`allocateAsync`), filled into pinned staging, and uploaded by a copy queued on that stream ahead of the stages that read
+it. The outgrown table is freed in stream order right after the upload (`freeAsync`), so reservation never waits for the
+device and never synchronizes with queued work. The other per-sequence growth (decode scratch, seed rows, DFlash2 taps,
+speculative GDN state, host-logits row selections) grows the same way.
 
 Other quanta and external readers never see beyond the committed frontier. A failed or cancelled
 quantum never commits (`discardSubmitted`). GDN recurrent and convolution state is updated in place by
@@ -303,11 +327,12 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   keep-alive (an SSE comment, or Anthropic's `ping`) from the second prefill quantum on. The same tasks probe the queued
   requests, which give up their places. Measured on `q3`: a JSON client that left closed its session 9 ms later, and a
   stream abandoned 1 s into a 13 s prefill let the next request run 0.45 s later.
-- **The prefix cache** ([PREFIX_CACHE.md](PREFIX_CACHE.md)) captures and restores sequence state between quanta, as
-  frames: each frame runs at most 16 MiB of copies between the pinned arena and the sequence's buffers, one after
-  another, with no stream selected, so a worker is never held for a whole checkpoint. The worker that retires a prefill
-  chunk publishes its checkpoint, then admits the next chunk; a restore runs before the first quantum is admitted.
-  A 16384-token restore takes 23 ms and a checkpoint's capture about 5 ms.
+- **The prefix cache** ([PREFIX_CACHE.md](PREFIX_CACHE.md)) captures and restores sequence state between quanta. Its
+  tree belongs to its owner: lookups, reservations, publications and releases are frames ordered on `PrefixCache.HASH`.
+  Its copies are queued asynchronously on the cache's own stream in pieces of at most 16 MiB, so a worker is never held
+  for a whole checkpoint, and their device completion is a frame. Each prefix step tells the session what happened and
+  throws the step's `Select`. A 16384-token restore takes 23 ms and a checkpoint's capture about 5 ms (measured with
+  the synchronous copies these replaced).
 - **Host jobs have their own routing seeds** (`FrameSeeds.forHostWork`). A stage graph's seeds decide which workers, and
   therefore which lanes, its stages run on. When tokenization drew from the graphs' sequence, every graph built after
   it got other seeds: on nvfp4-compressed at 32K the verify step took 34.1 ms instead of 33.7 ms (CUDA graphs off), and
@@ -342,7 +367,7 @@ between its two quanta, and one callback per quantum.
 
 The host boundary between decode tokens (retirement callback to the next quantum's first launch) is 0.37 ms with no device
 allocation, free, or synchronous copy and no host allocation; what remained was CPU sampling (0.20 ms argmax, 0.07 ms
-BF16-to-FP32 conversion), which greedy calls avoid by selecting on the device (below). Workspace storage stays with the graph, the sampled row is copied to pinned host memory before retirement,
+BF16-to-FP32 conversion), which greedy calls avoid by selecting on the device (below). The workspace is allocated at load, the sampled row is copied to pinned host memory before retirement,
 and page-table uploads are queued on the stream, so none of them allocates or synchronizes at the token boundary.
 
 A greedy, unconstrained call selects on the device: `euhedral_argmax_bf16` (`native/src/sampling/`), one 1024-thread CTA over the
@@ -465,3 +490,13 @@ Rejected:
 - A tensor-core decode attention CTA that shared one K/V expansion across the six query heads with 256-key splits: slower at every
   measured length (64 to 32768 keys), because its MMA, softmax and rescaling phases ran on two, half of one, and all four warps in
   turn and a 1024-token prefix occupied 20 CTAs. The three-warp 32-key-split kernel from 2048 keys replaced it.
+
+## No locks on the hot path
+
+Nothing that runs per quantum or per token takes a lock, waits blocking or starts a thread, in either model. State is
+confined by routing every frame that touches it to its owner: the workspace, the expert cache, the prefix cache. Device
+completions arrive as frames, and order comes from edges and from a sequence's admission order (`Sequencer`).
+`ArchitectureTest.theHotPathHoldsNoLockBlocksNorStartsThreads` scans `model/qwen38`, `model/qwen4`, `runtime`,
+`generation`, `prefix` and `state` for locks, blocking waits, `join`s, futures' blocking `get`s, threads and executors.
+It allows them only in named lifecycle and tool methods (opening lanes and pools, closing, the blocking caller-thread
+`generate`) and in the startup loaders.

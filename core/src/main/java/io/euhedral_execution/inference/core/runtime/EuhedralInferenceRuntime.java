@@ -19,6 +19,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -102,9 +104,15 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         return this.owner;
     }
 
-    /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime
-    /// closed releases its streams itself, because close() never saw it.
+    /// The shared lanes, opened by the first graph built.
     private LanePool lanes() {
+        LanePool open = this.lanes;
+        return open != null ? open : openLanes();
+    }
+
+    /// Lifecycle: opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime
+    /// closed releases its streams itself, because close() never saw it.
+    private LanePool openLanes() {
         synchronized (this.laneLock) {
             synchronized (this.closeLock) {
                 if (this.lanes != null) return this.lanes;
@@ -258,7 +266,11 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     private GraphPool pool(GraphShape view) {
         GraphPool pool = this.pools.get(view);
-        if (pool != null) return pool;
+        return pool != null ? pool : openPool(view);
+    }
+
+    /// Lifecycle: the first graph pool of a shape.
+    private GraphPool openPool(GraphShape view) {
         synchronized (this.closeLock) {
             ensureOpen();
             return this.pools.computeIfAbsent(view, GraphPool::new);
@@ -386,7 +398,30 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     /// A reusable graph and the workspace storage its quanta bind. Both are recycled together, only
     /// after the graph's quantum retired, so storage is never shared by two live quanta.
-    private record PooledGraph(StageGraph graph, GraphStorage storage) {}
+    /// A built graph and its storage; released once, by whichever of the runtime's close and a build that raced it
+    /// claims it.
+    private static final class PooledGraph {
+        private final StageGraph graph;
+        private final GraphStorage storage;
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        PooledGraph(StageGraph graph, GraphStorage storage) {
+            this.graph = graph;
+            this.storage = storage;
+        }
+
+        StageGraph graph() {
+            return this.graph;
+        }
+
+        GraphStorage storage() {
+            return this.storage;
+        }
+
+        boolean claimRelease() {
+            return this.released.compareAndSet(false, true);
+        }
+    }
 
     /// Idle graphs of one shape. Graphs are built only when every existing one is in use.
     private final class GraphPool {
@@ -394,7 +429,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         /// Each buffer's first and last accessors in this shape, computed once.
         final WorkspaceUse use;
         private final MpmcQueue<PooledGraph> idle = new MpmcQueue<>(16, 2);
-        private final List<PooledGraph> built = new ArrayList<>();
+        private final ConcurrentLinkedQueue<PooledGraph> built = new ConcurrentLinkedQueue<>();
 
         private GraphPool(GraphShape view) {
             this.view = view;
@@ -437,32 +472,25 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                             EuhedralInferenceRuntime.this.quanta,
                             retired -> recycle(pooled[0]));
             pooled[0] = new PooledGraph(graph, storage);
-            synchronized (EuhedralInferenceRuntime.this.closeLock) {
-                // A close that ran during this build saw no such graph; it would never release it.
-                if (EuhedralInferenceRuntime.this.closed) {
-                    graph.close();
-                    throw new IllegalStateException("inference runtime is closed");
-                }
-                synchronized (this.built) {
-                    this.built.add(pooled[0]);
-                }
+            this.built.add(pooled[0]);
+            // A close that ran during this build may not have seen the graph: whichever claims it releases it.
+            if (EuhedralInferenceRuntime.this.closed && pooled[0].claimRelease()) {
+                this.built.remove(pooled[0]);
+                graph.close();
+                throw new IllegalStateException("inference runtime is closed");
             }
             return pooled[0];
         }
 
         long replayedQuanta() {
             long replayed = 0;
-            synchronized (this.built) {
-                for (PooledGraph pooled : this.built) replayed += pooled.graph().replayedQuanta();
-            }
+            for (PooledGraph pooled : this.built) replayed += pooled.graph().replayedQuanta();
             return replayed;
         }
 
         long retainedWorkspaceBytes() {
             long bytes = 0;
-            synchronized (this.built) {
-                for (PooledGraph pooled : this.built) bytes += pooled.storage().retainedBytes();
-            }
+            for (PooledGraph pooled : this.built) bytes += pooled.storage().retainedBytes();
             return bytes;
         }
 
@@ -472,24 +500,23 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         void close() {
             RuntimeException failure = null;
             boolean proven = EuhedralInferenceRuntime.this.gpu.completionProven();
-            synchronized (this.built) {
-                for (PooledGraph pooled : this.built) {
-                    try {
-                        pooled.graph().close();
-                    } catch (RuntimeException closeFailure) {
-                        if (failure == null) failure = closeFailure;
-                        else failure.addSuppressed(closeFailure);
-                    }
-                    if (!proven) continue;
-                    try {
-                        pooled.storage().close();
-                    } catch (RuntimeException closeFailure) {
-                        if (failure == null) failure = closeFailure;
-                        else failure.addSuppressed(closeFailure);
-                    }
+            for (PooledGraph pooled : this.built) {
+                if (!pooled.claimRelease()) continue;
+                try {
+                    pooled.graph().close();
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
                 }
-                this.built.removeIf(pooled -> pooled.storage().isClosed());
+                if (!proven) continue;
+                try {
+                    pooled.storage().close();
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) failure = closeFailure;
+                    else failure.addSuppressed(closeFailure);
+                }
             }
+            this.built.removeIf(pooled -> pooled.storage().isClosed());
             if (failure != null) throw failure;
         }
     }

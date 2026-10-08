@@ -8,6 +8,7 @@ import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -97,7 +98,7 @@ public final class StageGraph implements AutoCloseable {
     private boolean overlap;
     /// Opens the shadow streams that record captured quanta; null when quanta are never captured.
     private final Supplier<GpuStream> shadowStreams;
-    private final GpuStream[] shadows;
+    private final AtomicReferenceArray<GpuStream> shadows;
     private long shadowPrepared;
     private long[] shadowTails;
     private final LinkedHashMap<Object, Capture> captures = new LinkedHashMap<>(16, 0.75f, true);
@@ -160,7 +161,7 @@ public final class StageGraph implements AutoCloseable {
             boolean spread,
             Supplier<GpuStream> shadowStreams) {
         this.shadowStreams = shadowStreams;
-        this.shadows = new GpuStream[pool.size()];
+        this.shadows = new AtomicReferenceArray<>(pool.size());
         this.spread = spread;
         this.topology = Objects.requireNonNull(topology, "topology");
         this.pool = Objects.requireNonNull(pool, "pool");
@@ -684,14 +685,14 @@ public final class StageGraph implements AutoCloseable {
         return this.recording != null && !this.recordingBroken.get();
     }
 
-    /// The shadow of `lane`, opened on first use.
-    private synchronized GpuStream shadow(int lane) {
-        GpuStream shadow = this.shadows[lane];
-        if (shadow == null) {
-            shadow = Objects.requireNonNull(this.shadowStreams.get(), "shadow stream");
-            this.shadows[lane] = shadow;
-        }
-        return shadow;
+    /// The shadow of `lane`, opened on first use: of two stages that open it at once, the loser closes its stream.
+    private GpuStream shadow(int lane) {
+        GpuStream shadow = this.shadows.get(lane);
+        if (shadow != null) return shadow;
+        GpuStream opened = Objects.requireNonNull(this.shadowStreams.get(), "shadow stream");
+        if (this.shadows.compareAndSet(lane, null, opened)) return opened;
+        opened.close();
+        return this.shadows.get(lane);
     }
 
     /// Mirrors a marker wait on `lane`'s shadow; the shadow joins the recording by its first wait.
@@ -851,15 +852,15 @@ public final class StageGraph implements AutoCloseable {
             }
         }
         this.captures.clear();
-        for (int lane = 0; lane < this.shadows.length; lane++) {
-            if (this.shadows[lane] == null) continue;
+        for (int lane = 0; lane < this.shadows.length(); lane++) {
+            GpuStream shadow = this.shadows.getAndSet(lane, null);
+            if (shadow == null) continue;
             try {
-                this.shadows[lane].close();
+                shadow.close();
             } catch (RuntimeException closeFailure) {
                 if (failure == null) failure = closeFailure;
                 else failure.addSuppressed(closeFailure);
             }
-            this.shadows[lane] = null;
         }
         if (failure != null) throw failure;
     }
