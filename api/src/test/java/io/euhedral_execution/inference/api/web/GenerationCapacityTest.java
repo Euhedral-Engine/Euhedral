@@ -12,12 +12,15 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
 /// With one generation slot and no queue, a second concurrent request is refused before it opens a session,
 /// and the client receives an OpenAI 503.
+// Contexts with equal configuration are cached and shared, backend included: one such class at a time.
+@ResourceLock("scripted-api-context")
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
