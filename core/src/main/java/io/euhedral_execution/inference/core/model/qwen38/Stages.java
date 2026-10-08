@@ -805,7 +805,7 @@ public final class Stages {
             this.pendingAppendState = null;
             // An uncommitted append never becomes visible; a committed one was published by the commit, and a later
             // quantum's submitted rows must stay.
-            if (state != null && !this.retirementCommitted) state.discardSubmitted();
+            if (state != null && !this.retirementCommitted) state.discardSubmitted(position(context) + rows(context));
         }
     }
 

@@ -30,7 +30,12 @@ public final class AttentionKvState implements AutoCloseable {
     private final ExecutionGpu gpu;
     private final long planePageBytes;
     private final List<Long> pages = new ArrayList<>();
-    private final List<ExecutionGpu.UploadBuffer> pendingStaging = new ArrayList<>();
+    /// Table uploads' staging, each with the frontier its append reaches: released once that append settled, so a
+    /// later quantum's queued upload keeps its staging while an earlier quantum commits.
+    private final List<Pending> pendingStaging = new ArrayList<>();
+
+    private record Pending(long upTo, ExecutionGpu.UploadBuffer staging) {}
+
     private long table;
     private int tableSlots;
     private int capacity;
@@ -70,21 +75,22 @@ public final class AttentionKvState implements AutoCloseable {
         try {
             ExecutionGpu.UploadBuffer staging = this.gpu.allocateUploadBuffer(tableBytes);
             // Owned until retirement from here on: a queued copy may read it even if this call fails.
-            this.pendingStaging.add(staging);
+            this.pendingStaging.add(new Pending(required, staging));
             MemorySegment entries = staging.segment();
             entries.fill((byte) 0);
             for (int i = 0; i < count; i++) {
                 entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, i, this.pages.get(i));
                 entries.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, slots + i, this.pages.get(i) + this.planePageBytes);
             }
-            // No reader of this layer's table precedes this stage in the quantum, and the previous
-            // quantum retired before the lease was granted, so the stream orders the rewrite.
+            // No reader of this layer's table precedes this stage in the quantum, and an earlier quantum's readers
+            // precede it through the carried KV edge, so the stream orders the rewrite.
             this.gpu.copyUploadToDevice(nextTable, staging);
         } catch (RuntimeException | Error failure) {
             if (nextTable != this.table) this.gpu.freeAsync(nextTable);
             throw failure;
         }
-        // Readers of the outgrown table belong to quanta that retired; the stream frees it after this upload.
+        // Readers of the outgrown table precede this stage (earlier stages, or an earlier quantum's through the
+        // carried KV edge); the stream frees it after this upload.
         if (nextTable != this.table && this.table != 0) this.gpu.freeAsync(this.table);
         this.table = nextTable;
         this.tableSlots = slots;
@@ -120,7 +126,7 @@ public final class AttentionKvState implements AutoCloseable {
     public void commitSubmitted() {
         ensureOpen();
         this.length = this.submittedLength;
-        releaseRetired();
+        releaseRetired(this.length);
     }
 
     /// Publishes the `rows` rows a quantum appended, every one of them, once its device work retired. Rows a later
@@ -130,7 +136,7 @@ public final class AttentionKvState implements AutoCloseable {
         if (rows < 0 || (long) this.length + rows > this.submittedLength)
             throw new IllegalArgumentException("committed rows exceed the submitted frontier");
         this.length += rows;
-        releaseRetired();
+        releaseRetired(this.length);
     }
 
     /// Publishes only the first `rows` submitted rows (a speculative verification's accepted prefix);
@@ -139,17 +145,27 @@ public final class AttentionKvState implements AutoCloseable {
         ensureOpen();
         if (rows < 0 || (long) this.length + rows > this.submittedLength)
             throw new IllegalArgumentException("committed rows exceed the submitted frontier");
+        long submitted = this.submittedLength;
         this.length += rows;
         this.submittedLength = this.length;
-        releaseRetired();
+        releaseRetired(submitted);
     }
 
     /// Drops a submitted frontier that must not become visible, such as a failed quantum's. Called
     /// after the quantum's device work retired, so it also releases what the reservation retired.
     public void discardSubmitted() {
         if (this.closed) return;
+        long submitted = this.submittedLength;
         this.submittedLength = this.length;
-        releaseRetired();
+        releaseRetired(submitted);
+    }
+
+    /// As [#discardSubmitted()] for a quantum whose append ends at `end`: a later quantum of the sequence may still
+    /// be in flight, so only staging of appends up to `end` is released.
+    public void discardSubmitted(long end) {
+        if (this.closed) return;
+        this.submittedLength = this.length;
+        releaseRetired(end);
     }
 
     /// Drops committed rows from `length` on (speculative MTP draft rows), between quanta. The rows stay
@@ -212,7 +228,7 @@ public final class AttentionKvState implements AutoCloseable {
         if (this.closed) return;
         Throwable failure = null;
         try {
-            releaseRetired();
+            releaseRetired(Long.MAX_VALUE);
         } catch (Throwable error) {
             failure = combine(failure, error);
         }
@@ -250,12 +266,16 @@ public final class AttentionKvState implements AutoCloseable {
         return address;
     }
 
-    /// Releases staging once no queued work can reference it. A GPU that cannot prove its submitted work
-    /// stopped keeps the staging.
-    private void releaseRetired() {
-        if (!this.pendingStaging.isEmpty() && this.gpu.completionProven()) {
-            for (ExecutionGpu.UploadBuffer staging : this.pendingStaging) staging.close();
-            this.pendingStaging.clear();
+    /// Releases the staging of appends reaching at most `upTo`, whose quanta retired, so no queued work references
+    /// it. A GPU that cannot prove its submitted work stopped keeps the staging.
+    private void releaseRetired(long upTo) {
+        if (this.pendingStaging.isEmpty() || !this.gpu.completionProven()) return;
+        var settled = this.pendingStaging.iterator();
+        while (settled.hasNext()) {
+            Pending pending = settled.next();
+            if (pending.upTo() > upTo) continue;
+            pending.staging().close();
+            settled.remove();
         }
     }
 

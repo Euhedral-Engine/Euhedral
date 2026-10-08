@@ -69,6 +69,38 @@ class AttentionKvStateTest {
     }
 
     @Test
+    void aLaterAppendsTableStagingOutlivesTheEarlierOnesCommit() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            state.prepareAppend(0, 2);
+            state.appendSubmitted(2);
+            // A later quantum grows the table before the earlier one retired: its upload may not have run yet.
+            state.prepareAppend(2, 300);
+            state.appendSubmitted(300);
+            state.commitAppended(2);
+            assertEquals(1, gpu.stagingReleases, "the later quantum's upload may still read its staging");
+            state.commitAppended(300);
+            assertEquals(2, gpu.stagingReleases);
+        }
+    }
+
+    @Test
+    void aFailedAppendReleasesOnlyItsOwnStagingWhileALaterOneIsInFlight() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            state.prepareAppend(0, 2);
+            state.appendSubmitted(2);
+            state.prepareAppend(2, 300);
+            state.appendSubmitted(300);
+            state.discardSubmitted(2);
+            assertEquals(1, gpu.stagingReleases, "the later quantum's upload may still read its staging");
+            assertEquals(0, state.length());
+            state.discardSubmitted(302);
+            assertEquals(2, gpu.stagingReleases);
+        }
+    }
+
+    @Test
     void anAppendMustContinueTheSubmittedFrontier() {
         RecordingGpu gpu = new RecordingGpu();
         try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
