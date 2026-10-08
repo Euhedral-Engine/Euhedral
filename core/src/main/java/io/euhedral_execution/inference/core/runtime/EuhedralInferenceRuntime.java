@@ -32,10 +32,12 @@ import org.slf4j.LoggerFactory;
 /// plan supplies the shapes and quanta, and the model's runtime owns the lake and the host work.
 public final class EuhedralInferenceRuntime implements AutoCloseable {
 
-    /// Ingest sinks of a lake (upstream sources of the lattice) and the producer partitions of each.
-    public static final int LAKE_SINKS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_SINKS", "4"));
+    /// Ingest sinks of a lake (upstream sources of the lattice) and the producer partitions of each. A sink of one
+    /// partition keeps the order frames were published in, like a stream; more sinks, not partitions, spread the
+    /// contention of producers and consumers.
+    public static final int LAKE_SINKS = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_SINKS", "8"));
     public static final int LAKE_PARTITIONS =
-            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_PARTITIONS", "2"));
+            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_LAKE_PARTITIONS", "1"));
 
     /// Decode, verification and draft quanta replay CUDA graphs captured from earlier quanta
     /// (docs/CUDA_GRAPHS.md); `EUHEDRAL_CUDA_GRAPHS=0` submits every quantum stage by stage instead.
@@ -165,9 +167,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// One admission run on the workspace's owner: its `idHash` is [WorkspaceOwner#HASH] and it stays ordered, so
-    /// admissions run one at a time. Not necessarily in the order they were published: the lake's queues are
-    /// partitioned ([#LAKE_PARTITIONS], more than one by default), so only frames one admission publishes after it
-    /// ran are ordered behind it.
+    /// admissions run one at a time, in the order they were published (the lake's sinks have one partition each,
+    /// [#LAKE_PARTITIONS]).
     static final class Admission extends AbstractFrame {
         private final Runnable admission;
 

@@ -15,10 +15,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 /// Producers throw frames into the lake from anywhere: a stage that made its successors ready, a
 /// driver callback, a request thread. A frame goes into the sink its routing hash selects, so the
 /// frames of one lane (equal hashes) keep to one sink and the frames that may run in parallel
-/// spread over all of them. Every sink is a queue ingest sink with partitioned producer queues, and
-/// every one is attached to the lattice on its own: the workers pull from many sources at once
-/// instead of all queuing at one, which keeps producers and consumers off a common cache line and
-/// lets the cores work side by side.
+/// spread over all of them. Every sink is a queue ingest sink, attached to the lattice on its own: the
+/// workers pull from many sources at once instead of all queuing at one, which keeps producers and
+/// consumers off a common cache line and lets the cores work side by side.
+///
+/// A sink is like a GPU stream. With one producer partition it keeps the order frames were published
+/// in, whatever mixture of ordered and unordered frames it carries, and an ordered frame runs in its
+/// own chain's order (frames of one `idHash`), not in queue order: two chains in one sink may run at
+/// the same time. A sink of several partitions keeps no order across producers. More sinks, not more
+/// partitions, reduce contention: partitions only spread the producers.
 ///
 /// The lake counts the units it carries (quanta, host tasks). [#completeGracefully] closes
 /// admission; once every admitted unit terminated, the sinks complete and the lattice detaches

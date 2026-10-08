@@ -145,4 +145,51 @@ class InferenceLakeTest {
         var lake = new InferenceLake(new Recording(), 1, 1);
         assertThrows(IllegalStateException.class, lake::terminated);
     }
+
+    /// A frame of `owner`, stamped with its place in publication order, ordered on its owner.
+    private static final class Owned extends AbstractFrame {
+        final long owner;
+        final int stamp;
+
+        Owned(long owner, int stamp) {
+            super(owner);
+            this.owner = owner;
+            this.stamp = stamp;
+        }
+    }
+
+    private static List<Owned> drainOwned(Recording lattice) {
+        List<AbstractFrame> pulled = new ArrayList<>();
+        for (LatticeSource source : lattice.sources) lattice.pull(source, pulled);
+        List<Owned> owned = new ArrayList<>();
+        for (AbstractFrame frame : pulled) owned.add((Owned) frame);
+        return owned;
+    }
+
+    @Test
+    void framesOfOneOwnerLeaveTheLakeInPublicationOrder() {
+        var lattice = new Recording();
+        InferenceLake lake = io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime.newLake(lattice);
+        for (int i = 0; i < 2000; i++) lake.publish(new Owned(0x5eed_0001L, i));
+        List<Owned> owned = drainOwned(lattice);
+        assertEquals(2000, owned.size());
+        for (int i = 0; i < owned.size(); i++) assertEquals(i, owned.get(i).stamp, "publication order at " + i);
+    }
+
+    @Test
+    void chainsOfTwoOwnersKeepTheirOwnOrder() {
+        var lattice = new Recording();
+        InferenceLake lake = io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime.newLake(lattice);
+        for (int i = 0; i < 2000; i++) lake.publish(new Owned(i % 2 == 0 ? 0xa11cL : 0xb0bL, i));
+        int lastA = -1, lastB = -1;
+        for (Owned frame : drainOwned(lattice)) {
+            if (frame.owner == 0xa11cL) {
+                assertTrue(frame.stamp > lastA, "owner A out of order");
+                lastA = frame.stamp;
+            } else {
+                assertTrue(frame.stamp > lastB, "owner B out of order");
+                lastB = frame.stamp;
+            }
+        }
+    }
 }
