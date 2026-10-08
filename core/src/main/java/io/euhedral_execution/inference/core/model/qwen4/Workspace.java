@@ -60,6 +60,8 @@ final class Workspace {
     /// The MoE block resources of each row capacity of [ExecutionPlan#rowBucket], ascending; the last is `rows`'.
     private final int[] capacities;
     private final ExecutionPlan plan;
+    /// The device side of the MoE block resources of each capacity, shared by its graphs.
+    private final MoeLayer.Device[] moeDevices;
     private final long tokensDevice;
     private final long embedded;
     private final long state;
@@ -93,8 +95,16 @@ final class Workspace {
         int hidden = plan.hidden();
         this.capacities = plan.rowBuckets();
         this.plan = plan;
+        this.moeDevices = new MoeLayer.Device[this.capacities.length];
+        try {
+            for (int i = 0; i < this.capacities.length; i++) this.moeDevices[i] = plan.newMoeDevice(this.capacities[i]);
+        } catch (Throwable failure) {
+            closeMoeDevices();
+            throw failure;
+        }
         // Sizes the MoE scratch for the largest capacity; each graph's lease has block resources of its own.
-        MoeLayer moe = plan.newMoeLayer(this.capacities[this.capacities.length - 1]);
+        MoeLayer moe = plan.newMoeLayer(
+                this.capacities[this.capacities.length - 1], this.moeDevices[this.capacities.length - 1]);
         try {
             long bf16 = Short.BYTES;
             long width = (long) plan.streams() * hidden;
@@ -119,6 +129,7 @@ final class Workspace {
             this.expansion = this.expansionBytes > 0 ? allocate(this.expansionBytes) : 0;
         } catch (Throwable failure) {
             releaseBuffers();
+            closeMoeDevices();
             throw failure;
         } finally {
             moe.close();
@@ -145,8 +156,17 @@ final class Workspace {
 
     /// New MoE block resources of the capacity that serves a shape of `rows` rows.
     MoeLayer newMoeLayer(int rows) {
-        for (int capacity : this.capacities) if (rows <= capacity) return this.plan.newMoeLayer(capacity);
+        for (int i = 0; i < this.capacities.length; i++)
+            if (rows <= this.capacities[i]) return this.plan.newMoeLayer(this.capacities[i], this.moeDevices[i]);
         throw new IllegalArgumentException("no MoE block resources for " + rows + " rows");
+    }
+
+    private void closeMoeDevices() {
+        for (int i = 0; i < this.moeDevices.length; i++) {
+            MoeLayer.Device device = this.moeDevices[i];
+            this.moeDevices[i] = null;
+            if (device != null) device.close();
+        }
     }
 
     long tokensDevice() {
@@ -213,6 +233,10 @@ final class Workspace {
     void close() {
         if (this.closed) return;
         this.closed = true;
-        releaseBuffers();
+        try {
+            releaseBuffers();
+        } finally {
+            closeMoeDevices();
+        }
     }
 }
