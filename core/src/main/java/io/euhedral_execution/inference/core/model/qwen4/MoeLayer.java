@@ -165,6 +165,13 @@ public final class MoeLayer implements AutoCloseable {
         return Math.min(experts, Math.multiplyExact(maxRows, topK));
     }
 
+    /// Expansion scratch of the shared expert's NVFP4 linears at `rows` rows.
+    long linearScratchBytes(int rows) {
+        int padded = paddedWidth(this.sharedInter);
+        return Ops.nvfp4Scratch(
+                this.gpu, rows, this.hidden, this.sharedInter, this.sharedInter, this.hidden, padded, this.hidden);
+    }
+
     /// Device bytes of the scratch for `rows` rows.
     public long scratchBytes(int rows) {
         long bf16 = Short.BYTES;

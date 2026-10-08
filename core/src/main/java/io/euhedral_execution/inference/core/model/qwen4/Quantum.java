@@ -34,6 +34,7 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
     private final ExecutionPlan.StateExchange exchange;
     private final AtomicReference<Object> successor = new AtomicReference<>();
     private Workspace storage;
+    private MoeLayer moe;
     private boolean prepared;
 
     // The diagnostic shape's clock: the component running and when it began.
@@ -67,6 +68,11 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
 
     Workspace storage() {
         return this.storage;
+    }
+
+    /// The MoE block resources of the quantum's row capacity.
+    MoeLayer moe() {
+        return this.moe;
     }
 
     Sequence sequence() {
@@ -114,7 +120,9 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
     /// Runs on the graph's home lane before any stage: binds the graph's workspace, hands over the
     /// tokens, and queues the state a layer test starts from.
     private boolean prepare(GpuStream stream, GraphStorage graphStorage) {
-        this.storage = ((Workspace.Lease) graphStorage).storage();
+        Workspace.Lease lease = (Workspace.Lease) graphStorage;
+        this.storage = lease.storage();
+        this.moe = lease.moe();
         this.prepared = true;
         for (int i = 0; i < this.rows; i++)
             this.storage.tokenUpload().segment().set(INT, 4L * i, this.tokens[this.offset + i]);
@@ -137,7 +145,7 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
     protected void release() {
         if (!this.prepared) return;
         tick(-1);
-        this.storage.moe().abandon();
+        this.moe.abandon();
     }
 
     @Override

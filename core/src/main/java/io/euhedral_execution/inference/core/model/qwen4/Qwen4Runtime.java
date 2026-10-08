@@ -78,7 +78,8 @@ public final class Qwen4Runtime implements ModelRuntime {
         Storage storage = Storage.load(config);
         EuhedralInferenceRuntime runtime = null;
         try {
-            runtime = new EuhedralInferenceRuntime(lake, storage.gpu(), EuhedralInferenceRuntime.Lanes.of(LANES));
+            // The plan's one workspace is one buffer whose reuse the runtime's owner orders across graphs.
+            runtime = new EuhedralInferenceRuntime(lake, storage.gpu(), EuhedralInferenceRuntime.Lanes.of(LANES), 1);
             ExecutionPlan plan = new ExecutionPlan(storage.gpu(), storage.model(), config.maxContextTokens(), runtime);
             var identity =
                     identity(config.artifactPath(), storage.model().artifact().config());

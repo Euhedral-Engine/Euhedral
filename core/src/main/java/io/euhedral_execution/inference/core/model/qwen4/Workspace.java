@@ -6,26 +6,33 @@ import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
 import java.util.ArrayList;
 import java.util.List;
 
-/// The workspace of the graphs of one row capacity: the device buffers of a chunk of up to `rows`
-/// tokens (the residual state, the activations, the logits row, the scratch of each kind of layer)
-/// and the block resources of its MoE layers ([MoeLayer]). The plan serves one quantum at a
-/// time and a graph is recycled only after its quantum's device work retired, so the graphs of
-/// every shape of a capacity (the diagnostic variants, a test's single layers) take turns on one
-/// workspace through a [Lease] instead of each holding their own.
+/// The plan's one workspace: the device buffers of a chunk of up to `rows` tokens (the residual state, the
+/// activations, the logits row, the scratch of each kind of layer, the expansion scratch of the NVFP4 linears),
+/// sized at load for the plan's chunk, and the block resources of its MoE layers ([MoeLayer]) for each row capacity:
+/// a decode token's block description stays as small as the token. The graphs of every shape
+/// (every row capacity, the diagnostic variants, a test's single layers) take turns on it through a [Lease]: the
+/// plan serves one quantum at a time, and the workspace's owner orders a graph's first device stages behind the
+/// previous graph's last ones ([Shape#workspaceBuffers]).
 final class Workspace {
 
-    /// A graph's hold on the shared workspace of its capacity, in the runtime's terms. The plan
-    /// owns the workspace and frees it; closing a lease only ends the graph's use.
+    /// A graph's hold on the workspace, in the runtime's terms, with the MoE block resources of its shape's row
+    /// capacity. The plan owns the workspace and frees it; closing a lease only ends the graph's use.
     static final class Lease implements GraphStorage {
         private final Workspace storage;
+        private final MoeLayer moe;
         private boolean closed;
 
-        Lease(Workspace storage) {
+        Lease(Workspace storage, int rows) {
             this.storage = storage;
+            this.moe = storage.moe(rows);
         }
 
         Workspace storage() {
             return this.storage;
+        }
+
+        MoeLayer moe() {
+            return this.moe;
         }
 
         @Override
@@ -46,7 +53,9 @@ final class Workspace {
 
     private final ExecutionGpu gpu;
     private final int rows;
-    private final MoeLayer moe;
+    /// The MoE block resources of each row capacity of [ExecutionPlan#rowBucket], ascending; the last is `rows`'.
+    private final int[] capacities;
+    private final MoeLayer[] moes;
     private final ExecutionGpu.UploadBuffer tokenUpload;
     private final long tokensDevice;
     private final long embedded;
@@ -59,6 +68,10 @@ final class Workspace {
     private final long hcScratch;
     private final long layerScratch;
     private final long moeScratch;
+    /// The expansion scratch the native NVFP4 route takes, bound around the stages that declare it
+    /// ([Shape#takesScratch]); 0 when no linear takes that route at `rows` rows.
+    private final long expansion;
+    private final long expansionBytes;
     private final List<Long> allocations = new ArrayList<>();
     private long retained;
     private boolean closed;
@@ -81,9 +94,19 @@ final class Workspace {
         this.gpu = gpu;
         this.rows = rows;
         int hidden = plan.hidden();
-        this.moe = plan.newMoeLayer(rows);
         this.pleRowIds = new long[rows * plan.ple().rowsPerToken()];
-        this.tokenUpload = gpu.allocateUploadBuffer(4L * rows);
+        this.capacities = plan.rowBuckets();
+        this.moes = new MoeLayer[this.capacities.length];
+        ExecutionGpu.UploadBuffer upload = null;
+        try {
+            for (int i = 0; i < this.capacities.length; i++) this.moes[i] = plan.newMoeLayer(this.capacities[i]);
+            upload = gpu.allocateUploadBuffer(4L * rows);
+        } catch (Throwable failure) {
+            closeMoes();
+            throw failure;
+        }
+        this.tokenUpload = upload;
+        MoeLayer moe = this.moes[this.moes.length - 1];
         try {
             long bf16 = Short.BYTES;
             long width = (long) plan.streams() * hidden;
@@ -100,11 +123,16 @@ final class Workspace {
                     Math.max(plan.gdn().scratchBytes(rows), plan.qsa().scratchBytes(rows)),
                     plan.ple().scratchBytes(rows));
             this.layerScratch = allocate(layerBytes);
-            this.moeScratch = allocate(this.moe.scratchBytes(rows));
+            this.moeScratch = allocate(moe.scratchBytes(rows));
+            this.expansionBytes = Math.max(
+                    Math.max(
+                            plan.gdn().linearScratchBytes(gpu, rows), plan.qsa().linearScratchBytes(gpu, rows)),
+                    Math.max(plan.ple().linearScratchBytes(gpu, rows), moe.linearScratchBytes(rows)));
+            this.expansion = this.expansionBytes > 0 ? allocate(this.expansionBytes) : 0;
         } catch (Throwable failure) {
             releaseBuffers();
             this.tokenUpload.close();
-            this.moe.close();
+            closeMoes();
             throw failure;
         }
     }
@@ -127,8 +155,26 @@ final class Workspace {
         return this.rows;
     }
 
-    MoeLayer moe() {
-        return this.moe;
+    /// The MoE block resources of the capacity that serves a shape of `rows` rows.
+    MoeLayer moe(int rows) {
+        for (int i = 0; i < this.capacities.length; i++) if (rows <= this.capacities[i]) return this.moes[i];
+        throw new IllegalArgumentException("no MoE block resources for " + rows + " rows");
+    }
+
+    private void closeMoes() {
+        RuntimeException failure = null;
+        for (int i = 0; i < this.moes.length; i++) {
+            MoeLayer moe = this.moes[i];
+            this.moes[i] = null;
+            if (moe == null) continue;
+            try {
+                moe.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
+        }
+        if (failure != null) throw failure;
     }
 
     ExecutionGpu.UploadBuffer tokenUpload() {
@@ -180,6 +226,14 @@ final class Workspace {
         return this.moeScratch;
     }
 
+    long scratchAddress() {
+        return this.expansion;
+    }
+
+    long scratchBytes() {
+        return this.expansionBytes;
+    }
+
     long retainedBytes() {
         return this.retained;
     }
@@ -192,7 +246,7 @@ final class Workspace {
         if (this.closed) return;
         this.closed = true;
         try {
-            this.moe.close();
+            closeMoes();
         } finally {
             try {
                 this.tokenUpload.close();

@@ -1,7 +1,9 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
+import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.KernelArguments;
+import io.euhedral_execution.inference.core.gpu.ScratchUse;
 
 /// Typed launches of the Flash-Next kernels (native/src/qwen4): the geometry each kernel is written for and the
 /// argument checks the native launcher cannot make (alignment, extents). Every method queues on the GPU's selected
@@ -370,5 +372,17 @@ public final class Ops {
             if (address == 0 || address % alignment != 0)
                 throw new IllegalArgumentException("address " + address + " is not " + alignment + "-byte aligned");
         }
+    }
+
+    /// Expansion scratch the NVFP4 linears `(inFeatures, outFeatures)` of `shapes` take at `rows` rows: the
+    /// largest of them, since a stage runs its linears one after another.
+    static long nvfp4Scratch(ExecutionGpu gpu, int rows, int... shapes) {
+        long bytes = 0;
+        for (int i = 0; i < shapes.length; i += 2)
+            bytes = Math.max(
+                    bytes,
+                    gpu.scratchBytes(
+                            ScratchUse.NVFP4_LINEAR, rows, shapes[i], shapes[i + 1], WeightLayout.ROW_SPLIT_K128_V1));
+        return bytes;
     }
 }

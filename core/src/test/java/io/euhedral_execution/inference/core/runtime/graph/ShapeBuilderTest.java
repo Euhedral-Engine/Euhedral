@@ -44,4 +44,17 @@ class ShapeBuilderTest {
                 StageTopology.submitted(new int[][] {{}, {}, {0, 1}, {2}}).toString(),
                 builder.build().toString());
     }
+
+    @Test
+    void aChainOrdersOnlyTheStagesNotAlreadyOrdered() {
+        var builder = new ShapeBuilder<String>();
+        int a = builder.stage("a"), b = builder.stage("b"), c = builder.stage("c"), d = builder.stage("d");
+        builder.submitted(a, b);
+        builder.submitted(b, c);
+        builder.chain(new int[] {a, c, d});
+        StageTopology topology = builder.build();
+        assertArrayEquals(new int[] {b}, topology.submittedSuccessors(a), "a already reaches c");
+        assertArrayEquals(new int[] {d}, topology.submittedSuccessors(c), "c did not reach d");
+        assertEquals(1, topology.inDegree(d));
+    }
 }
