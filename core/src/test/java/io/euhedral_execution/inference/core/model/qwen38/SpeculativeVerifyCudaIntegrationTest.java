@@ -2,14 +2,14 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -27,15 +27,12 @@ import org.junit.jupiter.api.Timeout;
 /// position, and leave the same sequence state: two sequences prefill the same prompt, then one decodes
 /// four forced tokens one quantum at a time while the other verifies them in one four-row quantum. Every
 /// logits row, every GDN recurrent and convolution state and the committed attention KV bytes must match.
+@ModelGroup.CompactQ3
 class SpeculativeVerifyCudaIntegrationTest {
 
     @Test
-    @Timeout(value = 1800, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void verificationRowsAndCommittedStateEqualSequentialDecode() throws Throwable {
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(
-                System.getProperty("euhedral.speculative.artifact", System.getProperty("euhedral.qwen.artifact", "")));
-        assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
@@ -44,9 +41,10 @@ class SpeculativeVerifyCudaIntegrationTest {
                 .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
         int[] forced = java.util.Arrays.copyOfRange(text, prefix, prefix + rows);
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                Qwen38Model model = load(artifact, gpu);
-                var lattice = new PullingLattice()) {
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        try (var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice, plan, gpu);
             var sequential = new Sequence(1);
@@ -90,21 +88,18 @@ class SpeculativeVerifyCudaIntegrationTest {
     /// GDN state is replayed from the checkpoint by the next quantum, so after a further partial
     /// verification and a one-row decode, everything equals sequential decode of the committed tokens.
     @Test
-    @Timeout(value = 1800, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void partiallyCommittedVerificationsLeaveSequentialState() throws Throwable {
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(
-                System.getProperty("euhedral.speculative.artifact", System.getProperty("euhedral.qwen.artifact", "")));
-        assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
         int[] text = QwenTokenizer.load(tokenizerDirectory)
                 .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prompt = java.util.Arrays.copyOf(text, prefix);
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                Qwen38Model model = load(artifact, gpu);
-                var lattice = new PullingLattice()) {
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        try (var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice, plan, gpu);
             try {
@@ -196,19 +191,6 @@ class SpeculativeVerifyCudaIntegrationTest {
                 .get(600, TimeUnit.SECONDS);
         if (outcome.status() != Quantum.Status.SUCCESS) throw new AssertionError(outcome.failure());
         return captured.get();
-    }
-
-    /// Executed weights; `euhedral.speculative.host-mib` host-backs that many MiB of base weights (the
-    /// NVFP4 artifact needs it for two sequences).
-    static Qwen38Model load(Path artifact, CudaGpuMemory gpu) throws Exception {
-        var data = ArtifactReader.read(artifact);
-        long hostBytes = Long.getLong("euhedral.speculative.host-mib", 0L) << 20;
-        return Qwen38Model.load(
-                artifact,
-                data,
-                gpu,
-                io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Speculation.NONE,
-                io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection.select(data, hostBytes));
     }
 
     static Path repositoryRoot() {

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.BufferedWriter;
 import java.nio.file.Files;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.Timeout;
 /// JSON lines in `-Peuhedral.dflash2.report` (tools/dflash2_quality.py compares two reports). Greedy output is exact
 /// whatever the drafter, so two reports hold the same tokens and differ only in their steps.
 /// `-Peuhedral.dflash2.verified` verifies only that many drafts per block (a screen of the verification length).
+@ModelGroup.OwnJvm // loads the DFlash2 artifact, which no shared group holds
 class DFlash2QualityCudaIntegrationTest {
 
     static final List<String> PROMPTS = List.of(

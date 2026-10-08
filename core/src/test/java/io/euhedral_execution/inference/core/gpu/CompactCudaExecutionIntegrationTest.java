@@ -22,6 +22,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactHeader
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
+import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -71,9 +72,8 @@ class CompactCudaExecutionIntegrationTest {
         assertEquals(WeightLayout.ROW_SPLIT_K128_V1, projectionDescriptor.layout());
         assertEquals(hiddenSize, projectionDescriptor.shape()[1]);
 
-        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath);
-                Arena arena = Arena.ofShared()) {
+        CudaGpuMemory gpu = SharedQwen38.gpu();
+        try (Arena arena = Arena.ofShared()) {
             CudaGpuMemory.DeviceMemoryInfo before = gpu.deviceMemoryInfo();
             long allocatedBefore = gpu.allocatedBytes();
             long requiredModelBytes = Math.addExact(
