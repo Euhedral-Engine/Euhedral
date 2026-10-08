@@ -9,7 +9,22 @@ final class TestShapes {
     private TestShapes() {}
 
     static GraphShape of(StageTopology topology, int[][] buffers, int count) {
+        return of(topology, buffers, count, new int[topology.size()][0], 0);
+    }
+
+    /// As above, each stage also carrying the sequence-state keys listed for it.
+    static GraphShape of(StageTopology topology, int[][] buffers, int count, int[][] carried, int carriedCount) {
         return new GraphShape() {
+            @Override
+            public int[] carriedState(int stage) {
+                return carried[stage];
+            }
+
+            @Override
+            public int carriedStateCount() {
+                return carriedCount;
+            }
+
             @Override
             public StageTopology topology() {
                 return topology;

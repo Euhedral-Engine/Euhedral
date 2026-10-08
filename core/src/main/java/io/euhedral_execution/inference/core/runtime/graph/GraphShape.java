@@ -28,5 +28,18 @@ public interface GraphShape {
         return 0;
     }
 
+    /// The sequence state stage `stage` reads or writes, by key: state one chunk of a prompt (or one graph of a
+    /// sequence) hands to the next, such as a layer's recurrent state or its KV rows. A later chunk's first users
+    of
+    /// a key follow the earlier chunk's last users of it ([ChunkedShape], [CarriedState]).
+    default int[] carriedState(int stage) {
+        return NO_BUFFERS;
+    }
+
+    /// How many carried-state keys the shape's stages may name.
+    default int carriedStateCount() {
+        return 0;
+    }
+
     int[] NO_BUFFERS = new int[0];
 }
