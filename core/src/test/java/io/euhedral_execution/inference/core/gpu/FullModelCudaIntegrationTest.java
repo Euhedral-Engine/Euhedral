@@ -448,11 +448,12 @@ class FullModelCudaIntegrationTest {
         // The route structure is bitwise against the reference under exact numerics; relaxed-order
         // kernels (the FP8 route, contiguous decode) are bounded by RelaxedNumericsDriftCudaIntegrationTest.
         // Exact numerics run a row at a time, so a run costs time in proportion to its rows: 64 is the smallest
-        // quantum on the region route, and 320 crosses a 256-token KV page into a second, partial one. Rows
+        // quantum on the region route, and 257 crosses a 256-token KV page by one token, into a second page holding a
+        // single row. Rows
         // at the 512-token chunk size are covered by the engine tests.
         boolean previous = gpu.selectExactNumerics(true);
         try {
-            for (int rows : new int[] {64, 320}) {
+            for (int rows : new int[] {64, 257}) {
                 var selected = production.forExecution(Quantum.ExecutionKind.PREFILL, rows);
                 assertTrue(selected.instructions().stream()
                         .anyMatch(i -> i.kind() == ExecutionPlan.Kind.ATTENTION_KV_APPEND));
