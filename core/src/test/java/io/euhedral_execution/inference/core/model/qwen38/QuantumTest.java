@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu.UploadBuffer;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
@@ -346,7 +347,7 @@ class QuantumTest {
 
     @Test
     @Timeout(10)
-    void aQuantumThatSharesSequenceStateIsRefusedWhileAnotherIsInFlight() throws Exception {
+    void aQuantumWithAHostRowIsRefusedWhileAnotherIsInFlight() throws Exception {
         var weights = EngineExecutionFixture.weights();
         var plan = new ExecutionPlan(weights);
         var stream = new ExecutionFixtures.HoldingStream();
@@ -360,7 +361,16 @@ class QuantumTest {
         var runtime = new Execution(lattice, plan, gpu);
         var sequence = new Sequence(909);
         var first = new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[64], LogitsRequirement.NONE);
-        var second = new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 64, new int[1], LogitsRequirement.NONE);
+        // The host row is per-sequence state no edge orders.
+        var hostLogits = new HostLogits(gpu, weights.config().vocabSize());
+        var second = new Quantum(
+                plan,
+                sequence,
+                Quantum.ExecutionKind.PREFILL,
+                64,
+                new int[1],
+                LogitsRequirement.LAST_TOKEN,
+                hostLogits);
         try {
             var firstOutcome = runtime.submit(first);
             lattice.drive();
@@ -379,6 +389,7 @@ class QuantumTest {
             assertEquals(64, sequence.committedFrontier());
         } finally {
             releaseAndClose(stream, lattice, runtime);
+            hostLogits.close();
             sequence.complete();
         }
     }

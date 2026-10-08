@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.inference.core.runtime.graph.SequenceOwner;
 import io.euhedral_execution.inference.core.runtime.graph.Sequencer;
 import java.lang.invoke.VarHandle;
 import java.util.Objects;
@@ -48,6 +49,8 @@ public final class Sequence {
 
     private final long sequenceId;
     private final Order order = new Order();
+    /// The last users of the sequence's carried state in its graphs; confined to the workspace's owner.
+    private final SequenceOwner owner = new SequenceOwner();
     /// Written by admission only.
     private volatile long submitted;
     private volatile long admitted;
@@ -198,6 +201,11 @@ public final class Sequence {
 
     /// Concludes the complete work at the head of the order, in order. Called by a piece of work after it became
     /// ready.
+    /// The record of the last users of this sequence's carried state ([SequenceOwner]).
+    public SequenceOwner owner() {
+        return this.owner;
+    }
+
     public void drain() {
         this.order.drain();
     }

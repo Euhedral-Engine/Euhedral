@@ -14,6 +14,11 @@ public interface StageQuantum {
     void fail(Throwable failure);
 
     /// Whether registered kernels of this quantum may overlap their predecessor's tail.
+    /// The sequence whose carried state this quantum's graph shares with the sequence's other graphs, or null.
+    default SequenceOwner sequenceOwner() {
+        return null;
+    }
+
     default boolean overlapLaunches() {
         return false;
     }

@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
+import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
+import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import org.junit.jupiter.api.Test;
 
@@ -46,6 +48,34 @@ class PromptStateTest {
             }
         }
         assertTrue(gdn && kv, "the fixture has GDN and attention layers");
+    }
+
+    @Test
+    void aFirstLayerPlansGdnStagesCarryLayerZerosState() {
+        var full = EngineExecutionFixture.weights();
+        var firstLayer = new Weights(
+                full.config(),
+                full.tokenEmbedding(),
+                new LayerWeights[] {full.layers()[0]},
+                full.finalNorm(),
+                full.lmHead(),
+                null);
+        Shape view = new ExecutionPlan(firstLayer).forExecution(Quantum.ExecutionKind.PREFILL, 64);
+        boolean gdn = false;
+        for (int stage = 0; stage < view.topology().size(); stage++) {
+            ExecutionPlan.Instruction instruction = view.instructions().get(stage);
+            switch (instruction.kind()) {
+                case GDN_CONVOLUTION, GDN_RECURRENCE -> {
+                    assertArrayEquals(
+                            new int[] {0},
+                            view.carriedState(stage),
+                            instruction.kind().name());
+                    gdn = true;
+                }
+                default -> {}
+            }
+        }
+        assertTrue(gdn, "the first layer is a GDN layer");
     }
 
     @Test

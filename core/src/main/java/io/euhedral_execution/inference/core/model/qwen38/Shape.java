@@ -106,11 +106,12 @@ public final class Shape implements GraphShape {
     }
 
     /// The sequence state stage `stage` carries from one chunk of a prompt to the next: `2L` for layer L's GDN
-    /// convolution and recurrent state, `2L + 1` for its KV rows. Layer slots include the MTP layer's.
+    /// convolution and recurrent state, `2L + 1` for its KV rows. Layer slots include the MTP layer's. A
+    /// first-layer plan's stages name no layer: their state is layer 0's, the sequence's only one.
     @Override
     public int[] carriedState(int stage) {
         ExecutionPlan.Instruction instruction = this.instructions.get(stage);
-        int layer = instruction.layerIndex();
+        int layer = Math.max(instruction.layerIndex(), 0);
         return switch (instruction.kind()) {
             case GDN_CONVOLUTION, GDN_RECURRENCE -> new int[] {2 * layer};
             case ATTENTION_KV_APPEND, ATTENTION_CAUSAL -> new int[] {2 * layer + 1};

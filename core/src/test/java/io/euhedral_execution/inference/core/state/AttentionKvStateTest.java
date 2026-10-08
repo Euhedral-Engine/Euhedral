@@ -52,6 +52,23 @@ class AttentionKvStateTest {
     }
 
     @Test
+    void aLaterQuantumsAppendSurvivesTheEarlierOnesCommit() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            state.prepareAppend(0, 2);
+            state.appendSubmitted(2);
+            // A later quantum of the sequence appends before the earlier one retired.
+            state.prepareAppend(2, 3);
+            state.appendSubmitted(3);
+            state.commitAppended(2);
+            assertEquals(2, state.length());
+            assertEquals(5, state.submittedLength(), "the later quantum's rows stay submitted");
+            state.commitAppended(3);
+            assertEquals(5, state.length());
+        }
+    }
+
+    @Test
     void anAppendMustContinueTheSubmittedFrontier() {
         RecordingGpu gpu = new RecordingGpu();
         try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
