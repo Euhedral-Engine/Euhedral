@@ -72,8 +72,9 @@ seal) that runs once.
 
 Admission is a frame on the workspace's owner: its `idHash` is `WorkspaceOwner.HASH` and it stays ordered on it,
 so admissions run one at a time (`publishOnOwner`). An ordered frame is exclusive on its owner, not first in, first
-out: frames keep their publication order only when they enter the lattice through the same source and no partitioned
-queue, and the lake's sinks are partitioned. Two admissions published from different threads may therefore run in
+out: frames keep their publication order only when they enter the lattice through the same source and no queue of more
+than one partition, and each of the lake's sinks has two producer partitions by default (`EUHEDRAL_LAKE_PARTITIONS`).
+Two admissions published from different threads may therefore run in
 either order, and nothing depends on which: quanta that share sequence state are never in flight together, and the
 owner's records say who wrote each buffer. Order the code relies on is causal: a frame publishes its successor after
 it ran.
