@@ -53,11 +53,12 @@ public final class AttentionStates implements AutoCloseable {
     public long draftSeedRows(int rows, int hidden) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
         if (rows > this.draftSeedCapacity) {
-            if (this.draftSeedRows != 0) this.gpu.free(this.draftSeedRows);
+            // Grown in stream order inside a stage: the outgrown rows' readers are retired quanta.
+            if (this.draftSeedRows != 0) this.gpu.freeAsync(this.draftSeedRows);
             this.draftSeedRows = 0;
             this.draftSeedCapacity = 0;
             int capacity = Math.max(rows, 8);
-            this.draftSeedRows = this.gpu.allocate((long) capacity * hidden * Short.BYTES);
+            this.draftSeedRows = this.gpu.allocateAsync((long) capacity * hidden * Short.BYTES);
             this.draftSeedCapacity = capacity;
         }
         return this.draftSeedRows;
@@ -66,7 +67,7 @@ public final class AttentionStates implements AutoCloseable {
     /// The latest MTP row's post-`mtp.norm` hidden (BF16), seeding the next recursive draft row.
     public long draftRecursionHidden(int hidden) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
-        if (this.draftRecursionHidden == 0) this.draftRecursionHidden = this.gpu.allocate((long) hidden * Short.BYTES);
+        if (this.draftRecursionHidden == 0) this.draftRecursionHidden = this.gpu.allocateAsync((long) hidden * Short.BYTES);
         return this.draftRecursionHidden;
     }
 
@@ -91,11 +92,11 @@ public final class AttentionStates implements AutoCloseable {
         if (this.decodeScratch != 0 && queryHeads != this.decodeScratchHeads)
             throw new IllegalArgumentException("decode head geometry changed");
         if (this.decodeScratch == 0 || rows > this.decodeScratchRows) {
-            if (this.decodeScratch != 0) this.gpu.free(this.decodeScratch);
+            if (this.decodeScratch != 0) this.gpu.freeAsync(this.decodeScratch);
             this.decodeScratch = 0;
             this.decodeScratchRows = 0;
             this.decodeScratch =
-                    this.gpu.allocate(Math.multiplyExact((long) queryHeads * rows, 64L * 258 * Float.BYTES));
+                    this.gpu.allocateAsync(Math.multiplyExact((long) queryHeads * rows, 64L * 258 * Float.BYTES));
             this.decodeScratchHeads = queryHeads;
             this.decodeScratchRows = rows;
         }

@@ -405,7 +405,7 @@ public final class MoeLayer implements AutoCloseable {
     /// Queues a later layer's router (`ahead`) applied to `layer`'s single row: a prediction of the experts that
     /// layer will ask for, read back for [#takePrediction].
     void submitPrediction(int layer, Weights ahead, long input) {
-        long device = this.predictedDevice.computeIfAbsent(layer, l -> this.gpu.allocate(2L * this.experts));
+        long device = this.predictedDevice.computeIfAbsent(layer, l -> this.gpu.allocateAsync(2L * this.experts));
         ExecutionGpu.ReadbackBuffer logits =
                 this.predictedLogits.computeIfAbsent(layer, l -> this.gpu.allocateReadbackBuffer(2L * this.experts));
         Ops.linearBf16(this.gpu, input, ahead.router().address(), device, 1, this.hidden, this.experts);
