@@ -7,10 +7,13 @@ import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertCacheStats;
 import io.euhedral_execution.inference.core.model.qwen4.loader.LayerType;
 import io.euhedral_execution.inference.core.model.qwen4.loader.NgramStore;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
+import io.euhedral_execution.inference.core.runtime.graph.ChunkedShape;
+import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
+import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
+import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.IntStream;
 
@@ -122,9 +125,20 @@ public final class ExecutionPlan implements AutoCloseable {
     private Workspace workspace;
 
     private final int maxRows;
-    /// The last quantum admitted: a new quantum registers as its successor, and its conclusion
-    /// starts the new one.
-    private final AtomicReference<Quantum> chainTail = new AtomicReference<>();
+    /// The prompt graphs' shapes: the most recently used [#PROMPT_SHAPES] of them, confined to the workspace's owner
+    /// (admission looks them up); an evicted one's pool is released to the runtime.
+    private final java.util.Map<java.util.List<Object>, ChunkedShape> promptShapes =
+            new java.util.LinkedHashMap<>(PROMPT_SHAPES, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<java.util.List<Object>, ChunkedShape> eldest) {
+                    if (size() <= PROMPT_SHAPES) return false;
+                    ExecutionPlan.this.runtime.release(eldest.getValue());
+                    return true;
+                }
+            };
+
+    /// Prompt shapes kept at once.
+    static final int PROMPT_SHAPES = 16;
     private final AtomicInteger active = new AtomicInteger();
     private final LongAdder stepsRun = new LongAdder();
     private volatile Timings timings;
@@ -325,8 +339,56 @@ public final class ExecutionPlan implements AutoCloseable {
         return this.runtime;
     }
 
-    AtomicReference<Quantum> chainTail() {
-        return this.chainTail;
+    /// The graph a prompt quantum of several chunks runs: its full chunks copy its shape, its last chunk the shape
+    /// of its row count. Runs on the workspace's owner.
+    ChunkedShape promptShape(Quantum prompt) {
+        Shape full = prompt.shape();
+        int chunks = prompt.chunkCount();
+        int lastRows = prompt.chunk(chunks - 1).rows();
+        Shape last = this.shapes.computeIfAbsent(
+                new ShapeKey(full.key().range(), rowBucket(lastRows), full.key().diagnostic()),
+                key -> new Shape(this, key));
+        return this.promptShapes.computeIfAbsent(
+                java.util.List.of(full, last, chunks),
+                key -> new ChunkedShape(full, last, chunks, new ChunkedShape.Chunks() {
+                    @Override
+                    public StageFrame create(
+                            StageGraph graph, int stage, int chunk, int templateStage, ExecutionGpu gpu) {
+                        Shape template = chunk == chunks - 1 ? last : full;
+                        return Stages.create(graph, stage, template, template.spec(templateStage), chunk);
+                    }
+
+                    @Override
+                    public GraphStorage newStorage(ExecutionGpu gpu) {
+                        return leaseStorage(ExecutionPlan.this.maxRows);
+                    }
+                }));
+    }
+
+    /// Starts `rows` tokens (`tokens[offset ..]`) of a prompt at the sequence's position as one quantum: a single
+    /// chunk as [#start] does, more as one graph of chunks of `chunkRows` (at most [#maxRows]), which overlap where
+    /// their buffers allow.
+    public Handle startPrompt(
+            Sequence sequence,
+            int[] tokens,
+            int offset,
+            int rows,
+            int chunkRows,
+            LogitsSink sink,
+            AbstractFrame continuation) {
+        if (chunkRows <= 0 || chunkRows > this.maxRows) throw new IllegalArgumentException("chunkRows " + chunkRows);
+        if (rows <= chunkRows) return start(sequence, tokens, offset, rows, sink, continuation);
+        if (this.closed) throw new IllegalStateException("the plan is closed");
+        if (sequence.position() + rows > sequence.maxTokens())
+            throw new IllegalStateException("the sequence would exceed its " + sequence.maxTokens() + " positions");
+        boolean diagnostic = timingsOn() || hasObserver() || hasMidObserver();
+        Range range = new Range(0, this.sparse.length, true, true, true);
+        Shape shape = this.shapes.computeIfAbsent(
+                new ShapeKey(range, rowBucket(chunkRows), diagnostic), key -> new Shape(this, key));
+        Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, chunkRows, sink);
+        quantum.continueWith(this.runtime.lake(), Objects.requireNonNull(continuation, "continuation"));
+        quantum.enter();
+        return quantum;
     }
 
     MoeLayer newMoeLayer(int rows) {

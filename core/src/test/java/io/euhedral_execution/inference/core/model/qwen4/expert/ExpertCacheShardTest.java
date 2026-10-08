@@ -426,4 +426,18 @@ class ExpertCacheShardTest {
         shard.checkQuiescent();
         assertEquals(4, shard.evictableSlots());
     }
+
+    @Test
+    void aClaimOfAnExpertWhoseCopyIsNotYetSubmittedComesBackFullNotFailed() throws Exception {
+        cache(2, 1);
+        ExpertCacheShard shard = this.cache.shard(0);
+        ExpertCacheShard.Load load = miss(shard, 2, 5);
+        // Another block asks for the same expert before the first load submitted its copy.
+        var second = new ExpertCacheShard.Ticket();
+        shard.claim(2, 5, true, second);
+        assertNull(second.lease(), "nothing to lease yet");
+        assertNull(second.load(), "and no second load: the fetch republishes itself");
+        load.cancel();
+        shard.checkQuiescent();
+    }
 }

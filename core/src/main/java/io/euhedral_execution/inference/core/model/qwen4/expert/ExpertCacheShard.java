@@ -274,10 +274,10 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
 
     /// Asks for the expert. A resident expert is a lease at once. An absent one is a load when
     /// `mayLoad` and a slot is free or evictable; otherwise the ticket says to wait. Nothing is
-    /// changed when the ticket waits.
+    /// changed when the ticket waits. An expert another block is loading joins that load once its copy was
+    /// submitted; before that the ticket is empty, and the fetch republishes itself as for a full cache.
     ///
-    /// @throws IllegalStateException when the shard is closed, or the expert is being loaded by a
-    ///     request whose copy was not submitted yet
+    /// @throws IllegalStateException when the shard is closed
     public void claim(int bank, int expert, boolean mayLoad, Ticket ticket) {
         ticket.lease = null;
         ticket.load = null;
@@ -288,9 +288,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         if (slot != NONE) {
             if (this.state[slot] == LOADING) {
                 Load joined = this.load[slot];
-                if (!joined.streamed)
-                    throw new IllegalStateException(
-                            "expert " + expert + " of bank " + bank + " is loading and its copy was not submitted");
+                // Another block's load has not submitted its copy: nothing to lease yet; ask again.
+                if (!joined.streamed) return;
                 this.pins[slot]++;
                 asked(slot);
                 this.stats.coalesced();
@@ -329,7 +328,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         private final int expert;
         /// The slot's pending fence, taken for the copy to wait behind.
         private DeviceFence fence;
-        private boolean streamed;
+        /// Set when the load's lease is made, off the owner; read by the owner's claims.
+        private volatile boolean streamed;
         private boolean finished;
         private long startNanos;
 
@@ -379,8 +379,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
 
         /// The load's own claim on the slot as a lease carrying the copy's marker, made before the copy is
         /// submitted: whoever submits the copy hands it on, and only then, so nothing waits for the marker
-        /// before it was recorded. A miss of the same expert is never asked while its copy is being made
-        /// (a block names an expert once, and a quantum's fetches end before the next quantum's begin).
+        /// before it was recorded. A claim of the same expert while the copy is being made comes back empty
+        /// and is asked again ([#claim]).
         public ExpertLease lease() {
             this.streamed = true;
             this.startNanos = System.nanoTime();

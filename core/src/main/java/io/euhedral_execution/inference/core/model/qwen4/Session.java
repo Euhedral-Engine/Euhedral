@@ -207,14 +207,14 @@ public final class Session implements GenerationSession {
             }
         };
 
-        /// A prefill chunk; the last one samples the first token.
+        /// The rest of the prompt: one quantum, a graph of its chunks; the last chunk samples the first token.
         private final StepPort chunk = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                rows = Math.min(Session.this.prefillChunkTokens, prompt.length - offset);
-                samples = offset + rows == prompt.length && maxNewTokens > 0;
+                rows = prompt.length - offset;
+                samples = maxNewTokens > 0;
                 started = System.nanoTime();
-                startStep(prompt, offset, rows, samples, select);
+                startPromptStep(prompt, offset, rows, samples, select);
             }
 
             @Override
@@ -326,6 +326,17 @@ public final class Session implements GenerationSession {
             Session.this.generationActive.set(false);
             if (Session.this.closed.get()) completeClose();
         }
+    }
+
+    private void startPromptStep(int[] tokens, int from, int count, boolean wantsLogits, AbstractFrame select) {
+        if (count <= this.prefillChunkTokens) {
+            startStep(tokens, from, count, wantsLogits, select);
+            return;
+        }
+        ExecutionPlan.Handle step = this.plan.startPrompt(
+                this.sequence, tokens, from, count, this.prefillChunkTokens, wantsLogits ? this.sink : null, select);
+        this.activeStep = step;
+        if (isStopRequested()) step.cancel();
     }
 
     private void startStep(int[] tokens, int from, int count, boolean wantsLogits, AbstractFrame select) {

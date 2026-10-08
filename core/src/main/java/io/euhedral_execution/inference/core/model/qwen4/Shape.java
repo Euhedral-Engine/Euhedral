@@ -257,6 +257,15 @@ final class Shape implements GraphShape {
         return this.plan;
     }
 
+    ExecutionPlan.ShapeKey key() {
+        return this.key;
+    }
+
+    /// The spec of stage `stage`.
+    Spec spec(int stage) {
+        return this.specs.get(stage);
+    }
+
     boolean diagnostic() {
         return this.key.diagnostic();
     }

@@ -422,6 +422,33 @@ class ExpertCacheOwnerTest {
     }
 
     @Test
+    void twoBlocksAskingForTheSameExpertsAtOnceBothFinishWithOneLoadEach() throws Exception {
+        build(4, 2);
+        // Two blocks' fetches, interleaved: experts 2 and 3 are asked by both, the second time while their loads
+        // may not have submitted their copies yet.
+        List<Fetch> fetches = fetchAll(2, 1, 2, 2, 3, 3, 4);
+        drained();
+        for (Fetch fetch : fetches) assertTrue(fetch.ended() && fetch.lease() != null);
+        assertEquals(
+                4,
+                this.cache.shard(this.cache.shardOf(2, 1)).stats().snapshot().misses() + otherShardMisses(2, 1),
+                "one load per expert");
+        for (Fetch fetch : fetches) fetch.lease().close();
+        drained();
+        this.cache.checkQuiescent();
+    }
+
+    /// Misses of every shard but the one holding (`bank`, `expert`).
+    private long otherShardMisses(int bank, int expert) {
+        long misses = 0;
+        int own = this.cache.shardOf(bank, expert);
+        for (int shard = 0; shard < this.cache.shardCount(); shard++)
+            if (shard != own)
+                misses += this.cache.shard(shard).stats().snapshot().misses();
+        return misses;
+    }
+
+    @Test
     void aCopyThatCannotBeSubmittedFailsTheFetchAndReturnsItsSlotAndBuffer() throws Exception {
         build(2, 2);
         this.gpu.failNextHostCopies(1);
