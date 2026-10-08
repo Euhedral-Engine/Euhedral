@@ -151,8 +151,12 @@ class AttentionKvStateTest {
             state.prepareAppend(1, 256);
             assertEquals(List.of(first), gpu.asyncFreed, "the outgrown table is freed on the stream, at once");
             assertEquals(0, gpu.syncFrees, "nothing is freed synchronously while the quantum runs");
-            assertEquals(gpu.allocations.keySet(), new java.util.HashSet<>(gpu.asyncAllocated.stream()
-                    .filter(gpu.allocations::containsKey).toList()), "pages and tables are stream-ordered allocations");
+            assertEquals(
+                    gpu.allocations.keySet(),
+                    new java.util.HashSet<>(gpu.asyncAllocated.stream()
+                            .filter(gpu.allocations::containsKey)
+                            .toList()),
+                    "pages and tables are stream-ordered allocations");
             commit(state, 256);
             assertEquals(0, gpu.syncFrees);
         }

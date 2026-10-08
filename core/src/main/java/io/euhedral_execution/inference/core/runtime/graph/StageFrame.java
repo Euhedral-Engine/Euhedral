@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.gpu.GpuStream;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /// One execution stage of a reusable [StageGraph], an Euhedral frame like any other.
 ///
@@ -62,6 +63,17 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     boolean attempted;
     boolean submitted;
+
+    /// The external edges registered on this stage in its current binding (a stack of [ExternalEdge]s), or a
+    /// sentinel once the stage satisfied them: [#SUBMITTED] (later graphs await this stage's marker) or
+    /// [#SWEPT] (its graph quiesced without it submitting: they await the graph's join marker).
+    final AtomicReference<Object> externals = new AtomicReference<>();
+
+    static final Object SUBMITTED = new Object();
+    static final Object SWEPT = new Object();
+    /// External edges this stage waits for in the current binding, and its first await slot in its graph.
+    int externalIn;
+    int firstSlot;
 
     protected StageFrame(StageGraph graph, int stage) {
         this(graph, stage, false);
@@ -195,6 +207,13 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
                     if (recording) owner.shadowAwait(lane, predecessor.shadowMarker);
                     awaited = true;
                 }
+                // Other graphs' last accessors of the buffers this stage touches first; never captured.
+                for (int slot = this.firstSlot; slot < this.firstSlot + this.externalIn; slot++) {
+                    long external = owner.externalAwait(slot);
+                    if (external == 0) continue;
+                    stream.await(external);
+                    awaited = true;
+                }
                 owner.used(lane);
             }
             // A launch that waits on another lane does not overlap its stream predecessor.
@@ -238,7 +257,7 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     /// Satisfies one incoming edge. Exactly one caller sees the final arrival.
     final boolean arrive() {
-        return (int) ARRIVALS.getAndAdd(this, 1) + 1 == this.inDegree;
+        return (int) ARRIVALS.getAndAdd(this, 1) + 1 == this.inDegree + this.externalIn;
     }
 
     /// The lane this stage continues, or -1: its path predecessor's, or the graph's home lane for a
@@ -252,6 +271,9 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
 
     final void reset() {
         ARRIVALS.set(this, 0);
+        this.externals.set(null);
+        this.externalIn = 0;
+        this.firstSlot = 0;
         this.deferred = false;
         this.deferral.set(0);
         this.attempted = false;

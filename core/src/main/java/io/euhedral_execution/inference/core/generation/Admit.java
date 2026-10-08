@@ -2,10 +2,13 @@ package io.euhedral_execution.inference.core.generation;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.impl.FrameManager;
-import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
+import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
 
 /// Starts a generation's next step: checks out the step's [Select] and hands it to the port, whose quantum throws it
 /// when it retires. A port that could not hand its step over fails the generation, which then finishes.
+///
+/// Runs on the workspace's owner: its `idHash` is [WorkspaceOwner#HASH] and it stays ordered (its routing hash is
+/// its `idHash`, which recycling keeps), so a port admits its quantum where admissions bind, one at a time.
 final class Admit extends AbstractFrame {
 
     private final GenerationFrames frames;
@@ -13,10 +16,8 @@ final class Admit extends AbstractFrame {
     StepPort port;
     private Select refused;
 
-    Admit(long idHash, FrameManager<Generation, Admit> recycler, GenerationFrames frames, Generation generation) {
-        super(idHash, recycler, null);
-        // Unordered, so the factory draws a fresh seed on create and on every reuse.
-        randomizeHash(FrameSeeds.forHostWork().next());
+    Admit(FrameManager<Generation, Admit> recycler, GenerationFrames frames, Generation generation) {
+        super(WorkspaceOwner.HASH, recycler, null);
         this.frames = frames;
         this.generation = generation;
     }

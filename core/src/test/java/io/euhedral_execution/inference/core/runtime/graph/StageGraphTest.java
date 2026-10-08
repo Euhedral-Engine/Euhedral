@@ -136,13 +136,15 @@ class StageGraphTest {
         run(stage(graph, 2));
         run(stage(graph, 1));
         run(take(this.source).getFirst());
-        // Markers 1-4: preparation, then stages 0, 1 and 2; lanes 1 and 2 get tails 101 and 201.
+        // Markers 1-5: preparation, then stages 0 to 3 (every device stage marks: a later graph may wait for any
+        // last accessor); 6 is the join marker; lanes 1 and 2 get tails 101 and 201.
         assertEquals(List.of("await:2", "k2", "mark:4"), side.kernels.subList(0, 3));
         assertEquals(List.of("mark:1", "k0", "mark:2", "k1", "mark:3"), home.kernels.subList(0, 5));
         assertEquals("await:4", home.kernels.get(5), "stage 3 awaits the side lane's producer");
-        assertEquals("k3", home.kernels.get(6));
+        assertEquals(List.of("k3", "mark:5"), home.kernels.subList(6, 8));
         assertEquals(List.of("mark:101"), side.kernels.subList(3, 4), "quiesce marks the used side lane");
-        assertEquals("await:101", home.kernels.get(7));
+        assertEquals("await:101", home.kernels.get(8));
+        assertEquals("mark:6", home.kernels.get(9), "the join marker follows every joined lane");
         assertTrue(idle.kernels.isEmpty(), "an unused lane is not joined");
         assertEquals(1, home.armed());
         home.retireNext(false);
@@ -150,7 +152,7 @@ class StageGraphTest {
         assertEquals("SUCCESS", quantum.outcome.join());
         graph.close();
         assertFalse(home.closed, "a shared pool outlives its graphs");
-        assertEquals(Set.of(1L, 2L, 3L, 4L, 101L, 201L), new HashSet<>(home.closedMarkers));
+        assertEquals(Set.of(1L, 2L, 3L, 4L, 5L, 6L, 101L, 201L), new HashSet<>(home.closedMarkers));
     }
 
     @Test

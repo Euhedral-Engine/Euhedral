@@ -105,15 +105,17 @@ public final class Execution implements AutoCloseable {
         return submit(context, NO_TERMINAL_CONSUMER);
     }
 
-    /// Admits one quantum. The returned future completes after its device work retired and the
-    /// quantum's graph was recycled. A quantum is admitted at most once: when admission itself
-    /// fails, the failure is thrown and the quantum's outcome is failed as well.
+    /// Admits one quantum from outside the workspace's owner (tests and tools): the admission runs as an owner
+    /// frame. The returned future completes after its device work retired and the quantum's graph was recycled. A
+    /// quantum of another plan, or one already admitted, throws here; any other failure to admit it fails its
+    /// outcome.
     public CompletableFuture<Quantum.Outcome> submit(Quantum context, Consumer<? super Quantum> terminalConsumer) {
         Objects.requireNonNull(context, "context");
         Objects.requireNonNull(terminalConsumer, "terminalConsumer");
+        claim(context);
         Completion done = new Completion();
         context.continueWith(this.lake, done);
-        accept(context, terminalConsumer, true);
+        this.runtime.publishOnOwner(() -> accept(context, terminalConsumer));
         return done.outcome;
     }
 
@@ -144,22 +146,28 @@ public final class Execution implements AutoCloseable {
         }
     }
 
-    /// Admits `context` on the generation path: once its outcome is published it throws `continuation` into the
-    /// lake. Throws only when the quantum never reached the runtime (another plan's, already admitted); then
-    /// `continuation` is never thrown. The runtime's refusal is not thrown: the runtime published the quantum's
-    /// failed outcome, which `continuation` carries.
+    /// Admits `context` on the generation path, from its `Admit`, which runs ordered on the workspace's owner: once
+    /// its outcome is published it throws `continuation` into the lake. Throws only when the quantum never reached
+    /// the runtime (another plan's, already admitted); then `continuation` is never thrown. The runtime's refusal
+    /// is not thrown: the runtime published the quantum's failed outcome, which `continuation` carries.
     public void admit(Quantum context, AbstractFrame continuation) {
         Objects.requireNonNull(context, "context");
+        claim(context);
         context.continueWith(this.lake, continuation);
-        accept(context, NO_TERMINAL_CONSUMER, false);
+        accept(context, NO_TERMINAL_CONSUMER);
     }
 
-    private void accept(Quantum context, Consumer<? super Quantum> terminalConsumer, boolean refusalThrows) {
-        Shape view = context.shape();
+    /// Checks that `context` belongs to this plan and claims its single admission.
+    private void claim(Quantum context) {
         if (context.plan() != this.plan) {
             throw new IllegalArgumentException("quantum belongs to another execution plan");
         }
         context.claim();
+    }
+
+    /// Admits a claimed quantum. Runs on the workspace's owner.
+    private void accept(Quantum context, Consumer<? super Quantum> terminalConsumer) {
+        Shape view = context.shape();
         boolean staging = view.stagesWeights();
         if (staging) {
             // Blocks only this admitting thread, until the previous staging quantum has submitted its
@@ -180,7 +188,6 @@ public final class Execution implements AutoCloseable {
                     ordered ? stream -> stream.await(this.runtime.transferMarker()) : null,
                     (stream, storage) -> context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage));
         } catch (RuntimeException | Error refused) {
-            if (refusalThrows) throw refused;
             LOG.debug("a quantum was refused; its continuation carries the failure", refused);
         }
     }

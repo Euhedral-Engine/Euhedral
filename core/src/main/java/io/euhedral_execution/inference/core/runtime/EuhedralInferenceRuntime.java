@@ -12,12 +12,16 @@ import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.runtime.graph.LanePool;
 import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import io.euhedral_execution.inference.core.runtime.graph.StageQuantum;
+import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
+import io.euhedral_execution.inference.core.runtime.graph.WorkspaceUse;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// Admits quanta of any model into reusable frame graphs.
 ///
@@ -53,7 +57,10 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     private final ExecutionGpu gpu;
+    private static final Logger LOG = LoggerFactory.getLogger(EuhedralInferenceRuntime.class);
     private final ConcurrentHashMap<GraphShape, GraphPool> pools = new ConcurrentHashMap<>();
+    /// The workspace's owner: confined to frames ordered on [WorkspaceOwner#HASH], as every admission is.
+    private final WorkspaceOwner owner;
     private final Object closeLock = new Object();
     /// The pool of ready work the graphs' stages and the driver callbacks throw frames into. The model's runtime owns
     /// it, with the host work that also publishes into it.
@@ -82,9 +89,16 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// A runtime that runs the [GraphShape]s its callers admit through [#admit] on `lanes`, throwing every ready
     /// frame into `lake`, which the caller owns, attaches and completes after closing this runtime.
     public EuhedralInferenceRuntime(InferenceLake lake, ExecutionGpu gpu, Lanes lanes) {
+        this(lake, gpu, lanes, 0);
+    }
+
+    /// A runtime whose quanta share a workspace of `workspaceBuffers` buffers, the reuse of which its owner orders
+    /// across graphs ([WorkspaceOwner]).
+    public EuhedralInferenceRuntime(InferenceLake lake, ExecutionGpu gpu, Lanes lanes, int workspaceBuffers) {
         this.lake = Objects.requireNonNull(lake, "lake");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.lanesConfig = Objects.requireNonNull(lanes, "lanes");
+        this.owner = new WorkspaceOwner(workspaceBuffers);
     }
 
     /// A marker on the transfer lane, for an owner that orders the transfers of successive quanta (a weight staging
@@ -145,12 +159,51 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         boolean prepare(GpuStream stream, GraphStorage storage);
     }
 
+    /// Runs `admission` on the workspace's owner, for a caller outside a frame ordered on it (tests and tools,
+    /// or a completion chain): publishes an [Admission] whose `execute` runs it. `admission` calls [#admit]; a
+    /// refusal it throws is logged, because the runtime already published the quantum's failure through its
+    /// continuation.
+    public void publishOnOwner(Runnable admission) {
+        // A lake that no longer takes frames (it is closing) runs the admission here, which then refuses it.
+        this.lake.publishOrRun(new Admission(admission));
+    }
+
+    /// One admission run on the workspace's owner: its `idHash` is [WorkspaceOwner#HASH] and it stays ordered, so
+    /// admissions run one at a time, in the order they were published.
+    static final class Admission extends AbstractFrame {
+        private final Runnable admission;
+
+        Admission(Runnable admission) {
+            super(WorkspaceOwner.HASH);
+            this.admission = Objects.requireNonNull(admission, "admission");
+        }
+
+        @Override
+        public void execute() {
+            try {
+                this.admission.run();
+            } catch (RuntimeException | Error refused) {
+                LOG.debug("an admission was refused; its quantum's continuation carries the failure", refused);
+            }
+        }
+
+        /// A rejected owner frame still admits (and so still concludes) its quantum.
+        @Override
+        public void doFinallyWithError(Throwable rejection) {
+            execute();
+        }
+    }
+
     /// Admits one quantum of any shape: acquires an idle graph of `shape` (building one when every
-    /// graph is in use), runs `ordering` and `prepare` on its home stream, and publishes its root
-    /// stages. After that the runtime is out of the execution path: stages publish their
-    /// successors, workers run them, and the quantum's retirement recycles the graph before the
-    /// outcome is published. A quantum is admitted at most once: when admission itself fails the
-    /// quantum is retired as failed and the failure is thrown.
+    /// graph is in use), runs `ordering` and `prepare` on its home stream, binds the graph behind the
+    /// last accessors of the workspace buffers it touches, and publishes its root stages. After that
+    /// the runtime is out of the execution path: stages publish their successors, workers run them,
+    /// and the quantum's retirement recycles the graph before the outcome is published. A quantum is
+    /// admitted at most once: when admission itself fails the quantum is retired as failed and the
+    /// failure is thrown.
+    ///
+    /// Runs only on frames ordered on [WorkspaceOwner#HASH] (the generation's `Admit`, or an [Admission]): the
+    /// workspace's owner state is confined to them.
     public void admit(GraphShape shape, StageQuantum quantum, Consumer<GpuStream> ordering, Preparation prepare) {
         Objects.requireNonNull(shape, "shape");
         Objects.requireNonNull(quantum, "quantum");
@@ -193,7 +246,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             if (proceeds[0]) {
                 // From here the graph owns the quantum; its retirement recycles the graph.
                 started = true;
-                graph.start(quantum);
+                this.owner.bind(graph, shape, pool.use, quantum);
             }
         } finally {
             if (!started) {
@@ -357,11 +410,14 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// Idle graphs of one shape. Graphs are built only when every existing one is in use.
     private final class GraphPool {
         private final GraphShape view;
+        /// Each buffer's first and last accessors in this shape, computed once.
+        final WorkspaceUse use;
         private final MpmcQueue<PooledGraph> idle = new MpmcQueue<>(16, 2);
         private final List<PooledGraph> built = new ArrayList<>();
 
         private GraphPool(GraphShape view) {
             this.view = view;
+            this.use = WorkspaceUse.of(view);
         }
 
         PooledGraph acquire() {

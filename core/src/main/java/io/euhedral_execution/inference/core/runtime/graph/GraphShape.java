@@ -16,4 +16,17 @@ public interface GraphShape {
 
     /// The storage one graph of this shape owns.
     GraphStorage newStorage(ExecutionGpu gpu);
+
+    /// The runtime workspace's buffers stage `stage` reads or writes, by index. A graph admitted after another
+    /// orders its first accessors of a buffer behind the other's last accessors of it ([WorkspaceOwner]).
+    default int[] workspaceBuffers(int stage) {
+        return NO_BUFFERS;
+    }
+
+    /// How many workspace buffers the shape's stages may name.
+    default int workspaceBufferCount() {
+        return 0;
+    }
+
+    int[] NO_BUFFERS = new int[0];
 }

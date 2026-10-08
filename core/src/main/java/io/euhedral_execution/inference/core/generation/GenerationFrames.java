@@ -27,7 +27,7 @@ public final class GenerationFrames {
     public GenerationFrames(FrameLake lake) {
         this.lake = Objects.requireNonNull(lake, "lake");
         this.admits.setFactory(new FrameFactory<>(
-                (id, generation) -> counted(new Admit(id, this.admits, this, generation)),
+                (id, generation) -> counted(new Admit(this.admits, this, generation)),
                 (generation, frame) -> frame.generation = generation));
         this.selects.setFactory(new FrameFactory<>(
                 (id, generation) -> counted(new Select(id, this.selects, this, generation)),

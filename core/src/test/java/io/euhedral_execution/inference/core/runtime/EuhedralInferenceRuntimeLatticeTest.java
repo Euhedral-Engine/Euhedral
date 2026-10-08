@@ -194,10 +194,10 @@ class EuhedralInferenceRuntimeLatticeTest {
 
         assertSame(completionFailure, assertThrows(IllegalStateException.class, runtime::close));
         assertFalse(runtime.isAttached(), "the runtime retained a completed source after its callback failed");
-        assertThrows(
-                IllegalStateException.class,
-                () -> runtime.submit(
-                        new Quantum(plan, new Sequence(704), Quantum.ExecutionKind.DECODE, 0, new int[] {1})));
+        // A closed runtime refuses the admission; the refusal is the quantum's outcome.
+        var refused =
+                runtime.submit(new Quantum(plan, new Sequence(704), Quantum.ExecutionKind.DECODE, 0, new int[] {1}));
+        assertEquals(Quantum.Status.FAILED, refused.get(10, TimeUnit.SECONDS).status());
     }
 
     @Test

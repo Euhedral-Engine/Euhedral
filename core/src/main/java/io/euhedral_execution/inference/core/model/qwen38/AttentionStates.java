@@ -67,7 +67,8 @@ public final class AttentionStates implements AutoCloseable {
     /// The latest MTP row's post-`mtp.norm` hidden (BF16), seeding the next recursive draft row.
     public long draftRecursionHidden(int hidden) {
         if (this.closed) throw new IllegalStateException("attention sequence states are closed");
-        if (this.draftRecursionHidden == 0) this.draftRecursionHidden = this.gpu.allocateAsync((long) hidden * Short.BYTES);
+        if (this.draftRecursionHidden == 0)
+            this.draftRecursionHidden = this.gpu.allocateAsync((long) hidden * Short.BYTES);
         return this.draftRecursionHidden;
     }
 

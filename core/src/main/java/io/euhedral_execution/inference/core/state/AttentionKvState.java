@@ -228,8 +228,7 @@ public final class AttentionKvState implements AutoCloseable {
                 failure = combine(failure, error);
             }
         }
-        this.closed =
-                this.pages.isEmpty() && this.table == 0 && this.decodeScratch == 0;
+        this.closed = this.pages.isEmpty() && this.table == 0 && this.decodeScratch == 0;
         if (failure != null) throw propagate(failure);
     }
 
@@ -247,7 +246,6 @@ public final class AttentionKvState implements AutoCloseable {
             this.pendingStaging.clear();
         }
     }
-
 
     private void ensureOpen() {
         if (this.closed) throw new IllegalStateException("attention KV state is closed");

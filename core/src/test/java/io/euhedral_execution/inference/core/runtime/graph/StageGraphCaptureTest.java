@@ -310,4 +310,52 @@ class StageGraphCaptureTest {
                         .orElseThrow());
         assertEquals(2, count(side.kernels, "k2"), "a replay touches no other lane");
     }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(10)
+    void aReplayWaitsForEveryExternalPredecessor() throws Exception {
+        CapturingStream home = new CapturingStream();
+        CapturingStream side = new CapturingStream();
+        side.base = 500;
+        LanePool pool = new LanePool(new RecordingStream[] {home, side});
+        WorkspaceOwner owner = new WorkspaceOwner(1);
+        GraphShape shape = TestShapes.of(LINEAR, new int[][] {{0}, {0}, {0}}, 1);
+        StageGraph graph = graph(LINEAR, pool);
+        for (int run = 0; run < 2; run++) {
+            TestQuantum quantum = keyed("decode");
+            owner.bind(graph, shape, WorkspaceUse.of(shape), quantum);
+            drain(this.source);
+            while (home.armed() > 0 || side.armed() > 0) {
+                if (home.armed() > 0) home.retireNext(false);
+                if (side.armed() > 0) side.retireNext(false);
+                drain(this.source);
+            }
+            if (!quantum.outcome.isDone())
+                throw new AssertionError("run " + run + " did not conclude: " + quantum.events + " home=" + home.kernels
+                        + " side=" + side.kernels + " armed=" + home.armed() + "/" + side.armed());
+            assertEquals("SUCCESS", quantum.outcome.join());
+        }
+        // P holds buffer 0: its last stage is published but not run.
+        StageGraph p = graph(LINEAR, pool);
+        TestQuantum pQuantum = new TestQuantum();
+        owner.bind(p, shape, WorkspaceUse.of(shape), pQuantum);
+        StageGraphFixtures.run(take(this.source).getFirst());
+        StageGraphFixtures.run(take(this.source).getFirst());
+        List<AbstractFrame> held = take(this.source);
+        assertEquals(List.of(p.stage(2)), held);
+
+        TestQuantum replayed = keyed("decode");
+        owner.bind(graph, shape, WorkspaceUse.of(shape), replayed);
+        assertTrue(take(this.source).isEmpty(), "the replay waits for P's last accessor");
+        StageGraphFixtures.run(held.getFirst());
+        List<AbstractFrame> frames = take(this.source);
+        assertEquals(1, frames.size());
+        assertInstanceOf(StageGraph.Replay.class, frames.getFirst());
+        StageGraphFixtures.run(frames.getFirst());
+        int launch = home.kernels.lastIndexOf("graph:1001");
+        assertTrue(launch > 0, home.kernels.toString());
+        assertTrue(
+                home.kernels.subList(0, launch).contains("await:" + p.stage(2).marker),
+                "the home lane awaited P's last accessor before the launch: " + home.kernels);
+    }
 }

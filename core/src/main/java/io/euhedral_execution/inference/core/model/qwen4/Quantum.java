@@ -104,14 +104,11 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         return this.successor.compareAndSet(null, next);
     }
 
+    /// Admits this quantum on the workspace's owner: the plan's completion chain calls this from its predecessor's
+    /// publication, outside the owner, so the admission is published as an owner frame.
     private void go() {
         this.plan.quantumStarted();
-        try {
-            this.plan.runtime().admit(this.shape, this, null, this::prepare);
-        } catch (RuntimeException | Error refused) {
-            // The runtime retired the quantum as failed and published its outcome before it threw.
-            LOG.debug("a quantum was refused", refused);
-        }
+        this.plan.runtime().publishOnOwner(() -> this.plan.runtime().admit(this.shape, this, null, this::prepare));
     }
 
     /// Runs on the graph's home lane before any stage: binds the graph's workspace, hands over the
