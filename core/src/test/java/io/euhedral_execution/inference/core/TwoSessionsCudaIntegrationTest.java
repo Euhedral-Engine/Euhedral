@@ -64,6 +64,72 @@ class TwoSessionsCudaIntegrationTest {
         }
     }
 
+    /// The concurrency screen (`-Peuhedral.twosessions.screen=true`): two prompts of 4096 tokens, 32 new tokens each,
+    /// one after the other and both at once on one runtime; prints the median wall times of three rounds after a
+    /// warm-up. Each prompt's tokens are the same either way.
+    @Test
+    @Timeout(1800)
+    void twoLongPromptsTogetherAndOneAfterTheOther() throws Exception {
+        String name = System.getProperty("euhedral.twosessions.artifact");
+        assumeTrue(name != null && Boolean.getBoolean("euhedral.twosessions.screen"), "opt-in screen");
+        String artifact = "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_" + name.replace('-', '_') + ".edrl";
+        String library = System.getProperty("euhedral.cuda.library");
+        assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
+        var config = new InferenceConfig(
+                Path.of(artifact),
+                Path.of(TOKENIZER),
+                Path.of(library),
+                SystemInfo.getPCpuSet(),
+                Duration.ofSeconds(30));
+        try (InferenceEngine engine = InferenceEngine.load(config)) {
+            int[] first = prompt(engine, "square", 4096);
+            int[] second = prompt(engine, "cube", 4096);
+            generate(engine, first, 32).get(10, TimeUnit.MINUTES);
+            long[] apart = new long[3], together = new long[3];
+            List<Integer> firstApart = null, secondApart = null;
+            for (int round = 0; round < 3; round++) {
+                long started = System.nanoTime();
+                firstApart = generate(engine, first, 32).get(10, TimeUnit.MINUTES);
+                secondApart = generate(engine, second, 32).get(10, TimeUnit.MINUTES);
+                apart[round] = System.nanoTime() - started;
+                started = System.nanoTime();
+                CompletableFuture<List<Integer>> a = generate(engine, first, 32);
+                CompletableFuture<List<Integer>> b = generate(engine, second, 32);
+                assertEquals(firstApart, a.get(10, TimeUnit.MINUTES), "the first prompt changed when run together");
+                assertEquals(secondApart, b.get(10, TimeUnit.MINUTES), "the second prompt changed when run together");
+                together[round] = System.nanoTime() - started;
+            }
+            java.util.Arrays.sort(apart);
+            java.util.Arrays.sort(together);
+            System.out.printf(
+                    "TWO_SESSIONS_SCREEN %s one-after-the-other %.2f s, together %.2f s (medians of 3; %s)%n",
+                    name,
+                    apart[1] / 1e9,
+                    together[1] / 1e9,
+                    java.util.Arrays.toString(java.util.Arrays.stream(together)
+                            .mapToObj(t -> String.format("%.2f", t / 1e9))
+                            .toArray()));
+        }
+    }
+
+    /// A prompt of exactly `tokens` tokens: a numbered list of facts about `kind`s of numbers.
+    private static int[] prompt(InferenceEngine engine, String kind, int tokens) {
+        StringBuilder text = new StringBuilder("Here is a numbered list of facts.\n");
+        for (int i = 1; i <= 2000; i++)
+            text.append("Fact ")
+                    .append(i)
+                    .append(": the ")
+                    .append(kind)
+                    .append(" of ")
+                    .append(i)
+                    .append(" is ")
+                    .append(kind.equals("cube") ? (long) i * i * i : (long) i * i)
+                    .append(".\n");
+        int[] encoded = engine.tokenizer().encodeWithModelSpecialTokens(text.toString());
+        if (encoded.length < tokens) throw new IllegalStateException("the prompt text is too short");
+        return java.util.Arrays.copyOf(encoded, tokens);
+    }
+
     private static CompletableFuture<List<Integer>> generate(InferenceEngine engine, int[] prompt, int tokens) {
         GenerationSession session = engine.createGenerationSession(GenerationConfig.greedy(7L));
         return session.generateAsync(prompt, tokens, text -> {}, null, null).whenComplete((done, failure) -> {
