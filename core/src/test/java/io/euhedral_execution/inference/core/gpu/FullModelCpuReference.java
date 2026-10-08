@@ -23,13 +23,21 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/// Independent scalar CPU reference for a single-token compact Qwen text-model forward pass.
+/// Independent scalar CPU reference for a single-token compact Qwen text-model forward pass. A reference that stops
+/// after the first layers costs those layers only: the final norm and the vocabulary projection alone are a large
+/// share of the full pass.
 final class FullModelCpuReference {
     record Result(Map<Integer, short[]> layerOutputs, short[] finalNormalized, short[] logits) {}
 
     private FullModelCpuReference() {}
 
     static Result run(Weights weights, ExecutionGpu gpu, int tokenId) {
+        return run(weights, gpu, tokenId, weights.layers().length);
+    }
+
+    /// The pass through the first `layerCount` layers; the final norm and the logits are null unless it covers them
+    /// all.
+    static Result run(Weights weights, ExecutionGpu gpu, int tokenId, int layerCount) {
         int hidden = weights.config().hiddenSize();
         int intermediate = weights.config().intermediateSize();
         float epsilon = (float) weights.config().rmsNormEpsilon();
@@ -40,7 +48,7 @@ final class FullModelCpuReference {
                 weights.config().vocabSize());
         Map<Integer, short[]> layerOutputs = new LinkedHashMap<>();
 
-        for (int layerIndex = 0; layerIndex < weights.layers().length; layerIndex++) {
+        for (int layerIndex = 0; layerIndex < layerCount; layerIndex++) {
             LayerWeights layer = weights.layers()[layerIndex];
             short[] inputNorm = rmsNormUnitOffset(hiddenState, read(gpu, layer.inputNorm()), 1, hidden, epsilon);
             short[] mixerDelta;
@@ -103,6 +111,7 @@ final class FullModelCpuReference {
             layerOutputs.put(layerIndex, hiddenState);
         }
 
+        if (layerCount < weights.layers().length) return new Result(Map.copyOf(layerOutputs), null, null);
         short[] finalNormalized = rmsNormUnitOffset(hiddenState, read(gpu, weights.finalNorm()), 1, hidden, epsilon);
         short[] logits = quantizedLinear(
                 finalNormalized,
