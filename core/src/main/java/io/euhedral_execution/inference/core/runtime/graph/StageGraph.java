@@ -85,6 +85,14 @@ public final class StageGraph implements AutoCloseable {
     /// The confirmed boundary's failure, read by the conclusion.
     private Throwable deviceFailure;
     private final AtomicInteger live = new AtomicInteger();
+    /// Recorded on the home lane once every lane of the bound quantum joined it: what a later graph awaits for a
+    /// last accessor that never submitted (multi-lane pools only).
+    private long joined;
+    /// The markers the current binding's external edges await, by slot.
+    private long[] awaits = new long[16];
+    private int externalCount;
+    /// External edges a replaying quantum still waits for before its replay frame is published.
+    private final AtomicInteger replayGate = new AtomicInteger();
     private StageQuantum quantum;
     private boolean overlap;
     /// Opens the shadow streams that record captured quanta; null when quanta are never captured.
@@ -205,10 +213,12 @@ public final class StageGraph implements AutoCloseable {
         try {
             if (pool.size() > 1) {
                 preparedMarker = pool.lane(this.home).openMarker();
+                // Every device stage records a marker: a stage with no successor here may still be the last accessor
+                // of a workspace buffer that a later graph waits for.
                 for (StageFrame stage : this.stages) {
-                    if (stage.submittedSuccessors.length > 0 && !stage.host())
-                        stage.marker = pool.lane(this.home).openMarker();
+                    if (!stage.host()) stage.marker = pool.lane(this.home).openMarker();
                 }
+                this.joined = pool.lane(this.home).openMarker();
                 for (int lane = 0; lane < this.tails.length; lane++) {
                     if (lane != this.home) this.tails[lane] = pool.lane(lane).openMarker();
                 }
@@ -347,6 +357,14 @@ public final class StageGraph implements AutoCloseable {
     /// Binds a quantum whose resources are already prepared and publishes the root stages, or the
     /// frame that replays the quantum's captured graph.
     public void start(StageQuantum quantum) {
+        start(quantum, null, 0);
+    }
+
+    /// As [#start(StageQuantum)], behind `count` external edges: each of `edges[0..count)` names a stage of this
+    /// graph that waits for a stage of an earlier graph. A stage waiting for one is published by its last
+    /// arrival; a replaying quantum's frame by the last of all of them. Each edge holds one live count until it
+    /// arrives, so the graph cannot retire before every earlier graph released it.
+    void start(StageQuantum quantum, ExternalEdge[] edges, int count) {
         Objects.requireNonNull(quantum, "quantum");
         if (this.quantum != null) throw new IllegalStateException("stage graph already runs a quantum");
         this.quantum = quantum;
@@ -361,28 +379,103 @@ public final class StageGraph implements AutoCloseable {
             if (capture.graph != 0) this.replaying = capture;
             else if (capture.sightings++ > 0 && !capture.unrecordable) beginRecording(capture);
         }
+        this.externalCount = count;
+        if (this.awaits.length < count) this.awaits = new long[Integer.highestOneBit(count) << 1];
         if (this.replaying != null) {
             this.replays.incrementAndGet();
-            // The replay frame and admission's hold.
-            this.live.set(2);
-            this.source.publish(this.replay);
+            // The replay frame waits for every external edge; its stages wait for none of their own.
+            for (int index = 0; index < count; index++) edges[index].slot = index;
+            this.replayGate.set(count);
+            // The replay frame, admission's hold, and one count per external edge.
+            this.live.set(2 + count);
+            if (count == 0) this.source.publish(this.replay);
+            for (int index = 0; index < count; index++) register(edges[index]);
             stageFinished();
             return;
+        }
+        for (int index = 0; index < count; index++) edges[index].target.externalIn++;
+        int slot = 0;
+        for (StageFrame stage : this.stages) {
+            if (stage.externalIn == 0) continue;
+            stage.firstSlot = slot;
+            slot += stage.externalIn;
+            stage.externalIn = 0;
+        }
+        for (int index = 0; index < count; index++) {
+            StageFrame target = edges[index].target;
+            edges[index].slot = target.firstSlot + target.externalIn++;
         }
         // Roots on other lanes order behind the preparation already submitted to the home lane.
         if (this.prepared != 0) {
             this.pool.lane(this.home).mark(this.prepared);
             if (this.recording != null) shadowMark(this.home, this.shadowPrepared);
         }
+        int ready = 0;
+        for (StageFrame root : this.roots) if (root.externalIn == 0) ready++;
         // Admission holds one count so that fast roots cannot retire the quantum before all publish.
-        this.live.set(this.roots.length + 1);
-        for (StageFrame root : this.roots) this.source.publish(root);
+        this.live.set(ready + 1 + count);
+        for (StageFrame root : this.roots) if (root.externalIn == 0) this.source.publish(root);
+        for (int index = 0; index < count; index++) register(edges[index]);
         stageFinished();
+    }
+
+    /// Registers `edge` on its source, or arrives at once when the source already satisfied its edges.
+    private static void register(ExternalEdge edge) {
+        StageFrame source = edge.source;
+        while (true) {
+            Object head = source.externals.get();
+            if (head == StageFrame.SUBMITTED) {
+                edge.target.graph().externalArrived(edge, source.marker);
+                return;
+            }
+            if (head == StageFrame.SWEPT) {
+                edge.target.graph().externalArrived(edge, source.graph().joined);
+                return;
+            }
+            edge.next = (ExternalEdge) head;
+            if (source.externals.compareAndSet(head, edge)) return;
+        }
+    }
+
+    /// Satisfies the external edges registered on `stage`, which await `marker`; later ones arrive at once.
+    private static void releaseExternals(StageFrame stage, Object sentinel, long marker) {
+        Object head = stage.externals.getAndSet(sentinel);
+        for (ExternalEdge edge = head instanceof ExternalEdge first ? first : null; edge != null; ) {
+            ExternalEdge next = edge.next;
+            edge.next = null;
+            edge.target.graph().externalArrived(edge, marker);
+            edge = next;
+        }
+    }
+
+    /// An external edge of this graph arrived: its target awaits `marker` before it submits.
+    void externalArrived(ExternalEdge edge, long marker) {
+        this.awaits[edge.slot] = marker;
+        try {
+            if (this.replaying != null) {
+                if (this.replayGate.decrementAndGet() == 0) this.source.publish(this.replay);
+            } else if (edge.target.arrive() && !stopRequested()) {
+                publish(edge.target);
+            }
+        } finally {
+            stageFinished();
+        }
+    }
+
+    /// The marker external slot `slot` awaits.
+    long externalAwait(int slot) {
+        return this.awaits[slot];
+    }
+
+    /// The join marker, for tests.
+    long joinedMarker() {
+        return this.joined;
     }
 
     /// Publishes the successors that `stage` makes ready after its successful submission.
     void release(StageFrame stage) {
         try {
+            releaseExternals(stage, StageFrame.SUBMITTED, stage.marker);
             for (StageFrame successor : stage.submittedSuccessors) {
                 if (stopRequested()) break;
                 if (successor.arrive()) publish(successor);
@@ -449,14 +542,26 @@ public final class StageGraph implements AutoCloseable {
                 this.pool.lane(lane).mark(this.tails[lane]);
                 home.await(this.tails[lane]);
             }
+            if (this.joined != 0) home.mark(this.joined);
+            sweepExternals();
             if (this.recording != null) finishRecording();
             this.quantum.lanesJoined(home);
             home.notifyRetired(terminal);
         } catch (RuntimeException | Error failure) {
             this.quantum.fail(failure);
             recover(failure);
+            sweepExternals();
             this.quantum.lanesJoined(null);
             this.source.publish(terminal);
+        }
+    }
+
+    /// Every last accessor that never submitted (a stopped, failed or replayed quantum) releases the later graphs
+    /// that wait for it: they await this graph's join marker.
+    private void sweepExternals() {
+        for (StageFrame stage : this.stages) {
+            if (stage.externals.get() == StageFrame.SUBMITTED) continue;
+            releaseExternals(stage, StageFrame.SWEPT, this.joined);
         }
     }
 
@@ -690,6 +795,8 @@ public final class StageGraph implements AutoCloseable {
         Capture capture = this.replaying;
         GpuStream home = this.pool.lane(this.home);
         if (stopRequested()) return;
+        // Every earlier graph's last accessor of a buffer this quantum touches, before anything of it runs.
+        for (int slot = 0; slot < this.externalCount; slot++) if (this.awaits[slot] != 0) home.await(this.awaits[slot]);
         try {
             if (!home.launchGraph(capture.graph, capture.ordered)) {
                 // The shared storage the capture used was replaced: this quantum runs stage by stage.
@@ -815,6 +922,8 @@ public final class StageGraph implements AutoCloseable {
 
     private void closeMarkers() {
         GpuStream any = this.pool.lane(this.home);
+        if (this.joined != 0) any.closeMarker(this.joined);
+        this.joined = 0;
         for (StageFrame stage : this.stages) {
             if (stage == null) continue;
             if (stage.shadowMarker != 0) any.closeMarker(stage.shadowMarker);

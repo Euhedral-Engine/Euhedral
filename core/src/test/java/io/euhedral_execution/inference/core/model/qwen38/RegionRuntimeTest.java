@@ -45,7 +45,6 @@ class RegionRuntimeTest {
             assertEquals(
                     0, this.lattice.pull(frame -> fail("stop predicate must prevent transfer"), frame -> true, 1000));
             assertTrue(completions.stream().noneMatch(CompletableFuture::isDone));
-            assertEquals(2, runtime.activeQuanta());
             this.lattice.drive();
             for (var completion : completions)
                 assertEquals(

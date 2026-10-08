@@ -51,8 +51,7 @@ class GrowthInStreamOrderTest {
     @Test
     void dflash2TapsGrowInStreamOrder() {
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var config = new DFlash2Config(
-                1, 64, 128, 2, 1, 32, 16, 0, 4, 1, 16, 8, 64, 32, 1e-6f, 10000f, new int[] {0});
+        var config = new DFlash2Config(1, 64, 128, 2, 1, 32, 16, 0, 4, 1, 16, 8, 64, 32, 1e-6f, 10000f, new int[] {0});
         var state = new DFlash2State(gpu, config);
         long first = state.taps(8);
         long grown = state.taps(64);

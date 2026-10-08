@@ -16,7 +16,6 @@ import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -82,7 +81,9 @@ class QuantumTest {
         gpu.failSubmission = true;
         var runtime = ExecutionFixtures.runtime(plan, gpu);
         var context = new Quantum(plan, new Sequence(899), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
-        assertThrows(IllegalStateException.class, () -> runtime.submit(context));
+        // The refused admission is the quantum's outcome; nothing is thrown to the submitter.
+        assertInstanceOf(
+                IllegalStateException.class, runtime.submit(context).join().failure());
         assertTrue(gpu.poisoned);
         assertTrue((context.conclusion() != null));
         assertEquals(Quantum.Status.FAILED, context.conclusion().status());
@@ -112,8 +113,9 @@ class QuantumTest {
         var sequence = new Sequence(905);
         var context = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
 
-        assertSame(selectionFailure, assertThrows(IllegalStateException.class, () -> runtime.submit(context)));
-        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
+        var refused = runtime.submit(context).get(2, TimeUnit.SECONDS);
+        assertEquals(Quantum.Status.FAILED, refused.status());
+        assertSame(selectionFailure, refused.failure());
         failSelection.set(false);
         // A retry would take a second sequence admission and workspace that the finished outcome never releases.
         assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
@@ -156,12 +158,14 @@ class QuantumTest {
                 new Quantum(plan, new Sequence(907), Quantum.ExecutionKind.DECODE, 0, new int[] {Integer.MAX_VALUE});
         List<Integer> selectedAtOutcome = new ArrayList<>();
         var cancelledOutcome = runtime.submit(cancelled);
-        cancelledOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        var cancelledSeen = cancelledOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
         var invalidOutcome = runtime.submit(invalid);
-        invalidOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        var invalidSeen = invalidOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
 
         assertEquals(Quantum.Status.CANCELLED, cancelledOutcome.join().status());
         assertEquals(Quantum.Status.FAILED, invalidOutcome.join().status());
+        cancelledSeen.join();
+        invalidSeen.join();
         // An outcome callback that launched work would otherwise land on the graph's stream.
         assertEquals(List.of(0, 0), selectedAtOutcome);
         runtime.close();
@@ -174,8 +178,7 @@ class QuantumTest {
         runtime.close();
         var context = new Quantum(plan, new Sequence(908), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
 
-        assertThrows(IllegalStateException.class, () -> runtime.submit(context));
-        assertEquals(Quantum.Status.FAILED, context.conclusion().status());
+        assertEquals(Quantum.Status.FAILED, runtime.submit(context).join().status());
         assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
     }
 
@@ -207,12 +210,14 @@ class QuantumTest {
         var runtime = ExecutionFixtures.runtime(plan, gpu);
         var context = new Quantum(plan, new Sequence(909), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         try (var admission = Executors.newSingleThreadExecutor()) {
-            Future<?> submitted = admission.submit(() -> runtime.submit(context));
+            Future<java.util.concurrent.CompletableFuture<Quantum.Outcome>> submitted =
+                    admission.submit(() -> runtime.submit(context));
             assertTrue(building.await(10, TimeUnit.SECONDS));
-            runtime.close();
+            var closing = admission.submit(runtime::close);
             closed.countDown();
-            var failure = assertThrows(ExecutionException.class, () -> submitted.get(10, TimeUnit.SECONDS));
-            assertInstanceOf(IllegalStateException.class, failure.getCause());
+            var outcome = submitted.get(10, TimeUnit.SECONDS).get(10, TimeUnit.SECONDS);
+            assertInstanceOf(IllegalStateException.class, outcome.failure());
+            closing.get(10, TimeUnit.SECONDS);
         }
         assertTrue(streamClosed.get(), "close() never saw this graph, so its build must release the stream");
         assertEquals(Quantum.Status.FAILED, context.conclusion().status());
@@ -613,11 +618,11 @@ class QuantumTest {
         var runtime = new Execution(lattice, plan, new ExecutionFixtures.RecordingGpu());
         var context = new Quantum(plan, new Sequence(17), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var first = runtime.submit(context);
-        // The quantum has one continuation; a second admission is refused before it could bind another.
-        assertThrows(IllegalStateException.class, () -> runtime.submit(context));
-        assertEquals(1, runtime.activeQuanta());
+        // The quantum has one admission; a second is refused before it could bind another continuation.
+        assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
         lattice.drive();
         assertEquals(Quantum.Status.SUCCESS, first.join().status());
+        assertEquals(0, runtime.activeQuanta());
         runtime.close();
         assertTrue(lattice.source.isComplete());
     }
@@ -632,7 +637,6 @@ class QuantumTest {
         var exposed = runtime.submit(context);
         exposed.complete(new Quantum.Outcome(Quantum.Status.SUCCESS, null));
         assertFalse((context.conclusion() != null));
-        assertEquals(1, runtime.activeQuanta());
         lattice.drive();
         assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         assertTrue(context.workspace().isClosed());

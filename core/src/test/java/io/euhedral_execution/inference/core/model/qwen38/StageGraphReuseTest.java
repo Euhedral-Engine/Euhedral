@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
@@ -127,7 +126,7 @@ class StageGraphReuseTest {
             throw failure;
         };
         var first = context(plan, 401);
-        runtime.submit(first);
+        admit(runtime, first);
         AbstractFrame failedStage = pullOne();
         // The stage records its failure instead of throwing into Euhedral, which then runs doFinally.
         failedStage.execute();
@@ -139,7 +138,7 @@ class StageGraphReuseTest {
 
         gpu.afterEmbedding = () -> {};
         var second = context(plan, 402);
-        runtime.submit(second);
+        admit(runtime, second);
         AbstractFrame reused = pullOne();
 
         assertSame(failedStage, reused);
@@ -173,7 +172,7 @@ class StageGraphReuseTest {
         // One lane: the quantum's single stream is the one that must prove idleness.
         var runtime = new Execution(this.lattice, plan, gpu, 1);
         var first = context(plan, 501);
-        runtime.submit(first);
+        admit(runtime, first);
         AbstractFrame stage = pullOne();
         stage.execute();
         stage.doFinally();
@@ -182,7 +181,7 @@ class StageGraphReuseTest {
         assertEquals(1, recoveries[0], "the stream proves idleness before storage is released");
         assertEquals(Quantum.Status.FAILED, first.conclusion().status());
         var second = context(plan, 502);
-        runtime.submit(second);
+        admit(runtime, second);
         AbstractFrame reused = pullOne();
         assertSame(stage, reused, "the failed quantum recycled its graph exactly once");
         reused.execute();
@@ -236,7 +235,7 @@ class StageGraphReuseTest {
         var gpu = new UnrecoverableGpu(false);
         var runtime = new Execution(this.lattice, plan, gpu);
         var context = context(plan, 503);
-        runtime.submit(context);
+        admit(runtime, context);
         AbstractFrame stage = pullOne();
         stage.execute();
         stage.doFinally();
@@ -246,7 +245,11 @@ class StageGraphReuseTest {
         assertTrue(gpu.poisoned);
         assertEquals(0, gpu.nativeFrees, "uncertain GPU work may still use every submitted buffer");
         assertEquals(0, gpu.hostReleases, "uncertain DMA may still read the pinned upload");
-        assertThrows(IllegalStateException.class, () -> runtime.submit(context(plan, 504)));
+        // A poisoned GPU refuses the next admission; the refusal is the quantum's outcome.
+        var refused = admit(runtime, context(plan, 504));
+        this.lattice.drive();
+        assertTrue(refused.isDone(), "the refusal's continuation ran");
+        assertEquals(Quantum.Status.FAILED, refused.join().status());
         runtime.close();
         assertEquals(0, gpu.nativeFrees, "closing the runtime keeps the poisoned graph's workspace storage");
         assertTrue(runtime.retainedWorkspaceBytes() > 0);
@@ -395,6 +398,13 @@ class StageGraphReuseTest {
 
     private List<AbstractFrame> admitAndPull(Execution runtime, List<Quantum> contexts) {
         for (Quantum context : contexts) runtime.submit(context);
+        // Each submission published its admission, which runs on the workspace's owner and publishes the roots.
+        List<AbstractFrame> admissions = new ArrayList<>(contexts.size());
+        assertEquals(contexts.size(), this.lattice.pull(admissions::add, frame -> false, contexts.size()));
+        for (AbstractFrame admission : admissions) {
+            admission.execute();
+            admission.doFinally();
+        }
         List<AbstractFrame> frames = new ArrayList<>(contexts.size());
         assertEquals(contexts.size(), this.lattice.pull(frames::add, frame -> false, contexts.size()));
         return frames;
@@ -437,6 +447,16 @@ class StageGraphReuseTest {
         }
         assertEquals(Quantum.Status.SUCCESS, outcome.join().status());
         return stages;
+    }
+
+    /// Submits `context` and runs its admission frame, which runs on the workspace's owner and publishes the
+    /// quantum's roots.
+    private java.util.concurrent.CompletableFuture<Quantum.Outcome> admit(Execution runtime, Quantum context) {
+        var outcome = runtime.submit(context);
+        AbstractFrame admission = pullOne();
+        admission.execute();
+        admission.doFinally();
+        return outcome;
     }
 
     private AbstractFrame pullOne() {

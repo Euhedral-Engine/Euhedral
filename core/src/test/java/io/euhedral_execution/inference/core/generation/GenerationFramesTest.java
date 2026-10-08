@@ -95,7 +95,7 @@ class GenerationFramesTest {
     }
 
     @Test
-    void everyFrameRoutesOnItsOwnHashAndDrawsANewOneOnReuse() {
+    void admitIsOrderedOnTheWorkspaceOwnerAndTheOthersDrawANewSeedOnReuse() {
         var lake = new Lake();
         var frames = new GenerationFrames(lake);
         var generation = new Generation(frames);
@@ -104,18 +104,20 @@ class GenerationFramesTest {
                 List.of(frames.admit(generation, port), frames.select(generation, port), frames.finish(generation));
         List<Long> hashes = new ArrayList<>();
         for (AbstractFrame frame : firsts) {
-            org.junit.jupiter.api.Assertions.assertFalse(
-                    frame.isOrdered(), frame.getClass().getSimpleName());
             hashes.add(frame.getRoutingHash());
             frame.recycle();
         }
         List<AbstractFrame> reused =
                 List.of(frames.admit(generation, port), frames.select(generation, port), frames.finish(generation));
-        for (int i = 0; i < 3; i++) {
-            assertSame(firsts.get(i), reused.get(i), "recycled");
+        for (int i = 0; i < 3; i++) assertSame(firsts.get(i), reused.get(i), "recycled");
+        AbstractFrame admit = reused.getFirst();
+        org.junit.jupiter.api.Assertions.assertTrue(admit.isOrdered(), "Admit runs ordered on the workspace owner");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner.HASH, admit.getRoutingHash());
+        for (int i = 1; i < 3; i++) {
             org.junit.jupiter.api.Assertions.assertFalse(reused.get(i).isOrdered());
             org.junit.jupiter.api.Assertions.assertNotEquals(
-                    hashes.get(i), reused.get(i).getRoutingHash(), "a reused frame draws a new seed");
+                    hashes.get(i), reused.get(i).getRoutingHash(), "a reused parallel frame draws a new seed");
         }
     }
 
