@@ -63,5 +63,16 @@ public final class ModelGroup {
     @Tag(FLASH_NEXT_ENGINE)
     public @interface FlashNextEngine {}
 
+    public static final String OWN_JVM = "own-jvm";
+
+    /// A class that must start in a JVM of its own: it measures process-wide state, owns a singleton the other
+    /// classes would find taken, or loads several artifacts that would not fit the device with a shared one. It
+    /// is run apart from the groups, one JVM per class.
+    @Target(ElementType.TYPE)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Documented
+    @Tag(OWN_JVM)
+    public @interface OwnJvm {}
+
     private ModelGroup() {}
 }
