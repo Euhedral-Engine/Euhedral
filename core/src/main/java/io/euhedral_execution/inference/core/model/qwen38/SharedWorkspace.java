@@ -10,7 +10,8 @@ import java.util.Objects;
 /// holds is refused at admission. Reuse of a slot across graphs is ordered by edges ([Shape#workspaceBuffers] and
 /// the runtime's workspace owner). The input record and the logits stay in each graph's own storage.
 ///
-/// Its buffer indexes are the [Workspace] slots, then the expansion scratch.
+/// Its buffer indexes are the [Workspace] slots, then the expansion scratch, then the plan's staging slots (allocated
+/// with the model; ordered here like any buffer).
 public final class SharedWorkspace implements AutoCloseable {
 
     private final ExecutionGpu gpu;
@@ -75,9 +76,16 @@ public final class SharedWorkspace implements AutoCloseable {
         return Workspace.PROJECTION_SLOTS + projections;
     }
 
-    /// The workspace buffers a shape of `plan` may name: its slots, then the expansion scratch.
+    /// The workspace buffers a shape of `plan` may name: its slots, the expansion scratch, then the staging slots.
     static int bufferCount(ExecutionPlan plan) {
-        return slotCount(plan) + 1;
+        return slotCount(plan)
+                + 1
+                + (plan.staging() == null ? 0 : plan.staging().slots());
+    }
+
+    /// Staging slot `slot`'s buffer index: a transfer writes it, the staged weight's consumer reads it.
+    static int stagingBuffer(ExecutionPlan plan, int slot) {
+        return slotCount(plan) + 1 + slot;
     }
 
     /// The expansion scratch's buffer index.

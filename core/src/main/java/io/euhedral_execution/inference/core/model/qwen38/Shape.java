@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
+import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
@@ -118,6 +119,20 @@ public final class Shape implements GraphShape {
         return this.scratchUses[stage];
     }
 
+    /// The staging slots `instruction` writes (a transfer) or reads (a staged weight): each a workspace buffer, so a
+    /// transfer into a slot follows the slot's last reader, in this graph or the one admitted before.
+    private void addStagingSlots(ExecutionPlan.Instruction instruction, java.util.Set<Integer> slots) {
+        WeightStaging staging = this.plan.staging();
+        if (staging == null) return;
+        long end = staging.slotAddress(0) + (long) staging.slots() * staging.slotBytes();
+        for (var weight : instruction.weights()) {
+            long address = weight.deviceAddress();
+            if (address < staging.slotAddress(0) || address >= end) continue;
+            slots.add(SharedWorkspace.stagingBuffer(
+                    this.plan, (int) ((address - staging.slotAddress(0)) / staging.slotBytes())));
+        }
+    }
+
     private static ScratchUse scratchUse(ExecutionPlan.Instruction instruction, View view) {
         boolean nvfp4 = !instruction.weights().isEmpty() && instruction.weightFormat() == WeightFormat.NVFP4;
         if (instruction.kind() == ExecutionPlan.Kind.Q3_GATE_UP_SWIGLU)
@@ -159,6 +174,7 @@ public final class Shape implements GraphShape {
                 slots.add(owners.getOrDefault(buffer, buffer).ordinal());
             slots.remove(ExecutionPlan.Buffer.LOGITS.ordinal());
             if (this.scratchUses[instruction.id()] != null) slots.add(SharedWorkspace.scratchBuffer(this.plan));
+            addStagingSlots(instruction, slots);
             buffers[instruction.id()] =
                     slots.stream().mapToInt(Integer::intValue).toArray();
         }
@@ -181,7 +197,9 @@ public final class Shape implements GraphShape {
 
     @Override
     public StageFrame createStage(StageGraph graph, int stage, ExecutionGpu gpu) {
-        return Stages.create(graph, this.instructions.get(stage), gpu);
+        Stages.Stage frame = Stages.create(graph, this.instructions.get(stage), gpu);
+        frame.scratchUse = this.scratchUses[stage];
+        return frame;
     }
 
     @Override

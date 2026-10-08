@@ -275,6 +275,8 @@ public final class ExecutionPlan {
     /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded by the
     /// prefetch of a DFlash2 block (null when no weight is host-backed).
     private final Shape decodePreloaded;
+    /// The staging slots a DFlash2 block's prefetch fills (0 without one).
+    private final int prefetchedSlots;
     private final Shape regionPrefill;
     /// The MTP draft view; null without loaded MTP weights and draft head.
     private final Shape mtpDraft;
@@ -580,6 +582,7 @@ public final class ExecutionPlan {
             this.smallPrefill = null;
             this.decode = null;
             this.decodePreloaded = null;
+            this.prefetchedSlots = 0;
             this.regionPrefill = null;
             this.mtpDraft = null;
             this.dflashBlock = null;
@@ -619,6 +622,7 @@ public final class ExecutionPlan {
                 : new Shape(Shape.View.DFLASH_CONTEXT, this, staged(dflash2Context(drafter), staging), false, false);
         this.smallPrefill = prefillShape(Shape.View.SMALL_PREFILL, data, PrefillView.SMALL);
         this.decode = prefillShape(Shape.View.DECODE, data, PrefillView.SMALL);
+        this.prefetchedSlots = this.dflashBlock != null && this.dflashBlock.prefetchesRing() ? firstUses.size() : 0;
         this.decodePreloaded = this.dflashBlock != null && this.dflashBlock.prefetchesRing()
                 ? new Shape(
                         Shape.View.DECODE_PRELOADED,
@@ -643,6 +647,16 @@ public final class ExecutionPlan {
     /// its first slots, or `view` when it has no such variant.
     Shape preloadedVariant(Shape view) {
         return view == this.decode && this.decodePreloaded != null ? this.decodePreloaded : view;
+    }
+
+    /// The DFlash2 block view, or null without a drafter.
+    Shape dflashBlockShape() {
+        return this.dflashBlock;
+    }
+
+    /// The staging slots a DFlash2 block's prefetch fills, which the preloaded decode view does not transfer.
+    int prefetchedSlots() {
+        return this.prefetchedSlots;
     }
 
     /// The plan's own topology: the reference or unfused form it was built as, which a plan without views runs.

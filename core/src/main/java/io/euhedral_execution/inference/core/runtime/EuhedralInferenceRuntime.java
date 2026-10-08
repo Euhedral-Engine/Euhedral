@@ -19,7 +19,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -68,13 +67,10 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     /// What the graphs publish through: the lake, with this runtime's quanta counted.
     private final QuantumLake quanta = new QuantumLake();
     private volatile boolean closed;
-    /// Device lanes shared by every graph, opened with the first graph. Volatile so the transfer marker, written
-    /// before it, is read without a lock.
+    /// Device lanes shared by every graph, opened with the first graph.
     private volatile LanePool lanes;
     private final Object laneLock = new Object();
     private final Lanes lanesConfig;
-    /// A marker on the transfer lane, opened with the lanes and closed with them.
-    private long transferMarker;
 
     /// Lanes in the shared pool: one per available processor, at most [LanePool#MAX_LANES].
     public static int laneCount() {
@@ -101,13 +97,9 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         this.owner = new WorkspaceOwner(workspaceBuffers);
     }
 
-    /// A marker on the transfer lane, for an owner that orders the transfers of successive quanta (a weight staging
-    /// ring). It opens and closes with the lanes. Once they are open this is a plain read: every staging quantum
-    /// orders on it at admission and again at retirement.
-    public long transferMarker() {
-        if (!this.lanesConfig.transferLane()) throw new IllegalStateException("this runtime has no transfer lane");
-        if (this.lanes == null) lanes();
-        return this.transferMarker;
+    /// The workspace's owner. Frames ordered on [WorkspaceOwner#HASH] only.
+    public WorkspaceOwner workspaceOwner() {
+        return this.owner;
     }
 
     /// Opens the shared pool once. Streams open outside `closeLock`; a pool that finds the runtime
@@ -125,7 +117,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                 for (int lane = 0; lane < streams.length; lane++) streams[lane] = this.gpu.openStream();
                 if (transfers) {
                     pool = LanePool.withTransferLane(java.util.Arrays.copyOf(streams, compute), streams[compute]);
-                    this.transferMarker = streams[compute].openMarker();
                 } else pool = new LanePool(streams);
             } catch (RuntimeException | Error failure) {
                 for (GpuStream stream : streams) {
@@ -144,7 +135,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
                     return pool;
                 }
             }
-            if (transfers) streams[compute].closeMarker(this.transferMarker);
             pool.close();
             throw new IllegalStateException("inference runtime is closed");
         }
@@ -195,7 +185,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     }
 
     /// Admits one quantum of any shape: acquires an idle graph of `shape` (building one when every
-    /// graph is in use), runs `ordering` and `prepare` on its home stream, binds the graph behind the
+    /// graph is in use), runs `prepare` on its home stream, binds the graph behind the
     /// last accessors of the workspace buffers it touches, and publishes its root stages. After that
     /// the runtime is out of the execution path: stages publish their successors, workers run them,
     /// and the quantum's retirement recycles the graph before the outcome is published. A quantum is
@@ -204,7 +194,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
     ///
     /// Runs only on frames ordered on [WorkspaceOwner#HASH] (the generation's `Admit`, or an [Admission]): the
     /// workspace's owner state is confined to them.
-    public void admit(GraphShape shape, StageQuantum quantum, Consumer<GpuStream> ordering, Preparation prepare) {
+    public void admit(GraphShape shape, StageQuantum quantum, Preparation prepare) {
         Objects.requireNonNull(shape, "shape");
         Objects.requireNonNull(quantum, "quantum");
         Objects.requireNonNull(prepare, "prepare");
@@ -233,7 +223,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         boolean started = false;
         try {
             GpuStream stream = graph.stream();
-            if (ordering != null) ordering.accept(stream);
             boolean[] proceeds = new boolean[1];
             try {
                 stream.submit(() -> proceeds[0] = prepare.prepare(stream, pooled.storage()), false);
@@ -304,14 +293,6 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             lanes = this.lanes;
         }
         if (lanes != null) {
-            if (this.transferMarker != 0) {
-                try {
-                    lanes.lane(lanes.transferLane()).closeMarker(this.transferMarker);
-                } catch (RuntimeException closeFailure) {
-                    if (failure == null) failure = closeFailure;
-                    else failure.addSuppressed(closeFailure);
-                }
-            }
             try {
                 lanes.close();
             } catch (RuntimeException closeFailure) {

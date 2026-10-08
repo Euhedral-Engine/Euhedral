@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2State;
 import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
@@ -56,6 +57,8 @@ public final class Stages {
 
         private final ExecutionPlan.Instruction instruction;
         private final ExecutionGpu gpu;
+        /// The scratch route its shape declared for it, or null ([Shape#scratchUse]).
+        ScratchUse scratchUse;
 
         protected Stage(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, Objects.requireNonNull(instruction, "instruction").id());
@@ -78,9 +81,7 @@ public final class Stages {
             Quantum context = context();
             // A stage the shape declared as a scratch user takes the workspace's one scratch buffer, which the
             // shape's edges (and the workspace's, across graphs) give it alone.
-            long scratch = context.shape().scratchUse(stage()) != null
-                    ? context.workspace().scratchAddress()
-                    : 0;
+            long scratch = this.scratchUse != null ? context.workspace().scratchAddress() : 0;
             if (scratch != 0) this.gpu.withScratch(scratch, context.workspace().scratchBytes(), () -> run(context));
             else run(context);
         }
