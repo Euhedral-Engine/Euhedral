@@ -6,6 +6,7 @@ EXPORTS
     cudaEventQuery
     cudaEventRecord
     cudaFree
+    cudaFreeAsync
     cudaFreeHost
     cudaGetDevice
     cudaGraphDestroy
@@ -18,6 +19,7 @@ EXPORTS
     cudaHostRegister
     cudaHostUnregister
     cudaMalloc
+    cudaMallocAsync
     cudaMemGetInfo
     cudaMemcpy
     cudaMemcpy2D

@@ -26,6 +26,8 @@ extern "C" {
 
 EUHEDRAL_CUDA_EXPORT void* euhedral_cuda_malloc(uint64_t byte_size);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_free(void* address);
+EUHEDRAL_CUDA_EXPORT void* euhedral_cuda_malloc_async(uint64_t byte_size);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_free_async(void* address);
 EUHEDRAL_CUDA_EXPORT void* euhedral_cuda_host_malloc(uint64_t byte_size);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_host_free(void* address);
 /// Pinned, huge-page-backed host memory for weights that are staged to the device on use.

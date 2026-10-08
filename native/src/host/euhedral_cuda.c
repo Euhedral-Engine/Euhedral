@@ -63,6 +63,23 @@ int euhedral_cuda_free(void* address) {
     return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int) status;
 }
 
+/* Allocates in stream order on the thread's selected stream (the legacy default stream when none is selected),
+   from the device's default memory pool. Never synchronizes the host. */
+void* euhedral_cuda_malloc_async(uint64_t byte_size) {
+    if (byte_size == 0 || byte_size > SIZE_MAX) return NULL;
+    void* address = NULL;
+    if (cudaMallocAsync(&address, (size_t) byte_size, selected_stream) != cudaSuccess) return NULL;
+    return address;
+}
+
+/* Frees in stream order on the thread's selected stream: the memory returns to the pool once the stream reaches
+   this point, after every reader queued before it on that stream. Never synchronizes the host. */
+int euhedral_cuda_free_async(void* address) {
+    if (address == NULL) return EUHEDRAL_CUDA_SUCCESS;
+    cudaError_t status = cudaFreeAsync(address, selected_stream);
+    return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int) status;
+}
+
 void* euhedral_cuda_host_malloc(uint64_t byte_size) {
     if (byte_size == 0 || byte_size > SIZE_MAX) return NULL;
     void* address = NULL;
