@@ -101,8 +101,7 @@ public final class PrefixTree {
     /// Reserves `bytes` for a node covering `[parent.position, position)` of `tokens`, evicting least recently
     /// used nodes for room. Returns null when nothing evictable remains. The node is invisible until
     /// [#publish], and `parent` stays pinned until [#publish] or [#abort].
-    public PrefixNode reserve(
-            PrefixNode parent, int[] tokens, int position, String speculation, long bytes) {
+    public PrefixNode reserve(PrefixNode parent, int[] tokens, int position, String speculation, long bytes) {
         if (position <= parent.position() || position > tokens.length || position % POSITION_GRANULE != 0)
             throw new IllegalArgumentException("a node must advance, on the page grid, within the tokens");
         parent.pins++;

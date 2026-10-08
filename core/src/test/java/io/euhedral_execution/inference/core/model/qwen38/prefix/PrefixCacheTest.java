@@ -10,6 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
@@ -19,8 +21,6 @@ import io.euhedral_execution.inference.core.model.qwen38.MemoryGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
-import io.euhedral_execution.core.frames.AbstractFrame;
-import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpCheckpoint;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeCheckpoint;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
@@ -211,8 +211,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         Sequence source = sequence(1024, 4);
-        PrefixNode node =
-                capture(cache, source, cache.root(), tokens, 1024);
+        PrefixNode node = capture(cache, source, cache.root(), tokens, 1024);
         assertEquals(1024, node.position());
         assertEquals(1, cache.stats().captured());
 
@@ -248,8 +247,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(16L << 20, 512);
         int[] tokens = IntStream.range(0, 1400).toArray();
         Sequence source = sequence(1280, 4);
-        PrefixNode first =
-                capture(cache, source, cache.root(), tokens, 512);
+        PrefixNode first = capture(cache, source, cache.root(), tokens, 512);
         PrefixNode second = capture(cache, source, first, tokens, 1280);
         assertSame(first, second.parent());
         var hit = lookup(cache, tokens);
@@ -264,10 +262,8 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8L << 20, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         Sequence source = sequence(1024, 4);
-        PrefixNode first =
-                capture(cache, source, cache.root(), tokens, 1024);
-        PrefixNode second =
-                capture(cache, source, cache.root(), tokens, 1024);
+        PrefixNode first = capture(cache, source, cache.root(), tokens, 1024);
+        PrefixNode second = capture(cache, source, cache.root(), tokens, 1024);
         assertSame(first, second);
         assertEquals(1, cache.stats().captured());
     }
@@ -277,8 +273,7 @@ class PrefixCacheTest {
         PrefixCache cache = cache(8192, 1024);
         int[] tokens = IntStream.range(0, 1100).toArray();
         PrefixNode parent = cache.root();
-        PrefixNode result =
-                capture(cache, sequence(1024, 4), parent, tokens, 1024);
+        PrefixNode result = capture(cache, sequence(1024, 4), parent, tokens, 1024);
         assertSame(parent, result, "the cursor stays where it was");
         assertEquals(1, cache.stats().skipped());
         assertEquals(0, cache.stats().captured());
@@ -355,10 +350,7 @@ class PrefixCacheTest {
         source.cancel();
         assertSame(
                 cache.root(),
-                capture(cache, source,
-                                cache.root(),
-                                IntStream.range(0, 1100).toArray(),
-                                1024));
+                capture(cache, source, cache.root(), IntStream.range(0, 1100).toArray(), 1024));
         assertEquals(0, cache.stats().captured());
     }
 
@@ -472,7 +464,8 @@ class PrefixCacheTest {
             if (frame.getIdHash() != PrefixCache.HASH) continue;
             if (frame instanceof PrefixCopies || frame instanceof PrefixCopies.Retired) continue;
             owner++;
-            assertEquals(PrefixCache.HASH, frame.getRoutingHash(), frame.getClass().getSimpleName());
+            assertEquals(
+                    PrefixCache.HASH, frame.getRoutingHash(), frame.getClass().getSimpleName());
         }
         // Reserve x3 (one per capture), abort, publish, lookup, release.
         assertTrue(owner >= 7, "owner frames: " + owner);
@@ -497,7 +490,8 @@ class PrefixCacheTest {
     void closeFreesTheArena() {
         var released = new AtomicBoolean();
         Arena arena = Arena.ofShared();
-        var cache = new PrefixCache(this.gpu, this.frames, CONFIG, arena.allocate(1 << 20), () -> released.set(true), 512);
+        var cache =
+                new PrefixCache(this.gpu, this.frames, CONFIG, arena.allocate(1 << 20), () -> released.set(true), 512);
         cache.close();
         cache.close();
         assertTrue(released.get());
@@ -625,13 +619,13 @@ class PrefixCacheTest {
         PrefixCache cache = mtpCache(16L << 20);
         int[] tokens = IntStream.range(0, 1100).toArray();
         PrefixNode plain = capture(cache, sequence(1024, 4), cache.root(), tokens, 1024);
-        PrefixNode withMtp = capture(cache, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, mtp(seedRow(9)));
+        PrefixNode withMtp =
+                capture(cache, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, mtp(seedRow(9)));
         assertNull(plain.speculation());
         assertEquals(MtpCheckpoint.KIND, withMtp.speculation());
         assertEquals(2, cache.stats().captured());
         assertEquals(
-                withMtp.position(),
-                lookup(cache, tokens, MtpCheckpoint.KIND).position());
+                withMtp.position(), lookup(cache, tokens, MtpCheckpoint.KIND).position());
     }
 
     @Test
@@ -671,7 +665,8 @@ class PrefixCacheTest {
     void aSamplingPromptReusesAnMtpNodeInsteadOfStoringASecondOne() {
         PrefixCache cache = mtpCache(16L << 20);
         int[] tokens = IntStream.range(0, 1100).toArray();
-        PrefixNode withMtp = capture(cache, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, mtp(seedRow(9)));
+        PrefixNode withMtp =
+                capture(cache, sequenceWithMtp(1024, 1023, 4), cache.root(), tokens, 1024, mtp(seedRow(9)));
         PrefixNode reused = capture(cache, sequence(1024, 4), cache.root(), tokens, 1024);
         assertSame(withMtp, reused, "an MTP node is a superset of a plain one");
         assertEquals(1, cache.stats().captured());
