@@ -102,6 +102,16 @@ public final class StageTopology {
         return this.retiredSuccessors[stage].clone();
     }
 
+    /// [#submittedSuccessors] without the copy, for the graph kit's own loops; never modified.
+    int[] submittedSuccessorsView(int stage) {
+        return this.submittedSuccessors[stage];
+    }
+
+    /// [#retiredSuccessors] without the copy, for the graph kit's own loops; never modified.
+    int[] retiredSuccessorsView(int stage) {
+        return this.retiredSuccessors[stage];
+    }
+
     private static int[][] copy(int[][] dependencies) {
         Objects.requireNonNull(dependencies, "dependencies");
         int[][] copied = new int[dependencies.length][];
