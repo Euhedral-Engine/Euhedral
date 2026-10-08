@@ -1,9 +1,7 @@
 package io.euhedral_execution.inference.core.runtime.graph;
 
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology.Boundary;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -16,6 +14,10 @@ public final class ShapeBuilder<S> {
     private final List<S> specs = new ArrayList<>();
     private final List<List<Integer>> producers = new ArrayList<>();
     private final List<List<Boundary>> boundaries = new ArrayList<>();
+    /// [#reaches]' visit marks (the search that last visited each stage), its stack, and its search count.
+    private int[] visited = new int[0];
+    private int[] pending = new int[0];
+    private int search;
 
     /// Adds a stage and returns its index.
     public int stage(S spec) {
@@ -42,17 +44,22 @@ public final class ShapeBuilder<S> {
             if (!reaches(stages[i - 1], stages[i])) submitted(stages[i - 1], stages[i]);
     }
 
-    /// Whether an edge path runs from `from` to `to`.
+    /// Whether an edge path runs from `from` to `to`: a backward search from `to` over stages after `from`. The
+    /// visit marks and the stack are kept between searches, so a long chain allocates nothing per link.
     private boolean reaches(int from, int to) {
-        BitSet seen = new BitSet(to + 1);
-        ArrayDeque<Integer> pending = new ArrayDeque<>();
-        pending.push(to);
-        while (!pending.isEmpty()) {
-            for (int producer : this.producers.get(pending.pop())) {
+        if (this.visited.length < this.specs.size()) {
+            this.visited = java.util.Arrays.copyOf(this.visited, this.specs.size());
+            this.pending = java.util.Arrays.copyOf(this.pending, this.specs.size());
+        }
+        int search = ++this.search;
+        int depth = 0;
+        this.pending[depth++] = to;
+        while (depth > 0) {
+            for (int producer : this.producers.get(this.pending[--depth])) {
                 if (producer == from) return true;
-                if (producer > from && !seen.get(producer)) {
-                    seen.set(producer);
-                    pending.push(producer);
+                if (producer > from && this.visited[producer] != search) {
+                    this.visited[producer] = search;
+                    this.pending[depth++] = producer;
                 }
             }
         }
