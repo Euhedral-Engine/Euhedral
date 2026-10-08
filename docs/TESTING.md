@@ -15,7 +15,9 @@ parallel.
 2. **Model groups** (`cudaModelTest`): classes that load an artifact, directly or through an engine. All of them run
    in **one JVM**, ordered by group, and each artifact is loaded **once**: the first class that needs it loads it,
    the rest find it ready, and the next group closes it before loading its own (two models do not fit the GPU).
-3. **Own JVM** (`cudaOwnJvmTest`): classes that cannot share a process, one JVM each.
+3. **Flash-Next** (`cudaFlashNextTest`): the same, for the Flash-Next groups, in a Gradle run of its own: its
+   whole-model classes pin host memory sized from what the cgroup has left, and the Qwen3.8 groups fill it with page cache.
+4. **Own JVM** (`cudaOwnJvmTest`): classes that cannot share a process, one JVM each.
 
 A class tells which kind it is with an annotation from `ModelGroup` (core test sources, `core/testing`), which is also
 a JUnit tag:
