@@ -108,6 +108,8 @@ public final class ExecutionPlan implements AutoCloseable {
     private final QsaLayer qsa;
     private final ExpertOps.Geometry geometry;
     private final MoeLayer.Metrics metrics = new MoeLayer.Metrics();
+    /// The lanes' expert fences, shared by every graph's MoE block resources.
+    private final MoeLayer.LaneFences laneFences = new MoeLayer.LaneFences();
     private final int pleLayer;
     private final int hidden;
     private final int streams;
@@ -216,7 +218,11 @@ public final class ExecutionPlan implements AutoCloseable {
     private void closeWorkspace() {
         Workspace storage = this.workspace;
         this.workspace = null;
-        if (storage != null) storage.close();
+        try {
+            if (storage != null) storage.close();
+        } finally {
+            this.laneFences.close();
+        }
     }
 
     // ---------------------------------------------------------------- starting quanta
@@ -399,7 +405,8 @@ public final class ExecutionPlan implements AutoCloseable {
                 this.config.moe().expertsPerToken(),
                 this.config.moe().sharedExpertIntermediateSize(),
                 rows,
-                this.metrics);
+                this.metrics,
+                this.laneFences);
     }
 
     /// The most experts a block of a shape of `rows` rows can name: the fetch and expert stages of a layer.

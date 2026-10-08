@@ -116,12 +116,12 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         return this.chunks.length;
     }
 
-    /// Chunk `chunk`'s n-gram rows: the workspace's for a quantum of one chunk.
+    /// Chunk `chunk`'s n-gram rows, the quantum's own: quanta of other sessions run beside it on the one workspace.
     PleRows pleRows(int chunk) {
-        return this.chunks.length == 1 ? this.storage.ple() : this.pleRows[chunk];
+        return this.pleRows[chunk];
     }
 
-    /// The pinned host address of chunk `chunk`'s tokens in a prompt's own copy.
+    /// The pinned host address of chunk `chunk`'s tokens in the quantum's own copy.
     long promptTokens(int chunk) {
         return this.promptUpload.segment().address() + 4L * (this.chunks[chunk].offset() - this.offset);
     }
@@ -189,17 +189,13 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         this.storage = lease.storage();
         this.moe = lease.moe();
         this.prepared = true;
-        if (this.chunks.length == 1) {
-            for (int i = 0; i < this.rows; i++)
-                this.storage.tokenUpload().segment().set(INT, 4L * i, this.tokens[this.offset + i]);
-        } else {
-            this.promptUpload = this.plan.gpu().allocateUploadBuffer(4L * this.rows);
-            for (int i = 0; i < this.rows; i++)
-                this.promptUpload.segment().set(INT, 4L * i, this.tokens[this.offset + i]);
-            this.pleRows = new PleRows[this.chunks.length];
-            int perToken = this.plan.ple().rowsPerToken();
-            for (Chunk chunk : this.chunks) this.pleRows[chunk.index()] = new PleRows(chunk.rows() * perToken);
-        }
+        // The quantum's own tokens and n-gram rows: another session's quantum may be admitted, and its host stages
+        // run, before this one's device copies and gathers ran.
+        this.promptUpload = this.plan.gpu().allocateUploadBuffer(4L * this.rows);
+        for (int i = 0; i < this.rows; i++) this.promptUpload.segment().set(INT, 4L * i, this.tokens[this.offset + i]);
+        this.pleRows = new PleRows[this.chunks.length];
+        int perToken = this.plan.ple().rowsPerToken();
+        for (Chunk chunk : this.chunks) this.pleRows[chunk.index()] = new PleRows(chunk.rows() * perToken);
         if (stopRequested()) {
             // Stopped before it began: no stage will run, so the runtime publishes the outcome this prepares.
             retire(null);
@@ -220,8 +216,9 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         if (!this.prepared) return;
         tick(-1);
         this.moe.abandon();
-        // The device stopped reading the prompt's tokens: every chunk's embedding retired.
-        if (this.promptUpload != null) {
+        // The device stopped reading the tokens, every chunk's embedding retired, unless the GPU cannot prove its
+        // work stopped: then a queued copy may still read them, and they are kept.
+        if (this.promptUpload != null && this.plan.gpu().completionProven()) {
             this.promptUpload.close();
             this.promptUpload = null;
         }
