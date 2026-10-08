@@ -38,6 +38,9 @@ class InferenceEngineCudaIntegrationTest {
         try (InferenceEngine engine = InferenceEngine.load(config, bootstrap)) {
             long loaded = engine.allocatedDeviceBytes();
             assertTrue(loaded > (1L << 30), "real model was not resident");
+            // The runtime's workspace is allocated at load, inside `loaded`.
+            long atLoad = engine.retainedWorkspaceBytes();
+            assertTrue(atLoad > 0, "the workspace is allocated at load");
             StringBuilder output = new StringBuilder();
             try (Session session = engine.createSession(GenerationConfig.greedy(91L))) {
                 var tokens = session.generate("The capital of France is", 5, output::append);
@@ -54,10 +57,9 @@ class InferenceEngineCudaIntegrationTest {
                         session.currentTokenPosition());
                 assertTrue(engine.allocatedDeviceBytes() > loaded, "sequence did not retain device state");
             }
-            // Execution graphs keep their workspace storage; everything the session owned is released.
-            assertTrue(engine.retainedWorkspaceBytes() > 0);
+            // Execution graphs keep their own storage; everything the session owned is released.
             assertEquals(
-                    loaded + engine.retainedWorkspaceBytes(),
+                    loaded + engine.retainedWorkspaceBytes() - atLoad,
                     engine.allocatedDeviceBytes(),
                     "session device memory was not released");
             System.out.println("Generated text: " + output);

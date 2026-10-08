@@ -27,9 +27,7 @@ public final class TestExecution {
                     gpu,
                     EuhedralInferenceRuntime.laneCount(),
                     EuhedralInferenceRuntime.CAPTURE_GRAPHS,
-                    Math.max(
-                            InferenceConfig.PREFILL_CHUNK_TOKENS,
-                            context.inputTokenCount()));
+                    Math.max(InferenceConfig.PREFILL_CHUNK_TOKENS, context.inputTokenCount()));
             try {
                 return runtime.submit(context, terminalConsumer).get(timeoutSeconds, TimeUnit.SECONDS);
             } finally {

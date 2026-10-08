@@ -55,20 +55,22 @@ class StreamOrderedEngineCudaIntegrationTest {
             assertTrue(
                     engine.tokenizer().encodeWithModelSpecialTokens(PROMPT).length > 4,
                     "test prompt must exercise multiple prefill quanta");
-            // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest,
-            // and the execution graphs keep their workspace storage for later quanta.
+            // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest, the
+            // runtime's workspace is allocated at load (inside `loaded`), and the execution graphs keep their own
+            // storage for later quanta.
             long loaded = engine.allocatedDeviceBytes();
-            assertEquals(0, engine.retainedWorkspaceBytes());
+            long atLoad = engine.retainedWorkspaceBytes();
+            assertTrue(atLoad > 0, "the workspace is allocated at load");
             first = generateSession(engine);
             long retained = engine.retainedWorkspaceBytes();
-            assertTrue(retained > 0, "the graphs retained no workspace storage");
-            assertEquals(loaded + retained, engine.allocatedDeviceBytes(), "the first session kept device allocations");
+            assertTrue(retained >= atLoad, "the retained storage shrank");
+            long kept = loaded + retained - atLoad;
+            assertEquals(kept, engine.allocatedDeviceBytes(), "the first session kept device allocations");
             Result second = generateSession(engine);
             assertEquals(retained, engine.retainedWorkspaceBytes(), "an equal session grew the retained storage");
-            assertEquals(
-                    loaded + retained, engine.allocatedDeviceBytes(), "the second session kept device allocations");
+            assertEquals(kept, engine.allocatedDeviceBytes(), "the second session kept device allocations");
             Result third = generateSession(engine);
-            assertEquals(loaded + retained, engine.allocatedDeviceBytes(), "the third session kept device allocations");
+            assertEquals(kept, engine.allocatedDeviceBytes(), "the third session kept device allocations");
             assertEquals(first, second, "a new session did not reproduce the same sequence");
             assertEquals(second, third, "a later session did not reproduce the same sequence");
         }

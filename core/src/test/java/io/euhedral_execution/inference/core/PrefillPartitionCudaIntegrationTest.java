@@ -43,7 +43,9 @@ class PrefillPartitionCudaIntegrationTest {
         assumeTrue(cpus.cardinality() == 2);
         var config = new InferenceConfig(artifact, tokenizer, Path.of(library), cpus, Duration.ofSeconds(10));
         var bootstrap = new RecordingBootstrap();
-        try (InferenceEngine engine = InferenceEngine.load(config, bootstrap)) {
+        // Chunks up to 1536 tokens: the workspace is sized at load for the widest.
+        System.setProperty("euhedral.workspace.rows", "1536");
+        try (InferenceEngine engine = loaded(config, bootstrap)) {
             String text = "The quick brown fox jumps over the lazy dog while the engine counts tokens. ".repeat(400);
             int[] encoded = engine.tokenizer().encodeWithModelSpecialTokens(text);
             assertTrue(encoded.length >= PROMPT_TOKENS, "the prompt text is too short");
@@ -54,6 +56,15 @@ class PrefillPartitionCudaIntegrationTest {
                 List<String> other = stateAfterPrefill(engine, bootstrap.gpu, prompt, chunk);
                 System.out.println("prefill partition " + chunk + ": " + describe(baseline, other));
             }
+        }
+    }
+
+    /// Loads the engine, then restores the default workspace sizing for the JVM's later loads.
+    private static InferenceEngine loaded(InferenceConfig config, RecordingBootstrap bootstrap) throws Exception {
+        try {
+            return InferenceEngine.load(config, bootstrap);
+        } finally {
+            System.clearProperty("euhedral.workspace.rows");
         }
     }
 
