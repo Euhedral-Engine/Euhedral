@@ -172,7 +172,8 @@ class ArchitectureTest {
 
     private static List<Path> hotPathSources() throws IOException {
         List<Path> files = new ArrayList<>();
-        for (String directory : List.of("model/qwen38", "model/qwen4", "runtime", "generation", "prefix", "state", "gpu"))
+        for (String directory :
+                List.of("model/qwen38", "model/qwen4", "runtime", "generation", "prefix", "state", "gpu"))
             files.addAll(javaFiles(directory, true));
         return files;
     }
