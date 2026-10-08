@@ -392,7 +392,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// Package-private hook to deterministically exercise cancellation at the sequence-admission boundary.
     void begin(ExecutionGpu gpu, Runnable beforeClaim) {
         claim();
-        if (!begin(gpu, null, null, new WorkspaceStorage(gpu), beforeClaim)) concludeUnstarted();
+        if (!begin(gpu, null, null, new WorkspaceStorage(gpu), null, beforeClaim)) concludeUnstarted();
     }
 
     /// Joins the sequence's admission order and binds the executing graph's `storage` with `stream` selected, so
@@ -401,7 +401,18 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// selected.
     public boolean begin(
             ExecutionGpu gpu, GpuStream stream, Consumer<? super Quantum> terminalConsumer, WorkspaceStorage storage) {
-        return begin(gpu, stream, terminalConsumer, storage, NO_OP);
+        return begin(gpu, stream, terminalConsumer, storage, null, NO_OP);
+    }
+
+    /// As [#begin(ExecutionGpu, GpuStream, Consumer, WorkspaceStorage)], binding the runtime's `shared` workspace
+    /// (the graph's `storage` keeps only the input record and the logits).
+    public boolean begin(
+            ExecutionGpu gpu,
+            GpuStream stream,
+            Consumer<? super Quantum> terminalConsumer,
+            WorkspaceStorage storage,
+            SharedWorkspace shared) {
+        return begin(gpu, stream, terminalConsumer, storage, shared, NO_OP);
     }
 
     private boolean begin(
@@ -409,6 +420,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             GpuStream stream,
             Consumer<? super Quantum> terminalConsumer,
             WorkspaceStorage storage,
+            SharedWorkspace shared,
             Runnable beforeClaim) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         Objects.requireNonNull(storage, "storage");
@@ -422,6 +434,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             if (end < 0) {
                 throw new IllegalArgumentException("token range overflows");
             }
+            if (shared != null && this.tokenIds.length > shared.maxRows())
+                throw new IllegalArgumentException("a quantum of " + this.tokenIds.length
+                        + " rows exceeds the workspace sized at load for " + shared.maxRows());
             int vocabulary = this.plan.weights().config().vocabSize();
             for (int index = 0; index < this.tokenIds.length; index++) {
                 if (this.tokenIds[index] < 0 || this.tokenIds[index] >= vocabulary) {
@@ -452,13 +467,15 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 throw admissionFailure;
             }
             initializeSequenceState(gpu);
-            this.workspace = this.shape.hasFirstLayer()
-                    ? new Workspace(storage, this.tokenIds.length, this.shape, this.logitsRequirement)
-                    : new Workspace(
-                            storage,
-                            this.tokenIds.length,
-                            this.plan.weights().config().hiddenSize(),
-                            this.shape.projectionWidths());
+            int hidden = this.plan.weights().config().hiddenSize();
+            if (shared == null)
+                this.workspace = this.shape.hasFirstLayer()
+                        ? new Workspace(storage, this.tokenIds.length, this.shape, this.logitsRequirement)
+                        : new Workspace(storage, this.tokenIds.length, hidden, this.shape.projectionWidths());
+            else
+                this.workspace = this.shape.hasFirstLayer()
+                        ? Workspace.bound(shared, storage, this.tokenIds.length, this.shape, this.logitsRequirement)
+                        : Workspace.bound(shared, storage, this.tokenIds.length, hidden, this.shape.projectionWidths());
             this.workspace.allocateBuffers();
             uploadInput(gpu);
             return true;

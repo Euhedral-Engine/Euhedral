@@ -48,6 +48,8 @@ public final class Shape implements GraphShape {
     private final boolean firstLayer;
     private final boolean reuseStorage;
     private final boolean prefetchesRing;
+    /// The workspace slots each stage reads or writes; computed on first use.
+    private volatile int[][] workspaceBuffers;
 
     Shape(View view, ExecutionPlan plan, ExecutionPlan.PlanData data, boolean reuseStorage, boolean prefetchesRing) {
         this.view = Objects.requireNonNull(view, "view");
@@ -83,6 +85,48 @@ public final class Shape implements GraphShape {
 
     public View view() {
         return this.view;
+    }
+
+    /// The runtime workspace's slots stage `stage` reads or writes: its instruction's buffers, through the region
+    /// aliases when the view shares storage. The input record and the logits belong to the graph, not the
+    /// workspace. A view without a first layer names its hidden, normalized and projection slots on every stage.
+    @Override
+    public int[] workspaceBuffers(int stage) {
+        int[][] buffers = this.workspaceBuffers;
+        if (buffers == null) this.workspaceBuffers = buffers = declareWorkspaceBuffers();
+        return buffers[stage];
+    }
+
+    @Override
+    public int workspaceBufferCount() {
+        return SharedWorkspace.bufferCount(this.plan);
+    }
+
+    private int[][] declareWorkspaceBuffers() {
+        int[][] buffers = new int[this.instructions.size()][];
+        if (!this.firstLayer) {
+            int[] all = new int[2 + this.projectionWidths.size()];
+            all[0] = Workspace.HIDDEN_SLOT;
+            all[1] = Workspace.NORMALIZED_SLOT;
+            for (int index = 0; index < this.projectionWidths.size(); index++)
+                all[2 + index] = Workspace.PROJECTION_SLOTS + index;
+            java.util.Arrays.fill(buffers, all);
+            return buffers;
+        }
+        java.util.Map<ExecutionPlan.Buffer, ExecutionPlan.Buffer> owners =
+                new java.util.EnumMap<>(ExecutionPlan.Buffer.class);
+        if (this.reuseStorage) for (var pair : ExecutionPlan.REGION_STORAGE) owners.put(pair.getKey(), pair.getValue());
+        for (ExecutionPlan.Instruction instruction : this.instructions) {
+            java.util.TreeSet<Integer> slots = new java.util.TreeSet<>();
+            for (ExecutionPlan.Buffer buffer : instruction.inputBuffers())
+                slots.add(owners.getOrDefault(buffer, buffer).ordinal());
+            for (ExecutionPlan.Buffer buffer : instruction.outputBuffers())
+                slots.add(owners.getOrDefault(buffer, buffer).ordinal());
+            slots.remove(ExecutionPlan.Buffer.LOGITS.ordinal());
+            buffers[instruction.id()] =
+                    slots.stream().mapToInt(Integer::intValue).toArray();
+        }
+        return buffers;
     }
 
     /// The plan this view belongs to: its weights, its staging ring and its other views.

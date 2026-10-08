@@ -973,6 +973,24 @@ public final class ExecutionPlan {
         return this.shape.bufferSpecs();
     }
 
+    /// Every shape of this plan: its own and each view, once.
+    List<Shape> shapes() {
+        List<Shape> all = new ArrayList<>();
+        for (Shape shape : new Shape[] {
+            this.shape,
+            this.smallPrefill,
+            this.decode,
+            this.decodePreloaded,
+            this.regionPrefill,
+            this.mtpDraft,
+            this.dflashBlock,
+            this.dflashContext
+        }) {
+            if (shape != null && all.stream().noneMatch(existing -> existing == shape)) all.add(shape);
+        }
+        return all;
+    }
+
     /// The views this plan owns besides its own topology; empty for a plan without views.
     List<Shape> executionVariants() {
         if (this.regionPrefill == null) return List.of();

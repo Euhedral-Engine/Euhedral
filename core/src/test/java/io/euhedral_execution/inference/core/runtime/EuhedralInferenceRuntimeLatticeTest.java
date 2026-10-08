@@ -120,11 +120,13 @@ class EuhedralInferenceRuntimeLatticeTest {
                     },
                     plan,
                     gpu);
+            // A second runtime on the same lattice: its quanta share nothing with the first's workspace.
+            var other = new Execution(lattice, plan, gpu);
             try (var calls = java.util.concurrent.Executors.newFixedThreadPool(2)) {
                 try {
                     var first = calls.submit(() -> runtime.execute(List.of(
                             new Quantum(plan, new Sequence(801), Quantum.ExecutionKind.PREFILL, 0, new int[] {1}))));
-                    var second = calls.submit(() -> runtime.execute(List.of(
+                    var second = calls.submit(() -> other.execute(List.of(
                             new Quantum(plan, new Sequence(802), Quantum.ExecutionKind.PREFILL, 0, new int[] {2}))));
                     assertTrue(gpu.embeddingGate.awaitEntries(), "independent quanta did not run concurrently");
                     assertEquals(2, gpu.embeddingGate.workerCount(), "independent quanta shared one worker");
@@ -159,6 +161,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                 assertEquals(EuhedralInferenceRuntime.LAKE_SINKS, attachments.get());
             } finally {
                 runtime.close();
+                other.close();
             }
             awaitDrained(lattice);
         } finally {
@@ -218,7 +221,10 @@ class EuhedralInferenceRuntimeLatticeTest {
                             .mapToObj(index -> ExecutionFixtures.q3("projection-" + index, 64, 201 + index))
                             .toList());
             var gpu = new ConcurrentGpu();
+            // Within one runtime, quanta share its one workspace and follow each other buffer by buffer; two
+            // runtimes on one lattice share nothing, so their quanta are independent.
             var runtime = new Execution(lattice, plan, gpu);
+            var other = new Execution(lattice, plan, gpu);
             List<Sequence> sequences = new ArrayList<>();
             List<CompletableFuture<Quantum.Outcome>> completions = new ArrayList<>();
             try {
@@ -227,8 +233,8 @@ class EuhedralInferenceRuntimeLatticeTest {
                 for (int sequenceId = 1; sequenceId <= 16; sequenceId++) {
                     Sequence sequence = new Sequence(sequenceId);
                     sequences.add(sequence);
-                    completions.add(
-                            runtime.submit(new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[] {
+                    completions.add((sequenceId % 2 == 0 ? runtime : other)
+                            .submit(new Quantum(plan, sequence, Quantum.ExecutionKind.PREFILL, 0, new int[] {
                                 sequenceId % ExecutionFixtures.VOCABULARY
                             })));
                 }
@@ -260,13 +266,16 @@ class EuhedralInferenceRuntimeLatticeTest {
                 }
                 for (Sequence sequence : sequences) assertEquals(1, sequence.currentTokenPosition());
                 assertEquals(0, runtime.activeQuanta());
+                assertEquals(0, other.activeQuanta());
             } finally {
                 gpu.projectionGate.release();
                 gpu.embeddingGate.release();
                 runtime.close();
+                other.close();
                 for (Sequence sequence : sequences) sequence.complete();
             }
             assertFalse(runtime.isAttached());
+            assertFalse(other.isAttached());
             awaitDrained(lattice);
         } finally {
             lattice.close();

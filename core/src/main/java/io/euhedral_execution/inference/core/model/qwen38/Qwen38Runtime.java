@@ -165,6 +165,9 @@ public final class Qwen38Runtime implements ModelRuntime {
             SessionOptions options,
             Consumer<GenerationSession> release) {
         Objects.requireNonNull(release, "release");
+        if (prefillChunkTokens > this.execution.maxRows())
+            throw new IllegalArgumentException("a prefill chunk of " + prefillChunkTokens
+                    + " tokens exceeds the workspace, sized at load for " + this.execution.maxRows() + " rows");
         var session = new Session(
                 this.tokenizer,
                 this.plan,

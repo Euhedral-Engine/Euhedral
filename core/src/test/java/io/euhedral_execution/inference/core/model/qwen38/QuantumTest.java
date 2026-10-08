@@ -110,6 +110,7 @@ class QuantumTest {
             }
         };
         var runtime = ExecutionFixtures.runtime(plan, gpu);
+        int atLoad = gpu.allocations.size();
         var sequence = new Sequence(905);
         var context = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
 
@@ -120,7 +121,7 @@ class QuantumTest {
         // A retry would take a second sequence admission and workspace that the finished outcome never releases.
         assertThrows(Quantum.DuplicateAdmissionException.class, () -> runtime.submit(context));
         assertFalse(sequence.inFlight());
-        assertTrue(gpu.allocations.isEmpty());
+        assertEquals(atLoad, gpu.allocations.size(), "the refused quantum allocated nothing");
         assertEquals(0, runtime.activeQuanta());
 
         var next = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
@@ -230,8 +231,9 @@ class QuantumTest {
                 ExecutionFixtures.norm(),
                 List.of(ExecutionFixtures.q3("projection", 64, 201)));
         var gpu = new PoisonableGpu();
-        gpu.failAllocationAt = 2;
         var runtime = ExecutionFixtures.runtime(plan, gpu);
+        // The workspace allocated at load; the quantum's own input record is the next allocation, and it fails.
+        gpu.failAllocationAt = gpu.allocationAttempts + 1;
         var context = new Quantum(plan, new Sequence(900), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         assertEquals(
                 Quantum.Status.FAILED,
@@ -566,18 +568,20 @@ class QuantumTest {
                 ExecutionFixtures.norm(),
                 List.of(ExecutionFixtures.q3("projection", 64, 201)));
         var gpu = new ExecutionFixtures.RecordingGpu();
-        gpu.failAllocationAt = 2;
         var context = new Quantum(plan, new Sequence(103), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var runtime = ExecutionFixtures.runtime(plan, gpu);
+        int atLoad = gpu.allocations.size();
+        // The workspace allocated at load; the graph's input record is the quantum's one allocation, and it fails.
+        gpu.failAllocationAt = gpu.allocationAttempts + 1;
 
         assertEquals(Quantum.Status.FAILED, runtime.submit(context).join().status());
-        assertEquals(1, gpu.allocations.size());
-        assertTrue(gpu.frees.isEmpty(), "the failed admission queued nothing; its graph keeps the allocation");
-        assertTrue(context.workspace().isClosed());
+        assertEquals(atLoad, gpu.allocations.size());
+        assertTrue(gpu.frees.isEmpty(), "the failed admission queued nothing");
+        assertTrue(context.workspace() == null || context.workspace().isClosed());
 
         var next = new Quantum(plan, new Sequence(104), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         assertEquals(Quantum.Status.SUCCESS, runtime.submit(next).join().status());
-        assertEquals(4, gpu.allocations.size(), "the next quantum reused the first slot and filled the rest");
+        assertEquals(atLoad + 1, gpu.allocations.size(), "the next quantum allocated only its graph's input record");
         runtime.close();
         ExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
@@ -604,9 +608,10 @@ class QuantumTest {
         var context =
                 new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {ExecutionFixtures.VOCABULARY});
         var runtime = ExecutionFixtures.runtime(plan, gpu);
+        int atLoad = gpu.allocations.size();
         assertEquals(Quantum.Status.FAILED, runtime.submit(context).join().status());
         assertEquals(Sequence.TerminalState.ACTIVE, sequence.terminalState());
-        assertTrue(gpu.allocations.isEmpty());
+        assertEquals(atLoad, gpu.allocations.size(), "the rejected token allocated nothing");
         assertEquals(0, runtime.activeQuanta());
         runtime.close();
     }

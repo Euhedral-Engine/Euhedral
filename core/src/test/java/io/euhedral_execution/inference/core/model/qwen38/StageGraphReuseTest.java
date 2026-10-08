@@ -373,41 +373,51 @@ class StageGraphReuseTest {
         var gpu = new ExecutionFixtures.RecordingGpu();
         var runtime = new Execution(this.lattice, plan, gpu);
         var firstContexts = List.of(context(plan, 409), context(plan, 410));
-        List<AbstractFrame> firstRoots = admitAndPull(runtime, firstContexts);
+        List<AbstractFrame> firstRoots = runBothThenFinishConcurrently(runtime, firstContexts);
         assertNotSame(firstRoots.getFirst(), firstRoots.getLast(), "concurrent quanta use separate graphs");
-        firstRoots.forEach(AbstractFrame::execute);
-        runConcurrently(firstRoots, AbstractFrame::doFinally);
-        this.lattice.drive();
         for (Quantum context : firstContexts) {
             assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         }
 
         var secondContexts = List.of(context(plan, 411), context(plan, 412));
-        List<AbstractFrame> secondRoots = admitAndPull(runtime, secondContexts);
+        List<AbstractFrame> secondRoots = runBothThenFinishConcurrently(runtime, secondContexts);
         assertEquals(new HashSet<>(firstRoots), new HashSet<>(secondRoots), "no graph was built on the hot path");
-        secondRoots.forEach(frame -> {
-            frame.execute();
-            frame.doFinally();
-        });
-        this.lattice.drive();
         for (Quantum context : secondContexts) {
             assertEquals(Quantum.Status.SUCCESS, context.conclusion().status());
         }
         runtime.close();
     }
 
-    private List<AbstractFrame> admitAndPull(Execution runtime, List<Quantum> contexts) {
+    /// Admits both quanta, runs each one's root in the order the workspace's edges give (the second's root is
+    /// published once the first's submitted), then runs both retirement frames at once, so the two graphs conclude
+    /// and recycle concurrently. Returns the roots.
+    private List<AbstractFrame> runBothThenFinishConcurrently(Execution runtime, List<Quantum> contexts)
+            throws Exception {
         for (Quantum context : contexts) runtime.submit(context);
-        // Each submission published its admission, which runs on the workspace's owner and publishes the roots.
         List<AbstractFrame> admissions = new ArrayList<>(contexts.size());
         assertEquals(contexts.size(), this.lattice.pull(admissions::add, frame -> false, contexts.size()));
         for (AbstractFrame admission : admissions) {
             admission.execute();
             admission.doFinally();
         }
-        List<AbstractFrame> frames = new ArrayList<>(contexts.size());
-        assertEquals(contexts.size(), this.lattice.pull(frames::add, frame -> false, contexts.size()));
-        return frames;
+        List<AbstractFrame> roots = new ArrayList<>();
+        List<AbstractFrame> retirements = new ArrayList<>();
+        while (roots.size() < contexts.size() || retirements.size() < contexts.size()) {
+            AbstractFrame next = pullOne();
+            if (next instanceof io.euhedral_execution.inference.core.runtime.graph.StageFrame) {
+                roots.add(next);
+                next.execute();
+                next.doFinally();
+            } else {
+                retirements.add(next);
+            }
+        }
+        runConcurrently(retirements, frame -> {
+            frame.execute();
+            frame.doFinally();
+        });
+        this.lattice.drive();
+        return roots;
     }
 
     private static void runConcurrently(List<AbstractFrame> frames, Consumer<? super AbstractFrame> action)
