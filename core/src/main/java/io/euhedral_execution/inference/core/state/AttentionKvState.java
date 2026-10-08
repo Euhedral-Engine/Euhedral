@@ -9,13 +9,14 @@ import java.util.List;
 import java.util.Objects;
 
 /// Sequence-owned NVFP4 pages for one full-attention layer. Existing KV payloads
-/// never move. The sequence lease serializes reservation with attention; close
-/// runs after GPU completion. Each D256 row holds 128 code and 16 scale bytes.
+/// never move. The sequence takes one state-sharing quantum at a time, which orders reservation with
+/// attention; close runs after GPU completion. Each D256 row holds 128 code and 16 scale bytes.
 ///
-/// Reservation runs inside the owning quantum with its stream selected. A grown page table is
-/// uploaded from pinned staging by a copy queued on that stream, ahead of the stages that read the
-/// table, so reservation never waits for the device. The staging and any outgrown table stay owned
-/// until the append is committed or discarded, which happens only after the quantum retired.
+/// Reservation runs inside the owning quantum with its stream selected, and allocates in stream order on
+/// it. A grown page table is uploaded from pinned staging by a copy queued on that stream, ahead of the
+/// stages that read the table, so reservation never waits for the device. The outgrown table is freed in
+/// stream order right after the upload: its readers belong to quanta that already retired. The staging
+/// stays owned until the append is committed or discarded, which happens only after the quantum retired.
 ///
 /// Rows move through three frontiers. `capacity` is reserved: backed by pages. The submitted
 /// frontier covers rows whose writes are queued on the owning quantum's stream; later stages of that
@@ -28,7 +29,6 @@ public final class AttentionKvState implements AutoCloseable {
     private final ExecutionGpu gpu;
     private final long planePageBytes;
     private final List<Long> pages = new ArrayList<>();
-    private final List<Long> retiredTables = new ArrayList<>();
     private final List<ExecutionGpu.UploadBuffer> pendingStaging = new ArrayList<>();
     private long table;
     private int tableSlots;
@@ -78,10 +78,11 @@ public final class AttentionKvState implements AutoCloseable {
             // quantum retired before the lease was granted, so the stream orders the rewrite.
             this.gpu.copyUploadToDevice(nextTable, staging);
         } catch (RuntimeException | Error failure) {
-            if (nextTable != this.table) this.retiredTables.add(nextTable);
+            if (nextTable != this.table) this.gpu.freeAsync(nextTable);
             throw failure;
         }
-        if (nextTable != this.table && this.table != 0) this.retiredTables.add(this.table);
+        // Readers of the outgrown table belong to quanta that retired; the stream frees it after this upload.
+        if (nextTable != this.table && this.table != 0) this.gpu.freeAsync(this.table);
         this.table = nextTable;
         this.tableSlots = slots;
         this.capacity = nextCapacity;
@@ -228,34 +229,25 @@ public final class AttentionKvState implements AutoCloseable {
             }
         }
         this.closed =
-                this.pages.isEmpty() && this.retiredTables.isEmpty() && this.table == 0 && this.decodeScratch == 0;
+                this.pages.isEmpty() && this.table == 0 && this.decodeScratch == 0;
         if (failure != null) throw propagate(failure);
     }
 
     private long allocate(long bytes) {
-        long address = this.gpu.allocate(bytes);
+        long address = this.gpu.allocateAsync(bytes);
         if (address == 0) throw new IllegalStateException("GPU returned a null attention KV allocation");
         return address;
     }
 
-    /// Releases staging and outgrown tables once no queued work can reference them. A GPU that cannot
-    /// prove its submitted work stopped keeps the staging, and its frees fail, keeping the tables.
+    /// Releases staging once no queued work can reference it. A GPU that cannot prove its submitted work
+    /// stopped keeps the staging.
     private void releaseRetired() {
         if (!this.pendingStaging.isEmpty() && this.gpu.completionProven()) {
             for (ExecutionGpu.UploadBuffer staging : this.pendingStaging) staging.close();
             this.pendingStaging.clear();
         }
-        Throwable failure = null;
-        for (int i = this.retiredTables.size() - 1; i >= 0; i--) {
-            try {
-                this.gpu.free(this.retiredTables.get(i));
-                this.retiredTables.remove(i);
-            } catch (Throwable error) {
-                failure = combine(failure, error);
-            }
-        }
-        if (failure != null) throw propagate(failure);
     }
+
 
     private void ensureOpen() {
         if (this.closed) throw new IllegalStateException("attention KV state is closed");

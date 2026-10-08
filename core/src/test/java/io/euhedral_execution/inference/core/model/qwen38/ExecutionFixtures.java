@@ -227,6 +227,9 @@ public final class ExecutionFixtures {
         public final AtomicLong nextAddress = new AtomicLong(1000);
         final List<Long> allocations = new ArrayList<>();
         public final List<Long> frees = new ArrayList<>();
+        /// Allocations and frees made in stream order; each is also in `allocations` or `frees`.
+        public final List<Long> asyncAllocations = new ArrayList<>();
+        public final List<Long> asyncFrees = new ArrayList<>();
         public final List<String> operations = new ArrayList<>();
         Runnable afterEmbedding = () -> {};
         RuntimeException linearFailure;
@@ -251,6 +254,19 @@ public final class ExecutionFixtures {
 
         @Override
         public void copyDeviceToHost(MemorySegment destination, long source, long byteSize) {}
+
+        @Override
+        public long allocateAsync(long byteSize) {
+            long address = allocate(byteSize);
+            asyncAllocations.add(address);
+            return address;
+        }
+
+        @Override
+        public synchronized void freeAsync(long address) {
+            asyncFrees.add(address);
+            free(address);
+        }
 
         @Override
         public synchronized void free(long address) {

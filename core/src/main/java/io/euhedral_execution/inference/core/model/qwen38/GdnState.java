@@ -145,7 +145,7 @@ public final class GdnState implements AutoCloseable {
             s.replayOutput()
         }) {
             try {
-                this.gpu.free(address);
+                this.gpu.freeAsync(address);
             } catch (Throwable cleanupFailure) {
                 if (failure == null) failure = cleanupFailure;
                 else failure.addSuppressed(cleanupFailure);
@@ -224,7 +224,7 @@ public final class GdnState implements AutoCloseable {
     }
 
     private static long allocateRequired(ExecutionGpu gpu, long byteSize) {
-        long address = gpu.allocate(byteSize);
+        long address = gpu.allocateAsync(byteSize);
         if (address <= 0) throw new IllegalStateException("GPU returned an invalid GDN state address");
         return address;
     }
@@ -232,7 +232,7 @@ public final class GdnState implements AutoCloseable {
     private static void freeAfterFailure(ExecutionGpu gpu, long address, Throwable failure) {
         if (address == 0) return;
         try {
-            gpu.free(address);
+            gpu.freeAsync(address);
         } catch (Throwable cleanupFailure) {
             failure.addSuppressed(cleanupFailure);
         }

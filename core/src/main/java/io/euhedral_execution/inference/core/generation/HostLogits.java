@@ -74,7 +74,7 @@ public final class HostLogits implements AutoCloseable {
         long finalRow = Math.addExact(logitsAddress, Math.multiplyExact((long) (rows - 1), this.rowBytes));
         if (this.selectOnDevice) {
             // Allocated and pinned once per session, while the host runs ahead of the device.
-            if (this.deviceSelection == 0) this.deviceSelection = this.gpu.allocate(Long.BYTES);
+            if (this.deviceSelection == 0) this.deviceSelection = this.gpu.allocateAsync(Long.BYTES);
             if (this.selection == null) this.selection = this.gpu.allocateReadbackBuffer(Long.BYTES);
             if (this.gpu.argmaxBf16(finalRow, this.vocabularySize, this.deviceSelection)) {
                 this.gpu.copyDeviceToReadback(this.selection, this.deviceSelection, Long.BYTES);
@@ -102,10 +102,10 @@ public final class HostLogits implements AutoCloseable {
         if (rows > this.rowSelectionCapacity) {
             // Grown between sessions' first verifications; the previous quantum retired before this one.
             if (this.rowSelections != null) this.rowSelections.close();
-            if (this.deviceRowSelections != 0) this.gpu.free(this.deviceRowSelections);
+            if (this.deviceRowSelections != 0) this.gpu.freeAsync(this.deviceRowSelections);
             this.rowSelections = null;
             this.deviceRowSelections = 0;
-            this.deviceRowSelections = this.gpu.allocate((long) rows * Long.BYTES);
+            this.deviceRowSelections = this.gpu.allocateAsync((long) rows * Long.BYTES);
             this.rowSelections = this.gpu.allocateReadbackBuffer((long) rows * Long.BYTES);
             this.rowSelectionCapacity = rows;
         }
