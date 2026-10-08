@@ -46,14 +46,6 @@ class ArchitectureTest {
             "model/qwen4/loader/NgramStore.java",
             "model/qwen4/expert/RamTierPreload.java");
 
-    /// Files that hold a lock only to close what they own; their execution paths hold none.
-    private static final Set<String> LIFECYCLE = Set.of(
-            "model/qwen4/Qwen4Runtime.java",
-            "model/qwen4/Qwen4Model.java",
-            "model/qwen4/Storage.java",
-            "model/qwen4/Session.java",
-            // A sequence's persistent state closes once, when its session's lifecycle completes it.
-            "model/qwen38/SequenceCleanup.java");
 
     private static List<Path> javaFiles(String directory, boolean recursive) throws IOException {
         try (Stream<Path> walk =
@@ -114,33 +106,118 @@ class ArchitectureTest {
         assertTrue(offenders.isEmpty(), "host work outside the graph: " + offenders);
     }
 
-    /// The hot paths hold no lock. Qwen4's path through the expert cache and back changes its bookkeeping only by
-    /// frames routed to its owner, and everything else reaches it as such a frame. Qwen3.8's quantum, stages and
-    /// shapes run on the generation chain, which admits one quantum of a sequence at a time.
+    /// Nothing on either model's hot path holds a lock, waits blocking or starts a thread: state is confined by
+    /// routing every frame that touches it to its owner, and completions arrive as frames. Locks, waits and threads
+    /// are allowed only in the lifecycle and tool methods below (opening, closing, the blocking caller-thread
+    /// forms), and in the startup loaders.
     @Test
-    void theHotPathHoldsNoLockAndStartsNoThread() throws IOException {
-        Pattern lock = Pattern.compile(
-                "\\bsynchronized\\b|\\bReentrantLock\\b|\\bReadWriteLock\\b|\\bCondition\\b|\\bSemaphore\\b|\\.wait\\(|\\bnew Thread\\(|\\bExecutors\\b");
-        List<Path> hot = new ArrayList<>();
-        hot.addAll(javaFiles("model/qwen4", false));
-        hot.addAll(javaFiles("model/qwen4/expert", true));
-        hot.add(MAIN.resolve("runtime/graph/Join.java"));
-        hot.add(MAIN.resolve("runtime/graph/Sequencer.java"));
-        for (String dense : List.of("Sequence", "Quantum", "Stages", "Shape", "SequenceCleanup"))
-            hot.add(MAIN.resolve("model/qwen38/" + dense + ".java"));
+    void theHotPathHoldsNoLockBlocksNorStartsThreads() throws IOException {
         List<String> violations = new ArrayList<>();
-        for (Path file : hot) {
-            // The resident tier is read by loader threads that end with the load, before any request exists.
-            if (file.getFileName().toString().equals("RamTierPreload.java")) continue;
-            if (LIFECYCLE.contains(relative(file))) continue;
+        for (Path file : hotPathSources()) {
+            String path = relative(file);
+            if (path.startsWith("model/qwen4/loader/") || path.equals("model/qwen4/expert/RamTierPreload.java"))
+                continue;
             List<String> lines = Files.readAllLines(file);
             for (int i = 0; i < lines.size(); i++) {
                 String code = lines.get(i).strip();
                 if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
-                if (lock.matcher(code).find()) violations.add(relative(file) + ":" + (i + 1) + ": " + code);
+                // Imports and fields name what a method may use; the methods that use them are what is checked.
+                if (code.startsWith("import ") || !BLOCKING.matcher(code).find()) continue;
+                String method = enclosingMethod(lines, i);
+                if (method.equals("?") && FIELD.matcher(code).find()) continue;
+                if (LIFECYCLE_METHODS.contains(path + "#" + method)) continue;
+                violations.add(path + ":" + (i + 1) + " (" + method + "): " + code);
             }
         }
-        assertTrue(violations.isEmpty(), "locks or threads on the hot path:\n" + String.join("\n", violations));
+        assertTrue(
+                violations.isEmpty(),
+                "locks, blocking waits or threads on the hot path:\n" + String.join("\n", violations));
+    }
+
+    /// A lock, a blocking wait, or a thread. A future's blocking `get` is found by its usual receivers and by its
+    /// timed form.
+    static final Pattern BLOCKING = Pattern.compile("\\bsynchronized\\b"
+            + "|\\b(ReentrantLock|ReadWriteLock|StampedLock|Semaphore|Condition)\\b|\\.wait\\(|LockSupport\\.park"
+            + "|\\.join\\(\\)|\\bnew Thread\\b|Thread\\.of(Platform|Virtual)|\\bExecutors\\b|\\bExecutorService\\b"
+            + "|(result|future|outcome|done|settled|completion)\\w*\\(\\)\\.get\\(|\\.get\\(\\d+\\s*,\\s*TimeUnit");
+
+    /// The lifecycle and tool methods that may lock, wait or start threads, as `path#method`.
+    static final Set<String> LIFECYCLE_METHODS = Set.of(
+            "runtime/EuhedralInferenceRuntime.java#close",
+            "runtime/EuhedralInferenceRuntime.java#awaitIdle",
+            "runtime/EuhedralInferenceRuntime.java#openLanes",
+            "runtime/EuhedralInferenceRuntime.java#openPool",
+            "runtime/graph/InferenceLake.java#attach",
+            "runtime/graph/InferenceLake.java#awaitTermination",
+            "runtime/HostTasks.java#close",
+            "model/qwen38/Execution.java#execute",
+            "model/qwen38/Execution.java#close",
+            "model/qwen38/Session.java#close",
+            "model/qwen38/Session.java#completeClose",
+            "model/qwen38/Emission.java#text",
+            "model/qwen38/Emission.java#end",
+            "model/qwen38/Emission.java#drain",
+            "model/qwen38/SequenceCleanup.java#close",
+            "model/qwen38/Qwen38Model.java#close",
+            "model/qwen38/prefix/PrefixCache.java#close",
+            "model/qwen38/speculative/MtpDecoder.java#generate",
+            "model/qwen38/speculative/DFlash2Decoder.java#generate",
+            "model/qwen4/Session.java#close",
+            "model/qwen4/Session.java#completeClose",
+            "model/qwen4/Qwen4Runtime.java#stop",
+            "model/qwen4/Qwen4Model.java#close",
+            "model/qwen4/Storage.java#close");
+
+    private static List<Path> hotPathSources() throws IOException {
+        List<Path> files = new ArrayList<>();
+        for (String directory : List.of("model/qwen38", "model/qwen4", "runtime", "generation", "prefix", "state"))
+            files.addAll(javaFiles(directory, true));
+        return files;
+    }
+
+    private static final Pattern FIELD =
+            Pattern.compile("^(private|protected|public)?\\s*(static\\s+)?(final\\s+)?[\\w<>\\[\\]?, .]+\\s+\\w+\\s*(=.*)?;$");
+
+    private static final Pattern SIGNATURE = Pattern.compile(
+            "^\\s*(public|protected|private|static|final|synchronized|abstract|default|\\s)*[\\w<>\\[\\]?, .]+\\s+(\\w+)\\s*\\(");
+    private static final Set<String> NOT_METHODS =
+            Set.of("if", "for", "while", "switch", "catch", "synchronized", "return", "new", "throw", "else");
+
+    /// The method whose body holds line `at`: the nearest enclosing block opened by a method signature (blocks of
+    /// statements, lambdas and anonymous classes are looked through); the signature's own line names itself.
+    static String enclosingMethod(List<String> lines, int at) {
+        String own = methodName(lines.get(at));
+        if (own != null) return own;
+        int depth = 0;
+        for (int j = at - 1; j >= 0; j--) {
+            String code = lines.get(j).strip();
+            if (code.startsWith("//") || code.startsWith("*")) continue;
+            for (int c = code.length() - 1; c >= 0; c--) {
+                char ch = code.charAt(c);
+                if (ch == '}') depth++;
+                else if (ch == '{' && --depth < 0) {
+                    // A block opens here: a method's, or one to look through.
+                    for (int k = j; k >= Math.max(0, j - 8); k--) {
+                        String name = methodName(lines.get(k));
+                        if (name != null && !code.contains("->")) return name;
+                        if (lines.get(k).strip().endsWith(";") || lines.get(k).strip().endsWith("}")) break;
+                    }
+                    depth = 0;
+                    break;
+                }
+            }
+        }
+        return "?";
+    }
+
+    private static String methodName(String line) {
+        String code = line.strip();
+        if (code.startsWith("//") || code.startsWith("*") || code.contains("->") || code.contains(" new ")
+                || code.contains("=") || code.startsWith("return ")) return null;
+        var matcher = SIGNATURE.matcher(line);
+        if (!matcher.find()) return null;
+        String name = matcher.group(2);
+        return NOT_METHODS.contains(name) ? null : name;
     }
 
     /// Loading experts is ordinary lattice work, not a subsystem attached to the lattice: frames, dependencies,
