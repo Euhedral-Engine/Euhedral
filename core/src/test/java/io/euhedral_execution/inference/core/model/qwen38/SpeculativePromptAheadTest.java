@@ -1,6 +1,9 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
@@ -97,6 +100,42 @@ class SpeculativePromptAheadTest {
         }
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aFailedChunkFailsTheRunAheadAndLeavesNothingInFlight() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.mtpCompactWeights(VOCABULARY));
+        var gpu = new SelectingGpu() {
+            private int embeddings;
+
+            @Override
+            public void embedQ3(
+                    long tokenIds, long embedding, long bytes, long hidden, int count, int vocab, int size) {
+                if (++this.embeddings == 1) throw new IllegalStateException("chunk 0 failed");
+                super.embedQ3(tokenIds, embedding, bytes, hidden, count, vocab, size);
+            }
+        };
+        var lattice = new ExecutionFixtures.ManualLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        var sequence = new Sequence(1203);
+        try (var decoder = new MtpDecoder(runtime, plan, gpu, sequence, token -> false, 1, CHUNK)) {
+            StepPort first = decoder.start(new int[10], 1, token -> {}, null, null, 0, tokens -> {});
+            var select = new Captured();
+            first.admit(select);
+            // The later chunks and catch-ups were admitted behind the failing one.
+            assertEquals(8, sequence.submittedFrontier());
+            IllegalStateException failed =
+                    assertThrows(IllegalStateException.class, () -> drive(first, select, lattice));
+            Throwable cause = failed;
+            while (cause != null && !"chunk 0 failed".equals(cause.getMessage())) cause = cause.getCause();
+            assertNotNull(cause, "the run reports the first chunk's failure: " + failed);
+            assertEquals(Sequence.TerminalState.FAILED, sequence.terminalState());
+            assertFalse(sequence.inFlight(), "every quantum behind the failed one concluded");
+            assertEquals(0, sequence.committedFrontier(), "nothing after the failure committed");
+        } finally {
+            close(runtime, lattice, sequence);
+        }
+    }
+
     /// Runs the generation's ports to the end, as the generation frames do: `port` was admitted with `select`.
     private static void drive(StepPort port, Captured select, ExecutionFixtures.ManualLattice lattice)
             throws Exception {
@@ -118,7 +157,7 @@ class SpeculativePromptAheadTest {
     }
 
     /// Selects token 1 on the device for every row, as a speculative decoder's host rows read it.
-    private static final class SelectingGpu extends EngineExecutionFixture.SamplingGpu {
+    private static class SelectingGpu extends EngineExecutionFixture.SamplingGpu {
         SelectingGpu() {
             super(VOCABULARY);
         }

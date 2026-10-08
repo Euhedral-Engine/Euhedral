@@ -101,6 +101,44 @@ class PromptGraphTest {
     }
 
     @Test
+    void attentionSeesOnlyItsChunksRows() throws Exception {
+        var plan = new ExecutionPlan(EngineExecutionFixture.weights());
+        List<Integer> cacheLengths = new java.util.concurrent.CopyOnWriteArrayList<>();
+        var gpu = new EngineExecutionFixture.SamplingGpu(VOCABULARY) {
+            @Override
+            public void attentionCausalNvfp4(
+                    long queryKeyAddress,
+                    long gateValueAddress,
+                    long keyCacheAddress,
+                    long valueCacheAddress,
+                    long outputAddress,
+                    int rows,
+                    int queryHeads,
+                    int keyValueHeads,
+                    int headDim,
+                    int cacheLength,
+                    long startPosition,
+                    long positionAddress,
+                    long scratchAddress) {
+                cacheLengths.add(cacheLength);
+            }
+        };
+        var runtime = ExecutionFixtures.runtime(plan, gpu);
+        try {
+            // Every row's KV is reserved and the later chunks' appends continue the submitted frontier, but a chunk's
+            // attention reads the rows up to its own end only.
+            var prompt = Quantum.prompt(
+                    plan, new Sequence(5), 0, new int[] {1, 2, 3, 4, 5}, 2, LogitsRequirement.NONE, null);
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    runtime.submit(prompt).get(5, TimeUnit.SECONDS).status());
+            assertEquals(List.of(2, 4, 5), cacheLengths);
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
     void aFailedChunkStopsItsDependentsAndRetiresOnce() throws Exception {
         var plan = new ExecutionPlan(EngineExecutionFixture.weights());
         var gpu = new EngineExecutionFixture.SamplingGpu(VOCABULARY) {
