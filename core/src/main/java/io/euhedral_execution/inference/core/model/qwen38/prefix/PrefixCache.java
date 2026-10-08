@@ -428,7 +428,7 @@ public final class PrefixCache implements AutoCloseable {
         try {
             steps.captured(node, failure);
         } finally {
-            this.lake.publish(next);
+            this.lake.publishOrRun(next);
         }
     }
 
@@ -440,7 +440,7 @@ public final class PrefixCache implements AutoCloseable {
             try {
                 tell.run();
             } finally {
-                this.lake.publish(next);
+                this.lake.publishOrRun(next);
             }
         });
     }
@@ -458,9 +458,20 @@ public final class PrefixCache implements AutoCloseable {
             this.work = work;
         }
 
+        private boolean ran;
+
         @Override
         public void execute() {
+            if (this.ran) return;
+            this.ran = true;
             this.work.run();
+        }
+
+        /// An owner frame the lattice rejected still runs, on the rejecting thread, so its call is told and goes
+        /// on: rejection happens only while the lattice shuts down, when nothing else runs on the owner.
+        @Override
+        public void doFinallyWithError(Throwable rejection) {
+            execute();
         }
     }
 
