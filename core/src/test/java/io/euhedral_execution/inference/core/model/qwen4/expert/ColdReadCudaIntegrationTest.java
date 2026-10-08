@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.model.qwen4.loader.Artifact;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ArtifactReader;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
@@ -23,6 +24,8 @@ import org.junit.jupiter.api.Test;
 ///
 /// Part 1 reads random records with N plain threads (the device's ceiling, independent of any scheduler).
 /// Part 2 fills a resident [RamTier] of the first banks with N readers, as the startup load does.
+/// Own JVM: evicts the artifact pages of the OS cache and measures cold reads: opt-in, host-memory sensitive.
+@ModelGroup.OwnJvm
 class ColdReadCudaIntegrationTest {
 
     private static final int[] CONCURRENCY = {1, 2, 4, 8, 16, 32};
