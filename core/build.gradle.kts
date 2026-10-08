@@ -36,7 +36,7 @@ val latticeTest = tasks.register<Test>("latticeTest") {
     include(latticeTestClasses)
     forkEvery = 1
     // Each JVM starts its own lattice on its own worker threads (no ports, no shared files), so JVMs can overlap.
-    maxParallelForks = minOf(4, maxOf(1, Runtime.getRuntime().availableProcessors() / 4))
+    maxParallelForks = maxOf(1, Runtime.getRuntime().availableProcessors() / 4)
     useJUnitPlatform()
 }
 

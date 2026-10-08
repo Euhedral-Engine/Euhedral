@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
@@ -22,6 +23,8 @@ import org.springframework.context.ConfigurableApplicationContext;
 /// the running generation is stopped and its stream ends with an error event, and a queued request is refused
 /// with 503. Each test starts its own server, because it closes it.
 @Timeout(60)
+// Starting a Spring application registers its shutdown hook in static state that concurrent starts corrupt.
+@ResourceLock("scripted-api-context")
 class ShutdownTest {
     private static final String STREAM = "{\"model\":\"" + ScriptedInferenceBackend.MODEL_ID
             + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"max_tokens\":%d,"
