@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.Timeout;
 ///
 /// Report format, little endian: int32 steps, int32 vocabulary, then per step the int32 forced next
 /// token and the logits row as `vocabulary` BF16 values.
+@ModelGroup.OwnJvm // loads the artifact named by euhedral.quality.artifact, not one of the shared ones
 class TeacherForcedQualityCudaIntegrationTest {
 
     @Test

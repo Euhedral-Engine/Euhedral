@@ -6,8 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -33,6 +34,7 @@ import org.junit.jupiter.api.Timeout;
 /// must stay small and must not grow with position: the recurrent GDN and KV state carry any
 /// difference forward, so progressive drift would show as a rising trend. With
 /// `euhedral.numerics.drift.candidate=exact` both sequences run the exact kernels, which must agree bitwise.
+@ModelGroup.CompactQ3
 class RelaxedNumericsDriftCudaIntegrationTest {
 
     private static final int BURN_IN = 128;
@@ -49,22 +51,24 @@ class RelaxedNumericsDriftCudaIntegrationTest {
             boolean topAgrees) {}
 
     @Test
-    @Timeout(value = 3600, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void relaxedKernelsStayWithinBoundedErrorOfTheExactOracle() throws Throwable {
-        int steps = Integer.getInteger("euhedral.numerics.drift.steps", 384);
+        // 256 steps: the 128-step burn-in, then two 64-step halves for the no-growth check, in eight 32-step windows.
+        // Each decode step of the two sequences costs about 0.12 s, so 384 steps took 46 s; the error settles within
+        // the burn-in, and the bounds below are unchanged.
+        int steps = Integer.getInteger("euhedral.numerics.drift.steps", 256);
         int prefixLength = Integer.getInteger("euhedral.numerics.drift.prefix", 256);
         // Calibration: "exact" runs the exact kernels on both sequences (determinism floor).
         String mode = System.getProperty("euhedral.numerics.drift.candidate", "");
         boolean candidate = "exact".equals(mode);
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         int[] tokens = forcedTokens(QwenTokenizer.load(tokenizerDirectory), prefixLength + steps);
         List<Metrics> metrics = new ArrayList<>();
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                Qwen38Model model = Qwen38Model.load(artifact, ArtifactReader.read(artifact), gpu);
-                var lattice = new PullingLattice()) {
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        try (var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights());
             var runtime = new Execution(lattice, plan, gpu);
             var exact = new Sequence(1);

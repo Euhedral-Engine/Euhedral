@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Proposal;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -37,6 +38,7 @@ import org.junit.jupiter.api.Timeout;
 /// that dump (`-Peuhedral.dflash2.fixtures`, `dflash2_reference.py --inputs DUMP --embedding
 /// DUMP/noise_embedding.bin --lm-head-artifact ARTIFACT`), every tensor must stay within the BF16 reference's own
 /// distance from the FP32 reference, and the proposal must be the reference's.
+@ModelGroup.OwnJvm // loads the DFlash2 artifact, which no shared group holds
 class DFlash2FixtureCudaIntegrationTest {
 
     /// Relative RMS bounds per tensor family: the BF16 reference measured 2-9e-3 per layer-0 tensor, 6-9e-2 at the
