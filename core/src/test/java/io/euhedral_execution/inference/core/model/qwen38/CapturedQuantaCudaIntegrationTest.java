@@ -26,6 +26,7 @@ import org.junit.jupiter.api.Timeout;
 /// one that never captures, and the same drafts: every verification accepts as many of them, which the
 /// output tokens alone would not show (the verifier keeps the output exact whatever the drafts are).
 @ModelGroup.CompactQ3
+@ModelGroup.Mtp
 class CapturedQuantaCudaIntegrationTest {
 
     private record Run(List<List<Integer>> tokens, List<long[]> accepted, long replayed) {}

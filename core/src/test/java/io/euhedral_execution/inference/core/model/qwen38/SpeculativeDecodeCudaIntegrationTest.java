@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Timeout;
 /// leave exactly the same GDN and attention state. Prompts cover several kinds of text, long runs (many
 /// steps with zero, partial and full acceptance, and context growth) and an end-of-generation stop.
 @ModelGroup.Nvfp4
+@ModelGroup.Mtp
 class SpeculativeDecodeCudaIntegrationTest {
 
     @Test
