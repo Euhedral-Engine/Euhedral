@@ -166,6 +166,13 @@ public final class QsaLayer {
         return bytes;
     }
 
+    /// Expansion scratch of the layer's NVFP4 linears at `rows` rows.
+    long linearScratchBytes(ExecutionGpu gpu, int rows) {
+        Config c = this.config;
+        return Ops.nvfp4Scratch(
+                gpu, rows, c.hidden(), 2 * c.queryWidth(), c.hidden(), c.keyValueWidth(), c.queryWidth(), c.hidden());
+    }
+
     private int splitsCap(int rows) {
         return Math.clamp(TARGET_UNITS / (rows * this.config.keyHeads()), 1, MAX_SPLITS);
     }

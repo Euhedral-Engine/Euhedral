@@ -1,7 +1,9 @@
 package io.euhedral_execution.inference.core.runtime.graph;
 
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology.Boundary;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -31,6 +33,30 @@ public final class ShapeBuilder<S> {
     /// `to` waits for `from`'s work to retire.
     public void retired(int from, int to) {
         edge(from, to, Boundary.RETIRED);
+    }
+
+    /// Orders `stages` (ascending) one after another, as the users of one resource: each waits for the previous
+    /// one's submission unless an edge path already orders them.
+    public void chain(int[] stages) {
+        for (int i = 1; i < stages.length; i++)
+            if (!reaches(stages[i - 1], stages[i])) submitted(stages[i - 1], stages[i]);
+    }
+
+    /// Whether an edge path runs from `from` to `to`.
+    private boolean reaches(int from, int to) {
+        BitSet seen = new BitSet(to + 1);
+        ArrayDeque<Integer> pending = new ArrayDeque<>();
+        pending.push(to);
+        while (!pending.isEmpty()) {
+            for (int producer : this.producers.get(pending.pop())) {
+                if (producer == from) return true;
+                if (producer > from && !seen.get(producer)) {
+                    seen.set(producer);
+                    pending.push(producer);
+                }
+            }
+        }
+        return false;
     }
 
     public int size() {

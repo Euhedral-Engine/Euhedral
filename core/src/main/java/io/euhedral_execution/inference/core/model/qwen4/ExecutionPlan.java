@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.stream.IntStream;
 
 /// What a loaded Flash-Next model runs, as the shape of the work rather than a runner of it:
 ///
@@ -116,12 +117,10 @@ public final class ExecutionPlan implements AutoCloseable {
     private final Weight embedding;
     private final Weight head;
     private final ConcurrentHashMap<ShapeKey, Shape> shapes = new ConcurrentHashMap<>();
-    /// The workspaces, one per row capacity of [#rowBuckets]: allocated with the plan, shared by
-    /// the graphs of a capacity, freed by [#close].
-    private final Workspace[] workspaces;
+    /// The workspace, sized for [#maxRows]: allocated with the plan, shared by the graphs of every shape, freed by
+    /// [#close].
+    private Workspace workspace;
 
-    /// The row capacities of the plan's shapes: a decode token, a short chunk, a full chunk.
-    private final int[] rowBuckets;
     private final int maxRows;
     /// The last quantum admitted: a new quantum registers as its successor, and its conclusion
     /// starts the new one.
@@ -144,8 +143,6 @@ public final class ExecutionPlan implements AutoCloseable {
         this.config = model.artifact().config();
         this.maxTokens = maxContextTokens;
         this.maxRows = model.plan().prefillChunkTokens();
-        this.rowBuckets = new int[] {1, 16, this.maxRows};
-        this.workspaces = new Workspace[this.rowBuckets.length];
         this.hidden = this.config.text().hiddenSize();
         this.streams = this.config.hyperConnection().count();
         this.vocabulary = this.config.text().vocabSize();
@@ -197,23 +194,15 @@ public final class ExecutionPlan implements AutoCloseable {
         if (model.asyncReads() != null) runtime.lake().attach(model.asyncReads().getDelegate());
         this.embedding = this.weights.embedding();
         this.head = this.weights.head();
-        // The workspaces are allocated now, not by the first step: a model that cannot hold them fails to load, and the
+        // The workspace is allocated now, not by the first step: a model that cannot hold it fails to load, and the
         // residency plan's reserve is spent at a known time.
-        try {
-            for (int i = 0; i < this.rowBuckets.length; i++)
-                this.workspaces[i] = new Workspace(this, gpu, this.rowBuckets[i]);
-        } catch (Throwable failure) {
-            closeWorkspaces();
-            throw failure;
-        }
+        this.workspace = new Workspace(this, gpu, this.maxRows);
     }
 
-    private void closeWorkspaces() {
-        for (int i = 0; i < this.workspaces.length; i++) {
-            Workspace storage = this.workspaces[i];
-            this.workspaces[i] = null;
-            if (storage != null) storage.close();
-        }
+    private void closeWorkspace() {
+        Workspace storage = this.workspace;
+        this.workspace = null;
+        if (storage != null) storage.close();
     }
 
     // ---------------------------------------------------------------- starting quanta
@@ -297,12 +286,16 @@ public final class ExecutionPlan implements AutoCloseable {
         return quantum;
     }
 
-    /// A graph's hold on the workspace of capacity `rows`: the graphs of a capacity take turns on
+    /// A graph's hold on the workspace, for a shape of up to `rows` rows: the graphs of every shape take turns on
     /// it.
     Workspace.Lease leaseStorage(int rows) {
-        for (int i = 0; i < this.rowBuckets.length; i++)
-            if (this.rowBuckets[i] == rows) return new Workspace.Lease(this.workspaces[i]);
-        throw new IllegalArgumentException("no workspace of " + rows + " rows");
+        if (rows > this.maxRows) throw new IllegalArgumentException("no workspace of " + rows + " rows");
+        return new Workspace.Lease(this.workspace, rows);
+    }
+
+    /// Workspaces the plan holds (tests).
+    int workspaceCount() {
+        return this.workspace == null ? 0 : 1;
     }
 
     /// Most tokens of one chunk: the residency plan's prefill chunk.
@@ -310,12 +303,19 @@ public final class ExecutionPlan implements AutoCloseable {
         return this.maxRows;
     }
 
+    /// The row capacities of [#rowBucket], ascending.
+    int[] rowBuckets() {
+        return IntStream.of(1, Math.min(16, this.maxRows), this.maxRows)
+                .distinct()
+                .toArray();
+    }
+
     /// The row capacity of the shape that serves `rows` rows: a decode token, a short chunk, a full
-    /// chunk. The capacity sizes the shape's workspace and the most experts its MoE blocks can name,
+    /// chunk. The capacity sizes the shape's MoE block resources and the most experts its blocks can name,
     /// so a decode graph is small and has no expert stage that a token could not use.
     int rowBucket(int rows) {
         if (rows <= 1) return 1;
-        if (rows <= 16) return 16;
+        if (rows <= 16) return Math.min(16, this.maxRows);
         return this.maxRows;
     }
 
@@ -569,7 +569,7 @@ public final class ExecutionPlan implements AutoCloseable {
     @Override
     public void close() {
         this.closed = true;
-        closeWorkspaces();
+        closeWorkspace();
         this.weights.close();
     }
 }

@@ -121,6 +121,13 @@ public final class GdnLayer {
         gpu.zeroDeviceMemory(state.recurrent(), recurrentBytes());
     }
 
+    /// Expansion scratch of the layer's NVFP4 linears at `rows` rows.
+    long linearScratchBytes(ExecutionGpu gpu, int rows) {
+        int values = valueWidth();
+        return Ops.nvfp4Scratch(
+                gpu, rows, this.hidden, convolutionChannels(), this.hidden, values, values, this.hidden);
+    }
+
     public long scratchBytes(int rows) {
         long bf16 = Short.BYTES;
         return (long) rows

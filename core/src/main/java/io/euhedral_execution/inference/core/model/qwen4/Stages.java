@@ -75,6 +75,20 @@ final class Stages {
             return quantum().storage();
         }
 
+        final MoeLayer moe() {
+            return quantum().moe();
+        }
+
+        /// Runs `work` with the workspace's expansion scratch bound when the shape declared this stage a
+        /// scratch user ([Shape#takesScratch]): its edges, and the workspace's across graphs, give it the
+        /// region alone.
+        final void withScratch(Runnable work) {
+            Workspace storage = storage();
+            if (this.shape.takesScratch(stage()) && storage.scratchAddress() != 0)
+                gpu().withScratch(storage.scratchAddress(), storage.scratchBytes(), work);
+            else work.run();
+        }
+
         final ExecutionGpu gpu() {
             return plan().gpu();
         }
@@ -268,6 +282,10 @@ final class Stages {
 
         @Override
         protected void submit() {
+            withScratch(this::apply);
+        }
+
+        private void apply() {
             tick(ExecutionPlan.Timings.PLE);
             ExecutionPlan plan = plan();
             Workspace storage = storage();
@@ -320,6 +338,10 @@ final class Stages {
 
         @Override
         protected void submit() {
+            withScratch(this::block);
+        }
+
+        private void block() {
             tick(plan().isSparse(this.layer) ? ExecutionPlan.Timings.QSA : ExecutionPlan.Timings.GDN);
             this.opened = null;
             Sequence sequence = quantum().sequence();
@@ -398,7 +420,7 @@ final class Stages {
             tick(ExecutionPlan.Timings.MOE);
             ExecutionPlan plan = plan();
             Workspace storage = storage();
-            MoeLayer moe = storage.moe();
+            MoeLayer moe = moe();
             storage.bank = plan.bankOrdinal(this.layer);
             storage.moeBlock = moe.scratch(storage.moeScratch(), rows());
             if (plan.traceOn()) storage.traceBefore = plan.expertStats().snapshot();
@@ -416,9 +438,7 @@ final class Stages {
         @Override
         protected void submit() {
             int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
-            storage()
-                    .moe()
-                    .submitPrediction(
+            moe().submitPrediction(
                             this.layer, plan().weights().moe(ahead), storage().mixed());
         }
     }
@@ -442,7 +462,7 @@ final class Stages {
             int bank = plan.bankOrdinal(ahead);
             ExecutionPlan.ExpertDemand demand = plan.demandListener();
             int candidates = ExpertCacheOwner.prefetchCandidates();
-            int[] ranked = storage().moe().takePrediction(this.layer, Math.max(candidates, demand != null ? 64 : 0));
+            int[] ranked = moe().takePrediction(this.layer, Math.max(candidates, demand != null ? 64 : 0));
             plan.expertOwner()
                     .publishPrefetch(bank, java.util.Arrays.copyOf(ranked, Math.min(ranked.length, candidates)));
             if (demand != null) demand.prediction(ahead, bank, ranked);
@@ -458,8 +478,10 @@ final class Stages {
 
         @Override
         protected void submit() {
-            Workspace storage = storage();
-            storage.moe().submitShared(plan().weights().moe(this.layer), storage.mixed(), rows(), storage.moeBlock);
+            withScratch(() -> {
+                Workspace storage = storage();
+                moe().submitShared(plan().weights().moe(this.layer), storage.mixed(), rows(), storage.moeBlock);
+            });
         }
     }
 
@@ -473,7 +495,7 @@ final class Stages {
         @Override
         protected void submit() {
             Workspace storage = storage();
-            MoeLayer moe = storage.moe();
+            MoeLayer moe = moe();
             long now = System.nanoTime();
             moe.chargeRouteWait(now - storage.routeArmedNanos);
             storage.plannedNanos = now;
@@ -522,7 +544,7 @@ final class Stages {
                 return;
             }
             Workspace storage = storage();
-            int expert = storage.moe().activeExpert(this.index);
+            int expert = moe().activeExpert(this.index);
             if (plan().expertOwner().fetch(this, storage.bank, expert) == ExpertCacheOwner.Outcome.FULL)
                 graph().lake().publish(this.retry);
         }
@@ -540,7 +562,7 @@ final class Stages {
         @Override
         public void arrived(ExpertLease lease) {
             if (stopped()) lease.close();
-            else storage().moe().hold(this.index, lease);
+            else moe().hold(this.index, lease);
             completeDeferred();
         }
 
@@ -589,7 +611,7 @@ final class Stages {
         @Override
         protected void submit() {
             Workspace storage = storage();
-            storage.moe().submitExpert(this.index, laneStream(), laneIndex(), storage.mixed(), storage.moeBlock);
+            moe().submitExpert(this.index, laneStream(), laneIndex(), storage.mixed(), storage.moeBlock);
         }
     }
 
@@ -604,7 +626,7 @@ final class Stages {
         protected void submit() {
             ExecutionPlan plan = plan();
             Workspace storage = storage();
-            MoeLayer moe = storage.moe();
+            MoeLayer moe = moe();
             moe.chargeExpertWait(System.nanoTime() - storage.plannedNanos);
             moe.submitFinish(storage.blockOutput(), rows(), storage.moeBlock);
             if (plan.traceOn())

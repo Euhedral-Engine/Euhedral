@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
 import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology.Boundary;
+import java.util.ArrayList;
 import java.util.List;
 
 /// The static DAG of one chunk of Flash-Next, given to the runtime to instantiate (a [GraphShape]):
@@ -68,12 +69,19 @@ final class Shape implements GraphShape {
     /// Stages that gather the n-gram rows of a chunk side by side.
     static final int PLE_PARTS = 8;
 
+    /// Rows from which an NVFP4 linear takes the native route, whose activations use the expansion scratch.
+    static final int SCRATCH_MIN_ROWS = 9;
+
+    private static final int[] WORKSPACE = {0};
+
     private final ExecutionPlan plan;
     private final ExecutionPlan.ShapeKey key;
     private final ShapeBuilder<Spec> builder = new ShapeBuilder<>();
     private final List<Spec> specs;
     private final int expertCap;
     private final StageTopology topology;
+    /// The stages that take the expansion scratch, in order: [#build] chains them.
+    private final List<Integer> scratchUsers = new ArrayList<>();
 
     Shape(ExecutionPlan plan, ExecutionPlan.ShapeKey key) {
         this.plan = plan;
@@ -94,6 +102,7 @@ final class Shape implements GraphShape {
 
     private int add(Kind kind, int layer, int index, Edge... edges) {
         int stage = this.builder.stage(new Spec(kind, layer, index));
+        if (takesScratch(kind, this.key.rows())) this.scratchUsers.add(stage);
         for (Edge edge : edges) {
             if (edge.boundary() == Boundary.SUBMITTED) this.builder.submitted(edge.from(), stage);
             else this.builder.retired(edge.from(), stage);
@@ -167,6 +176,43 @@ final class Shape implements GraphShape {
             } else edge = Boundary.SUBMITTED;
         }
         if (range.head()) add(Kind.HEAD, -1, -1, follow(previous, edge));
+        // The scratch is one region: its users take it one after another.
+        this.builder.chain(
+                this.scratchUsers.stream().mapToInt(Integer::intValue).toArray());
+    }
+
+    /// Whether a stage of `kind` touches the workspace on the device: every stage but the host ones. The plan's
+    /// completion chain still runs one quantum at a time, so the one buffer orders a graph behind the previous one
+    /// conservatively.
+    static boolean declaresWorkspace(Kind kind) {
+        return switch (kind) {
+            case PLEIDS, PLEGATHER, MID, OBSERVE, PREFETCH, FETCH -> false;
+            default -> true;
+        };
+    }
+
+    /// Whether a stage of `kind` in a shape of `rows` rows takes the workspace's expansion scratch: the stages that
+    /// run NVFP4 linears (attention, the shared expert, the PLE projections) at the native route's row counts.
+    static boolean takesScratch(Kind kind, int rows) {
+        if (rows < SCRATCH_MIN_ROWS) return false;
+        return switch (kind) {
+            case PLE, ATTENTION, BLOCK, SHARED -> true;
+            default -> false;
+        };
+    }
+
+    boolean takesScratch(int stage) {
+        return takesScratch(this.specs.get(stage).kind(), this.key.rows());
+    }
+
+    @Override
+    public int[] workspaceBuffers(int stage) {
+        return declaresWorkspace(this.specs.get(stage).kind()) ? WORKSPACE : NO_BUFFERS;
+    }
+
+    @Override
+    public int workspaceBufferCount() {
+        return 1;
     }
 
     @Override

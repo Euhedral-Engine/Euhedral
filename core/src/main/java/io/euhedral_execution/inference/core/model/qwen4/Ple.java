@@ -111,6 +111,11 @@ public final class Ple {
         state.context().reset(endOfSequence);
     }
 
+    /// Expansion scratch of the layer's NVFP4 linears at `rows` rows.
+    long linearScratchBytes(ExecutionGpu gpu, int rows) {
+        return Ops.nvfp4Scratch(gpu, rows, this.embedDim, stateWidth(), this.embedDim, this.hidden);
+    }
+
     public long scratchBytes(int rows) {
         long bf16 = Short.BYTES;
         return (long) rows * this.store.heads() * this.store.recordBytes()

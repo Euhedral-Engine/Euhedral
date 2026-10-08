@@ -106,7 +106,8 @@ public final class TestLattice implements AutoCloseable {
                 this.lake,
                 gpu,
                 EuhedralInferenceRuntime.Lanes.of(
-                        Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_LANES", "2"))));
+                        Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_LANES", "2"))),
+                1);
         try {
             return new Run(runtime, new ExecutionPlan(gpu, model, maxContextTokens, runtime));
         } catch (RuntimeException | Error failure) {
