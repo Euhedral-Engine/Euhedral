@@ -275,6 +275,10 @@ public final class ExecutionPlan {
     /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded by the
     /// prefetch of a DFlash2 block (null when no weight is host-backed).
     private final Shape decodePreloaded;
+    /// The decode view's work for verifications of more than [#DECODE_MAX_ROWS] rows, and its preloaded variant: their
+    /// quantized linears take the expansion scratch, which a decode token's do not.
+    private final Shape verify;
+    private final Shape verifyPreloaded;
     /// The staging slots a DFlash2 block's prefetch fills (0 without one).
     private final int prefetchedSlots;
     private final Shape regionPrefill;
@@ -403,12 +407,16 @@ public final class ExecutionPlan {
                 throw new IllegalStateException("the model has no loaded DFlash2 drafter");
             return family.dflashContext;
         }
+        if (kind == Quantum.ExecutionKind.VERIFY && rows > DECODE_MAX_ROWS) return family.verify;
         if (kind == Quantum.ExecutionKind.DECODE || kind == Quantum.ExecutionKind.VERIFY) return family.decode;
         if (rows < REGION_MIN_ROWS) return family.smallPrefill;
         return family.regionPrefill;
     }
 
     static final String DRAFT_HEAD = "text/draft_head";
+
+    /// Most rows a quantum runs on the decode kernels, which read quantized weights in place without scratch.
+    static final int DECODE_MAX_ROWS = 8;
 
     /// Whether this plan's family can draft with MTP.
     public boolean drafts() {
@@ -582,6 +590,8 @@ public final class ExecutionPlan {
             this.smallPrefill = null;
             this.decode = null;
             this.decodePreloaded = null;
+            this.verify = null;
+            this.verifyPreloaded = null;
             this.prefetchedSlots = 0;
             this.regionPrefill = null;
             this.mtpDraft = null;
@@ -631,6 +641,15 @@ public final class ExecutionPlan {
                         false,
                         false)
                 : null;
+        this.verify = prefillShape(Shape.View.VERIFY, data, PrefillView.SMALL);
+        this.verifyPreloaded = this.decodePreloaded == null
+                ? null
+                : new Shape(
+                        Shape.View.VERIFY_PRELOADED,
+                        this,
+                        staged(prefillView(data, PrefillView.SMALL), staging, true),
+                        false,
+                        false);
         this.regionPrefill = prefillShape(Shape.View.REGION_PREFILL, data, PrefillView.REGIONS);
     }
 
@@ -646,7 +665,9 @@ public final class ExecutionPlan {
     /// The view to run when the ring holds what [Shape#prefetchesRing] loads: the decode view without the transfers of
     /// its first slots, or `view` when it has no such variant.
     Shape preloadedVariant(Shape view) {
-        return view == this.decode && this.decodePreloaded != null ? this.decodePreloaded : view;
+        if (view == this.decode && this.decodePreloaded != null) return this.decodePreloaded;
+        if (view == this.verify && this.verifyPreloaded != null) return this.verifyPreloaded;
+        return view;
     }
 
     /// The DFlash2 block view, or null without a drafter.
@@ -1005,6 +1026,8 @@ public final class ExecutionPlan {
             this.smallPrefill,
             this.decode,
             this.decodePreloaded,
+            this.verify,
+            this.verifyPreloaded,
             this.regionPrefill,
             this.mtpDraft,
             this.dflashBlock,

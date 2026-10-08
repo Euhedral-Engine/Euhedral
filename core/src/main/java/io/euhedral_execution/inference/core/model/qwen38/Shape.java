@@ -34,6 +34,10 @@ public final class Shape implements GraphShape {
         DECODE,
         /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded.
         DECODE_PRELOADED,
+        /// The decode view's work for a verification of more than eight rows, whose quantized linears expand into the
+        /// scratch; and its preloaded variant.
+        VERIFY,
+        VERIFY_PRELOADED,
         SMALL_PREFILL,
         REGION_PREFILL,
         MTP_DRAFT,

@@ -68,6 +68,27 @@ class ScratchDeclarationTest {
     }
 
     @Test
+    void aVerificationOfMoreThanEightRowsDeclaresItsQuantizedLinears() {
+        Shape verify = PLAN.forExecution(Quantum.ExecutionKind.VERIFY, 16);
+        boolean linear = false;
+        for (int stage : declared(verify)) {
+            ExecutionPlan.Kind kind = verify.instructions().get(stage).kind();
+            linear |= kind == ExecutionPlan.Kind.Q4_LINEAR || kind == ExecutionPlan.Kind.Q5_LINEAR;
+        }
+        assertTrue(linear, "a 16-row verification expands its linears into the scratch: " + declared(verify));
+        assertEquals(
+                PLAN.forExecution(Quantum.ExecutionKind.DECODE, 1).instructions().stream()
+                        .map(ExecutionPlan.Instruction::kind)
+                        .toList(),
+                verify.instructions().stream().map(ExecutionPlan.Instruction::kind).toList(),
+                "the same work as a decode token");
+        assertEquals(
+                PLAN.forExecution(Quantum.ExecutionKind.DECODE, 1),
+                PLAN.forExecution(Quantum.ExecutionKind.VERIFY, 4),
+                "a verification of up to eight rows runs the decode view");
+    }
+
+    @Test
     void declaredStagesAreTotallyOrdered() {
         for (Shape shape : PLAN.shapes()) {
             List<Integer> users = declared(shape);
