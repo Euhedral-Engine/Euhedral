@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.ShapeDescription;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -19,6 +20,8 @@ import org.junit.jupiter.params.provider.MethodSource;
 /// artifact per JVM:
 /// `-Peuhedral.shapes.artifacts=q3`, then `nvfp4`, `nvfp4-compressed`; `-Peuhedral.shapes.record=true` records. Without
 /// the filter the test skips (the CUDA suite runs it as a skip); a filter that names no artifact fails.
+// Own JVM: loads one of several artifacts chosen per JVM, and sets a global residency budget property.
+@ModelGroup.OwnJvm
 class ShapeIdentityCudaIntegrationTest {
 
     private static final Path GOLDENS = Path.of("src/test/resources/shapes");

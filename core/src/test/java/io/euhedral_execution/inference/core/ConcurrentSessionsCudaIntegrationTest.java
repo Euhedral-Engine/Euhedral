@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.Timeout;
 /// Two Flash-Next sessions generating at once, from different prompts, each produce exactly the tokens they produce
 /// alone: their quanta share the plan's one workspace, and nothing one of them stages (its tokens, its n-gram rows,
 /// its expert leases) is the other's. Runs on `-Peuhedral.qwen4.artifact`.
+@ModelGroup.FlashNextEngine
 class ConcurrentSessionsCudaIntegrationTest {
 
     private static final int NEW_TOKENS = 24;
