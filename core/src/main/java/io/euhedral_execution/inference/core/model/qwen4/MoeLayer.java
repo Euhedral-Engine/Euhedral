@@ -85,9 +85,12 @@ public final class MoeLayer implements AutoCloseable {
     // predictions of several layers may be in flight at once.
     private final java.util.Map<Integer, ExecutionGpu.ReadbackBuffer> predictedLogits =
             new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.Map<Integer, Long> predictedDevice = new java.util.concurrent.ConcurrentHashMap<>();
     private final ExecutionGpu.ReadbackBuffer routeWeights;
     private final ExecutionGpu.UploadBuffer hostDescriptor;
+    /// The device side: the description the kernels read and the predictions' logits, the workspace's (shared by
+    /// the graphs of one row capacity, whose device stages the workspace's edges order) or this layer's own.
+    private final Device device;
+    private final boolean ownsDevice;
     private final long deviceDescriptor;
     private final int[] ids;
     private final short[] weights;
@@ -134,6 +137,36 @@ public final class MoeLayer implements AutoCloseable {
         }
     }
 
+    /// A row capacity's device-side block resources: the block description the kernels read and each layer's
+    /// prediction logits. Only device stages write and read them, and the workspace's edges order every graph's
+    /// device stages behind the previous graph's, so the graphs of one capacity share them. The host side (leases,
+    /// the pinned description, the routing) is each graph's own.
+    public static final class Device implements AutoCloseable {
+        private final ExecutionGpu gpu;
+        private final long descriptor;
+        private final java.util.Map<Integer, Long> predicted = new java.util.concurrent.ConcurrentHashMap<>();
+        private boolean closed;
+
+        public Device(ExecutionGpu gpu, int experts, int topK, int maxRows) {
+            this.gpu = gpu;
+            this.descriptor = gpu.allocate(new ExpertRouting(experts, topK, maxRows).descriptorBytes());
+        }
+
+        long predicted(int layer, int experts) {
+            return this.predicted.computeIfAbsent(layer, l -> this.gpu.allocateAsync(2L * experts));
+        }
+
+        /// Frees the buffers. Every lane must have retired the work that used them.
+        @Override
+        public void close() {
+            if (this.closed) return;
+            this.closed = true;
+            for (long buffer : this.predicted.values()) this.gpu.free(buffer);
+            this.predicted.clear();
+            this.gpu.free(this.descriptor);
+        }
+    }
+
     /// Counters that every graph of a plan adds to.
     public static final class Metrics {
         final LongAdder routeWaitNanos = new LongAdder();
@@ -161,10 +194,11 @@ public final class MoeLayer implements AutoCloseable {
             int sharedInter,
             int maxRows,
             Metrics metrics) {
-        this(gpu, geometry, experts, topK, sharedInter, maxRows, metrics, new LaneFences(), true);
+        this(gpu, geometry, experts, topK, sharedInter, maxRows, metrics, new LaneFences(), true, null);
     }
 
-    /// As above, recording the lanes' fences in `laneFences`, which the caller owns.
+    /// As above, recording the lanes' fences in `laneFences` and using the device side `device` (null: its own),
+    /// which the caller owns.
     public MoeLayer(
             ExecutionGpu gpu,
             ExpertOps.Geometry geometry,
@@ -173,8 +207,9 @@ public final class MoeLayer implements AutoCloseable {
             int sharedInter,
             int maxRows,
             Metrics metrics,
-            LaneFences laneFences) {
-        this(gpu, geometry, experts, topK, sharedInter, maxRows, metrics, laneFences, false);
+            LaneFences laneFences,
+            Device device) {
+        this(gpu, geometry, experts, topK, sharedInter, maxRows, metrics, laneFences, false, device);
     }
 
     private MoeLayer(
@@ -186,7 +221,8 @@ public final class MoeLayer implements AutoCloseable {
             int maxRows,
             Metrics metrics,
             LaneFences laneFences,
-            boolean ownsFences) {
+            boolean ownsFences,
+            Device device) {
         this.gpu = gpu;
         this.laneFences = laneFences;
         this.ownsFences = ownsFences;
@@ -205,10 +241,10 @@ public final class MoeLayer implements AutoCloseable {
         this.routeIds = gpu.allocateReadbackBuffer(4L * maxPairs);
         this.routeWeights = gpu.allocateReadbackBuffer(2L * maxPairs);
         ExecutionGpu.UploadBuffer host = null;
-        long device = 0;
+        Device side = device;
         try {
             host = gpu.allocateUploadBuffer(this.routing.descriptorBytes());
-            device = gpu.allocate(this.routing.descriptorBytes());
+            if (side == null) side = new Device(gpu, experts, topK, maxRows);
         } catch (Throwable failure) {
             if (host != null) host.close();
             this.routeIds.close();
@@ -216,7 +252,9 @@ public final class MoeLayer implements AutoCloseable {
             throw failure;
         }
         this.hostDescriptor = host;
-        this.deviceDescriptor = device;
+        this.device = side;
+        this.ownsDevice = device == null;
+        this.deviceDescriptor = side.descriptor;
     }
 
     /// The most experts a block can name: the expert stages of a layer.
@@ -448,8 +486,7 @@ public final class MoeLayer implements AutoCloseable {
 
     private void release() {
         for (ExecutionGpu.ReadbackBuffer buffer : this.predictedLogits.values()) buffer.close();
-        for (long device : this.predictedDevice.values()) this.gpu.free(device);
-        this.gpu.free(this.deviceDescriptor);
+        if (this.ownsDevice) this.device.close();
         this.hostDescriptor.close();
         this.routeIds.close();
         this.routeWeights.close();
@@ -462,7 +499,7 @@ public final class MoeLayer implements AutoCloseable {
     /// Queues a later layer's router (`ahead`) applied to `layer`'s single row: a prediction of the experts that
     /// layer will ask for, read back for [#takePrediction].
     void submitPrediction(int layer, Weights ahead, long input) {
-        long device = this.predictedDevice.computeIfAbsent(layer, l -> this.gpu.allocateAsync(2L * this.experts));
+        long device = this.device.predicted(layer, this.experts);
         ExecutionGpu.ReadbackBuffer logits =
                 this.predictedLogits.computeIfAbsent(layer, l -> this.gpu.allocateReadbackBuffer(2L * this.experts));
         Ops.linearBf16(this.gpu, input, ahead.router().address(), device, 1, this.hidden, this.experts);

@@ -398,6 +398,11 @@ public final class ExecutionPlan implements AutoCloseable {
     }
 
     MoeLayer newMoeLayer(int rows) {
+        return newMoeLayer(rows, null);
+    }
+
+    /// Block resources of `rows` rows on the device side `device` (null: their own).
+    MoeLayer newMoeLayer(int rows, MoeLayer.Device device) {
         return new MoeLayer(
                 this.gpu,
                 this.geometry,
@@ -406,7 +411,14 @@ public final class ExecutionPlan implements AutoCloseable {
                 this.config.moe().sharedExpertIntermediateSize(),
                 rows,
                 this.metrics,
-                this.laneFences);
+                this.laneFences,
+                device);
+    }
+
+    /// The device side of block resources of `rows` rows.
+    MoeLayer.Device newMoeDevice(int rows) {
+        return new MoeLayer.Device(
+                this.gpu, this.config.moe().numExperts(), this.config.moe().expertsPerToken(), rows);
     }
 
     /// The most experts a block of a shape of `rows` rows can name: the fetch and expert stages of a layer.
