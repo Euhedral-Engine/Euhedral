@@ -32,6 +32,20 @@ public abstract class ExecutionGpu implements GpuMemory {
         return false;
     }
 
+    /// Allocates `bytes` of device memory in stream order on the stream selected on this thread (inside
+    /// [GpuStream#submit]), or the default stream: the allocation is usable by work queued after it on that stream,
+    /// and by other streams once they are ordered after it. Never blocks the host.
+    public long allocateAsync(long bytes) {
+        return allocate(bytes);
+    }
+
+    /// Frees `address` in stream order on the stream selected on this thread: the memory is reused only after the
+    /// stream reaches this point. Every reader on another stream must already be ordered before it (it retired, or
+    /// this stream awaited it). Never blocks the host.
+    public void freeAsync(long address) {
+        free(address);
+    }
+
     public UploadBuffer allocateUploadBuffer(long bytes) {
         Arena arena = Arena.ofShared();
         try {

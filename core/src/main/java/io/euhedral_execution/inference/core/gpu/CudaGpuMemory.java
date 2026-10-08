@@ -43,6 +43,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final Arena arena;
     private final MethodHandle malloc;
     private final MethodHandle free;
+    private final MethodHandle mallocAsync;
+    private final MethodHandle freeAsync;
+    /// Live allocations made in stream order; only these are freed in stream order.
+    private final java.util.Set<Long> streamOrdered = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final MethodHandle hostMalloc;
     private final MethodHandle hostFree;
     private final MethodHandle hostWeightsMalloc;
@@ -190,6 +194,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.arena = loadedLibraryArena;
             this.malloc = bind(linker, symbols, "euhedral_cuda_malloc", MALLOC);
             this.free = bind(linker, symbols, "euhedral_cuda_free", FREE);
+            this.mallocAsync = bind(linker, symbols, "euhedral_cuda_malloc_async", MALLOC);
+            this.freeAsync = bind(linker, symbols, "euhedral_cuda_free_async", FREE);
             this.hostMalloc = bind(linker, symbols, "euhedral_cuda_host_malloc", MALLOC);
             this.hostFree = bind(linker, symbols, "euhedral_cuda_host_free", FREE);
             this.hostWeightsMalloc = bind(linker, symbols, "euhedral_cuda_host_weights_malloc", MALLOC);
@@ -1008,16 +1014,68 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             MemorySegment address = (MemorySegment) malloc.invokeExact(byteSize);
             long value = address.address();
             if (value == 0) throw new GpuMemoryException("CUDA allocation returned a null address");
-            allocationSizes.put(value, byteSize);
-            allocationIds.put(value, allocationSerial.incrementAndGet());
-            long live = allocatedBytes.addAndGet(byteSize);
-            peakAllocatedBytes.accumulateAndGet(live, Math::max);
+            track(value, byteSize);
             return value;
         } catch (GpuMemoryException exception) {
             throw exception;
         } catch (Throwable throwable) {
             throw new GpuMemoryException("CUDA allocation invocation failed", throwable);
         }
+    }
+
+    @Override
+    public long allocateAsync(long byteSize) {
+        ensureOpen();
+        if (byteSize <= 0) throw new IllegalArgumentException("byteSize must be positive");
+        // A captured or checked submission cannot take a stream-ordered allocation: it becomes ordinary.
+        if (SUBMISSION.get()[0] != 0) {
+            markUnrecordable();
+            return allocate(byteSize);
+        }
+        MemorySegment address;
+        try {
+            address = (MemorySegment) this.mallocAsync.invokeExact(byteSize);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("CUDA stream-ordered allocation invocation failed", throwable);
+        }
+        long value = address.address();
+        if (value == 0) throw new GpuMemoryException("CUDA stream-ordered allocation returned a null address");
+        track(value, byteSize);
+        this.streamOrdered.add(value);
+        return value;
+    }
+
+    @Override
+    public void freeAsync(long address) {
+        ensureOpen();
+        if (address == 0) return;
+        boolean recordable = SUBMISSION.get()[0] == 0;
+        if (!recordable) markUnrecordable();
+        if (!this.streamOrdered.remove(address) || !recordable) {
+            free(address);
+            return;
+        }
+        int status;
+        try {
+            status = (int) this.freeAsync.invokeExact(MemorySegment.ofAddress(address));
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("CUDA stream-ordered free invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException("CUDA stream-ordered free", status);
+        untrack(address);
+    }
+
+    private void track(long address, long byteSize) {
+        allocationSizes.put(address, byteSize);
+        allocationIds.put(address, allocationSerial.incrementAndGet());
+        long live = allocatedBytes.addAndGet(byteSize);
+        peakAllocatedBytes.accumulateAndGet(live, Math::max);
+    }
+
+    private void untrack(long address) {
+        Long size = allocationSizes.remove(address);
+        allocationIds.remove(address);
+        if (size != null) allocatedBytes.addAndGet(-size);
     }
 
     /// Pinned staging memory is page-locked, so allocating it per quantum costs about a millisecond.
@@ -2909,9 +2967,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             throw new GpuMemoryException("CUDA free invocation failed", throwable);
         }
         if (status != 0) throw new GpuMemoryException("CUDA free", status);
-        Long size = allocationSizes.remove(address);
-        allocationIds.remove(address);
-        if (size != null) allocatedBytes.addAndGet(-size);
+        this.streamOrdered.remove(address);
+        untrack(address);
     }
 
     @Override

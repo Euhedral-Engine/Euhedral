@@ -58,7 +58,7 @@ Includes within a folder are relative; includes across folders name the path fro
 (`common/pdl.cuh`, `nvfp4/nvfp4.cuh`), which NVRTC resolves through the installed root.
 
 The exported C API (`include/euhedral_cuda.h`) falls into these groups:
-- memory and transfers: `euhedral_cuda_malloc`/`free`, `host_malloc`/`host_free`, `host_weights_malloc`/`free`/`device_pointer`,
+- memory and transfers: `euhedral_cuda_malloc`/`free`, the stream-ordered `malloc_async`/`free_async`, `host_malloc`/`host_free`, `host_weights_malloc`/`free`/`device_pointer`,
   `device_memory_info`, the `copy_*` family, `zero_device_memory`, `synchronize`;
 - streams, markers and completion: `stream_create`/`destroy`/`select`/`clear`/`synchronize`/`wait_event`, `completion_event_*`,
   `completion_notify`;
