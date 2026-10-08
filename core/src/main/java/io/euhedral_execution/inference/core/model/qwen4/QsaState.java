@@ -34,6 +34,10 @@ public final class QsaState implements AutoCloseable {
     private final long tails;
     private int liveTail;
     private int pendingRows;
+    /// Chunks pending (a prompt's chunks of this layer), and the parity of the one being written: chunk `k` reads
+    /// the tail chunk `k - 1` wrote and writes the other.
+    private int pendingChunks;
+    private int writing;
     private boolean closed;
 
     /// A state for sequences of up to `maxTokens` positions of a layer with `keyValueWidth` K (and
@@ -77,18 +81,20 @@ public final class QsaState implements AutoCloseable {
         return this.maxTokens;
     }
 
-    /// Reserves the cache pages for `rows` more positions and returns the first one (the committed
-    /// length).
+    /// Reserves the cache pages for `rows` more positions and returns the first one: where the previous pending
+    /// chunk of the quantum ends (a prompt's chunks, in order), or the committed length.
     public int beginChunk(int rows) {
         ensureOpen();
         if (rows <= 0) throw new IllegalArgumentException("a chunk needs rows");
-        if (this.pendingRows != 0)
-            throw new IllegalStateException("the previous chunk was neither committed nor discarded");
-        int start = this.kv.length();
+        int start = this.kv.submittedLength();
+        if (start != this.kv.length() + this.pendingRows)
+            throw new IllegalStateException("the previous chunk's writes were not submitted");
         if ((long) start + rows > this.maxTokens)
             throw new IllegalArgumentException("the sequence would exceed " + this.maxTokens + " tokens");
         this.kv.prepareAppend(start, rows);
-        this.pendingRows = rows;
+        this.writing = this.pendingChunks & 1;
+        this.pendingRows += rows;
+        this.pendingChunks++;
         return start;
     }
 
@@ -97,23 +103,30 @@ public final class QsaState implements AutoCloseable {
     public void submitted() {
         ensureOpen();
         if (this.pendingRows == 0) throw new IllegalStateException("no chunk in flight");
-        this.kv.appendSubmitted(this.pendingRows);
+        this.kv.appendSubmitted(this.pendingRows - (this.kv.submittedLength() - this.kv.length()));
     }
 
-    /// Publishes the chunk; the quantum's device work has retired.
+    /// Publishes every pending chunk; the quantum's device work has retired. A prompt's later chunks find
+    /// nothing left to publish.
     public void commit() {
         ensureOpen();
-        if (this.pendingRows == 0) throw new IllegalStateException("no chunk in flight");
+        if (this.pendingRows == 0) return;
         this.kv.commitSubmitted();
-        this.liveTail ^= 1;
+        this.liveTail ^= this.pendingChunks & 1;
         this.pendingRows = 0;
+        this.pendingChunks = 0;
+        this.writing = 0;
     }
 
-    /// Drops the chunk; the quantum's device work has retired.
+    /// Drops every pending chunk; the quantum's device work has retired. A prompt's chunks after the first
+    /// rewrite the tail the committed state reads, so only a quantum of one chunk leaves the committed state
+    /// intact; a failed prompt leaves its sequence terminal.
     public void discard() {
         if (this.closed) return;
         this.kv.discardSubmitted();
         this.pendingRows = 0;
+        this.pendingChunks = 0;
+        this.writing = 0;
     }
 
     /// Forgets the sequence: the next chunk starts at position 0.
@@ -139,14 +152,15 @@ public final class QsaState implements AutoCloseable {
         return this.blockKeys;
     }
 
-    /// The committed raw tail, `[3][128]` BF16: token `4 (length / 4) + i` at slot `i`.
+    /// The raw tail the chunk being written reads, `[3][128]` BF16: token `4 (start / 4) + i` at slot `i`. The
+    /// committed tail for a quantum's first chunk, the previous chunk's for a prompt's later ones.
     public long tailIn() {
-        return this.tails + this.liveTail * TAIL_BYTES;
+        return this.tails + (this.liveTail ^ this.writing) * TAIL_BYTES;
     }
 
-    /// Where the pending chunk writes the tail it leaves.
+    /// Where the chunk being written writes the tail it leaves.
     public long tailOut() {
-        return this.tails + (this.liveTail ^ 1) * TAIL_BYTES;
+        return this.tails + (this.liveTail ^ this.writing ^ 1) * TAIL_BYTES;
     }
 
     /// The underlying KV state (page count and lengths).

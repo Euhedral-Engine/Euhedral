@@ -83,18 +83,14 @@ final class Workspace {
     long routeArmedNanos;
     long plannedNanos;
     ExpertCacheStats.Snapshot traceBefore;
-    /// The n-gram rows of the chunk, their staging buffer and how many there are: written by the stage that
-    /// computes the ids and gathers them, read by the stage that copies them to the device.
-    final long[] pleRowIds;
-
-    ExecutionGpu.UploadBuffer pleUpload;
-    int pleCount;
+    /// The n-gram rows of a quantum of one chunk ([Quantum#pleRows]); a prompt's chunks have their own.
+    private final Quantum.PleRows ple;
 
     Workspace(ExecutionPlan plan, ExecutionGpu gpu, int rows) {
         this.gpu = gpu;
         this.rows = rows;
         int hidden = plan.hidden();
-        this.pleRowIds = new long[rows * plan.ple().rowsPerToken()];
+        this.ple = new Quantum.PleRows(rows * plan.ple().rowsPerToken());
         this.capacities = plan.rowBuckets();
         this.moes = new MoeLayer[this.capacities.length];
         ExecutionGpu.UploadBuffer upload = null;
@@ -175,6 +171,10 @@ final class Workspace {
             }
         }
         if (failure != null) throw failure;
+    }
+
+    Quantum.PleRows ple() {
+        return this.ple;
     }
 
     ExecutionGpu.UploadBuffer tokenUpload() {

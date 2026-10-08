@@ -35,4 +35,22 @@ class ShapeDeclarationsTest {
         }
         assertTrue(Shape.takesScratch(Shape.Kind.SHARED, 16));
     }
+
+    @Test
+    void eachLayersAttentionStateAndThePleStateAreCarried() {
+        int layers = 48;
+        assertEquals(java.util.List.of(7), boxed(Shape.carriedKeys(Shape.Kind.BLOCK, 7, layers)));
+        assertEquals(java.util.List.of(7), boxed(Shape.carriedKeys(Shape.Kind.ATTENTION, 7, layers)));
+        assertEquals(java.util.List.of(layers), boxed(Shape.carriedKeys(Shape.Kind.PLEIDS, 2, layers)), "PLE context");
+        assertEquals(java.util.List.of(layers + 1), boxed(Shape.carriedKeys(Shape.Kind.PLE, 2, layers)), "PLE history");
+        for (Shape.Kind kind : Shape.Kind.values())
+            if (kind != Shape.Kind.BLOCK
+                    && kind != Shape.Kind.ATTENTION
+                    && kind != Shape.Kind.PLEIDS
+                    && kind != Shape.Kind.PLE) assertEquals(0, Shape.carriedKeys(kind, 3, layers).length, kind.name());
+    }
+
+    private static java.util.List<Integer> boxed(int[] keys) {
+        return java.util.Arrays.stream(keys).boxed().toList();
+    }
 }
