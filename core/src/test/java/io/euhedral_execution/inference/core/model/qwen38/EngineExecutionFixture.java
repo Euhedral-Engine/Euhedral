@@ -124,6 +124,10 @@ public final class EngineExecutionFixture {
         public void copyDeviceToDevice(long destination, long source, long byteSize) {}
 
         @Override
+        public void copyRowsDeviceToDevice(
+                long destination, long destinationPitch, long source, long sourcePitch, int rows) {}
+
+        @Override
         public void zeroDeviceMemory(long address, long byteSize) {}
 
         @Override

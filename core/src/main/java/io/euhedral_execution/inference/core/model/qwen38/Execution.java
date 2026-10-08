@@ -179,6 +179,15 @@ public final class Execution implements AutoCloseable {
         accept(context, NO_TERMINAL_CONSUMER);
     }
 
+    /// Admits `context` ahead of a later quantum of its sequence whose continuation reads both: no frame follows
+    /// its own conclusion. The later quantum concludes after it and fails when it failed, so its continuation
+    /// sees the outcome of both. Returns why the runtime refused `context`, or null. Runs where [#admit] does.
+    public Throwable admitAhead(Quantum context) {
+        Objects.requireNonNull(context, "context");
+        claim(context);
+        return accept(context, NO_TERMINAL_CONSUMER);
+    }
+
     /// Checks that `context` belongs to this plan and claims its single admission.
     private void claim(Quantum context) {
         if (context.plan() != this.plan) {
@@ -187,8 +196,8 @@ public final class Execution implements AutoCloseable {
         context.claim();
     }
 
-    /// Admits a claimed quantum. Runs on the workspace's owner.
-    private void accept(Quantum context, Consumer<? super Quantum> terminalConsumer) {
+    /// Admits a claimed quantum, and returns why the runtime refused it, or null. Runs on the workspace's owner.
+    private Throwable accept(Quantum context, Consumer<? super Quantum> terminalConsumer) {
         Shape view = context.shape();
         // A decode view whose first staging slots this sequence's DFlash2 block just filled runs without their
         // transfers; its first readers of those slots then follow the block's prefetch transfers (their last writer).
@@ -212,7 +221,9 @@ public final class Execution implements AutoCloseable {
                             context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage, this.shared));
         } catch (RuntimeException | Error refused) {
             LOG.debug("a quantum was refused; its continuation carries the failure", refused);
+            return refused;
         }
+        return null;
     }
 
     /// Whether the first `slots` staging slots hold what `block` (a DFlash2 block view that prefetches) loads for

@@ -105,23 +105,43 @@ public final class Shape implements GraphShape {
         return this.view;
     }
 
-    /// The sequence state stage `stage` carries from one chunk of a prompt to the next: `2L` for layer L's GDN
-    /// convolution and recurrent state, `2L + 1` for its KV rows. Layer slots include the MTP layer's. A
-    /// first-layer plan's stages name no layer: their state is layer 0's, the sequence's only one.
+    /// The sequence state stage `stage` carries from one quantum (or chunk) of the sequence to the next: `2L` for
+    /// layer L's GDN convolution and recurrent state, `2L + 1` for its KV rows (layer slots include the MTP
+    /// layer's), then the drafters' state ([#seedRowsKey]). A first-layer plan's stages name no layer: their state
+    /// is layer 0's, the sequence's only one.
     @Override
     public int[] carriedState(int stage) {
         ExecutionPlan.Instruction instruction = this.instructions.get(stage);
         int layer = Math.max(instruction.layerIndex(), 0);
+        int drafter = seedRowsKey(this.plan.weights().config().numHiddenLayers());
         return switch (instruction.kind()) {
             case GDN_CONVOLUTION, GDN_RECURRENCE -> new int[] {2 * layer};
             case ATTENTION_KV_APPEND, ATTENTION_CAUSAL -> new int[] {2 * layer + 1};
+            // The MTP stem reads the seed rows; a final norm of a drafting plan writes them (a seeding quantum's,
+            // or an MTP row's recursion hidden).
+            case MTP_STEM -> new int[] {drafter};
+            case RMS_NORM, RMS_NORM_UNIT_OFFSET ->
+                this.plan.drafts() && instruction.outputBuffers().contains(ExecutionPlan.Buffer.FINAL_NORMALIZED)
+                        ? new int[] {drafter}
+                        : NO_BUFFERS;
+            // The DFlash2 taps: written by the target's tap stages, read by the drafter's linears without input.
+            case DFLASH_TAP -> new int[] {drafter + 1};
+            case DFLASH_LINEAR -> instruction.inputBuffers().isEmpty() ? new int[] {drafter + 1} : NO_BUFFERS;
+            // The DFlash2 context ring: written by the context's keys and values, read by attention.
+            case DFLASH_CONTEXT_KV, DFLASH_ATTENTION -> new int[] {drafter + 2};
             default -> NO_BUFFERS;
         };
     }
 
+    /// The carried-state key of the draft seed rows (and the MTP recursion hidden) in a plan of `layers` base
+    /// layers; the DFlash2 taps and context ring follow it.
+    static int seedRowsKey(int layers) {
+        return 2 * (layers + 1);
+    }
+
     @Override
     public int carriedStateCount() {
-        return 2 * (this.plan.weights().config().numHiddenLayers() + 1);
+        return seedRowsKey(this.plan.weights().config().numHiddenLayers()) + 3;
     }
 
     /// The runtime workspace's slots stage `stage` reads or writes: its instruction's buffers, through the region

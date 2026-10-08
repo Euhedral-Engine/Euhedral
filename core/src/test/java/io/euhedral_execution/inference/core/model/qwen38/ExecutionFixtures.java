@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.DenseFfnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.GdnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.MixerWeights;
+import io.euhedral_execution.inference.core.model.qwen38.loader.MtpWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import java.lang.foreign.MemorySegment;
@@ -157,6 +158,35 @@ public final class ExecutionFixtures {
                 direct("text/final_norm", WeightFormat.BF16, hidden),
                 quantized("text/output_head", vocabularySize, hidden, WeightFormat.Q3_G64_FP16),
                 null);
+    }
+
+    /// The stateful compact weights with an MTP layer and a draft head over the whole vocabulary: a plan that drafts.
+    public static Weights mtpCompactWeights(int vocabularySize) {
+        Weights base = statefulCompactWeights(vocabularySize);
+        int hidden = base.config().hiddenSize();
+        MtpWeights mtp = new MtpWeights(
+                direct("mtp/embedding_norm", WeightFormat.BF16, hidden),
+                direct("mtp/hidden_norm", WeightFormat.BF16, hidden),
+                quantized("mtp/projection", hidden, 2 * hidden, WeightFormat.Q3_G64_FP16),
+                // The draft view builds the MTP layer as a one-layer model, so its weights are layer 0's.
+                layer(
+                        0,
+                        hidden,
+                        base.config().intermediateSize(),
+                        attentionWeights(hidden, base.config().attentionHeadDim())),
+                direct("mtp/final_norm", WeightFormat.BF16, hidden));
+        return new Weights(
+                base.config(),
+                base.tokenEmbedding(),
+                base.layers(),
+                base.finalNorm(),
+                base.lmHead(),
+                mtp,
+                java.util.Map.of(
+                        ExecutionPlan.DRAFT_HEAD,
+                        quantized("text/draft_head", vocabularySize, hidden, WeightFormat.Q3_G64_FP16),
+                        "text/draft_head_token_ids",
+                        direct("text/draft_head_token_ids", WeightFormat.FP32, vocabularySize)));
     }
 
     private static LayerWeights layer(int index, int hidden, int intermediate, MixerWeights mixer) {

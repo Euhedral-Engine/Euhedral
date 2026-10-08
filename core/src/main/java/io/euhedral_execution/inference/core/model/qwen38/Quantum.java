@@ -87,6 +87,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// DRAFT: the device rows of base (or MTP) hidden state that seed this quantum's MTP rows, and how
     /// many of its rows the MTP cache commits (catch-up rows commit, recursive draft rows do not).
     private long draftSeedAddress;
+    /// DRAFT seeded from the sequence's draft seed rows: the first of them, read when its stage runs; else -1.
+    private int draftSeedRow = -1;
     private int draftCommittedRows;
     /// Base quanta of a speculative session also keep every row's post-final-norm hidden for drafting.
     private boolean seedsDraft;
@@ -308,8 +310,24 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return this;
     }
 
+    /// A DRAFT quantum whose MTP rows are seeded by the sequence's draft seed rows from `firstRow`, committing its
+    /// first `committedRows` MTP cache rows. The rows are found when its stage runs, after the seeding quantum's
+    /// writer (the carried seed-row edge): so a catch-up can be admitted before that quantum ran.
+    public Quantum withSeedRows(int firstRow, int committedRows) {
+        if (this.kind != ExecutionKind.DRAFT) throw new IllegalStateException("only drafting takes a seed");
+        if (firstRow < 0 || committedRows < 0 || committedRows > this.tokenIds.length)
+            throw new IllegalArgumentException("invalid draft seed");
+        this.draftSeedRow = firstRow;
+        this.draftCommittedRows = committedRows;
+        return this;
+    }
+
+    /// The seed rows' device address; for [#withSeedRows], as the sequence's seed rows are now.
     public long draftSeedAddress() {
-        return this.draftSeedAddress;
+        if (this.draftSeedRow < 0) return this.draftSeedAddress;
+        var states = (AttentionStates) this.sequence.kvCacheState();
+        int hidden = this.plan.weights().config().hiddenSize();
+        return states.seedRows() + (long) this.draftSeedRow * hidden * Short.BYTES;
     }
 
     /// Keeps every row's post-final-norm hidden in the sequence's draft seed rows.
@@ -411,6 +429,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     public Object captureKey() {
         if (this.kind == ExecutionKind.PREFILL || this.tokenIds.length > MAX_CAPTURED_ROWS) return null;
         if (this.workspace == null || this.gpu == null || this.gpu.exactNumerics()) return null;
+        // Its seed rows are found only when its stage runs.
+        if (this.draftSeedRow >= 0) return null;
         if (!this.shape.hasFirstLayer()) return null;
         if (!(this.sequence.kvCacheState() instanceof AttentionStates attention)
                 || !(this.sequence.recurrentState() instanceof GdnStates recurrent)) return null;
@@ -536,9 +556,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 }
             }
             beforeClaim.run();
-            // The sequence takes several quanta in flight, but not the state no edge orders: the draft's
-            // frontier and seed rows, the host row and the proposal. A quantum that touches it is refused while
-            // other work on the sequence is in flight.
+            // The sequence takes several quanta in flight, but not the state no edge orders: the host row and the
+            // proposal. A quantum that touches it is refused while other work on the sequence is in flight.
             if (sharesSequenceState() && this.sequence.inFlight())
                 throw new IllegalStateException(
                         "another quantum of the sequence is in flight, and its state takes one quantum at a time");
@@ -686,12 +705,12 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
     }
 
-    /// Whether the quantum touches per-sequence state no edge orders: the draft's frontier and seed rows, the
-    /// session's host row, or a proposal. Its layers' GDN and KV state are carried state, which the edges between
-    /// the sequence's graphs order ([SequenceOwner]), so a quantum that touches only those may be admitted while
-    /// another of the sequence is in flight.
+    /// Whether the quantum touches per-sequence state no edge orders: the session's host row, or a proposal. Its
+    /// layers' GDN and KV state, the MTP cache, the draft seed rows and the DFlash2 taps and ring are carried
+    /// state, which the edges between the sequence's graphs order ([SequenceOwner]), so a quantum that touches
+    /// only those may be admitted while another of the sequence is in flight.
     private boolean sharesSequenceState() {
-        return drafting() || this.seedsDraft || this.hostLogits != null || this.proposal != null;
+        return this.hostLogits != null || this.proposal != null;
     }
 
     @Override

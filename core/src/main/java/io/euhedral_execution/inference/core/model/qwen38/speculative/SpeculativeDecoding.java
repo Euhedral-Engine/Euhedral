@@ -29,11 +29,14 @@ public interface SpeculativeDecoding extends AutoCloseable {
                 int prefillChunk);
     }
 
-    /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk, once the
-    /// strategy's own state covers it and before the next chunk changes it. Once the cache is finished with the
-    /// sequence's state it tells `failed` what stopped it (null: nothing) and then throws `next`.
-    @FunctionalInterface
+    /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk it [#wants] a
+    /// checkpoint at, once the strategy's own state covers it and before the next chunk changes it. Once the cache
+    /// is finished with the sequence's state it tells `failed` what stopped it (null: nothing) and then throws
+    /// `next`. Chunks between those boundaries run ahead of the strategy's own steps.
     interface PrefixHooks {
+        /// Whether the cache checkpoints the prompt after the chunk ending at `end`.
+        boolean wants(int end);
+
         void afterChunk(int end, Consumer<Throwable> failed, AbstractFrame next);
     }
 

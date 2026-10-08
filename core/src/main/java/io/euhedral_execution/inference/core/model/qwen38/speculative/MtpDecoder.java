@@ -38,8 +38,10 @@ import java.util.function.IntPredicate;
 ///    those MTP cache rows, and its last row drafts d′₁.
 /// 3. n − 1 recursive DRAFT rows, each seeded by the previous MTP hidden.
 ///
-/// The prompt is prefilled in chunks that seed drafting, each followed by its catch-up. Not thread-safe;
-/// one decoder per sequence.
+/// The prompt is prefilled in chunks that seed drafting, each followed by its catch-up. The chunks before the last
+/// run ahead ([Run#ahead]): they are admitted with their catch-ups at once, up to the next prefix checkpoint, and
+/// the sequence's carried state (the seed rows, the MTP cache) orders them. Not thread-safe; one decoder per
+/// sequence.
 public final class MtpDecoder implements SpeculativeDecoding {
 
     /// Per-generation measurements. `acceptedDrafts[a]` counts verifications that accepted a drafts.
@@ -246,6 +248,11 @@ public final class MtpDecoder implements SpeculativeDecoding {
         private long started;
         private long promptCatchUpStarted;
 
+        // The run-ahead in flight: chunks [offset, aheadEnd) with their catch-ups.
+        private int aheadEnd;
+        private Throwable aheadRefusal;
+        private Throwable drainFailure;
+
         // The catch-up in flight.
         private long catchUpPosition;
         private int[] catchUpTokens;
@@ -308,8 +315,93 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
         private StepPort prefillFrom(int from) {
             this.offset = from;
-            return this.offset >= this.prompt.length ? afterPrompt() : this.prefill;
+            if (this.offset >= this.prompt.length) return afterPrompt();
+            int lastStart = from + (this.prompt.length - from - 1) / prefillChunk * prefillChunk;
+            if (from == lastStart) return this.prefill;
+            // Up to the last chunk, whose prefill fills the host row, or to the first checkpoint the cache wants.
+            int stop = from + prefillChunk;
+            while (stop < lastStart && (this.hooks == null || !this.hooks.wants(stop))) stop += prefillChunk;
+            this.aheadEnd = stop;
+            return this.ahead;
         }
+
+        /// Prompt chunks before the last, each with its catch-up, admitted at once. A chunk's seed-row
+        /// writer follows the previous catch-up's readers through the carried seed rows, and the rest of
+        /// the chunk runs ahead; a catch-up finds its seed rows when its stem runs. Only the last
+        /// catch-up's conclusion comes back: the sequence concludes the quanta in admission order, and
+        /// one that failed blocks the rest.
+        private final StepPort ahead = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                started = System.nanoTime();
+                aheadRefusal = null;
+                for (int at = offset; at < aheadEnd; at += prefillChunk) {
+                    int to = at + prefillChunk;
+                    refused(runtime.admitAhead(new Quantum(
+                                    plan,
+                                    sequence,
+                                    Quantum.ExecutionKind.PREFILL,
+                                    at,
+                                    Arrays.copyOfRange(prompt, at, to),
+                                    LogitsRequirement.NONE)
+                            .seedingDraft()));
+                    // Each row pairs with the token that follows it.
+                    for (int first = 0; first < prefillChunk; first += CATCH_UP_ROWS) {
+                        int count = Math.min(CATCH_UP_ROWS, prefillChunk - first);
+                        Quantum catchUp = new Quantum(
+                                        plan,
+                                        sequence,
+                                        Quantum.ExecutionKind.DRAFT,
+                                        at + first,
+                                        Arrays.copyOfRange(prompt, at + first + 1, at + first + 1 + count),
+                                        LogitsRequirement.NONE)
+                                .withSeedRows(first, count);
+                        if (to == aheadEnd && first + count == prefillChunk) runtime.admit(catchUp, select);
+                        else refused(runtime.admitAhead(catchUp));
+                    }
+                }
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                // A refused last catch-up leaves the earlier quanta in flight: the run ends after them.
+                if (sequence.inFlight()) {
+                    drainFailure = ((Quantum) step).conclusion().failure();
+                    return drain;
+                }
+                succeeded(step);
+                if (aheadRefusal != null) throw new IllegalStateException("a prompt chunk was refused", aheadRefusal);
+                if (sequence.committedFrontier() != aheadEnd || mtpCache().length() != aheadEnd)
+                    throw new IllegalStateException("the prompt's chunks stopped short of " + aheadEnd);
+                long executed = System.nanoTime();
+                statistics.prefillNanos += executed - started;
+                if (timing != null) timing.prefillQuantum(started, executed, aheadEnd - offset);
+                end = aheadEnd;
+                if (hooks == null || !hooks.wants(end)) return prefillFrom(end);
+                checkpoint.seedRow(states().seedRows() + (long) (prefillChunk - 1) * hidden * Short.BYTES);
+                return capture;
+            }
+        };
+
+        private void refused(Throwable refusal) {
+            if (refusal == null) return;
+            if (this.aheadRefusal == null) this.aheadRefusal = refusal;
+            else if (this.aheadRefusal != refusal) this.aheadRefusal.addSuppressed(refusal);
+        }
+
+        /// Waits, one thrown frame at a time, for quanta a refused step left in flight, then fails the run.
+        private final StepPort drain = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                runtime.lake().publishOrRun(select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                if (sequence.inFlight()) return this;
+                throw new IllegalStateException("a speculative quantum was refused", drainFailure);
+            }
+        };
 
         /// Prompt: a prefill chunk that seeds drafting; its MTP catch-up follows.
         private final StepPort prefill = new StepPort() {
@@ -453,7 +545,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 case AFTER_CHUNK:
                     statistics.promptCatchUpNanos += System.nanoTime() - this.promptCatchUpStarted;
                     if (this.last) this.drafts = newDrafts;
-                    if (this.hooks == null) return prefillFrom(this.end);
+                    if (this.hooks == null || !this.hooks.wants(this.end)) return prefillFrom(this.end);
                     // Gives the prefix cache the state after the chunk, before the next chunk overwrites the seeds.
                     long seeds = states().draftSeedRows(this.end - this.offset, hidden);
                     checkpoint.seedRow(seeds + (long) (this.end - this.offset - 1) * hidden * Short.BYTES);
