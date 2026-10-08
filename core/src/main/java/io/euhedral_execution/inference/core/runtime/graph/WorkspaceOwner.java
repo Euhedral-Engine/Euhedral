@@ -6,10 +6,8 @@ import java.util.Arrays;
 /// The workspace's owner: an owner-confined record of each buffer's last accessors. Every admission runs on
 /// frames ordered on [#HASH] (their `idHash`, which they keep as their routing hash), one at a time, so each graph's
 /// first accessors of a buffer follow the last ones of the graph bound before it: concurrent quanta interleave
-/// buffer by buffer. One at a time is all the routing gives: frames published from different threads cross the
-/// lake's queues of several partitions in any order, so graphs bind in the order their admissions ran, which need
-/// not be the order they were published. Nothing depends on that order: quanta that share sequence state are never
-/// in flight together, and a decision that reads the records ([#last]) checks who wrote them.
+/// buffer by buffer. The lake's sinks keep publication order (one partition each), so admissions bind in the order
+/// they were published; a decision that reads the records ([#last]) still checks who wrote them.
 public final class WorkspaceOwner {
 
     /// The workspace owner's `idHash`. Frames built with it and left ordered run one at a time, on the owner.

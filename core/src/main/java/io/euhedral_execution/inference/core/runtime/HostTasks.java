@@ -30,8 +30,8 @@ public final class HostTasks implements HostFrames, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(HostTasks.class);
     private static final int CLOSED = Integer.MIN_VALUE;
     /// Sinks and producer partitions of a lake that host work builds for itself.
-    private static final int OWN_SINKS = 2;
-    private static final int OWN_PARTITIONS = 2;
+    private static final int OWN_SINKS = 4;
+    private static final int OWN_PARTITIONS = 1;
 
     private final FrameLake lake;
     private final InferenceLake ownedLake;

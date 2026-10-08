@@ -157,7 +157,8 @@ class QuantumTest {
         var cancelled = new Quantum(plan, cancelledSequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
         var invalid =
                 new Quantum(plan, new Sequence(907), Quantum.ExecutionKind.DECODE, 0, new int[] {Integer.MAX_VALUE});
-        List<Integer> selectedAtOutcome = new ArrayList<>();
+        // The callbacks may run on two threads at once: the test thread and the worker that completed the outcome.
+        List<Integer> selectedAtOutcome = new java.util.concurrent.CopyOnWriteArrayList<>();
         var cancelledOutcome = runtime.submit(cancelled);
         var cancelledSeen = cancelledOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
         var invalidOutcome = runtime.submit(invalid);
