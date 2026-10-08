@@ -201,10 +201,6 @@ final class Shape implements GraphShape {
         };
     }
 
-    boolean takesScratch(int stage) {
-        return takesScratch(this.specs.get(stage).kind(), this.key.rows());
-    }
-
     @Override
     public int[] workspaceBuffers(int stage) {
         return declaresWorkspace(this.specs.get(stage).kind()) ? WORKSPACE : NO_BUFFERS;

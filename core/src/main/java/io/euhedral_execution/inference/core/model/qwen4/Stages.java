@@ -22,6 +22,8 @@ final class Stages {
     static StageFrame create(StageGraph graph, int stage, Shape shape, Shape.Spec spec, int chunk) {
         StageFrame frame = of(graph, stage, shape, spec);
         ((Base) frame).chunk = chunk;
+        // Decided by the spec, not by `stage`: in a prompt graph that numbers the whole graph's stages.
+        ((Base) frame).scratch = Shape.takesScratch(spec.kind(), shape.key().rows());
         return frame;
     }
 
@@ -58,6 +60,8 @@ final class Stages {
         final int layer;
         /// The chunk of a prompt graph this stage belongs to; 0 in any other graph.
         int chunk;
+        /// Whether its shape declared it a user of the workspace's expansion scratch ([Shape#takesScratch]).
+        boolean scratch;
 
         Base(StageGraph graph, int stage, Shape shape, int layer) {
             this(graph, stage, shape, layer, false);
@@ -107,7 +111,7 @@ final class Stages {
         /// region alone.
         final void withScratch(Runnable work) {
             Workspace storage = storage();
-            if (this.shape.takesScratch(stage()) && storage.scratchAddress() != 0)
+            if (this.scratch && storage.scratchAddress() != 0)
                 gpu().withScratch(storage.scratchAddress(), storage.scratchBytes(), work);
             else work.run();
         }
