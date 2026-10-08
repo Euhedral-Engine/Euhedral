@@ -25,6 +25,7 @@ final class PrefixCopies extends AbstractFrame {
     private final Consumer<Throwable> done;
     /// Whether an earlier piece queued copies.
     private final boolean queued;
+    private boolean ran;
 
     private PrefixCopies(
             PrefixCache cache,
@@ -50,27 +51,40 @@ final class PrefixCopies extends AbstractFrame {
             done.accept(null);
             return;
         }
-        cache.lake().publish(new PrefixCopies(cache, copies, 0, toDevice, done, false));
+        cache.lake().publishOrRun(new PrefixCopies(cache, copies, 0, toDevice, done, false));
     }
 
     @Override
     public void execute() {
+        if (this.ran) return;
+        this.ran = true;
         int end = this.from;
         long bytes = 0;
         while (end < this.copies.size()
                 && (end == this.from || bytes + this.copies.get(end).bytes() <= PrefixCache.PIECE_BYTES))
             bytes += this.copies.get(end++).bytes();
+        boolean queuing = false;
         try {
             // The arena is freed by close(): a piece that runs after it must not touch it.
             if (this.cache.isClosed()) throw new IllegalStateException("the prefix cache is closed");
+            queuing = true;
             queue(this.from, end);
         } catch (RuntimeException | Error failure) {
-            retire(this.queued, failure);
+            // Copies this piece queued before the failure still write their memory: wait for them too.
+            retire(this.queued || queuing, failure);
             return;
         }
         if (end < this.copies.size())
-            this.cache.lake().publish(new PrefixCopies(this.cache, this.copies, end, this.toDevice, this.done, true));
+            this.cache
+                    .lake()
+                    .publishOrRun(new PrefixCopies(this.cache, this.copies, end, this.toDevice, this.done, true));
         else retire(true, null);
+    }
+
+    /// A piece the lattice rejected still runs, so its copies complete.
+    @Override
+    public void doFinallyWithError(Throwable rejection) {
+        execute();
     }
 
     private void queue(int start, int end) {
@@ -100,8 +114,9 @@ final class PrefixCopies extends AbstractFrame {
         try {
             stream.notifyRetired((ticket, driverThread) -> {
                 var retired = new Retired(stream, ticket, failure, this.done);
+                // A driver callback may only enqueue; an ordinary thread runs a refused completion itself.
                 if (driverThread) lake.publishFromCallback(retired);
-                else lake.publish(retired);
+                else lake.publishOrRun(retired);
             });
         } catch (RuntimeException | Error armFailure) {
             if (failure != null) armFailure.addSuppressed(failure);
@@ -126,10 +141,20 @@ final class PrefixCopies extends AbstractFrame {
             this.done = done;
         }
 
+        private boolean ran;
+
         @Override
         public void execute() {
+            if (this.ran) return;
+            this.ran = true;
             Throwable device = this.stream.confirmRetired(this.ticket);
             this.done.accept(this.failure != null ? this.failure : device);
+        }
+
+        /// A boundary the lattice rejected is still confirmed, so the copies complete.
+        @Override
+        public void doFinallyWithError(Throwable rejection) {
+            execute();
         }
     }
 }

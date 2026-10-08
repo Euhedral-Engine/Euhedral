@@ -48,9 +48,14 @@ class PrefixCacheTest {
         final List<AbstractFrame> published = new ArrayList<>();
         /// Runs before each frame (a test's interference, such as a cancellation).
         Runnable beforeEach = () -> {};
+        /// Frames the lake refuses to take (a closing lake, a full partition).
+        java.util.function.Predicate<AbstractFrame> refuse = frame -> false;
+        /// Frames the lattice rejects without running them (their worker retired).
+        java.util.function.Predicate<AbstractFrame> reject = frame -> false;
 
         @Override
         public synchronized void publish(AbstractFrame frame) {
+            if (this.refuse.test(frame)) throw new IllegalStateException("the inference lake is closed");
             this.published.add(frame);
             this.ready.add(frame);
         }
@@ -72,6 +77,10 @@ class PrefixCacheTest {
         void drive() {
             for (AbstractFrame frame; (frame = this.ready.poll()) != null; ) {
                 this.beforeEach.run();
+                if (this.reject.test(frame)) {
+                    frame.doFinallyWithError(new java.util.concurrent.RejectedExecutionException("no worker"));
+                    continue;
+                }
                 try {
                     frame.execute();
                     frame.doFinally();
@@ -119,11 +128,20 @@ class PrefixCacheTest {
 
     /// The stream the next cache opens: the GPU's own (inline) unless a test holds its boundaries.
     private GpuStream cacheStream;
+    /// Device-to-host copies left before one fails to queue; negative: none fails.
+    private int copiesBeforeFailure = -1;
 
     private final MemoryGpu gpu = new MemoryGpu() {
         @Override
         public GpuStream openStream() {
             return cacheStream != null ? cacheStream : super.openStream();
+        }
+
+        @Override
+        public void copyDeviceToHostAsync(long hostAddress, long deviceAddress, long bytes) {
+            if (copiesBeforeFailure == 0) throw new IllegalStateException("the copy could not be queued");
+            if (copiesBeforeFailure > 0) copiesBeforeFailure--;
+            super.copyDeviceToHostAsync(hostAddress, deviceAddress, bytes);
         }
     };
     private final Frames frames = new Frames();
@@ -670,5 +688,51 @@ class PrefixCacheTest {
         PrefixNode reused = capture(cache, sequence(1024, 4), cache.root(), tokens, 1024);
         assertSame(withMtp, reused, "an MTP node is a superset of a plain one");
         assertEquals(1, cache.stats().captured());
+    }
+
+    @Test
+    void aPieceTheLakeRefusesStillRunsAndTheCaptureCompletes() {
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        this.frames.refuse = PrefixCopies.class::isInstance;
+        var outcome = new Outcome();
+        cache.capture(sequence(1024, 4), cache.root(), tokens, 1024, null, outcome, outcome);
+        this.frames.drive();
+        assertTrue(outcome.continued, "the capture threw its next frame");
+        assertEquals(1024, outcome.captured.position());
+    }
+
+    @Test
+    void anOwnerFrameTheLatticeRejectsStillTellsItsCallAndThrowsItsNextFrame() {
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        capture(cache, sequence(1024, 4), cache.root(), tokens, 1024);
+        this.frames.reject = PrefixCache.Owned.class::isInstance;
+        var outcome = new Outcome();
+        cache.lookup(tokens, null, outcome, outcome);
+        this.frames.drive();
+        assertTrue(outcome.continued, "the lookup threw its next frame");
+        assertNotNull(outcome.hit);
+    }
+
+    @Test
+    void aPieceThatFailsPartwayWaitsForWhatItQueued() {
+        var stream = new ExecutionFixtures.HoldingStream();
+        this.cacheStream = stream;
+        PrefixCache cache = cache(8L << 20, 1024);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        Sequence source = sequence(1024, 4);
+        this.copiesBeforeFailure = 1;
+        var outcome = new Outcome();
+        cache.capture(source, cache.root(), tokens, 1024, null, outcome, outcome);
+        this.frames.drive();
+        assertFalse(outcome.continued, "the node's bytes are not given back under a queued copy");
+        assertEquals(1, stream.held());
+        stream.release(null);
+        this.frames.drive();
+        assertTrue(outcome.continued);
+        assertSame(cache.root(), outcome.captured);
+        assertEquals(1, cache.stats().failed());
+        assertEquals(0, cache.stats().usedBytes());
     }
 }
