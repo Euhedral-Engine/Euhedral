@@ -523,6 +523,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 throw admissionFailure;
             }
             initializeSequenceState(gpu);
+            reservePrompt();
             int hidden = this.plan.weights().config().hiddenSize();
             if (shared == null)
                 this.workspace = this.shape.hasFirstLayer()
@@ -563,6 +564,17 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         ExecutionGpu.UploadBuffer upload = this.inputUpload;
         this.inputUpload = null;
         if (upload != null && this.gpu.completionProven()) upload.close();
+    }
+
+    /// A prompt quantum reserves every row's KV pages and table now, with its stream selected, so none of its
+    /// chunks grows a table; each chunk's append then continues the previous one's.
+    private void reservePrompt() {
+        if (this.chunks.length == 1 || !this.shape.hasFirstLayer()) return;
+        var attention = (AttentionStates) this.sequence.kvCacheState();
+        LayerType[] layers = this.plan.weights().config().layerTypes();
+        for (int layer = 0; layer < layers.length; layer++)
+            if (layers[layer] == LayerType.FULL_ATTENTION)
+                attention.forLayer(layer).prepareAppend(this.startPosition, this.tokenIds.length);
     }
 
     private void initializeSequenceState(ExecutionGpu gpu) {

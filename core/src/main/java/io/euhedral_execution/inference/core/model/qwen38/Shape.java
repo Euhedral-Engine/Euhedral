@@ -105,6 +105,24 @@ public final class Shape implements GraphShape {
         return this.view;
     }
 
+    /// The sequence state stage `stage` carries from one chunk of a prompt to the next: `2L` for layer L's GDN
+    /// convolution and recurrent state, `2L + 1` for its KV rows. Layer slots include the MTP layer's.
+    @Override
+    public int[] carriedState(int stage) {
+        ExecutionPlan.Instruction instruction = this.instructions.get(stage);
+        int layer = instruction.layerIndex();
+        return switch (instruction.kind()) {
+            case GDN_CONVOLUTION, GDN_RECURRENCE -> new int[] {2 * layer};
+            case ATTENTION_KV_APPEND, ATTENTION_CAUSAL -> new int[] {2 * layer + 1};
+            default -> NO_BUFFERS;
+        };
+    }
+
+    @Override
+    public int carriedStateCount() {
+        return 2 * (this.plan.weights().config().numHiddenLayers() + 1);
+    }
+
     /// The runtime workspace's slots stage `stage` reads or writes: its instruction's buffers, through the region
     /// aliases when the view shares storage. The input record and the logits belong to the graph, not the
     /// workspace. A view without a first layer names its hidden, normalized and projection slots on every stage.

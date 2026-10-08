@@ -762,11 +762,13 @@ public final class Stages {
             state.appendSubmitted(rows(context));
         }
 
-        /// Publishes the appended rows once the quantum's device work has retired.
+        /// Publishes the appended rows once the quantum's device work has retired: a prompt's rows all at once, by
+        /// its last chunk's append.
         @Override
         protected void commit() {
-            if (this.pendingAppendState != null)
-                this.pendingAppendState.commitSubmitted(context().committedRowCount());
+            Quantum context = context();
+            if (this.pendingAppendState != null && chunk(context).last())
+                this.pendingAppendState.commitSubmitted(context.committedRowCount());
         }
 
         @Override
@@ -801,7 +803,7 @@ public final class Stages {
                             config.attentionHeadDim(),
                             // The append stage submitted these rows earlier on this quantum's stream; they are
                             // readable here but not committed until the quantum retires.
-                            state.submittedLength(),
+                            Math.toIntExact(position(context) + rows(context)),
                             position(context),
                             positionAddress(context),
                             rows(context) == 1

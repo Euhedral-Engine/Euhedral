@@ -9,8 +9,9 @@ import java.util.List;
 import java.util.Objects;
 
 /// Sequence-owned NVFP4 pages for one full-attention layer. Existing KV payloads
-/// never move. The sequence takes one state-sharing quantum at a time, which orders reservation with
-/// attention; close runs after GPU completion. Each D256 row holds 128 code and 16 scale bytes.
+/// never move. The sequence takes one state-sharing quantum at a time, and a prompt quantum's chunks append in
+/// order (their carried-state edges), which orders reservation with attention; close runs after GPU completion.
+/// Each D256 row holds 128 code and 16 scale bytes.
 ///
 /// Reservation runs inside the owning quantum with its stream selected, and allocates in stream order on
 /// it. A grown page table is uploaded from pinned staging by a copy queued on that stream, ahead of the
@@ -46,13 +47,15 @@ public final class AttentionKvState implements AutoCloseable {
         this.planePageBytes = Math.multiplyExact((long) PAGE_TOKENS * HEAD_ROW_BYTES, keyValueWidth / 256);
     }
 
-    /// Reserves contiguous append rows without publishing them to consumers.
+    /// Reserves contiguous append rows without publishing them to consumers. The rows continue the submitted
+    /// frontier: a quantum's first append starts at the committed length, and a prompt's later chunks each start
+    /// where the previous chunk's append ended. A prompt quantum reserves all its rows once, at admission, so its
+    /// chunks find them reserved.
     public void prepareAppend(long startPosition, int tokenCount) {
         ensureOpen();
-        if (startPosition != this.length || tokenCount <= 0)
-            throw new IllegalArgumentException("KV append must begin at the current sequence length");
-        if (this.submittedLength != this.length)
-            throw new IllegalStateException("a previous KV append has not been committed or discarded");
+        if (startPosition != this.submittedLength || tokenCount <= 0)
+            throw new IllegalArgumentException("KV append must continue the submitted frontier at "
+                    + this.submittedLength + ", not " + startPosition);
         int required = Math.toIntExact(Math.addExact(startPosition, tokenCount));
         if (required <= this.capacity) return;
         int count = Math.toIntExact(((long) required + PAGE_TOKENS - 1) / PAGE_TOKENS);
@@ -98,14 +101,13 @@ public final class AttentionKvState implements AutoCloseable {
         fingerprint.add(this.gpu, this.table).add(this.tableSlots).add(this.gpu, this.decodeScratch);
     }
 
-    /// Records that the writes for `tokenCount` reserved rows after the committed frontier were
-    /// submitted to the owning quantum's stream.
+    /// Records that the writes for `tokenCount` reserved rows after the submitted frontier were submitted to the
+    /// owning quantum's stream (a prompt's chunks, one after another).
     public void appendSubmitted(int tokenCount) {
         ensureOpen();
-        if (tokenCount <= 0 || (long) this.length + tokenCount > this.capacity)
+        if (tokenCount <= 0 || (long) this.submittedLength + tokenCount > this.capacity)
             throw new IllegalArgumentException("KV append exceeds reserved capacity");
-        if (this.submittedLength != this.length) throw new IllegalStateException("KV append was already submitted");
-        this.submittedLength = this.length + tokenCount;
+        this.submittedLength += tokenCount;
     }
 
     /// Rows that a later stage of the submitting quantum may read.
