@@ -95,6 +95,52 @@ class CrossGraphEdgesTest {
     }
 
     @Test
+    void aClosedGraphsMarkerThatALaterGraphAwaitsIsKeptForReuse() {
+        StageGraph p = graph(WRITE_READ);
+        StageGraph g = graph(ONE);
+        var pQuantum = new TestQuantum();
+        var gQuantum = new TestQuantum();
+        bind(p, TestShapes.of(WRITE_READ, new int[][] {{0}, {0}}, 2), pQuantum);
+        runStage(p, 0);
+        runStage(p, 1);
+        long marker = p.stage(1).marker;
+        bind(g, TestShapes.of(ONE, new int[][] {{0}}, 2), gQuantum);
+        // P retires and is closed (its shape's pool was released) before G's writer, which took P's reader's
+        // marker, submits.
+        drainExcept(g.stage(0));
+        while (this.home.armed() > 0 || this.side.armed() > 0) {
+            if (this.home.armed() > 0) this.home.retireNext(false);
+            if (this.side.armed() > 0) this.side.retireNext(false);
+            drainExcept(g.stage(0));
+        }
+        assertEquals("SUCCESS", pQuantum.outcome.join());
+        p.close();
+        assertFalse(this.home.closedMarkers.contains(marker), "a later graph may still await it");
+        runStage(g, 0);
+        RecordingStream lane = (RecordingStream) this.pool.lane(g.stage(0).lane);
+        assertTrue(lane.kernels.contains("await:" + marker), lane.kernels.toString());
+        retireAll();
+        assertEquals("SUCCESS", gQuantum.outcome.join());
+        this.pool.close();
+        assertTrue(this.home.closedMarkers.contains(marker), "the pool's close destroys the spare markers");
+    }
+
+    /// Runs every published frame but `kept`, which stays published.
+    private void drainExcept(AbstractFrame kept) {
+        for (List<AbstractFrame> frames = take(this.lake); !frames.isEmpty(); frames = take(this.lake)) {
+            boolean ranAny = false;
+            for (AbstractFrame frame : frames) {
+                if (frame == kept) this.lake.publish(frame);
+                else {
+                    StageGraphFixtures.run(frame);
+                    ranAny = true;
+                }
+            }
+            if (!ranAny) return;
+        }
+    }
+
+    @Test
     void independentBuffersDoNotWait() {
         StageGraph p = graph(WRITE_READ);
         StageGraph g = graph(ONE);
