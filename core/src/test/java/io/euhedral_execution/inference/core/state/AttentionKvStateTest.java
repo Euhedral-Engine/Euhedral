@@ -31,6 +31,39 @@ class AttentionKvStateTest {
     }
 
     @Test
+    void aPromptsChunksAppendInOrderAfterOneReservation() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            // The prompt quantum reserves every row at admission; its chunks then append in order.
+            state.prepareAppend(0, 600);
+            int tables = gpu.tableEntries.size();
+            int[][] chunks = {{0, 256}, {256, 256}, {512, 88}};
+            for (int[] chunk : chunks) {
+                state.prepareAppend(chunk[0], chunk[1]);
+                state.appendSubmitted(chunk[1]);
+            }
+            assertEquals(tables, gpu.tableEntries.size(), "no chunk uploads a table");
+            assertEquals(600, state.submittedLength());
+            assertEquals(0, state.length(), "nothing is visible before retirement");
+            // The last chunk's append publishes every row once the prompt retired.
+            state.commitSubmitted(600);
+            assertEquals(600, state.length());
+        }
+    }
+
+    @Test
+    void anAppendMustContinueTheSubmittedFrontier() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
+            state.prepareAppend(0, 512);
+            state.prepareAppend(0, 256);
+            state.appendSubmitted(256);
+            assertThrows(IllegalArgumentException.class, () -> state.prepareAppend(0, 256), "a gap or overlap");
+            assertThrows(IllegalArgumentException.class, () -> state.prepareAppend(300, 10), "a gap");
+        }
+    }
+
+    @Test
     void sixtyFourKUsesNvfp4PayloadAndHasNoDoublingPeak() {
         RecordingGpu gpu = new RecordingGpu();
         try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
@@ -71,7 +104,10 @@ class AttentionKvStateTest {
             state.appendSubmitted(2);
             assertEquals(2, state.submittedLength(), "the submitting quantum may read its own rows");
             assertEquals(0, state.length(), "submitted rows are not committed");
-            assertThrows(IllegalStateException.class, () -> state.prepareAppend(0, 1), "one pending append");
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> state.prepareAppend(0, 1),
+                    "a second append must continue the pending one, not overwrite it");
             state.commitSubmitted();
             assertEquals(2, state.length());
             assertThrows(IllegalArgumentException.class, () -> state.prepareAppend(1, 1));
