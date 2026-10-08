@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
+import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
@@ -73,7 +74,14 @@ public final class Qwen38Runtime implements ModelRuntime {
             ArtifactProfile profile,
             LatticeTerminal lattice) {
         ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging());
-        Execution execution = new Execution(lattice, plan, gpu);
+        // The workspace is sized at load for the widest quantum: the prefill chunk, unless a diagnostic widens it.
+        Execution execution = new Execution(
+                lattice,
+                plan,
+                gpu,
+                EuhedralInferenceRuntime.laneCount(),
+                EuhedralInferenceRuntime.CAPTURE_GRAPHS,
+                Integer.getInteger("euhedral.workspace.rows", InferenceConfig.PREFILL_CHUNK_TOKENS));
         var identity = identity(config.artifactPath(), artifact, model);
         // Last, so nothing that can fail follows the pinned arena.
         PrefixCache prefixCache = openPrefixCache(config, gpu, plan, execution);
