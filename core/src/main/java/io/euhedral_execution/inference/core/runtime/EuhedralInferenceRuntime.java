@@ -166,7 +166,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
     /// One admission run on the workspace's owner: its `idHash` is [WorkspaceOwner#HASH] and it stays ordered, so
     /// admissions run one at a time. Not necessarily in the order they were published: the lake's queues are
-    /// partitioned, so only frames one admission publishes after it ran are ordered behind it.
+    /// partitioned ([#LAKE_PARTITIONS], more than one by default), so only frames one admission publishes after it ran
+    /// are ordered behind it.
     static final class Admission extends AbstractFrame {
         private final Runnable admission;
 
