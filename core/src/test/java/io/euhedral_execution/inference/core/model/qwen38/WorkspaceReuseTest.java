@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.generation.LogitsSampler;
+import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.util.ArrayList;
@@ -18,9 +19,11 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.Test;
 
-/// Workspace storage belongs to a reusable graph: consecutive quanta on the graph bind the same device
-/// allocations, and storage passes to another quantum only after the one using it retired.
+/// One workspace per runtime, sized at load: every quantum binds the same device buffers, concurrent quanta share
+/// them in the order their edges give, and only a graph's input record and logits are its own.
 class WorkspaceReuseTest {
+
+    private static final int MAX_ROWS = 8;
 
     private static ExecutionPlan slicePlan() {
         return new ExecutionPlan(
@@ -29,10 +32,17 @@ class WorkspaceReuseTest {
                 List.of(ExecutionFixtures.q3("projection", 64, 201)));
     }
 
+    private static Execution runtime(ExecutionPlan plan, ExecutionGpu gpu) {
+        return new Execution(ExecutionFixtures.inlineLattice(), plan, gpu, 2, false, MAX_ROWS);
+    }
+
     /// Token IDs padded to 8 bytes, then the 64-bit start position.
     private static long inputRecordBytes(int rows) {
         return ((long) rows * Integer.BYTES + 7) / 8 * 8 + Long.BYTES;
     }
+
+    /// Hidden, normalized and projection buffers of `MAX_ROWS` 64-wide BF16 rows.
+    private static final long WORKSPACE_BYTES = 3L * MAX_ROWS * 64 * Short.BYTES;
 
     private static List<Long> bound(Quantum context) {
         var workspace = context.workspace();
@@ -44,28 +54,29 @@ class WorkspaceReuseTest {
     void consecutiveQuantaBindTheSameStorageWithoutAllocatingOrFreeing() throws Exception {
         var plan = slicePlan();
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = ExecutionFixtures.runtime(plan, gpu);
+        var runtime = runtime(plan, gpu);
+        assertEquals(3, gpu.allocations.size(), "the workspace allocated its buffers at load");
         List<List<Long>> addresses = new ArrayList<>();
-        long retained = -1;
         for (int quantum = 0; quantum < 4; quantum++) {
             var context =
                     new Quantum(plan, new Sequence(700 + quantum), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
             var outcome = runtime.submit(context, done -> addresses.add(bound(done)));
             assertEquals(Quantum.Status.SUCCESS, outcome.join().status());
-            if (quantum == 0) retained = runtime.retainedWorkspaceBytes();
-            assertEquals(retained, runtime.retainedWorkspaceBytes(), "retained storage must not grow per quantum");
+            assertEquals(
+                    WORKSPACE_BYTES + inputRecordBytes(1),
+                    runtime.retainedWorkspaceBytes(),
+                    "retained storage must not grow per quantum");
         }
-        assertEquals(1, new HashSet<>(addresses).size(), "every quantum bound the first quantum's buffers");
-        assertEquals(4, gpu.allocations.size(), "hidden, normalized, projection and input record, once");
+        assertEquals(1, new HashSet<>(addresses).size(), "every quantum bound the workspace's buffers");
+        assertEquals(4, gpu.allocations.size(), "the workspace's three buffers, then one input record");
         assertTrue(gpu.frees.isEmpty(), "retirement released bindings, not device storage");
-        assertEquals((3L * 64 * Short.BYTES) + inputRecordBytes(1), retained);
         runtime.close();
         ExecutionFixtures.assertEachAllocationFreedOnce(gpu);
         assertEquals(0, runtime.retainedWorkspaceBytes());
     }
 
     @Test
-    void storageOfAnUnretiredQuantumIsNeverLentAndConcurrentQuantaNeverShareIt() {
+    void concurrentQuantaShareTheWorkspaceInTheOrderTheirEdgesGive() {
         var plan = slicePlan();
         var stream = new ExecutionFixtures.HoldingStream();
         var gpu = new ExecutionFixtures.RecordingGpu() {
@@ -75,17 +86,16 @@ class WorkspaceReuseTest {
             }
         };
         var lattice = new ExecutionFixtures.ManualLattice();
-        var runtime = new Execution(lattice, plan, gpu);
+        var runtime = new Execution(lattice, plan, gpu, 2, false, MAX_ROWS);
         List<List<Long>> first = new ArrayList<>();
         List<List<Long>> second = new ArrayList<>();
-        List<List<Long>> third = new ArrayList<>();
 
         var held = submit(runtime, plan, 710, first);
         lattice.drive();
         var concurrent = submit(runtime, plan, 711, second);
         lattice.drive();
         assertFalse(held.isDone(), "the first quantum's device work has not retired");
-        assertEquals(2, stream.held());
+        assertEquals(2, stream.held(), "the second ran behind the first's last accessors, before it retired");
         assertTrue(gpu.frees.isEmpty());
 
         stream.release(null);
@@ -94,48 +104,30 @@ class WorkspaceReuseTest {
         lattice.drive();
         assertEquals(Quantum.Status.SUCCESS, held.join().status());
         assertEquals(Quantum.Status.SUCCESS, concurrent.join().status());
-        assertTrue(
-                Collections.disjoint(first.getFirst(), second.getFirst()),
-                "a quantum admitted while another was in flight got storage of its own");
-
-        int allocated = gpu.allocations.size();
-        var reused = submit(runtime, plan, 712, third);
-        lattice.drive();
-        stream.release(null);
-        lattice.drive();
-        assertEquals(Quantum.Status.SUCCESS, reused.join().status());
-        assertEquals(allocated, gpu.allocations.size(), "a retired graph's storage served the next quantum");
-        assertTrue(third.getFirst().equals(first.getFirst()) || third.getFirst().equals(second.getFirst()));
+        assertEquals(first.getFirst(), second.getFirst(), "one copy of each buffer");
         runtime.close();
         ExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }
 
     @Test
-    void largerQuantaGrowOnlyUndersizedSlotsAndSmallerQuantaReuseThem() {
+    void quantaOfAnySizeUpToTheWorkspaceBindTheSameBuffersAndNothingGrows() {
         var plan = slicePlan();
         var gpu = new ExecutionFixtures.RecordingGpu();
-        var runtime = ExecutionFixtures.runtime(plan, gpu);
+        var runtime = runtime(plan, gpu);
         List<List<Long>> addresses = new ArrayList<>();
-        long[] retained = new long[3];
-        int[] rows = {2, 5, 3};
+        int[] rows = {2, MAX_ROWS, 3};
         for (int index = 0; index < rows.length; index++) {
             var context = new Quantum(
                     plan, new Sequence(720 + index), Quantum.ExecutionKind.PREFILL, 0, new int[rows[index]]);
             var outcome = runtime.submit(context, done -> addresses.add(bound(done)));
             assertEquals(Quantum.Status.SUCCESS, outcome.join().status());
-            retained[index] = runtime.retainedWorkspaceBytes();
         }
-        long perRow = 3L * 64 * Short.BYTES;
-        assertEquals(2 * perRow + inputRecordBytes(2), retained[0]);
+        assertEquals(1, new HashSet<>(addresses).size());
         assertEquals(
-                5 * perRow + inputRecordBytes(5), retained[1], "the five-row quantum replaced each undersized slot");
-        assertEquals(
-                5 * perRow + inputRecordBytes(5),
-                retained[2],
-                "a smaller quantum neither grows nor shrinks the storage");
-        assertEquals(gpu.allocations.subList(0, 4), gpu.frees, "only the outgrown two-row buffers were freed");
-        assertEquals(addresses.get(1), addresses.get(2));
-        assertTrue(Collections.disjoint(addresses.get(0), addresses.get(1)));
+                WORKSPACE_BYTES + inputRecordBytes(MAX_ROWS),
+                runtime.retainedWorkspaceBytes(),
+                "only the graph's input record follows the largest quantum");
+        assertFalse(gpu.frees.containsAll(gpu.allocations.subList(0, 3)), "the workspace was never freed");
         runtime.close();
         ExecutionFixtures.assertEachAllocationFreedOnce(gpu);
     }

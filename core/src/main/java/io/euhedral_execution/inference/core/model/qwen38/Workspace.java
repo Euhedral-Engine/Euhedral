@@ -17,13 +17,17 @@ import java.util.Objects;
 /// A workspace constructed from a [GpuMemory] owns private storage and frees it on close.
 public final class Workspace implements AutoCloseable {
 
-    private static final int BUFFER_SLOTS = ExecutionPlan.Buffer.values().length;
-    private static final int TOKEN_IDS_SLOT = BUFFER_SLOTS;
-    private static final int HIDDEN_SLOT = BUFFER_SLOTS + 1;
-    private static final int NORMALIZED_SLOT = BUFFER_SLOTS + 2;
-    private static final int PROJECTION_SLOTS = BUFFER_SLOTS + 3;
+    static final int BUFFER_SLOTS = ExecutionPlan.Buffer.values().length;
+    static final int TOKEN_IDS_SLOT = BUFFER_SLOTS;
+    static final int HIDDEN_SLOT = BUFFER_SLOTS + 1;
+    static final int NORMALIZED_SLOT = BUFFER_SLOTS + 2;
+    static final int PROJECTION_SLOTS = BUFFER_SLOTS + 3;
+    private static final int LOGITS_SLOT = ExecutionPlan.Buffer.LOGITS.ordinal();
 
     private final WorkspaceStorage storage;
+    /// The runtime's workspace, sized at load: every slot but the input record and the logits; null when the
+    /// quantum's graph storage holds every slot (a workspace that owns its storage).
+    private SharedWorkspace shared;
     private final boolean ownsStorage;
     private final int tokenCount;
     private final int hiddenSize;
@@ -174,6 +178,76 @@ public final class Workspace implements AutoCloseable {
         this.storageByteSizes[from] = 0;
     }
 
+    /// A first-layer workspace whose buffers are the runtime's `shared` ones, sized at load, except the input record
+    /// and the logits, which stay in the graph's `storage`.
+    static Workspace bound(
+            SharedWorkspace shared,
+            WorkspaceStorage storage,
+            int tokenCount,
+            Shape shape,
+            LogitsRequirement logitsRequirement) {
+        Workspace workspace = new Workspace(storage, tokenCount, shape, logitsRequirement);
+        workspace.shared = Objects.requireNonNull(shared, "shared");
+        return workspace;
+    }
+
+    /// As [#bound] for a view without a first layer.
+    static Workspace bound(
+            SharedWorkspace shared,
+            WorkspaceStorage storage,
+            int tokenCount,
+            int hiddenSize,
+            List<Integer> projectionWidths) {
+        Workspace workspace = new Workspace(storage, tokenCount, hiddenSize, projectionWidths);
+        workspace.shared = Objects.requireNonNull(shared, "shared");
+        return workspace;
+    }
+
+    /// The bytes each slot needs for `rows` rows of `shape`, every logits row included: what a workspace sized at
+    /// load for `rows` holds.
+    static long[] slotBytes(Shape shape, int rows, int slots) {
+        long[] bytes = new long[slots];
+        Workspace sizing = shape.hasFirstLayer()
+                ? new Workspace(SIZING, rows, shape, LogitsRequirement.ALL_TOKENS)
+                : new Workspace(SIZING, rows, shape.plan().weights().config().hiddenSize(), shape.projectionWidths());
+        if (shape.hasFirstLayer()) {
+            System.arraycopy(sizing.storageByteSizes, 0, bytes, 0, sizing.storageByteSizes.length);
+        } else {
+            bytes[HIDDEN_SLOT] = sizing.byteSize;
+            if (sizing.projectionByteSizes.length != 0) bytes[NORMALIZED_SLOT] = sizing.byteSize;
+            for (int index = 0; index < sizing.projectionByteSizes.length; index++)
+                bytes[PROJECTION_SLOTS + index] = sizing.projectionByteSizes[index];
+        }
+        bytes[TOKEN_IDS_SLOT] = 0;
+        bytes[LOGITS_SLOT] = 0;
+        return bytes;
+    }
+
+    /// Storage that only sizes: it is never asked for memory.
+    private static final WorkspaceStorage SIZING = new WorkspaceStorage(new SizingMemory());
+
+    private static final class SizingMemory implements GpuMemory {
+        @Override
+        public long allocate(long byteSize) {
+            throw new IllegalStateException("sizing storage allocates nothing");
+        }
+
+        @Override
+        public void free(long address) {}
+
+        @Override
+        public void copyHostToDevice(long destination, java.lang.foreign.MemorySegment source, long byteSize) {}
+
+        @Override
+        public void copyDeviceToHost(java.lang.foreign.MemorySegment destination, long source, long byteSize) {}
+    }
+
+    private long acquire(int slot, long bytes) {
+        if (this.shared != null && slot != TOKEN_IDS_SLOT && slot != LOGITS_SLOT)
+            return this.shared.acquire(slot, bytes);
+        return this.storage.acquire(slot, bytes);
+    }
+
     /// Acquires this submission's buffers once it owns the workspace. Storage that a partial failure
     /// already acquired stays with its storage owner, which reclaims it.
     void allocateBuffers() {
@@ -185,19 +259,18 @@ public final class Workspace implements AutoCloseable {
         if (hasFirstLayerBuffers()) {
             for (int index = 0; index < this.firstLayerByteSizes.length; index++) {
                 if (this.storageByteSizes[index] != 0) {
-                    this.firstLayerAddresses[index] = this.storage.acquire(index, this.storageByteSizes[index]);
+                    this.firstLayerAddresses[index] = acquire(index, this.storageByteSizes[index]);
                 }
             }
             this.hiddenStateAddress = this.firstLayerAddresses[ExecutionPlan.Buffer.HIDDEN_STATE.ordinal()];
             this.normalizedAddress = this.firstLayerAddresses[ExecutionPlan.Buffer.INPUT_NORMALIZED.ordinal()];
             return;
         }
-        this.hiddenStateAddress = this.storage.acquire(HIDDEN_SLOT, this.byteSize);
+        this.hiddenStateAddress = acquire(HIDDEN_SLOT, this.byteSize);
         if (this.projectionByteSizes.length != 0) {
-            this.normalizedAddress = this.storage.acquire(NORMALIZED_SLOT, this.byteSize);
+            this.normalizedAddress = acquire(NORMALIZED_SLOT, this.byteSize);
             for (int index = 0; index < this.projectionByteSizes.length; index++) {
-                this.projectionAddresses[index] =
-                        this.storage.acquire(PROJECTION_SLOTS + index, this.projectionByteSizes[index]);
+                this.projectionAddresses[index] = acquire(PROJECTION_SLOTS + index, this.projectionByteSizes[index]);
             }
         }
     }
@@ -215,6 +288,7 @@ public final class Workspace implements AutoCloseable {
 
     void fingerprint(CaptureFingerprint fingerprint) {
         this.storage.fingerprint(fingerprint);
+        if (this.shared != null) this.shared.fingerprint(fingerprint);
     }
 
     /// The input record's device address: its token IDs.

@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.prefix.PrefixFrames;
@@ -45,6 +46,8 @@ public final class Execution implements AutoCloseable {
     /// written only under `stagingHold`.
     private boolean ringPreloaded;
     private final Object closeLock = new Object();
+    /// The runtime's one workspace, sized at load.
+    private final SharedWorkspace shared;
     private boolean closed;
 
     /// An execution whose lane pool has one lane per available processor.
@@ -61,6 +64,17 @@ public final class Execution implements AutoCloseable {
     /// A plan that stages weights gets one lane fewer for compute and a lane for its transfers.
     public Execution(
             LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu, int laneCount, boolean captureGraphs) {
+        this(lattice, plan, gpu, laneCount, captureGraphs, InferenceConfig.PREFILL_CHUNK_TOKENS);
+    }
+
+    /// As above, with one workspace sized at load for quanta of up to `maxRows` rows.
+    public Execution(
+            LatticeTerminal lattice,
+            ExecutionPlan plan,
+            ExecutionGpu gpu,
+            int laneCount,
+            boolean captureGraphs,
+            int maxRows) {
         this.plan = Objects.requireNonNull(plan, "plan");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
@@ -69,8 +83,17 @@ public final class Execution implements AutoCloseable {
         int compute = transfers ? Math.min(laneCount, LanePool.MAX_LANES - 1) : laneCount;
         this.lake = EuhedralInferenceRuntime.newLake(lattice);
         this.hostTasks = new HostTasks(this.lake);
+        this.shared = new SharedWorkspace(gpu, this.plan, maxRows);
         this.runtime = new EuhedralInferenceRuntime(
-                this.lake, gpu, new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs));
+                this.lake,
+                gpu,
+                new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs),
+                SharedWorkspace.bufferCount(this.plan));
+    }
+
+    /// The rows the workspace holds: the largest quantum it admits.
+    public int maxRows() {
+        return this.shared.maxRows();
     }
 
     /// Executes quanta and waits for all of their outcomes.
@@ -186,7 +209,8 @@ public final class Execution implements AutoCloseable {
                     view,
                     context,
                     ordered ? stream -> stream.await(this.runtime.transferMarker()) : null,
-                    (stream, storage) -> context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage));
+                    (stream, storage) ->
+                            context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage, this.shared));
         } catch (RuntimeException | Error refused) {
             LOG.debug("a quantum was refused; its continuation carries the failure", refused);
         }
@@ -240,7 +264,7 @@ public final class Execution implements AutoCloseable {
 
     /// Device bytes the graphs' reusable workspace storage retains between quanta.
     public long retainedWorkspaceBytes() {
-        return this.runtime.retainedWorkspaceBytes();
+        return this.runtime.retainedWorkspaceBytes() + this.shared.retainedBytes();
     }
 
     /// Quanta replayed from captured CUDA graphs.
@@ -284,6 +308,15 @@ public final class Execution implements AutoCloseable {
         } catch (RuntimeException completionFailure) {
             if (failure == null) failure = completionFailure;
             else failure.addSuppressed(completionFailure);
+        }
+        // Every quantum retired: the workspace is idle. A poisoned GPU keeps it, as it keeps the graphs' storage.
+        if (this.gpu.completionProven()) {
+            try {
+                this.shared.close();
+            } catch (RuntimeException freeFailure) {
+                if (failure == null) failure = freeFailure;
+                else failure.addSuppressed(freeFailure);
+            }
         }
         if (failure != null) throw failure;
     }

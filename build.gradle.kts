@@ -97,6 +97,7 @@ subprojects {
             providers.gradleProperty("euhedral.identity.artifacts").orNull?.let { systemProperty("euhedral.identity.artifacts", it) }
             providers.gradleProperty("euhedral.shapes.record").orNull?.let { systemProperty("euhedral.shapes.record", it) }
             providers.gradleProperty("euhedral.shapes.artifacts").orNull?.let { systemProperty("euhedral.shapes.artifacts", it) }
+            providers.gradleProperty("euhedral.twosessions.artifact").orNull?.let { systemProperty("euhedral.twosessions.artifact", it) }
             // Teacher-forced relaxed-numerics drift: decode length, prefill prefix, an optional per-step CSV
             // report, and `exact` to run the oracle on both sequences.
             for (name in listOf("steps", "prefix", "report", "candidate"))
