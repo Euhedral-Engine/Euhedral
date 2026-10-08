@@ -40,6 +40,7 @@ public final class ShapeDescription {
             add(text, seen, "draft", plan, plan.forExecution(Quantum.ExecutionKind.DRAFT, 1));
         if (plan.draftsWithDFlash2())
             add(text, seen, "draft-context", plan, plan.forExecution(Quantum.ExecutionKind.DRAFT_CONTEXT, 1));
+        if (plan.drafts()) add(text, seen, "draft-catch-up", plan, plan.forExecution(Quantum.ExecutionKind.DRAFT, 16));
         return text.toString();
     }
 

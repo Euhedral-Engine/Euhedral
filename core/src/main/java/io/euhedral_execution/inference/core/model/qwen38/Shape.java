@@ -41,6 +41,9 @@ public final class Shape implements GraphShape {
         SMALL_PREFILL,
         REGION_PREFILL,
         MTP_DRAFT,
+        /// The MTP draft's work over more than eight rows (a catch-up over a chunk's or a verification's rows), whose
+        /// quantized linears expand into the scratch.
+        MTP_CATCHUP,
         DFLASH_BLOCK,
         DFLASH_CONTEXT
     }

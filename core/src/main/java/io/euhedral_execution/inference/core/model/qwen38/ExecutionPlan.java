@@ -284,6 +284,8 @@ public final class ExecutionPlan {
     private final Shape regionPrefill;
     /// The MTP draft view; null without loaded MTP weights and draft head.
     private final Shape mtpDraft;
+    /// The MTP draft's work for catch-ups of more than [#DECODE_MAX_ROWS] rows; null without the draft view.
+    private final Shape mtpCatchUp;
     /// The DFlash2 views, null without the loaded drafter: its block (DRAFT) and its context rows (DRAFT_CONTEXT).
     private final Shape dflashBlock;
     private final Shape dflashContext;
@@ -398,7 +400,7 @@ public final class ExecutionPlan {
         // Decode runs its own instance of the small topology: rounded residual add + RMSNorm and the
         // joint GDN A/B projection + control are single region launches, as in short prefill quanta.
         if (kind == Quantum.ExecutionKind.DRAFT) {
-            if (family.mtpDraft != null) return family.mtpDraft;
+            if (family.mtpDraft != null) return rows > DECODE_MAX_ROWS ? family.mtpCatchUp : family.mtpDraft;
             if (family.dflashBlock != null) return family.dflashBlock;
             throw new IllegalStateException("the model has no loaded drafter");
         }
@@ -601,6 +603,7 @@ public final class ExecutionPlan {
             this.prefetchedSlots = 0;
             this.regionPrefill = null;
             this.mtpDraft = null;
+            this.mtpCatchUp = null;
             this.dflashBlock = null;
             this.dflashContext = null;
             return;
@@ -612,6 +615,9 @@ public final class ExecutionPlan {
                         && weights.runtimeObjects().containsKey(DRAFT_HEAD)
                 ? new Shape(Shape.View.MTP_DRAFT, this, staged(mtpDraft(weights), staging), false, false)
                 : null;
+        this.mtpCatchUp = this.mtpDraft == null
+                ? null
+                : new Shape(Shape.View.MTP_CATCHUP, this, staged(mtpDraft(weights), staging), false, false);
         DFlash2Weights drafter = weights.dflash2();
         // A DFlash2 block leaves the host-backed transfer lane idle for milliseconds before every verification, so it
         // copies the decode view's first ring slots, and a verification that finds them loaded skips their transfers.
@@ -1036,6 +1042,7 @@ public final class ExecutionPlan {
             this.verifyPreloaded,
             this.regionPrefill,
             this.mtpDraft,
+            this.mtpCatchUp,
             this.dflashBlock,
             this.dflashContext
         }) {
