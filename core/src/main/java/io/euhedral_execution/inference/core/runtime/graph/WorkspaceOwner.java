@@ -31,6 +31,14 @@ public final class WorkspaceOwner {
     /// Starts `graph` for `quantum` behind the last accessors of every buffer `shape` touches, then records the
     /// graph's own exits. Owner frames only.
     public void bind(StageGraph graph, GraphShape shape, WorkspaceUse use, StageQuantum quantum) {
+        bind(graph, shape, use, null, quantum);
+    }
+
+    /// As above, also behind the last users of each carried-state key `carried` names in the graphs of `quantum`'s
+    /// sequence ([StageQuantum#sequenceOwner]), whose records then take the graph's own exits.
+    public void bind(StageGraph graph, GraphShape shape, WorkspaceUse use, CarriedState carried, StageQuantum quantum) {
+        SequenceOwner sequence = carried == null ? null : quantum.sequenceOwner();
+        int keys = sequence == null ? 0 : shape.carriedStateCount();
         int count = 0;
         for (int b = 0; b < this.last.length; b++) {
             Last previous = this.last[b];
@@ -39,6 +47,18 @@ public final class WorkspaceOwner {
                 StageFrame target = graph.stage(entry);
                 for (StageFrame exit : previous.exits()) {
                     // The graph's own previous binding: it was recycled only after its device work retired.
+                    if (exit.graph() == graph) continue;
+                    if (count == this.edges.length) this.edges = Arrays.copyOf(this.edges, count * 2);
+                    this.edges[count++] = new ExternalEdge(exit, target);
+                }
+            }
+        }
+        for (int key = 0; key < keys; key++) {
+            StageFrame[] previous = sequence.last(key);
+            if (previous == null) continue;
+            for (int entry : carried.entries(key)) {
+                StageFrame target = graph.stage(entry);
+                for (StageFrame exit : previous) {
                     if (exit.graph() == graph) continue;
                     if (count == this.edges.length) this.edges = Arrays.copyOf(this.edges, count * 2);
                     this.edges[count++] = new ExternalEdge(exit, target);
@@ -56,6 +76,13 @@ public final class WorkspaceOwner {
             StageFrame[] frames = new StageFrame[exits.length];
             for (int i = 0; i < exits.length; i++) frames[i] = graph.stage(exits[i]);
             this.last[b] = new Last(shape, quantum, frames);
+        }
+        for (int key = 0; key < keys; key++) {
+            int[] exits = carried.exits(key);
+            if (exits.length == 0) continue;
+            StageFrame[] frames = new StageFrame[exits.length];
+            for (int i = 0; i < exits.length; i++) frames[i] = graph.stage(exits[i]);
+            sequence.record(key, frames);
         }
     }
 }

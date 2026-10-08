@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Prop
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeAcceptance;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
+import io.euhedral_execution.inference.core.runtime.graph.SequenceOwner;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
@@ -535,9 +536,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 }
             }
             beforeClaim.run();
-            // The sequence takes several quanta in flight, but the state it shares with them does not yet: GDN
-            // state updated in place, the KV cache's one append, the decode scratch, the host row and the proposal.
-            // A quantum that touches it is refused while other work on the sequence is in flight.
+            // The sequence takes several quanta in flight, but not the state no edge orders: the draft's
+            // frontier and seed rows, the host row and the proposal. A quantum that touches it is refused while
+            // other work on the sequence is in flight.
             if (sharesSequenceState() && this.sequence.inFlight())
                 throw new IllegalStateException(
                         "another quantum of the sequence is in flight, and its state takes one quantum at a time");
@@ -685,10 +686,17 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
     }
 
-    /// Whether the quantum touches state its sequence shares with every quantum: its layers' GDN and KV state, the
-    /// draft's state, the session's host row, or a proposal.
+    /// Whether the quantum touches per-sequence state no edge orders: the draft's frontier and seed rows, the
+    /// session's host row, or a proposal. Its layers' GDN and KV state are carried state, which the edges between
+    /// the sequence's graphs order ([SequenceOwner]), so a quantum that touches only those may be admitted while
+    /// another of the sequence is in flight.
     private boolean sharesSequenceState() {
-        return this.shape.hasFirstLayer() || drafting() || this.hostLogits != null || this.proposal != null;
+        return drafting() || this.seedsDraft || this.hostLogits != null || this.proposal != null;
+    }
+
+    @Override
+    public SequenceOwner sequenceOwner() {
+        return this.sequence.owner();
     }
 
     /// A quantum is cancelled through its sequence.

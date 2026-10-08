@@ -123,6 +123,16 @@ public final class AttentionKvState implements AutoCloseable {
         releaseRetired();
     }
 
+    /// Publishes the `rows` rows a quantum appended, every one of them, once its device work retired. Rows a later
+    /// quantum of the sequence appended meanwhile stay submitted.
+    public void commitAppended(int rows) {
+        ensureOpen();
+        if (rows < 0 || (long) this.length + rows > this.submittedLength)
+            throw new IllegalArgumentException("committed rows exceed the submitted frontier");
+        this.length += rows;
+        releaseRetired();
+    }
+
     /// Publishes only the first `rows` submitted rows (a speculative verification's accepted prefix);
     /// the rest stay beyond the committed frontier, where the next append overwrites them.
     public void commitSubmitted(int rows) {

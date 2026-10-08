@@ -5,6 +5,7 @@ import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.data_structures.queues.MpmcQueue;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.runtime.graph.CarriedState;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
@@ -244,7 +245,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             if (proceeds[0]) {
                 // From here the graph owns the quantum; its retirement recycles the graph.
                 started = true;
-                this.owner.bind(graph, shape, pool.use, quantum);
+                this.owner.bind(graph, shape, pool.use, pool.carried, quantum);
             }
         } finally {
             if (!started) {
@@ -439,6 +440,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         private final GraphShape view;
         /// Each buffer's first and last accessors in this shape, computed once.
         final WorkspaceUse use;
+        /// Each carried-state key's first and last users in this shape, computed once.
+        final CarriedState carried;
         private final MpmcQueue<PooledGraph> idle = new MpmcQueue<>(16, 2);
         private final ConcurrentLinkedQueue<PooledGraph> built = new ConcurrentLinkedQueue<>();
         /// Set once the runtime stops pooling the shape ([EuhedralInferenceRuntime#release]).
@@ -447,6 +450,7 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         private GraphPool(GraphShape view) {
             this.view = view;
             this.use = WorkspaceUse.of(view);
+            this.carried = CarriedState.of(view);
         }
 
         PooledGraph idleOrNew() {

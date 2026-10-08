@@ -205,10 +205,17 @@ final class StageGraphFixtures {
         volatile boolean overlap;
         volatile Runnable onOutcome;
         volatile Object captureKey;
+        /// The sequence whose carried state the quantum's graph shares with its other graphs; null for none.
+        volatile SequenceOwner sequence;
 
         @Override
         public Object captureKey() {
             return this.captureKey;
+        }
+
+        @Override
+        public SequenceOwner sequenceOwner() {
+            return this.sequence;
         }
 
         @Override

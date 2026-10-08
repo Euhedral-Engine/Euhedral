@@ -791,17 +791,21 @@ public final class Stages {
         @Override
         protected void commit() {
             Quantum context = context();
-            if (this.pendingAppendState != null && chunk(context).last())
-                this.pendingAppendState.commitSubmitted(context.committedRowCount());
+            if (this.pendingAppendState == null || !chunk(context).last()) return;
+            int committed = context.committedRowCount();
+            // Every row the quantum appended: a later quantum's rows stay submitted. Fewer (a verification's
+            // accepted prefix): the rest are dropped, and no later quantum is in flight behind a verification.
+            if (committed == context.inputTokenCount()) this.pendingAppendState.commitAppended(committed);
+            else this.pendingAppendState.commitSubmitted(committed);
         }
 
         @Override
         protected void releaseTemporary(Quantum context) {
             AttentionKvState state = this.pendingAppendState;
             this.pendingAppendState = null;
-            // A committed frontier is unaffected; an uncommitted one never becomes visible. A prompt's earlier
-            // chunks leave a committing retirement's rows to the last chunk's commit.
-            if (state != null && (chunk(context).last() || !this.retirementCommitted)) state.discardSubmitted();
+            // An uncommitted append never becomes visible; a committed one was published by the commit, and a later
+            // quantum's submitted rows must stay.
+            if (state != null && !this.retirementCommitted) state.discardSubmitted();
         }
     }
 
