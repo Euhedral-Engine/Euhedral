@@ -76,6 +76,16 @@ public final class Stages {
         @Override
         protected final void submit() {
             Quantum context = context();
+            // A stage the shape declared as a scratch user takes the workspace's one scratch buffer, which the
+            // shape's edges (and the workspace's, across graphs) give it alone.
+            long scratch = context.shape().scratchUse(stage()) != null
+                    ? context.workspace().scratchAddress()
+                    : 0;
+            if (scratch != 0) this.gpu.withScratch(scratch, context.workspace().scratchBytes(), () -> run(context));
+            else run(context);
+        }
+
+        private void run(Quantum context) {
             if (context.kind() != Quantum.ExecutionKind.VERIFY) {
                 perform(context, this.instruction);
                 return;

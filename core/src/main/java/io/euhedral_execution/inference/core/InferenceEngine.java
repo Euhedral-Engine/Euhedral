@@ -393,7 +393,7 @@ public final class InferenceEngine implements AutoCloseable {
     /// sessions or tokens, and is released when the engine closes.
     public synchronized long retainedWorkspaceBytes() {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
-        return this.model.retainedWorkspaceBytes() + this.model.gpu().retainedScratchBytes();
+        return this.model.retainedWorkspaceBytes();
     }
 
     /// Stops admission, closes sessions, stops the model, closes the lattice, then frees the model and the GPU.

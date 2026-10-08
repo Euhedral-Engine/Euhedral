@@ -294,11 +294,19 @@ public final class ExecutionPlan {
     /// last writer, and each writer after the last writer and every reader since it. Edges the
     /// dependencies already imply transitively are not added.
     static int[][] withStorageHazards(List<Instruction> instructions, int[][] dependencies, boolean reuseStorage) {
+        return withStorageHazards(instructions, dependencies, reuseStorage, new boolean[instructions.size()]);
+    }
+
+    /// As above, with the expansion scratch as one more storage, which each of the `scratch` stages writes: they
+    /// take it one after another.
+    static int[][] withStorageHazards(
+            List<Instruction> instructions, int[][] dependencies, boolean reuseStorage, boolean[] scratch) {
         int count = instructions.size();
         Map<Buffer, Buffer> owners = new EnumMap<>(Buffer.class);
         if (reuseStorage)
             for (Map.Entry<Buffer, Buffer> pair : REGION_STORAGE) owners.put(pair.getKey(), pair.getValue());
-        int storages = Buffer.values().length;
+        int scratchStorage = Buffer.values().length;
+        int storages = scratchStorage + 1;
         int[] lastWriter = new int[storages];
         java.util.Arrays.fill(lastWriter, -1);
         List<List<Integer>> readers = new ArrayList<>(storages);
@@ -324,6 +332,7 @@ public final class ExecutionPlan {
                 if (lastWriter[storage] >= 0) required.add(lastWriter[storage]);
                 required.addAll(readers.get(storage));
             }
+            if (scratch[stage] && lastWriter[scratchStorage] >= 0) required.add(lastWriter[scratchStorage]);
             // Latest first: an earlier requirement is often already an ancestor of a later one.
             for (int producer : required.descendingSet()) {
                 if (producer == stage || reach.get(producer)) continue;
@@ -340,6 +349,7 @@ public final class ExecutionPlan {
                 lastWriter[storage] = stage;
                 readers.get(storage).clear();
             }
+            if (scratch[stage]) lastWriter[scratchStorage] = stage;
         }
         return ordered;
     }

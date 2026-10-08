@@ -151,7 +151,6 @@ class CompactCudaExecutionIntegrationTest {
                 failure = freeAll(gpu, ownedModelAddresses, failure);
             }
 
-            gpu.releaseQ3Scratch(); // the shared scratch of the quantized-activation routes outlives a slice
             long allocatedAfter = gpu.allocatedBytes();
             if (allocatedAfter != allocatedBefore) {
                 IllegalStateException restoreFailure = new IllegalStateException(

@@ -468,6 +468,19 @@ public abstract class ExecutionGpu implements GpuMemory {
 
     /// Device bytes of the shared scratch that prefill and verification routes keep allocated between
     /// launches (expanded P2E2 weights, quantized activations); zero when this GPU keeps none.
+    /// Runs `submit` with the scratch region [`address`, `address + bytes`) bound for the submissions it makes on
+    /// this thread: a route that needs scratch uses it instead of taking memory of its own. The caller orders the
+    /// region's uses (a workspace buffer, ordered by edges).
+    public void withScratch(long address, long bytes, Runnable submit) {
+        submit.run();
+    }
+
+    /// The scratch bytes `use` takes for `rows` rows of an `inFeatures` x `outFeatures` operation in `layout`; 0 when
+    /// this GPU takes none.
+    public long scratchBytes(ScratchUse use, int rows, int inFeatures, int outFeatures, WeightLayout layout) {
+        return 0;
+    }
+
     public long retainedScratchBytes() {
         return 0;
     }

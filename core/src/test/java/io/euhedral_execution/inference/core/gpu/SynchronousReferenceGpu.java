@@ -334,6 +334,21 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
     }
 
     @Override
+    public void withScratch(long address, long bytes, Runnable submit) {
+        this.delegate.withScratch(address, bytes, submit);
+    }
+
+    @Override
+    public long scratchBytes(
+            ScratchUse use,
+            int rows,
+            int inFeatures,
+            int outFeatures,
+            io.euhedral_execution.inference.core.artifact.WeightLayout layout) {
+        return this.delegate.scratchBytes(use, rows, inFeatures, outFeatures, layout);
+    }
+
+    @Override
     public long retainedScratchBytes() {
         return this.delegate.retainedScratchBytes();
     }

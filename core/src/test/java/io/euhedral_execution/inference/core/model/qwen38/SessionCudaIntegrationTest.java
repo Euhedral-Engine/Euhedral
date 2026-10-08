@@ -176,7 +176,6 @@ class SessionCudaIntegrationTest {
                         else failure.addSuppressed(cleanupFailure);
                     }
                 }
-                gpu.releaseQ3Scratch(); // the shared scratch of the quantized-activation routes outlives the model
                 long allocatedAfterWeightsRelease = gpu.allocatedBytes();
                 if (allocatedAfterWeightsRelease != allocatedBeforeWeights) {
                     IllegalStateException cleanupFailure =
