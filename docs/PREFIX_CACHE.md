@@ -77,6 +77,14 @@ back. A failed copy does not stop the generation. A restore allocates the sequen
 first quantum does, so those allocations and uploads come before its copies. It then copies the chain's KV pages and the
 last node's GDN state in, publishes the position in the sequence's order, and releases the hit on the owner.
 
+A plain prompt takes its checkpoints inside its prompt graph, the one graph of all its chunks. Before the prompt is
+admitted, an owner frame reserves a node at each wanted chunk boundary (`reserveCheckpoints`), chained one under the
+next. After each chunk that ends at a reserved node, one stage of the graph queues the copies of the sequence's state
+into the node's extent, on its lane. That stage follows every stage of its chunk and touches every layer's carried
+state, so the next chunk updates the GDN state only after the copy; the KV rows it copies are append-only. The copies
+complete before the prompt's retirement, and an owner frame then publishes the nodes, or gives their bytes back if
+the prompt failed (`settleCheckpoints`). A speculative prompt still captures between its chunks.
+
 A capture is work on the sequence, admitted like a quantum, and so is a restore. A cancellation that arrives
 mid-capture therefore only flags the sequence, and its buffers are released after the copies' device completion. A
 sequence already cancelled is not captured. (Without this, a client that left during prefill released the buffers

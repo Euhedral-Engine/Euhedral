@@ -74,6 +74,9 @@ public final class PrefixCache implements AutoCloseable {
         /// The node the sequence's next capture attaches to: the new or existing node, or the parent when nothing
         /// was stored. `failure` is an unexpected error; an ordinary miss is not one.
         default void captured(PrefixNode node, Throwable failure) {}
+
+        /// The checkpoints a prompt graph takes ([PrefixCache#reserveCheckpoints]).
+        default void reserved(PromptCheckpoints checkpoints) {}
     }
 
     private final ExecutionGpu gpu;
@@ -429,6 +432,77 @@ public final class PrefixCache implements AutoCloseable {
         } finally {
             this.lake.publishOrRun(next);
         }
+    }
+
+    // ---------------------------------------------------------------- checkpoints inside a prompt graph
+
+    /// Finds or reserves, on the owner, a node at each of `positions` (ascending, on the chunk grid) along `tokens`,
+    /// chained from `parent`; tells `steps` which, and throws `next`. A position the cache cannot hold ends
+    /// the chain there. The reserved nodes stay invisible until [#settleCheckpoints] publishes them.
+    public void reserveCheckpoints(
+            PrefixNode parent,
+            int[] tokens,
+            int[] positions,
+            SpeculativeCheckpoint speculative,
+            Steps steps,
+            AbstractFrame next) {
+        onOwner(steps, next, () -> {
+            PrefixNode[] nodes = new PrefixNode[positions.length];
+            boolean[] reserved = new boolean[positions.length];
+            int count = 0;
+            PrefixNode at = parent;
+            for (int position : positions) {
+                if (this.closed) break;
+                PrefixNode existing = this.tree.find(at, tokens, position, null);
+                if (existing == null) existing = this.tree.findAny(at, tokens, position);
+                if (existing != null) {
+                    nodes[count++] = existing;
+                    at = existing;
+                    continue;
+                }
+                PrefixNode node =
+                        this.tree.reserve(at, tokens, position, null, this.layout.extentBytes(at.position(), position));
+                if (node == null) {
+                    this.skipped.incrementAndGet();
+                    break;
+                }
+                reserved[count] = true;
+                nodes[count++] = node;
+                at = node;
+            }
+            steps.reserved(new PromptCheckpoints(
+                    this,
+                    parent,
+                    java.util.Arrays.copyOf(positions, count),
+                    java.util.Arrays.copyOf(nodes, count),
+                    java.util.Arrays.copyOf(reserved, count)));
+        });
+    }
+
+    /// After the prompt graph retired: publishes the reserved checkpoints if the prompt `committed` (its copies
+    /// completed with it), or gives their bytes back; tells `steps` the node the sequence's next capture
+    /// attaches to, and throws `next`.
+    public void settleCheckpoints(PromptCheckpoints checkpoints, boolean committed, Steps steps, AbstractFrame next) {
+        onOwner(steps, next, () -> {
+            PrefixNode deepest = checkpoints.parent();
+            if (committed) {
+                for (int index = 0; index < checkpoints.count(); index++) {
+                    if (checkpoints.copies(index)) {
+                        this.tree.publish(checkpoints.node(index));
+                        this.captured.incrementAndGet();
+                    }
+                    deepest = checkpoints.node(index);
+                }
+            } else {
+                for (int index = checkpoints.count() - 1; index >= 0; index--)
+                    if (checkpoints.copies(index)) this.tree.abort(checkpoints.node(index));
+            }
+            steps.captured(deepest, null);
+        });
+    }
+
+    PrefixLayout layout() {
+        return this.layout;
     }
 
     // ---------------------------------------------------------------- the owner

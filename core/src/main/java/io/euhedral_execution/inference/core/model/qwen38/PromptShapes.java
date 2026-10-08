@@ -3,10 +3,12 @@ package io.euhedral_execution.inference.core.model.qwen38;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.graph.ChunkedShape;
+import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
 import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
 import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -21,9 +23,11 @@ final class PromptShapes {
     /// Prompt shapes kept at once.
     static final int CAPACITY = 16;
 
-    private record Key(Shape full, Shape last, int chunks) {}
+    private record Key(Shape full, Shape last, int chunks, List<Integer> checkpointChunks) {}
 
     private final EuhedralInferenceRuntime runtime;
+    /// The checkpointing variant of each view, built once.
+    private final Map<Shape, CheckpointView> checkpointViews = new java.util.HashMap<>();
     private final Map<Key, ChunkedShape> shapes = new LinkedHashMap<>(CAPACITY, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<Key, ChunkedShape> eldest) {
@@ -44,9 +48,17 @@ final class PromptShapes {
         Shape last = prompt.plan()
                 .forExecution(
                         Quantum.ExecutionKind.PREFILL, prompt.chunk(chunks - 1).rows());
-        return this.shapes.computeIfAbsent(
-                new Key(full, last, chunks),
-                key -> new ChunkedShape(full, last, chunks, new Frames(full, last, chunks)));
+        List<Integer> checkpoints = prompt.checkpointChunks();
+        return this.shapes.computeIfAbsent(new Key(full, last, chunks, checkpoints), key -> {
+            GraphShape[] templates = new GraphShape[chunks];
+            for (int chunk = 0; chunk < chunks; chunk++) {
+                Shape view = chunk == chunks - 1 ? last : full;
+                templates[chunk] = checkpoints.contains(chunk)
+                        ? this.checkpointViews.computeIfAbsent(view, CheckpointView::new)
+                        : view;
+            }
+            return new ChunkedShape(templates, new Frames(templates));
+        });
     }
 
     /// Shapes kept now (tests).
@@ -55,13 +67,16 @@ final class PromptShapes {
     }
 
     /// The frames of a prompt graph: each stage is its template's, told its chunk.
-    private record Frames(Shape full, Shape last, int chunks) implements ChunkedShape.Chunks {
+    private record Frames(GraphShape[] templates) implements ChunkedShape.Chunks {
         @Override
         public StageFrame create(StageGraph graph, int stage, int chunk, int templateStage, ExecutionGpu gpu) {
-            Shape template = chunk == this.chunks - 1 ? this.last : this.full;
-            Stages.Stage frame =
-                    Stages.create(graph, stage, template.instructions().get(templateStage), gpu, chunk);
-            frame.scratchUse = template.scratchUse(templateStage);
+            Shape view;
+            if (this.templates[chunk] instanceof CheckpointView checkpointed) {
+                if (checkpointed.isCheckpoint(templateStage)) return new Stages.Checkpoint(graph, stage, chunk, gpu);
+                view = checkpointed.view();
+            } else view = (Shape) this.templates[chunk];
+            Stages.Stage frame = Stages.create(graph, stage, view.instructions().get(templateStage), gpu, chunk);
+            frame.scratchUse = view.scratchUse(templateStage);
             return frame;
         }
 

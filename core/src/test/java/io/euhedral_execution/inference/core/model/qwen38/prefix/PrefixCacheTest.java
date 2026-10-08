@@ -735,4 +735,79 @@ class PrefixCacheTest {
         assertEquals(1, cache.stats().failed());
         assertEquals(0, cache.stats().usedBytes());
     }
+
+    /// What a prompt's checkpoint reservation told its call, and whether its next frame ran.
+    static final class Reserved extends AbstractFrame implements PrefixCache.Steps {
+        PromptCheckpoints checkpoints;
+        PrefixNode captured;
+        boolean continued;
+
+        Reserved() {
+            super(FrameSeeds.ID_HASH);
+        }
+
+        @Override
+        public void reserved(PromptCheckpoints checkpoints) {
+            this.checkpoints = checkpoints;
+        }
+
+        @Override
+        public void captured(PrefixNode node, Throwable failure) {
+            this.captured = node;
+        }
+
+        @Override
+        public void execute() {
+            this.continued = true;
+        }
+    }
+
+    @Test
+    void reservedCheckpointsStayInvisibleUntilAPromptCommitsThem() {
+        PrefixCache cache = cache(16L << 20, 512);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        var reserve = new Reserved();
+        cache.reserveCheckpoints(cache.root(), tokens, new int[] {512, 1024}, null, reserve, reserve);
+        this.frames.drive();
+        assertTrue(reserve.continued);
+        assertEquals(2, reserve.checkpoints.count());
+        assertEquals(512, reserve.checkpoints.position(0));
+        assertNull(lookup(cache, tokens), "nothing is visible before the prompt commits");
+        var settle = new Reserved();
+        cache.settleCheckpoints(reserve.checkpoints, true, settle, settle);
+        this.frames.drive();
+        assertTrue(settle.continued);
+        assertEquals(1024, settle.captured.position(), "the cursor moves to the deepest checkpoint");
+        assertEquals(2, cache.stats().captured());
+        assertEquals(1024, lookup(cache, tokens).position());
+    }
+
+    @Test
+    void reservedCheckpointsOfAFailedPromptAreAborted() {
+        PrefixCache cache = cache(16L << 20, 512);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        var reserve = new Reserved();
+        cache.reserveCheckpoints(cache.root(), tokens, new int[] {512, 1024}, null, reserve, reserve);
+        this.frames.drive();
+        var settle = new Reserved();
+        cache.settleCheckpoints(reserve.checkpoints, false, settle, settle);
+        this.frames.drive();
+        assertSame(cache.root(), settle.captured, "the cursor stays where it was");
+        assertEquals(0, cache.stats().usedBytes(), "the bytes went back");
+        assertNull(lookup(cache, tokens));
+    }
+
+    @Test
+    void anExistingCheckpointIsReusedNotReserved() {
+        PrefixCache cache = cache(16L << 20, 512);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        PrefixNode stored = capture(cache, sequence(1024, 4), cache.root(), tokens, 512);
+        var reserve = new Reserved();
+        cache.reserveCheckpoints(cache.root(), tokens, new int[] {512, 1024}, null, reserve, reserve);
+        this.frames.drive();
+        assertSame(stored, reserve.checkpoints.node(0), "the stored node is the chain's first");
+        assertFalse(reserve.checkpoints.copies(0), "nothing to copy for it");
+        assertTrue(reserve.checkpoints.copies(1));
+        assertSame(stored, reserve.checkpoints.node(1).parent());
+    }
 }
