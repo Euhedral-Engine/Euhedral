@@ -18,37 +18,49 @@ public final class Stages {
 
     private Stages() {}
 
-    /// The stage frame of one instruction.
+    /// The stage frame of one instruction: stage `instruction.id()` of a single-chunk graph.
     public static Stage create(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+        return create(graph, instruction.id(), instruction, gpu, 0);
+    }
+
+    /// The stage frame of `instruction` in chunk `chunk` of a prompt graph, at stage `stage`.
+    public static Stage create(
+            StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu, int chunk) {
+        Stage created = of(graph, stage, instruction, gpu);
+        created.chunk = chunk;
+        return created;
+    }
+
+    private static Stage of(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
         return switch (instruction.kind()) {
-            case EMBEDDING -> new Embed(graph, instruction, gpu);
-            case WEIGHT_TRANSFER -> new WeightTransfer(graph, instruction, gpu);
-            case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNorm(graph, instruction, gpu);
-            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new Linear(graph, instruction, gpu);
-            case Q3_GATE_UP_SWIGLU -> new GateUpSwiGlu(graph, instruction, gpu);
-            case RESIDUAL_RMS_NORM -> new ResidualNorm(graph, instruction, gpu);
-            case GDN_PROJECT_CONTROL -> new GdnProjectControl(graph, instruction, gpu);
-            case MTP_STEM -> new MtpStem(graph, instruction, gpu);
-            case GDN_CONTROL -> new GdnControl(graph, instruction, gpu);
-            case GDN_CONVOLUTION -> new GdnConvolution(graph, instruction, gpu);
-            case GDN_RECURRENCE -> new GdnRecurrence(graph, instruction, gpu);
-            case GDN_GATED_RMS_NORM -> new GdnGatedNorm(graph, instruction, gpu);
-            case ATTENTION_QK_NORM_ROPE -> new QkNormRope(graph, instruction, gpu);
-            case ATTENTION_KV_APPEND -> new KvAppend(graph, instruction, gpu);
-            case ATTENTION_CAUSAL -> new CausalAttention(graph, instruction, gpu);
-            case RESIDUAL_ADD -> new ResidualAdd(graph, instruction, gpu);
-            case SWIGLU -> new SwiGlu(graph, instruction, gpu);
-            case DFLASH_TAP -> new DFlash2.Tap(graph, instruction, gpu);
-            case DFLASH_LINEAR -> new DFlash2.Linear(graph, instruction, gpu);
-            case DFLASH_RMS_NORM -> new DFlash2.RmsNorm(graph, instruction, gpu);
-            case DFLASH_CONV -> new DFlash2.Conv(graph, instruction, gpu);
-            case DFLASH_CONTEXT_KV -> new DFlash2.ContextKv(graph, instruction, gpu);
-            case DFLASH_BLOCK_QK -> new DFlash2.BlockQk(graph, instruction, gpu);
-            case DFLASH_ATTENTION -> new DFlash2.Attention(graph, instruction, gpu);
-            case DFLASH_SWIGLU -> new DFlash2.SwiGlu(graph, instruction, gpu);
-            case DFLASH_LM_HEAD -> new DFlash2.LmHead(graph, instruction, gpu);
-            case DFLASH_TOPK -> new DFlash2.TopK(graph, instruction, gpu);
-            case DFLASH_SELECT -> new DFlash2.Select(graph, instruction, gpu);
+            case EMBEDDING -> new Embed(graph, stage, instruction, gpu);
+            case WEIGHT_TRANSFER -> new WeightTransfer(graph, stage, instruction, gpu);
+            case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNorm(graph, stage, instruction, gpu);
+            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new Linear(graph, stage, instruction, gpu);
+            case Q3_GATE_UP_SWIGLU -> new GateUpSwiGlu(graph, stage, instruction, gpu);
+            case RESIDUAL_RMS_NORM -> new ResidualNorm(graph, stage, instruction, gpu);
+            case GDN_PROJECT_CONTROL -> new GdnProjectControl(graph, stage, instruction, gpu);
+            case MTP_STEM -> new MtpStem(graph, stage, instruction, gpu);
+            case GDN_CONTROL -> new GdnControl(graph, stage, instruction, gpu);
+            case GDN_CONVOLUTION -> new GdnConvolution(graph, stage, instruction, gpu);
+            case GDN_RECURRENCE -> new GdnRecurrence(graph, stage, instruction, gpu);
+            case GDN_GATED_RMS_NORM -> new GdnGatedNorm(graph, stage, instruction, gpu);
+            case ATTENTION_QK_NORM_ROPE -> new QkNormRope(graph, stage, instruction, gpu);
+            case ATTENTION_KV_APPEND -> new KvAppend(graph, stage, instruction, gpu);
+            case ATTENTION_CAUSAL -> new CausalAttention(graph, stage, instruction, gpu);
+            case RESIDUAL_ADD -> new ResidualAdd(graph, stage, instruction, gpu);
+            case SWIGLU -> new SwiGlu(graph, stage, instruction, gpu);
+            case DFLASH_TAP -> new DFlash2.Tap(graph, stage, instruction, gpu);
+            case DFLASH_LINEAR -> new DFlash2.Linear(graph, stage, instruction, gpu);
+            case DFLASH_RMS_NORM -> new DFlash2.RmsNorm(graph, stage, instruction, gpu);
+            case DFLASH_CONV -> new DFlash2.Conv(graph, stage, instruction, gpu);
+            case DFLASH_CONTEXT_KV -> new DFlash2.ContextKv(graph, stage, instruction, gpu);
+            case DFLASH_BLOCK_QK -> new DFlash2.BlockQk(graph, stage, instruction, gpu);
+            case DFLASH_ATTENTION -> new DFlash2.Attention(graph, stage, instruction, gpu);
+            case DFLASH_SWIGLU -> new DFlash2.SwiGlu(graph, stage, instruction, gpu);
+            case DFLASH_LM_HEAD -> new DFlash2.LmHead(graph, stage, instruction, gpu);
+            case DFLASH_TOPK -> new DFlash2.TopK(graph, stage, instruction, gpu);
+            case DFLASH_SELECT -> new DFlash2.Select(graph, stage, instruction, gpu);
         };
     }
 
@@ -59,9 +71,12 @@ public final class Stages {
         private final ExecutionGpu gpu;
         /// The scratch route its shape declared for it, or null ([Shape#scratchUse]).
         ScratchUse scratchUse;
+        /// The chunk of a prompt graph this stage belongs to; 0 in any other graph.
+        int chunk;
 
-        protected Stage(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, Objects.requireNonNull(instruction, "instruction").id());
+        protected Stage(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage);
+            Objects.requireNonNull(instruction, "instruction");
             this.instruction = instruction;
             this.gpu = Objects.requireNonNull(gpu, "gpu");
         }
@@ -122,6 +137,36 @@ public final class Stages {
             return (Quantum) graph().quantum();
         }
 
+        /// The chunk of the quantum this stage runs: 0 unless the stage belongs to a prompt graph.
+        protected final Quantum.Chunk chunk(Quantum context) {
+            return context.chunk(this.chunk);
+        }
+
+        /// This stage's rows: its chunk's.
+        protected final int rows(Quantum context) {
+            return chunk(context).rows();
+        }
+
+        /// The position of this stage's first row.
+        protected final long position(Quantum context) {
+            return chunk(context).startPosition();
+        }
+
+        /// The device address of this stage's token ids.
+        protected final long tokenIds(Quantum context) {
+            return context.workspace().tokenIdsAddress(chunk(context));
+        }
+
+        /// The device address of this stage's start position.
+        protected final long positionAddress(Quantum context) {
+            return context.workspace().positionAddress(chunk(context));
+        }
+
+        /// The logits rows this stage produces: its chunk's, only in the last chunk.
+        protected final int logitsRows(Quantum context) {
+            return chunk(context).logitsRows(context.logitsRequirement());
+        }
+
         protected static long input(Quantum context, ExecutionPlan.Instruction instruction, int index) {
             return context.workspace().address(instruction.inputBuffers().get(index));
         }
@@ -153,18 +198,18 @@ public final class Stages {
     /// Runs the embedding lookup over the token IDs the quantum uploaded at admission.
     public static final class Embed extends Stage {
 
-        Embed(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        Embed(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             gpu().embedQ3(
-                            context.workspace().tokenIdsAddress(),
+                            tokenIds(context),
                             instruction.weightAddress(),
                             instruction.weightByteSize(),
                             context.workspace().hiddenStateAddress(),
-                            context.inputTokenCount(),
+                            rows(context),
                             context.plan().weights().config().vocabSize(),
                             instruction.outputWidth(),
                             instruction.weightLayout());
@@ -178,8 +223,8 @@ public final class Stages {
         private final long destination;
         private final long byteSize;
 
-        WeightTransfer(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        WeightTransfer(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
             TensorHandle weight = instruction.weight();
             this.source = weight.hostAddress();
             this.destination = weight.deviceAddress();
@@ -200,18 +245,18 @@ public final class Stages {
     /// Runs the standalone BF16 RMSNorm instruction.
     public static final class RmsNorm extends Stage {
 
-        RmsNorm(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        RmsNorm(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             boolean finalNorm = instruction.outputBuffers().contains(ExecutionPlan.Buffer.FINAL_NORMALIZED);
-            int rows = finalNorm ? context.logitsRowCount() : context.inputTokenCount();
+            int rows = finalNorm ? logitsRows(context) : rows(context);
             if (finalNorm && context.seedsDraft() && context.plan().drafts()) {
                 // Speculative drafting reads every row's post-final-norm hidden (docs/MTP_CONTRACT.md §2).
                 var states = (AttentionStates) context.sequenceState().kvCacheState();
-                int all = context.inputTokenCount();
+                int all = rows(context);
                 normalize(
                         instruction,
                         context.workspace().address(instruction.inputBuffers().getFirst()),
@@ -223,8 +268,8 @@ public final class Stages {
             long input = context.shape().hasFirstLayer()
                     ? context.workspace().address(instruction.inputBuffers().getFirst())
                     : context.workspace().hiddenStateAddress();
-            if (finalNorm && rows != context.inputTokenCount()) {
-                input += (long) (context.inputTokenCount() - 1) * instruction.inputWidth() * Short.BYTES;
+            if (finalNorm && rows != rows(context)) {
+                input += (long) (rows(context) - 1) * instruction.inputWidth() * Short.BYTES;
             }
             long output = context.shape().hasFirstLayer()
                     ? context.workspace().address(instruction.outputBuffers().getFirst())
@@ -255,14 +300,14 @@ public final class Stages {
     /// Runs one independent quantized or BF16 projection instruction.
     public static final class Linear extends Stage {
 
-        Linear(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        Linear(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             boolean logits = instruction.outputBuffers().contains(ExecutionPlan.Buffer.LOGITS);
-            int rows = logits ? context.logitsRowCount() : context.inputTokenCount();
+            int rows = logits ? logitsRows(context) : rows(context);
             if (rows == 0) return;
             long input = context.shape().hasFirstLayer()
                     ? context.workspace().address(instruction.inputBuffers().getFirst())
@@ -353,8 +398,8 @@ public final class Stages {
     /// The fused gate/up projection and SwiGLU of a prefill FFN region.
     public static final class GateUpSwiGlu extends Stage {
 
-        GateUpSwiGlu(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        GateUpSwiGlu(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -364,7 +409,7 @@ public final class Stages {
                                 input(context, instruction, 0),
                                 instruction.weightAddress(),
                                 output(context, instruction, 0),
-                                context.inputTokenCount(),
+                                rows(context),
                                 instruction.inputWidth(),
                                 instruction.outputWidth(),
                                 instruction.weightByteSize());
@@ -373,7 +418,7 @@ public final class Stages {
                                 input(context, instruction, 0),
                                 instruction.weightAddress(),
                                 output(context, instruction, 0),
-                                context.inputTokenCount(),
+                                rows(context),
                                 instruction.inputWidth(),
                                 instruction.outputWidth(),
                                 instruction.weightByteSize(),
@@ -384,8 +429,8 @@ public final class Stages {
     /// The rounded residual add and RMSNorm of a region view, in one launch.
     public static final class ResidualNorm extends Stage {
 
-        ResidualNorm(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        ResidualNorm(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -396,7 +441,7 @@ public final class Stages {
                             instruction.weightAddress(),
                             output(context, instruction, 0),
                             output(context, instruction, 1),
-                            context.inputTokenCount(),
+                            rows(context),
                             instruction.outputWidth(),
                             (float) context.plan().weights().config().rmsNormEpsilon());
         }
@@ -405,8 +450,8 @@ public final class Stages {
     /// The joint GDN A/B projection and control of a region view.
     public static final class GdnProjectControl extends Stage {
 
-        GdnProjectControl(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        GdnProjectControl(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -419,7 +464,7 @@ public final class Stages {
                             instruction.weightAddress(3),
                             output(context, instruction, 0),
                             output(context, instruction, 1),
-                            context.inputTokenCount(),
+                            rows(context),
                             instruction.inputWidth(),
                             instruction.outputWidth());
         }
@@ -430,13 +475,13 @@ public final class Stages {
     /// the context (base hidden rows for catch-up, the previous MTP hidden for a recursive row).
     public static final class MtpStem extends Stage {
 
-        MtpStem(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        MtpStem(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
-            int rows = context.inputTokenCount();
+            int rows = rows(context);
             int hidden = instruction.inputWidth();
             long rowBytes = (long) hidden * Short.BYTES;
             long normed = output(context, instruction, 0);
@@ -459,8 +504,8 @@ public final class Stages {
     /// The GDN control (alpha and beta) of an unfused view.
     public static final class GdnControl extends Stage {
 
-        GdnControl(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        GdnControl(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -472,7 +517,7 @@ public final class Stages {
                             instruction.weightAddress(1),
                             output(context, instruction, 0),
                             output(context, instruction, 1),
-                            context.inputTokenCount(),
+                            rows(context),
                             instruction.outputWidth());
         }
     }
@@ -485,8 +530,8 @@ public final class Stages {
         /// The GDN state a verification checkpointed in this stage; its commit sets the replay.
         private GdnState pendingSpeculativeState;
 
-        GdnConvolution(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        GdnConvolution(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -498,7 +543,7 @@ public final class Stages {
             // A previous verification committed only part of its rows: rebuild this layer's state first.
             if (state.pendingReplayRows() > 0) replay(context, instruction, state);
             if (context.kind() == Quantum.ExecutionKind.VERIFY) {
-                int rows = context.inputTokenCount();
+                int rows = rows(context);
                 var speculative = state.speculative(
                         rows,
                         queryKeyWidth,
@@ -526,7 +571,7 @@ public final class Stages {
                             instruction.weightAddress(0),
                             sequenceState(context, instruction).convolutionStateAddress(),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             queryKeyWidth,
                             valueWidth,
                             instruction.outputWidth(),
@@ -587,7 +632,7 @@ public final class Stages {
             GdnState speculative = this.pendingSpeculativeState;
             if (speculative != null) {
                 int committed = context().committedRowCount();
-                speculative.setPendingReplayRows(committed < context().inputTokenCount() ? committed : 0);
+                speculative.setPendingReplayRows(committed < rows(context()) ? committed : 0);
             }
         }
 
@@ -600,8 +645,8 @@ public final class Stages {
     /// The GDN recurrence over the sequence's persistent recurrent state; a verification checkpoints it first.
     public static final class GdnRecurrence extends Stage {
 
-        GdnRecurrence(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        GdnRecurrence(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -611,7 +656,7 @@ public final class Stages {
             if (context.kind() == Quantum.ExecutionKind.VERIFY) {
                 GdnState state = sequenceState(context, instruction);
                 var speculative = state.speculative();
-                long rowBytes = (long) context.inputTokenCount() * config.linearNumValueHeads() * Float.BYTES;
+                long rowBytes = (long) rows(context) * config.linearNumValueHeads() * Float.BYTES;
                 gpu().copyDeviceToDevice(
                                 speculative.recurrentCheckpoint(),
                                 state.recurrentStateAddress(),
@@ -625,7 +670,7 @@ public final class Stages {
                             input(context, instruction, 2),
                             sequenceState(context, instruction).recurrentStateAddress(),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             config.linearNumKeyHeads(),
                             config.linearNumValueHeads(),
                             config.linearKeyHeadDim(),
@@ -637,8 +682,8 @@ public final class Stages {
     /// The GDN gated RMSNorm.
     public static final class GdnGatedNorm extends Stage {
 
-        GdnGatedNorm(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        GdnGatedNorm(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -649,7 +694,7 @@ public final class Stages {
                             input(context, instruction, 1),
                             instruction.weightAddress(0),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             config.linearNumValueHeads(),
                             config.linearValueHeadDim(),
                             (float) config.rmsNormEpsilon());
@@ -659,8 +704,8 @@ public final class Stages {
     /// The attention Q/K RMSNorm and RoPE.
     public static final class QkNormRope extends Stage {
 
-        QkNormRope(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        QkNormRope(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -672,13 +717,13 @@ public final class Stages {
                             instruction.weightAddress(0),
                             instruction.weightAddress(1),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             config.numAttentionHeads(),
                             config.numKeyValueHeads(),
                             config.attentionHeadDim(),
                             rotaryDim,
-                            context.startPosition(),
-                            context.workspace().positionAddress(),
+                            position(context),
+                            positionAddress(context),
                             (float) config.rmsNormEpsilon(),
                             config.ropeTheta());
         }
@@ -691,8 +736,8 @@ public final class Stages {
 
         private AttentionKvState pendingAppendState;
 
-        KvAppend(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        KvAppend(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -703,18 +748,18 @@ public final class Stages {
             AttentionKvState state = attentionState(context, instruction);
             // Retirement settles the reservation, including staging a failed launch leaves queued.
             this.pendingAppendState = state;
-            state.prepareAppend(context.startPosition(), context.inputTokenCount());
+            state.prepareAppend(position(context), rows(context));
             gpu().attentionKvAppendNvfp4(
                             input(context, instruction, 0),
                             input(context, instruction, 1),
                             state.keyCacheAddress(),
                             state.valueCacheAddress(),
-                            context.inputTokenCount(),
+                            rows(context),
                             queryWidth,
                             keyValueWidth,
-                            context.startPosition(),
-                            context.workspace().positionAddress());
-            state.appendSubmitted(context.inputTokenCount());
+                            position(context),
+                            positionAddress(context));
+            state.appendSubmitted(rows(context));
         }
 
         /// Publishes the appended rows once the quantum's device work has retired.
@@ -736,8 +781,8 @@ public final class Stages {
     /// Causal attention over the sequence's KV cache, including the rows this quantum appended.
     public static final class CausalAttention extends Stage {
 
-        CausalAttention(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        CausalAttention(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -750,20 +795,20 @@ public final class Stages {
                             state.keyCacheAddress(),
                             state.valueCacheAddress(),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             config.numAttentionHeads(),
                             config.numKeyValueHeads(),
                             config.attentionHeadDim(),
                             // The append stage submitted these rows earlier on this quantum's stream; they are
                             // readable here but not committed until the quantum retires.
                             state.submittedLength(),
-                            context.startPosition(),
-                            context.workspace().positionAddress(),
-                            context.inputTokenCount() == 1
+                            position(context),
+                            positionAddress(context),
+                            rows(context) == 1
                                             || context.kind() == Quantum.ExecutionKind.VERIFY
                                             || draftRowTwins(context)
                                     ? ((AttentionStates) context.sequenceState().kvCacheState())
-                                            .decodeScratch(config.numAttentionHeads(), context.inputTokenCount())
+                                            .decodeScratch(config.numAttentionHeads(), rows(context))
                                     : 0);
         }
 
@@ -778,8 +823,8 @@ public final class Stages {
     /// Adds a residual into the hidden state.
     public static final class ResidualAdd extends Stage {
 
-        ResidualAdd(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        ResidualAdd(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -788,7 +833,7 @@ public final class Stages {
                             input(context, instruction, 0),
                             input(context, instruction, 1),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             instruction.outputWidth());
         }
     }
@@ -796,8 +841,8 @@ public final class Stages {
     /// The FFN's SwiGLU of an unfused view.
     public static final class SwiGlu extends Stage {
 
-        SwiGlu(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        SwiGlu(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         @Override
@@ -805,7 +850,7 @@ public final class Stages {
             gpu().swiGluBf16(
                             input(context, instruction, 0),
                             output(context, instruction, 0),
-                            context.inputTokenCount(),
+                            rows(context),
                             context.plan().weights().config().intermediateSize());
         }
     }
@@ -826,8 +871,8 @@ public final class Stages {
             observer = stages;
         }
 
-        DFlash2(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-            super(graph, instruction, gpu);
+        DFlash2(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
         }
 
         /// Launches the stage's DFlash2 operation.
@@ -835,7 +880,7 @@ public final class Stages {
 
         @Override
         protected final void perform(Quantum context, ExecutionPlan.Instruction instruction) {
-            submit(context, instruction, context.inputTokenCount());
+            submit(context, instruction, rows(context));
             Observer stages = observer;
             if (stages != null) stages.submitted(context, instruction);
         }
@@ -852,8 +897,8 @@ public final class Stages {
         /// Copies the target's hidden rows after one tapped layer into the sequence's DFlash2 tap rows, in quanta
         /// that seed drafting.
         public static final class Tap extends DFlash2 {
-            Tap(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            Tap(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -872,8 +917,8 @@ public final class Stages {
 
         /// A drafter projection; with no input buffer it reads the sequence's tap rows.
         public static final class Linear extends DFlash2 {
-            Linear(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            Linear(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -903,8 +948,8 @@ public final class Stages {
         }
 
         public static final class RmsNorm extends DFlash2 {
-            RmsNorm(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            RmsNorm(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -921,8 +966,8 @@ public final class Stages {
 
         /// The dynamic convolution's prepare (`outputBufferIndex` 0) or finish (1) kernel.
         public static final class Conv extends DFlash2 {
-            Conv(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            Conv(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -944,8 +989,8 @@ public final class Stages {
         /// The drafter's keys and values of committed rows into its own cache. A context quantum's rows are the
         /// drafter's context once its last layer's keys and values are written.
         public static final class ContextKv extends DFlash2 {
-            ContextKv(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            ContextKv(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -958,7 +1003,7 @@ public final class Stages {
                                 state.ringKeys(instruction.layerIndex()),
                                 state.ringValues(instruction.layerIndex()),
                                 rows,
-                                context.workspace().positionAddress(),
+                                positionAddress(context),
                                 config.slidingWindow(),
                                 config.keyValueHeads(),
                                 config.headDim(),
@@ -971,13 +1016,13 @@ public final class Stages {
                 ExecutionPlan.Instruction instruction = instruction();
                 Quantum context = context();
                 if (instruction.layerIndex() != config(context).layers() - 1) return;
-                state(context).commitContext(Math.toIntExact(context.startPosition() + context.inputTokenCount()));
+                state(context).commitContext(Math.toIntExact(position(context) + rows(context)));
             }
         }
 
         public static final class BlockQk extends DFlash2 {
-            BlockQk(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            BlockQk(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -991,7 +1036,7 @@ public final class Stages {
                                 output(context, instruction, 0),
                                 output(context, instruction, 1),
                                 rows,
-                                context.workspace().positionAddress(),
+                                positionAddress(context),
                                 config.attentionHeads(),
                                 config.keyValueHeads(),
                                 config.headDim(),
@@ -1001,8 +1046,8 @@ public final class Stages {
         }
 
         public static final class Attention extends DFlash2 {
-            Attention(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            Attention(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -1018,7 +1063,7 @@ public final class Stages {
                                 output(context, instruction, 0),
                                 output(context, instruction, 1),
                                 rows,
-                                context.workspace().positionAddress(),
+                                positionAddress(context),
                                 config.slidingWindow(),
                                 config.attentionHeads(),
                                 config.keyValueHeads(),
@@ -1027,8 +1072,8 @@ public final class Stages {
         }
 
         public static final class SwiGlu extends DFlash2 {
-            SwiGlu(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            SwiGlu(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -1043,8 +1088,8 @@ public final class Stages {
 
         /// The target's output head over the block's proposal rows: every row but the anchor proposes a token.
         public static final class LmHead extends DFlash2 {
-            LmHead(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            LmHead(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -1074,8 +1119,8 @@ public final class Stages {
         }
 
         public static final class TopK extends DFlash2 {
-            TopK(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            TopK(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -1092,8 +1137,8 @@ public final class Stages {
 
         /// The selector's path over the candidates: the block's proposal, queued for the host.
         public static final class Select extends DFlash2 {
-            Select(StageGraph graph, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
-                super(graph, instruction, gpu);
+            Select(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+                super(graph, stage, instruction, gpu);
             }
 
             @Override
@@ -1107,7 +1152,7 @@ public final class Stages {
                                 input(context, instruction, 2),
                                 instruction.weightAddress(0),
                                 instruction.weightAddress(1),
-                                context.workspace().tokenIdsAddress(),
+                                tokenIds(context),
                                 rows - 1,
                                 instruction.inputWidth(),
                                 tokens,

@@ -30,6 +30,10 @@ public final class Workspace implements AutoCloseable {
     private SharedWorkspace shared;
     private final boolean ownsStorage;
     private final int tokenCount;
+    /// The input record's rows and chunks: every chunk's token ids, then each chunk's start position. A quantum of
+    /// one chunk has `tokenCount` rows and one position, so its record is what it always was.
+    private int inputRows;
+    private int inputChunks = 1;
     private final int hiddenSize;
     private final long byteSize;
     private final long[] projectionAddresses;
@@ -289,11 +293,24 @@ public final class Workspace implements AutoCloseable {
     /// aligned). The quantum uploads the record once at admission, before its first launch, so kernels read
     /// the position from device memory instead of taking it as a launch parameter.
     public long inputByteSize() {
-        return positionOffset() + Long.BYTES;
+        return positionOffset() + (long) this.inputChunks * Long.BYTES;
     }
 
     private long positionOffset() {
-        return ((long) this.tokenCount * Integer.BYTES + Long.BYTES - 1) / Long.BYTES * Long.BYTES;
+        return ((long) inputRows() * Integer.BYTES + Long.BYTES - 1) / Long.BYTES * Long.BYTES;
+    }
+
+    private int inputRows() {
+        return this.inputRows == 0 ? this.tokenCount : this.inputRows;
+    }
+
+    /// Sizes the input record for `rows` rows in `chunks` chunks (a prompt quantum's), before it is bound.
+    Workspace withInput(int rows, int chunks) {
+        if (this.inputAddress != 0) throw new IllegalStateException("the input record is already bound");
+        if (rows < this.tokenCount || chunks < 1) throw new IllegalArgumentException("invalid input record");
+        this.inputRows = rows;
+        this.inputChunks = chunks;
+        return this;
     }
 
     void fingerprint(CaptureFingerprint fingerprint) {
@@ -312,14 +329,31 @@ public final class Workspace implements AutoCloseable {
         return tokenIdsAddress() + positionOffset();
     }
 
+    /// The device address of `chunk`'s token ids in the input record.
+    public long tokenIdsAddress(Quantum.Chunk chunk) {
+        return tokenIdsAddress() + (long) chunk.inputOffset() * Integer.BYTES;
+    }
+
+    /// The device address of `chunk`'s start position in the input record.
+    public long positionAddress(Quantum.Chunk chunk) {
+        return positionAddress() + (long) chunk.index() * Long.BYTES;
+    }
+
     /// Fills `record` (at least [#inputByteSize] bytes) with the input record for `tokenIds` at `startPosition`.
     public void writeInput(MemorySegment record, int[] tokenIds, long startPosition) {
-        if (tokenIds.length != this.tokenCount) throw new IllegalArgumentException("token count mismatch");
+        writeInput(record, tokenIds, new long[] {startPosition});
+    }
+
+    /// As above, for a record of chunks starting at `positions`.
+    public void writeInput(MemorySegment record, int[] tokenIds, long[] positions) {
+        if (tokenIds.length != inputRows()) throw new IllegalArgumentException("token count mismatch");
+        if (positions.length != this.inputChunks) throw new IllegalArgumentException("chunk count mismatch");
         for (int index = 0; index < tokenIds.length; index++)
             record.set(ValueLayout.JAVA_INT, (long) index * Integer.BYTES, tokenIds[index]);
         for (long offset = (long) tokenIds.length * Integer.BYTES; offset < positionOffset(); offset += Integer.BYTES)
             record.set(ValueLayout.JAVA_INT, offset, 0);
-        record.set(ValueLayout.JAVA_LONG_UNALIGNED, positionOffset(), startPosition);
+        for (int index = 0; index < positions.length; index++)
+            record.set(ValueLayout.JAVA_LONG_UNALIGNED, positionOffset() + (long) index * Long.BYTES, positions[index]);
     }
 
     public int tokenCount() {

@@ -90,6 +90,17 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private boolean seedsDraft;
     /// A DFlash2 block's host copy of its proposal, queued by its selector stage.
     private DFlash2Proposal proposal;
+    /// The quantum's rows in chunks: a prompt's chunks, or one chunk of all its rows.
+    private final Chunk[] chunks;
+
+    /// One chunk of a quantum's rows: its place in the quantum, its first position, its rows, and the offset of its
+    /// rows in the quantum's input record. Only the last chunk produces logits.
+    public record Chunk(int index, long startPosition, int rows, int inputOffset, boolean last) {
+        /// The logits rows this chunk produces under `requirement`.
+        public int logitsRows(LogitsRequirement requirement) {
+            return this.last ? requirement.outputRows(this.rows) : 0;
+        }
+    }
 
     public Quantum(ExecutionPlan plan, Sequence sequence, ExecutionKind kind, long startPosition, int[] tokenIds) {
         this(plan, sequence, kind, startPosition, tokenIds, LogitsRequirement.ALL_TOKENS);
@@ -137,6 +148,66 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
         this.startPosition = startPosition;
         this.tokenIds = tokenIds.clone();
+        this.chunks = new Chunk[] {new Chunk(0, startPosition, tokenIds.length, 0, true)};
+    }
+
+    /// A prompt quantum: `tokens` from `startPosition` in chunks of `chunkRows` rows (the remainder last), run as one
+    /// graph whose chunks are copies of the view a chunk selects. Only the last chunk produces logits.
+    static Quantum prompt(
+            ExecutionPlan plan,
+            Sequence sequence,
+            long startPosition,
+            int[] tokens,
+            int chunkRows,
+            LogitsRequirement last,
+            HostLogits hostLogits) {
+        if (chunkRows <= 0) throw new IllegalArgumentException("chunkRows must be positive");
+        return new Quantum(plan, sequence, startPosition, tokens, chunkRows, last, hostLogits);
+    }
+
+    private Quantum(
+            ExecutionPlan plan,
+            Sequence sequence,
+            long startPosition,
+            int[] tokens,
+            int chunkRows,
+            LogitsRequirement last,
+            HostLogits hostLogits) {
+        this.plan = Objects.requireNonNull(plan, "plan");
+        Objects.requireNonNull(tokens, "tokens");
+        if (startPosition < 0 || tokens.length == 0) throw new IllegalArgumentException("invalid token range");
+        this.kind = ExecutionKind.PREFILL;
+        this.shape = plan.forExecution(ExecutionKind.PREFILL, Math.min(chunkRows, tokens.length));
+        this.logitsRequirement = Objects.requireNonNull(last, "last");
+        if (last == LogitsRequirement.ALL_TOKENS)
+            throw new IllegalArgumentException("a prompt quantum produces at most its last chunk's logits");
+        if (hostLogits != null && last == LogitsRequirement.NONE)
+            throw new IllegalArgumentException("host logits require a logits row");
+        this.hostLogits = hostLogits;
+        this.sequence = Objects.requireNonNull(sequence, "sequence");
+        this.startPosition = startPosition;
+        this.tokenIds = tokens.clone();
+        int count = (tokens.length + chunkRows - 1) / chunkRows;
+        this.chunks = new Chunk[count];
+        for (int index = 0; index < count; index++) {
+            int offset = index * chunkRows;
+            int rows = Math.min(chunkRows, tokens.length - offset);
+            this.chunks[index] = new Chunk(index, startPosition + offset, rows, offset, index == count - 1);
+        }
+    }
+
+    /// Chunk `index` of the quantum's rows.
+    public Chunk chunk(int index) {
+        return this.chunks[index];
+    }
+
+    public int chunkCount() {
+        return this.chunks.length;
+    }
+
+    /// The most rows one chunk has: what the workspace holds at a time.
+    public int chunkRows() {
+        return this.chunks[0].rows();
     }
 
     /// The plan whose weights this quantum runs.
@@ -419,8 +490,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             if (end < 0) {
                 throw new IllegalArgumentException("token range overflows");
             }
-            if (shared != null && this.tokenIds.length > shared.maxRows())
-                throw new IllegalArgumentException("a quantum of " + this.tokenIds.length
+            if (shared != null && chunkRows() > shared.maxRows())
+                throw new IllegalArgumentException("a quantum of " + chunkRows()
                         + " rows exceeds the workspace sized at load for " + shared.maxRows());
             int vocabulary = this.plan.weights().config().vocabSize();
             for (int index = 0; index < this.tokenIds.length; index++) {
@@ -455,12 +526,16 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             int hidden = this.plan.weights().config().hiddenSize();
             if (shared == null)
                 this.workspace = this.shape.hasFirstLayer()
-                        ? new Workspace(storage, this.tokenIds.length, this.shape, this.logitsRequirement)
-                        : new Workspace(storage, this.tokenIds.length, hidden, this.shape.projectionWidths());
+                        ? new Workspace(storage, chunkRows(), this.shape, this.logitsRequirement)
+                                .withInput(this.tokenIds.length, this.chunks.length)
+                        : new Workspace(storage, chunkRows(), hidden, this.shape.projectionWidths())
+                                .withInput(this.tokenIds.length, this.chunks.length);
             else
                 this.workspace = this.shape.hasFirstLayer()
-                        ? Workspace.bound(shared, storage, this.tokenIds.length, this.shape, this.logitsRequirement)
-                        : Workspace.bound(shared, storage, this.tokenIds.length, hidden, this.shape.projectionWidths());
+                        ? Workspace.bound(shared, storage, chunkRows(), this.shape, this.logitsRequirement)
+                                .withInput(this.tokenIds.length, this.chunks.length)
+                        : Workspace.bound(shared, storage, chunkRows(), hidden, this.shape.projectionWidths())
+                                .withInput(this.tokenIds.length, this.chunks.length);
             this.workspace.allocateBuffers();
             uploadInput(gpu);
             return true;
@@ -477,7 +552,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private void uploadInput(ExecutionGpu gpu) {
         ExecutionGpu.UploadBuffer upload = gpu.allocateUploadBuffer(this.workspace.inputByteSize());
         this.inputUpload = upload;
-        this.workspace.writeInput(upload.segment(), this.tokenIds, this.startPosition);
+        long[] positions = new long[this.chunks.length];
+        for (int index = 0; index < positions.length; index++) positions[index] = this.chunks[index].startPosition();
+        this.workspace.writeInput(upload.segment(), this.tokenIds, positions);
         gpu.copyUploadToDevice(this.workspace.tokenIdsAddress(), upload);
     }
 
