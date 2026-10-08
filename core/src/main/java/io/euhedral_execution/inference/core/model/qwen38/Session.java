@@ -380,7 +380,7 @@ public final class Session implements GenerationSession {
 
     /// One call: prefix restore, prefill chunks with their checkpoints, then one decode quantum per token (or a
     /// speculative strategy's steps), in the order of the sequential loop.
-    private final class Call extends Generation implements PromptSink {
+    private final class Call extends Generation implements PromptSink, PrefixCache.Steps {
         private final int maxNewTokens;
         private final Consumer<String> text;
         private final TokenConstraint constraint;
@@ -405,13 +405,13 @@ public final class Session implements GenerationSession {
         /// positions of the sequence, so nothing it holds may be stored under its tokens.
         private volatile PrefixNode cursor;
 
+        // Written by the prefix cache's frames, then read by the Select they throw.
         private PrefixCache.Hit hit;
         private SpeculativeCheckpoint speculativeState;
         private long restoreStarted;
-        // Written by a copy's completion, then read by the Select it throws.
-        private volatile boolean restored;
-        private volatile Throwable copyFailure;
-        private volatile PrefixNode captured;
+        private boolean restored;
+        private Throwable copyFailure;
+        private PrefixNode captured;
 
         Call(
                 int maxNewTokens,
@@ -468,24 +468,46 @@ public final class Session implements GenerationSession {
                 start(this.prompt);
                 return;
             }
-            this.hit = cache.lookup(this.promptTokenIds);
-            this.cursor = this.hit == null ? cache.root() : this.hit.cursor();
-            start(this.hit == null ? this.prompt : this.restore);
+            start(this.lookup);
         }
 
-        /// Restores the longest stored prefix of the prompt; the copy's completion throws the Select.
+        @Override
+        public void found(PrefixCache.Hit found) {
+            this.hit = found;
+            this.cursor = found == null ? prefixCache.root() : found.cursor();
+        }
+
+        @Override
+        public void restored(boolean done, Throwable failure) {
+            this.restored = done;
+            this.copyFailure = failure;
+        }
+
+        @Override
+        public void captured(PrefixNode node, Throwable failure) {
+            this.captured = failure == null ? node : null;
+        }
+
+        /// Finds the longest stored prefix of the prompt on the cache's owner, which throws the Select.
+        private final StepPort lookup = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                prefixCache.lookup(promptTokenIds, null, Call.this, select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                return hit == null ? prompt : restore;
+            }
+        };
+
+        /// Restores the longest stored prefix of the prompt; the cache's frame that releases the hit throws the
+        /// Select.
         private final StepPort restore = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                PrefixCache cache = prefixCache;
-                PrefixCache.Hit stored = hit;
                 restoreStarted = System.nanoTime();
-                cache.restore(runtime.frames(), plan, sequence, stored).whenComplete((done, failure) -> {
-                    cache.release(stored);
-                    restored = Boolean.TRUE.equals(done);
-                    copyFailure = failure;
-                    skip(select);
-                });
+                prefixCache.restore(plan, sequence, hit, null, Call.this, select);
             }
 
             @Override
@@ -537,12 +559,7 @@ public final class Session implements GenerationSession {
         private final StepPort capture = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                prefixCache
-                        .capture(runtime.frames(), sequence, cursor, promptTokenIds, end)
-                        .whenComplete((node, failure) -> {
-                            captured = failure == null ? node : null;
-                            skip(select);
-                        });
+                prefixCache.capture(sequence, cursor, promptTokenIds, end, null, Call.this, select);
             }
 
             @Override
@@ -715,35 +732,35 @@ public final class Session implements GenerationSession {
             }
             // A speculative prompt restores only through checkpoints that hold its strategy's state, and stores them.
             this.speculativeState = speculative.checkpoint();
-            this.hit = cache.lookup(this.promptTokenIds, this.speculativeState);
-            this.cursor = this.hit == null ? cache.root() : this.hit.cursor();
-            if (this.hit == null) {
-                start(speculative.start(
-                        this.promptTokenIds,
-                        this.maxNewTokens,
-                        this::speculativeToken,
-                        this.timing,
-                        this::checkpoint,
-                        0,
-                        this::speculativeEnded));
-                return;
-            }
-            start(this.speculativeRestore);
+            start(this.speculativeLookup);
         }
+
+        /// Finds the longest stored prefix that holds the strategy's state, on the cache's owner.
+        private final StepPort speculativeLookup = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                prefixCache.lookup(promptTokenIds, speculativeState.kind(), Call.this, select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                if (hit != null) return speculativeRestore;
+                return speculative.start(
+                        promptTokenIds,
+                        maxNewTokens,
+                        Call.this::speculativeToken,
+                        timing,
+                        Call.this::checkpoint,
+                        0,
+                        Call.this::speculativeEnded);
+            }
+        };
 
         private final StepPort speculativeRestore = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                PrefixCache cache = prefixCache;
-                PrefixCache.Hit stored = hit;
                 restoreStarted = System.nanoTime();
-                cache.restore(runtime.frames(), plan, sequence, stored, speculativeState)
-                        .whenComplete((done, failure) -> {
-                            cache.release(stored);
-                            restored = Boolean.TRUE.equals(done);
-                            copyFailure = failure;
-                            skip(select);
-                        });
+                prefixCache.restore(plan, sequence, hit, speculativeState, Call.this, select);
             }
 
             @Override
@@ -766,19 +783,24 @@ public final class Session implements GenerationSession {
             }
         };
 
-        /// The prefix cache's hook after a speculative chunk: stores a checkpoint when the cache wants one there.
-        private void checkpoint(int end, Consumer<Throwable> done) {
+        /// The prefix cache's hook after a speculative chunk: stores a checkpoint when the cache wants one there,
+        /// tells `failed` what went wrong (null: nothing), then throws `next`.
+        private void checkpoint(int end, Consumer<Throwable> failed, AbstractFrame next) {
             PrefixCache cache = prefixCache;
             PrefixNode attachedTo = this.cursor;
             if (end <= attachedTo.position() || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) {
-                done.accept(null);
+                failed.accept(null);
+                skip(next);
                 return;
             }
-            cache.capture(runtime.frames(), sequence, attachedTo, this.promptTokenIds, end, this.speculativeState)
-                    .whenComplete((node, failure) -> {
-                        if (failure == null) this.cursor = node;
-                        done.accept(failure);
-                    });
+            PrefixCache.Steps steps = new PrefixCache.Steps() {
+                @Override
+                public void captured(PrefixNode node, Throwable failure) {
+                    if (failure == null) Call.this.cursor = node;
+                    failed.accept(failure);
+                }
+            };
+            cache.capture(sequence, attachedTo, this.promptTokenIds, end, this.speculativeState, steps, next);
         }
 
         private void speculativeToken(int token) {

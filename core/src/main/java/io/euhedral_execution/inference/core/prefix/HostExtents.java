@@ -4,14 +4,16 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /// First-fit allocator of byte extents over a fixed range, in units of [#ALIGNMENT]. It owns no memory; it
-/// hands out offsets into whatever arena the caller maps over the range. Thread-safe.
+/// hands out offsets into whatever arena the caller maps over the range. Not thread-safe: confined to its owner (the
+/// prefix cache's owner frames); [#freeBytes] and [#usedBytes] may be read from anywhere.
 public final class HostExtents {
     public static final long ALIGNMENT = 4096;
 
     private final long totalBytes;
     // Free extents by offset, never adjacent: neighbours are merged when an extent is freed.
     private final TreeMap<Long, Long> free = new TreeMap<>();
-    private long freeBytes;
+    /// Written by the owner only; read by statistics from any thread.
+    private volatile long freeBytes;
 
     public HostExtents(long totalBytes) {
         if (totalBytes < 0) throw new IllegalArgumentException("totalBytes must not be negative");
@@ -22,7 +24,7 @@ public final class HostExtents {
 
     /// Reserves `bytes`, rounded up to the alignment, and returns its offset, or -1 when no free extent is
     /// large enough.
-    public synchronized long allocate(long bytes) {
+    public long allocate(long bytes) {
         if (bytes <= 0) throw new IllegalArgumentException("bytes must be positive");
         long size = roundUp(bytes);
         for (Map.Entry<Long, Long> entry : this.free.entrySet()) {
@@ -38,7 +40,7 @@ public final class HostExtents {
     }
 
     /// Returns an extent that [#allocate] handed out, with the size it was allocated with.
-    public synchronized void free(long offset, long bytes) {
+    public void free(long offset, long bytes) {
         long size = roundUp(bytes);
         if (offset < 0 || offset % ALIGNMENT != 0 || size <= 0 || offset + size > this.totalBytes)
             throw new IllegalArgumentException("extent lies outside the range");
@@ -63,11 +65,11 @@ public final class HostExtents {
         this.freeBytes += size;
     }
 
-    public synchronized long freeBytes() {
+    public long freeBytes() {
         return this.freeBytes;
     }
 
-    public synchronized long usedBytes() {
+    public long usedBytes() {
         return this.totalBytes - this.freeBytes;
     }
 

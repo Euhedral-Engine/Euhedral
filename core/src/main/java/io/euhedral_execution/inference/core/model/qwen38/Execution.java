@@ -4,7 +4,6 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.PromptSink;
@@ -241,11 +240,6 @@ public final class Execution implements AutoCloseable {
     /// Runs `work` as one frame on the lattice's workers; the future completes on that worker.
     public <T> CompletableFuture<T> onWorker(Supplier<T> work) {
         return this.hostTasks.onWorker(work);
-    }
-
-    /// Host work for the prefix cache: each piece runs as one frame on the lattice's workers.
-    public PrefixFrames frames() {
-        return this.hostTasks.prefixFrames();
     }
 
     public EuhedralInferenceRuntime runtime() {

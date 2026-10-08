@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
@@ -29,12 +30,11 @@ public interface SpeculativeDecoding extends AutoCloseable {
     }
 
     /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk, once the
-    /// strategy's own state covers it and before the next chunk changes it. `done` runs once the cache is
-    /// finished with the sequence's state, with the failure that stopped it or null, on any thread; it must not
-    /// block.
+    /// strategy's own state covers it and before the next chunk changes it. Once the cache is finished with the
+    /// sequence's state it tells `failed` what stopped it (null: nothing) and then throws `next`.
     @FunctionalInterface
     interface PrefixHooks {
-        void afterChunk(int end, Consumer<Throwable> done);
+        void afterChunk(int end, Consumer<Throwable> failed, AbstractFrame next);
     }
 
     /// The first step of a speculative generation: prefills `prompt` from `startPosition` (0 for a fresh

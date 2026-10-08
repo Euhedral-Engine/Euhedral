@@ -467,10 +467,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
         private final StepPort capture = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                hooks.afterChunk(end, failure -> {
-                    captureFailure = failure;
-                    runtime.lake().publish(select);
-                });
+                hooks.afterChunk(end, failure -> captureFailure = failure, select);
             }
 
             @Override

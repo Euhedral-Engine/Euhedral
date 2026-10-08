@@ -189,9 +189,13 @@ class ArchitectureTest {
     /// `whenComplete` each until the cache becomes frames.
     @Test
     void generationRunsAsFramesWithoutFutureChainsOrLocks() throws IOException {
-        Pattern forbidden =
-                Pattern.compile("\\.then(Compose|Apply|Accept|Run|Combine)(Async)?\\(|\\bsynchronized\\s*\\("
+        Pattern forbidden = Pattern.compile(
+                "\\.then(Compose|Apply|Accept|Run|Combine)(Async)?\\(|\\.whenComplete(Async)?\\(|\\bsynchronized\\s*\\("
                         + "|\\bReentrantLock\\b|\\bSemaphore\\b|\\bBlockingQueue\\b|\\.wait\\(");
+        // The prefix cache is owner frames and device-completion frames: no futures, and no lock but its close.
+        Pattern prefixForbidden = Pattern.compile("\\bCompletableFuture\\b|\\bsynchronized\\b(?!.*\\bclose\\(\\))");
+        List<Path> prefix = new ArrayList<>(javaFiles("prefix", false));
+        prefix.addAll(javaFiles("model/qwen38/prefix", false));
         List<Path> files = new ArrayList<>(javaFiles("generation", false));
         files.add(MAIN.resolve("model/qwen38/Session.java"));
         files.add(MAIN.resolve("model/qwen38/Emission.java"));
@@ -205,6 +209,15 @@ class ArchitectureTest {
                 String code = lines.get(i).strip();
                 if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
                 if (forbidden.matcher(code).find()) violations.add(relative(file) + ":" + (i + 1) + ": " + code);
+            }
+        }
+        for (Path file : prefix) {
+            List<String> lines = Files.readAllLines(file);
+            for (int i = 0; i < lines.size(); i++) {
+                String code = lines.get(i).strip();
+                if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
+                if (forbidden.matcher(code).find() || prefixForbidden.matcher(code).find())
+                    violations.add(relative(file) + ":" + (i + 1) + ": " + code);
             }
         }
         assertTrue(

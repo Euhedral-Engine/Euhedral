@@ -5,7 +5,7 @@ import java.util.List;
 
 /// One stored checkpoint: the sequence state at `position`, whose parent holds the state at `startPosition`.
 /// The node owns the extent that holds its bytes; what the bytes mean is the layout's business. Its mutable
-/// fields belong to the owning [PrefixTree] and are guarded by its monitor.
+/// fields belong to the owning [PrefixTree] and are confined to its owner.
 public final class PrefixNode {
     private final PrefixNode parent;
     private final int startPosition;
@@ -48,6 +48,11 @@ public final class PrefixNode {
     /// defines it), or null. It is usable only with an unbroken chain of ancestors of the same kind.
     public String speculation() {
         return this.speculation;
+    }
+
+    /// Whether a lookup's match holds the node (owner frames, or tests after them).
+    public boolean pinned() {
+        return this.pins > 0;
     }
 
     public long extentOffset() {

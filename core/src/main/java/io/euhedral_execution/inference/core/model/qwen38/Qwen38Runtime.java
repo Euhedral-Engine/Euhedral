@@ -76,7 +76,7 @@ public final class Qwen38Runtime implements ModelRuntime {
         Execution execution = new Execution(lattice, plan, gpu);
         var identity = identity(config.artifactPath(), artifact, model);
         // Last, so nothing that can fail follows the pinned arena.
-        PrefixCache prefixCache = openPrefixCache(config, gpu, plan);
+        PrefixCache prefixCache = openPrefixCache(config, gpu, plan, execution);
         return new Qwen38Runtime(
                 Objects.requireNonNull(tokenizer, "tokenizer"),
                 gpu,
@@ -90,11 +90,16 @@ public final class Qwen38Runtime implements ModelRuntime {
 
     /// The cache is an optimisation: when it is off, the plan is not a full model, or its host memory cannot be
     /// pinned, the model serves without it.
-    private static PrefixCache openPrefixCache(InferenceConfig config, ExecutionGpu gpu, ExecutionPlan plan) {
+    private static PrefixCache openPrefixCache(
+            InferenceConfig config, ExecutionGpu gpu, ExecutionPlan plan, Execution execution) {
         if (config.prefixCacheBytes() == 0 || plan.weights().layers().length <= 1) return null;
         try {
             PrefixCache cache = PrefixCache.create(
-                    gpu, plan.weights().config(), config.prefixCacheBytes(), config.prefixCacheCheckpointTokens());
+                    gpu,
+                    execution.lake(),
+                    plan.weights().config(),
+                    config.prefixCacheBytes(),
+                    config.prefixCacheCheckpointTokens());
             LOG.info(
                     "Prefix cache: {} MiB pinned, a checkpoint every {} tokens",
                     config.prefixCacheBytes() >> 20,

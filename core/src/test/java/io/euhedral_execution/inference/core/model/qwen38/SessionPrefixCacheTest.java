@@ -73,7 +73,8 @@ class SessionPrefixCacheTest {
                 "PrefixCacheSessionTestLattice-" + LATTICE_ID.incrementAndGet(), cpus, Duration.ofSeconds(10), shard));
         var runtime = new Execution(lattice, plan, gpu);
         Arena arena = Arena.ofShared();
-        var cache = new PrefixCache(gpu, weights.config(), arena.allocate(cacheBytes), arena::close, interval);
+        var cache = new PrefixCache(
+                gpu, runtime.lake(), weights.config(), arena.allocate(cacheBytes), arena::close, interval);
         lattice.start();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         while (lattice.getActiveWorkers() < 1 && System.nanoTime() < deadline) Thread.onSpinWait();
