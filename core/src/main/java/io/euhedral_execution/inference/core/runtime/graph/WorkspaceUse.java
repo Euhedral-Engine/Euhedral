@@ -14,8 +14,7 @@ public final class WorkspaceUse {
     }
 
     public static WorkspaceUse of(GraphShape shape) {
-        int[][][] analysis =
-                AccessAnalysis.of(shape.topology(), shape::workspaceBuffers, shape.workspaceBufferCount());
+        int[][][] analysis = AccessAnalysis.of(shape.topology(), shape::workspaceBuffers, shape.workspaceBufferCount());
         return new WorkspaceUse(analysis[0], analysis[1]);
     }
 

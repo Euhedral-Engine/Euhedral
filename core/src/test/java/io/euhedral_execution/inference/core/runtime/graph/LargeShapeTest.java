@@ -51,7 +51,8 @@ class LargeShapeTest {
                 List<Integer> producers = new ArrayList<>();
                 for (int earlier = Math.max(0, stage - 12); earlier < stage; earlier++)
                     if (random.nextInt(4) == 0) producers.add(earlier);
-                dependencies[stage] = producers.stream().mapToInt(Integer::intValue).toArray();
+                dependencies[stage] =
+                        producers.stream().mapToInt(Integer::intValue).toArray();
                 List<Integer> touched = new ArrayList<>();
                 for (int buffer = 0; buffer < count; buffer++) if (random.nextInt(5) == 0) touched.add(buffer);
                 buffers[stage] = touched.stream().mapToInt(Integer::intValue).toArray();
@@ -71,7 +72,8 @@ class LargeShapeTest {
                 for (int stage = 0; stage < stages; stage++)
                     for (int b : buffers[stage]) if (b == buffer) all.set(stage);
                 BitSet reached = new BitSet(stages);
-                for (int stage = all.nextSetBit(0); stage >= 0; stage = all.nextSetBit(stage + 1)) reached.or(below[stage]);
+                for (int stage = all.nextSetBit(0); stage >= 0; stage = all.nextSetBit(stage + 1))
+                    reached.or(below[stage]);
                 List<Integer> entries = new ArrayList<>(), exits = new ArrayList<>();
                 for (int stage = all.nextSetBit(0); stage >= 0; stage = all.nextSetBit(stage + 1)) {
                     if (!reached.get(stage)) entries.add(stage);
