@@ -177,10 +177,20 @@ class GrammarConstraintTest {
         }
     }
 
+    /// Whether a token is short punctuation or digits; a token's text never changes, so each is decoded once
+    /// (0 unknown, 1 yes, 2 no), not on every step of every walk.
+    private static final byte[] STRUCTURAL = new byte[GuidanceFixtures.VOCABULARY];
+
     private static boolean isStructural(QwenTokenizer tokenizer, int id) {
-        if (tokenizer.isGenerationEosToken(id)) return false;
-        String text = tokenizer.decode(new int[] {id});
-        return text.length() <= 2 && text.chars().allMatch(c -> "\"{}[],:-0123456789aeu".indexOf(c) >= 0);
+        if (STRUCTURAL[id] == 0) {
+            boolean structural = false;
+            if (!tokenizer.isGenerationEosToken(id)) {
+                String text = tokenizer.decode(new int[] {id});
+                structural = text.length() <= 2 && text.chars().allMatch(c -> "\"{}[],:-0123456789aeu".indexOf(c) >= 0);
+            }
+            STRUCTURAL[id] = (byte) (structural ? 1 : 2);
+        }
+        return STRUCTURAL[id] == 1;
     }
 
     private static List<Integer> allowedTokens(GrammarConstraint constraint) {

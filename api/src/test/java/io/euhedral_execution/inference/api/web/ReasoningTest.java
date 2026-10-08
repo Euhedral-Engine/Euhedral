@@ -15,6 +15,7 @@ import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -22,6 +23,8 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /// Reasoning controls and the split of reasoning from the answer, against the scripted backend.
+// Contexts with equal configuration are cached and shared, backend included: one such class at a time.
+@ResourceLock("scripted-api-context")
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         properties = "euhedral.test.scripted-api=true",

@@ -13,12 +13,15 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
 /// A client that leaves stops its generation before the next quantum, however it leaves and whatever its
 /// request is doing: a JSON response being generated, a stream still prefilling its prompt, or a place in the queue.
+// Contexts with equal configuration are cached and shared, backend included: one such class at a time.
+@ResourceLock("scripted-api-context")
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
