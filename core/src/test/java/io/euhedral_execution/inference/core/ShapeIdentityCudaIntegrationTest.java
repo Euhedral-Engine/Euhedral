@@ -15,7 +15,8 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 /// Every view of each real Qwen3.8 artifact, as production loads it (residency, staging, MTP), keeps the topology and
-/// specs recorded before 3.8's views moved into shapes. Run one artifact per JVM:
+/// specs recorded before 3.8's views moved into shapes, and its prompt graph the shape recorded with it. Run one
+/// artifact per JVM:
 /// `-Peuhedral.shapes.artifacts=q3`, then `nvfp4`, `nvfp4-compressed`; `-Peuhedral.shapes.record=true` records. Without
 /// the filter the test skips (the CUDA suite runs it as a skip); a filter that names no artifact fails.
 class ShapeIdentityCudaIntegrationTest {
@@ -70,6 +71,11 @@ class ShapeIdentityCudaIntegrationTest {
         try (InferenceEngine engine = InferenceEngine.load(config)) {
             var plan = ((Qwen38Runtime) engine.modelRuntime()).plan();
             ShapeDescription.check(GOLDENS, name, ShapeDescription.views(plan));
+            // Three full chunks and a short last one, at the sessions' chunk size.
+            ShapeDescription.check(
+                    GOLDENS,
+                    name + "-prompt",
+                    ShapeDescription.prompt(plan, InferenceConfig.PREFILL_CHUNK_TOKENS, 100, 4));
         }
     }
 }
