@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -28,6 +29,8 @@ import org.junit.jupiter.api.Test;
 /// request's prefill and 1 for its decode; a prediction is `3, layer, bank, count` followed by `count` experts of the
 /// next layer ranked by its router applied to a decode step's input at the layer before (written before the block of
 /// the layer before is reported).
+/// Own JVM: records an expert trace of a whole run with a lattice of its own: opt-in.
+@ModelGroup.OwnJvm
 class DemandRecordingCudaIntegrationTest {
 
     /// Prompt lengths of the requests, in the order they arrive.

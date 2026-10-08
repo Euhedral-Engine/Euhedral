@@ -5,15 +5,15 @@ import static io.euhedral_execution.inference.core.model.qwen4.TestSupport.error
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
-import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /// The whole model on the real artifact against the upstream fixtures of the model cases (`short`,
 /// `eos`), recorded through the NVFP4 KV codec the engine's cache applies: every layer fed the
@@ -26,9 +26,11 @@ import org.junit.jupiter.api.Test;
 /// in that difference: its router sees an input one rounding step away, which can choose another
 /// expert for a near-tied token. The MoE block alone on the reference's input agrees to 3e-4
 /// (`MoeFixtureCudaIntegrationTest`), so the layer bound is 10%, not a kernel tolerance.
+@ModelGroup.FlashNext
+@Timeout(value = 5, unit = TimeUnit.MINUTES)
 class ModelFixtureCudaIntegrationTest {
 
-    private static final int CONTEXT = 8192;
+    private static final int CONTEXT = SharedFlashNext.ROOMY.context();
 
     private static int chunkCount(ReferenceFixtures fixture) {
         int count = 0;
@@ -40,16 +42,6 @@ class ModelFixtureCudaIntegrationTest {
         return Arrays.stream(fixture.i64("c" + chunk + "/tokens"))
                 .mapToInt(t -> (int) t)
                 .toArray();
-    }
-
-    private static Qwen4Model open(CudaGpuMemory gpu) throws Exception {
-        return Qwen4Model.open(
-                TestSupport.artifactPath(),
-                gpu,
-                gpu.deviceMemoryInfo().freeBytes(),
-                HostBudget.system(),
-                Mode.TEXT,
-                CONTEXT);
     }
 
     private static ReferenceFixtures fixtures(String name) throws Exception {
@@ -64,11 +56,11 @@ class ModelFixtureCudaIntegrationTest {
         for (String name : new String[] {"short", "eos"}) {
             ReferenceFixtures fixture = fixtures(name);
             TestSupport.Report report = new TestSupport.Report("layers fed their input, case " + name);
-            try (CudaGpuMemory gpu = TestSupport.openGpu();
-                    Qwen4Model model = open(gpu);
-                    TestLattice.Run run = TestLattice.shared().run(gpu, model, CONTEXT);
-                    ExecutionPlan executor = run.plan();
-                    Sequence sequence = executor.newSequence()) {
+            var loaded = SharedFlashNext.model(SharedFlashNext.ROOMY);
+            var gpu = loaded.gpu();
+            var model = loaded.model();
+            ExecutionPlan executor = loaded.plan();
+            try (Sequence sequence = executor.newSequence()) {
                 int layers = model.artifact().config().text().numLayers();
                 for (int chunk = 0; chunk < chunkCount(fixture); chunk++) {
                     int[] tokens = tokens(fixture, chunk);
@@ -94,11 +86,11 @@ class ModelFixtureCudaIntegrationTest {
         for (String name : new String[] {"short", "eos"}) {
             ReferenceFixtures fixture = fixtures(name);
             TestSupport.Report report = new TestSupport.Report("state after the attention block, case " + name);
-            try (CudaGpuMemory gpu = TestSupport.openGpu();
-                    Arena arena = Arena.ofShared();
-                    Qwen4Model model = open(gpu);
-                    TestLattice.Run run = TestLattice.shared().run(gpu, model, CONTEXT);
-                    ExecutionPlan executor = run.plan();
+            var loaded = SharedFlashNext.model(SharedFlashNext.ROOMY);
+            var gpu = loaded.gpu();
+            var model = loaded.model();
+            ExecutionPlan executor = loaded.plan();
+            try (Arena arena = Arena.ofShared();
                     Sequence sequence = executor.newSequence()) {
                 int[] chunkHolder = new int[1];
                 executor.observeMid((layer, state, rows) -> {
@@ -120,6 +112,8 @@ class ModelFixtureCudaIntegrationTest {
                     }
                     executor.finishChunk(sequence, tokens.length);
                 }
+            } finally {
+                executor.observeMid(null);
             }
             report.finish();
         }
@@ -132,11 +126,11 @@ class ModelFixtureCudaIntegrationTest {
     void theFullForwardFollowsTheReference() throws Exception {
         ReferenceFixtures fixture = fixtures("short");
         TestSupport.Report report = new TestSupport.Report("full forward, case short");
-        try (CudaGpuMemory gpu = TestSupport.openGpu();
-                Arena arena = Arena.ofShared();
-                Qwen4Model model = open(gpu);
-                TestLattice.Run run = TestLattice.shared().run(gpu, model, CONTEXT);
-                ExecutionPlan executor = run.plan();
+        var loaded = SharedFlashNext.model(SharedFlashNext.ROOMY);
+        var gpu = loaded.gpu();
+        var model = loaded.model();
+        ExecutionPlan executor = loaded.plan();
+        try (Arena arena = Arena.ofShared();
                 Sequence sequence = executor.newSequence()) {
             int vocabulary = executor.vocabularySize();
             var readback = gpu.allocateReadbackBuffer((long) vocabulary * 2);
@@ -174,6 +168,8 @@ class ModelFixtureCudaIntegrationTest {
                 assertEquals(top[0], mine[0], "greedy token of chunk " + chunk);
             }
             readback.close();
+        } finally {
+            executor.observe(null);
         }
         report.finish();
     }
