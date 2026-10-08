@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -18,6 +19,8 @@ import org.junit.jupiter.api.Timeout;
 /// Every scratch use of a prefill chunk and of decoding finds the workspace's scratch bound, sized at load: the
 /// stages that take scratch are the ones their shapes declare, and the sizes match the routes. One artifact per JVM
 /// (`-Peuhedral.scratch.artifact=q3` or `nvfp4`); skips without one.
+// Own JVM: the artifact is chosen per JVM by a system property.
+@ModelGroup.OwnJvm
 class ScratchCudaIntegrationTest {
 
     private static final String TOKENIZER =

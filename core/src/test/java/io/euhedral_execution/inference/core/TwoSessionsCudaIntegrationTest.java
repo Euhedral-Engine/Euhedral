@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -18,6 +19,8 @@ import org.junit.jupiter.api.Timeout;
 /// Two sessions on one runtime share its one workspace: one prefilling a long prompt while the other decodes. Each
 /// produces exactly the tokens it produces alone. Runs on one dense artifact (`-Peuhedral.twosessions.artifact=q3`,
 /// or `nvfp4` for host-staged weights); skips without one.
+// Own JVM: the artifact is chosen per JVM by a system property.
+@ModelGroup.OwnJvm
 class TwoSessionsCudaIntegrationTest {
 
     private static final String TOKENIZER =
