@@ -369,8 +369,19 @@ public final class MtpDecoder implements SpeculativeDecoding {
                     drainFailure = ((Quantum) step).conclusion().failure();
                     return drain;
                 }
+                if (aheadRefusal != null) {
+                    // The refusal is the cause; what the later quanta then failed on follows from it.
+                    var refused = new IllegalStateException("a prompt chunk was refused", aheadRefusal);
+                    Throwable later = ((Quantum) step).conclusion().failure();
+                    if (later != null) refused.addSuppressed(later);
+                    throw refused;
+                }
+                // A failure of an earlier quantum failed the sequence first; the later ones failed after it.
+                Throwable first = sequence.terminalFailure();
+                Quantum.Outcome outcome = ((Quantum) step).conclusion();
+                if (outcome.status() != Quantum.Status.SUCCESS && first != null && first != outcome.failure())
+                    throw new IllegalStateException("a prompt chunk failed", first);
                 succeeded(step);
-                if (aheadRefusal != null) throw new IllegalStateException("a prompt chunk was refused", aheadRefusal);
                 if (sequence.committedFrontier() != aheadEnd || mtpCache().length() != aheadEnd)
                     throw new IllegalStateException("the prompt's chunks stopped short of " + aheadEnd);
                 long executed = System.nanoTime();

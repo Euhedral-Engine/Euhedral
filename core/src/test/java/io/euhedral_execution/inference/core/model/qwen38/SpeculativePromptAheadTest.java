@@ -68,6 +68,35 @@ class SpeculativePromptAheadTest {
         }
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void repeatedLongMtpPromptsOnOneRuntimeRunAheadInOrder() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.mtpCompactWeights(VOCABULARY));
+        var gpu = new SelectingGpu();
+        var lattice = new ExecutionFixtures.ManualLattice();
+        var runtime = new Execution(lattice, plan, gpu);
+        try {
+            for (int generation = 0; generation < 4; generation++) {
+                var sequence = new Sequence(1300 + generation);
+                List<List<Integer>> ended = new ArrayList<>();
+                try (var decoder = new MtpDecoder(runtime, plan, gpu, sequence, token -> false, 1, CHUNK)) {
+                    StepPort first = decoder.start(new int[39], 3, token -> {}, null, null, 0, ended::add);
+                    var select = new Captured();
+                    first.admit(select);
+                    drive(first, select, lattice);
+                    assertEquals(1, ended.size(), "generation " + generation);
+                } finally {
+                    lattice.drive();
+                    if (!sequence.inFlight()) sequence.complete();
+                }
+            }
+        } finally {
+            lattice.drive();
+            runtime.close();
+            lattice.drive();
+        }
+    }
+
     /// Runs the generation's ports to the end, as the generation frames do: `port` was admitted with `select`.
     private static void drive(StepPort port, Captured select, ExecutionFixtures.ManualLattice lattice)
             throws Exception {
