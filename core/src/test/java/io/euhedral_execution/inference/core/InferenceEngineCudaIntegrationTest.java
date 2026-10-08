@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -15,9 +16,12 @@ import java.util.BitSet;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+/// Loads an engine of its own, because it checks that closing the engine frees every device allocation, which a
+/// shared engine cannot show before the run ends.
+@ModelGroup.CompactQ3Engine
 class InferenceEngineCudaIntegrationTest {
     @Test
-    @Timeout(1800)
+    @Timeout(120)
     void highLevelGenerationRestoresSessionAndEngineDeviceMemory() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)));
@@ -31,6 +35,7 @@ class InferenceEngineCudaIntegrationTest {
         for (int cpu = available.nextSetBit(0); cpu >= 0 && cpus.cardinality() < 2; cpu = available.nextSetBit(cpu + 1))
             cpus.set(cpu);
         assumeTrue(cpus.cardinality() == 2);
+        CoreEngines.releaseDevice();
         var config = new InferenceConfig(artifact, tokenizer, Path.of(library), cpus, Duration.ofSeconds(10));
         // Only records the engine's CUDA binding, whose allocations stay readable after the engine closed;
         // inference uses exclusively the public engine/session surface.
