@@ -31,6 +31,9 @@ public final class ShapeDescription {
         var decode = plan.forExecution(Quantum.ExecutionKind.DECODE, 1);
         add(text, seen, "decode", plan, decode);
         add(text, seen, "decode-preloaded", plan, decode.preloadedVariant());
+        var verify = plan.forExecution(Quantum.ExecutionKind.VERIFY, 16);
+        add(text, seen, "verify", plan, verify);
+        add(text, seen, "verify-preloaded", plan, verify.preloadedVariant());
         add(text, seen, "small-prefill", plan, plan.forExecution(Quantum.ExecutionKind.PREFILL, 1));
         add(text, seen, "region-prefill", plan, plan.forExecution(Quantum.ExecutionKind.PREFILL, 64));
         if (plan.drafts() || plan.draftsWithDFlash2())
