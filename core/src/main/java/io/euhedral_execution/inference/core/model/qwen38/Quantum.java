@@ -159,7 +159,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     }
 
     /// A prompt quantum: `tokens` from `startPosition` in chunks of `chunkRows` rows (the remainder last), run as one
-    /// graph whose chunks are copies of the view a chunk selects. Only the last chunk produces logits.
+    /// graph whose chunks are copies of the view a chunk selects. Only the last chunk produces logits. The graph
+    /// binds one view's workspace, so its last chunk must select the same view as the others: a shorter remainder
+    /// that selects another (the small prefill view) runs as a quantum of its own.
     static Quantum prompt(
             ExecutionPlan plan,
             Sequence sequence,
@@ -169,6 +171,13 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             LogitsRequirement last,
             HostLogits hostLogits) {
         if (chunkRows <= 0) throw new IllegalArgumentException("chunkRows must be positive");
+        int rest = tokens.length % chunkRows;
+        if (tokens.length > chunkRows
+                && rest != 0
+                && plan.forExecution(ExecutionKind.PREFILL, rest)
+                        != plan.forExecution(ExecutionKind.PREFILL, chunkRows))
+            throw new IllegalArgumentException(
+                    "a prompt's last chunk of " + rest + " rows selects another view than its chunks of " + chunkRows);
         return new Quantum(plan, sequence, startPosition, tokens, chunkRows, last, hostLogits);
     }
 

@@ -552,9 +552,9 @@ public final class Session implements GenerationSession {
         private final StepPort prompt = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                end = promptTokenIds.length;
+                end = promptEnd();
                 started = timing == null ? 0L : System.nanoTime();
-                samples = maxNewTokens > 0;
+                samples = maxNewTokens > 0 && end == promptTokenIds.length;
                 int[] rows = Arrays.copyOfRange(promptTokenIds, offset, end);
                 LogitsRequirement logits = samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE;
                 Quantum quantum = rows.length > prefillChunkTokens || checkpoints != null
@@ -649,16 +649,29 @@ public final class Session implements GenerationSession {
         /// The chunk boundaries after `offset`, up to the prompt's end, where the prefix cache takes a checkpoint.
         private int[] wantedCheckpoints() {
             int length = this.promptTokenIds.length;
+            int end = promptEnd();
             PrefixCache cache = prefixCache;
             List<Integer> positions = new ArrayList<>();
-            for (int boundary = Math.min(this.offset + prefillChunkTokens, length);
+            for (int boundary = Math.min(this.offset + prefillChunkTokens, end);
                     ;
-                    boundary = Math.min(boundary + prefillChunkTokens, length)) {
+                    boundary = Math.min(boundary + prefillChunkTokens, end)) {
                 if (boundary > this.cursor.position() && cache.wantsCheckpoint(boundary, length))
                     positions.add(boundary);
-                if (boundary == length) break;
+                if (boundary == end) break;
             }
             return positions.stream().mapToInt(Integer::intValue).toArray();
+        }
+
+        /// Where the next prompt quantum ends: the prompt's end, unless its last chunk would select another
+        /// view than its full chunks (a short one: the small prefill view). A prompt graph binds one view's
+        /// workspace, so it then stops at the last full chunk, and the rest follows as a quantum of its own.
+        private int promptEnd() {
+            int length = this.promptTokenIds.length;
+            int rows = length - this.offset;
+            int rest = rows % prefillChunkTokens;
+            if (rows <= prefillChunkTokens || rest == 0) return length;
+            Shape full = plan.forExecution(Quantum.ExecutionKind.PREFILL, prefillChunkTokens);
+            return plan.forExecution(Quantum.ExecutionKind.PREFILL, rest) == full ? length : length - rest;
         }
 
         private StepPort prefillNext() {
