@@ -6,7 +6,6 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.List;
-import java.util.Map;
 
 public final class EngineExecutionFixture {
     public static Weights weights() {
@@ -24,7 +23,9 @@ public final class EngineExecutionFixture {
     public static class SamplingGpu extends ExecutionFixtures.RecordingGpu {
         public final List<Long> embeddingAddresses = new java.util.concurrent.CopyOnWriteArrayList<>();
         private final int vocabularySize;
-        private final Map<Long, int[]> uploadedTokenIds = new java.util.concurrent.ConcurrentHashMap<>();
+        /// Each upload's ints by its device address; a later chunk's token ids sit inside a prompt's record.
+        private final java.util.concurrent.ConcurrentSkipListMap<Long, int[]> uploadedTokenIds =
+                new java.util.concurrent.ConcurrentSkipListMap<>();
         public final List<int[]> embeddingInputs = new java.util.concurrent.CopyOnWriteArrayList<>();
         public final List<Long> allocatedLogits = new java.util.concurrent.CopyOnWriteArrayList<>();
         private final List<Long> closedLogits = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -134,10 +135,19 @@ public final class EngineExecutionFixture {
                 int tokenCount,
                 int vocabularySize,
                 int hiddenSize) {
-            int[] record = this.uploadedTokenIds.get(tokenIdsAddress);
-            if (record == null) throw new IllegalStateException("embedding did not receive uploaded token IDs");
-            // The input record carries the token IDs, then the start position.
-            int[] tokenIds = java.util.Arrays.copyOf(record, tokenCount);
+            // The nearest upload at or below the address that holds every row: fixture addresses are not spaced
+            // by allocation size, so another upload may sit between a prompt record's start and a later chunk.
+            int[] tokenIds = null;
+            for (var upload : this.uploadedTokenIds
+                    .headMap(tokenIdsAddress, true)
+                    .descendingMap()
+                    .entrySet()) {
+                long first = (tokenIdsAddress - upload.getKey()) / Integer.BYTES;
+                if (first + tokenCount > upload.getValue().length) continue;
+                tokenIds = java.util.Arrays.copyOfRange(upload.getValue(), (int) first, (int) first + tokenCount);
+                break;
+            }
+            if (tokenIds == null) throw new IllegalStateException("embedding did not receive uploaded token IDs");
             this.embeddingInputs.add(tokenIds.clone());
             this.embeddingAddresses.add(embeddingAddress);
             this.lastTokenCount = tokenCount;

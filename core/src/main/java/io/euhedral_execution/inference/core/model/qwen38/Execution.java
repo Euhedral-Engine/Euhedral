@@ -44,6 +44,8 @@ public final class Execution implements AutoCloseable {
     private final Object closeLock = new Object();
     /// The runtime's one workspace, sized at load.
     private final SharedWorkspace shared;
+    /// The prompt graphs' shapes; confined to the workspace's owner.
+    private final PromptShapes prompts;
     private boolean closed;
 
     /// An execution whose lane pool has one lane per available processor.
@@ -85,6 +87,7 @@ public final class Execution implements AutoCloseable {
                 gpu,
                 new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs),
                 SharedWorkspace.bufferCount(this.plan));
+        this.prompts = new PromptShapes(this.runtime);
     }
 
     /// The rows the workspace holds: the largest quantum it admits.
@@ -198,9 +201,11 @@ public final class Execution implements AutoCloseable {
                     this.plan.prefetchedSlots(),
                     slot -> owner.last(SharedWorkspace.stagingBuffer(this.plan, slot)))) view = preloaded;
         }
+        // A prompt of several chunks runs as one graph of them.
+        GraphShape admitted = context.chunkCount() > 1 ? this.prompts.shape(context) : view;
         try {
             this.runtime.admit(
-                    view,
+                    admitted,
                     context,
                     (stream, storage) ->
                             context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage, this.shared));
