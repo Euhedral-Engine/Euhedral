@@ -24,14 +24,20 @@ import java.util.Objects;
 /// quantum may read them, because stream order runs those reads after the writes. `length` is the
 /// committed frontier, published only after the quantum's device work retired; other quanta and
 /// external readers see nothing beyond it.
+///
+/// Two sides write it, each one at a time: appends (`prepareAppend`, `appendSubmitted`), which the carried KV edges
+/// order across a sequence's quanta, own the pages, the table, the submitted frontier and the table staging;
+/// conclusions (the commits and discards), which the sequence runs in admission order, own `length`. A later
+/// quantum's append may run while an earlier one concludes, so a conclusion touches nothing the appends own
+/// except, between quanta, the submitted frontier.
 public final class AttentionKvState implements AutoCloseable {
     public static final int PAGE_TOKENS = 256;
     public static final int HEAD_ROW_BYTES = 144;
     private final ExecutionGpu gpu;
     private final long planePageBytes;
     private final List<Long> pages = new ArrayList<>();
-    /// Table uploads' staging, each with the frontier its append reaches: released once that append settled, so a
-    /// later quantum's queued upload keeps its staging while an earlier quantum commits.
+    /// Table uploads' staging, each with the frontier its append reaches. The appends release what a committed
+    /// append queued; the close releases the rest.
     private final List<Pending> pendingStaging = new ArrayList<>();
 
     private record Pending(long upTo, ExecutionGpu.UploadBuffer staging) {}
@@ -40,7 +46,8 @@ public final class AttentionKvState implements AutoCloseable {
     private int tableSlots;
     private int capacity;
     private int submittedLength;
-    private int length;
+    /// Written by conclusions, read by appends.
+    private volatile int length;
     private long decodeScratch;
     private int scratchHeads;
     private boolean closed;
@@ -62,6 +69,7 @@ public final class AttentionKvState implements AutoCloseable {
             throw new IllegalArgumentException("KV append must continue the submitted frontier at "
                     + this.submittedLength + ", not " + startPosition);
         int required = Math.toIntExact(Math.addExact(startPosition, tokenCount));
+        releaseRetired(this.length);
         if (required <= this.capacity) return;
         int count = Math.toIntExact(((long) required + PAGE_TOKENS - 1) / PAGE_TOKENS);
         int nextCapacity = Math.toIntExact((long) count * PAGE_TOKENS);
@@ -126,7 +134,6 @@ public final class AttentionKvState implements AutoCloseable {
     public void commitSubmitted() {
         ensureOpen();
         this.length = this.submittedLength;
-        releaseRetired(this.length);
     }
 
     /// Publishes the `rows` rows a quantum appended, every one of them, once its device work retired. Rows a later
@@ -136,7 +143,6 @@ public final class AttentionKvState implements AutoCloseable {
         if (rows < 0 || (long) this.length + rows > this.submittedLength)
             throw new IllegalArgumentException("committed rows exceed the submitted frontier");
         this.length += rows;
-        releaseRetired(this.length);
     }
 
     /// Publishes only the first `rows` submitted rows (a speculative verification's accepted prefix);
@@ -145,27 +151,16 @@ public final class AttentionKvState implements AutoCloseable {
         ensureOpen();
         if (rows < 0 || (long) this.length + rows > this.submittedLength)
             throw new IllegalArgumentException("committed rows exceed the submitted frontier");
-        long submitted = this.submittedLength;
         this.length += rows;
         this.submittedLength = this.length;
-        releaseRetired(submitted);
     }
 
-    /// Drops a submitted frontier that must not become visible, such as a failed quantum's. Called
-    /// after the quantum's device work retired, so it also releases what the reservation retired.
+    /// Drops a submitted frontier that must not become visible, such as a failed quantum's. Called after the
+    /// quantum's device work retired. A later quantum of the sequence may still be appending: it fails behind this
+    /// one, so its rows never become visible either.
     public void discardSubmitted() {
         if (this.closed) return;
-        long submitted = this.submittedLength;
         this.submittedLength = this.length;
-        releaseRetired(submitted);
-    }
-
-    /// As [#discardSubmitted()] for a quantum whose append ends at `end`: a later quantum of the sequence may still
-    /// be in flight, so only staging of appends up to `end` is released.
-    public void discardSubmitted(long end) {
-        if (this.closed) return;
-        this.submittedLength = this.length;
-        releaseRetired(end);
     }
 
     /// Drops committed rows from `length` on (speculative MTP draft rows), between quanta. The rows stay

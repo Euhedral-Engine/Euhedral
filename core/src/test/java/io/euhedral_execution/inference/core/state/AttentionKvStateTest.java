@@ -8,7 +8,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 class AttentionKvStateTest {
     @Test
@@ -69,7 +71,7 @@ class AttentionKvStateTest {
     }
 
     @Test
-    void aLaterAppendsTableStagingOutlivesTheEarlierOnesCommit() {
+    void aCommitLeavesTableStagingToTheAppendsThatFollow() {
         RecordingGpu gpu = new RecordingGpu();
         try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
             state.prepareAppend(0, 2);
@@ -77,26 +79,63 @@ class AttentionKvStateTest {
             // A later quantum grows the table before the earlier one retired: its upload may not have run yet.
             state.prepareAppend(2, 300);
             state.appendSubmitted(300);
+            // The earlier quantum's commit runs on its conclusion's worker while the later quantum's stages may run.
             state.commitAppended(2);
-            assertEquals(1, gpu.stagingReleases, "the later quantum's upload may still read its staging");
+            assertEquals(0, gpu.stagingReleases, "a commit leaves the staging to the appends");
+            state.prepareAppend(302, 1);
+            assertEquals(1, gpu.stagingReleases, "the next append releases the committed append's staging");
+            state.appendSubmitted(1);
             state.commitAppended(300);
+            state.commitAppended(1);
+            state.prepareAppend(303, 1);
             assertEquals(2, gpu.stagingReleases);
         }
     }
 
     @Test
-    void aFailedAppendReleasesOnlyItsOwnStagingWhileALaterOneIsInFlight() {
+    void aDiscardLeavesTableStagingToTheAppendsOrTheClose() {
         RecordingGpu gpu = new RecordingGpu();
+        AttentionKvState state = new AttentionKvState(gpu, 1024);
+        state.prepareAppend(0, 2);
+        state.appendSubmitted(2);
+        state.prepareAppend(2, 300);
+        state.appendSubmitted(300);
+        state.discardSubmitted();
+        assertEquals(0, gpu.stagingReleases, "a later quantum's upload may still read its staging");
+        assertEquals(0, state.length());
+        state.close();
+        assertEquals(2, gpu.stagingReleases);
+        assertTrue(gpu.allocations.isEmpty());
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void appendsAndCommitsOnTwoThreadsKeepTheState() throws Exception {
+        RecordingGpu gpu = new RecordingGpu();
+        int rows = 40_000;
         try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {
-            state.prepareAppend(0, 2);
-            state.appendSubmitted(2);
-            state.prepareAppend(2, 300);
-            state.appendSubmitted(300);
-            state.discardSubmitted(2);
-            assertEquals(1, gpu.stagingReleases, "the later quantum's upload may still read its staging");
-            assertEquals(0, state.length());
-            state.discardSubmitted(302);
-            assertEquals(2, gpu.stagingReleases);
+            var appended = new java.util.concurrent.LinkedBlockingQueue<Integer>();
+            var commits = new Thread(() -> {
+                try {
+                    for (int row = 0; row < rows; row++) {
+                        appended.take();
+                        state.commitAppended(1);
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+            commits.setUncaughtExceptionHandler((thread, error) -> failure.set(error));
+            commits.start();
+            for (int row = 0; row < rows; row++) {
+                state.prepareAppend(row, 1);
+                state.appendSubmitted(1);
+                appended.put(row);
+            }
+            commits.join();
+            assertNull(failure.get(), () -> "commit failed: " + failure.get());
+            assertEquals(rows, state.length());
         }
     }
 
@@ -212,17 +251,18 @@ class AttentionKvStateTest {
             assertEquals(1, gpu.stagings);
             assertEquals(0, gpu.stagingReleases, "a queued upload may still read its staging");
             commit(state, 1);
-            assertEquals(1, gpu.stagingReleases, "retirement releases the staging");
+            assertEquals(0, gpu.stagingReleases, "a commit leaves the staging to the next append");
 
             state.prepareAppend(1, 256);
             long grown = state.keyCacheAddress();
             assertNotEquals(first, grown);
-            assertEquals(1, gpu.stagingReleases);
+            assertEquals(1, gpu.stagingReleases, "the next append releases the settled append's staging");
             state.appendSubmitted(256);
             state.discardSubmitted();
-            assertEquals(2, gpu.stagingReleases);
+            assertEquals(1, gpu.stagingReleases);
             assertEquals(1, state.length(), "a discarded append stays invisible");
         }
+        assertEquals(2, gpu.stagingReleases, "the close releases the rest");
         assertTrue(gpu.allocations.isEmpty());
     }
 
