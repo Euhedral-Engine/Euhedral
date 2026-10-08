@@ -106,11 +106,6 @@ public final class StageGraph implements AutoCloseable {
     private Capture recording;
     private Capture replaying;
     private final AtomicBoolean recordingBroken = new AtomicBoolean();
-    /// The current recording used device storage that other streams' quanta share, chained by this
-    /// order.
-    private final AtomicBoolean recordingShared = new AtomicBoolean();
-    private GpuStream.SharedOrdering sharedOrdering;
-    private long sharedMarker;
     /// Lanes whose shadow joined the current recording.
     private final AtomicLong shadowLanes = new AtomicLong();
     private long[] stageHashes;
@@ -664,8 +659,6 @@ public final class StageGraph implements AutoCloseable {
             return;
         }
         this.recordingBroken.set(false);
-        this.recordingShared.set(false);
-        this.sharedOrdering = new GpuStream.SharedOrdering(this.sharedMarker);
         this.shadowLanes.set(1L << this.home);
         java.util.Arrays.fill(this.stageHashes, 0L);
         this.recording = capture;
@@ -675,7 +668,6 @@ public final class StageGraph implements AutoCloseable {
         GpuStream any = this.pool.lane(this.home);
         long[] tails = new long[this.tails.length];
         try {
-            this.sharedMarker = any.openMarker();
             if (this.pool.size() > 1) {
                 this.shadowPrepared = any.openMarker();
                 for (StageFrame stage : this.stages) if (stage.marker != 0) stage.shadowMarker = any.openMarker();
@@ -747,9 +739,7 @@ public final class StageGraph implements AutoCloseable {
             stream.submit(stage, overlap);
             return;
         }
-        stream.takeRecordedShared();
-        long hash = stream.submitRecording(stage, overlap, shadow, independent, this.sharedOrdering);
-        if (stream.takeRecordedShared()) this.recordingShared.set(true);
+        long hash = stream.submitRecording(stage, overlap, shadow, independent);
         if (hash == 0) breakRecording(new IllegalStateException("stage " + stage.stage() + " could not be recorded"));
         else this.stageHashes[stage.stage()] = hash;
     }
@@ -780,7 +770,6 @@ public final class StageGraph implements AutoCloseable {
         this.recording = null;
         if (complete) {
             capture.graph = graph;
-            capture.ordered = this.recordingShared.get();
             capture.hashes = this.stageHashes.clone();
             return;
         }
@@ -798,8 +787,8 @@ public final class StageGraph implements AutoCloseable {
         // Every earlier graph's last accessor of a buffer this quantum touches, before anything of it runs.
         for (int slot = 0; slot < this.externalCount; slot++) if (this.awaits[slot] != 0) home.await(this.awaits[slot]);
         try {
-            if (!home.launchGraph(capture.graph, capture.ordered)) {
-                // The shared storage the capture used was replaced: this quantum runs stage by stage.
+            if (!home.launchGraph(capture.graph)) {
+                // The graph cannot run: this quantum runs stage by stage.
                 capture.diverged = true;
                 runStages();
                 return;
@@ -880,8 +869,6 @@ public final class StageGraph implements AutoCloseable {
         int sightings;
         long graph;
         long[] hashes;
-        /// Its runs are ordered with other streams' uses of shared device storage.
-        boolean ordered;
         /// Its recording broke (a submission the graph cannot repeat): it is never recorded again.
         boolean unrecordable;
         /// A replay diverged; the capture is released before the next quantum.
@@ -940,8 +927,6 @@ public final class StageGraph implements AutoCloseable {
         }
         if (this.shadowPrepared != 0) any.closeMarker(this.shadowPrepared);
         this.shadowPrepared = 0;
-        if (this.sharedMarker != 0) any.closeMarker(this.sharedMarker);
-        this.sharedMarker = 0;
         for (int lane = 0; lane < this.tails.length; lane++) {
             if (this.tails[lane] == 0) continue;
             any.closeMarker(this.tails[lane]);

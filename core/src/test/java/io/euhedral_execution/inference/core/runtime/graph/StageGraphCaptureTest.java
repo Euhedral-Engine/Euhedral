@@ -71,11 +71,7 @@ class StageGraphCaptureTest {
 
         @Override
         public long submitRecording(
-                Runnable launches,
-                boolean overlapPredecessor,
-                GpuStream shadow,
-                boolean shadowOverlap,
-                SharedOrdering shared) {
+                Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
             long[] sum = {17};
             this.hash.set(sum);
             this.shadow.set((CapturingStream) shadow);
@@ -130,7 +126,7 @@ class StageGraphCaptureTest {
         volatile boolean refuseLaunch;
 
         @Override
-        public boolean launchGraph(long graph, boolean ordered) {
+        public boolean launchGraph(long graph) {
             if (this.refuseLaunch) return false;
             this.kernels.add("graph:" + graph);
             return true;

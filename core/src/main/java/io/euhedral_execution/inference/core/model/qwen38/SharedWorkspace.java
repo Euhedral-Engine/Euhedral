@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
 import java.util.Objects;
 
@@ -9,13 +10,16 @@ import java.util.Objects;
 /// holds is refused at admission. Reuse of a slot across graphs is ordered by edges ([Shape#workspaceBuffers] and
 /// the runtime's workspace owner). The input record and the logits stay in each graph's own storage.
 ///
-/// Its buffer indexes are the [Workspace] slots.
+/// Its buffer indexes are the [Workspace] slots, then the expansion scratch.
 public final class SharedWorkspace implements AutoCloseable {
 
     private final ExecutionGpu gpu;
     private final int maxRows;
     private final long[] addresses;
     private final long[] capacities;
+    /// The expansion scratch: the largest region a declared stage of any view takes at `maxRows`; 0 when none does.
+    private long scratchAddress;
+    private final long scratchBytes;
     private boolean closed;
 
     public SharedWorkspace(ExecutionGpu gpu, ExecutionPlan plan, int maxRows) {
@@ -31,7 +35,25 @@ public final class SharedWorkspace implements AutoCloseable {
             for (int slot = 0; slot < slots; slot++)
                 this.capacities[slot] = Math.max(this.capacities[slot], bytes[slot]);
         }
+        long scratch = 0;
+        for (Shape shape : plan.shapes()) {
+            for (int stage = 0; stage < shape.topology().size(); stage++) {
+                ScratchUse use = shape.scratchUse(stage);
+                if (use == null) continue;
+                ExecutionPlan.Instruction instruction = shape.instructions().get(stage);
+                scratch = Math.max(
+                        scratch,
+                        gpu.scratchBytes(
+                                use,
+                                maxRows,
+                                instruction.inputWidth(),
+                                instruction.outputWidth(),
+                                instruction.weightLayout()));
+            }
+        }
+        this.scratchBytes = scratch;
         try {
+            if (scratch > 0) this.scratchAddress = gpu.allocate(scratch);
             for (int slot = 0; slot < slots; slot++) {
                 if (this.capacities[slot] == 0) continue;
                 long address = gpu.allocate(this.capacities[slot]);
@@ -53,8 +75,13 @@ public final class SharedWorkspace implements AutoCloseable {
         return Workspace.PROJECTION_SLOTS + projections;
     }
 
-    /// The workspace buffers a shape of `plan` may name.
+    /// The workspace buffers a shape of `plan` may name: its slots, then the expansion scratch.
     static int bufferCount(ExecutionPlan plan) {
+        return slotCount(plan) + 1;
+    }
+
+    /// The expansion scratch's buffer index.
+    static int scratchBuffer(ExecutionPlan plan) {
         return slotCount(plan);
     }
 
@@ -67,12 +94,22 @@ public final class SharedWorkspace implements AutoCloseable {
         return this.addresses[slot];
     }
 
+    /// The expansion scratch's address, or 0 when no declared stage takes scratch on this GPU.
+    long scratchAddress() {
+        return this.scratchAddress;
+    }
+
+    long scratchBytes() {
+        return this.scratchBytes;
+    }
+
     /// The rows the workspace was sized for.
     public int maxRows() {
         return this.maxRows;
     }
 
     void fingerprint(CaptureFingerprint fingerprint) {
+        fingerprint.add(this.gpu, this.scratchAddress).add(this.scratchBytes);
         for (int slot = 0; slot < this.addresses.length; slot++)
             fingerprint.add(this.gpu, this.addresses[slot]).add(this.capacities[slot]);
     }
@@ -80,7 +117,7 @@ public final class SharedWorkspace implements AutoCloseable {
     /// Device bytes the workspace holds.
     public long retainedBytes() {
         if (this.closed) return 0;
-        long total = 0;
+        long total = this.scratchAddress != 0 ? this.scratchBytes : 0;
         for (int slot = 0; slot < this.addresses.length; slot++)
             if (this.addresses[slot] != 0) total += this.capacities[slot];
         return total;
@@ -90,6 +127,14 @@ public final class SharedWorkspace implements AutoCloseable {
     @Override
     public void close() {
         RuntimeException failure = null;
+        if (this.scratchAddress != 0) {
+            try {
+                this.gpu.free(this.scratchAddress);
+                this.scratchAddress = 0;
+            } catch (RuntimeException freeFailure) {
+                failure = freeFailure;
+            }
+        }
         for (int slot = 0; slot < this.addresses.length; slot++) {
             if (this.addresses[slot] == 0) continue;
             try {

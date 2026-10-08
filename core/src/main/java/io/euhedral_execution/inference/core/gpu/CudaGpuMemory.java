@@ -20,7 +20,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -167,12 +166,12 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private volatile Boolean nvfp4Native;
     /// The stream whose launches the current thread is submitting, or null for synchronous calls.
     private final ThreadLocal<CudaStream> submitting = new ThreadLocal<>();
-    /// One device region, reused by every P2E2 route that expands its tensor for a row-split kernel.
-    /// Each use waits for the previous one through `q3ScratchEvent`, recorded on the stream that used it.
-    private final ReentrantLock q3ScratchLock = new ReentrantLock();
-    private long q3ScratchAddress;
-    private long q3ScratchBytes;
-    private long q3ScratchEvent;
+    /// The scratch region bound for the calling thread's submissions ([#withScratch]): {address, bytes, uses in
+    /// progress}. A route that needs scratch takes it; the stages that bind it are ordered by their shape's edges.
+    private static final ThreadLocal<long[]> SCRATCH = ThreadLocal.withInitial(() -> new long[3]);
+    /// Uses of scratch that found no region bound and took a private stream-ordered one.
+    private final java.util.concurrent.atomic.AtomicLong scratchFallbacks =
+            new java.util.concurrent.atomic.AtomicLong();
     private volatile boolean closed;
 
     public CudaGpuMemory(Path libraryPath) {
@@ -685,16 +684,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
         @Override
         public long submitRecording(
-                Runnable launches,
-                boolean overlapPredecessor,
-                GpuStream shadow,
-                boolean shadowOverlap,
-                SharedOrdering shared) {
+                Runnable launches, boolean overlapPredecessor, GpuStream shadow, boolean shadowOverlap) {
             ensureOpen();
             if (!(shadow instanceof CudaStream capture))
                 throw new IllegalArgumentException("shadow is not a CUDA stream");
             RECORDING_SHADOW.set(capture);
-            RECORDING_ORDER.set(Objects.requireNonNull(shared, "shared"));
             select(overlapPredecessor);
             CudaStream previous = submitting.get();
             submitting.set(this);
@@ -703,7 +697,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 submissionRecord.invokeExact(capture.handle, shadowOverlap ? 1 : 0);
             } catch (Throwable failure) {
                 RECORDING_SHADOW.remove();
-                RECORDING_ORDER.remove();
                 submitting.set(previous);
                 clear(overlapPredecessor);
                 throw new GpuMemoryException("CUDA submission recording invocation failed", failure);
@@ -715,7 +708,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             } finally {
                 mode[0] = 0;
                 RECORDING_SHADOW.remove();
-                RECORDING_ORDER.remove();
                 hash = finishSubmission();
                 submitting.set(previous);
                 clear(overlapPredecessor);
@@ -793,52 +785,17 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     LOG.debug("CUDA graph capture ended with status {}", status);
                     return 0;
                 }
-                long graph = exec.get(ValueLayout.JAVA_LONG, 0);
-                q3ScratchLock.lock();
-                try {
-                    graphScratch.put(
-                            graph, new long[] {q3ScratchAddress, q3ScratchBytes, allocationId(q3ScratchAddress)});
-                } finally {
-                    q3ScratchLock.unlock();
-                }
-                return graph;
+                return exec.get(ValueLayout.JAVA_LONG, 0);
             } catch (Throwable failure) {
                 throw new GpuMemoryException("CUDA graph capture invocation failed", failure);
             }
         }
 
         @Override
-        public boolean takeRecordedShared() {
-            boolean[] recorded = SCRATCH_RECORDED.get();
-            boolean used = recorded[0];
-            recorded[0] = false;
-            return used;
-        }
-
-        /// An ordered graph runs between the shared scratch's previous and next uses on any stream, as its
-        /// recorded quantum did, and only while that scratch is still in place.
-        @Override
-        public boolean launchGraph(long graph, boolean ordered) {
+        public boolean launchGraph(long graph) {
             ensureOpen();
-            if (!ordered) {
-                launch(graph);
-                return true;
-            }
-            q3ScratchLock.lock();
-            try {
-                long[] recorded = graphScratch.get(graph);
-                if (recorded == null
-                        || recorded[0] != q3ScratchAddress
-                        || recorded[1] != q3ScratchBytes
-                        || recorded[2] != allocationId(q3ScratchAddress)) return false;
-                if (q3ScratchEvent != 0) await(q3ScratchEvent);
-                launch(graph);
-                if (q3ScratchEvent == 0) q3ScratchEvent = openMarker();
-                mark(q3ScratchEvent);
-                return true;
-            } finally {
-                q3ScratchLock.unlock();
-            }
+            launch(graph);
+            return true;
         }
 
         private void launch(long graph) {
@@ -853,7 +810,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
         @Override
         public void destroyGraph(long graph) {
-            graphScratch.remove(graph);
             int status;
             try {
                 status = (int) graphDestroy.invokeExact(graph);
@@ -1096,27 +1052,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     /// While a thread records: its shadow, and the recording's order of shared-scratch uses.
     private static final ThreadLocal<CudaStream> RECORDING_SHADOW = new ThreadLocal<>();
-
-    private static final ThreadLocal<GpuStream.SharedOrdering> RECORDING_ORDER = new ThreadLocal<>();
-
-    /// The calling thread recorded a use of the shared scratch since it last asked.
-    private static final ThreadLocal<boolean[]> SCRATCH_RECORDED = ThreadLocal.withInitial(() -> new boolean[1]);
-
-    /// The shared scratch (address and bytes) when each captured graph was instantiated: an ordered graph runs
-    /// only while the scratch it was recorded with is still in place.
-    private final ConcurrentHashMap<Long, long[]> graphScratch = new ConcurrentHashMap<>();
-
-    private void shadowOrder(CudaStream shadow, GpuStream.SharedOrdering order, boolean after) {
-        try {
-            if (after) {
-                shadow.mark(order.marker);
-                order.recorded = true;
-            } else shadow.await(order.marker);
-        } catch (RuntimeException failure) {
-            LOG.debug("shared scratch order could not be recorded", failure);
-            markUnrecordable();
-        }
-    }
 
     private void markUnrecordable() {
         try {
@@ -1636,96 +1571,108 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     @Override
-    public long retainedScratchBytes() {
-        q3ScratchLock.lock();
-        try {
-            return q3ScratchBytes;
-        } finally {
-            q3ScratchLock.unlock();
-        }
-    }
-
-    @Override
     public void q3GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
         q3GateUpSwiGluBf16(input, weights, output, rows, width, outputs, weightBytes, WeightLayout.ROW_SPLIT_K128_V1);
     }
 
-    /// Frees the shared scratch (P2E2 expansion, quantized activations of the FP8 and native FP4 routes) after draining
-    /// the
-    /// device; the next route that needs it allocates it again. For callers that account for every allocation.
-    public void releaseQ3Scratch() {
-        q3ScratchLock.lock();
+    /// Runs `use` with scratch of at least `bytes`: the region bound for this thread's submissions
+    /// ([#withScratch]), whose uses the binding stages' edges order; or, for a route its stage did not declare (an
+    /// unusual fallback, a wider quantum), a private region taken and returned in stream order on the submitting
+    /// lane. A nested use (a composition around its own linear) gets the same bound region.
+    private void withQ3Scratch(long bytes, LongConsumer use) {
+        ensureOpen();
+        long[] bound = SCRATCH.get();
+        if (bound[0] != 0 && bound[1] >= bytes) {
+            bound[2]++;
+            try {
+                use.accept(bound[0]);
+            } finally {
+                bound[2]--;
+            }
+            return;
+        }
+        this.scratchFallbacks.incrementAndGet();
+        // A captured quantum cannot keep a private region's address.
+        if (SUBMISSION.get()[0] == RECORDING) markUnrecordable();
+        long region = allocateAsync(alignUp(bytes, 256));
+        long previousAddress = bound[0], previousBytes = bound[1], previousDepth = bound[2];
+        bound[0] = region;
+        bound[1] = bytes;
+        bound[2] = previousDepth + 1;
         try {
-            ensureOpen();
-            synchronize();
-            if (q3ScratchAddress != 0) free(q3ScratchAddress);
-            q3ScratchAddress = 0;
-            q3ScratchBytes = 0;
+            use.accept(region);
         } finally {
-            q3ScratchLock.unlock();
+            bound[0] = previousAddress;
+            bound[1] = previousBytes;
+            bound[2] = previousDepth;
+            freeAsync(region);
         }
     }
 
-    /// Runs `use` with the shared scratch of at least `bytes`, ordered after its previous use on any
-    /// stream; growing it first drains the device.
-    ///
-    /// A recorded use orders the captured graph's runs on the scratch's event instead (see
-    /// [CudaStream#launchGraph]); growing the scratch cannot be recorded. A checked use submits nothing.
-    private void withQ3Scratch(long bytes, LongConsumer use) {
-        int mode = SUBMISSION.get()[0];
-        q3ScratchLock.lock();
+    @Override
+    public void withScratch(long address, long bytes, Runnable submit) {
+        long[] bound = SCRATCH.get();
+        long previousAddress = bound[0], previousBytes = bound[1];
+        bound[0] = address;
+        bound[1] = bytes;
         try {
-            ensureOpen();
-            if (mode == CHECKING) {
-                if (bytes > q3ScratchBytes)
-                    throw new IllegalStateException("a replayed quantum would grow the shared scratch");
-                use.accept(q3ScratchAddress);
-                return;
-            }
-            GpuStream.SharedOrdering order = null;
-            CudaStream shadow = null;
-            if (mode == RECORDING) {
-                if (bytes > q3ScratchBytes) markUnrecordable();
-                else {
-                    SCRATCH_RECORDED.get()[0] = true;
-                    order = RECORDING_ORDER.get();
-                    shadow = RECORDING_SHADOW.get();
-                }
-            }
-            CudaStream stream = submitting.get();
-            if (bytes > q3ScratchBytes) {
-                synchronize();
-                if (q3ScratchAddress != 0) free(q3ScratchAddress);
-                q3ScratchAddress = 0;
-                q3ScratchBytes = 0;
-                long size = alignUp(bytes, 1L << 20);
-                q3ScratchAddress = allocate(size);
-                q3ScratchBytes = size;
-                LOG.info("P2E2 expansion scratch: {} MiB", size >> 20);
-            } else if (stream == null) {
-                synchronize();
-            } else if (q3ScratchEvent != 0) {
-                stream.await(q3ScratchEvent);
-            }
-            // A recording chains its uses the same way on the shadows, so the captured graph keeps them ordered
-            // across its branches.
-            if (shadow != null && order.recorded) shadowOrder(shadow, order, false);
-            use.accept(q3ScratchAddress);
-            if (shadow != null) shadowOrder(shadow, order, true);
-            if (stream != null) {
-                if (q3ScratchEvent == 0) {
-                    try {
-                        q3ScratchEvent = (long) eventCreate.invokeExact();
-                    } catch (Throwable failure) {
-                        throw new GpuMemoryException("CUDA event creation invocation failed", failure);
-                    }
-                    if (q3ScratchEvent == 0) throw new GpuMemoryException("CUDA event creation returned null");
-                }
-                stream.mark(q3ScratchEvent);
-            }
+            submit.run();
         } finally {
-            q3ScratchLock.unlock();
+            bound[0] = previousAddress;
+            bound[1] = previousBytes;
+        }
+    }
+
+    /// Uses of scratch that found no bound region large enough, since this binding opened.
+    public long scratchFallbacks() {
+        return this.scratchFallbacks.get();
+    }
+
+    @Override
+    public long scratchBytes(ScratchUse use, int rows, int inFeatures, int outFeatures, WeightLayout layout) {
+        ensureOpen();
+        boolean p2e2 = layout == WeightLayout.ROW_SPLIT_P2E2_V1;
+        return switch (use) {
+            case Q3_LINEAR ->
+                p2e2 ? p2e2LinearScratch(rows, inFeatures, outFeatures) : mxScratch(rows, inFeatures, outFeatures);
+            case MX_LINEAR -> mxScratch(rows, inFeatures, outFeatures);
+            case Q3_GATE_UP -> {
+                long composition = (long) rows * outFeatures * Short.BYTES;
+                if (!p2e2) yield Math.max(composition, mxScratch(rows, inFeatures, outFeatures));
+                long expanded = P2e2Layout.expandedByteSize(outFeatures, inFeatures);
+                long fused = q3MxReserveBytes(rows, inFeatures, outFeatures);
+                yield Math.max(composition, alignUp(expanded, 256) + (fused > 0 ? fused : composition));
+            }
+            case NVFP4_LINEAR -> rows >= NVFP4_NATIVE_MIN_ROWS ? nvfp4Activations(rows, inFeatures, outFeatures) : 0;
+            case NVFP4_GATE_UP ->
+                Math.max((long) rows * outFeatures * Short.BYTES, nvfp4Activations(rows, inFeatures, outFeatures));
+        };
+    }
+
+    private long mxScratch(int rows, int inFeatures, int outFeatures) {
+        if (rows < Q3_MX_MIN_ROWS || inFeatures % 128 != 0 || outFeatures % 128 != 0 || !q3MxAvailable()) return 0;
+        return q3MxScratchBytes(rows, inFeatures, outFeatures);
+    }
+
+    private long p2e2LinearScratch(int rows, int inFeatures, int outFeatures) {
+        if (rows <= Q3_DECODE_MAX_ROWS) return 0;
+        long expanded = P2e2Layout.expandedByteSize(outFeatures, inFeatures);
+        if (expanded <= Q3_SCRATCH_LIMIT)
+            return alignUp(expanded, 256) + q3MxReserveBytes(rows, inFeatures, outFeatures);
+        int chunk = linearChunkRows(rows, inFeatures);
+        long weights = P2e2Layout.expandedByteSize(chunk, inFeatures);
+        long outputOffset = alignUp(weights, 256);
+        long activationOffset = alignUp(outputOffset + (long) rows * chunk * Short.BYTES, 256);
+        return activationOffset + q3MxReserveBytes(rows, inFeatures, chunk);
+    }
+
+    private long nvfp4Activations(int rows, int inFeatures, int outFeatures) {
+        if (!nvfp4NativeAvailable()) return 0;
+        try {
+            return (long) this.nvfp4ActivationBytes.invokeExact(rows, inFeatures, outFeatures);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("NVFP4 activation size invocation failed", failure);
         }
     }
 
@@ -1881,7 +1828,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         long scratchBytes = q3MxScratchBytes(rows, width, outputs);
         // Inside a P2E2 expansion the shared scratch holds the expanded weights; the expansion reserved a region
         // behind them for the activations (withExpandedWeights).
-        if (q3ScratchLock.isHeldByCurrentThread()) {
+        if (SCRATCH.get()[2] > 0) {
             long[] reserved = q3MxReserved.get();
             if (reserved == null || reserved[1] < scratchBytes) return false;
             return runQ3Mx(
@@ -2069,7 +2016,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             linear.accept(gateUp);
             swiGluBf16(gateUp, output, rows, outputs / 2);
         };
-        if (q3ScratchLock.isHeldByCurrentThread()) {
+        if (SCRATCH.get()[2] > 0) {
             long[] reserved = q3MxReserved.get();
             if (reserved == null || reserved[1] < bytes)
                 throw new IllegalStateException("the gate/up composition needs a reserved scratch region");
@@ -3026,11 +2973,6 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         // A retirement may be confirmed before its native host callback returns. Drain the device
         // before releasing the FFM upcall stub or unloading its library arena.
         synchronize();
-        if (q3ScratchAddress != 0) free(q3ScratchAddress);
-        q3ScratchAddress = 0;
-        q3ScratchBytes = 0;
-        if (q3ScratchEvent != 0) destroyEvent(q3ScratchEvent);
-        q3ScratchEvent = 0;
         for (Long event; (event = availableEvents.poll()) != null; ) destroyEvent(event);
         for (MemorySegment pinned; (pinned = pinnedUploads.poll()) != null; ) freePinned(pinned);
         closed = true;

@@ -242,6 +242,16 @@ public final class Workspace implements AutoCloseable {
         public void copyDeviceToHost(java.lang.foreign.MemorySegment destination, long source, long byteSize) {}
     }
 
+    /// The runtime workspace's expansion scratch, or 0 when this workspace has none (it owns its storage, or no
+    /// declared stage takes scratch on this GPU).
+    public long scratchAddress() {
+        return this.shared == null ? 0 : this.shared.scratchAddress();
+    }
+
+    public long scratchBytes() {
+        return this.shared == null ? 0 : this.shared.scratchBytes();
+    }
+
     private long acquire(int slot, long bytes) {
         if (this.shared != null && slot != TOKEN_IDS_SLOT && slot != LOGITS_SLOT)
             return this.shared.acquire(slot, bytes);

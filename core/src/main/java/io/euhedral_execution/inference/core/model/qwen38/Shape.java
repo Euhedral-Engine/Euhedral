@@ -1,6 +1,8 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.GraphStorage;
 import io.euhedral_execution.inference.core.runtime.graph.ShapeBuilder;
@@ -50,6 +52,8 @@ public final class Shape implements GraphShape {
     private final boolean prefetchesRing;
     /// The workspace slots each stage reads or writes; computed on first use.
     private volatile int[][] workspaceBuffers;
+    /// The scratch route each stage takes, or null for a stage that takes none.
+    private final ScratchUse[] scratchUses;
 
     Shape(View view, ExecutionPlan plan, ExecutionPlan.PlanData data, boolean reuseStorage, boolean prefetchesRing) {
         this.view = Objects.requireNonNull(view, "view");
@@ -75,7 +79,13 @@ public final class Shape implements GraphShape {
             dependencies[instruction.id()] = instruction.dependencies().stream()
                     .mapToInt(Integer::intValue)
                     .toArray();
-        int[][] ordered = ExecutionPlan.withStorageHazards(this.instructions, dependencies, reuseStorage);
+        this.scratchUses = new ScratchUse[this.instructions.size()];
+        boolean[] scratch = new boolean[this.instructions.size()];
+        for (ExecutionPlan.Instruction instruction : this.instructions) {
+            this.scratchUses[instruction.id()] = scratchUse(instruction, view);
+            scratch[instruction.id()] = this.scratchUses[instruction.id()] != null;
+        }
+        int[][] ordered = ExecutionPlan.withStorageHazards(this.instructions, dependencies, reuseStorage, scratch);
         ShapeBuilder<ExecutionPlan.Instruction> builder = new ShapeBuilder<>();
         for (ExecutionPlan.Instruction instruction : this.instructions) builder.stage(instruction);
         for (int stage = 0; stage < ordered.length; stage++)
@@ -102,6 +112,31 @@ public final class Shape implements GraphShape {
         return SharedWorkspace.bufferCount(this.plan);
     }
 
+    /// The scratch route stage `stage` takes, or null: a gate/up region always (its gate/up rows), a quantized
+    /// linear in a view whose quanta have more than eight rows (its expansion or activations).
+    public ScratchUse scratchUse(int stage) {
+        return this.scratchUses[stage];
+    }
+
+    private static ScratchUse scratchUse(ExecutionPlan.Instruction instruction, View view) {
+        boolean nvfp4 = !instruction.weights().isEmpty() && instruction.weightFormat() == WeightFormat.NVFP4;
+        if (instruction.kind() == ExecutionPlan.Kind.Q3_GATE_UP_SWIGLU)
+            return nvfp4 ? ScratchUse.NVFP4_GATE_UP : ScratchUse.Q3_GATE_UP;
+        boolean multiRow =
+                switch (view) {
+                    case DECODE, DECODE_PRELOADED, MTP_DRAFT -> false;
+                    default -> true;
+                };
+        if (!multiRow) return null;
+        return switch (instruction.kind()) {
+            case Q3_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.Q3_LINEAR;
+            case Q4_LINEAR, Q5_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.MX_LINEAR;
+            case DFLASH_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : null;
+            case DFLASH_LM_HEAD -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.Q3_LINEAR;
+            default -> null;
+        };
+    }
+
     private int[][] declareWorkspaceBuffers() {
         int[][] buffers = new int[this.instructions.size()][];
         if (!this.firstLayer) {
@@ -123,6 +158,7 @@ public final class Shape implements GraphShape {
             for (ExecutionPlan.Buffer buffer : instruction.outputBuffers())
                 slots.add(owners.getOrDefault(buffer, buffer).ordinal());
             slots.remove(ExecutionPlan.Buffer.LOGITS.ordinal());
+            if (this.scratchUses[instruction.id()] != null) slots.add(SharedWorkspace.scratchBuffer(this.plan));
             buffers[instruction.id()] =
                     slots.stream().mapToInt(Integer::intValue).toArray();
         }
