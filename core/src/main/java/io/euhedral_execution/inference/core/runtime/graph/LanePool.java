@@ -23,6 +23,11 @@ public final class LanePool implements AutoCloseable {
     private final int computeLanes;
     private final AtomicInteger nextHome = new AtomicInteger();
     private final java.util.function.IntUnaryOperator fixed;
+    /// Markers of closed graphs that later graphs may still await (their stages' and their joins'): kept, and
+    /// reused by the graphs built after, instead of destroyed while an external edge may still name one. Awaiting
+    /// one a newer graph re-recorded waits for that graph's earlier work too, never for anything after the wait.
+    private final java.util.concurrent.ConcurrentLinkedQueue<Long> spareMarkers =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
     private boolean closed;
 
     public LanePool(GpuStream[] lanes) {
@@ -71,6 +76,17 @@ public final class LanePool implements AutoCloseable {
         return this.lanes[lane];
     }
 
+    /// A marker another graph's external edge may name: a spare one of a closed graph, or a new one on `lane`.
+    long openSharedMarker(int lane) {
+        Long spare = this.spareMarkers.poll();
+        return spare != null ? spare : this.lanes[lane].openMarker();
+    }
+
+    /// Keeps a closed graph's marker that another graph's external edge may name, for reuse.
+    void retireSharedMarker(long marker) {
+        if (marker != 0) this.spareMarkers.add(marker);
+    }
+
     /// The home lane for a newly built graph: its quantum's preparation and retirement boundary.
     int nextHome() {
         return Math.floorMod(this.nextHome.getAndIncrement(), this.computeLanes);
@@ -90,6 +106,14 @@ public final class LanePool implements AutoCloseable {
     public void close() {
         if (this.closed) return;
         RuntimeException failure = null;
+        for (Long spare = this.spareMarkers.poll(); spare != null; spare = this.spareMarkers.poll()) {
+            try {
+                this.lanes[0].closeMarker(spare);
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
+        }
         for (GpuStream lane : this.lanes) {
             try {
                 lane.close();

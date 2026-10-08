@@ -212,9 +212,9 @@ public final class StageGraph implements AutoCloseable {
                 // Every device stage records a marker: a stage with no successor here may still be the last accessor
                 // of a workspace buffer that a later graph waits for.
                 for (StageFrame stage : this.stages) {
-                    if (!stage.host()) stage.marker = pool.lane(this.home).openMarker();
+                    if (!stage.host()) stage.marker = pool.openSharedMarker(this.home);
                 }
-                this.joined = pool.lane(this.home).openMarker();
+                this.joined = pool.openSharedMarker(this.home);
                 for (int lane = 0; lane < this.tails.length; lane++) {
                     if (lane != this.home) this.tails[lane] = pool.lane(lane).openMarker();
                 }
@@ -925,14 +925,15 @@ public final class StageGraph implements AutoCloseable {
 
     private void closeMarkers() {
         GpuStream any = this.pool.lane(this.home);
-        if (this.joined != 0) any.closeMarker(this.joined);
+        // A later graph's external edge may name a stage's marker or the join: they are kept for reuse.
+        this.pool.retireSharedMarker(this.joined);
         this.joined = 0;
         for (StageFrame stage : this.stages) {
             if (stage == null) continue;
             if (stage.shadowMarker != 0) any.closeMarker(stage.shadowMarker);
             stage.shadowMarker = 0;
             if (stage.marker == 0) continue;
-            any.closeMarker(stage.marker);
+            this.pool.retireSharedMarker(stage.marker);
             stage.marker = 0;
         }
         if (this.shadowTails != null) {

@@ -152,6 +152,10 @@ class StageGraphTest {
         assertEquals("SUCCESS", quantum.outcome.join());
         graph.close();
         assertFalse(home.closed, "a shared pool outlives its graphs");
+        // The stages' markers and the join may still be named by a later graph's external edge: they wait for
+        // reuse, and the pool destroys them when it closes.
+        assertEquals(Set.of(1L, 101L, 201L), new HashSet<>(home.closedMarkers));
+        pool.close();
         assertEquals(Set.of(1L, 2L, 3L, 4L, 5L, 6L, 101L, 201L), new HashSet<>(home.closedMarkers));
     }
 
