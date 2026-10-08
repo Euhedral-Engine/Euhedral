@@ -57,8 +57,11 @@ subprojects {
         //  - a model group: the class loads an artifact, directly or through an engine. The classes of all groups
         //    run one after another in ONE JVM, ordered by group, so each artifact is loaded once (cudaModelTest);
         //  - own JVM: the class cannot share a process (cudaOwnJvmTest, one JVM per class).
-        val modelGroupTags = listOf(
-                "model-q3", "engine-q3", "model-nvfp4", "engine-nvfp4", "model-flash-next", "engine-flash-next")
+        // Flash-Next pins host memory sized from what its cgroup has left, so it runs in a Gradle run of its own, which
+        // the gate gives a fresh cgroup, apart from the Qwen3.8 groups that fill the page cache.
+        val qwen38GroupTags = listOf("model-q3", "engine-q3", "model-nvfp4", "engine-nvfp4")
+        val flashNextTags = listOf("model-flash-next", "engine-flash-next")
+        val modelGroupTags = qwen38GroupTags + flashNextTags
         val ownJvmTag = "own-jvm"
         val configureCuda: Test.() -> Unit = {
             group = "verification"
@@ -146,29 +149,35 @@ subprojects {
             maxParallelForks = (providers.gradleProperty("cudaForks").orNull ?: "4").toInt()
         }
         val cudaModels = tasks.register<Test>("cudaModelTest") {
-            description = "Run the CUDA tests of the model groups in one JVM, loading each artifact once."
+            description = "Run the CUDA tests of the Qwen3.8 model groups in one JVM, loading each artifact once."
             configureCuda()
-            useJUnitPlatform { includeTags(*modelGroupTags.toTypedArray()) }
+            useJUnitPlatform { includeTags(*qwen38GroupTags.toTypedArray()) }
             mustRunAfter(cudaLight)
+        }
+        val cudaFlashNext = tasks.register<Test>("cudaFlashNextTest") {
+            description = "Run the Flash-Next CUDA tests in one JVM; run it in a Gradle run of its own."
+            configureCuda()
+            useJUnitPlatform { includeTags(*flashNextTags.toTypedArray()) }
+            mustRunAfter(cudaModels)
         }
         val cudaOwn = tasks.register<Test>("cudaOwnJvmTest") {
             description = "Run the CUDA tests that need a JVM of their own, one JVM each."
             configureCuda()
             useJUnitPlatform { includeTags(ownJvmTag) }
             forkEvery = 1
-            mustRunAfter(cudaModels)
+            mustRunAfter(cudaFlashNext)
         }
         tasks.register("cudaTest") {
             group = "verification"
             description = "Run every CUDA test: the light ones in parallel, then the model groups, then the own-JVM ones."
-            dependsOn(cudaLight, cudaModels, cudaOwn)
+            dependsOn(cudaLight, cudaModels, cudaFlashNext, cudaOwn)
         }
     }
 }
 
 // Both modules' CUDA suites load models. Do not overlap them on one GPU.
 gradle.projectsEvaluated {
-    for (name in listOf("cudaLightTest", "cudaModelTest", "cudaOwnJvmTest")) {
+    for (name in listOf("cudaLightTest", "cudaModelTest", "cudaFlashNextTest", "cudaOwnJvmTest")) {
         project(":api").tasks.named<Test>(name) {
             mustRunAfter(project(":core").tasks.matching { it.name.startsWith("cuda") })
         }

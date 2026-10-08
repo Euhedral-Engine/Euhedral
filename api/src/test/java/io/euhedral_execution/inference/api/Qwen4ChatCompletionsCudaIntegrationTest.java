@@ -17,6 +17,7 @@ import java.util.List;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.Timeout;
@@ -32,6 +33,8 @@ import tools.jackson.databind.json.JsonMapper;
 /// The real application on the real Flash-Next artifact, driven over HTTP: the shared conversation pipeline, the OpenAI
 /// and Anthropic requests and the streamed response run unchanged over the Flash-Next text engine, which is selected by
 /// the artifact alone. Run through `gradle :api:cudaIntegrationTest`.
+// The api module cannot see core's ModelGroup annotations: the tag is the group's name.
+@Tag("engine-flash-next")
 @SpringBootTest(
         classes = EuhedralInferenceApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)

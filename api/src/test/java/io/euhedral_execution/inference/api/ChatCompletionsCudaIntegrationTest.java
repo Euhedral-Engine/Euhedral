@@ -31,6 +31,7 @@ import java.util.function.Consumer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.Timeout;
@@ -51,6 +52,8 @@ import tools.jackson.databind.json.JsonMapper;
 /// Run through `gradle :api:cudaIntegrationTest`. The production backend is wrapped only to count session
 /// open/close/cancel; generation runs entirely through the engine. The engine's device allocations are
 /// compared before and after each request to confirm sequence state was released.
+// The api module cannot see core's ModelGroup annotations: the tag is the group's name.
+@Tag("engine-q3")
 @SpringBootTest(
         classes = {EuhedralInferenceApplication.class, ChatCompletionsCudaIntegrationTest.Tracking.class},
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
