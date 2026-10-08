@@ -57,7 +57,9 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     /// Set by a stage whose completion is not its submission: its work finishes later,
     /// asynchronously (an expert load that ends on a transfer's completion frame). Its outgoing
     /// edges are then satisfied by [#completeDeferred], not by the end of `submit()`.
-    private volatile boolean deferred;
+    /// Plain: the worker that executes the frame sets it and finalizes the frame, and the
+    /// asynchronous completion only counts on [#deferral].
+    private boolean deferred;
 
     private final AtomicInteger deferral = new AtomicInteger();
 
