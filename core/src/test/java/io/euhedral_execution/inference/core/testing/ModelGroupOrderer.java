@@ -23,7 +23,13 @@ public final class ModelGroupOrderer implements ClassOrderer {
     public void orderClasses(ClassOrdererContext context) {
         context.getClassDescriptors()
                 .sort(Comparator.comparingInt(ModelGroupOrderer::rank)
+                        .thenComparing(ModelGroupOrderer::mtp)
                         .thenComparing(descriptor -> descriptor.getTestClass().getName()));
+    }
+
+    private static boolean mtp(ClassDescriptor descriptor) {
+        return AnnotationSupport.findRepeatableAnnotations(descriptor.getTestClass(), Tag.class).stream()
+                .anyMatch(tag -> tag.value().equals(ModelGroup.MTP));
     }
 
     private static int rank(ClassDescriptor descriptor) {

@@ -64,6 +64,16 @@ public final class ModelGroup {
     public @interface FlashNextEngine {}
 
     public static final String OWN_JVM = "own-jvm";
+    public static final String MTP = "mtp";
+
+    /// Within its group, the class uses the model loaded with the MTP drafter and host-backed weights
+    /// ([SharedQwen38Mtp]), which differs from the plain one: such classes run after the plain ones so the group
+    /// switches once.
+    @Target(ElementType.TYPE)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Documented
+    @Tag(MTP)
+    public @interface Mtp {}
 
     /// A class that must start in a JVM of its own: it measures process-wide state, owns a singleton the other
     /// classes would find taken, or loads several artifacts that would not fit the device with a shared one. It
