@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader
 import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.Timeout;
 /// DFlash2 speculative decoding is an optimization of greedy decode: for each prompt, ordinary one-row greedy
 /// decode and DFlash2 speculative decode on fresh sequences produce exactly the same token IDs and leave exactly
 /// the same GDN and attention state. Skipped unless -Peuhedral.qwen.dflash2-artifact names a DFlash2 artifact.
+@ModelGroup.OwnJvm // loads the DFlash2 artifact, which no shared group holds
 class DFlash2SpeculativeDecodeCudaIntegrationTest {
 
     static Qwen38Model load(Path artifact, CudaGpuMemory gpu, int contextTokens) throws Exception {

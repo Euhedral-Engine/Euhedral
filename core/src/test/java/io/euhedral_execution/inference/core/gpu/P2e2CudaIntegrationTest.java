@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.TestExecution;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.lang.foreign.Arena;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
@@ -29,6 +30,7 @@ import org.junit.jupiter.api.Timeout;
 /// logits bit for bit: prefill regions and an all-token LM head (expanded, the head in output-row
 /// chunks), short prompts on the small-row kernels, single-row decode on the P2E2 kernel, and exact
 /// numerics. Skipped unless -Peuhedral.qwen.q3-compressed-artifact names an existing artifact.
+@ModelGroup.OwnJvm // loads the compact and the P2E2 artifact in turn: with one shared they would not fit together
 class P2e2CudaIntegrationTest {
 
     private static final int PROMPT = 80;
@@ -36,7 +38,7 @@ class P2e2CudaIntegrationTest {
     private static final int DECODE_STEPS = 6;
 
     @Test
-    @Timeout(value = 1800, unit = TimeUnit.SECONDS)
+    @Timeout(value = 180, unit = TimeUnit.SECONDS)
     void p2e2ArtifactReproducesTheCompactArtifactBitwise() throws Exception {
         Path compact = Path.of(System.getProperty("euhedral.qwen.artifact"));
         Path p2e2 = Path.of(System.getProperty("euhedral.qwen.q3-compressed-artifact", ""));

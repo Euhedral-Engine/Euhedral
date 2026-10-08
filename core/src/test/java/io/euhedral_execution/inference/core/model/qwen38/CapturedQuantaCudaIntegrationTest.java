@@ -3,15 +3,14 @@ package io.euhedral_execution.inference.core.model.qwen38;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38Mtp;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,17 +25,14 @@ import org.junit.jupiter.api.Timeout;
 /// ordinary greedy generation on a runtime that replays captured graphs must produce the same tokens as on
 /// one that never captures, and the same drafts: every verification accepts as many of them, which the
 /// output tokens alone would not show (the verifier keeps the output exact whatever the drafts are).
+@ModelGroup.CompactQ3
 class CapturedQuantaCudaIntegrationTest {
 
     private record Run(List<List<Integer>> tokens, List<long[]> accepted, long replayed) {}
 
     @Test
-    @Timeout(value = 3600, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void replayedQuantaGenerateTheSameTokensAndDraftsAsStageByStageSubmission() throws Throwable {
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(
-                System.getProperty("euhedral.speculative.artifact", System.getProperty("euhedral.qwen.artifact", "")));
-        assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
@@ -48,16 +44,12 @@ class CapturedQuantaCudaIntegrationTest {
                         + "<think>\n\n</think>\n\n"),
                 // Crosses a KV page boundary and the 2048-key attention switch while generating.
                 Arrays.copyOf(tokenizer.encodeText(frameModel), 1990));
-        var artifactData = ArtifactReader.read(artifact);
-        long hostBytes = Long.getLong("euhedral.speculative.host-mib", 1024L) << 20;
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                Qwen38Model model = Qwen38Model.load(
-                        artifact,
-                        artifactData,
-                        gpu,
-                        io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Speculation.MTP,
-                        HostWeightSelection.select(artifactData, hostBytes));
-                var lattice = new PullingLattice()) {
+        long hostMiB = Long.getLong("euhedral.speculative.host-mib", 1024L);
+        var loaded = SharedQwen38Mtp.q3(hostMiB);
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        var artifactData = loaded.artifact();
+        try (var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             int depth = ArtifactProfile.of(artifactData).speculativeDepth();
             Run captured = generate(gpu, lattice, plan, tokenizer, prompts, depth, true);
@@ -96,12 +88,13 @@ class CapturedQuantaCudaIntegrationTest {
                 } finally {
                     speculative.complete();
                 }
-                // Ordinary one-row decode quanta as well.
+                // Ordinary one-row decode quanta as well: 48 tokens of the short prompt, and for the long one 72, which
+                // still crosses the 2048-key attention switch (58 tokens in) as the speculative run does.
                 var ordinary = new Sequence(++id);
                 try (var logits = new HostLogits(gpu, plan.weights().config().vocabSize())) {
                     logits.selectOnDevice(true);
                     tokens.add(SpeculativeDecodeCudaIntegrationTest.greedy(
-                            runtime, plan, ordinary, prompt, 96, logits, tokenizer));
+                            runtime, plan, ordinary, prompt, prompt.length > 1000 ? 72 : 48, logits, tokenizer));
                 } finally {
                     ordinary.complete();
                 }

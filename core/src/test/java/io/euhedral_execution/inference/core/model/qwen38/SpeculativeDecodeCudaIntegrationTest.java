@@ -2,16 +2,15 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38Mtp;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
@@ -27,15 +26,12 @@ import org.junit.jupiter.api.Timeout;
 /// decode and MTP speculative decode on fresh sequences must produce exactly the same token IDs and
 /// leave exactly the same GDN and attention state. Prompts cover several kinds of text, long runs (many
 /// steps with zero, partial and full acceptance, and context growth) and an end-of-generation stop.
+@ModelGroup.Nvfp4
 class SpeculativeDecodeCudaIntegrationTest {
 
     @Test
-    @Timeout(value = 3600, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void speculativeDecodeEqualsGreedyDecode() throws Throwable {
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        Path artifact = Path.of(System.getProperty(
-                "euhedral.speculative.artifact", System.getProperty("euhedral.qwen.nvfp4-artifact", "")));
-        assumeTrue(Files.isRegularFile(artifact), "no artifact: " + artifact);
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
         int budget = Integer.getInteger("euhedral.speculative.tokens", 160);
@@ -50,16 +46,11 @@ class SpeculativeDecodeCudaIntegrationTest {
                 tokenizer.encodeWithModelSpecialTokens("<|im_start|>user\nWrite a Java method that reverses a"
                         + " singly linked list, with a short explanation.<|im_end|>\n<|im_start|>assistant\n"
                         + "<think>\n\n</think>\n\n"));
-        var artifactData = ArtifactReader.read(artifact);
-        long hostBytes = Long.getLong("euhedral.speculative.host-mib", 1024L) << 20;
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library);
-                Qwen38Model model = Qwen38Model.load(
-                        artifact,
-                        artifactData,
-                        gpu,
-                        io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Speculation.MTP,
-                        HostWeightSelection.select(artifactData, hostBytes));
-                var lattice = new PullingLattice()) {
+        long hostMiB = Long.getLong("euhedral.speculative.host-mib", 1024L);
+        var loaded = SharedQwen38Mtp.nvfp4(hostMiB);
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        try (var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice, plan, gpu);
             try {

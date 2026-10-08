@@ -13,40 +13,38 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory.DeviceMemoryInfo;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactHeader;
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
+@ModelGroup.CompactQ3
 class CompactCudaResidencyIntegrationTest {
 
     private static final long EXPECTED_OBJECT_COUNT = 771;
-    private static final Path DEFAULT_ARTIFACT = Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl");
 
     @Test
     void reportsCudaDeviceMemory() throws Exception {
-        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
-            CudaGpuMemory.DeviceMemoryInfo info = gpu.deviceMemoryInfo();
+        CudaGpuMemory gpu = SharedQwen38.gpu();
+        CudaGpuMemory.DeviceMemoryInfo info = gpu.deviceMemoryInfo();
 
-            assertTrue(info.freeBytes() > 0, "CUDA reported no free device memory");
-            assertTrue(info.totalBytes() >= info.freeBytes(), "CUDA reported more free than total device memory");
-        }
+        assertTrue(info.freeBytes() > 0, "CUDA reported no free device memory");
+        assertTrue(info.totalBytes() >= info.freeBytes(), "CUDA reported more free than total device memory");
     }
 
+    /// The model every other class of the group shares is the full compact load: its objects are the artifact's
+    /// text inventory, each with the artifact's shape, format and layout, and none shares an address.
     @Test
-    void loadsAllCompactRuntimeObjectsAndRestoresVramAfterTeardown() throws Throwable {
-        Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact", DEFAULT_ARTIFACT.toString()));
-        assertTrue(Files.isRegularFile(artifactPath), "compact EDRL artifact is missing: " + artifactPath);
-
-        Artifact artifact = ArtifactReader.read(artifactPath);
+    void loadsAllCompactRuntimeObjects() throws Throwable {
+        var loaded = SharedQwen38.q3();
+        Artifact artifact = loaded.artifact();
         assertEquals(ArtifactHeader.COMPACT_VERSION, artifact.header().version(), "artifact is not compact EDRL");
         // A base load places the text model on the device: no vision tower, and the MTP layer and draft head
         // only come with speculative decoding.
@@ -60,103 +58,84 @@ class CompactCudaResidencyIntegrationTest {
         Set<String> descriptorNames = descriptorNames(descriptors);
         assertEquals(descriptors.length, descriptorNames.size(), "artifact contains duplicate runtime object names");
 
-        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
-            CudaGpuMemory.DeviceMemoryInfo before = gpu.deviceMemoryInfo();
-            long allocatedBefore = gpu.allocatedBytes();
-            Qwen38Model model = null;
-            CudaGpuMemory.DeviceMemoryInfo resident = null;
-            Throwable failure = null;
-            long allocatedDeviceBytes = 0;
-            try {
-                if (before.freeBytes() < expectedDeviceBytes) {
-                    throw new IllegalStateException("insufficient free VRAM before model load: artifact requires "
-                            + gibibytes(expectedDeviceBytes) + ", available " + gibibytes(before.freeBytes()));
-                }
+        Weights weights = loaded.model().weights();
+        verifyCompleteAssembly(weights, descriptors, descriptorNames);
+        long allocatedDeviceBytes = sumHandleBytes(weights.runtimeObjects().values());
+        assertEquals(expectedDeviceBytes, allocatedDeviceBytes, "device allocations do not cover every object");
+        CudaGpuMemory gpu = loaded.gpu();
+        assertTrue(gpu.allocatedBytes() >= expectedDeviceBytes, "the device holds less than the model's objects");
+        assertTrue(gpu.deviceMemoryInfo().freeBytes() > 0, "GPU reported no VRAM headroom after model load");
+    }
 
-                model = Qwen38Model.load(artifactPath, artifact, gpu);
-                Weights weights = model.weights();
-                verifyCompleteAssembly(weights, descriptors, descriptorNames);
-                allocatedDeviceBytes = sumHandleBytes(weights.runtimeObjects().values());
-                assertEquals(expectedDeviceBytes, allocatedDeviceBytes, "device allocations do not cover every object");
-                assertEquals(
-                        expectedDeviceBytes,
-                        gpu.allocatedBytes() - allocatedBefore,
-                        "the model's device footprint is not exactly its runtime objects");
-                resident = gpu.deviceMemoryInfo();
-                assertTrue(resident.freeBytes() > 0, "GPU reported no VRAM headroom after model load");
-            } catch (Throwable loadFailure) {
-                failure = loadFailure;
-            } finally {
-                if (model != null) {
-                    try {
-                        model.close();
-                    } catch (Throwable cleanupFailure) {
-                        if (failure == null) failure = cleanupFailure;
-                        else failure.addSuppressed(cleanupFailure);
-                    }
-                }
-            }
-
-            long allocatedAfter = gpu.allocatedBytes();
-            if (allocatedAfter != allocatedBefore) {
-                IllegalStateException restoreFailure = new IllegalStateException(
-                        "model teardown did not free every device allocation: allocated before=" + allocatedBefore
-                                + ", after=" + allocatedAfter);
-                if (failure == null) {
-                    failure = restoreFailure;
-                } else {
-                    failure.addSuppressed(restoreFailure);
+    /// A load places exactly its runtime objects on the device and closing it frees every allocation. This is
+    /// the real load path on the first layer, which the full model's shared load does not repeat.
+    @Test
+    void loadFootprintIsExactlyItsRuntimeObjectsAndTeardownRestoresTheDevice() throws Throwable {
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        long allocatedBefore = gpu.allocatedBytes();
+        Throwable failure = null;
+        Qwen38Model model = null;
+        try {
+            model = Qwen38Model.loadFirstLayer(loaded.path(), loaded.artifact(), gpu);
+            long objectBytes = sumHandleBytes(model.weights().runtimeObjects().values());
+            assertTrue(objectBytes > 0);
+            assertEquals(
+                    objectBytes,
+                    gpu.allocatedBytes() - allocatedBefore,
+                    "the model's device footprint is not exactly its runtime objects");
+        } catch (Throwable loadFailure) {
+            failure = loadFailure;
+        } finally {
+            if (model != null) {
+                try {
+                    model.close();
+                } catch (Throwable cleanupFailure) {
+                    if (failure == null) failure = cleanupFailure;
+                    else failure.addSuppressed(cleanupFailure);
                 }
             }
-
-            if (failure != null) {
-                System.out.printf(
-                        "Qwen CUDA residency validation failed: artifact=%s objects=%d requestedDeviceBytes=%d "
-                                + "allocatedBefore=%d allocatedAfter=%d%n",
-                        artifactPath, descriptors.length, allocatedDeviceBytes, allocatedBefore, allocatedAfter);
-                throw failure;
-            }
-
-            assertNotNull(resident);
-            System.out.printf(
-                    "Qwen CUDA residency validation passed: artifact=%s objects=%d allocatedDeviceBytes=%d "
-                            + "freeBefore=%d freeAfterLoad=%d%n",
-                    artifactPath, descriptors.length, allocatedDeviceBytes, before.freeBytes(), resident.freeBytes());
         }
+        long allocatedAfter = gpu.allocatedBytes();
+        if (allocatedAfter != allocatedBefore) {
+            IllegalStateException restoreFailure =
+                    new IllegalStateException("model teardown did not free every device allocation: allocated before="
+                            + allocatedBefore + ", after=" + allocatedAfter);
+            if (failure == null) failure = restoreFailure;
+            else failure.addSuppressed(restoreFailure);
+        }
+        if (failure != null) throw failure;
     }
 
     @Test
     void releasesPartialCudaAllocationsWhenAnUploadFails() throws Exception {
-        Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact", DEFAULT_ARTIFACT.toString()));
-        Artifact artifact = ArtifactReader.read(artifactPath);
+        var loaded = SharedQwen38.q3();
+        Path artifactPath = loaded.path();
+        Artifact artifact = loaded.artifact();
         TensorDescriptor[] descriptors = artifact.tensors();
 
-        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
-            DeviceMemoryInfo before = gpu.deviceMemoryInfo();
-            long allocatedBefore = gpu.allocatedBytes();
-            int failingCopyIndex = InjectingUploadFailure.FAIL_AFTER_COPIES;
-            long bytesBeforeInjectedFailure = 0;
-            for (int index = 0; index <= failingCopyIndex; index++) {
-                bytesBeforeInjectedFailure = Math.addExact(bytesBeforeInjectedFailure, descriptors[index].byteSize());
-            }
-            assertTrue(
-                    before.freeBytes() >= bytesBeforeInjectedFailure,
-                    "insufficient VRAM to verify partial-load rollback");
-
-            InjectingUploadFailure failingGpu = new InjectingUploadFailure(gpu);
-            GpuMemoryException failure =
-                    assertThrows(GpuMemoryException.class, () -> WeightLoader.load(artifactPath, artifact, failingGpu));
-            assertTrue(failure.getMessage().contains("injected CUDA upload failure"));
-            assertEquals(InjectingUploadFailure.FAIL_AFTER_COPIES, failingGpu.successfulCopies());
-            assertEquals(InjectingUploadFailure.FAIL_AFTER_COPIES + 1, failingGpu.allocations());
-
-            assertEquals(allocatedBefore, gpu.allocatedBytes(), "partial-load failure leaked CUDA allocations");
-            System.out.printf(
-                    "Qwen CUDA partial-load rollback passed: uploads=%d allocations=%d bytesBeforeFailure=%d%n",
-                    failingGpu.successfulCopies(), failingGpu.allocations(), bytesBeforeInjectedFailure);
+        CudaGpuMemory gpu = loaded.gpu();
+        DeviceMemoryInfo before = gpu.deviceMemoryInfo();
+        long allocatedBefore = gpu.allocatedBytes();
+        int failingCopyIndex = InjectingUploadFailure.FAIL_AFTER_COPIES;
+        long bytesBeforeInjectedFailure = 0;
+        for (int index = 0; index <= failingCopyIndex; index++) {
+            bytesBeforeInjectedFailure = Math.addExact(bytesBeforeInjectedFailure, descriptors[index].byteSize());
         }
+        assertTrue(
+                before.freeBytes() >= bytesBeforeInjectedFailure, "insufficient VRAM to verify partial-load rollback");
+
+        InjectingUploadFailure failingGpu = new InjectingUploadFailure(gpu);
+        GpuMemoryException failure =
+                assertThrows(GpuMemoryException.class, () -> WeightLoader.load(artifactPath, artifact, failingGpu));
+        assertTrue(failure.getMessage().contains("injected CUDA upload failure"));
+        assertEquals(InjectingUploadFailure.FAIL_AFTER_COPIES, failingGpu.successfulCopies());
+        assertEquals(InjectingUploadFailure.FAIL_AFTER_COPIES + 1, failingGpu.allocations());
+
+        assertEquals(allocatedBefore, gpu.allocatedBytes(), "partial-load failure leaked CUDA allocations");
+        System.out.printf(
+                "Qwen CUDA partial-load rollback passed: uploads=%d allocations=%d bytesBeforeFailure=%d%n",
+                failingGpu.successfulCopies(), failingGpu.allocations(), bytesBeforeInjectedFailure);
     }
 
     private static void verifyCompleteAssembly(
