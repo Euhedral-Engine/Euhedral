@@ -76,16 +76,17 @@ final class PrefixCopies extends AbstractFrame {
     private void queue(int start, int end) {
         ExecutionGpu gpu = this.cache.gpu();
         long arena = this.cache.arenaAddress();
-        this.cache.stream().submit(
-                () -> {
-                    for (int i = start; i < end; i++) {
-                        PrefixLayout.Copy copy = this.copies.get(i);
-                        long host = arena + copy.hostOffset();
-                        if (this.toDevice) gpu.copyHostToDeviceAsync(copy.deviceAddress(), host, copy.bytes());
-                        else gpu.copyDeviceToHostAsync(host, copy.deviceAddress(), copy.bytes());
-                    }
-                },
-                false);
+        this.cache.stream()
+                .submit(
+                        () -> {
+                            for (int i = start; i < end; i++) {
+                                PrefixLayout.Copy copy = this.copies.get(i);
+                                long host = arena + copy.hostOffset();
+                                if (this.toDevice) gpu.copyHostToDeviceAsync(copy.deviceAddress(), host, copy.bytes());
+                                else gpu.copyDeviceToHostAsync(host, copy.deviceAddress(), copy.bytes());
+                            }
+                        },
+                        false);
     }
 
     /// Completes the copies once what was queued retired: at once when nothing was.

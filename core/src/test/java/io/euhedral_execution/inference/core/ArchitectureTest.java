@@ -46,7 +46,6 @@ class ArchitectureTest {
             "model/qwen4/loader/NgramStore.java",
             "model/qwen4/expert/RamTierPreload.java");
 
-
     private static List<Path> javaFiles(String directory, boolean recursive) throws IOException {
         try (Stream<Path> walk =
                 recursive ? Files.walk(MAIN.resolve(directory)) : Files.list(MAIN.resolve(directory))) {
@@ -175,8 +174,8 @@ class ArchitectureTest {
         return files;
     }
 
-    private static final Pattern FIELD =
-            Pattern.compile("^(private|protected|public)?\\s*(static\\s+)?(final\\s+)?[\\w<>\\[\\]?, .]+\\s+\\w+\\s*(=.*)?;$");
+    private static final Pattern FIELD = Pattern.compile(
+            "^(private|protected|public)?\\s*(static\\s+)?(final\\s+)?[\\w<>\\[\\]?, .]+\\s+\\w+\\s*(=.*)?;$");
 
     private static final Pattern SIGNATURE = Pattern.compile(
             "^\\s*(public|protected|private|static|final|synchronized|abstract|default|\\s)*[\\w<>\\[\\]?, .]+\\s+(\\w+)\\s*\\(");
@@ -200,7 +199,8 @@ class ArchitectureTest {
                     for (int k = j; k >= Math.max(0, j - 8); k--) {
                         String name = methodName(lines.get(k));
                         if (name != null && !code.contains("->")) return name;
-                        if (lines.get(k).strip().endsWith(";") || lines.get(k).strip().endsWith("}")) break;
+                        if (lines.get(k).strip().endsWith(";")
+                                || lines.get(k).strip().endsWith("}")) break;
                     }
                     depth = 0;
                     break;
@@ -212,8 +212,12 @@ class ArchitectureTest {
 
     private static String methodName(String line) {
         String code = line.strip();
-        if (code.startsWith("//") || code.startsWith("*") || code.contains("->") || code.contains(" new ")
-                || code.contains("=") || code.startsWith("return ")) return null;
+        if (code.startsWith("//")
+                || code.startsWith("*")
+                || code.contains("->")
+                || code.contains(" new ")
+                || code.contains("=")
+                || code.startsWith("return ")) return null;
         var matcher = SIGNATURE.matcher(line);
         if (!matcher.find()) return null;
         String name = matcher.group(2);
@@ -293,7 +297,8 @@ class ArchitectureTest {
             for (int i = 0; i < lines.size(); i++) {
                 String code = lines.get(i).strip();
                 if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
-                if (forbidden.matcher(code).find() || prefixForbidden.matcher(code).find())
+                if (forbidden.matcher(code).find()
+                        || prefixForbidden.matcher(code).find())
                     violations.add(relative(file) + ":" + (i + 1) + ": " + code);
             }
         }

@@ -177,8 +177,8 @@ public final class PrefixCache implements AutoCloseable {
     /// Gives `sequence`, a fresh one, the state at `hit`'s position: allocates it, loads the chain's KV pages
     /// and the last node's GDN state, and publishes the position. With `speculative` (the hit came from a lookup
     /// with its kind) that strategy's state is restored too. Then an owner frame releases the hit, tells `steps`
-    /// whether the sequence was restored (false when it was cancelled meanwhile) or the failure that left it failed,
-    /// and throws `next`.
+    /// whether the sequence was restored (false when it was cancelled meanwhile) or the failure that left it
+    /// failed, and throws `next`.
     public void restore(
             ExecutionPlan plan,
             Sequence sequence,
@@ -190,8 +190,12 @@ public final class PrefixCache implements AutoCloseable {
         if (speculative != null)
             for (PrefixNode node : hit.match().chain())
                 if (!speculative.kind().equals(node.speculation())) {
-                    released(hit, false, new IllegalArgumentException(
-                            "the hit does not hold " + speculative.kind() + " state"), steps, next);
+                    released(
+                            hit,
+                            false,
+                            new IllegalArgumentException("the hit does not hold " + speculative.kind() + " state"),
+                            steps,
+                            next);
                     return;
                 }
         if (this.closed) {
@@ -218,7 +222,8 @@ public final class PrefixCache implements AutoCloseable {
                         Quantum.attachSequenceState(plan, sequence, this.gpu);
                         var attention = (AttentionStates) sequence.kvCacheState();
                         var gdn = (GdnStates) sequence.recurrentState();
-                        for (int layer : this.layout.kvLayers()) attention.forLayer(layer).prepareAppend(0, position);
+                        for (int layer : this.layout.kvLayers())
+                            attention.forLayer(layer).prepareAppend(0, position);
                         copies.addAll(this.layout.restoreCopies(hit.match().chain(), gdn, attention));
                         if (speculative != null)
                             copies.addAll(speculative.restoreCopies(
@@ -233,37 +238,41 @@ public final class PrefixCache implements AutoCloseable {
             return;
         }
         long started = System.nanoTime();
-        PrefixCopies.start(this, copies, true, copyFailure -> work.complete(blocked -> {
-            Throwable failure = copyFailure != null ? copyFailure : blocked;
-            if (failure != null) {
-                abandon(sequence, failure);
-                released(hit, false, failure, steps, next);
-                return;
-            }
-            this.restores.incrementAndGet();
-            this.restoreNanos.addAndGet(System.nanoTime() - started);
-            try {
-                var attention = (AttentionStates) sequence.kvCacheState();
-                for (int layer : this.layout.kvLayers()) {
-                    AttentionKvState state = attention.forLayer(layer);
-                    state.appendSubmitted(position);
-                    state.commitSubmitted();
-                }
-                if (speculative != null) speculative.restored(sequence, position);
-            } catch (RuntimeException | Error publication) {
-                abandon(sequence, publication);
-                released(hit, false, publication, steps, next);
-                return;
-            }
-            // A cancellation requested meanwhile ends the sequence instead of publishing the position.
-            if (sequence.cancellationRequested()) {
-                sequence.abandon();
-                released(hit, false, null, steps, next);
-                return;
-            }
-            sequence.commit(position);
-            released(hit, true, null, steps, next);
-        }));
+        PrefixCopies.start(
+                this,
+                copies,
+                true,
+                copyFailure -> work.complete(blocked -> {
+                    Throwable failure = copyFailure != null ? copyFailure : blocked;
+                    if (failure != null) {
+                        abandon(sequence, failure);
+                        released(hit, false, failure, steps, next);
+                        return;
+                    }
+                    this.restores.incrementAndGet();
+                    this.restoreNanos.addAndGet(System.nanoTime() - started);
+                    try {
+                        var attention = (AttentionStates) sequence.kvCacheState();
+                        for (int layer : this.layout.kvLayers()) {
+                            AttentionKvState state = attention.forLayer(layer);
+                            state.appendSubmitted(position);
+                            state.commitSubmitted();
+                        }
+                        if (speculative != null) speculative.restored(sequence, position);
+                    } catch (RuntimeException | Error publication) {
+                        abandon(sequence, publication);
+                        released(hit, false, publication, steps, next);
+                        return;
+                    }
+                    // A cancellation requested meanwhile ends the sequence instead of publishing the position.
+                    if (sequence.cancellationRequested()) {
+                        sequence.abandon();
+                        released(hit, false, null, steps, next);
+                        return;
+                    }
+                    sequence.commit(position);
+                    released(hit, true, null, steps, next);
+                }));
     }
 
     /// Unpins `hit` on the owner, then tells `steps` the restore's outcome and throws `next`.
@@ -377,18 +386,25 @@ public final class PrefixCache implements AutoCloseable {
             return;
         }
         PrefixNode node = reserved;
-        PrefixCopies.start(this, copies, false, failure -> settle(work, sequence, () -> onOwner(steps, next, () -> {
-            if (failure != null) {
-                this.tree.abort(node);
-                this.failed.incrementAndGet();
-                steps.captured(parent, null);
-                return;
-            }
-            this.tree.publish(node);
-            this.captured.incrementAndGet();
-            this.captureNanos.addAndGet(System.nanoTime() - started);
-            steps.captured(node, null);
-        })));
+        PrefixCopies.start(
+                this,
+                copies,
+                false,
+                failure -> settle(
+                        work,
+                        sequence,
+                        () -> onOwner(steps, next, () -> {
+                            if (failure != null) {
+                                this.tree.abort(node);
+                                this.failed.incrementAndGet();
+                                steps.captured(parent, null);
+                                return;
+                            }
+                            this.tree.publish(node);
+                            this.captured.incrementAndGet();
+                            this.captureNanos.addAndGet(System.nanoTime() - started);
+                            steps.captured(node, null);
+                        })));
     }
 
     /// Concludes a capture's work in the sequence's admission order, then runs `then`. A capture leaves the
