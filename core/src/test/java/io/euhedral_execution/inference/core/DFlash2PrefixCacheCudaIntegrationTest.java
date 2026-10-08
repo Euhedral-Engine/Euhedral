@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.SequenceStateProbe;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -26,6 +27,8 @@ import org.junit.jupiter.api.Timeout;
 /// A DFlash2 generation restored from the prefix cache continues exactly as a cold one: the checkpoint holds the
 /// target state and the drafter's context ring, and the rest is prefilled, tapped and projected in the chunks a cold
 /// run uses. Skipped unless -Peuhedral.qwen.dflash2-artifact names a DFlash2 artifact.
+// Own JVM: needs the DFlash2 artifact, which no group shares.
+@ModelGroup.OwnJvm
 class DFlash2PrefixCacheCudaIntegrationTest {
     private static final long CACHE_BYTES = 4L << 30;
     private static final int INTERVAL = 2048;

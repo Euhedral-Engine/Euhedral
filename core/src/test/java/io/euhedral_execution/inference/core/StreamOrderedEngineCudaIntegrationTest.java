@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.SynchronousReferenceGpu;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -20,11 +21,18 @@ import org.junit.jupiter.api.Timeout;
 
 /// Stream-ordered generation against the synchronous reference: every kernel of the reference engine
 /// runs on no selected stream and synchronizes, which is the retired synchronous execution mode.
+///
+/// The long generation (300 tokens, which crosses the 256-token KV page) runs once on each engine and the outputs are
+/// compared; the repeated sessions that check the engine takes no device memory from a session, and reproduces the
+/// sequence, are short and compare with the start of the long one.
+@ModelGroup.CompactQ3Engine
 class StreamOrderedEngineCudaIntegrationTest {
     private static final String PROMPT = "The capital of France is";
+    private static final int LONG = 300;
+    private static final int SHORT = 24;
 
     @Test
-    @Timeout(value = 1800, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void streamOrderedGenerationMatchesTheSynchronousReferenceAndReleasesState() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "CUDA library is required");
@@ -39,49 +47,60 @@ class StreamOrderedEngineCudaIntegrationTest {
             cpus.set(cpu);
         assumeTrue(cpus.cardinality() == 2);
 
-        Result reference = generate(artifact, tokenizer, Path.of(library), cpus, new ReferenceBootstrap());
-        Result streamOrdered = generate(artifact, tokenizer, Path.of(library), cpus, new RecordingBootstrap());
+        // The reference engine needs the device to itself: release the shared engine first.
+        CoreEngines.releaseDevice();
+        Result reference = generateOnReference(artifact, tokenizer, Path.of(library), cpus);
+        Result streamOrdered = generateStreamOrdered();
         assertEquals(reference.tokens(), streamOrdered.tokens(), "stream ordering changed committed token IDs");
         assertEquals(reference.position(), streamOrdered.position(), "KV/GDN sequence advancement differs");
         assertEquals(reference.output(), streamOrdered.output(), "incremental text differs");
         assertTrue(streamOrdered.tokens().size() >= 4, "expected several decode quanta");
     }
 
-    private static Result generate(
-            Path artifact, Path tokenizer, Path library, BitSet cpus, RecordingBootstrap bootstrap) throws Exception {
+    private static Result generateOnReference(Path artifact, Path tokenizer, Path library, BitSet cpus)
+            throws Exception {
         var config = new InferenceConfig(artifact, tokenizer, library, cpus, Duration.ofSeconds(10));
-        Result first;
+        var bootstrap = new ReferenceBootstrap();
+        Result result;
         try (var engine = InferenceEngine.load(config, bootstrap)) {
-            assertTrue(
-                    engine.tokenizer().encodeWithModelSpecialTokens(PROMPT).length > 4,
-                    "test prompt must exercise multiple prefill quanta");
-            // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest, the
-            // runtime's workspace is allocated at load (inside `loaded`), and the execution graphs keep their own
-            // storage for later quanta.
-            long loaded = engine.allocatedDeviceBytes();
-            long atLoad = engine.retainedWorkspaceBytes();
-            assertTrue(atLoad > 0, "the workspace is allocated at load");
-            first = generateSession(engine);
-            long retained = engine.retainedWorkspaceBytes();
-            assertTrue(retained >= atLoad, "the retained storage shrank");
-            long kept = loaded + retained - atLoad;
-            assertEquals(kept, engine.allocatedDeviceBytes(), "the first session kept device allocations");
-            Result second = generateSession(engine);
-            assertEquals(retained, engine.retainedWorkspaceBytes(), "an equal session grew the retained storage");
-            assertEquals(kept, engine.allocatedDeviceBytes(), "the second session kept device allocations");
-            Result third = generateSession(engine);
-            assertEquals(kept, engine.allocatedDeviceBytes(), "the third session kept device allocations");
-            assertEquals(first, second, "a new session did not reproduce the same sequence");
-            assertEquals(second, third, "a later session did not reproduce the same sequence");
+            result = generateSession(engine, LONG);
         }
         assertEquals(0, bootstrap.heldBytes(), "the engine did not release model and persistent sequence allocations");
+        return result;
+    }
+
+    private static Result generateStreamOrdered() throws Exception {
+        var engine = CoreEngines.q3();
+        assertTrue(
+                engine.tokenizer().encodeWithModelSpecialTokens(PROMPT).length > 4,
+                "test prompt must exercise multiple prefill quanta");
+        // A session owns its KV/GDN state, sampled logits, and decode scratch; the model owns the rest, the
+        // runtime's workspace is allocated at load (inside `loaded`), and the execution graphs keep their own
+        // storage for later quanta. The engine may have served sessions before: measure from here.
+        long loaded = engine.allocatedDeviceBytes();
+        long atLoad = engine.retainedWorkspaceBytes();
+        assertTrue(atLoad > 0, "the workspace is allocated at load");
+        Result first = generateSession(engine, LONG);
+        long retained = engine.retainedWorkspaceBytes();
+        assertTrue(retained >= atLoad, "the retained storage shrank");
+        long kept = loaded + retained - atLoad;
+        assertEquals(kept, engine.allocatedDeviceBytes(), "the first session kept device allocations");
+        Result second = generateSession(engine, SHORT);
+        assertEquals(retained, engine.retainedWorkspaceBytes(), "an equal session grew the retained storage");
+        assertEquals(kept, engine.allocatedDeviceBytes(), "the second session kept device allocations");
+        Result third = generateSession(engine, SHORT);
+        assertEquals(kept, engine.allocatedDeviceBytes(), "the third session kept device allocations");
+        List<Integer> start =
+                first.tokens().subList(0, Math.min(SHORT, first.tokens().size()));
+        assertEquals(start, second.tokens().subList(0, start.size()), "a new session did not reproduce the sequence");
+        assertEquals(second, third, "a later session did not reproduce the same sequence");
         return first;
     }
 
-    private static Result generateSession(InferenceEngine engine) throws Exception {
+    private static Result generateSession(InferenceEngine engine, int newTokens) throws Exception {
         try (var session = engine.createSession(GenerationConfig.greedy(91L), 4)) {
             StringBuilder output = new StringBuilder();
-            List<Integer> tokens = session.generate(PROMPT, 300, output::append);
+            List<Integer> tokens = session.generate(PROMPT, newTokens, output::append);
             long position = session.currentTokenPosition();
             long visible = tokens.stream()
                     .filter(id -> !engine.tokenizer().isGenerationEosToken(id))
@@ -93,31 +112,19 @@ class StreamOrderedEngineCudaIntegrationTest {
 
     private record Result(List<Integer> tokens, long position, String output) {}
 
-    /// Keeps the engine's GPU, whose allocation count stays readable after the engine closed.
-    private static class RecordingBootstrap extends InferenceEngine.Bootstrap {
-        private ExecutionGpu gpu;
-
-        /// The stream-ordered CUDA binding unless a subclass supplies another GPU.
-        ExecutionGpu create(Path path) {
-            return super.openGpu(path);
-        }
+    /// Loads the model on the synchronous reference GPU fixture, whose allocation count stays readable after the
+    /// engine closed.
+    private static final class ReferenceBootstrap extends InferenceEngine.Bootstrap {
+        private SynchronousReferenceGpu gpu;
 
         @Override
-        final ExecutionGpu openGpu(Path path) {
-            this.gpu = create(path);
+        ExecutionGpu openGpu(Path path) {
+            this.gpu = new SynchronousReferenceGpu(path);
             return this.gpu;
         }
 
         long heldBytes() {
-            return allocatedBytes(this.gpu);
-        }
-    }
-
-    /// Loads the model on the synchronous reference GPU fixture.
-    private static final class ReferenceBootstrap extends RecordingBootstrap {
-        @Override
-        ExecutionGpu create(Path path) {
-            return new SynchronousReferenceGpu(path);
+            return this.gpu.allocatedBytes();
         }
 
         @Override

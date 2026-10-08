@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -27,6 +28,8 @@ import org.junit.jupiter.params.provider.MethodSource;
 /// Run one artifact per JVM (`-Peuhedral.identity.artifacts=q3`, then `nvfp4`, `nvfp4-compressed`, `flash-next`), each
 /// `./gradlew --no-daemon` inside a capped scope with a stated host budget (`EUHEDRAL_HOST_MEMORY_MIB`), so the host is
 /// never over-committed. A filter that names no artifact, or a missing baseline, fails instead of skipping.
+// Own JVM: loads several artifacts one after another, chosen per JVM by a system property.
+@ModelGroup.OwnJvm
 class TokenIdentityCudaIntegrationTest {
 
     private static final int NEW_TOKENS = 32;

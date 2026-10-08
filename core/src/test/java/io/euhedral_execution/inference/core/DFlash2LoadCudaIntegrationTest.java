@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -18,6 +19,8 @@ import org.junit.jupiter.api.Timeout;
 /// An artifact that holds the DFlash2 drafter loads it instead of the MTP layer: the drafter's objects are typed
 /// weights, its selector codebooks stay in mapped host memory, and the MTP layer and draft head are not loaded.
 /// Skipped unless -Peuhedral.qwen.dflash2-artifact names such an artifact.
+// Own JVM: needs the DFlash2 artifact, which no group shares.
+@ModelGroup.OwnJvm
 class DFlash2LoadCudaIntegrationTest {
 
     @Test
