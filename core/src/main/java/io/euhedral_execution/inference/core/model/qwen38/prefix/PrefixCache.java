@@ -34,6 +34,8 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// The tree belongs to the cache's owner: every lookup, reservation, publication, abort and release is a frame
 /// whose `idHash` is [#HASH] and which stays ordered on it, so they run one at a time and the tree needs no lock.
+/// Frames of different calls run in any order (the lake's queues are partitioned); within a call each frame is
+/// published by the one before it, which is the only order the cache relies on.
 /// The copies are queued asynchronously on the cache's own stream, in pieces of at most [#PIECE_BYTES]
 /// ([PrefixCopies]); their device completion is a frame. A capture reserves its bytes first (evicting the least
 /// recently used nodes), copies, then publishes; a failed copy gives the bytes back. A restore pins the chain it

@@ -4,12 +4,15 @@ import io.euhedral_execution.hashing.HasherApi;
 import java.util.Arrays;
 
 /// The workspace's owner: an owner-confined record of each buffer's last accessors. Every admission runs on
-/// frames ordered on [#HASH] (their `idHash`, which they keep as their routing hash), one at a time, so graphs
-/// bind in the order they were admitted and each graph's first accessors of a buffer follow the previous graph's
-/// last ones: concurrent quanta interleave buffer by buffer.
+/// frames ordered on [#HASH] (their `idHash`, which they keep as their routing hash), one at a time, so each graph's
+/// first accessors of a buffer follow the last ones of the graph bound before it: concurrent quanta interleave
+/// buffer by buffer. One at a time is all the routing gives: frames published from different threads cross the
+/// lake's partitioned queues in any order, so graphs bind in the order their admissions ran, which need not be the
+/// order they were published. Nothing depends on that order: quanta that share sequence state are never in flight
+/// together, and a decision that reads the records ([#last]) checks who wrote them.
 public final class WorkspaceOwner {
 
-    /// The workspace owner's `idHash`. Frames built with it and left ordered run one at a time, in order.
+    /// The workspace owner's `idHash`. Frames built with it and left ordered run one at a time, on the owner.
     public static final long HASH = HasherApi.mix(0x0b_0ff3_45L);
 
     /// The graph that last used a buffer: its shape, its quantum, and the frames of its exits of the buffer.
