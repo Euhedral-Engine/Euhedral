@@ -44,9 +44,16 @@ subprojects {
             }
         }
         val testSourceSet = the<SourceSetContainer>()["test"]
-        tasks.register<Test>("cudaIntegrationTest") {
+        // A CUDA class belongs to one of three kinds, told apart by JUnit tags (core's `ModelGroup` annotations):
+        //  - light: no artifact and little device memory; several JVMs run these at once (cudaLightTest);
+        //  - a model group: the class loads an artifact, directly or through an engine. The classes of all groups
+        //    run one after another in ONE JVM, ordered by group, so each artifact is loaded once (cudaModelTest);
+        //  - own JVM: the class cannot share a process (cudaOwnJvmTest, one JVM per class).
+        val modelGroupTags = listOf(
+                "model-q3", "engine-q3", "model-nvfp4", "engine-nvfp4", "model-flash-next", "engine-flash-next")
+        val ownJvmTag = "own-jvm"
+        val configureCuda: Test.() -> Unit = {
             group = "verification"
-            description = "Run dedicated CUDA 13.1.x memory, operator, residency, and execution integration tests."
             dependsOn(rootProject.tasks.named("nativeBuild${hostProductId.split("-").joinToString("") { it.replaceFirstChar(Char::uppercase) }}"))
             testClassesDirs = testSourceSet.output.classesDirs
             classpath = testSourceSet.runtimeClasspath
@@ -114,20 +121,48 @@ subprojects {
             for (name in listOf("fixtures", "model-fixtures", "verbose"))
                 providers.gradleProperty("euhedral.qwen4.$name").orNull?.let { systemProperty("euhedral.qwen4.$name", it) }
             jvmArgs("--enable-native-access=ALL-UNNAMED")
-            // Each class loads the model and may start the process-wide Euhedral lattice singleton.
-            forkEvery = 1
             environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
             val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
             environment(searchVariable, hostRuntimeDirectory + java.io.File.pathSeparator +
                     (System.getenv(searchVariable) ?: ""))
             useJUnitPlatform()
         }
+        tasks.register<Test>("cudaIntegrationTest") {
+            description = "Run the CUDA tests selected with --tests in one JVM; cudaTest runs the whole suite."
+            configureCuda()
+        }
+        val cudaLight = tasks.register<Test>("cudaLightTest") {
+            description = "Run the CUDA tests that need no artifact, several JVMs at once."
+            configureCuda()
+            useJUnitPlatform { excludeTags(*(modelGroupTags + ownJvmTag).toTypedArray()) }
+            maxParallelForks = (providers.gradleProperty("cudaForks").orNull ?: "4").toInt()
+        }
+        val cudaModels = tasks.register<Test>("cudaModelTest") {
+            description = "Run the CUDA tests of the model groups in one JVM, loading each artifact once."
+            configureCuda()
+            useJUnitPlatform { includeTags(*modelGroupTags.toTypedArray()) }
+            mustRunAfter(cudaLight)
+        }
+        val cudaOwn = tasks.register<Test>("cudaOwnJvmTest") {
+            description = "Run the CUDA tests that need a JVM of their own, one JVM each."
+            configureCuda()
+            useJUnitPlatform { includeTags(ownJvmTag) }
+            forkEvery = 1
+            mustRunAfter(cudaModels)
+        }
+        tasks.register("cudaTest") {
+            group = "verification"
+            description = "Run every CUDA test: the light ones in parallel, then the model groups, then the own-JVM ones."
+            dependsOn(cudaLight, cudaModels, cudaOwn)
+        }
     }
 }
 
-// Both CUDA integration suites load the compact model. Do not overlap them on one GPU.
+// Both modules' CUDA suites load models. Do not overlap them on one GPU.
 gradle.projectsEvaluated {
-    project(":api").tasks.named<Test>("cudaIntegrationTest") {
-        mustRunAfter(project(":core").tasks.named<Test>("cudaIntegrationTest"))
+    for (name in listOf("cudaLightTest", "cudaModelTest", "cudaOwnJvmTest")) {
+        project(":api").tasks.named<Test>(name) {
+            mustRunAfter(project(":core").tasks.matching { it.name.startsWith("cuda") })
+        }
     }
 }

@@ -106,16 +106,18 @@ class CudaGpuStreamIntegrationTest {
                     }
                 });
                 assertTrue(entered.await(5, TimeUnit.SECONDS));
+                long allocated;
                 try {
-                    long allocated = worker.submit(() -> gpu.allocate(64)).get(2, TimeUnit.SECONDS);
+                    allocated = worker.submit(() -> gpu.allocate(64)).get(2, TimeUnit.SECONDS);
                     worker.submit(() -> other.submit(() -> gpu.copyUploadToDevice(destination, upload), false))
                             .get(2, TimeUnit.SECONDS);
                     worker.submit(() -> other.submit(() -> gpu.copyDeviceToDevice(destination, source, 64), false))
                             .get(2, TimeUnit.SECONDS);
-                    gpu.free(allocated);
                 } finally {
                     release.countDown();
                 }
+                // Releasing memory synchronizes the device, which waits for the callback, so it follows the release.
+                gpu.free(allocated);
                 other.synchronize();
                 held.synchronize();
                 assertNull(held.confirmRetired(ticket));
