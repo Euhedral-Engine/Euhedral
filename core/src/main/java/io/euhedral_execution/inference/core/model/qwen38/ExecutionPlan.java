@@ -415,6 +415,22 @@ public final class ExecutionPlan {
 
     static final String DRAFT_HEAD = "text/draft_head";
 
+    /// The MTP draft's stem (stage 1, after the embedding): reads the seed hidden rows and the embedding, normalizes
+    /// each into the normalized rows, and packs them.
+    static Instruction mtpStem(List<TensorHandle> norms, int hidden, int mtpLayer) {
+        return new Instruction(
+                1,
+                Kind.MTP_STEM,
+                List.of(0),
+                norms,
+                List.of(Buffer.HIDDEN_STATE),
+                List.of(Buffer.MTP_NORMED, Buffer.MTP_PACKED),
+                hidden,
+                2 * hidden,
+                -1,
+                mtpLayer);
+    }
+
     /// Most rows a quantum runs on the decode kernels, which read quantized weights in place without scratch.
     static final int DECODE_MAX_ROWS = 8;
 
@@ -493,17 +509,7 @@ public final class ExecutionPlan {
                 hidden,
                 -1,
                 -1));
-        nodes.add(new Instruction(
-                1,
-                Kind.MTP_STEM,
-                List.of(0),
-                List.of(embeddingNorm, hiddenNorm),
-                List.of(Buffer.HIDDEN_STATE),
-                List.of(Buffer.MTP_PACKED),
-                hidden,
-                2 * hidden,
-                -1,
-                mtpLayer));
+        nodes.add(mtpStem(List.of(embeddingNorm, hiddenNorm), hidden, mtpLayer));
         nodes.add(new Instruction(
                 2,
                 Kind.Q3_LINEAR,

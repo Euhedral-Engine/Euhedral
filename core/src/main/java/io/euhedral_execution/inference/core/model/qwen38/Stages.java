@@ -439,8 +439,8 @@ public final class Stages {
             int rows = context.inputTokenCount();
             int hidden = instruction.inputWidth();
             long rowBytes = (long) hidden * Short.BYTES;
-            long packed = output(context, instruction, 0);
-            long normed = context.workspace().address(ExecutionPlan.Buffer.MTP_NORMED);
+            long normed = output(context, instruction, 0);
+            long packed = output(context, instruction, 1);
             float epsilon = (float) context.plan().weights().config().rmsNormEpsilon();
             gpu().rmsNormUnitOffsetBf16(
                             input(context, instruction, 0),
