@@ -71,7 +71,8 @@ seal) that runs once.
 ## Admission
 
 Admission is a frame on the workspace's owner: its `idHash` is `WorkspaceOwner.HASH` and it stays ordered on it,
-so admissions run one at a time (`publishOnOwner`). Frames keep their publication order when they enter the lattice
+so admissions run one at a time. A generation's `Admit` admits its quantum itself (Qwen3.8 and Qwen4 alike); only a
+caller outside the owner (tests and tools) publishes the admission as a frame (`publishOnOwner`). Frames keep their publication order when they enter the lattice
 through one source and no queue of more than one partition. The lake's sinks are like GPU streams: each has one
 producer partition (`EUHEDRAL_LAKE_PARTITIONS`), carries any mixture of ordered and unordered frames, and runs an
 ordered frame in its own chain's order (frames of one `idHash`), not in queue order, so two owners' chains in one
@@ -497,6 +498,49 @@ Rejected:
 - A tensor-core decode attention CTA that shared one K/V expansion across the six query heads with 256-key splits: slower at every
   measured length (64 to 32768 keys), because its MMA, softmax and rescaling phases ran on two, half of one, and all four warps in
   turn and a 1024-token prefix occupied 20 CTAs. The three-warp 32-key-split kernel from 2048 keys replaced it.
+
+## What host progression costs
+
+Measured on the i9-14900K with an RTX 5070 Ti, 32 workers, Euhedral 0.2.0 and 0.2.1 (the same within noise), with a probe
+that stamps every frame at publication and at the start and end of `execute` (a throwaway patch, not in the tree). The
+numbers are medians unless said otherwise.
+
+- **A hop is cheap.** A frame published from a worker starts 4-8 us later (p99 16-32 us): the publishing worker, or an
+  awake neighbour, finds it in a sink on its next cycle. An ordered (owner) frame costs 15-20 us, because it takes the
+  request, route and cache path instead of the direct pull.
+- **Dense decode (Q3, speculation off, graphs replayed).** From the start of a token's retirement frame to the start of
+  the next token's replay frame: 170-180 us, of which the retirement 36, `Select` 20, `Admit` 85, and the hops about 30.
+  The token is 17 ms of device time, so the whole boundary is 1%. Speculative steps have three such boundaries, about
+  0.5 ms of 20 ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)). Where a boundary frame runs matters little: the retirement is 27%
+  slower on an E-core (42 against 33 us), `Admit` is the same on either, and the replay frame's 0.5-0.9 ms check of
+  every stage (E-core: twice that) runs behind the launched graph.
+- **Frame-by-frame quanta.** A 64-token prefill is 756 stage frames: the host submits all of them in 18-30 ms, and the
+  device finishes 31-45 ms later. Stage hops are hidden by the device.
+- **Flash-Next decode.** Per layer, from the end of the router stage to the first fetch starting: 200 us, of which the
+  device and the driver callback 155 and the host chain (retired-edge frame, fetch publication, owner hop) 41. The loads
+  themselves, 0.4-0.6 ms of read per miss, set the token's pace.
+
+Tried and not kept, each against a paired control (differences inside the run-to-run spread of 2-4%):
+
+- **Euhedral 0.2.1** (lock-free ingest, no monitor per publication): neutral on decode, prefill and Flash-Next.
+- **A frame published into the publishing worker's own cache** (an executor with a handle to its worker; the Fetch
+  retries): the owner worker is saturated by the retries either way, so a retry costs about the same.
+- **Placing ordered frames on performance cores** (`origin` plus `RoutingPolicy.CACHE_LOCAL` on every ordered frame, so
+  the owner chains left their hash-chosen E-cores): neutral. Flash-Next's cache owner ran on an E-core, `Admit` on another.
+- **A custom executor.** With the redundant owner hop gone, no chain of frames with one ordered hash is left for a
+  worker to continue inline, and the unordered chains (retirement, `Select`, replay) are hops of 5-8 us that the
+  scheduler already serves from the same worker's next cycle.
+
+Known costs this leaves:
+
+- **Fetch retries.** A fetch that finds the cache full publishes itself again (the rule above). In a 66 s Flash-Next
+  screen that is 20-25 million frames on the cache owner's one worker, which keep it busy; the frames that free the
+  resource (`Release`, `Retire`) wait behind them: 0.4-1 ms in prefill and cold decode, 20-40 us in warm decode, where it
+  does not matter. Both are bounded by the disk, so nothing waits on it; the worker's time is what it costs.
+- **One owner for every admission.** `Admit` (85 us) serializes all sessions' admissions on one worker: capacity of about
+  11,000 admissions a second, far beyond what one GPU's decode needs.
+- **Per-quantum fingerprints.** A third of `Admit` is the capture key: the allocation id of every state address, a
+  concurrent-map lookup each. It could be kept in the states instead of recomputed (about 30 us a quantum).
 
 ## No locks on the hot path
 
