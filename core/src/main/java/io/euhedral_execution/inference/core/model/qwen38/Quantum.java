@@ -13,7 +13,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /// Mutable state for one inference quantum: its token range, its admission to the sequence, workspace, and outcome.
@@ -68,8 +67,6 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private final long startPosition;
     private final int[] tokenIds;
     private final AtomicBoolean submitted = new AtomicBoolean();
-    /// Releases the staging ring this quantum holds; null when it holds none.
-    private final AtomicReference<java.util.function.Consumer<GpuStream>> stagingRelease = new AtomicReference<>();
     /// Whether the sequence admitted this quantum; only an admitted quantum retires the sequence's work.
     private boolean admitted;
     /// The position the sequence admitted this quantum at.
@@ -287,18 +284,6 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     @Override
     public boolean stopRequested() {
         return hasFailureOrCancellation();
-    }
-
-    /// Binds the staging ring hold this quantum releases once its lanes joined.
-    public void holdStaging(java.util.function.Consumer<GpuStream> release) {
-        if (!this.stagingRelease.compareAndSet(null, java.util.Objects.requireNonNull(release, "release")))
-            throw new IllegalStateException("quantum already holds the staging ring");
-    }
-
-    @Override
-    public void lanesJoined(GpuStream home) {
-        var release = this.stagingRelease.getAndSet(null);
-        if (release != null) release.accept(home);
     }
 
     @Override

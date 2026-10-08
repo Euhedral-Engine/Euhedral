@@ -108,7 +108,7 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
     /// publication, outside the owner, so the admission is published as an owner frame.
     private void go() {
         this.plan.quantumStarted();
-        this.plan.runtime().publishOnOwner(() -> this.plan.runtime().admit(this.shape, this, null, this::prepare));
+        this.plan.runtime().publishOnOwner(() -> this.plan.runtime().admit(this.shape, this, this::prepare));
     }
 
     /// Runs on the graph's home lane before any stage: binds the graph's workspace, hands over the

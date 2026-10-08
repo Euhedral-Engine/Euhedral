@@ -158,7 +158,7 @@ class FullModelExecutionPlanTest {
         return fullModelWeights(name -> false);
     }
 
-    private static Weights fullModelWeights(java.util.function.Predicate<String> host) {
+    static Weights fullModelWeights(java.util.function.Predicate<String> host) {
         hostBacked = host;
         try {
             return buildFullModelWeights();

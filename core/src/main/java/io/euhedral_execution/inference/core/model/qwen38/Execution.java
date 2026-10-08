@@ -4,15 +4,16 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
-import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.prefix.PrefixFrames;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.PromptSink;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
+import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.runtime.graph.LanePool;
+import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,15 +21,16 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
+import java.util.function.IntFunction;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/// Runs the dense model's quanta: the runtime it admits them to, the lake that runtime publishes into, the host
-/// work around a request, and the weight staging ring's hand-over between quanta.
+/// Runs the dense model's quanta: the runtime it admits them to, the lake that runtime publishes into, its one
+/// workspace, and the host work around a request.
 ///
-/// Quanta whose view stages weights hold the ring from admission until their last stage submitted (a later change
-/// replaces this hold with frames routed to the ring's owner).
+/// Host-backed weights reach the device through staging slots, which are workspace buffers: a transfer into a slot
+/// follows the slot's last reader, in its own graph or the one admitted before, so nothing holds the slots.
 public final class Execution implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(Execution.class);
@@ -40,11 +42,6 @@ public final class Execution implements AutoCloseable {
     private final InferenceLake lake;
     private final HostTasks hostTasks;
     private final EuhedralInferenceRuntime runtime;
-    /// Held by the quantum that stages weights, from its admission until its last stage submitted.
-    private final java.util.concurrent.Semaphore stagingHold = new java.util.concurrent.Semaphore(1);
-    /// Whether the staging ring holds the decode view's first slots ([ExecutionPlan#prefetchesRing]). Read and
-    /// written only under `stagingHold`.
-    private boolean ringPreloaded;
     private final Object closeLock = new Object();
     /// The runtime's one workspace, sized at load.
     private final SharedWorkspace shared;
@@ -191,24 +188,21 @@ public final class Execution implements AutoCloseable {
     /// Admits a claimed quantum. Runs on the workspace's owner.
     private void accept(Quantum context, Consumer<? super Quantum> terminalConsumer) {
         Shape view = context.shape();
-        boolean staging = view.stagesWeights();
-        if (staging) {
-            // Blocks only this admitting thread, until the previous staging quantum has submitted its
-            // last stage; its device work is ordered by the transfer marker, not waited for here. A decode view
-            // that finds its first slots prefetched runs without their transfers.
-            this.stagingHold.acquireUninterruptibly();
-            if (this.ringPreloaded) view = view.preloadedVariant();
-            this.ringPreloaded = false;
-            boolean prefetches = view.prefetchesRing();
-            context.holdStaging(
-                    home -> releaseStaging(home, prefetches && home != null && !context.hasFailureOrCancellation()));
+        // A decode view whose first staging slots this sequence's DFlash2 block just filled runs without their
+        // transfers; its first readers of those slots then follow the block's prefetch transfers (their last writer).
+        Shape preloaded = view.preloadedVariant();
+        if (preloaded != view) {
+            WorkspaceOwner owner = this.runtime.workspaceOwner();
+            if (preloadHolds(
+                    this.plan.dflashBlockShape(),
+                    context.sequenceState(),
+                    this.plan.prefetchedSlots(),
+                    slot -> owner.last(SharedWorkspace.stagingBuffer(this.plan, slot)))) view = preloaded;
         }
-        boolean ordered = staging;
         try {
             this.runtime.admit(
                     view,
                     context,
-                    ordered ? stream -> stream.await(this.runtime.transferMarker()) : null,
                     (stream, storage) ->
                             context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage, this.shared));
         } catch (RuntimeException | Error refused) {
@@ -216,16 +210,21 @@ public final class Execution implements AutoCloseable {
         }
     }
 
-    /// Releases the staging ring. `home` has joined every lane of the releasing quantum; null when its lanes
-    /// were proven idle instead. `preloaded`: every stage of a prefetching quantum ran, so the ring holds the
-    /// decode view's first slots once the transfer marker is reached.
-    private void releaseStaging(GpuStream home, boolean preloaded) {
-        try {
-            if (home != null) home.mark(this.runtime.transferMarker());
-            this.ringPreloaded = preloaded;
-        } finally {
-            this.stagingHold.release();
+    /// Whether the first `slots` staging slots hold what `block` (a DFlash2 block view that prefetches) loads for
+    /// `sequence`: the graph that last used each slot ran `block` for that sequence, and concluded successfully.
+    /// `last` gives each slot's record on the workspace's owner, whose frames call this.
+    static boolean preloadHolds(GraphShape block, Sequence sequence, int slots, IntFunction<WorkspaceOwner.Last> last) {
+        if (block == null || slots == 0) return false;
+        for (int slot = 0; slot < slots; slot++) {
+            WorkspaceOwner.Last written = last.apply(slot);
+            if (written == null
+                    || written.shape() != block
+                    || !(written.quantum() instanceof Quantum quantum)
+                    || quantum.sequenceState() != sequence
+                    || quantum.conclusion() == null
+                    || quantum.conclusion().status() != Quantum.Status.SUCCESS) return false;
         }
+        return true;
     }
 
     /// Tokenizes `text` on the lattice's workers (PromptTokenization), with the BOS/EOS tokens of

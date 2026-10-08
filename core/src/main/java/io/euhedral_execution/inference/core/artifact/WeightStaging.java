@@ -1,12 +1,11 @@
 package io.euhedral_execution.inference.core.artifact;
 
-/// The device staging ring for host-backed weights: `slots` slots of `slotBytes` each from
-/// `baseAddress`.
+/// The device staging slots for host-backed weights: `slots` slots of `slotBytes` each from `baseAddress`.
 ///
 /// Each view assigns the uses of host-backed weights to slots round-robin, in instruction order. A
-/// weight-transfer stage copies the weight into its slot after the use that
-/// last read the slot, and the consumer reads the slot after the transfer. Quanta that stage weights
-/// hold the ring from preparation until their last stage submitted, so their slot uses never interleave.
+/// weight-transfer stage copies the weight into its slot after the use that last read the slot, and the
+/// consumer reads the slot after the transfer. Each slot is a workspace buffer, so across graphs too a transfer
+/// follows the slot's last reader in the graph admitted before: nothing holds the slots.
 public record WeightStaging(long baseAddress, long slotBytes, int slots) {
 
     /// Slots in a staging ring: enough for copies to queue ahead of their consumers.
