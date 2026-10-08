@@ -343,6 +343,18 @@ public abstract class ExecutionGpu implements GpuMemory {
         linearQ3Bf16(inputAddress, weightsAddress, outputAddress, rows, inFeatures, outFeatures, weightsByteSize);
     }
 
+    /// Queues a copy of `bytes` bytes from pinned host memory at `hostAddress` to `deviceAddress` on the selected
+    /// stream. GPUs without streams copy before returning.
+    public void copyHostToDeviceAsync(long deviceAddress, long hostAddress, long bytes) {
+        copyHostToDevice(deviceAddress, MemorySegment.ofAddress(hostAddress).reinterpret(bytes), bytes);
+    }
+
+    /// Queues a copy of `bytes` device bytes at `deviceAddress` to pinned host memory at `hostAddress` on the
+    /// selected stream. GPUs without streams copy before returning.
+    public void copyDeviceToHostAsync(long hostAddress, long deviceAddress, long bytes) {
+        copyDeviceToHost(MemorySegment.ofAddress(hostAddress).reinterpret(bytes), deviceAddress, bytes);
+    }
+
     /// Queues a copy of `byteSize` bytes from pinned host weights at `source` to device memory on the
     /// selected stream.
     public void copyHostWeightsToDevice(long destination, long source, long byteSize) {

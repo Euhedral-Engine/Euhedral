@@ -10,7 +10,8 @@ import java.util.Set;
 /// its own; a lookup walks down the nodes whose tokens equal the prompt's, comparing the tokens themselves,
 /// so a match is exact. Nodes become visible when published, and are evicted least recently used first,
 /// childless nodes only, never while pinned. Positions lie on the KV page grid, so a node's pages start where
-/// its parent's end. Thread-safe.
+/// its parent's end. Not thread-safe: confined to its owner (the prefix cache's owner frames); [#size] and
+/// [#evictions] may be read from anywhere.
 public final class PrefixTree {
     /// Every node position is a multiple of this: the number of tokens in a KV page.
     public static final int POSITION_GRANULE = 256;
@@ -19,7 +20,9 @@ public final class PrefixTree {
     private final PrefixNode root = new PrefixNode(null, 0, 0, new int[0], null);
     private final Set<PrefixNode> published = new LinkedHashSet<>();
     private long clock;
-    private long evictions;
+    /// Written by the owner only; read by statistics from any thread.
+    private volatile long evictions;
+    private volatile int size;
 
     public PrefixTree(HostExtents extents) {
         this.extents = extents;
@@ -43,7 +46,7 @@ public final class PrefixTree {
     /// The longest match of `prompt` that leaves at least one token to prefill, or null. With a `speculation`
     /// kind only nodes that hold that kind of speculative state match, so the chain is unbroken; with null any
     /// node matches.
-    public synchronized Match lookup(int[] prompt, String speculation) {
+    public Match lookup(int[] prompt, String speculation) {
         List<PrefixNode> chain = new ArrayList<>();
         PrefixNode node = this.root;
         while (true) {
@@ -66,13 +69,13 @@ public final class PrefixTree {
         return new Match(List.copyOf(chain));
     }
 
-    public synchronized void release(Match match) {
+    public void release(Match match) {
         for (PrefixNode node : match.chain()) node.pins--;
     }
 
     /// The published child of `parent` whose span `[parent.position, position)` equals `tokens` and whose
     /// speculative state is of the kind `speculation` (null: none), or null. A span can be stored once per kind.
-    public synchronized PrefixNode find(PrefixNode parent, int[] tokens, int position, String speculation) {
+    public PrefixNode find(PrefixNode parent, int[] tokens, int position, String speculation) {
         for (PrefixNode child : parent.children)
             if (child.position() == position
                     && java.util.Objects.equals(child.speculation(), speculation)
@@ -86,7 +89,7 @@ public final class PrefixTree {
 
     /// The published child of `parent` whose span `[parent.position, position)` equals `tokens`, whatever
     /// speculative state it holds, or null: every node holds the base state a plain capture would store.
-    public synchronized PrefixNode findAny(PrefixNode parent, int[] tokens, int position) {
+    public PrefixNode findAny(PrefixNode parent, int[] tokens, int position) {
         for (PrefixNode child : parent.children)
             if (child.position() == position && position <= tokens.length && matches(child, tokens)) {
                 child.lastUse = ++this.clock;
@@ -98,7 +101,7 @@ public final class PrefixTree {
     /// Reserves `bytes` for a node covering `[parent.position, position)` of `tokens`, evicting least recently
     /// used nodes for room. Returns null when nothing evictable remains. The node is invisible until
     /// [#publish], and `parent` stays pinned until [#publish] or [#abort].
-    public synchronized PrefixNode reserve(
+    public PrefixNode reserve(
             PrefixNode parent, int[] tokens, int position, String speculation, long bytes) {
         if (position <= parent.position() || position > tokens.length || position % POSITION_GRANULE != 0)
             throw new IllegalArgumentException("a node must advance, on the page grid, within the tokens");
@@ -127,24 +130,25 @@ public final class PrefixTree {
     }
 
     /// Makes a reserved node visible to lookups.
-    public synchronized void publish(PrefixNode node) {
+    public void publish(PrefixNode node) {
         node.parent().children.add(node);
         this.published.add(node);
+        this.size = this.published.size();
         node.lastUse = ++this.clock;
         node.parent().pins--;
     }
 
     /// Gives a reserved node's bytes back; it never became visible.
-    public synchronized void abort(PrefixNode node) {
+    public void abort(PrefixNode node) {
         this.extents.free(node.extentOffset, node.extentBytes);
         node.parent().pins--;
     }
 
-    public synchronized int size() {
-        return this.published.size();
+    public int size() {
+        return this.size;
     }
 
-    public synchronized long evictions() {
+    public long evictions() {
         return this.evictions;
     }
 
@@ -160,7 +164,8 @@ public final class PrefixTree {
         node.parent().children.remove(node);
         this.published.remove(node);
         this.extents.free(node.extentOffset, node.extentBytes);
-        this.evictions++;
+        this.evictions = this.evictions + 1;
+        this.size = this.published.size();
     }
 
     private static boolean matches(PrefixNode node, int[] prompt) {

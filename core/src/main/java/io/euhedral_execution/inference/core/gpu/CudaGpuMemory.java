@@ -1160,6 +1160,25 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     @Override
+    public void copyHostToDeviceAsync(long deviceAddress, long hostAddress, long bytes) {
+        copyHostWeightsToDevice(deviceAddress, hostAddress, bytes);
+    }
+
+    @Override
+    public void copyDeviceToHostAsync(long hostAddress, long deviceAddress, long bytes) {
+        ensureOpen();
+        requireDeviceAddress(deviceAddress);
+        if (hostAddress == 0 || bytes <= 0) throw new IllegalArgumentException("invalid pinned host copy");
+        int status = invokeCopy(
+                copyDeviceToReadback,
+                MemorySegment.ofAddress(hostAddress),
+                MemorySegment.ofAddress(deviceAddress),
+                bytes,
+                "pinned device-to-host copy");
+        if (status != 0) throw new GpuMemoryException("pinned device-to-host copy", status);
+    }
+
+    @Override
     public void copyUploadToDevice(long destination, UploadBuffer upload) {
         ensureOpen();
         requireDeviceAddress(destination);

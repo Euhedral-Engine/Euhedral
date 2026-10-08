@@ -59,18 +59,29 @@ state is not prefill state either) never is. The last chunk boundary before the 
 
 ## Capture and restore
 
-Both move state in frames of at most 16 MiB of copies each (`EuhedralInferenceRuntime.onWorker`), so no worker holds a
-long copy, and both run between quanta: GDN state changes with every quantum, so a checkpoint is copied before the next
-chunk is admitted. A capture reserves its bytes first (evicting for room), copies, then publishes; a copy that fails gives
-the bytes back and the generation goes on. A restore allocates the sequence's state as a first quantum does, copies the
-chain's KV pages and the last node's GDN state in, and publishes the position; the pages of a chain are copied
-ancestor first.
+The tree belongs to the cache's owner. Every lookup, reservation, publication, abort and release is a frame built with
+the owner's `idHash` (`PrefixCache.HASH`) that stays ordered on it, so these frames run one at a time and the tree takes
+no lock; statistics read volatile snapshots. Each call tells the session what happened (`PrefixCache.Steps`) and then
+throws the frame the session gave it, the step's Select, so a prefix step is one more step of the generation's chain.
 
-A capture holds the sequence's execution lease while it copies, as a restore does, so a cancellation that arrives
-mid-capture only flags the sequence and its buffers are released after the copies; a sequence already cancelled is not
-captured. (Without the lease, a client that left during prefill released the buffers under the copy, and the process
-crashed in `cuMemcpyDtoH`.) A cancelled generation takes no checkpoint at its end, and one cancelled while restoring
-ends with the sequence released.
+Both directions queue their copies asynchronously on the cache's own stream, in pieces of at most 16 MiB
+(`PrefixCopies`): a piece queues its copies and throws the next piece, so no worker holds a long copy. The pieces carry
+the owner's `idHash` but are randomized, so they run on any worker. They queue in list order, because a restore copies
+the pages of a chain ancestor first and a later node overwrites the page it shares with its parent. The last piece arms a
+device-completion boundary; its driver callback publishes the frame that confirms it. Copies run between quanta, because
+GDN state changes with every quantum, so a checkpoint is copied before the next chunk is admitted.
+
+A capture's owner frame reserves its bytes first (evicting for room) and queues the copies. Once they complete, the
+capture concludes in the sequence's order, and an owner frame publishes the node, or aborts it and gives the bytes
+back. A failed copy does not stop the generation. A restore allocates the sequence's state on the cache's stream, as a
+first quantum does, so those allocations and uploads come before its copies. It then copies the chain's KV pages and the
+last node's GDN state in, publishes the position in the sequence's order, and releases the hit on the owner.
+
+A capture is work on the sequence, admitted like a quantum, and so is a restore. A cancellation that arrives
+mid-capture therefore only flags the sequence, and its buffers are released after the copies' device completion. A
+sequence already cancelled is not captured. (Without this, a client that left during prefill released the buffers
+under the copy, and the process crashed in `cuMemcpyDtoH`.) A cancelled generation takes no checkpoint at its end, and
+a generation cancelled while restoring ends with the sequence released.
 
 ## Speculative prompts
 
