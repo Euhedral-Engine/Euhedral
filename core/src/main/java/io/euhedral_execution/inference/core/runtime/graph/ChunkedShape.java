@@ -10,7 +10,8 @@ import java.util.Objects;
 /// the last chunk the `last` one (a smaller row count may select a different view). Within a chunk the edges are the
 /// template's. Between chunks there are only the edges the templates' declarations give: for every workspace buffer
 /// and every carried-state key, chunk c's first users follow chunk c-1's last users. A stage that touches nothing
-/// shared (a token upload, a weight transfer) has no edge from the previous chunk and runs as soon as its inputs exist.
+/// shared (a token upload, a weight transfer) has no edge from the previous chunk and runs as soon as its inputs
+/// exist.
 ///
 /// The edges between chunks come from each template's [WorkspaceUse] and [CarriedState], once, so a shape of many
 /// chunks builds in time linear in its size.
