@@ -22,14 +22,13 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.TestExecution;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
-import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
@@ -39,6 +38,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+@ModelGroup.CompactQ3
 class FullModelCudaIntegrationTest {
 
     private static void reportError(String name, short[] expected, short[] actual) {
@@ -95,315 +95,289 @@ class FullModelCudaIntegrationTest {
     @Test
     @Timeout(value = 1200, unit = TimeUnit.SECONDS)
     void realCompactQwenRunsAllLayersMatchesLocalReferencesAndPreservesState() throws Exception {
-        Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact"));
-        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
-        assertTrue(Files.isRegularFile(artifactPath), "compact Qwen artifact is missing: " + artifactPath);
-        Artifact artifact = ArtifactReader.read(artifactPath);
+        var loaded = SharedQwen38.q3();
+        Artifact artifact = loaded.artifact();
         assertEquals(64, artifact.config().numHiddenLayers());
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(LayerType.FULL_ATTENTION));
         assertTrue(Arrays.asList(artifact.config().layerTypes()).contains(LayerType.GATED_DELTA_NET));
 
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
-            long allocatedBefore = gpu.allocatedBytes();
-            Qwen38Model model = Qwen38Model.load(artifactPath, artifact, gpu);
-            Weights weights = model.weights();
-            Throwable failure = null;
-            Sequence prefixSequence = new Sequence(501);
-            Sequence mixedSequence = new Sequence(502);
-            Sequence stateSequence = new Sequence(503);
-            Sequence referenceSequence = new Sequence(504);
-            Sequence isolationSequence = new Sequence(505);
-            List<RunResult> runs = new ArrayList<>();
-            try {
-                ExecutionPlan plan = new ExecutionPlan(weights);
-                ExecutionPlan firstLayerPlan = ExecutionPlan.prefix(weights, 1);
-                ExecutionPlan mixedPlan = ExecutionPlan.prefix(weights, 4);
-                int fullAttentionLayers = (int) Arrays.stream(weights.config().layerTypes())
-                        .filter(type -> type == LayerType.FULL_ATTENTION)
-                        .count();
-                assertEquals(
-                        64,
-                        plan.instructions().stream()
-                                        .mapToInt(ExecutionPlan.Instruction::layerIndex)
-                                        .filter(index -> index >= 0)
-                                        .max()
-                                        .orElseThrow()
-                                + 1);
-                assertEquals(
-                        fullAttentionLayers,
-                        plan.instructions().stream()
-                                .filter(instruction -> instruction.kind() == ExecutionPlan.Kind.ATTENTION_CAUSAL)
-                                .count());
-                for (int layerIndex = 0; layerIndex < weights.layers().length; layerIndex++) {
-                    int selectedLayer = layerIndex;
-                    long expectedWeight =
-                            weights.layers()[layerIndex].inputNorm().deviceAddress();
-                    assertTrue(plan.instructions().stream()
-                            .anyMatch(instruction -> instruction.layerIndex() == selectedLayer
-                                    && instruction.weightAddress() == expectedWeight));
-                }
+        CudaGpuMemory gpu = loaded.gpu();
+        long allocatedBefore = gpu.allocatedBytes();
+        Weights weights = loaded.model().weights();
+        Throwable failure = null;
+        Sequence prefixSequence = new Sequence(501);
+        Sequence mixedSequence = new Sequence(502);
+        Sequence stateSequence = new Sequence(503);
+        Sequence referenceSequence = new Sequence(504);
+        Sequence isolationSequence = new Sequence(505);
+        List<RunResult> runs = new ArrayList<>();
+        try {
+            ExecutionPlan plan = new ExecutionPlan(weights);
+            ExecutionPlan firstLayerPlan = ExecutionPlan.prefix(weights, 1);
+            ExecutionPlan mixedPlan = ExecutionPlan.prefix(weights, 4);
+            int fullAttentionLayers = (int) Arrays.stream(weights.config().layerTypes())
+                    .filter(type -> type == LayerType.FULL_ATTENTION)
+                    .count();
+            assertEquals(
+                    64,
+                    plan.instructions().stream()
+                                    .mapToInt(ExecutionPlan.Instruction::layerIndex)
+                                    .filter(index -> index >= 0)
+                                    .max()
+                                    .orElseThrow()
+                            + 1);
+            assertEquals(
+                    fullAttentionLayers,
+                    plan.instructions().stream()
+                            .filter(instruction -> instruction.kind() == ExecutionPlan.Kind.ATTENTION_CAUSAL)
+                            .count());
+            for (int layerIndex = 0; layerIndex < weights.layers().length; layerIndex++) {
+                int selectedLayer = layerIndex;
+                long expectedWeight = weights.layers()[layerIndex].inputNorm().deviceAddress();
+                assertTrue(plan.instructions().stream()
+                        .anyMatch(instruction -> instruction.layerIndex() == selectedLayer
+                                && instruction.weightAddress() == expectedWeight));
+            }
 
-                FullModelCpuReference.Result reference = FullModelCpuReference.run(weights, gpu, INITIAL_TOKEN);
-                FirstLayerCpuReference.Result firstLayerReference =
-                        FirstLayerCpuReference.run(weights, gpu, INITIAL_TOKEN);
+            // The mixed plan below is the only run compared with this reference, and it covers four layers.
+            FullModelCpuReference.Result reference = FullModelCpuReference.run(weights, gpu, INITIAL_TOKEN, 4);
+            FirstLayerCpuReference.Result firstLayerReference = FirstLayerCpuReference.run(weights, gpu, INITIAL_TOKEN);
 
-                RunResult firstLayer = execute(
-                        gpu,
-                        firstLayerPlan,
-                        prefixSequence,
-                        Quantum.ExecutionKind.DECODE,
-                        0,
-                        new int[] {INITIAL_TOKEN},
-                        FIRST_LAYER_BOUNDARIES);
-                runs.add(firstLayer);
-                assertSuccessful(firstLayer);
+            RunResult firstLayer = execute(
+                    gpu,
+                    firstLayerPlan,
+                    prefixSequence,
+                    Quantum.ExecutionKind.DECODE,
+                    0,
+                    new int[] {INITIAL_TOKEN},
+                    FIRST_LAYER_BOUNDARIES);
+            runs.add(firstLayer);
+            assertSuccessful(firstLayer);
+            assertBf16Equals(
+                    firstLayerReference.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                    firstLayer.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                    0.08f);
+            for (ExecutionPlan.Buffer boundary : FIRST_LAYER_BOUNDARIES) {
                 assertBf16Equals(
-                        firstLayerReference.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
-                        firstLayer.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                        firstLayerReference.buffers().get(boundary),
+                        firstLayer.buffers().get(boundary),
                         0.08f);
-                for (ExecutionPlan.Buffer boundary : FIRST_LAYER_BOUNDARIES) {
-                    assertBf16Equals(
-                            firstLayerReference.buffers().get(boundary),
-                            firstLayer.buffers().get(boundary),
-                            0.08f);
+            }
+
+            RunResult mixed = execute(
+                    gpu,
+                    mixedPlan,
+                    mixedSequence,
+                    Quantum.ExecutionKind.DECODE,
+                    0,
+                    new int[] {INITIAL_TOKEN},
+                    List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
+            runs.add(mixed);
+            assertSuccessful(mixed);
+            assertBf16Equals(
+                    reference.layerOutputs().get(3),
+                    mixed.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                    HIDDEN_TOLERANCE);
+
+            RunResult prefill = execute(
+                    gpu,
+                    plan,
+                    stateSequence,
+                    Quantum.ExecutionKind.PREFILL,
+                    0,
+                    new int[] {INITIAL_TOKEN, 26},
+                    List.of(ExecutionPlan.Buffer.FINAL_NORMALIZED));
+            runs.add(prefill);
+            assertSuccessful(prefill);
+            assertEquals(2, stateSequence.currentTokenPosition());
+            GdnStates recurrent = (GdnStates) stateSequence.recurrentState();
+            AttentionStates attention = (AttentionStates) stateSequence.kvCacheState();
+            long firstRecurrentAddress = recurrent.forLayer(0).recurrentStateAddress();
+            long firstConvolutionAddress = recurrent.forLayer(0).convolutionStateAddress();
+            long recurrentBytes = (long) weights.config().linearNumValueHeads()
+                    * weights.config().linearKeyHeadDim()
+                    * weights.config().linearValueHeadDim()
+                    * Float.BYTES;
+            byte[] recurrentAfterPrefill = readDeviceBytes(gpu, firstRecurrentAddress, recurrentBytes);
+            int attentionLayers = 0;
+            for (int layerIndex = 0; layerIndex < weights.config().layerTypes().length; layerIndex++) {
+                if (weights.config().layerTypes()[layerIndex] != LayerType.FULL_ATTENTION) continue;
+                assertEquals(2, attention.forLayer(layerIndex).length());
+                attentionLayers++;
+            }
+            assertEquals(fullAttentionLayers, attentionLayers);
+
+            RunResult decode = execute(
+                    gpu,
+                    plan,
+                    stateSequence,
+                    Quantum.ExecutionKind.DECODE,
+                    2,
+                    new int[] {13},
+                    List.of(ExecutionPlan.Buffer.FINAL_NORMALIZED));
+            runs.add(decode);
+            assertSuccessful(decode);
+            assertEquals(3, stateSequence.currentTokenPosition());
+            assertTrue(
+                    !Arrays.equals(recurrentAfterPrefill, readDeviceBytes(gpu, firstRecurrentAddress, recurrentBytes)),
+                    "GDN recurrent state did not advance in the decode quantum");
+            assertTrue(firstConvolutionAddress != 0);
+            for (int layerIndex = 0; layerIndex < weights.config().layerTypes().length; layerIndex++) {
+                if (weights.config().layerTypes()[layerIndex] == LayerType.FULL_ATTENTION) {
+                    assertEquals(3, attention.forLayer(layerIndex).length());
                 }
+            }
 
-                RunResult mixed = execute(
-                        gpu,
-                        mixedPlan,
-                        mixedSequence,
-                        Quantum.ExecutionKind.DECODE,
-                        0,
-                        new int[] {INITIAL_TOKEN},
-                        List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
-                runs.add(mixed);
-                assertSuccessful(mixed);
-                assertBf16Equals(
-                        reference.layerOutputs().get(3),
-                        mixed.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
-                        HIDDEN_TOLERANCE);
-
-                RunResult prefill = execute(
-                        gpu,
-                        plan,
-                        stateSequence,
-                        Quantum.ExecutionKind.PREFILL,
-                        0,
-                        new int[] {INITIAL_TOKEN, 26},
-                        List.of(ExecutionPlan.Buffer.FINAL_NORMALIZED));
-                runs.add(prefill);
-                assertSuccessful(prefill);
-                assertEquals(2, stateSequence.currentTokenPosition());
-                GdnStates recurrent = (GdnStates) stateSequence.recurrentState();
-                AttentionStates attention = (AttentionStates) stateSequence.kvCacheState();
-                long firstRecurrentAddress = recurrent.forLayer(0).recurrentStateAddress();
-                long firstConvolutionAddress = recurrent.forLayer(0).convolutionStateAddress();
-                long recurrentBytes = (long) weights.config().linearNumValueHeads()
-                        * weights.config().linearKeyHeadDim()
-                        * weights.config().linearValueHeadDim()
-                        * Float.BYTES;
-                byte[] recurrentAfterPrefill = readDeviceBytes(gpu, firstRecurrentAddress, recurrentBytes);
-                int attentionLayers = 0;
-                for (int layerIndex = 0; layerIndex < weights.config().layerTypes().length; layerIndex++) {
-                    if (weights.config().layerTypes()[layerIndex] != LayerType.FULL_ATTENTION) continue;
-                    assertEquals(2, attention.forLayer(layerIndex).length());
-                    attentionLayers++;
+            RunResult cleanSequence = execute(
+                    gpu,
+                    plan,
+                    referenceSequence,
+                    Quantum.ExecutionKind.DECODE,
+                    0,
+                    new int[] {INITIAL_TOKEN},
+                    List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE, ExecutionPlan.Buffer.FINAL_NORMALIZED));
+            runs.add(cleanSequence);
+            assertSuccessful(cleanSequence);
+            assertEquals(1, referenceSequence.currentTokenPosition());
+            assertNotSame(stateSequence.recurrentState(), referenceSequence.recurrentState());
+            assertNotSame(stateSequence.kvCacheState(), referenceSequence.kvCacheState());
+            assertEquals(
+                    1,
+                    ((AttentionStates) referenceSequence.kvCacheState())
+                            .forLayer(3)
+                            .length());
+            // NVFP4 has a discrete, lossy KV boundary. Independent CPU/GPU
+            // projection rounding can select different codes and compound across
+            // layers. Accumulated hidden/logit differences are not a correctness
+            // assertion, so no scalar CPU pass over all 64 layers is run for them. The represented-value FP64 operator
+            // oracle,
+            // real-layer same-input oracle, and exact state/lifecycle checks are
+            // the correctness contract; the V-input-matching probe is not a gate.
+            for (ExecutionPlan.Buffer buffer :
+                    List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE, ExecutionPlan.Buffer.FINAL_NORMALIZED)) {
+                for (short value : cleanSequence.buffers().get(buffer)) {
+                    assertTrue(Float.isFinite(bf16ToFloat(value)), "non-finite " + buffer);
                 }
-                assertEquals(fullAttentionLayers, attentionLayers);
-
-                RunResult decode = execute(
-                        gpu,
-                        plan,
-                        stateSequence,
-                        Quantum.ExecutionKind.DECODE,
-                        2,
-                        new int[] {13},
-                        List.of(ExecutionPlan.Buffer.FINAL_NORMALIZED));
-                runs.add(decode);
-                assertSuccessful(decode);
-                assertEquals(3, stateSequence.currentTokenPosition());
+            }
+            for (short value : cleanSequence.logits()) {
                 assertTrue(
-                        !Arrays.equals(
-                                recurrentAfterPrefill, readDeviceBytes(gpu, firstRecurrentAddress, recurrentBytes)),
-                        "GDN recurrent state did not advance in the decode quantum");
-                assertTrue(firstConvolutionAddress != 0);
-                for (int layerIndex = 0; layerIndex < weights.config().layerTypes().length; layerIndex++) {
-                    if (weights.config().layerTypes()[layerIndex] == LayerType.FULL_ATTENTION) {
-                        assertEquals(3, attention.forLayer(layerIndex).length());
-                    }
-                }
+                        Float.isFinite(bf16ToFloat(value)), "final vocabulary projection produced a non-finite logit");
+            }
+            assertEquals(weights.config().vocabSize(), cleanSequence.logits().length);
+            int expectedGreedyToken = independentArgmax(cleanSequence.logits());
+            LogitsSampler greedySampler = new LogitsSampler(
+                    GenerationConfig.greedy(0L), weights.config().vocabSize());
+            assertEquals(
+                    expectedGreedyToken,
+                    greedySampler.selectToken(
+                            cleanSequence.context().logitsOutput().orElseThrow(), gpu));
 
-                RunResult cleanSequence = execute(
-                        gpu,
-                        plan,
-                        referenceSequence,
-                        Quantum.ExecutionKind.DECODE,
-                        0,
-                        new int[] {INITIAL_TOKEN},
-                        List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE, ExecutionPlan.Buffer.FINAL_NORMALIZED));
-                runs.add(cleanSequence);
-                assertSuccessful(cleanSequence);
-                assertEquals(1, referenceSequence.currentTokenPosition());
-                assertNotSame(stateSequence.recurrentState(), referenceSequence.recurrentState());
-                assertNotSame(stateSequence.kvCacheState(), referenceSequence.kvCacheState());
-                assertEquals(
-                        1,
-                        ((AttentionStates) referenceSequence.kvCacheState())
-                                .forLayer(3)
-                                .length());
-                reportError(
-                        "hidden",
-                        reference.layerOutputs().get(63),
-                        cleanSequence.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
-                reportError(
-                        "normalized",
-                        reference.finalNormalized(),
-                        cleanSequence.buffers().get(ExecutionPlan.Buffer.FINAL_NORMALIZED));
-                reportError("logits", reference.logits(), cleanSequence.logits());
-                // NVFP4 has a discrete, lossy KV boundary. Independent CPU/GPU
-                // projection rounding can select different codes and compound across
-                // layers. Accumulated hidden/logit differences are diagnostic, not a
-                // correctness assertion. The represented-value FP64 operator oracle,
-                // real-layer same-input oracle, and exact state/lifecycle checks are
-                // the correctness contract; the V-input-matching probe is not a gate.
-                for (ExecutionPlan.Buffer buffer :
-                        List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE, ExecutionPlan.Buffer.FINAL_NORMALIZED)) {
-                    for (short value : cleanSequence.buffers().get(buffer)) {
-                        assertTrue(Float.isFinite(bf16ToFloat(value)), "non-finite " + buffer);
-                    }
-                }
-                for (short value : cleanSequence.logits()) {
-                    assertTrue(
-                            Float.isFinite(bf16ToFloat(value)),
-                            "final vocabulary projection produced a non-finite logit");
-                }
-                assertEquals(weights.config().vocabSize(), cleanSequence.logits().length);
-                int expectedGreedyToken = independentArgmax(cleanSequence.logits());
-                LogitsSampler greedySampler = new LogitsSampler(
-                        GenerationConfig.greedy(0L), weights.config().vocabSize());
-                assertEquals(
-                        expectedGreedyToken,
-                        greedySampler.selectToken(
-                                cleanSequence.context().logitsOutput().orElseThrow(), gpu));
+            RunResult isolatedSequence = execute(
+                    gpu,
+                    plan,
+                    isolationSequence,
+                    Quantum.ExecutionKind.DECODE,
+                    0,
+                    new int[] {INITIAL_TOKEN},
+                    List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
+            runs.add(isolatedSequence);
+            assertSuccessful(isolatedSequence);
+            assertArrayEquals(cleanSequence.logits(), isolatedSequence.logits());
+            assertNotEquals(
+                    ((GdnStates) stateSequence.recurrentState()).forLayer(0).recurrentStateAddress(),
+                    ((GdnStates) referenceSequence.recurrentState()).forLayer(0).recurrentStateAddress());
 
-                RunResult isolatedSequence = execute(
-                        gpu,
-                        plan,
-                        isolationSequence,
-                        Quantum.ExecutionKind.DECODE,
-                        0,
-                        new int[] {INITIAL_TOKEN},
-                        List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE));
-                runs.add(isolatedSequence);
-                assertSuccessful(isolatedSequence);
-                assertArrayEquals(cleanSequence.logits(), isolatedSequence.logits());
-                assertNotEquals(
-                        ((GdnStates) stateSequence.recurrentState()).forLayer(0).recurrentStateAddress(),
-                        ((GdnStates) referenceSequence.recurrentState())
-                                .forLayer(0)
-                                .recurrentStateAddress());
-
-                GdnStates completedRecurrent = recurrent;
-                AttentionStates completedAttention = attention;
-                stateSequence.complete();
-                prefixSequence.complete();
-                mixedSequence.complete();
-                referenceSequence.complete();
-                isolationSequence.complete();
-                assertThrows(IllegalStateException.class, () -> completedRecurrent.forLayer(0));
-                assertThrows(IllegalStateException.class, () -> completedAttention.forLayer(3));
-                for (RunResult run : runs) assertTrue(run.context().workspace().isClosed());
-            } catch (Throwable executionFailure) {
-                failure = executionFailure;
-            } finally {
-                for (Sequence sequence :
-                        List.of(isolationSequence, referenceSequence, stateSequence, mixedSequence, prefixSequence)) {
-                    try {
-                        sequence.complete();
-                    } catch (Throwable cleanupFailure) {
-                        if (failure == null) failure = cleanupFailure;
-                        else failure.addSuppressed(cleanupFailure);
-                    }
-                }
-                for (RunResult run : runs) {
-                    try {
-                        run.closeLogits();
-                    } catch (Throwable cleanupFailure) {
-                        if (failure == null) failure = cleanupFailure;
-                        else failure.addSuppressed(cleanupFailure);
-                    }
-                }
+            GdnStates completedRecurrent = recurrent;
+            AttentionStates completedAttention = attention;
+            stateSequence.complete();
+            prefixSequence.complete();
+            mixedSequence.complete();
+            referenceSequence.complete();
+            isolationSequence.complete();
+            assertThrows(IllegalStateException.class, () -> completedRecurrent.forLayer(0));
+            assertThrows(IllegalStateException.class, () -> completedAttention.forLayer(3));
+            for (RunResult run : runs) assertTrue(run.context().workspace().isClosed());
+        } catch (Throwable executionFailure) {
+            failure = executionFailure;
+        } finally {
+            for (Sequence sequence :
+                    List.of(isolationSequence, referenceSequence, stateSequence, mixedSequence, prefixSequence)) {
                 try {
-                    model.close();
+                    sequence.complete();
                 } catch (Throwable cleanupFailure) {
                     if (failure == null) failure = cleanupFailure;
                     else failure.addSuppressed(cleanupFailure);
                 }
             }
-            // Every byte the model, its sequences, and their graphs allocated is released.
-            long allocatedAfter = gpu.allocatedBytes();
-            if (allocatedAfter != allocatedBefore) {
-                IllegalStateException cleanupFailure =
-                        new IllegalStateException("full model test leaked device memory: " + "allocated before="
-                                + allocatedBefore + ", after=" + allocatedAfter);
-                if (failure == null) failure = cleanupFailure;
-                else failure.addSuppressed(cleanupFailure);
+            for (RunResult run : runs) {
+                try {
+                    run.closeLogits();
+                } catch (Throwable cleanupFailure) {
+                    if (failure == null) failure = cleanupFailure;
+                    else failure.addSuppressed(cleanupFailure);
+                }
             }
-            if (failure != null) {
-                if (failure instanceof Exception exception) throw exception;
-                if (failure instanceof Error error) throw error;
-                throw new IllegalStateException(failure);
-            }
+        }
+        // Every byte the sequences and their graphs allocated is released.
+        long allocatedAfter = gpu.allocatedBytes();
+        if (allocatedAfter != allocatedBefore) {
+            IllegalStateException cleanupFailure = new IllegalStateException("full model test leaked device memory: "
+                    + "allocated before=" + allocatedBefore + ", after=" + allocatedAfter);
+            if (failure == null) failure = cleanupFailure;
+            else failure.addSuppressed(cleanupFailure);
+        }
+        if (failure != null) {
+            if (failure instanceof Exception exception) throw exception;
+            if (failure instanceof Error error) throw error;
+            throw new IllegalStateException(failure);
         }
     }
 
     @Test
     @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void everyRealAttentionLayerMatchesRepresentedValueOracleOnItsActualProjectedInput() throws Exception {
-        Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact"));
-        Artifact artifact = ArtifactReader.read(artifactPath);
-        try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
-                Qwen38Model model = Qwen38Model.load(artifactPath, artifact, gpu)) {
-            var config = model.weights().config();
-            for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
-                if (config.layerTypes()[layer] != LayerType.FULL_ATTENTION) continue;
-                Sequence sequence = new Sequence(900 + layer);
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        var config = model.weights().config();
+        for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
+            if (config.layerTypes()[layer] != LayerType.FULL_ATTENTION) continue;
+            Sequence sequence = new Sequence(900 + layer);
+            try {
+                RunResult run = execute(
+                        gpu,
+                        ExecutionPlan.prefix(model.weights(), layer + 1),
+                        sequence,
+                        Quantum.ExecutionKind.DECODE,
+                        0,
+                        new int[] {INITIAL_TOKEN},
+                        List.of(ExecutionPlan.Buffer.VALUE_Z_PROJECTED, ExecutionPlan.Buffer.ATTENTION_CONTEXT));
                 try {
-                    RunResult run = execute(
-                            gpu,
-                            ExecutionPlan.prefix(model.weights(), layer + 1),
-                            sequence,
-                            Quantum.ExecutionKind.DECODE,
-                            0,
-                            new int[] {INITIAL_TOKEN},
-                            List.of(ExecutionPlan.Buffer.VALUE_Z_PROJECTED, ExecutionPlan.Buffer.ATTENTION_CONTEXT));
-                    try {
-                        assertSuccessful(run);
-                        short[] projected = Arrays.copyOf(
-                                run.buffers().get(ExecutionPlan.Buffer.VALUE_Z_PROJECTED),
-                                (config.numAttentionHeads() + config.numKeyValueHeads()) * config.attentionHeadDim());
-                        short[] expected = FullModelCpuReference.singleTokenAttentionContext(
-                                projected,
-                                config.numAttentionHeads(),
-                                config.numKeyValueHeads(),
-                                config.attentionHeadDim());
-                        short[] actual = run.buffers().get(ExecutionPlan.Buffer.ATTENTION_CONTEXT);
-                        reportError("local attention layer " + layer, expected, actual);
-                        assertEquals(expected.length, actual.length);
-                        for (int i = 0; i < expected.length; i++) {
-                            float error = Math.abs(bf16ToFloat(expected[i]) - bf16ToFloat(actual[i]));
-                            boolean adjacent = (expected[i] < 0) == (actual[i] < 0)
-                                    && Math.abs((expected[i] & 0xffff) - (actual[i] & 0xffff)) <= 1;
-                            assertTrue(
-                                    Float.isFinite(error) && (error <= 0.001f || adjacent),
-                                    "layer " + layer + " context index " + i + " error " + error);
-                        }
-                    } finally {
-                        run.closeLogits();
+                    assertSuccessful(run);
+                    short[] projected = Arrays.copyOf(
+                            run.buffers().get(ExecutionPlan.Buffer.VALUE_Z_PROJECTED),
+                            (config.numAttentionHeads() + config.numKeyValueHeads()) * config.attentionHeadDim());
+                    short[] expected = FullModelCpuReference.singleTokenAttentionContext(
+                            projected,
+                            config.numAttentionHeads(),
+                            config.numKeyValueHeads(),
+                            config.attentionHeadDim());
+                    short[] actual = run.buffers().get(ExecutionPlan.Buffer.ATTENTION_CONTEXT);
+                    reportError("local attention layer " + layer, expected, actual);
+                    assertEquals(expected.length, actual.length);
+                    for (int i = 0; i < expected.length; i++) {
+                        float error = Math.abs(bf16ToFloat(expected[i]) - bf16ToFloat(actual[i]));
+                        boolean adjacent = (expected[i] < 0) == (actual[i] < 0)
+                                && Math.abs((expected[i] & 0xffff) - (actual[i] & 0xffff)) <= 1;
+                        assertTrue(
+                                Float.isFinite(error) && (error <= 0.001f || adjacent),
+                                "layer " + layer + " context index " + i + " error " + error);
                     }
                 } finally {
-                    sequence.complete();
+                    run.closeLogits();
                 }
+            } finally {
+                sequence.complete();
             }
         }
     }
@@ -411,101 +385,92 @@ class FullModelCudaIntegrationTest {
     @Test
     @Timeout(value = 600, unit = TimeUnit.SECONDS)
     void fullQwenGpuGreedySelectionMatchesIndependentArgmaxOfDownloadedLogits() throws Exception {
-        Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact"));
-        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
-        assertTrue(Files.isRegularFile(artifactPath), "compact Qwen artifact is missing: " + artifactPath);
-        Artifact artifact = ArtifactReader.read(artifactPath);
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Weights weights = loaded.model().weights();
+        Sequence sequence = new Sequence(601);
+        RunResult run = null;
+        Throwable failure = null;
+        try {
+            run = execute(
+                    gpu,
+                    new ExecutionPlan(weights),
+                    sequence,
+                    Quantum.ExecutionKind.DECODE,
+                    0,
+                    new int[] {INITIAL_TOKEN},
+                    List.of());
+            assertSuccessful(run);
+            assertEquals(weights.config().vocabSize(), run.logits().length);
+            int expectedToken = independentArgmax(run.logits());
+            LogitsSampler greedySampler = new LogitsSampler(
+                    GenerationConfig.greedy(0L), weights.config().vocabSize());
 
-        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
-            Qwen38Model model = Qwen38Model.load(artifactPath, artifact, gpu);
-            Weights weights = model.weights();
-            Sequence sequence = new Sequence(601);
-            RunResult run = null;
-            Throwable failure = null;
+            assertEquals(
+                    expectedToken,
+                    greedySampler.selectToken(run.context().logitsOutput().orElseThrow(), gpu));
+            int[] topTwoTokens = independentTopTwo(run.logits());
+            LogitsSampler stochasticSampler = new LogitsSampler(
+                    new GenerationConfig(1.0f, 2, 1.0f, 17L, false),
+                    weights.config().vocabSize());
+            int stochasticToken =
+                    stochasticSampler.selectToken(run.context().logitsOutput().orElseThrow(), gpu);
+            assertTrue(stochasticToken == topTwoTokens[0] || stochasticToken == topTwoTokens[1]);
+        } catch (Throwable testFailure) {
+            failure = testFailure;
+        } finally {
             try {
-                run = execute(
-                        gpu,
-                        new ExecutionPlan(weights),
-                        sequence,
-                        Quantum.ExecutionKind.DECODE,
-                        0,
-                        new int[] {INITIAL_TOKEN},
-                        List.of());
-                assertSuccessful(run);
-                assertEquals(weights.config().vocabSize(), run.logits().length);
-                int expectedToken = independentArgmax(run.logits());
-                LogitsSampler greedySampler = new LogitsSampler(
-                        GenerationConfig.greedy(0L), weights.config().vocabSize());
-
-                assertEquals(
-                        expectedToken,
-                        greedySampler.selectToken(run.context().logitsOutput().orElseThrow(), gpu));
-                int[] topTwoTokens = independentTopTwo(run.logits());
-                LogitsSampler stochasticSampler = new LogitsSampler(
-                        new GenerationConfig(1.0f, 2, 1.0f, 17L, false),
-                        weights.config().vocabSize());
-                int stochasticToken = stochasticSampler.selectToken(
-                        run.context().logitsOutput().orElseThrow(), gpu);
-                assertTrue(stochasticToken == topTwoTokens[0] || stochasticToken == topTwoTokens[1]);
-            } catch (Throwable testFailure) {
-                failure = testFailure;
-            } finally {
+                sequence.complete();
+            } catch (Throwable cleanupFailure) {
+                failure = mergeFailure(failure, cleanupFailure);
+            }
+            if (run != null) {
                 try {
-                    sequence.complete();
-                } catch (Throwable cleanupFailure) {
-                    failure = mergeFailure(failure, cleanupFailure);
-                }
-                if (run != null) {
-                    try {
-                        run.closeLogits();
-                    } catch (Throwable cleanupFailure) {
-                        failure = mergeFailure(failure, cleanupFailure);
-                    }
-                }
-                try {
-                    model.close();
+                    run.closeLogits();
                 } catch (Throwable cleanupFailure) {
                     failure = mergeFailure(failure, cleanupFailure);
                 }
             }
-            if (failure instanceof Exception exception) throw exception;
-            if (failure instanceof Error error) throw error;
-            if (failure != null) throw new IllegalStateException(failure);
         }
+        if (failure instanceof Exception exception) throw exception;
+        if (failure instanceof Error error) throw error;
+        if (failure != null) throw new IllegalStateException(failure);
     }
 
     @Test
     @Timeout(value = 600, unit = TimeUnit.SECONDS)
     void productionPrefillRouteMatchesReferenceHiddenLogitsAndPersistentStateBitwise() throws Exception {
-        Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
-                Qwen38Model model = Qwen38Model.load(artifact, ArtifactReader.read(artifact), gpu)) {
-            var production = new ExecutionPlan(model.weights());
-            var reference = ExecutionPlan.reference(model.weights());
-            // The route structure is bitwise against the reference under exact numerics; relaxed-order
-            // kernels (the FP8 route, contiguous decode) are bounded by RelaxedNumericsDriftCudaIntegrationTest.
-            boolean previous = gpu.selectExactNumerics(true);
-            try {
-                for (int rows : new int[] {64, 256, 512, 1024}) {
-                    var selected = production.forExecution(Quantum.ExecutionKind.PREFILL, rows);
-                    assertTrue(selected.instructions().stream()
-                            .anyMatch(i -> i.kind() == ExecutionPlan.Kind.ATTENTION_KV_APPEND));
-                    int[] tokens = new int[rows];
-                    for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
-                    RouteResult expected = runRoute(gpu, model, reference, rows, tokens, 900 + rows);
-                    RouteResult actual = runRoute(gpu, model, production, rows, tokens, 901 + rows);
-                    assertArrayEquals(expected.hidden(), actual.hidden(), "hidden M=" + rows);
-                    assertArrayEquals(expected.logits(), actual.logits(), "logits M=" + rows);
-                    assertEquals(expected.state(), actual.state(), "state M=" + rows);
-                    assertArrayEquals(expected.decodeLogits(), actual.decodeLogits(), "decode M=" + rows);
-                    assertEquals(expected.decodeState(), actual.decodeState(), "decode state M=" + rows);
-                    System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows
-                            + " workspace_bytes=" + actual.workspaceBytes()
-                            + " reference_workspace_bytes=" + expected.workspaceBytes());
-                }
-            } finally {
-                gpu.selectExactNumerics(previous);
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        var production = new ExecutionPlan(model.weights());
+        var reference = ExecutionPlan.reference(model.weights());
+        // The route structure is bitwise against the reference under exact numerics; relaxed-order
+        // kernels (the FP8 route, contiguous decode) are bounded by RelaxedNumericsDriftCudaIntegrationTest.
+        // Exact numerics run a row at a time, so a run costs time in proportion to its rows: 64 is the smallest
+        // quantum on the region route, and 320 crosses a 256-token KV page into a second, partial one. Rows
+        // at the 512-token chunk size are covered by the engine tests.
+        boolean previous = gpu.selectExactNumerics(true);
+        try {
+            for (int rows : new int[] {64, 320}) {
+                var selected = production.forExecution(Quantum.ExecutionKind.PREFILL, rows);
+                assertTrue(selected.instructions().stream()
+                        .anyMatch(i -> i.kind() == ExecutionPlan.Kind.ATTENTION_KV_APPEND));
+                int[] tokens = new int[rows];
+                for (int i = 0; i < rows; i++) tokens[i] = INITIAL_TOKEN + i % 97;
+                RouteResult expected = runRoute(gpu, model, reference, rows, tokens, 900 + rows);
+                RouteResult actual = runRoute(gpu, model, production, rows, tokens, 901 + rows);
+                assertArrayEquals(expected.hidden(), actual.hidden(), "hidden M=" + rows);
+                assertArrayEquals(expected.logits(), actual.logits(), "logits M=" + rows);
+                assertEquals(expected.state(), actual.state(), "state M=" + rows);
+                assertArrayEquals(expected.decodeLogits(), actual.decodeLogits(), "decode M=" + rows);
+                assertEquals(expected.decodeState(), actual.decodeState(), "decode state M=" + rows);
+                System.out.println("PREFILL_ROUTE_BITWISE PASS rows=" + rows
+                        + " workspace_bytes=" + actual.workspaceBytes()
+                        + " reference_workspace_bytes=" + expected.workspaceBytes());
             }
+        } finally {
+            gpu.selectExactNumerics(previous);
         }
     }
 
@@ -690,103 +655,100 @@ class FullModelCudaIntegrationTest {
     @org.junit.jupiter.params.provider.ValueSource(ints = {3, 33})
     @Timeout(value = 600, unit = TimeUnit.SECONDS)
     void logitsRequirementsPreserveEveryStateAndFinalVocabularyRow(int tokenCount) throws Exception {
-        Path artifactPath = Path.of(System.getProperty("euhedral.qwen.artifact"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
-                Qwen38Model model = Qwen38Model.load(artifactPath, ArtifactReader.read(artifactPath), gpu)) {
-            // Plumbing check under exact numerics: relaxed kernels bound their own error in
-            // RelaxedNumericsDriftCudaIntegrationTest.
-            boolean previousExact = gpu.selectExactNumerics(true);
-            try {
-                var plan = new ExecutionPlan(model.weights());
-                var config = model.weights().config();
-                List<byte[]> expectedState = null;
-                short[] expectedLastRow = null;
-                short[] expectedHidden = null;
-                int[] tokens = new int[tokenCount];
-                Arrays.fill(tokens, INITIAL_TOKEN);
-                for (var requirement :
-                        List.of(LogitsRequirement.ALL_TOKENS, LogitsRequirement.LAST_TOKEN, LogitsRequirement.NONE)) {
-                    var sequence = new Sequence(701 + requirement.ordinal());
+        var loaded = SharedQwen38.q3();
+        CudaGpuMemory gpu = loaded.gpu();
+        Qwen38Model model = loaded.model();
+        // Plumbing check under exact numerics: relaxed kernels bound their own error in
+        // RelaxedNumericsDriftCudaIntegrationTest.
+        boolean previousExact = gpu.selectExactNumerics(true);
+        try {
+            var plan = new ExecutionPlan(model.weights());
+            var config = model.weights().config();
+            List<byte[]> expectedState = null;
+            short[] expectedLastRow = null;
+            short[] expectedHidden = null;
+            int[] tokens = new int[tokenCount];
+            Arrays.fill(tokens, INITIAL_TOKEN);
+            for (var requirement :
+                    List.of(LogitsRequirement.ALL_TOKENS, LogitsRequirement.LAST_TOKEN, LogitsRequirement.NONE)) {
+                var sequence = new Sequence(701 + requirement.ordinal());
+                try {
+                    RunResult run = execute(
+                            gpu,
+                            plan,
+                            sequence,
+                            Quantum.ExecutionKind.PREFILL,
+                            0,
+                            tokens,
+                            List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
+                            requirement);
                     try {
-                        RunResult run = execute(
-                                gpu,
-                                plan,
-                                sequence,
-                                Quantum.ExecutionKind.PREFILL,
-                                0,
-                                tokens,
-                                List.of(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE),
-                                requirement);
-                        try {
-                            assertEquals(tokenCount, sequence.currentTokenPosition());
-                            short[] hidden = run.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
-                            if (expectedHidden == null) expectedHidden = hidden;
-                            else assertArrayEquals(expectedHidden, hidden);
-                            List<byte[]> state = new ArrayList<>();
-                            for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
-                                if (config.layerTypes()[layer] == LayerType.GATED_DELTA_NET) {
-                                    var gdn = ((GdnStates) sequence.recurrentState()).forLayer(layer);
-                                    long channels = 2L * config.linearNumKeyHeads() * config.linearKeyHeadDim()
-                                            + (long) config.linearNumValueHeads() * config.linearValueHeadDim();
-                                    state.add(readDeviceBytes(
-                                            gpu,
-                                            gdn.convolutionStateAddress(),
-                                            channels * (config.linearConvKernelDim() - 1) * Short.BYTES));
-                                    state.add(readDeviceBytes(
-                                            gpu,
-                                            gdn.recurrentStateAddress(),
-                                            (long) config.linearNumValueHeads()
-                                                    * config.linearKeyHeadDim()
-                                                    * config.linearValueHeadDim()
-                                                    * Float.BYTES));
-                                } else {
-                                    var kv = ((AttentionStates) sequence.kvCacheState()).forLayer(layer);
-                                    assertEquals(tokenCount, kv.length());
-                                    int heads = config.numKeyValueHeads();
-                                    state.add(readKvPayload(gpu, kv.keyCacheAddress(), kv.length(), heads));
-                                    state.add(readKvPayload(gpu, kv.valueCacheAddress(), kv.length(), heads));
-                                }
-                            }
-                            if (expectedState == null) expectedState = state;
-                            else
-                                for (int index = 0; index < state.size(); index++)
-                                    assertArrayEquals(
-                                            expectedState.get(index), state.get(index), "state buffer " + index);
-                            if (requirement == LogitsRequirement.ALL_TOKENS) {
-                                assertEquals(tokenCount * config.vocabSize(), run.logits().length);
-                                expectedLastRow = Arrays.copyOfRange(
-                                        run.logits(),
-                                        (tokenCount - 1) * config.vocabSize(),
-                                        tokenCount * config.vocabSize());
-                            } else if (requirement == LogitsRequirement.LAST_TOKEN) {
-                                assertEquals(config.vocabSize(), run.logits().length);
-                                reportError("last-row-" + tokenCount, expectedLastRow, run.logits());
-                                // All-token logits use multi-row decode (3 rows) or WMMA (33 rows), which
-                                // measured max 0.0625 and RMS 0.000818 against single-row decode. Bound
-                                // rounding by one BF16 step, with an absolute floor for near-zero
-                                // cancellation; transformer state stays exact.
-                                for (int i = 0; i < expectedLastRow.length; i++) {
-                                    short expected = expectedLastRow[i], actual = run.logits()[i];
-                                    float error = Math.abs(bf16ToFloat(expected) - bf16ToFloat(actual));
-                                    boolean adjacent = (expected < 0) == (actual < 0)
-                                            && Math.abs((expected & 0xffff) - (actual & 0xffff)) <= 1;
-                                    assertTrue(
-                                            Float.isFinite(error) && (error <= 0.001f || adjacent),
-                                            "last row index " + i);
-                                }
+                        assertEquals(tokenCount, sequence.currentTokenPosition());
+                        short[] hidden = run.buffers().get(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE);
+                        if (expectedHidden == null) expectedHidden = hidden;
+                        else assertArrayEquals(expectedHidden, hidden);
+                        List<byte[]> state = new ArrayList<>();
+                        for (int layer = 0; layer < config.numHiddenLayers(); layer++) {
+                            if (config.layerTypes()[layer] == LayerType.GATED_DELTA_NET) {
+                                var gdn = ((GdnStates) sequence.recurrentState()).forLayer(layer);
+                                long channels = 2L * config.linearNumKeyHeads() * config.linearKeyHeadDim()
+                                        + (long) config.linearNumValueHeads() * config.linearValueHeadDim();
+                                state.add(readDeviceBytes(
+                                        gpu,
+                                        gdn.convolutionStateAddress(),
+                                        channels * (config.linearConvKernelDim() - 1) * Short.BYTES));
+                                state.add(readDeviceBytes(
+                                        gpu,
+                                        gdn.recurrentStateAddress(),
+                                        (long) config.linearNumValueHeads()
+                                                * config.linearKeyHeadDim()
+                                                * config.linearValueHeadDim()
+                                                * Float.BYTES));
                             } else {
-                                assertTrue(run.context().logitsOutput().isEmpty());
+                                var kv = ((AttentionStates) sequence.kvCacheState()).forLayer(layer);
+                                assertEquals(tokenCount, kv.length());
+                                int heads = config.numKeyValueHeads();
+                                state.add(readKvPayload(gpu, kv.keyCacheAddress(), kv.length(), heads));
+                                state.add(readKvPayload(gpu, kv.valueCacheAddress(), kv.length(), heads));
                             }
-                        } finally {
-                            run.closeLogits();
+                        }
+                        if (expectedState == null) expectedState = state;
+                        else
+                            for (int index = 0; index < state.size(); index++)
+                                assertArrayEquals(expectedState.get(index), state.get(index), "state buffer " + index);
+                        if (requirement == LogitsRequirement.ALL_TOKENS) {
+                            assertEquals(tokenCount * config.vocabSize(), run.logits().length);
+                            expectedLastRow = Arrays.copyOfRange(
+                                    run.logits(),
+                                    (tokenCount - 1) * config.vocabSize(),
+                                    tokenCount * config.vocabSize());
+                        } else if (requirement == LogitsRequirement.LAST_TOKEN) {
+                            assertEquals(config.vocabSize(), run.logits().length);
+                            reportError("last-row-" + tokenCount, expectedLastRow, run.logits());
+                            // All-token logits use multi-row decode (3 rows) or WMMA (33 rows), which
+                            // measured max 0.0625 and RMS 0.000818 against single-row decode. Bound
+                            // rounding by one BF16 step, with an absolute floor for near-zero
+                            // cancellation; transformer state stays exact.
+                            for (int i = 0; i < expectedLastRow.length; i++) {
+                                short expected = expectedLastRow[i], actual = run.logits()[i];
+                                float error = Math.abs(bf16ToFloat(expected) - bf16ToFloat(actual));
+                                boolean adjacent = (expected < 0) == (actual < 0)
+                                        && Math.abs((expected & 0xffff) - (actual & 0xffff)) <= 1;
+                                assertTrue(
+                                        Float.isFinite(error) && (error <= 0.001f || adjacent), "last row index " + i);
+                            }
+                        } else {
+                            assertTrue(run.context().logitsOutput().isEmpty());
                         }
                     } finally {
-                        sequence.complete();
+                        run.closeLogits();
                     }
+                } finally {
+                    sequence.complete();
                 }
-            } finally {
-                gpu.selectExactNumerics(previousExact);
             }
+        } finally {
+            gpu.selectExactNumerics(previousExact);
         }
     }
 

@@ -14,7 +14,7 @@ dependencies {
     implementation(libs.jackson.databind)
     api(libs.slf4j.api)
     testImplementation(libs.junit.jupiter)
-    testRuntimeOnly(libs.junit.platform.launcher)
+    testImplementation(libs.junit.platform.launcher)
 }
 
 // Euhedral's ControlPlaneLattice is a process-wide singleton. Every test class that starts one runs in
