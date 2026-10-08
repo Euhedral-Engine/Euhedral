@@ -328,7 +328,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         private final int expert;
         /// The slot's pending fence, taken for the copy to wait behind.
         private DeviceFence fence;
-        /// Set when the load's lease is made, off the owner; read by the owner's claims.
+        /// Set once the copy and its ready marker were submitted, by the load's frames; read by the owner's claims.
         private volatile boolean streamed;
         private boolean finished;
         private long startNanos;
@@ -374,6 +374,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         /// The copy was submitted: the load's own claim on the slot becomes the returned lease,
         /// which carries the copy's marker.
         public ExpertLease submitted() {
+            copySubmitted();
             return lease();
         }
 
@@ -382,9 +383,13 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         /// before it was recorded. A claim of the same expert while the copy is being made comes back empty
         /// and is asked again ([#claim]).
         public ExpertLease lease() {
-            this.streamed = true;
             this.startNanos = System.nanoTime();
             return newLease(this.slot, this.generation, this.bank, this.expert, readyMarker());
+        }
+
+        /// The copy, and the ready marker it records, were submitted: claims of the same expert may now join.
+        public void copySubmitted() {
+            this.streamed = true;
         }
 
         /// Gives the reserved slot back before anything was loaded or leased (the load could not start): the

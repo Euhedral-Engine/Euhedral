@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.LongAdder;
 ///
 /// The routed experts are not on the device: they pass through the [ExpertCache]. One instance is
 /// the block resources of one stage graph (its route readback, its descriptor, the leases a block
-/// holds); the stages of the graph use it:
+/// holds), never shared with another graph: another session's graph may fill its own while this one's
+/// queued copies still read this one's. The stages of the graph use it:
 ///
 /// 1. [#submitRouting] queues the router and the copy of its choice to the host; the plan stage follows
 ///    it across a device-completion edge, and the shared expert ([#submitShared]) is a side branch;
@@ -90,10 +91,9 @@ public final class MoeLayer implements AutoCloseable {
     private final long deviceDescriptor;
     private final int[] ids;
     private final short[] weights;
-    /// One fence marker per lane, re-recorded after every expert's kernels on that lane: waiting for it waits for
-    /// its latest recording, so a slot's fence never holds more than one marker per lane.
-    private final AtomicLongArray laneFences = new AtomicLongArray(LanePool.MAX_LANES);
-    private final GpuStream[] fenceStreams = new GpuStream[LanePool.MAX_LANES];
+    /// The lanes' fence markers, the plan's (shared by every graph's block resources) or this layer's own.
+    private final LaneFences laneFences;
+    private final boolean ownsFences;
 
     // The leases the block holds, by active expert: stored by the expert's fetch, closed by its expert stage, or
     // by an abandoned block.
@@ -102,6 +102,37 @@ public final class MoeLayer implements AutoCloseable {
     private int lastUnique;
     private final Metrics metrics;
     private boolean closed;
+
+    /// One fence marker per lane, re-recorded after every expert's kernels on that lane: waiting for it waits for
+    /// its latest recording, so a slot's fence never holds more than one marker per lane. A lane is one stream for
+    /// the whole runtime, so every graph's block resources may share them: the recordings stay in that stream's
+    /// order. Shared, they outlive every graph, so a slot's fence never names a destroyed marker.
+    public static final class LaneFences implements AutoCloseable {
+        private final AtomicLongArray markers = new AtomicLongArray(LanePool.MAX_LANES);
+        private final GpuStream[] streams = new GpuStream[LanePool.MAX_LANES];
+
+        /// The fence marker of `lane`, opened on first use.
+        long marker(GpuStream stream, int lane) {
+            long marker = this.markers.get(lane);
+            if (marker != 0) return marker;
+            long opened = stream.openMarker();
+            if (this.markers.compareAndSet(lane, 0, opened)) {
+                this.streams[lane] = stream;
+                return opened;
+            }
+            stream.closeMarker(opened);
+            return this.markers.get(lane);
+        }
+
+        /// Destroys the markers. Every lane must have retired the work that recorded them.
+        @Override
+        public void close() {
+            for (int lane = 0; lane < this.streams.length; lane++) {
+                long marker = this.markers.getAndSet(lane, 0);
+                if (marker != 0) this.streams[lane].closeMarker(marker);
+            }
+        }
+    }
 
     /// Counters that every graph of a plan adds to.
     public static final class Metrics {
@@ -130,7 +161,35 @@ public final class MoeLayer implements AutoCloseable {
             int sharedInter,
             int maxRows,
             Metrics metrics) {
+        this(gpu, geometry, experts, topK, sharedInter, maxRows, metrics, new LaneFences(), true);
+    }
+
+    /// As above, recording the lanes' fences in `laneFences`, which the caller owns.
+    public MoeLayer(
+            ExecutionGpu gpu,
+            ExpertOps.Geometry geometry,
+            int experts,
+            int topK,
+            int sharedInter,
+            int maxRows,
+            Metrics metrics,
+            LaneFences laneFences) {
+        this(gpu, geometry, experts, topK, sharedInter, maxRows, metrics, laneFences, false);
+    }
+
+    private MoeLayer(
+            ExecutionGpu gpu,
+            ExpertOps.Geometry geometry,
+            int experts,
+            int topK,
+            int sharedInter,
+            int maxRows,
+            Metrics metrics,
+            LaneFences laneFences,
+            boolean ownsFences) {
         this.gpu = gpu;
+        this.laneFences = laneFences;
+        this.ownsFences = ownsFences;
         this.geometry = geometry;
         this.hidden = geometry.hidden();
         this.experts = experts;
@@ -362,17 +421,8 @@ public final class MoeLayer implements AutoCloseable {
         }
     }
 
-    /// The fence marker of `lane`, opened on first use.
     private long laneFence(GpuStream stream, int lane) {
-        long marker = this.laneFences.get(lane);
-        if (marker != 0) return marker;
-        long opened = stream.openMarker();
-        if (this.laneFences.compareAndSet(lane, 0, opened)) {
-            this.fenceStreams[lane] = stream;
-            return opened;
-        }
-        stream.closeMarker(opened);
-        return this.laneFences.get(lane);
+        return this.laneFences.marker(stream, lane);
     }
 
     /// Closes every lease the block still holds, without a fence: no device work reads a lease that
@@ -468,10 +518,7 @@ public final class MoeLayer implements AutoCloseable {
     public void close() {
         if (this.closed) return;
         this.closed = true;
-        for (int lane = 0; lane < this.fenceStreams.length; lane++) {
-            long marker = this.laneFences.get(lane);
-            if (marker != 0) this.fenceStreams[lane].closeMarker(marker);
-        }
+        if (this.ownsFences) this.laneFences.close();
         release();
     }
 }

@@ -428,6 +428,25 @@ class ExpertCacheShardTest {
     }
 
     @Test
+    void aClaimJoinsALoadOnlyOnceItsCopyWasSubmitted() throws Exception {
+        cache(2, 1);
+        ExpertCacheShard shard = this.cache.shard(0);
+        ExpertCacheShard.Load load = miss(shard, 2, 5);
+        // The fetch makes the load's own lease at once (ExpertLoad does), long before the record is read and the
+        // copy, which records the ready marker, is submitted.
+        ExpertLease own = load.lease();
+        var early = new ExpertCacheShard.Ticket();
+        shard.claim(2, 5, true, early);
+        assertNull(early.lease(), "the ready marker is not recorded yet: nothing to join");
+        load.copySubmitted();
+        var late = new ExpertCacheShard.Ticket();
+        shard.claim(2, 5, true, late);
+        assertNotNull(late.lease(), "the copy and its marker were submitted: the claim joins the load");
+        late.lease().close();
+        load.failed(own, new IllegalStateException("test"));
+    }
+
+    @Test
     void aClaimOfAnExpertWhoseCopyIsNotYetSubmittedComesBackFullNotFailed() throws Exception {
         cache(2, 1);
         ExpertCacheShard shard = this.cache.shard(0);

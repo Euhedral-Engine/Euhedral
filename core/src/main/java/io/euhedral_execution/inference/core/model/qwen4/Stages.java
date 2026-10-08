@@ -210,8 +210,7 @@ final class Stages {
             ExecutionPlan plan = plan();
             Workspace storage = storage();
             Quantum quantum = quantum();
-            if (quantum.chunkCount() == 1) gpu().copyUploadToDevice(storage.tokensDevice(), storage.tokenUpload());
-            else gpu().copyHostToDeviceAsync(storage.tokensDevice(), quantum.promptTokens(this.chunk), 4L * rows());
+            gpu().copyHostToDeviceAsync(storage.tokensDevice(), quantum.promptTokens(this.chunk), 4L * rows());
             Ops.embedding(
                     gpu(),
                     plan.embedding().address(),

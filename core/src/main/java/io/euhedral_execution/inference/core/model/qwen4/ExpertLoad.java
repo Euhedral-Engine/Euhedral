@@ -159,6 +159,8 @@ final class ExpertLoad {
                 this.load.fence(),
                 this.load.readyMarker(),
                 this.retire);
+        // The copy and its ready marker are queued: another block's claim of the expert may join the load now.
+        this.load.copySubmitted();
         this.submittedAt = System.nanoTime();
     }
 

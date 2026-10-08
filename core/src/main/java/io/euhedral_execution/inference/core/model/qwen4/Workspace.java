@@ -8,15 +8,17 @@ import java.util.List;
 
 /// The plan's one workspace: the device buffers of a chunk of up to `rows` tokens (the residual state, the
 /// activations, the logits row, the scratch of each kind of layer, the expansion scratch of the NVFP4 linears),
-/// sized at load for the plan's chunk, and the block resources of its MoE layers ([MoeLayer]) for each row capacity:
-/// a decode token's block description stays as small as the token. The graphs of every shape
+/// sized at load for the plan's chunk. The graphs of every shape
 /// (every row capacity, the diagnostic variants, a test's single layers) take turns on it through a [Lease]: the
 /// plan serves one quantum at a time, and the workspace's owner orders a graph's first device stages behind the
 /// previous graph's last ones ([Shape#workspaceBuffers]).
 final class Workspace {
 
-    /// A graph's hold on the workspace, in the runtime's terms, with the MoE block resources of its shape's row
-    /// capacity. The plan owns the workspace and frees it; closing a lease only ends the graph's use.
+    /// A graph's hold on the workspace, in the runtime's terms, with the graph's own MoE block resources
+    /// ([MoeLayer]) at its shape's row capacity: a decode token's block description stays as small as the
+    /// token. They are the graph's because graphs of different sessions overlap: one quantum's host stages
+    /// fill a block's leases and description while another's queued copies still read its own. The plan
+    /// owns the workspace and frees it; closing a lease ends the graph's use and frees its block resources.
     static final class Lease implements GraphStorage {
         private final Workspace storage;
         private final MoeLayer moe;
@@ -24,7 +26,7 @@ final class Workspace {
 
         Lease(Workspace storage, int rows) {
             this.storage = storage;
-            this.moe = storage.moe(rows);
+            this.moe = storage.newMoeLayer(rows);
         }
 
         Workspace storage() {
@@ -47,7 +49,9 @@ final class Workspace {
 
         @Override
         public void close() {
+            if (this.closed) return;
             this.closed = true;
+            this.moe.close();
         }
     }
 
@@ -55,8 +59,7 @@ final class Workspace {
     private final int rows;
     /// The MoE block resources of each row capacity of [ExecutionPlan#rowBucket], ascending; the last is `rows`'.
     private final int[] capacities;
-    private final MoeLayer[] moes;
-    private final ExecutionGpu.UploadBuffer tokenUpload;
+    private final ExecutionPlan plan;
     private final long tokensDevice;
     private final long embedded;
     private final long state;
@@ -83,26 +86,15 @@ final class Workspace {
     long routeArmedNanos;
     long plannedNanos;
     ExpertCacheStats.Snapshot traceBefore;
-    /// The n-gram rows of a quantum of one chunk ([Quantum#pleRows]); a prompt's chunks have their own.
-    private final Quantum.PleRows ple;
 
     Workspace(ExecutionPlan plan, ExecutionGpu gpu, int rows) {
         this.gpu = gpu;
         this.rows = rows;
         int hidden = plan.hidden();
-        this.ple = new Quantum.PleRows(rows * plan.ple().rowsPerToken());
         this.capacities = plan.rowBuckets();
-        this.moes = new MoeLayer[this.capacities.length];
-        ExecutionGpu.UploadBuffer upload = null;
-        try {
-            for (int i = 0; i < this.capacities.length; i++) this.moes[i] = plan.newMoeLayer(this.capacities[i]);
-            upload = gpu.allocateUploadBuffer(4L * rows);
-        } catch (Throwable failure) {
-            closeMoes();
-            throw failure;
-        }
-        this.tokenUpload = upload;
-        MoeLayer moe = this.moes[this.moes.length - 1];
+        this.plan = plan;
+        // Sizes the MoE scratch for the largest capacity; each graph's lease has block resources of its own.
+        MoeLayer moe = plan.newMoeLayer(this.capacities[this.capacities.length - 1]);
         try {
             long bf16 = Short.BYTES;
             long width = (long) plan.streams() * hidden;
@@ -127,9 +119,9 @@ final class Workspace {
             this.expansion = this.expansionBytes > 0 ? allocate(this.expansionBytes) : 0;
         } catch (Throwable failure) {
             releaseBuffers();
-            this.tokenUpload.close();
-            closeMoes();
             throw failure;
+        } finally {
+            moe.close();
         }
     }
 
@@ -151,34 +143,10 @@ final class Workspace {
         return this.rows;
     }
 
-    /// The MoE block resources of the capacity that serves a shape of `rows` rows.
-    MoeLayer moe(int rows) {
-        for (int i = 0; i < this.capacities.length; i++) if (rows <= this.capacities[i]) return this.moes[i];
+    /// New MoE block resources of the capacity that serves a shape of `rows` rows.
+    MoeLayer newMoeLayer(int rows) {
+        for (int capacity : this.capacities) if (rows <= capacity) return this.plan.newMoeLayer(capacity);
         throw new IllegalArgumentException("no MoE block resources for " + rows + " rows");
-    }
-
-    private void closeMoes() {
-        RuntimeException failure = null;
-        for (int i = 0; i < this.moes.length; i++) {
-            MoeLayer moe = this.moes[i];
-            this.moes[i] = null;
-            if (moe == null) continue;
-            try {
-                moe.close();
-            } catch (RuntimeException closeFailure) {
-                if (failure == null) failure = closeFailure;
-                else failure.addSuppressed(closeFailure);
-            }
-        }
-        if (failure != null) throw failure;
-    }
-
-    Quantum.PleRows ple() {
-        return this.ple;
-    }
-
-    ExecutionGpu.UploadBuffer tokenUpload() {
-        return this.tokenUpload;
     }
 
     long tokensDevice() {
@@ -245,14 +213,6 @@ final class Workspace {
     void close() {
         if (this.closed) return;
         this.closed = true;
-        try {
-            closeMoes();
-        } finally {
-            try {
-                this.tokenUpload.close();
-            } finally {
-                releaseBuffers();
-            }
-        }
+        releaseBuffers();
     }
 }
