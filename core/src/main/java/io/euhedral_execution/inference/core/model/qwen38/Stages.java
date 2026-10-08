@@ -73,6 +73,8 @@ public final class Stages {
         ScratchUse scratchUse;
         /// The chunk of a prompt graph this stage belongs to; 0 in any other graph.
         int chunk;
+        /// Whether the retirement now running commits the quantum ([#releaseTemporary] reads it).
+        protected boolean retirementCommitted;
 
         protected Stage(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, stage);
@@ -118,6 +120,7 @@ public final class Stages {
         @Override
         protected final void retired(boolean committed) {
             Quantum context = context();
+            this.retirementCommitted = committed;
             try {
                 if (committed) commit();
             } finally {
@@ -775,8 +778,9 @@ public final class Stages {
         protected void releaseTemporary(Quantum context) {
             AttentionKvState state = this.pendingAppendState;
             this.pendingAppendState = null;
-            // A committed frontier is unaffected; an uncommitted one never becomes visible.
-            if (state != null) state.discardSubmitted();
+            // A committed frontier is unaffected; an uncommitted one never becomes visible. A prompt's earlier
+            // chunks leave a committing retirement's rows to the last chunk's commit.
+            if (state != null && (chunk(context).last() || !this.retirementCommitted)) state.discardSubmitted();
         }
     }
 

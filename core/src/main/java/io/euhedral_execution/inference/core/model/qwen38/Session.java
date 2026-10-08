@@ -528,19 +528,30 @@ public final class Session implements GenerationSession {
         private final StepPort prompt = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                end = Math.min(offset + prefillChunkTokens, promptTokenIds.length);
+                end = promptEnd(offset);
                 started = timing == null ? 0L : System.nanoTime();
                 samples = end == promptTokenIds.length && maxNewTokens > 0;
-                runtime.admit(
-                        new Quantum(
+                int[] rows = Arrays.copyOfRange(promptTokenIds, offset, end);
+                LogitsRequirement logits = samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE;
+                // Several chunks run as one prompt graph; a single chunk as an ordinary prefill.
+                Quantum quantum = rows.length > prefillChunkTokens
+                        ? Quantum.prompt(
+                                plan,
+                                sequence,
+                                sequence.currentTokenPosition(),
+                                rows,
+                                prefillChunkTokens,
+                                logits,
+                                samples ? hostLogits : null)
+                        : new Quantum(
                                 plan,
                                 sequence,
                                 Quantum.ExecutionKind.PREFILL,
                                 sequence.currentTokenPosition(),
-                                Arrays.copyOfRange(promptTokenIds, offset, end),
-                                samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                                samples ? hostLogits : null),
-                        select);
+                                rows,
+                                logits,
+                                samples ? hostLogits : null);
+                runtime.admit(quantum, select);
             }
 
             @Override
@@ -597,6 +608,19 @@ public final class Session implements GenerationSession {
                 return decodeNext();
             }
         };
+
+        /// Where the prompt quantum that starts at `from` ends: at the prompt's end, or at the first chunk boundary
+        /// after `from` where the prefix cache takes a checkpoint, which is captured between quanta.
+        private int promptEnd(int from) {
+            int length = this.promptTokenIds.length;
+            PrefixCache cache = prefixCache;
+            if (cache == null || this.cursor == null) return length;
+            for (int boundary = Math.min(from + prefillChunkTokens, length);
+                    boundary < length;
+                    boundary = Math.min(boundary + prefillChunkTokens, length))
+                if (boundary > this.cursor.position() && cache.wantsCheckpoint(boundary, length)) return boundary;
+            return length;
+        }
 
         private StepPort checkpointThen(int end) {
             PrefixCache cache = prefixCache;
