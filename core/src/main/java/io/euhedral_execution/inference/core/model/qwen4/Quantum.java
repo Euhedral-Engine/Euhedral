@@ -163,19 +163,31 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
 
     // ---------------------------------------------------------------- starting
 
-    /// Admits this quantum on the workspace's owner, as an owner frame: the owner orders its graph behind the graphs
-    /// admitted before it, buffer by buffer, so quanta of the plan (several sessions' steps) need no chain of their
-    /// own. A prompt of several chunks runs as one graph of them, whose shape the owner looks up.
+    /// Admits this quantum from a caller that is not on the workspace's owner (tests, tools): the admission runs
+    /// as an owner frame.
     void enter() {
         this.plan.quantumStarted();
-        this.plan
-                .runtime()
-                .publishOnOwner(() -> this.plan
-                        .runtime()
-                        .admit(
-                                this.chunks.length == 1 ? this.shape : this.plan.promptShape(this),
-                                this,
-                                this::prepare));
+        this.plan.runtime().publishOnOwner(this::admit);
+    }
+
+    /// Admits this quantum from a frame ordered on the workspace's owner (a generation's `Admit`): the owner orders
+    /// its graph behind the graphs admitted before it, buffer by buffer, so quanta of the plan (several sessions'
+    /// steps) need no chain of their own. A refusal is not thrown: the runtime published the quantum's failed
+    /// outcome, which its continuation carries.
+    void enterOnOwner() {
+        this.plan.quantumStarted();
+        admit();
+    }
+
+    /// A prompt of several chunks runs as one graph of them, whose shape the owner looks up.
+    private void admit() {
+        try {
+            this.plan
+                    .runtime()
+                    .admit(this.chunks.length == 1 ? this.shape : this.plan.promptShape(this), this, this::prepare);
+        } catch (RuntimeException | Error refused) {
+            LOG.debug("a quantum was refused; its continuation carries the failure", refused);
+        }
     }
 
     Shape shape() {

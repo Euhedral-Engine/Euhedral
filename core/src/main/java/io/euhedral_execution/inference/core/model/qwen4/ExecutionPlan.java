@@ -246,7 +246,16 @@ public final class ExecutionPlan implements AutoCloseable {
     /// `tokens` must stay unchanged until the continuation ran.
     public Handle start(
             Sequence sequence, int[] tokens, int offset, int rows, LogitsSink sink, AbstractFrame continuation) {
-        return begin(
+        Quantum quantum = step(sequence, tokens, offset, rows, sink, continuation);
+        quantum.enter();
+        return quantum;
+    }
+
+    /// As [#start], but creates the quantum without admitting it: the caller, a frame ordered on the workspace's
+    /// owner (a generation's `Admit`), may use the quantum before its graph runs, and admits it with
+    /// [Quantum#enterOnOwner].
+    Quantum step(Sequence sequence, int[] tokens, int offset, int rows, LogitsSink sink, AbstractFrame continuation) {
+        return create(
                 sequence,
                 tokens,
                 offset,
@@ -268,15 +277,16 @@ public final class ExecutionPlan implements AutoCloseable {
             int rows,
             StateExchange exchange,
             AbstractFrame continuation) {
-        begin(
-                sequence,
-                tokens,
-                offset,
-                rows,
-                null,
-                new Range(layer, layer + 1, false, false, false),
-                Objects.requireNonNull(exchange, "exchange"),
-                continuation);
+        create(
+                        sequence,
+                        tokens,
+                        offset,
+                        rows,
+                        null,
+                        new Range(layer, layer + 1, false, false, false),
+                        Objects.requireNonNull(exchange, "exchange"),
+                        continuation)
+                .enter();
     }
 
     /// Advances `sequence` past a chunk whose layers ran through [#startLayer].
@@ -284,7 +294,7 @@ public final class ExecutionPlan implements AutoCloseable {
         sequence.advance(rows);
     }
 
-    private Handle begin(
+    private Quantum create(
             Sequence sequence,
             int[] tokens,
             int offset,
@@ -302,7 +312,6 @@ public final class ExecutionPlan implements AutoCloseable {
                 new ShapeKey(range, rowBucket(rows), diagnostic), key -> new Shape(this, key));
         Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, sink, exchange);
         quantum.continueWith(this.runtime.lake(), Objects.requireNonNull(continuation, "continuation"));
-        quantum.enter();
         return quantum;
     }
 
@@ -382,8 +391,22 @@ public final class ExecutionPlan implements AutoCloseable {
             int chunkRows,
             LogitsSink sink,
             AbstractFrame continuation) {
+        Quantum quantum = promptStep(sequence, tokens, offset, rows, chunkRows, sink, continuation);
+        quantum.enter();
+        return quantum;
+    }
+
+    /// As [#startPrompt], but creates the quantum without admitting it, as [#step] does.
+    Quantum promptStep(
+            Sequence sequence,
+            int[] tokens,
+            int offset,
+            int rows,
+            int chunkRows,
+            LogitsSink sink,
+            AbstractFrame continuation) {
         if (chunkRows <= 0 || chunkRows > this.maxRows) throw new IllegalArgumentException("chunkRows " + chunkRows);
-        if (rows <= chunkRows) return start(sequence, tokens, offset, rows, sink, continuation);
+        if (rows <= chunkRows) return step(sequence, tokens, offset, rows, sink, continuation);
         if (this.closed) throw new IllegalStateException("the plan is closed");
         if (sequence.position() + rows > sequence.maxTokens())
             throw new IllegalStateException("the sequence would exceed its " + sequence.maxTokens() + " positions");
@@ -393,7 +416,6 @@ public final class ExecutionPlan implements AutoCloseable {
                 new ShapeKey(range, rowBucket(chunkRows), diagnostic), key -> new Shape(this, key));
         Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, chunkRows, sink);
         quantum.continueWith(this.runtime.lake(), Objects.requireNonNull(continuation, "continuation"));
-        quantum.enter();
         return quantum;
     }
 

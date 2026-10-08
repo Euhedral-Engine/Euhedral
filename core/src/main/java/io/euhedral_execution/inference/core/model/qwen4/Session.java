@@ -333,18 +333,20 @@ public final class Session implements GenerationSession {
             startStep(tokens, from, count, wantsLogits, select);
             return;
         }
-        ExecutionPlan.Handle step = this.plan.startPrompt(
-                this.sequence, tokens, from, count, this.prefillChunkTokens, wantsLogits ? this.sink : null, select);
-        this.activeStep = step;
-        if (isStopRequested()) step.cancel();
+        enter(this.plan.promptStep(
+                this.sequence, tokens, from, count, this.prefillChunkTokens, wantsLogits ? this.sink : null, select));
     }
 
     private void startStep(int[] tokens, int from, int count, boolean wantsLogits, AbstractFrame select) {
-        ExecutionPlan.Handle step =
-                this.plan.start(this.sequence, tokens, from, count, wantsLogits ? this.sink : null, select);
+        enter(this.plan.step(this.sequence, tokens, from, count, wantsLogits ? this.sink : null, select));
+    }
+
+    /// Admits `step`, from a generation's `Admit`, which runs on the workspace's owner: the step is the active one
+    /// (and stopped, when a stop was requested before it existed) before its graph can run and conclude.
+    private void enter(Quantum step) {
         this.activeStep = step;
-        // A cancellation that arrived before the handle existed is applied now.
         if (isStopRequested()) step.cancel();
+        step.enterOnOwner();
     }
 
     private int select(TokenConstraint constraint) {
