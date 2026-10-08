@@ -103,4 +103,20 @@ class ChunkedShapeTest {
         assertTrue(System.nanoTime() - started < 3_000_000_000L);
         assertEquals(30_000, shape.topology().size());
     }
+
+    @Test
+    void eachChunkMayHaveItsOwnTemplate() {
+        GraphShape plain = bufferTemplate();
+        // A chunk that also checkpoints: an extra stage after its reader, touching nothing shared.
+        GraphShape checkpointed = TestShapes.of(
+                StageTopology.submitted(new int[][] {{}, {0}, {1}, {2}}), new int[][] {{0}, {}, {0}, {}}, 1);
+        var shape = new ChunkedShape(new GraphShape[] {plain, checkpointed, plain}, TEST_CHUNKS);
+        StageTopology topology = shape.topology();
+        assertEquals(10, topology.size());
+        assertEquals(1, shape.chunkOf(shape.stage(1, 3)));
+        assertEquals(3, shape.templateStageOf(shape.stage(1, 3)));
+        assertEquals(shape.stage(2, 0), 7);
+        assertTrue(edge(topology, shape.stage(1, 2), shape.stage(2, 0)), "chunk 2 follows chunk 1's last reader");
+        assertTrue(edge(topology, shape.stage(0, 2), shape.stage(1, 0)));
+    }
 }

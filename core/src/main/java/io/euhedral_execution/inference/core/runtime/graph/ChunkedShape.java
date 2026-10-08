@@ -26,42 +26,67 @@ public final class ChunkedShape implements GraphShape {
         GraphStorage newStorage(ExecutionGpu gpu);
     }
 
-    private final GraphShape full;
-    private final GraphShape last;
-    private final int chunks;
+    private final GraphShape[] templates;
     private final Chunks factory;
-    private final int fullSize;
+    /// The first stage of each chunk, and one past the last stage.
+    private final int[] offsets;
     private final StageTopology topology;
 
+    /// Chunks 0 to `chunks - 2` of `full`, then one of `last`.
     public ChunkedShape(GraphShape full, GraphShape last, int chunks, Chunks factory) {
-        this.full = Objects.requireNonNull(full, "full");
-        this.last = Objects.requireNonNull(last, "last");
+        this(templates(full, last, chunks), factory);
+    }
+
+    /// One chunk of each of `templates`, in order: a chunk that also takes a prefix checkpoint has a template of
+    /// its own.
+    public ChunkedShape(GraphShape[] templates, Chunks factory) {
         this.factory = Objects.requireNonNull(factory, "factory");
-        if (chunks < 1) throw new IllegalArgumentException("a chunked shape has at least one chunk");
-        if (full.workspaceBufferCount() != last.workspaceBufferCount()
-                || full.carriedStateCount() != last.carriedStateCount())
-            throw new IllegalArgumentException("the templates must declare the same buffers and carried state");
-        this.chunks = chunks;
-        this.fullSize = full.topology().size();
+        if (templates.length < 1) throw new IllegalArgumentException("a chunked shape has at least one chunk");
+        this.templates = templates.clone();
+        for (GraphShape template : this.templates) {
+            Objects.requireNonNull(template, "template");
+            if (template.workspaceBufferCount() != this.templates[0].workspaceBufferCount()
+                    || template.carriedStateCount() != this.templates[0].carriedStateCount())
+                throw new IllegalArgumentException("the templates must declare the same buffers and carried state");
+        }
+        this.offsets = new int[this.templates.length + 1];
+        for (int chunk = 0; chunk < this.templates.length; chunk++)
+            this.offsets[chunk + 1] =
+                    this.offsets[chunk] + this.templates[chunk].topology().size();
         this.topology = build();
     }
 
+    private static GraphShape[] templates(GraphShape full, GraphShape last, int chunks) {
+        Objects.requireNonNull(full, "full");
+        Objects.requireNonNull(last, "last");
+        if (chunks < 1) throw new IllegalArgumentException("a chunked shape has at least one chunk");
+        GraphShape[] templates = new GraphShape[chunks];
+        java.util.Arrays.fill(templates, full);
+        templates[chunks - 1] = last;
+        return templates;
+    }
+
     private StageTopology build() {
-        int size = this.fullSize * (this.chunks - 1) + this.last.topology().size();
+        int size = this.offsets[this.templates.length];
         List<List<Integer>> producers = new ArrayList<>(size);
         List<List<Boundary>> boundaries = new ArrayList<>(size);
         for (int stage = 0; stage < size; stage++) {
             producers.add(new ArrayList<>(2));
             boundaries.add(new ArrayList<>(2));
         }
-        WorkspaceUse fullBuffers = WorkspaceUse.of(this.full);
-        CarriedState fullCarried = CarriedState.of(this.full);
-        WorkspaceUse lastBuffers = this.last == this.full ? fullBuffers : WorkspaceUse.of(this.last);
-        CarriedState lastCarried = this.last == this.full ? fullCarried : CarriedState.of(this.last);
-        for (int chunk = 0; chunk < this.chunks; chunk++) {
-            GraphShape template = template(chunk);
+        // Each distinct template's analyses, once.
+        java.util.IdentityHashMap<GraphShape, WorkspaceUse> buffers = new java.util.IdentityHashMap<>();
+        java.util.IdentityHashMap<GraphShape, CarriedState> carried = new java.util.IdentityHashMap<>();
+        for (GraphShape template : this.templates) {
+            buffers.computeIfAbsent(template, WorkspaceUse::of);
+            carried.computeIfAbsent(template, CarriedState::of);
+        }
+        int bufferCount = this.templates[0].workspaceBufferCount();
+        int keyCount = this.templates[0].carriedStateCount();
+        for (int chunk = 0; chunk < this.templates.length; chunk++) {
+            GraphShape template = this.templates[chunk];
             StageTopology edges = template.topology();
-            int offset = chunk * this.fullSize;
+            int offset = this.offsets[chunk];
             for (int stage = 0; stage < edges.size(); stage++) {
                 for (int next : edges.submittedSuccessorsView(stage)) {
                     producers.get(offset + next).add(offset + stage);
@@ -73,14 +98,24 @@ public final class ChunkedShape implements GraphShape {
                 }
             }
             if (chunk == 0) continue;
-            int previous = offset - this.fullSize;
-            boolean lastChunk = chunk == this.chunks - 1;
-            WorkspaceUse buffers = lastChunk ? lastBuffers : fullBuffers;
-            CarriedState carried = lastChunk ? lastCarried : fullCarried;
-            for (int buffer = 0; buffer < this.full.workspaceBufferCount(); buffer++)
-                link(producers, boundaries, previous, fullBuffers.exits(buffer), offset, buffers.entries(buffer));
-            for (int key = 0; key < this.full.carriedStateCount(); key++)
-                link(producers, boundaries, previous, fullCarried.exits(key), offset, carried.entries(key));
+            GraphShape before = this.templates[chunk - 1];
+            int previous = this.offsets[chunk - 1];
+            for (int buffer = 0; buffer < bufferCount; buffer++)
+                link(
+                        producers,
+                        boundaries,
+                        previous,
+                        buffers.get(before).exits(buffer),
+                        offset,
+                        buffers.get(template).entries(buffer));
+            for (int key = 0; key < keyCount; key++)
+                link(
+                        producers,
+                        boundaries,
+                        previous,
+                        carried.get(before).exits(key),
+                        offset,
+                        carried.get(template).entries(key));
         }
         int[][] dependencies = new int[size][];
         Boundary[][] kinds = new Boundary[size][];
@@ -110,25 +145,27 @@ public final class ChunkedShape implements GraphShape {
         }
     }
 
-    private GraphShape template(int chunk) {
-        return chunk == this.chunks - 1 ? this.last : this.full;
+    /// The template of chunk `chunk`.
+    public GraphShape template(int chunk) {
+        return this.templates[chunk];
     }
 
     /// The stage of `chunk` that is `templateStage` of its template.
     public int stage(int chunk, int templateStage) {
-        return chunk * this.fullSize + templateStage;
+        return this.offsets[chunk] + templateStage;
     }
 
     public int chunkOf(int stage) {
-        return Math.min(stage / this.fullSize, this.chunks - 1);
+        int found = java.util.Arrays.binarySearch(this.offsets, stage);
+        return found >= 0 ? Math.min(found, this.templates.length - 1) : -found - 2;
     }
 
     public int templateStageOf(int stage) {
-        return stage - chunkOf(stage) * this.fullSize;
+        return stage - this.offsets[chunkOf(stage)];
     }
 
     public int chunks() {
-        return this.chunks;
+        return this.templates.length;
     }
 
     @Override
@@ -148,21 +185,21 @@ public final class ChunkedShape implements GraphShape {
 
     @Override
     public int[] workspaceBuffers(int stage) {
-        return template(chunkOf(stage)).workspaceBuffers(templateStageOf(stage));
+        return this.templates[chunkOf(stage)].workspaceBuffers(templateStageOf(stage));
     }
 
     @Override
     public int workspaceBufferCount() {
-        return this.full.workspaceBufferCount();
+        return this.templates[0].workspaceBufferCount();
     }
 
     @Override
     public int[] carriedState(int stage) {
-        return template(chunkOf(stage)).carriedState(templateStageOf(stage));
+        return this.templates[chunkOf(stage)].carriedState(templateStageOf(stage));
     }
 
     @Override
     public int carriedStateCount() {
-        return this.full.carriedStateCount();
+        return this.templates[0].carriedStateCount();
     }
 }

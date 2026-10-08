@@ -202,7 +202,8 @@ public final class Execution implements AutoCloseable {
                     slot -> owner.last(SharedWorkspace.stagingBuffer(this.plan, slot)))) view = preloaded;
         }
         // A prompt of several chunks runs as one graph of them.
-        GraphShape admitted = context.chunkCount() > 1 ? this.prompts.shape(context) : view;
+        GraphShape admitted =
+                context.chunkCount() > 1 || !context.checkpointChunks().isEmpty() ? this.prompts.shape(context) : view;
         try {
             this.runtime.admit(
                     admitted,

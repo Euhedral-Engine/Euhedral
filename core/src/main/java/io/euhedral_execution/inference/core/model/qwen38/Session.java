@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.generation.TokenRecord;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
+import io.euhedral_execution.inference.core.model.qwen38.prefix.PromptCheckpoints;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeCheckpoint;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeDecoding;
@@ -412,6 +413,9 @@ public final class Session implements GenerationSession {
         private boolean restored;
         private Throwable copyFailure;
         private PrefixNode captured;
+        /// The prompt graph's reserved checkpoints, and the prompt step they settle after.
+        private PromptCheckpoints checkpoints;
+        private Quantum promptStep;
 
         Call(
                 int maxNewTokens,
@@ -488,6 +492,11 @@ public final class Session implements GenerationSession {
             this.captured = failure == null ? node : null;
         }
 
+        @Override
+        public void reserved(PromptCheckpoints reserved) {
+            this.checkpoints = reserved.count() == 0 ? null : reserved;
+        }
+
         /// Finds the longest stored prefix of the prompt on the cache's owner, which throws the Select.
         private final StepPort lookup = new StepPort() {
             @Override
@@ -497,7 +506,7 @@ public final class Session implements GenerationSession {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                return hit == null ? prompt : restore;
+                return hit == null ? prefillNext() : restore;
             }
         };
 
@@ -525,16 +534,30 @@ public final class Session implements GenerationSession {
         };
 
         /// A prefill chunk; the last one samples the first token.
+        /// Reserves, on the prefix cache's owner, the checkpoints the prompt graph copies on its way.
+        private final StepPort reserve = new StepPort() {
+            @Override
+            public void admit(AbstractFrame select) {
+                prefixCache.reserveCheckpoints(cursor, promptTokenIds, wantedCheckpoints(), null, Call.this, select);
+            }
+
+            @Override
+            public StepPort retired(AbstractQuantum step) {
+                return prompt;
+            }
+        };
+
+        /// The rest of the prompt as one quantum: one graph of its chunks, which also copies the reserved prefix
+        /// checkpoints; the last chunk samples the first token.
         private final StepPort prompt = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                end = promptEnd(offset);
+                end = promptTokenIds.length;
                 started = timing == null ? 0L : System.nanoTime();
-                samples = end == promptTokenIds.length && maxNewTokens > 0;
+                samples = maxNewTokens > 0;
                 int[] rows = Arrays.copyOfRange(promptTokenIds, offset, end);
                 LogitsRequirement logits = samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE;
-                // Several chunks run as one prompt graph; a single chunk as an ordinary prefill.
-                Quantum quantum = rows.length > prefillChunkTokens
+                Quantum quantum = rows.length > prefillChunkTokens || checkpoints != null
                         ? Quantum.prompt(
                                 plan,
                                 sequence,
@@ -551,33 +574,36 @@ public final class Session implements GenerationSession {
                                 rows,
                                 logits,
                                 samples ? hostLogits : null);
+                if (checkpoints != null) quantum.withCheckpoints(checkpoints);
                 runtime.admit(quantum, select);
             }
 
             @Override
             public StepPort retired(AbstractQuantum step) throws Exception {
-                nextToken = select((Quantum) step, samples, true);
-                if (isStopRequested()) {
-                    complete(List.of());
-                    return null;
-                }
-                offset = end;
-                return checkpointThen(end);
+                if (checkpoints == null) return afterPrompt((Quantum) step);
+                promptStep = (Quantum) step;
+                return settle;
             }
         };
 
-        /// Stores the state after a chunk when the cache wants a checkpoint there; a failed capture is ignored.
-        private final StepPort capture = new StepPort() {
+        /// Publishes the prompt's checkpoints once it committed, or gives their bytes back; then reads the prompt's
+        /// outcome. Runs whether or not the prompt succeeded.
+        private final StepPort settle = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                prefixCache.capture(sequence, cursor, promptTokenIds, end, null, Call.this, select);
+                Quantum.Outcome outcome = promptStep.conclusion();
+                boolean committed = outcome != null && outcome.status() == Quantum.Status.SUCCESS;
+                prefixCache.settleCheckpoints(checkpoints, committed, Call.this, select);
             }
 
             @Override
-            public StepPort retired(AbstractQuantum step) {
+            public StepPort retired(AbstractQuantum step) throws Exception {
+                checkpoints = null;
                 if (captured != null) cursor = captured;
                 captured = null;
-                return prefillNext();
+                Quantum prompted = promptStep;
+                promptStep = null;
+                return afterPrompt(prompted);
             }
         };
 
@@ -609,26 +635,30 @@ public final class Session implements GenerationSession {
             }
         };
 
-        /// Where the prompt quantum that starts at `from` ends: at the prompt's end, or at the first chunk boundary
-        /// after `from` where the prefix cache takes a checkpoint, which is captured between quanta.
-        private int promptEnd(int from) {
-            int length = this.promptTokenIds.length;
-            PrefixCache cache = prefixCache;
-            if (cache == null || this.cursor == null) return length;
-            for (int boundary = Math.min(from + prefillChunkTokens, length);
-                    boundary < length;
-                    boundary = Math.min(boundary + prefillChunkTokens, length))
-                if (boundary > this.cursor.position() && cache.wantsCheckpoint(boundary, length)) return boundary;
-            return length;
+        /// Reads the prompt's outcome and samples its first token.
+        private StepPort afterPrompt(Quantum step) throws Exception {
+            nextToken = select(step, samples, true);
+            if (isStopRequested()) {
+                complete(List.of());
+                return null;
+            }
+            offset = end;
+            return prefillNext();
         }
 
-        private StepPort checkpointThen(int end) {
+        /// The chunk boundaries after `offset`, up to the prompt's end, where the prefix cache takes a checkpoint.
+        private int[] wantedCheckpoints() {
+            int length = this.promptTokenIds.length;
             PrefixCache cache = prefixCache;
-            if (cache == null
-                    || this.cursor == null
-                    || end <= this.cursor.position()
-                    || !cache.wantsCheckpoint(end, this.promptTokenIds.length)) return prefillNext();
-            return this.capture;
+            List<Integer> positions = new ArrayList<>();
+            for (int boundary = Math.min(this.offset + prefillChunkTokens, length);
+                    ;
+                    boundary = Math.min(boundary + prefillChunkTokens, length)) {
+                if (boundary > this.cursor.position() && cache.wantsCheckpoint(boundary, length))
+                    positions.add(boundary);
+                if (boundary == length) break;
+            }
+            return positions.stream().mapToInt(Integer::intValue).toArray();
         }
 
         private StepPort prefillNext() {
@@ -637,7 +667,9 @@ public final class Session implements GenerationSession {
                 complete(List.of());
                 return null;
             }
-            return this.prompt;
+            PrefixCache cache = prefixCache;
+            boolean checkpointed = cache != null && this.cursor != null && wantedCheckpoints().length > 0;
+            return checkpointed ? this.reserve : this.prompt;
         }
 
         private StepPort afterPrefill() {

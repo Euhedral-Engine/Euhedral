@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.model.qwen38.prefix.PromptCheckpoints;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Proposal;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeAcceptance;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
@@ -92,6 +93,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private DFlash2Proposal proposal;
     /// The quantum's rows in chunks: a prompt's chunks, or one chunk of all its rows.
     private final Chunk[] chunks;
+    /// A prompt's prefix checkpoints, and for each chunk the checkpoint copied after it (-1: none).
+    private PromptCheckpoints checkpoints;
+    private int[] checkpointOf;
 
     /// One chunk of a quantum's rows: its place in the quantum, its first position, its rows, and the offset of its
     /// rows in the quantum's input record. Only the last chunk produces logits.
@@ -194,6 +198,37 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             int rows = Math.min(chunkRows, tokens.length - offset);
             this.chunks[index] = new Chunk(index, startPosition + offset, rows, offset, index == count - 1);
         }
+    }
+
+    /// Takes `checkpoints` inside the prompt graph: after each chunk that ends at a checkpoint the cache reserved,
+    /// a stage copies the sequence's state into it. Before submission only.
+    Quantum withCheckpoints(PromptCheckpoints checkpoints) {
+        if (this.submitted.get()) throw new IllegalStateException("the quantum was already submitted");
+        this.checkpoints = Objects.requireNonNull(checkpoints, "checkpoints");
+        this.checkpointOf = new int[this.chunks.length];
+        java.util.Arrays.fill(this.checkpointOf, -1);
+        for (int index = 0; index < checkpoints.count(); index++) {
+            if (!checkpoints.copies(index)) continue;
+            for (Chunk chunk : this.chunks)
+                if (chunk.startPosition() + chunk.rows() == checkpoints.position(index))
+                    this.checkpointOf[chunk.index()] = index;
+        }
+        return this;
+    }
+
+    /// The chunks after which the prompt graph copies a checkpoint, ascending; empty without checkpoints.
+    java.util.List<Integer> checkpointChunks() {
+        java.util.List<Integer> chunks = new java.util.ArrayList<>();
+        if (this.checkpointOf != null)
+            for (int index = 0; index < this.checkpointOf.length; index++)
+                if (this.checkpointOf[index] >= 0) chunks.add(index);
+        return chunks;
+    }
+
+    /// Queues the copies of the checkpoint taken after chunk `chunk` ([Stages.Checkpoint]).
+    void checkpointAfter(int chunk, ExecutionGpu gpu) {
+        int index = this.checkpointOf == null ? -1 : this.checkpointOf[chunk];
+        if (index >= 0) this.checkpoints.copy(index, this.sequence, gpu);
     }
 
     /// Chunk `index` of the quantum's rows.

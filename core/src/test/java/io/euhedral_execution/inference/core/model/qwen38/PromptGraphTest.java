@@ -146,4 +146,45 @@ class PromptGraphTest {
             runtime.close();
         }
     }
+
+    @Test
+    void aCheckpointCopyFollowsItsChunkAndPrecedesTheNextChunksStateUpdates() {
+        var plan = new ExecutionPlan(EngineExecutionFixture.weights());
+        Shape full = plan.forExecution(Quantum.ExecutionKind.PREFILL, 64);
+        var checkpointed = new CheckpointView(full);
+        var shape = new io.euhedral_execution.inference.core.runtime.graph.ChunkedShape(
+                new io.euhedral_execution.inference.core.runtime.graph.GraphShape[] {checkpointed, full},
+                new io.euhedral_execution.inference.core.runtime.graph.ChunkedShape.Chunks() {
+                    @Override
+                    public io.euhedral_execution.inference.core.runtime.graph.StageFrame create(
+                            io.euhedral_execution.inference.core.runtime.graph.StageGraph graph,
+                            int stage,
+                            int chunk,
+                            int templateStage,
+                            io.euhedral_execution.inference.core.gpu.ExecutionGpu gpu) {
+                        throw new UnsupportedOperationException();
+                    }
+
+                    @Override
+                    public io.euhedral_execution.inference.core.runtime.graph.GraphStorage newStorage(
+                            io.euhedral_execution.inference.core.gpu.ExecutionGpu gpu) {
+                        throw new UnsupportedOperationException();
+                    }
+                });
+        int copy = shape.stage(0, full.topology().size());
+        var topology = shape.topology();
+        assertTrue(topology.inDegree(copy) > 0, "the copy follows its chunk");
+        int[] successors = topology.submittedSuccessors(copy);
+        boolean beforeGdn = false;
+        for (int next : successors) {
+            assertEquals(1, shape.chunkOf(next), "the copy is followed only by the next chunk");
+            var kind = full.instructions().get(shape.templateStageOf(next)).kind();
+            beforeGdn |= kind == ExecutionPlan.Kind.GDN_CONVOLUTION || kind == ExecutionPlan.Kind.GDN_RECURRENCE;
+        }
+        assertTrue(beforeGdn, "the next chunk's GDN updates wait for the copy");
+        assertArrayEquals(
+                io.euhedral_execution.inference.core.runtime.graph.GraphShape.NO_BUFFERS,
+                checkpointed.workspaceBuffers(full.topology().size()),
+                "the copy touches no workspace buffer");
+    }
 }

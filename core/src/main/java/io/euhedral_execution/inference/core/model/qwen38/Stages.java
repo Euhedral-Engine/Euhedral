@@ -64,6 +64,27 @@ public final class Stages {
         };
     }
 
+    /// A prompt chunk's prefix checkpoint ([CheckpointView]): queues the copies of the sequence's state at the end of
+    /// chunk `chunk` into the checkpoint's extent, on its lane, after every stage of the chunk and before the next
+    /// chunk's updates of that state. The copies complete before the prompt's retirement, which publishes the
+    /// checkpoint.
+    public static final class Checkpoint extends StageFrame {
+        private final int chunk;
+        private final ExecutionGpu gpu;
+
+        Checkpoint(StageGraph graph, int stage, int chunk, ExecutionGpu gpu) {
+            super(graph, stage);
+            this.chunk = chunk;
+            this.gpu = Objects.requireNonNull(gpu, "gpu");
+        }
+
+        @Override
+        protected void submit() {
+            Quantum context = (Quantum) graph().quantum();
+            context.checkpointAfter(this.chunk, this.gpu);
+        }
+    }
+
     /// The base of every 3.8 stage: its instruction, the GPU it launches on, and the quantum it reads.
     public abstract static class Stage extends StageFrame {
 
