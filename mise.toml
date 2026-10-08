@@ -30,8 +30,8 @@ description = "Build and verify both Linux and Windows native products."
 run = "./gradlew nativeVerify"
 
 [tasks."cuda-test"]
-description = "Run core and API CUDA integration tests; reserve the GPU first."
-run = "./gradlew :core:cudaIntegrationTest :api:cudaIntegrationTest --rerun-tasks"
+description = "Run core and API CUDA tests (light ones in parallel, then model groups, one model load each); reserve the GPU first."
+run = "./gradlew :core:cudaTest :api:cudaTest --rerun-tasks"
 
 [tasks."benchmark-validate"]
 description = "Validate the baseline benchmark configuration without running it."

@@ -280,7 +280,7 @@ and libraries are resolved automatically. `mise.toml` records the versions and t
 ./gradlew build            # compiles, formats, runs the CPU tests, builds the Linux and Windows native products
 ./gradlew test             # CPU tests
 python3 -m unittest discover -s native/tests -p 'test_*.py'   # kernel tests on the GPU (needs NumPy)
-./gradlew :core:cudaIntegrationTest :api:cudaIntegrationTest  # model tests on the GPU
+./gradlew :core:cudaTest :api:cudaTest  # every CUDA test on the GPU; --tests needs :core:cudaIntegrationTest
 ```
 
 Stop any serving container before the GPU suites. The native layer is described in [native/README.md](native/README.md),
