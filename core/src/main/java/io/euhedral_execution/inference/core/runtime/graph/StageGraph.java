@@ -538,6 +538,9 @@ public final class StageGraph implements AutoCloseable {
                 this.pool.lane(lane).mark(this.tails[lane]);
                 home.await(this.tails[lane]);
             }
+            // A stage that never ran never awaited what it waited for: the join takes those waits over, so a later
+            // graph released onto this join still follows the graphs before this one.
+            awaitExternals(home);
             if (this.joined != 0) home.mark(this.joined);
             sweepExternals();
             if (this.recording != null) finishRecording();
@@ -546,10 +549,22 @@ public final class StageGraph implements AutoCloseable {
         } catch (RuntimeException | Error failure) {
             this.quantum.fail(failure);
             recover(failure);
+            // The join may not be recorded: later graphs are released onto it as well as they can be.
+            try {
+                awaitExternals(home);
+                if (this.joined != 0) home.mark(this.joined);
+            } catch (RuntimeException | Error markFailure) {
+                failure.addSuppressed(markFailure);
+            }
             sweepExternals();
             this.quantum.lanesJoined(null);
             this.source.publish(terminal);
         }
+    }
+
+    /// Orders the home lane behind every external predecessor this binding waited on.
+    private void awaitExternals(GpuStream home) {
+        for (int slot = 0; slot < this.externalCount; slot++) if (this.awaits[slot] != 0) home.await(this.awaits[slot]);
     }
 
     /// Every last accessor that never submitted (a stopped, failed or replayed quantum) releases the later graphs
@@ -786,7 +801,7 @@ public final class StageGraph implements AutoCloseable {
         GpuStream home = this.pool.lane(this.home);
         if (stopRequested()) return;
         // Every earlier graph's last accessor of a buffer this quantum touches, before anything of it runs.
-        for (int slot = 0; slot < this.externalCount; slot++) if (this.awaits[slot] != 0) home.await(this.awaits[slot]);
+        awaitExternals(home);
         try {
             if (!home.launchGraph(capture.graph)) {
                 // The graph cannot run: this quantum runs stage by stage.

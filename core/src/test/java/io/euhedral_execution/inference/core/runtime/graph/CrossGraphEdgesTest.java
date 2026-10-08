@@ -176,4 +176,27 @@ class CrossGraphEdgesTest {
         assertTrue(second.outcome.isDone(), "the second binding waited for the first binding of its own graph");
         assertEquals("SUCCESS", second.outcome.join());
     }
+
+    @Test
+    void aCancelledGraphBetweenTwoOthersPassesTheEarlierOnesOrderOn() {
+        StageGraph a = graph(WRITE_READ);
+        StageGraph b = graph(ONE);
+        StageGraph c = graph(ONE);
+        var bQuantum = new TestQuantum();
+        bQuantum.cancelled = true;
+        bind(a, TestShapes.of(WRITE_READ, new int[][] {{0}, {0}}, 2), new TestQuantum());
+        bind(b, TestShapes.of(ONE, new int[][] {{0}}, 2), bQuantum);
+        bind(c, TestShapes.of(ONE, new int[][] {{0}}, 2), new TestQuantum());
+        // A's reader submits; B never runs its stage, so C is released onto B's join.
+        runStage(a, 0);
+        runStage(a, 1);
+        retireAll();
+        RecordingStream bHome = this.home.kernels.contains("mark:" + b.joinedMarker()) ? this.home : this.side;
+        int joined = bHome.kernels.lastIndexOf("mark:" + b.joinedMarker());
+        assertTrue(joined >= 0, "B marked its join: " + bHome.kernels);
+        assertTrue(
+                bHome.kernels.subList(0, joined).contains("await:" + a.stage(1).marker),
+                "B's join follows A's reader, so C, ordered behind B's join, follows A too: " + bHome.kernels);
+        assertEquals("CANCELLED", bQuantum.outcome.join());
+    }
 }
