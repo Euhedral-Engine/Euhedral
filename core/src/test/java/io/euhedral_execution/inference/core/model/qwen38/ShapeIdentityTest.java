@@ -19,6 +19,14 @@ class ShapeIdentityTest {
     }
 
     @Test
+    void theFullFixtureModelsPromptGraphKeepsItsShape() throws Exception {
+        ShapeDescription.check(
+                GOLDENS,
+                "fixture-full-prompt",
+                ShapeDescription.prompt(new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(64)), 64, 5, 4));
+    }
+
+    @Test
     void theReferencePlanKeepsItsShape() throws Exception {
         ShapeDescription.check(
                 GOLDENS,
