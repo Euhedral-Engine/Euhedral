@@ -80,7 +80,9 @@ class ScratchDeclarationTest {
                 PLAN.forExecution(Quantum.ExecutionKind.DECODE, 1).instructions().stream()
                         .map(ExecutionPlan.Instruction::kind)
                         .toList(),
-                verify.instructions().stream().map(ExecutionPlan.Instruction::kind).toList(),
+                verify.instructions().stream()
+                        .map(ExecutionPlan.Instruction::kind)
+                        .toList(),
                 "the same work as a decode token");
         assertEquals(
                 PLAN.forExecution(Quantum.ExecutionKind.DECODE, 1),
