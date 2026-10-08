@@ -33,12 +33,9 @@ class ShutdownTest {
 
     private void start(String drainWindow) {
         this.context = new SpringApplicationBuilder(ScriptedApiApplication.class)
-                .properties(
-                        "euhedral.test.scripted-api=true",
-                        "euhedral.api.max-queued-generations=1",
-                        "server.port=0",
-                        "spring.lifecycle.timeout-per-shutdown-phase=" + drainWindow)
-                .run();
+                .properties("euhedral.test.scripted-api=true", "euhedral.api.max-queued-generations=1", "server.port=0")
+                // A command-line argument: default properties lose to application.yaml's 30s window.
+                .run("--spring.lifecycle.timeout-per-shutdown-phase=" + drainWindow);
         this.backend = this.context.getBean(ScriptedInferenceBackend.class);
         this.port = Integer.parseInt(this.context.getEnvironment().getProperty("local.server.port"));
     }
@@ -51,8 +48,8 @@ class ShutdownTest {
     @Test
     void runningAndQueuedRequestsFinishWithinTheDrainWindow() throws Exception {
         start("20s");
-        // 20 tokens 50 ms apart: each generation takes a second.
-        this.backend.script = ScriptedInferenceBackend.endless(50);
+        // 20 tokens 10 ms apart: each generation takes a fifth of a second.
+        this.backend.script = ScriptedInferenceBackend.endless(10);
         try (var running = SseTestClient.post(this.port, "/v1/chat/completions", STREAM.formatted(20));
                 var client = HttpClient.newHttpClient()) {
             running.readUntil(line -> line.contains("\"tok0 \""));
@@ -74,7 +71,8 @@ class ShutdownTest {
 
     @Test
     void whatIsLeftAfterTheDrainWindowIsAnsweredBeforeTheServerStops() throws Exception {
-        start("1s");
+        // The window must end while the generation (3000 tokens, over a minute) still runs.
+        start("300ms");
         this.backend.script = ScriptedInferenceBackend.endless(20);
         try (var running = SseTestClient.post(this.port, "/v1/chat/completions", STREAM.formatted(3000));
                 var client = HttpClient.newHttpClient()) {

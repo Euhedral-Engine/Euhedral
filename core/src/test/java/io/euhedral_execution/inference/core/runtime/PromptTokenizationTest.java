@@ -74,8 +74,10 @@ class PromptTokenizationTest {
                 PromptTokenization.start(tokenizer, text, special, queue::add, terminations::incrementAndGet);
         Random random = new Random(seed);
         while (!queue.isEmpty()) {
-            Collections.shuffle(queue, random);
-            AbstractFrame frame = queue.removeFirst();
+            // A uniformly random pending frame, swapped out in O(1): shuffling the whole queue per step is
+            // quadratic in the frame count (thousands for the document) and picks no more orders.
+            Collections.swap(queue, random.nextInt(queue.size()), queue.size() - 1);
+            AbstractFrame frame = queue.removeLast();
             frame.execute();
             frame.doFinally();
         }
@@ -114,7 +116,10 @@ class PromptTokenizationTest {
         for (String text : texts()) {
             for (boolean special : new boolean[] {false, true}) {
                 int[] expected = special ? tokenizer.encodeWithModelSpecialTokens(text) : tokenizer.encodeText(text);
-                for (long seed = 0; seed < 4; seed++)
+                // Every run encodes the whole text again (40 KB is 0.25 s): the long texts, which already publish
+                // thousands of frames, take one random order; the short ones four.
+                int orders = text.length() > 5000 ? 1 : 4;
+                for (long seed = 0; seed < orders; seed++)
                     assertArrayEquals(
                             expected, runShuffled(text, special, seed), "text of " + text.length() + " chars");
             }

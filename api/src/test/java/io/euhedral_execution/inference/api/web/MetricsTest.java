@@ -13,12 +13,15 @@ import java.util.regex.Pattern;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 
 /// `/metrics` in Prometheus text format, after requests that succeed, are refused and fail.
+// Contexts with equal configuration are cached and shared, backend included: one such class at a time.
+@ResourceLock("scripted-api-context")
 @SpringBootTest(
         classes = ScriptedApiApplication.class,
         properties = "euhedral.test.scripted-api=true",

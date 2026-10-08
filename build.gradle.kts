@@ -33,6 +33,14 @@ subprojects {
             // Every *IntegrationTest needs a GPU (and usually an artifact); cudaIntegrationTest runs them.
             exclude("**/*IntegrationTest.class")
             useJUnitPlatform()
+            // Host tests run concurrently, class by class; methods of a class stay on one thread. A class that
+            // touches shared state opts out with @ResourceLock / @Isolated. Set here, not in
+            // junit-platform.properties, so the CUDA tasks (which share GPU state) never run in parallel.
+            systemProperty("junit.jupiter.execution.parallel.enabled", "true")
+            systemProperty("junit.jupiter.execution.parallel.mode.default", "same_thread")
+            systemProperty("junit.jupiter.execution.parallel.mode.classes.default", "concurrent")
+            systemProperty("junit.jupiter.execution.parallel.config.strategy", "dynamic")
+            systemProperty("junit.jupiter.execution.parallel.config.dynamic.factor", "0.5")
             // Shape goldens: `-Peuhedral.shapes.record=true` rewrites them instead of comparing.
             providers.gradleProperty("euhedral.shapes.record").orNull?.let { systemProperty("euhedral.shapes.record", it) }
             // Constrained decoding is CPU work; its tests load the host's llguidance build.

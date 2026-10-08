@@ -16,6 +16,7 @@ import java.util.List;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -31,6 +32,8 @@ import tools.jackson.databind.node.ObjectNode;
 /// OpenAI function calling through the real Spring MVC stack against the scripted backend: request
 /// validation, prompt rendering (checked against the jinja2 goldens), and parsing of the model's
 /// `<tool_call>` output into `tool_calls`.
+// Contexts with equal configuration are cached and shared, backend included: one such class at a time.
+@ResourceLock("scripted-api-context")
 @SpringBootTest(classes = ScriptedApiApplication.class, properties = "euhedral.test.scripted-api=true")
 @AutoConfigureMockMvc
 class ToolCallingTest {
