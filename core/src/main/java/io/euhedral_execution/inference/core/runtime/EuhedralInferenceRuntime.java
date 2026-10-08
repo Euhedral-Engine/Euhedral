@@ -278,6 +278,16 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         }
     }
 
+    /// Lifecycle: stops pooling `shape`'s graphs (an evicted prompt shape): idle ones close now, with their storage,
+    /// and busy ones when their quantum retires. A later admission of the shape builds a pool again.
+    public void release(GraphShape shape) {
+        GraphPool pool;
+        synchronized (this.closeLock) {
+            pool = this.pools.remove(shape);
+        }
+        if (pool != null) pool.release();
+    }
+
     private void ensureOpen() {
         if (this.closed) throw new IllegalStateException("inference runtime is closed");
     }
@@ -431,6 +441,8 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
         final WorkspaceUse use;
         private final MpmcQueue<PooledGraph> idle = new MpmcQueue<>(16, 2);
         private final ConcurrentLinkedQueue<PooledGraph> built = new ConcurrentLinkedQueue<>();
+        /// Set once the runtime stops pooling the shape ([EuhedralInferenceRuntime#release]).
+        private volatile boolean released;
 
         private GraphPool(GraphShape view) {
             this.view = view;
@@ -444,6 +456,27 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
 
         void recycle(PooledGraph graph) {
             if (!this.idle.offer(graph)) throw new IllegalStateException("idle graph pool rejected a graph");
+            // A release that drained the idle graphs before this offer did not see this one.
+            if (this.released) closeIdle();
+        }
+
+        /// The runtime no longer pools this shape: its idle graphs close, and each busy one as it is recycled.
+        void release() {
+            this.released = true;
+            closeIdle();
+        }
+
+        private void closeIdle() {
+            for (PooledGraph graph; (graph = this.idle.poll()) != null; ) {
+                if (!graph.claimRelease()) continue;
+                this.built.remove(graph);
+                try {
+                    graph.graph().close();
+                } finally {
+                    if (EuhedralInferenceRuntime.this.gpu.completionProven())
+                        graph.storage().close();
+                }
+            }
         }
 
         private PooledGraph build() {

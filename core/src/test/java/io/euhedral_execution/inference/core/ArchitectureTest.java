@@ -148,6 +148,7 @@ class ArchitectureTest {
             "runtime/EuhedralInferenceRuntime.java#awaitIdle",
             "runtime/EuhedralInferenceRuntime.java#openLanes",
             "runtime/EuhedralInferenceRuntime.java#openPool",
+            "runtime/EuhedralInferenceRuntime.java#release",
             "runtime/graph/InferenceLake.java#attach",
             "runtime/graph/InferenceLake.java#awaitTermination",
             "runtime/HostTasks.java#close",
