@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -22,23 +23,37 @@ import org.junit.jupiter.api.Test;
 /// component. Measurements, not assertions; opt-in because it takes minutes:
 /// `EUHEDRAL_QWEN4_PERF=1`; `EUHEDRAL_QWEN4_PERF_MAX` bounds the contexts (default 4096). The
 /// prompt is the repository's own documentation, tokenized with the model's tokenizer.
+/// Own JVM: measures timings of generation: opt-in, needs the machine to itself.
+@ModelGroup.OwnJvm
 class PerformanceCudaIntegrationTest {
 
     private static final int MAX = Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_PERF_MAX", "4096"));
     private static final int CONTEXT = Math.max(MAX, 4096) + 1024;
 
-    static int[] corpus(int tokens) throws IOException {
+    /// The documentation as token ids, per number of characters encoded (kept for the JVM: encoding the whole of the
+    /// docs takes seconds).
+    private static final java.util.Map<Integer, int[]> ENCODED = new java.util.HashMap<>();
+
+    /// `tokens` ids of the repository's documentation. A request that the first `tokens * 16` characters
+    /// cover (a token is a few characters) encodes only those, so a short prompt does not pay for encoding
+    /// all the docs; a longer one repeats what there is.
+    static synchronized int[] corpus(int tokens) throws IOException {
         Path tokenizerDirectory =
                 Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
         assumeTrue(Files.isRegularFile(tokenizerDirectory.resolve("tokenizer.json")), "no tokenizer");
-        QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
-        StringBuilder text = new StringBuilder();
-        try (Stream<Path> docs = Files.list(SpeculativeRoot.docs())) {
-            for (Path doc :
-                    docs.filter(p -> p.toString().endsWith(".md")).sorted().toList())
-                text.append(Files.readString(doc)).append("\n\n");
+        int characters = (int) Math.min(Integer.MAX_VALUE, Math.max(1L << 16, tokens * 16L));
+        int[] ids = ENCODED.get(characters);
+        if (ids == null) {
+            QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
+            StringBuilder text = new StringBuilder();
+            try (Stream<Path> docs = Files.list(SpeculativeRoot.docs())) {
+                for (Path doc :
+                        docs.filter(p -> p.toString().endsWith(".md")).sorted().toList())
+                    text.append(Files.readString(doc)).append("\n\n");
+            }
+            ids = tokenizer.encodeText(text.length() > characters ? text.substring(0, characters) : text.toString());
+            ENCODED.put(characters, ids);
         }
-        int[] ids = tokenizer.encodeText(text.toString());
         int[] out = new int[tokens];
         for (int i = 0; i < tokens; i++) out[i] = ids[i % ids.length];
         return out;

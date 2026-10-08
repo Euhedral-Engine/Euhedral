@@ -37,7 +37,7 @@ import tools.jackson.databind.json.JsonMapper;
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-@Timeout(1800)
+@Timeout(300)
 class Qwen4ChatCompletionsCudaIntegrationTest {
     private static final String MODEL = "flash-next-test";
     private static final JsonMapper JSON = JsonMapper.shared();

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -15,6 +16,8 @@ import org.junit.jupiter.api.Test;
 /// 512 rows at histories from 1K to 262K tokens, the history built by running the layer itself over
 /// random rows. Prints a table; asserts nothing (the numbers go to docs/FLASH_NEXT_QSA.md). Enable
 /// with the environment variable EUHEDRAL_QWEN4_TIMING=1.
+/// Own JVM: measures kernel timings: opt-in, needs the device to itself.
+@ModelGroup.OwnJvm
 class QsaTimingCudaIntegrationTest {
 
     private static final int[] HISTORIES = histories();

@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.SplittableRandom;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 
 /// The whole QSA attention block of layer 3 of the real artifact (NVFP4 projections, BF16 indexer):
@@ -57,6 +58,24 @@ class QsaLayerCudaIntegrationTest {
         }
         assumeTrue(fallback != null, "no fixtures for " + name);
         return fallback;
+    }
+
+    /// The layer's weights on the device, loaded by the first test and kept for the others (immutable: a test
+    /// that selects row-exact numerics restores them).
+    private static QsaTestSupport.Loaded shared;
+
+    private static synchronized QsaTestSupport.Loaded shared() throws IOException {
+        if (shared == null) shared = QsaTestSupport.Loaded.load(open(), LAYER);
+        return shared;
+    }
+
+    @AfterAll
+    static synchronized void freeWeights() {
+        if (shared == null) return;
+        CudaGpuMemory gpu = shared.gpu();
+        shared.close();
+        gpu.close();
+        shared = null;
     }
 
     private record Stat(String what, double relativeRms, double worstInRms) {}
@@ -126,9 +145,9 @@ class QsaLayerCudaIntegrationTest {
             chunks[i] = fixtures.metadata().get("chunks").get(i).asInt();
         int total = Arrays.stream(chunks).sum(),
                 maxRows = Arrays.stream(chunks).max().orElseThrow();
-        try (CudaGpuMemory gpu = open();
-                Arena arena = Arena.ofConfined();
-                QsaTestSupport.Loaded loaded = QsaTestSupport.Loaded.load(gpu, LAYER)) {
+        QsaTestSupport.Loaded loaded = shared();
+        CudaGpuMemory gpu = loaded.gpu();
+        try (Arena arena = Arena.ofConfined()) {
             gpu.selectRowExact(true);
             QsaLayer layer = new QsaLayer(QsaLayer.Config.of(loaded.artifact().config(), total));
             long scratchBytes = layer.scratchBytes(maxRows);
@@ -360,9 +379,9 @@ class QsaLayerCudaIntegrationTest {
         int tokens = 2300;
         SplittableRandom rng = new SplittableRandom(99);
         short[] x = random(rng, tokens * 2560, 0.6);
-        try (CudaGpuMemory gpu = open();
-                Arena arena = Arena.ofConfined();
-                QsaTestSupport.Loaded loaded = QsaTestSupport.Loaded.load(gpu, LAYER)) {
+        QsaTestSupport.Loaded loaded = shared();
+        CudaGpuMemory gpu = loaded.gpu();
+        try (Arena arena = Arena.ofConfined()) {
             gpu.selectRowExact(true);
             try {
                 short[] oneShot = runSequence(gpu, arena, loaded, x, tokens, new int[] {tokens});
@@ -401,9 +420,9 @@ class QsaLayerCudaIntegrationTest {
     void layerAtFullContextMatchesTheReference() throws IOException {
         int maxTokens = 262144, history = 261632, rows = 8;
         SplittableRandom rng = new SplittableRandom(17);
-        try (CudaGpuMemory gpu = open();
-                Arena arena = Arena.ofConfined();
-                QsaTestSupport.Loaded loaded = QsaTestSupport.Loaded.load(gpu, LAYER)) {
+        QsaTestSupport.Loaded loaded = shared();
+        CudaGpuMemory gpu = loaded.gpu();
+        try (Arena arena = Arena.ofConfined()) {
             QsaLayer layer = new QsaLayer(QsaLayer.Config.of(loaded.artifact().config(), maxTokens));
             int maxRows = 512;
             long base = gpu.allocate(layer.scratchBytes(maxRows));

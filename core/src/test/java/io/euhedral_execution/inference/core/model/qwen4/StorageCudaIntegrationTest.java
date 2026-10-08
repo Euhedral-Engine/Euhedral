@@ -12,11 +12,11 @@ import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertCache;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ComponentGroup;
-import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
-import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlan;
 import io.euhedral_execution.inference.core.model.qwen4.loader.StorageClass;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Tensor;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.SharedQwen38;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
@@ -27,16 +27,27 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
 import java.util.SplittableRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.Timeout;
 
 /// The real Flash-Next artifact through the engine's storage load on the real GPU, for several
 /// maximum contexts: every component has a location, device memory stays within the plan, experts
 /// move through the cache with the artifact's own bytes, rows come out of the n-gram tables, and
 /// closing returns every allocation. No model runs.
+@ModelGroup.FlashNext
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@Timeout(value = 10, unit = TimeUnit.MINUTES)
 class StorageCudaIntegrationTest {
 
-    static final int[] CONTEXTS = {4096, 32768, 131072, 262144};
+    /// The two ends of the range. The plan's prefill chunk is 4,096 tokens up to a context of 32,768 and
+    /// 2,048 from 131,072 on (the workspace shrinks to leave room for the KV), so one end sits on each side
+    /// of that change; the contexts between only move the expert cache by a few percent.
+    static final int[] CONTEXTS = {4096, 262144};
 
     static Path artifactPath() {
         return Path.of(System.getProperty(
@@ -44,10 +55,13 @@ class StorageCudaIntegrationTest {
     }
 
     @Test
+    @Order(1)
     void loadsTheRealArtifactAtSeveralContexts() throws Exception {
         Path artifact = artifactPath();
         assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
+        // The model of another class must not be on the device: this loads the artifact itself, at each context.
+        SharedFlashNext.release();
         for (int context : CONTEXTS) {
             BitSet cpus = new BitSet();
             cpus.set(0);
@@ -65,67 +79,58 @@ class StorageCudaIntegrationTest {
         }
     }
 
-    /// A device with far less free memory than the GPU has: fixed objects must leave it, the output
-    /// head is read in place from mapped host memory, and the load still places every object and
-    /// moves every expert correctly.
-    @Test
-    void placesFixedObjectsOnTheHostWhenTheDeviceIsSmall() throws Exception {
-        Path artifact = artifactPath();
-        assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library)) {
-            long free = Math.min(5L << 30, gpu.deviceMemoryInfo().freeBytes());
-            Qwen4Model model = Qwen4Model.open(artifact, gpu, free, HostBudget.system(), Mode.TEXT, 262144);
-            try {
-                var plan = model.plan();
-                assertTrue(plan.host().stagedBytes() > 0, plan.report());
-                assertEquals(StorageClass.HOST_MAPPED, plan.storageOf("text/output_head"));
-                assertTrue(model.staging() != null);
-                assertTrue(gpu.allocatedBytes() <= free, "allocated " + gpu.allocatedBytes() + " of " + free);
-                verify(model, gpu, artifact, 262144);
-            } finally {
-                model.close();
-            }
-            assertEquals(0, gpu.allocatedBytes());
-            assertEquals(0, gpu.hostWeightBytes());
-        }
-    }
-
     /// The MTP layer and its experts load, and their experts move through the same cache, when the
     /// mode selects MTP.
     @Test
+    @Order(2)
     void selectingMtpLoadsItsLayerAndItsExpertBank() throws Exception {
         Path artifact = artifactPath();
         assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
-        Path library = Path.of(System.getProperty("euhedral.cuda.library"));
-        try (CudaGpuMemory gpu = new CudaGpuMemory(library)) {
-            Qwen4Model model = Qwen4Model.open(
-                    artifact,
-                    gpu,
-                    gpu.deviceMemoryInfo().freeBytes(),
-                    HostBudget.system(),
-                    new Mode(true, false),
-                    8192);
-            try {
-                assertEquals(49, model.expertBanks().length);
-                assertTrue(model.tensors().containsKey("mtp/fc_embedding"));
-                int mtp = model.bankOrdinal("mtp/layers/0/moe/experts");
-                ExpertBank bank = model.expertBanks()[mtp];
-                try (ExpertLease lease =
-                                io.euhedral_execution.inference.core.model.qwen4.expert.ExpertTestSupport.acquire(
-                                        model.expertCache(), mtp, 511);
-                        Arena arena = Arena.ofConfined()) {
-                    MemorySegment back = arena.allocate(lease.byteSize());
-                    gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
-                    assertArrayEquals(
-                            readFile(artifact, bank.fileOffset(511), (int) bank.recordBytes(511)),
-                            back.toArray(ValueLayout.JAVA_BYTE));
-                }
-            } finally {
-                model.close();
-            }
-            assertEquals(0, gpu.allocatedBytes());
+        SharedFlashNext.release();
+        CudaGpuMemory gpu = SharedQwen38.gpu();
+        long allocatedBefore = gpu.allocatedBytes();
+        long hostBefore = gpu.hostWeightBytes();
+        var model = SharedFlashNext.model(SharedFlashNext.MTP).model();
+        assertEquals(49, model.expertBanks().length);
+        assertTrue(model.tensors().containsKey("mtp/fc_embedding"));
+        int mtp = model.bankOrdinal("mtp/layers/0/moe/experts");
+        ExpertBank bank = model.expertBanks()[mtp];
+        try (ExpertLease lease = io.euhedral_execution.inference.core.model.qwen4.expert.ExpertTestSupport.acquire(
+                        model.expertCache(), mtp, 511);
+                Arena arena = Arena.ofConfined()) {
+            MemorySegment back = arena.allocate(lease.byteSize());
+            gpu.copyDeviceToHost(back, lease.deviceAddress(), lease.byteSize());
+            assertArrayEquals(
+                    readFile(artifact, bank.fileOffset(511), (int) bank.recordBytes(511)),
+                    back.toArray(ValueLayout.JAVA_BYTE));
         }
+        SharedFlashNext.release();
+        assertEquals(allocatedBefore, gpu.allocatedBytes(), "device allocations after closing the MTP model");
+        assertEquals(hostBefore, gpu.hostWeightBytes(), "pinned host allocations after closing the MTP model");
+    }
+
+    /// A device with far less free memory than the GPU has: fixed objects must leave it, the output
+    /// head is read in place from mapped host memory, and the load still places every object and
+    /// moves every expert correctly. The two tests above check that closing returns every allocation; this one
+    /// leaves the model open for the classes that follow with the same small cache.
+    @Test
+    @Order(3)
+    void placesFixedObjectsOnTheHostWhenTheDeviceIsSmall() throws Exception {
+        Path artifact = artifactPath();
+        assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
+        var loaded = SharedFlashNext.model(SharedFlashNext.SMALL_CACHE);
+        var model = loaded.model();
+        var gpu = loaded.gpu();
+        var plan = model.plan();
+        assertTrue(plan.host().stagedBytes() > 0, plan.report());
+        assertEquals(StorageClass.HOST_MAPPED, plan.storageOf("text/output_head"));
+        assertTrue(model.staging() != null);
+        long budget = plan.device().freeBytes();
+        assertTrue(budget <= 5L << 30, "planned with " + budget);
+        assertTrue(
+                gpu.allocatedBytes() - gpu.retainedScratchBytes() <= budget,
+                "allocated " + gpu.allocatedBytes() + " of " + budget);
+        verify(model, gpu, artifact, 262144);
     }
 
     private static void verify(Qwen4Model model, CudaGpuMemory gpu, Path artifact, int context) throws Exception {
@@ -138,7 +143,8 @@ class StorageCudaIntegrationTest {
         long planned = plan.device().fixedResidentBytes()
                 + plan.device().stagingRingBytes()
                 + plan.device().expertCacheBytes();
-        assertTrue(gpu.allocatedBytes() <= planned, "allocated " + gpu.allocatedBytes() + " of planned " + planned);
+        long resident = gpu.allocatedBytes() - gpu.retainedScratchBytes();
+        assertTrue(resident <= planned, "allocated " + resident + " of planned " + planned);
         assertTrue(plan.device().plannedBytes() <= plan.device().freeBytes());
         assertEquals(plan.device().expertCacheBytes(), model.expertCache().capacityBytes());
 

@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.SplittableRandom;
 import java.util.zip.CRC32;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,14 +52,32 @@ class ExpertCacheCudaIntegrationTest {
         this.gpu = new CudaGpuMemory(libraryPath);
         this.baseAllocated = this.gpu.allocatedBytes();
         this.baseHostWeights = this.gpu.hostWeightBytes();
-        this.file = Files.createTempFile(Path.of(System.getProperty("java.io.tmpdir")), "qwen4-experts", ".bin");
-        this.banks = generate(this.file);
+        ensureRecords();
+        this.file = recordsFile;
+        this.banks = recordBanks;
+    }
+
+    /// The records are read-only to the tests, so the file (a gigabyte of random bytes) is written once.
+    private static Path recordsFile;
+
+    private static ExpertBank[] recordBanks;
+
+    private static synchronized void ensureRecords() throws IOException {
+        if (recordsFile != null) return;
+        Path created = Files.createTempFile(Path.of(System.getProperty("java.io.tmpdir")), "qwen4-experts", ".bin");
+        recordBanks = generate(created);
+        recordsFile = created;
+    }
+
+    @AfterAll
+    static synchronized void deleteRecords() throws IOException {
+        if (recordsFile != null) Files.deleteIfExists(recordsFile);
+        recordsFile = null;
     }
 
     @AfterEach
     void tearDown() throws IOException {
         if (this.gpu != null) this.gpu.close();
-        if (this.file != null) Files.deleteIfExists(this.file);
     }
 
     /// Writes `BANKS * EXPERTS` records of pseudo-random bytes, in a few slightly different sizes,
