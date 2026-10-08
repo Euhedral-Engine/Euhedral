@@ -526,6 +526,10 @@ busy; the frames that free the resource (`Release`, `Retire`) waited behind them
 The cache's bookkeeping is now a source of the lattice, polled by the workers like the artifact's reads: requests,
 releases and retirements are records in a lock-free queue, the one worker that polls applies them in order, and a
 request the cache cannot serve waits in the source until something was given back, with nothing running again meanwhile.
+Paired against the retrying fetch (two forks each): fetches that found the cache full 34,000 against 120 a token in a
+512-token prefill and 7,400 against 26 in a 4096-token one; the hop from a copy's retirement to its application 18-56 us
+against 8-9; prefill unchanged (113-115 / 494-545 tokens/s); decode at 4096 tokens 61.4 and 60.3 ms against 54.3 and 52.0
+cold, 44.5 and 47.7 against 39.1 and 38.6 warm; at 64 tokens within noise.
 
 Tried and not kept, each against a paired control (differences inside the run-to-run spread of 2-4%):
 
