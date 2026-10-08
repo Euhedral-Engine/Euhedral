@@ -11,7 +11,13 @@ import org.junit.platform.commons.support.AnnotationSupport;
 /// Runs the classes of one [ModelGroup] together, so a JVM that runs several groups loads each model once; classes
 /// without a group go first, then the groups in the order of [#GROUPS].
 public final class ModelGroupOrderer implements ClassOrderer {
-    private static final List<String> GROUPS = List.of(ModelGroup.Q3, ModelGroup.NVFP4, ModelGroup.FLASH_NEXT);
+    private static final List<String> GROUPS = List.of(
+            ModelGroup.Q3,
+            ModelGroup.Q3_ENGINE,
+            ModelGroup.NVFP4,
+            ModelGroup.NVFP4_ENGINE,
+            ModelGroup.FLASH_NEXT,
+            ModelGroup.FLASH_NEXT_ENGINE);
 
     @Override
     public void orderClasses(ClassOrdererContext context) {
@@ -21,10 +27,11 @@ public final class ModelGroupOrderer implements ClassOrderer {
     }
 
     private static int rank(ClassDescriptor descriptor) {
+        int rank = Integer.MAX_VALUE;
         for (Tag tag : AnnotationSupport.findRepeatableAnnotations(descriptor.getTestClass(), Tag.class)) {
             int group = GROUPS.indexOf(tag.value());
-            if (group >= 0) return group + 1;
+            if (group >= 0) rank = Math.min(rank, group + 1);
         }
-        return 0;
+        return rank == Integer.MAX_VALUE ? 0 : rank;
     }
 }
