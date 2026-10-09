@@ -26,6 +26,16 @@ class HostBudgetTest {
     }
 
     @Test
+    void theRuntimesReserveBoundsTheHeapsRoomToGrow() {
+        long reserve = HostBudget.runtimeReserve();
+        long least = HostBudget.NATIVE_RESERVE + HostBudget.NGRAM_WORKING_SET;
+        assertTrue(reserve >= least, "native memory and the n-gram rows' page cache are always kept");
+        assertTrue(
+                reserve <= least + HostBudget.HEAP_GROWTH_RESERVE,
+                "a server started without -Xmx may grow its heap to a quarter of the machine; the reserve is bounded");
+    }
+
+    @Test
     void withoutAStatementTheBudgetIsWhatTheMachineCanSpareLessTheRuntimesReserve() {
         HostBudget budget = HostBudget.of(null, null, 20 * GIB, 2 * GIB);
         assertEquals(HostBudget.Source.AUTOMATIC, budget.source());
