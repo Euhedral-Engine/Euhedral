@@ -108,3 +108,17 @@ Paired screens, 4 forks alternating, 3 GiB test heap, no cgroup:
 
 Distance 2 against 1 (3 forks): prefill 4096 -7.6%, 16384 -17.3% (the prediction is worse and the holds longer): not
 kept.
+
+## Not kept
+
+- **Zero-copy decode** (`ZeroCopySpike`, throwaway): the ten experts of a decode token read in place from the pinned
+  tier over the bus take 1.07-1.17 ms; copied to the device first and then computed 0.94-0.99 ms; with the records on
+  the device 0.27-0.48 ms. The bus is the bound either way (about 25 GB/s read in place, 29 GB/s copied), and the copy
+  engine is faster than the kernels' loads: no gain, and a record read in place would never become a device hit.
+- **Decode prefetch settings** under the larger tier (3 forks, 16 candidates and 2 reads per layer against 10 and 1):
+  cold 64 -0.7%, cold 4096 -1.5%, warm 64 +3.9% (3/3), warm 4096 +1.9% (2/3), prefill unchanged: flat, as before.
+- **Dropping the n-gram rows' page cache** before a run (the rows a fresh prompt asks for are not resident): prefill 4096
+  -9.0% (0/3), 16384 +12.4% (2/3) against a warm cache; the runs were noisy (another tenant on the machine), so the
+  cost of cold rows is not established beyond "up to 9%".
+- **Lossless NVFP4 coding of the records** (`tools/nvfp4z.py`: 4.09 bits per weight against 4.5): 9% fewer bytes on the
+  disk and the bus and 10% more records in the tier, for a decoder on the load path: not built.
