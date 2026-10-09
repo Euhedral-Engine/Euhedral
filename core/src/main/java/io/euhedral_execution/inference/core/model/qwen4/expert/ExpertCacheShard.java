@@ -58,6 +58,9 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     private final int[] generation;
     private final DeviceFence[] fence;
     private final Load[] load;
+    /// Each slot's load object, made once: a slot has one load at a time, from its reservation to the end of the load,
+    /// so a miss takes the slot's own object instead of making one.
+    private final Load[] spare;
     private final int[] prev;
     private final int[] next;
     private int freeHead = NONE;
@@ -129,6 +132,8 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         this.generation = new int[slotCount];
         this.fence = new DeviceFence[slotCount];
         this.load = new Load[slotCount];
+        this.spare = new Load[slotCount];
+        for (int slot = 0; slot < slotCount; slot++) this.spare[slot] = new Load(slot);
         this.prev = new int[slotCount];
         this.next = new int[slotCount];
         for (int slot = 0; slot < slotCount; slot++) {
@@ -306,11 +311,16 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             return;
         }
         int victim = this.freeHead != NONE ? this.freeHead : victimFor(bank);
-        Load fresh =
-                new Load(victim, key, this.generation[victim] + 1, this.banks[bank].recordBytes(expert), bank, expert);
+        Load fresh = this.spare[victim];
+        fresh.begin(key, this.generation[victim] + 1, this.banks[bank].recordBytes(expert), bank, expert);
         reserve(victim, fresh);
         this.stats.miss();
         ticket.load = fresh;
+    }
+
+    /// The load object of `slot`, which every load of the slot reuses: the owner's load contexts are made around them.
+    public Load loadOf(int slot) {
+        return this.spare[slot];
     }
 
     /// Whether a miss could reserve a slot now.
@@ -318,14 +328,14 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         return this.freeHead != NONE || anyEvictable();
     }
 
-    /// One transfer, from the reservation of its slot to its end.
+    /// One transfer, from the reservation of its slot to its end. A slot's one object, reused by each of its loads.
     public final class Load {
         private final int slot;
-        private final int key;
-        private final int generation;
-        private final long bytes;
-        private final int bank;
-        private final int expert;
+        private int key;
+        private int generation;
+        private long bytes;
+        private int bank;
+        private int expert;
         /// The slot's pending fence, taken for the copy to wait behind.
         private DeviceFence fence;
         /// Set once the copy and its ready marker were submitted, by the load's frames; read by the owner's claims.
@@ -333,13 +343,27 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
         private boolean finished;
         private long startNanos;
 
-        private Load(int slot, int key, int generation, long bytes, int bank, int expert) {
+        private Load(int slot) {
             this.slot = slot;
+            this.finished = true;
+        }
+
+        /// Starts the slot's next load. The previous one ended: the slot was free or evictable.
+        private void begin(int key, int generation, long bytes, int bank, int expert) {
             this.key = key;
             this.generation = generation;
             this.bytes = bytes;
             this.bank = bank;
             this.expert = expert;
+            this.fence = null;
+            this.streamed = false;
+            this.finished = false;
+            this.startNanos = 0;
+        }
+
+        /// The slot this load fills.
+        public int slot() {
+            return this.slot;
         }
 
         public int bank() {
@@ -536,7 +560,7 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
     /// A lease on `slot` closed. The owner calls this, in its own turn.
     @Override
     public void release(int slot, int generation, DeviceFence fence) {
-        List<DeviceFence> unused = new ArrayList<>(2);
+        List<DeviceFence> unused = this.unusedFences;
         if (this.generation[slot] != generation) {
             // The shard closed with this lease open: the slab is gone, so there is nothing to order.
             if (fence != null) unused.add(fence);
@@ -546,7 +570,11 @@ public final class ExpertCacheShard implements ExpertLease.Owner {
             unpin(slot);
         }
         for (DeviceFence redundant : unused) releaseFence(redundant);
+        unused.clear();
     }
+
+    /// The fences a release found redundant; the owner's, so the one list serves every release.
+    private final List<DeviceFence> unusedFences = new ArrayList<>(2);
 
     /// Removes one pin from a slot that has leases.
     private void unpin(int slot) {
