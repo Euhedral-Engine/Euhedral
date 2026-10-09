@@ -124,20 +124,22 @@ class EuhedralInferenceRuntimeLatticeTest {
             var other = new Execution(lattice, plan, gpu);
             try (var calls = java.util.concurrent.Executors.newFixedThreadPool(2)) {
                 try {
-                    // Euhedral admits every quantum on the workspace owner's worker. A gate that holds a worker
-                    // inside a stage can hold that very worker before the second quantum was admitted (stages of
-                    // the runtime never block; the gate does), and then the second quantum cannot start: such an
-                    // attempt is released and made again.
+                    // Euhedral admits every quantum on the workspace owner's worker, which is held until both are
+                    // queued (below). Should the gate still hold that worker before the second quantum was admitted,
+                    // the second cannot start: such an attempt is released and made again.
                     java.util.concurrent.Future<List<Quantum.Outcome>> first = null;
                     java.util.concurrent.Future<List<Quantum.Outcome>> second = null;
                     boolean concurrent = false;
                     for (int attempt = 0; attempt < 10 && !concurrent; attempt++) {
                         gpu.embeddingGate = new WorkGate(2);
                         int base = 801 + 2 * attempt;
+                        var owner = holdOwner(runtime);
                         first = calls.submit(() -> runtime.execute(List.of(new Quantum(
                                 plan, new Sequence(base), Quantum.ExecutionKind.PREFILL, 0, new int[] {1}))));
                         second = calls.submit(() -> other.execute(List.of(new Quantum(
                                 plan, new Sequence(base + 1), Quantum.ExecutionKind.PREFILL, 0, new int[] {2}))));
+                        letAdmissionsQueue();
+                        owner.countDown();
                         concurrent = gpu.embeddingGate.awaitEntries(2, TimeUnit.SECONDS);
                         if (!concurrent) {
                             gpu.embeddingGate.release();
@@ -255,6 +257,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                     completions.clear();
                     gpu.embeddingGate = new WorkGate(2);
                     gpu.projectionGate = new WorkGate(2);
+                    var owner = holdOwner(runtime);
                     for (int sequenceId = 1; sequenceId <= 16; sequenceId++) {
                         Sequence sequence = new Sequence(attempt * 100 + sequenceId);
                         sequences.add(sequence);
@@ -263,6 +266,8 @@ class EuhedralInferenceRuntimeLatticeTest {
                                     sequenceId % ExecutionFixtures.VOCABULARY
                                 })));
                     }
+                    letAdmissionsQueue();
+                    owner.countDown();
                     concurrent = gpu.embeddingGate.awaitEntries(3, TimeUnit.SECONDS);
                     if (!concurrent) {
                         gpu.embeddingGate.release();
@@ -497,6 +502,30 @@ class EuhedralInferenceRuntimeLatticeTest {
                 expectedRegistrations,
                 registrationProbe.getThreadCount(),
                 "worker source partitions did not register before source attachment");
+    }
+
+    /// Holds the workspace owner's worker in a frame of its own until the returned latch opens: the admissions
+    /// published meanwhile wait in that worker's cache, in order, and the worker runs them back to back once it is
+    /// free, before it takes a stage. A gate that holds workers inside stages (production stages never block) can
+    /// then hold the owner's worker without keeping a quantum from being admitted.
+    private static CountDownLatch holdOwner(Execution execution) throws InterruptedException {
+        var held = new CountDownLatch(1);
+        var open = new CountDownLatch(1);
+        execution.runtime().publishOnOwner(() -> {
+            held.countDown();
+            try {
+                open.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertTrue(held.await(10, TimeUnit.SECONDS), "the owner's worker did not take the holding frame");
+        return open;
+    }
+
+    /// Lets the admissions that were published while the owner's worker was held reach its cache.
+    private static void letAdmissionsQueue() throws InterruptedException {
+        Thread.sleep(300);
     }
 
     private static void awaitDrained(ControlPlaneLattice lattice) throws InterruptedException {

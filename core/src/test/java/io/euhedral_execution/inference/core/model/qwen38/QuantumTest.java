@@ -212,11 +212,26 @@ class QuantumTest {
         };
         var runtime = ExecutionFixtures.runtime(plan, gpu);
         var context = new Quantum(plan, new Sequence(909), Quantum.ExecutionKind.DECODE, 0, new int[] {1});
-        try (var admission = Executors.newSingleThreadExecutor()) {
+        var admissionThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        var closeStarted = new CountDownLatch(1);
+        try (var admission = Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task);
+            admissionThread.set(thread);
+            return thread;
+        })) {
             Future<java.util.concurrent.CompletableFuture<Quantum.Outcome>> submitted =
                     admission.submit(() -> runtime.submit(context));
             assertTrue(building.await(10, TimeUnit.SECONDS));
-            var closing = admission.submit(runtime::close);
+            var closing = admission.submit(() -> {
+                closeStarted.countDown();
+                runtime.close();
+            });
+            // The build goes on only once close marked the runtime closed: it then waits for the quantum in flight.
+            assertTrue(closeStarted.await(10, TimeUnit.SECONDS));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (admissionThread.get().getState() != Thread.State.WAITING
+                    && admissionThread.get().getState() != Thread.State.TIMED_WAITING
+                    && System.nanoTime() < deadline) Thread.sleep(1);
             closed.countDown();
             var outcome = submitted.get(10, TimeUnit.SECONDS).get(10, TimeUnit.SECONDS);
             assertInstanceOf(IllegalStateException.class, outcome.failure());
