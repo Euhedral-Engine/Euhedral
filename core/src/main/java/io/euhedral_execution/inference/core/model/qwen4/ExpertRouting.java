@@ -199,6 +199,12 @@ public final class ExpertRouting {
         return this.itemStart[checkActive(index)];
     }
 
+    /// One past the last work item of the `index`-th active expert: the work items of consecutive active experts
+    /// are consecutive, so experts `first` to `end - 1` have `itemEnd(end - 1) - itemStart(first)` of them.
+    public int itemEnd(int index) {
+        return this.itemStart[checkActive(index) + 1];
+    }
+
     public int itemCount(int index) {
         return this.itemStart[checkActive(index) + 1] - this.itemStart[index];
     }

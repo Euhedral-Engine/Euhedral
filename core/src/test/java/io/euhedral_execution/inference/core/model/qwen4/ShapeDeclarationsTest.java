@@ -19,7 +19,9 @@ class ShapeDeclarationsTest {
                 Shape.Kind.MID,
                 Shape.Kind.OBSERVE,
                 Shape.Kind.PREFETCH,
-                Shape.Kind.FETCH);
+                Shape.Kind.FETCH,
+                Shape.Kind.FETCHALL,
+                Shape.Kind.FETCHWAIT);
         for (Shape.Kind kind : Shape.Kind.values())
             assertEquals(!host.contains(kind), Shape.declaresWorkspace(kind), kind.name());
     }

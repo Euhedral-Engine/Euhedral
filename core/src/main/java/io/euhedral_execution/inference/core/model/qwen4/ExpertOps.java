@@ -207,6 +207,27 @@ public final class ExpertOps {
         downWeighted(gpu, geometry, slots, items, count, pairs, act, weighted);
     }
 
+    /// The active experts `first` to `end - 1` of `routing` in one launch of each kernel. Their work items are
+    /// consecutive and each names its own expert's slot, so the result is that of [#runExpert] on each.
+    public static void runExperts(
+            ExecutionGpu gpu,
+            Geometry geometry,
+            ExpertRouting routing,
+            int first,
+            int end,
+            long descriptor,
+            long x,
+            long scratch) {
+        long act = scratch;
+        long weighted = scratch + Scratch.weightedOffset(routing.pairCount(), geometry.inter());
+        long slots = descriptor + routing.slotsOffset();
+        long items = descriptor + routing.itemsOffset() + 16L * routing.itemStart(first);
+        long pairs = descriptor + routing.pairsOffset();
+        int count = routing.itemEnd(end - 1) - routing.itemStart(first);
+        gateUpSwiGlu(gpu, geometry, slots, items, count, pairs, x, act);
+        downWeighted(gpu, geometry, slots, items, count, pairs, act, weighted);
+    }
+
     /// The ordered accumulation of the chunk: every row's weighted outputs added to its row of `out` in ascending
     /// expert order, after every expert ran ([#runExpert]); rows without pairs are zeroed.
     public static void combineExperts(

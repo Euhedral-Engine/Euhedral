@@ -95,7 +95,19 @@ public final class ExecutionPlan implements AutoCloseable {
     record Range(int firstLayer, int endLayer, boolean embeds, boolean head, boolean advances) {}
 
     /// Everything that distinguishes one shape of the plan from another.
-    record ShapeKey(Range range, int rows, boolean diagnostic) {}
+    record ShapeKey(Range range, int rows, boolean diagnostic, int variant) {
+        ShapeKey(Range range, int rows, boolean diagnostic) {
+            this(range, rows, diagnostic, 0);
+        }
+    }
+
+    /// A measurement switch (tests): shapes made while it is set differ in what [Shape] reads of the variant, so one
+    /// process can alternate arms.
+    private volatile int variant;
+
+    void variant(int variant) {
+        this.variant = variant;
+    }
 
     private final ExecutionGpu gpu;
     private final EuhedralInferenceRuntime runtime;
@@ -311,7 +323,7 @@ public final class ExecutionPlan implements AutoCloseable {
             throw new IllegalStateException("the sequence would exceed its " + sequence.maxTokens() + " positions");
         boolean diagnostic = timingsOn() || hasObserver() || hasMidObserver();
         Shape shape = this.shapes.computeIfAbsent(
-                new ShapeKey(range, rowBucket(rows), diagnostic), key -> new Shape(this, key));
+                new ShapeKey(range, rowBucket(rows), diagnostic, this.variant), key -> new Shape(this, key));
         Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, sink, exchange);
         quantum.continueWith(this.runtime.lake(), Objects.requireNonNull(continuation, "continuation"));
         return quantum;
@@ -363,7 +375,11 @@ public final class ExecutionPlan implements AutoCloseable {
         int chunks = prompt.chunkCount();
         int lastRows = prompt.chunk(chunks - 1).rows();
         Shape last = this.shapes.computeIfAbsent(
-                new ShapeKey(full.key().range(), rowBucket(lastRows), full.key().diagnostic()),
+                new ShapeKey(
+                        full.key().range(),
+                        rowBucket(lastRows),
+                        full.key().diagnostic(),
+                        full.key().variant()),
                 key -> new Shape(this, key));
         return this.promptShapes.computeIfAbsent(
                 java.util.List.of(full, last, chunks),
@@ -415,7 +431,7 @@ public final class ExecutionPlan implements AutoCloseable {
         boolean diagnostic = timingsOn() || hasObserver() || hasMidObserver();
         Range range = new Range(0, this.sparse.length, true, true, true);
         Shape shape = this.shapes.computeIfAbsent(
-                new ShapeKey(range, rowBucket(chunkRows), diagnostic), key -> new Shape(this, key));
+                new ShapeKey(range, rowBucket(chunkRows), diagnostic, this.variant), key -> new Shape(this, key));
         Quantum quantum = new Quantum(this, shape, sequence, tokens, offset, rows, chunkRows, sink);
         quantum.continueWith(this.runtime.lake(), Objects.requireNonNull(continuation, "continuation"));
         return quantum;
