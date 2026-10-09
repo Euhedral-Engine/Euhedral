@@ -61,7 +61,9 @@ class RegionRuntimeTest {
         }
         assertTrue(this.lattice.sources.stream().allMatch(LatticeSource::isComplete));
         assertEquals(
-                EuhedralInferenceRuntime.LAKE_SINKS, this.lattice.sources.size(), "the lake's sinks, attached once");
+                EuhedralInferenceRuntime.LAKE_SINKS + 1,
+                this.lattice.sources.size(),
+                "the lake's sinks and its idle watch, attached once");
         assertFalse(runtime.isAttached());
     }
 

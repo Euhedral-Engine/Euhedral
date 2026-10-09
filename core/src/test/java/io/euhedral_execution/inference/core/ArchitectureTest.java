@@ -150,6 +150,8 @@ class ArchitectureTest {
             "runtime/EuhedralInferenceRuntime.java#openPool",
             "runtime/EuhedralInferenceRuntime.java#release",
             "runtime/graph/InferenceLake.java#attach",
+            "runtime/graph/InferenceLake.java#detach",
+            "runtime/graph/InferenceLake.java#signalComplete",
             "runtime/graph/InferenceLake.java#awaitTermination",
             "runtime/HostTasks.java#close",
             "gpu/CudaGpuMemory.java#close",
