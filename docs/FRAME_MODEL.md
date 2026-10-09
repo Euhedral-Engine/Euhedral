@@ -531,6 +531,14 @@ Paired against the retrying fetch (two forks each): fetches that found the cache
 against 8-9; prefill unchanged (113-115 / 494-545 tokens/s); decode at 4096 tokens 61.4 and 60.3 ms against 54.3 and 52.0
 cold, 44.5 and 47.7 against 39.1 and 38.6 warm; at 64 tokens within noise.
 
+Allocation (JFR allocation samples over a Flash-Next decode, steady state): the expert path's per-miss objects were a few
+percent of it. A slot now owns the load object and the load context (its read parts, join, submit, copy, retire and
+failure frames and its tier directive) from the time the cache is made, a fetch stage owns its request, and the
+source's blocked list is an array: a miss, a request and a poll allocate nothing, for about 3 MB of host memory (one
+context per device slot). Leases (one per pin) and the FFM memory segments of the submissions are what the path still
+allocates. By far the largest allocator on a worker is Euhedral's own `QueueIngestSink`: its `drainRequests` makes the
+terminal's `push` method reference on every `request`, about 22 MB/s while workers poll.
+
 Tried and not kept, each against a paired control (differences inside the run-to-run spread of 2-4%):
 
 - **Euhedral 0.2.1** (lock-free ingest, no monitor per publication): neutral on decode, prefill and Flash-Next.
