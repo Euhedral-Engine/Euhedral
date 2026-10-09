@@ -263,9 +263,11 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             return Outcome.LEASED;
         }
         if (reserved == null) {
-            this.fullFetches.increment();
             boolean noStaging = staged && buffer < 0;
-            (noStaging ? this.fullStaging : this.fullSlots).increment();
+            if (!this.speculating) {
+                this.fullFetches.increment();
+                (noStaging ? this.fullStaging : this.fullSlots).increment();
+            }
             this.cause = noStaging ? Cause.STAGING : this.ticket.waiting() ? Cause.SLOTS : Cause.PENDING;
             this.causeShard = shardIndex;
             return Outcome.FULL;
@@ -274,8 +276,10 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             // A prefetch is reading the record into the tier: once it is in, the load copies it from there.
             reserved.cancel();
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
-            this.fullFetches.increment();
-            this.fullReads.increment();
+            if (!this.speculating) {
+                this.fullFetches.increment();
+                this.fullReads.increment();
+            }
             this.cause = Cause.PENDING;
             return Outcome.FULL;
         }
@@ -283,8 +287,10 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             // The disk has as many records in flight as keep it busy: this one is read once one of them is in.
             reserved.cancel();
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
-            this.fullFetches.increment();
-            this.fullReads.increment();
+            if (!this.speculating) {
+                this.fullFetches.increment();
+                this.fullReads.increment();
+            }
             this.cause = Cause.READS;
             return Outcome.FULL;
         }
@@ -371,6 +377,207 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         }
     }
 
+    // ---------------------------------------------------------------- device lookahead
+
+    /// The lookahead (`EUHEDRAL_QWEN4_AHEAD=D[,N]`, `0`: none): a prefill chunk's block asks for nearly every expert of
+    /// its layer, so the layer `D` ahead (1) is predicted from this layer's input by its own router, and what the
+    /// device lacks is loaded into device slots while this layer computes, `N` (1024) loads and held slots at most.
+    /// The disk is offered the next record whenever it has a read to spare, not once the layer's router has run.
+    static final int[] AHEAD = aheadSetting(System.getenv("EUHEDRAL_QWEN4_AHEAD"));
+
+    private static int[] aheadSetting(String value) {
+        if (value == null || value.isBlank()) return new int[] {1, 1024};
+        if (value.trim().equals("0")) return new int[] {0, 0};
+        String[] parts = value.split(",");
+        return new int[] {Integer.parseInt(parts[0].trim()), parts.length > 1 ? Integer.parseInt(parts[1].trim()) : 1024
+        };
+    }
+
+    /// How many layers ahead a prefill chunk's lookahead predicts; 0 when there is none.
+    public static int aheadDistance() {
+        return AHEAD[0];
+    }
+
+    /// Wanted records, oldest first: `tag << 32 | bank << 16 | expert`. Touched by the poll only.
+    private long[] wants = new long[1024];
+
+    private int wantHead;
+    private int wantCount;
+    /// Loads begun for the lookahead and slots it holds: at most `AHEAD[1]`.
+    private int aheadOutstanding;
+    /// Layers up to which the block asked for its experts itself, and whose held slots were released (-1: none).
+    private int passedTag = -1;
+
+    private int doneTag = -1;
+
+    private final java.util.ArrayList<ExpertLease>[] aheadHeld = newHolds();
+    /// Whether the last lookahead load found the cache full, and the epoch it asked at.
+    private boolean aheadFull;
+
+    private long aheadAskedAt;
+    /// Whether the cache is asked for the lookahead: its refusals are not the fetches'.
+    private volatile boolean speculating;
+
+    private final LongAdder aheadLoads = new LongAdder();
+
+    @SuppressWarnings("unchecked")
+    private static java.util.ArrayList<ExpertLease>[] newHolds() {
+        return new java.util.ArrayList[64];
+    }
+
+    /// Posts the experts layer `tag` is predicted to ask for (most named first), of bank `bank`. Any thread.
+    public void publishAhead(int tag, int bank, int[] experts) {
+        if (AHEAD[0] <= 0) return;
+        post(() -> {
+            if (tag <= this.passedTag) return;
+            if (this.wantCount + experts.length > this.wants.length) {
+                long[] larger = new long[Math.max(this.wants.length * 2, this.wantCount + experts.length)];
+                for (int i = 0; i < this.wantCount; i++)
+                    larger[i] = this.wants[(this.wantHead + i) % this.wants.length];
+                this.wants = larger;
+                this.wantHead = 0;
+            }
+            for (int expert : experts)
+                this.wants[(this.wantHead + this.wantCount++) % this.wants.length] =
+                        ((long) tag << 32) | ((long) bank << 16) | expert;
+            changed();
+        });
+    }
+
+    /// Layer `tag`'s block asks for its experts now: what was wanted for it or before is no longer. Any thread.
+    public void aheadPassed(int tag) {
+        if (AHEAD[0] <= 0) return;
+        post(() -> this.passedTag = Math.max(this.passedTag, tag));
+    }
+
+    /// Layer `tag` is done with its experts: the slots the lookahead held for it and before it are released; the
+    /// last layer of a chunk (`last`) starts the next chunk's bookkeeping over. Any thread.
+    public void aheadDone(int tag, boolean last) {
+        if (AHEAD[0] <= 0) return;
+        post(() -> {
+            this.doneTag = Math.max(this.doneTag, tag);
+            this.passedTag = Math.max(this.passedTag, tag);
+            for (int layer = 0; layer <= this.doneTag && layer < this.aheadHeld.length; layer++) {
+                java.util.ArrayList<ExpertLease> held = this.aheadHeld[layer];
+                if (held == null) continue;
+                for (ExpertLease lease : held) lease.close();
+                this.aheadOutstanding -= held.size();
+                held.clear();
+            }
+            if (last) {
+                this.passedTag = -1;
+                this.doneTag = -1;
+                this.wantHead = 0;
+                this.wantCount = 0;
+            }
+            changed();
+        });
+    }
+
+    /// Loads wanted records into device slots while the disk and the slots have room and no fetch waits. Called by
+    /// the poll.
+    private void pumpAhead() {
+        if (this.blockedCount > 0) return;
+        long epoch = this.epoch.get();
+        if (this.aheadFull && epoch == this.aheadAskedAt) return;
+        this.aheadAskedAt = epoch;
+        this.aheadFull = false;
+        while (this.wantCount > 0) {
+            long want = this.wants[this.wantHead];
+            int tag = (int) (want >>> 32);
+            if (tag <= this.passedTag) {
+                popWant();
+                continue;
+            }
+            if (this.aheadOutstanding >= aheadLimit()) return;
+            AheadTarget target = new AheadTarget(this, tag);
+            this.speculating = true;
+            Outcome outcome;
+            try {
+                outcome = fetch(target, (int) (want >>> 16 & 0xFFFF), (int) (want & 0xFFFF));
+            } finally {
+                this.speculating = false;
+            }
+            if (outcome == Outcome.FULL) {
+                this.aheadFull = true;
+                return;
+            }
+            popWant();
+            if (outcome == Outcome.LOADING) {
+                target.loading = true;
+                this.aheadOutstanding++;
+                this.aheadLoads.increment();
+            }
+        }
+    }
+
+    /// Slots the lookahead may hold: a third of the cache at most, so the layer's own fetches always find slots
+    /// (the holds are released only when the layer is done).
+    private int aheadLimit() {
+        return Math.min(AHEAD[1], this.cache.slotCount() / 3);
+    }
+
+    private void popWant() {
+        this.wantHead = (this.wantHead + 1) % this.wants.length;
+        this.wantCount--;
+    }
+
+    /// Loads begun by the lookahead. Any thread.
+    public long aheadLoads() {
+        return this.aheadLoads.sum();
+    }
+
+    /// The lookahead's request for an expert: the lease it gets is held until the layer is done with its experts.
+    private static final class AheadTarget implements Fetch {
+        private final ExpertCacheOwner owner;
+        private final int tag;
+        /// Set by the poll once the load began, before any record of its arrival is applied.
+        boolean loading;
+
+        AheadTarget(ExpertCacheOwner owner, int tag) {
+            this.owner = owner;
+            this.tag = tag;
+        }
+
+        @Override
+        public boolean stopped() {
+            return false;
+        }
+
+        @Override
+        public void abandoned() {}
+
+        @Override
+        public void arrived(ExpertLease lease) {
+            this.owner.post(() -> {
+                if (!this.loading) {
+                    lease.close();
+                    return;
+                }
+                if (this.tag <= this.owner.doneTag || this.tag >= this.owner.aheadHeld.length) {
+                    this.owner.aheadOutstanding--;
+                    lease.close();
+                    return;
+                }
+                java.util.ArrayList<ExpertLease> held = this.owner.aheadHeld[this.tag];
+                if (held == null) held = this.owner.aheadHeld[this.tag] = new java.util.ArrayList<>();
+                held.add(lease);
+            });
+        }
+
+        @Override
+        public void failed(Throwable failure) {
+            this.owner.post(() -> {
+                if (this.loading) this.owner.aheadOutstanding--;
+            });
+        }
+
+        @Override
+        public boolean scan() {
+            return true;
+        }
+    }
+
     /// A prefetch ended, its record in the tier (`read`) or not. Called by the poll.
     void prefetchEnded(boolean read) {
         (read ? this.prefetches : this.prefetchFailures).increment();
@@ -419,6 +626,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             }
         }
         if (this.blockedCount > 0) askBlocked();
+        if (this.wantCount > 0) pumpAhead();
     }
 
     /// A stopped quantum's fetches are found at least this often, even when nothing changed.

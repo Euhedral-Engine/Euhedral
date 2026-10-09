@@ -459,6 +459,15 @@ final class Stages {
 
         @Override
         protected void submit() {
+            if (this.shape.aheads()) {
+                int ahead = this.layer + ExpertCacheOwner.aheadDistance();
+                moe().submitPredictionRows(
+                                this.layer,
+                                plan().weights().moe(ahead),
+                                storage().mixed(),
+                                rows());
+                return;
+            }
             int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
             moe().submitPrediction(
                             this.layer, plan().weights().moe(ahead), storage().mixed());
@@ -480,6 +489,12 @@ final class Stages {
         @Override
         protected void submit() {
             ExecutionPlan plan = plan();
+            if (this.shape.aheads()) {
+                int wanted = this.layer + ExpertCacheOwner.aheadDistance();
+                plan.expertOwner()
+                        .publishAhead(wanted, plan.bankOrdinal(wanted), moe().takePredictedSet(this.layer, rows()));
+                return;
+            }
             int ahead = this.layer + ExpertCacheOwner.prefetchDistance();
             int bank = plan.bankOrdinal(ahead);
             ExecutionPlan.ExpertDemand demand = plan.demandListener();
@@ -522,6 +537,7 @@ final class Stages {
             moe.chargeRouteWait(now - storage.routeArmedNanos);
             storage.plannedNanos = now;
             storage.experts = moe.plan(storage.bank, rows());
+            if (this.shape.aheads()) plan().expertOwner().aheadPassed(this.layer);
             ExecutionPlan.ExpertDemand demand = plan().demandListener();
             if (demand != null) moe.reportDemand(demand, this.layer, -1, -1, rows(), null);
             moe.submitPlan();
@@ -628,6 +644,7 @@ final class Stages {
             MoeLayer moe = moe();
             moe.chargeExpertWait(System.nanoTime() - storage.plannedNanos);
             moe.submitFinish(storage.blockOutput(), rows(), storage.moeBlock);
+            if (this.shape.aheads()) plan.expertOwner().aheadDone(this.layer, this.layer == plan.layers() - 1);
             if (plan.traceOn())
                 plan.reportTrace(
                         this.layer,

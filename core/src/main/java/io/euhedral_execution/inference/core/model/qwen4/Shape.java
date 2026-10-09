@@ -153,10 +153,11 @@ final class Shape implements GraphShape {
             int planned = add(Kind.PLAN, layer, -1, retired(route));
             // A decode step predicts the experts of a later layer from this one's input, behind the route on its lane
             // so the plan does not wait for it, and its prefetch is a host stage after it retires: a side branch.
-            if (this.key.rows() == 1
-                    && !diagnostic
-                    && ExpertCacheOwner.prefetchCandidates() > 0
-                    && layer + ExpertCacheOwner.prefetchDistance() < this.plan.layers()) {
+            if (!diagnostic
+                    && ((this.key.rows() == 1
+                                    && ExpertCacheOwner.prefetchCandidates() > 0
+                                    && layer + ExpertCacheOwner.prefetchDistance() < this.plan.layers())
+                            || (aheads() && layer + ExpertCacheOwner.aheadDistance() < this.plan.layers()))) {
                 int predict = add(Kind.PREDICT, layer, -1, after(route));
                 add(Kind.PREFETCH, layer, -1, retired(predict));
             }
@@ -180,6 +181,14 @@ final class Shape implements GraphShape {
         this.builder.chain(
                 this.scratchUsers.stream().mapToInt(Integer::intValue).toArray());
     }
+
+    /// Whether this shape's blocks look ahead: a prefill chunk's block asks for nearly every expert of its layer.
+    boolean aheads() {
+        return this.key.rows() > AHEAD_MIN_ROWS && ExpertCacheOwner.aheadDistance() > 0;
+    }
+
+    /// Rows above which a shape looks ahead (the decode and the short-chunk shapes do not).
+    static final int AHEAD_MIN_ROWS = 16;
 
     /// Whether a stage of `kind` touches the workspace on the device: every stage but the host ones. The plan's
     /// completion chain still runs one quantum at a time, so the one buffer orders a graph behind the previous one

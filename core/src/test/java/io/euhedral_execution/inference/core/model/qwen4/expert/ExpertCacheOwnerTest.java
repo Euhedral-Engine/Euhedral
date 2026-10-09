@@ -190,6 +190,44 @@ class ExpertCacheOwnerTest {
         return target;
     }
 
+    /// The lookahead loads what a layer is predicted to ask for into device slots, holds them for the layer, and never
+    /// more than a third of the cache.
+    @Test
+    void aLookaheadLoadsTheWantedRecordsAndHoldsAThirdOfTheCacheUntilTheLayerIsDone() throws Exception {
+        build(9, 4);
+        this.owner.publishAhead(3, 2, new int[] {0, 1, 2, 3, 4});
+        drive(() -> this.owner.aheadLoads() == 3 && this.owner.loadsInFlight() == 0);
+        drive(() -> this.lake.ready.isEmpty() && !this.owner.hasRecords());
+        for (int expert = 0; expert < 3; expert++) assertTrue(this.cache.isResident(2, expert), "expert " + expert);
+        assertFalse(this.cache.isResident(2, 3), "the hold limit: a third of nine slots");
+        assertEquals(3, this.cache.openLeaseCount(), "each loaded record is held");
+        // The layer's own fetches find what was loaded, and the layer's end releases the holds, which lets the rest in.
+        Fetch own = fetch(2, 1, ExpertCacheOwner.Outcome.LEASED);
+        own.lease().close();
+        this.owner.aheadDone(3, false);
+        drive(() -> this.owner.aheadLoads() == 3 && this.cache.openLeaseCount() == 0 && !this.owner.hasRecords());
+        drained();
+        assertEquals(3, this.owner.aheadLoads(), "the layer is done: what is left of its wants is dropped");
+        this.cache.checkQuiescent();
+    }
+
+    @Test
+    void aLookaheadForALayerThatAsksForItsExpertsItselfLoadsNothing() throws Exception {
+        build(9, 4);
+        this.owner.aheadPassed(5);
+        this.owner.publishAhead(5, 2, new int[] {0, 1});
+        this.owner.poll();
+        drained();
+        assertEquals(0, this.owner.aheadLoads());
+        assertTrue(this.lake.ready.isEmpty());
+        this.owner.aheadDone(5, true);
+        this.owner.publishAhead(4, 2, new int[] {7});
+        drive(() -> this.owner.aheadLoads() == 1 && this.owner.loadsInFlight() == 0);
+        this.owner.aheadDone(4, true);
+        drained();
+        this.cache.checkQuiescent();
+    }
+
     @Test
     void aResidentExpertIsALeaseAtOnceWithNoFrame() throws Exception {
         build(4, 2);
