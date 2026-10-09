@@ -352,6 +352,15 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   tokens, six requests in a row: with 4 worker CPUs 83.9-86.6 tok/s against 101.1-101.8 with fixed timing; with 32 worker
   CPUs three requests at 101-103 and then 77.7-77.9, as long prefills had left fewer workers awake, against 101.5-102.9
   throughout. Idle CPU with no request is the same with either: 0.4 cores for 4 workers, 3.6-4.3 for 32.
+  That figure is before the first request. The lake attaches its sinks to the lattice when it admits its first unit, and
+  a worker polls every attached source, so after a request a worker whose polls find nothing yields in a loop: the
+  production server with one worker (`EUHEDRAL_INFERENCE_WORKER_CPUS=0`) sat at 100% of that core with no generation
+  active, no context switch in two seconds and the stack in `ControlPlaneFragment.runCycle` (`Thread.yield`) over
+  `QueueIngestSink` polls. The sinks are therefore attached for a busy period (`InferenceLake`): beside them the lake
+  attaches an idle watch, a source polled like the sinks, and when no unit has been admitted for a second
+  (`-Deuhedral.lake.idle-detach-ms`, 0 keeps them attached) the watch detaches both; the next unit attaches a fresh set.
+  A frame is published only while a unit it belongs to is admitted, so none is in flight when the sinks go. Sources the
+  lake does not own (the artifact's reads and the expert cache's owner in Flash-Next) stay attached.
 - **Waking a thread outside the lattice per token is expensive.** When a blocked caller drained each token's text from a
   queue, the wake-up sat between a VERIFY's retirement and the next admission: the median gap after a 4-row VERIFY was
   276 us, 229 us when nothing outside the workers was woken. The benchmark therefore drives `generateAsync`, as the server

@@ -66,11 +66,11 @@ class InferenceLakeTest {
         assertEquals(0, lattice.sources.size(), "nothing attaches before the first unit");
         assertFalse(lake.isAttached());
         lake.admit();
-        assertEquals(4, lattice.sources.size());
+        assertEquals(5, lattice.sources.size(), "the four sinks and the idle watch");
         assertEquals(4, lake.sinks());
         assertTrue(lake.isAttached());
         lake.admit();
-        assertEquals(4, lattice.sources.size(), "attached once");
+        assertEquals(5, lattice.sources.size(), "attached once");
     }
 
     @Test
@@ -126,9 +126,83 @@ class InferenceLakeTest {
         lake.terminated();
         assertTrue(lake.isComplete());
         lake.awaitTermination();
-        assertEquals(3, lattice.completions.get(), "every sink was detached");
+        assertEquals(4, lattice.completions.get(), "every sink and the idle watch were detached");
         assertFalse(lake.isAttached());
         assertThrows(IllegalStateException.class, () -> lake.publish(new Frame(1)));
+    }
+
+    /// The sources of the first attachment: the sinks, then the idle watch.
+    private static LatticeSource watchOf(Recording lattice, int sinks) {
+        return lattice.sources.get(sinks);
+    }
+
+    private static void pullAll(Recording lattice, List<AbstractFrame> into) {
+        for (LatticeSource source : List.copyOf(lattice.sources)) lattice.pull(source, into);
+    }
+
+    @Test
+    void theSinksDetachWhenNoUnitWasAdmittedForTheIdleTimeAndTheNextFrameAttachesFreshOnes() throws Exception {
+        var lattice = new Recording();
+        var lake = new InferenceLake(lattice, 2, 1, 1_000_000);
+        lake.admit();
+        lake.terminated();
+        assertEquals(3, lattice.sources.size());
+        Thread.sleep(5);
+        lattice.pull(watchOf(lattice, 2), new ArrayList<>());
+        assertFalse(lake.isAttached(), "the watch found the lake idle and let the sinks go");
+        // The sinks complete when they are polled and found empty, as the lattice does.
+        pullAll(lattice, new ArrayList<>());
+        assertEquals(3, lattice.completions.get(), "both sinks and the watch were detached");
+
+        Frame frame = new Frame(5);
+        lake.publish(frame);
+        assertTrue(lake.isAttached());
+        assertEquals(6, lattice.sources.size(), "a fresh set of sinks and a watch");
+        List<AbstractFrame> pulled = new ArrayList<>();
+        for (LatticeSource source : lattice.sources.subList(3, 6)) lattice.pull(source, pulled);
+        assertEquals(List.of(frame), pulled, "the frame reached the new sinks");
+    }
+
+    @Test
+    void anAdmittedUnitKeepsTheSinksAttached() throws Exception {
+        var lattice = new Recording();
+        var lake = new InferenceLake(lattice, 2, 1, 1_000_000);
+        lake.admit();
+        Thread.sleep(5);
+        lattice.pull(watchOf(lattice, 2), new ArrayList<>());
+        assertTrue(lake.isAttached(), "a unit is running");
+        lake.terminated();
+        lattice.pull(watchOf(lattice, 2), new ArrayList<>());
+        assertTrue(lake.isAttached(), "the idle time starts when the last unit ends");
+    }
+
+    @Test
+    void aUnitAdmittedAfterTheDetachAttachesFreshSinks() throws Exception {
+        var lattice = new Recording();
+        var lake = new InferenceLake(lattice, 2, 1, 1_000_000);
+        lake.admit();
+        lake.terminated();
+        Thread.sleep(5);
+        lattice.pull(watchOf(lattice, 2), new ArrayList<>());
+        assertFalse(lake.isAttached());
+        lake.admit();
+        assertTrue(lake.isAttached());
+        assertEquals(6, lattice.sources.size());
+        lake.completeGracefully();
+        lake.terminated();
+        assertTrue(lake.isComplete());
+        assertFalse(lake.isAttached());
+    }
+
+    @Test
+    void withoutAnIdleTimeTheSinksStayAttached() throws Exception {
+        var lattice = new Recording();
+        var lake = new InferenceLake(lattice, 2, 1, 0);
+        lake.admit();
+        lake.terminated();
+        Thread.sleep(5);
+        lattice.pull(watchOf(lattice, 2), new ArrayList<>());
+        assertTrue(lake.isAttached());
     }
 
     @Test

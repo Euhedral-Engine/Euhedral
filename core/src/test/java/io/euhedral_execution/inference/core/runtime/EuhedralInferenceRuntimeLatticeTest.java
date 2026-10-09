@@ -95,6 +95,49 @@ class EuhedralInferenceRuntimeLatticeTest {
         }
     }
 
+    /// On the real lattice: once the runtime has been idle its sinks detach and the lattice has nothing left to poll;
+    /// a quantum submitted after that attaches fresh sinks and runs as before.
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void theLakeDetachesWhenIdleAndTheNextQuantumAttachesItAgain() throws Exception {
+        BitSet cpus = twoWorkerCpus();
+        assumeTrue(!cpus.isEmpty());
+        System.setProperty("euhedral.lake.idle-detach-ms", "50");
+        var lattice = createLattice(cpus);
+        var gpu = new HeldGpu();
+        var plan = new ExecutionPlan(
+                ExecutionFixtures.weights(),
+                ExecutionFixtures.norm(),
+                List.of(ExecutionFixtures.q3("projection", 64, 201)));
+        try {
+            lattice.start();
+            var runtime = new Execution(lattice, plan, gpu);
+            try {
+                long sequenceId = 5900;
+                for (int round = 0; round < 3; round++) {
+                    var sequence = new Sequence(++sequenceId);
+                    var outcome =
+                            runtime.submit(new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1}));
+                    awaitHeld(gpu.stream, 1);
+                    Thread driver = Thread.ofPlatform().start(() -> gpu.stream.release(null));
+                    driver.join();
+                    assertEquals(
+                            Quantum.Status.SUCCESS,
+                            outcome.get(10, TimeUnit.SECONDS).status());
+                    sequence.complete();
+                    long deadline = System.nanoTime() + 20_000_000_000L;
+                    while (runtime.isAttached() && System.nanoTime() < deadline) Thread.sleep(20);
+                    assertFalse(runtime.isAttached(), "round " + round + ": the idle runtime let its sinks go");
+                }
+            } finally {
+                runtime.close();
+            }
+        } finally {
+            System.clearProperty("euhedral.lake.idle-detach-ms");
+            lattice.close();
+        }
+    }
+
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void independentQuantaFromConcurrentCallersRunOnDifferentWorkers() throws Exception {
@@ -157,9 +200,9 @@ class EuhedralInferenceRuntimeLatticeTest {
                             Quantum.Status.SUCCESS,
                             second.get(10, TimeUnit.SECONDS).getFirst().status());
                     assertEquals(
-                            EuhedralInferenceRuntime.LAKE_SINKS,
+                            EuhedralInferenceRuntime.LAKE_SINKS + 1,
                             attachments.get(),
-                            "the runtime attaches its lake once");
+                            "the runtime attaches its lake once: its sinks and the idle watch");
                     assertEquals(0, runtime.activeQuanta());
                 } finally {
                     gpu.embeddingGate.release();
@@ -177,7 +220,7 @@ class EuhedralInferenceRuntimeLatticeTest {
                                     .getFirst()
                                     .status());
                 }
-                assertEquals(EuhedralInferenceRuntime.LAKE_SINKS, attachments.get());
+                assertEquals(EuhedralInferenceRuntime.LAKE_SINKS + 1, attachments.get());
             } finally {
                 runtime.close();
                 other.close();
