@@ -131,6 +131,7 @@ subprojects {
             // Flash-Next fixture roots (tools/flash_next_reference.py) and test switches.
             for (name in listOf("fixtures", "model-fixtures", "verbose"))
                 providers.gradleProperty("euhedral.qwen4.$name").orNull?.let { systemProperty("euhedral.qwen4.$name", it) }
+            providers.gradleProperty("euhedral.test.heap").orNull?.let { maxHeapSize = it }
             jvmArgs("--enable-native-access=ALL-UNNAMED")
             environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
             val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"

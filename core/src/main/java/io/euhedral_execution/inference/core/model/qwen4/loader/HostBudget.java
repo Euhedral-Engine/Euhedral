@@ -20,7 +20,8 @@ import org.slf4j.LoggerFactory;
 ///
 /// By default the budget is automatic: what the machine can spare now (`MemAvailable`, or less when the process's
 /// cgroup allows less), less room for the operating system (10%, never closer than 4 GiB to exhaustion) and for the
-/// runtime itself (the JVM heap's room to grow and a native reserve). `EUHEDRAL_HOST_MEMORY_MIB` (or the system
+/// runtime itself (the JVM heap's room to grow, up to 2 GiB, a native reserve and the page cache of the n-gram rows).
+/// `EUHEDRAL_HOST_MEMORY_MIB` (or the system
 /// property `euhedral.host.memory-mib`) states the budget instead, in MiB, and is respected as stated: it may be
 /// smaller than the automatic one (0 means no RAM tier) or larger (a warning says so, as the memory is not free now).
 public record HostBudget(long pinnableBytes, long residentBytes, Source source) {
@@ -32,6 +33,16 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
     /// Native memory the runtime keeps for itself beyond the JVM heap: the driver, the native library, thread
     /// stacks, the lattice.
     static final long NATIVE_RESERVE = 1L << 30;
+
+    /// The most the JVM heap is expected to grow by. A server started without `-Xmx` may grow its heap to a quarter
+    /// of the machine, but the engine's own heap is small (under 1 GiB with the model loaded); reserving the
+    /// whole headroom would leave the expert tier a third smaller. A larger heap is stated with
+    /// [#ENVIRONMENT].
+    static final long HEAP_GROWTH_RESERVE = 2L << 30;
+
+    /// The page cache the memory-mapped n-gram rows settle at in a run: 5-6 GiB of the 27 GiB tables (the kernel reads
+    /// 128 KiB around each fault). Page cache is outside the budget, so the machine keeps room for it.
+    static final long NGRAM_WORKING_SET = 6L << 30;
 
     /// The variable that states the memory available to the engine, in MiB.
     public static final String ENVIRONMENT = "EUHEDRAL_HOST_MEMORY_MIB";
@@ -101,12 +112,12 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
         return new HostBudget(machine, bytes, Source.EXPLICIT);
     }
 
-    /// What the runtime keeps for itself: the JVM heap's room to grow beyond what it holds now, and the native
-    /// reserve.
+    /// What the runtime keeps for itself: the JVM heap's room to grow beyond what it holds now (at most
+    /// [#HEAP_GROWTH_RESERVE]), the native reserve and the n-gram rows' page cache.
     static long runtimeReserve() {
         Runtime runtime = Runtime.getRuntime();
-        long heapGrowth = Math.max(0, runtime.maxMemory() - runtime.totalMemory());
-        return heapGrowth + NATIVE_RESERVE;
+        long heapGrowth = Math.min(HEAP_GROWTH_RESERVE, Math.max(0, runtime.maxMemory() - runtime.totalMemory()));
+        return heapGrowth + NATIVE_RESERVE + NGRAM_WORKING_SET;
     }
 
     /// The memory this process can take now: `MemAvailable`, or the headroom of the process's cgroup and its
