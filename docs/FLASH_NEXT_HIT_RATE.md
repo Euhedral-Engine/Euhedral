@@ -122,3 +122,19 @@ kept.
   cost of cold rows is not established beyond "up to 9%".
 - **Lossless NVFP4 coding of the records** (`tools/nvfp4z.py`: 4.09 bits per weight against 4.5): 9% fewer bytes on the
   disk and the bus and 10% more records in the tier, for a decoder on the load path: not built.
+
+## Copy streams
+
+One copy stream queued a layer's copies one behind the other (a record alone copies in 71-77 us, 37 GB/s; the engine's
+loads measured 188 us submit to retire). A record split over two to four streams copies in the same 71-77 us
+(`CopySplitSpike`, throwaway: the link is the bound), so the gain is in the copies of different loads overlapping.
+Paired screens (`EUHEDRAL_QWEN4_COPY_STREAMS`):
+
+| streams, before to after | forks | prefill 4096 | decode cold 64 / 4096 | decode warm 64 / 4096 |
+|---|---|---|---|---|
+| 1 to 2 | 3 | +27.9% (2/3, noisy) | +3.8% / +1.7% | +4.3% / +4.3% |
+| 2 to 4 | 3 | +6.3% (3/3) | -0.7% / +0.7% | -0.8% / -0.3% |
+| 4 to 8 | 3 | +4.1% (2/3) | -2.9% / -5.1% | +2.5% / +2.8% |
+| 1 to 4 | 4 | +4.8% (4/4) | +4.5% / +2.4% | +3.9% / +4.5% |
+
+Four is the default. Prefill 4096 reads at 6.4 GB/s with the disk busy 96% of the time.
