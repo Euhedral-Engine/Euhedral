@@ -1,6 +1,10 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.core.generics.LatticeReceiver;
+import io.euhedral_execution.core.generics.LatticeSource;
+import io.euhedral_execution.core.ingest.AbstractIngestSink;
+import io.euhedral_execution.data_structures.queues.MpscQueue;
 import io.euhedral_execution.hashing.HasherApi;
 import io.euhedral_execution.inference.core.model.qwen4.expert.DeviceFence;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertCache;
@@ -10,26 +14,42 @@ import io.euhedral_execution.inference.core.model.qwen4.expert.RamTierShard;
 import io.euhedral_execution.inference.core.model.qwen4.expert.TierDirective;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
+import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// The owner of the expert cache's bookkeeping (the device cache's shards and the host tier's): the directory,
-/// the slots' states, pins and recency, the tier's slots.
+/// the slots' states, pins and recency, the tier's slots. It is a source of the lattice, like the artifact's reads.
 ///
-/// The bookkeeping is plain fields. Every frame that touches it carries the owner's routing hash ([#HASH]): a
-/// fetch stage, the submit and retire frames of a load, the release of a lease. The lattice runs frames of one
-/// hash in order, one at a time, so these are the only places the state changes and they need nothing else.
-/// Everything else the bookkeeping must learn becomes such a frame: a lease closed on a wave's thread publishes
-/// a release, and a copy's retirement (a driver callback) publishes its retire frame.
-public final class ExpertCacheOwner {
+/// The bookkeeping is plain fields, changed only while a worker polls the source: the lattice never calls `request`
+/// or `pull` of one source twice at a time, so the source is the owner and nothing else guards the state. Whatever
+/// the bookkeeping must learn becomes a [Record] posted to a lock-free queue, from any thread: a fetch stage's request,
+/// a lease closed on a wave's thread, a copy's retirement (a driver callback, which may only enqueue), a read's
+/// completion, a prediction. A poll applies the records in the order they were posted and then asks again the fetches
+/// that found the cache full, but only when something that could let one proceed has changed since it last asked
+/// ([#changed]): a fetch that cannot be served is not a frame that runs again, it waits in the source, and the poll of
+/// a source with nothing to do returns at once.
+public final class ExpertCacheOwner extends AbstractIngestSink {
 
-    /// The routing hash of every frame that touches the bookkeeping.
-    public static final long HASH = HasherApi.mix(0x0e_c4c8_0d0eL);
+    private static final Logger LOG = LoggerFactory.getLogger(ExpertCacheOwner.class);
+
+    /// Something the source applies to the cache's bookkeeping, in the order it was posted. It never throws.
+    interface Record {
+        void apply();
+    }
 
     /// What asked for an expert: a fetch stage of a graph.
     public interface Fetch {
         /// The quantum stopped: nothing more is loaded for it.
         boolean stopped();
+
+        /// The fetch will not be served: the quantum stopped before the expert came.
+        void abandoned();
 
         /// The expert is held by `lease` (carrying its copy's marker when the copy was only submitted).
         void arrived(ExpertLease lease);
@@ -50,9 +70,22 @@ public final class ExpertCacheOwner {
         LEASED,
         /// The expert is being loaded: the fetch hears from the load.
         LOADING,
-        /// Every slot that could hold it is pinned, every staging buffer is in use, or the disk has all the
-        /// reads in flight that keep it busy: nothing changed.
+        /// Every slot that could hold it is pinned, every staging buffer is in use, the disk has all the
+        /// reads in flight that keep it busy, or the expert is being filled or loaded and not ready to lease:
+        /// nothing changed, and [ExpertCacheOwner#fullCause] says what the fetch waits for.
         FULL
+    }
+
+    /// What a fetch that found the cache full waits for.
+    enum Cause {
+        /// A slot of the expert's shard.
+        SLOTS,
+        /// A staging buffer.
+        STAGING,
+        /// One of the disk's reads.
+        READS,
+        /// The expert's own fill or load, which is not ready to lease yet.
+        PENDING
     }
 
     /// Where the loads spent their time, summed over loads (loads overlap, so the sums exceed wall time): from the
@@ -94,6 +127,22 @@ public final class ExpertCacheOwner {
     private final LongAdder fullStaging = new LongAdder();
     private final LongAdder fullReads = new LongAdder();
 
+    /// What the bookkeeping must learn, from any thread; applied by the poll, in this order.
+    private final MpscQueue<Record> records = new MpscQueue<>(1024, 4);
+    /// Fetches that found the cache full, oldest first, and what each waits for. Touched by the poll only.
+    private final ArrayList<Request> blocked = new ArrayList<>();
+    /// Counts what could let a blocked fetch proceed: a slot released, a staging buffer or a read given back, a tier
+    /// slot settled, a copy submitted. Any thread.
+    private final AtomicLong epoch = new AtomicLong();
+    /// The epoch the blocked fetches were last asked at, and when the poll last looked for blocked fetches whose
+    /// quantum stopped. Touched by the poll only.
+    private long askedAt;
+    private long sweptAt;
+    /// What the last [#fetch] that returned FULL waited for. Touched by the poll only.
+    private Cause cause;
+    private int causeShard;
+    private final Delegate delegate = new Delegate();
+
     public ExpertCacheOwner(ExpertCache cache, FrameLake lake) {
         this.cache = cache;
         this.lake = lake;
@@ -102,7 +151,7 @@ public final class ExpertCacheOwner {
             cache.shard(shard).owner(new Releases(shard));
     }
 
-    /// The leases of one shard report here: a close publishes a release frame routed to the owner.
+    /// The leases of one shard report here: a close posts the release.
     private final class Releases implements ExpertLease.Owner {
         private final int shard;
 
@@ -112,7 +161,10 @@ public final class ExpertCacheOwner {
 
         @Override
         public void release(int slot, int generation, DeviceFence fence) {
-            ExpertCacheOwner.this.lake.publish(new Release(this.shard, slot, generation, fence));
+            post(() -> {
+                ExpertCacheOwner.this.cache.shard(this.shard).release(slot, generation, fence);
+                changed();
+            });
         }
 
         @Override
@@ -121,40 +173,49 @@ public final class ExpertCacheOwner {
         }
     }
 
-    /// A lease closed: the owner's frame that unpins its slot.
-    private final class Release extends AbstractFrame {
-        private final int shard;
-        private final int slot;
-        private final int generation;
-        private final DeviceFence fence;
+    // ---------------------------------------------------------------- any thread
 
-        Release(int shard, int slot, int generation, DeviceFence fence) {
-            super(HASH);
-            this.shard = shard;
-            this.slot = slot;
-            this.generation = generation;
-            this.fence = fence;
+    /// Posts `record` for the poll to apply. Never blocks, and is the only thing a driver callback may do.
+    void post(Record record) {
+        if (!this.records.offer(record)) throw new IllegalStateException("the expert cache's records refused one");
+    }
+
+    /// Something that could let a blocked fetch proceed happened: the next poll asks them again.
+    void changed() {
+        this.epoch.incrementAndGet();
+    }
+
+    /// Asks for `expert` of `bank` for `target`: the source serves it when the cache can, now or once something
+    /// frees a slot, a staging buffer or a read. The fetch hears of the outcome through `target`.
+    public void request(Fetch target, int bank, int expert) {
+        post(new Request(target, bank, expert));
+    }
+
+    /// A fetch's request, and what it waits for while the cache is full.
+    private final class Request implements Record {
+        final Fetch target;
+        final int bank;
+        final int expert;
+        Cause cause;
+        int shard;
+        /// The epoch the cache was last asked at for this request.
+        long askedAt;
+
+        Request(Fetch target, int bank, int expert) {
+            this.target = target;
+            this.bank = bank;
+            this.expert = expert;
         }
 
         @Override
-        public void execute() {
-            ExpertCacheOwner.this.cache.shard(this.shard).release(this.slot, this.generation, this.fence);
-        }
-
-        @Override
-        public void doFinally() {}
-
-        /// The lattice rejected the frame without running it; the slot is still released, on the rejecting
-        /// thread, which is not a driver callback.
-        @Override
-        public void doFinallyWithError(Throwable rejection) {
-            execute();
+        public void apply() {
+            if (!ask(this)) ExpertCacheOwner.this.blocked.add(this);
         }
     }
 
-    // ---------------------------------------------------------------- called by owner frames only
+    // ---------------------------------------------------------------- the poll only
 
-    /// Asks for `expert` of `bank` for `target`. Called by a frame routed with [#HASH].
+    /// Asks the cache for `expert` of `bank` for `target` once. Called by the poll.
     public Outcome fetch(Fetch target, int bank, int expert) {
         int shardIndex = this.cache.shardOf(bank, expert);
         ExpertCacheShard shard = this.cache.shard(shardIndex);
@@ -176,7 +237,10 @@ public final class ExpertCacheOwner {
         }
         if (reserved == null) {
             this.fullFetches.increment();
-            (staged && buffer < 0 ? this.fullStaging : this.fullSlots).increment();
+            boolean noStaging = staged && buffer < 0;
+            (noStaging ? this.fullStaging : this.fullSlots).increment();
+            this.cause = noStaging ? Cause.STAGING : this.ticket.waiting() ? Cause.SLOTS : Cause.PENDING;
+            this.causeShard = shardIndex;
             return Outcome.FULL;
         }
         if (tier != null && tier.isFilling(bank, expert)) {
@@ -185,6 +249,7 @@ public final class ExpertCacheOwner {
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
             this.fullFetches.increment();
             this.fullReads.increment();
+            this.cause = Cause.PENDING;
             return Outcome.FULL;
         }
         if (!inTier && this.reading.get() >= READS) {
@@ -193,6 +258,7 @@ public final class ExpertCacheOwner {
             if (buffer >= 0) this.cache.store().releaseStaging(buffer);
             this.fullFetches.increment();
             this.fullReads.increment();
+            this.cause = Cause.READS;
             return Outcome.FULL;
         }
         TierDirective directive = new TierDirective();
@@ -242,39 +308,16 @@ public final class ExpertCacheOwner {
     private final LongAdder prefetches = new LongAdder();
     private final LongAdder prefetchFailures = new LongAdder();
 
-    /// Publishes a prefetch of `experts` of bank `bank` (best first): the owner's frame reads up to the configured
-    /// number of them that neither the device nor the host tier holds into the tier, while the disk has a read to
-    /// spare. Any thread.
+    /// Posts a prefetch of `experts` of bank `bank` (best first): the poll reads up to the configured number of
+    /// them that neither the device nor the host tier holds into the tier, while the disk has a read to spare. Any
+    /// thread.
     public void publishPrefetch(int bank, int[] experts) {
         if (PREFETCH[1] <= 0) return;
-        this.lake.publish(new Prefetch(bank, experts));
+        post(() -> prefetch(bank, experts, PREFETCH[1]));
     }
 
-    /// A prediction of a layer's experts, on the owner: speculative, so it reads only what the disk can take now and
-    /// never waits.
-    private final class Prefetch extends AbstractFrame {
-        private final int bank;
-        private final int[] experts;
-
-        Prefetch(int bank, int[] experts) {
-            super(HASH);
-            this.bank = bank;
-            this.experts = experts;
-        }
-
-        @Override
-        public void execute() {
-            prefetch(this.bank, this.experts, PREFETCH[1]);
-        }
-
-        @Override
-        public void doFinally() {}
-
-        @Override
-        public void doFinallyWithError(Throwable rejection) {}
-    }
-
-    /// Reads up to `budget` of `experts` into the host tier. Called by a frame routed with [#HASH].
+    /// Reads up to `budget` of `experts` into the host tier, speculatively: it reads only what the disk can take now
+    /// and never waits. Called by the poll.
     public void prefetch(int bank, int[] experts, int budget) {
         for (int expert : experts) {
             if (budget <= 0 || this.reading.get() >= READS) return;
@@ -300,11 +343,12 @@ public final class ExpertCacheOwner {
         }
     }
 
-    /// A prefetch ended, its record in the tier (`read`) or not. On the owner.
+    /// A prefetch ended, its record in the tier (`read`) or not. Called by the poll.
     void prefetchEnded(boolean read) {
         (read ? this.prefetches : this.prefetchFailures).increment();
         this.inFlight.decrementAndGet();
         this.lake.terminated();
+        changed();
     }
 
     /// Prefetches that read their record, and those that failed. Any thread.
@@ -315,9 +359,10 @@ public final class ExpertCacheOwner {
     /// The load's artifact read is over: the disk may take another. Any thread, once per load.
     void readEnded() {
         this.reading.decrementAndGet();
+        changed();
     }
 
-    /// A load ended (its copy retired, or it failed). Called by a frame routed with [#HASH].
+    /// A load ended (its copy retired, or it failed). Called by the poll.
     void ended(ExpertLoad load, boolean submitted) {
         load.readDone();
         if (submitted) {
@@ -330,6 +375,123 @@ public final class ExpertCacheOwner {
         }
         this.inFlight.decrementAndGet();
         this.lake.terminated();
+        changed();
+    }
+
+    // ---------------------------------------------------------------- the source
+
+    /// Applies what was posted, in order, then asks the blocked fetches again if something could let one proceed.
+    /// The lattice calls it from one worker at a time.
+    public void poll() {
+        for (Record record = this.records.poll(); record != null; record = this.records.poll()) {
+            try {
+                record.apply();
+            } catch (RuntimeException failure) {
+                LOG.error("an expert cache record failed", failure);
+            }
+        }
+        if (!this.blocked.isEmpty()) askBlocked();
+    }
+
+    /// A stopped quantum's fetches are found at least this often, even when nothing changed.
+    private static final long SWEEP_NANOS = 250_000L;
+
+    /// Asks the blocked fetches once more, oldest first, when the epoch moved since they were last asked, and drops
+    /// those of stopped quanta. Once a fetch finds the staging buffers, the disk's reads or a shard's slots
+    /// exhausted, the younger fetches that wait for the same are not asked: they would find the same.
+    private void askBlocked() {
+        long epoch = this.epoch.get();
+        long now = System.nanoTime();
+        boolean moved = epoch != this.askedAt;
+        boolean sweep = now - this.sweptAt >= SWEEP_NANOS;
+        if (!moved && !sweep) return;
+        this.askedAt = epoch;
+        if (sweep) this.sweptAt = now;
+        boolean noStaging = false;
+        boolean noReads = false;
+        long noSlots = 0;
+        int kept = 0;
+        for (int i = 0; i < this.blocked.size(); i++) {
+            Request request = this.blocked.get(i);
+            if (request.target.stopped()) {
+                request.target.abandoned();
+                continue;
+            }
+            if (moved && request.askedAt != epoch) {
+                boolean skip =
+                        switch (request.cause) {
+                            case STAGING -> noStaging;
+                            case READS -> noReads;
+                            case SLOTS -> (noSlots >> request.shard & 1) != 0;
+                            case PENDING -> false;
+                        };
+                if (!skip) request.askedAt = epoch;
+                if (!skip && ask(request)) continue;
+                if (!skip) {
+                    noStaging |= request.cause == Cause.STAGING;
+                    noReads |= request.cause == Cause.READS;
+                    if (request.cause == Cause.SLOTS) noSlots |= 1L << request.shard;
+                }
+            }
+            this.blocked.set(kept++, request);
+        }
+        this.blocked.subList(kept, this.blocked.size()).clear();
+    }
+
+    /// Asks the cache once for `request`; false, with what it waits for recorded, when the cache is full.
+    private boolean ask(Request request) {
+        if (request.target.stopped()) {
+            request.target.abandoned();
+            return true;
+        }
+        request.askedAt = this.epoch.get();
+        if (fetch(request.target, request.bank, request.expert) != Outcome.FULL) return true;
+        request.cause = this.cause;
+        request.shard = this.causeShard;
+        return false;
+    }
+
+    /// The source: a worker that polls it applies the posted records. A poll that finds nothing to do returns at
+    /// once and emits no frame; the frames a record leads to (a load's reads) are published as before.
+    @Override
+    public LatticeSource getDelegate() {
+        return this.delegate;
+    }
+
+    @Override
+    public void complete() {
+        this.delegate.complete();
+    }
+
+    @Override
+    public boolean isComplete() {
+        return this.delegate.isComplete();
+    }
+
+    /// The lattice calls `request` and `pull` on a registered source one thread at a time, so the bookkeeping
+    /// needs no other protection.
+    private final class Delegate extends AbstractIngestSink.Delegate {
+        @Override
+        public long hookOnPull(
+                Consumer<AbstractFrame> consumer, Function<AbstractFrame, Boolean> stopCondition, long demand) {
+            poll();
+            return 0;
+        }
+
+        @Override
+        public void hookOnRequest(LatticeReceiver terminal, long demand) {
+            poll();
+        }
+    }
+
+    /// Fetches waiting for the cache. For tests, which play the worker that polls: the list is the poll's.
+    public int blockedFetches() {
+        return this.blocked.size();
+    }
+
+    /// Whether a record is posted and not yet applied. Any thread.
+    public boolean hasRecords() {
+        return !this.records.isEmpty();
     }
 
     // ---------------------------------------------------------------- inspection, any thread

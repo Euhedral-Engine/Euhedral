@@ -47,8 +47,9 @@ into equal page-aligned slots.
 
 An expert is a `(bank, expert)` key, and the key's hash chooses its shard. The device cache and the tier use the same hash, so the
 tier shard with index *i* holds the records of the experts that device shard *i* serves. Both belong to the cache's owner
-(`ExpertCacheOwner`): their directories, slot states, pins and recency lists are plain arrays changed only by frames that carry the
-owner's routing hash, which the lattice runs in order, one at a time: no lock, no atomic on the path.
+(`ExpertCacheOwner`): their directories, slot states, pins and recency lists are plain arrays changed only while a worker polls the
+owner, a source of the lattice that applies the records posted to it (a request, a release, a retirement); the lattice never polls a
+source twice at a time, so there is no lock and no atomic on the path.
 
 When a miss becomes a load the owner's fetch asks the tier what the load does, and gives the answer to the load's frames in its
 `TierDirective`:
@@ -65,7 +66,7 @@ pinned is never a victim.
 
 The fetch reserves everything a load needs before it asks the tier: the device slot, a staging buffer (given back at once when a
 pinned tier takes the record) and, for a record the tier does not hold, one of the disk's reads in flight. A fetch that finds any
-of them taken publishes itself again and leaves the tier as it was: planning a fill takes a slot and evicts its record, and a fetch
+of them taken waits in the owner and leaves the tier as it was: planning a fill takes a slot and evicts its record, and a fetch
 that waits for the disk would otherwise evict a record on every try.
 
 ## Replacement: layer-aware

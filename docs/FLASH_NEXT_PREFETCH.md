@@ -49,7 +49,7 @@ A decode step's graph gets, per layer, a side branch: `PREDICT` runs the next la
 the route on its lane, and the host stage `PREFETCH`, after it retires, ranks the best `K` and publishes the owner's
 prefetch frame. The owner reads up to `B` of them that the device and the tier lack straight into tier slots
 (`TierFill`, no device copy), only while the disk has a read to spare; speculative work never waits. A request that
-finds its record being prefetched publishes itself again until it is in, then copies it from the tier.
+finds its record being prefetched waits in the owner until it is in, then copies it from the tier.
 
 Running the prediction inside the route stage put it on the plan's critical path: the prediction alone cost 1-2
 ms/token and the prefetch saved only 0.4 ms. As a side branch the prediction costs nothing measurable.

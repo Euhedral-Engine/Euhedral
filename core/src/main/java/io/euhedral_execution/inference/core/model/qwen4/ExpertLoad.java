@@ -18,8 +18,9 @@ import org.slf4j.LoggerFactory;
 /// frames and the dependencies between them:
 ///
 /// ```
-/// fetch (owner) ─┬─> read parts 0..n ─ join ─> submit ─┐
-///                └─> copy out of RAM, submit ──────────┴─> (the fetch has its lease) ─ ─ (device) ─ ─> retire (owner)
+/// fetch (source) ─┬─> read parts 0..n ─ join ─> submit ─┐
+///                 └─> copy out of RAM, submit ──────────┴─> (the fetch has its lease) ─ ─ (device) ─ ─> retire
+/// (source)
 /// ```
 ///
 /// The fetch reserved the slot and made the lease (the slot's address and the marker the copy will record). A
@@ -28,10 +29,11 @@ import org.slf4j.LoggerFactory;
 /// the parts join into the frame that submits the device copy; a record the host tier holds is one frame that copies it
 /// out of RAM and submits. Whichever frame
 /// submits the copy hands the lease to the fetch: from there the expert's kernels wait for the marker on the
-/// device. The copy's retirement is a driver callback that publishes the retire frame, the owner's, which makes
-/// the slot resident, settles the host tier and gives the staging buffer back. A load that fails publishes the
-/// owner's failure frame instead. Nothing but the fetch, the retirement and a failure touches the cache's
-/// bookkeeping; the reads, the copy and the submission carry hashes of their own and spread over the workers.
+/// device. The copy's retirement is a driver callback that posts the retire record to the owner, which makes the slot
+/// resident, settles the host tier and gives the staging buffer back. A load that fails posts the owner's failure
+/// record instead. Nothing but the fetch, the retirement and a failure touches the cache's bookkeeping, and they run
+/// where the owner's source is polled; the reads, the copy and the submission carry hashes of their own and spread
+/// over the workers.
 final class ExpertLoad {
 
     private static final Logger LOG = LoggerFactory.getLogger(ExpertLoad.class);
@@ -152,6 +154,8 @@ final class ExpertLoad {
     private void submitCopy() throws Throwable {
         this.touched = true;
         this.stream = this.owner.cache.transfer().nextStream();
+        // Before the copy is queued: its retirement may be applied by the owner before this method returns.
+        this.submittedAt = System.nanoTime();
         this.owner.cache.transfer().stream(
                 this.stream,
                 this.record,
@@ -161,13 +165,13 @@ final class ExpertLoad {
                 this.retire);
         // The copy and its ready marker are queued: another block's claim of the expert may join the load now.
         this.load.copySubmitted();
-        this.submittedAt = System.nanoTime();
+        this.owner.changed();
     }
 
-    /// The load cannot complete: the owner's failure frame ends it.
+    /// The load cannot complete: the owner's failure record ends it.
     private void failed(Throwable thrown) {
         this.failure = thrown;
-        this.owner.lake.publish(this.fail);
+        this.owner.post(this.fail);
     }
 
     /// One part of the record's artifact read: a page-aligned range read straight into where the record goes.
@@ -338,7 +342,7 @@ final class ExpertLoad {
         }
     }
 
-    /// Gives back what [RamTierShard#plan] reserved for a load that will not start. Owner frames only.
+    /// Gives back what [RamTierShard#plan] reserved for a load that will not start. The owner's poll only.
     static void giveBack(RamTierShard tier, TierDirective directive) {
         if (tier == null) return;
         switch (directive.mode()) {
@@ -350,7 +354,7 @@ final class ExpertLoad {
     }
 
     /// The load is done with its tier slot: a fill whose record was read (`read`) keeps it for the next miss;
-    /// one that was not gives the slot back. Owner frames only.
+    /// one that was not gives the slot back. The owner's poll only.
     private void settleTier(boolean read) {
         if (this.tier == null) return;
         switch (this.directive.mode()) {
@@ -366,13 +370,9 @@ final class ExpertLoad {
 
     /// The load failed before its copy was submitted: on the owner, the slot returns to the cache with the lease
     /// that was never handed on, and the fetch hears of it.
-    private final class Fail extends AbstractFrame {
-        Fail() {
-            super(ExpertCacheOwner.HASH);
-        }
-
+    private final class Fail implements ExpertCacheOwner.Record {
         @Override
-        public void execute() {
+        public void apply() {
             ExpertLoad load = ExpertLoad.this;
             Throwable thrown = load.failure;
             load.settleTier(load.read);
@@ -388,37 +388,22 @@ final class ExpertLoad {
             load.target.failed(thrown);
             load.owner.ended(load, false);
         }
-
-        @Override
-        public void doFinally() {}
-
-        /// The lattice rejected the frame without running it; the load still ends once, and the rejecting
-        /// thread is never a driver callback.
-        @Override
-        public void doFinallyWithError(Throwable rejection) {
-            execute();
-        }
     }
 
     /// The copy retired: on the owner, the slot holds the expert, the tier is settled and the staging buffer is
     /// free again.
-    private final class Retire extends AbstractFrame implements GpuStream.RetirementListener {
-        Retire() {
-            super(ExpertCacheOwner.HASH);
-        }
-
-        /// A driver thread: it only publishes.
+    private final class Retire implements GpuStream.RetirementListener, ExpertCacheOwner.Record {
+        /// A driver thread: it only posts.
         @Override
         public void retired(long ticket, boolean driverThread) {
             ExpertLoad load = ExpertLoad.this;
             load.ticket = ticket;
             load.retiredAt = System.nanoTime();
-            if (driverThread) load.owner.lake.publishFromCallback(this);
-            else load.owner.lake.publish(this);
+            load.owner.post(this);
         }
 
         @Override
-        public void execute() {
+        public void apply() {
             ExpertLoad load = ExpertLoad.this;
             load.confirmedAt = System.nanoTime();
             Throwable device;
@@ -434,16 +419,6 @@ final class ExpertLoad {
             load.settleTier(true);
             if (load.buffer >= 0) load.store().releaseStaging(load.buffer);
             load.owner.ended(load, true);
-        }
-
-        @Override
-        public void doFinally() {}
-
-        /// The lattice rejected the frame without running it; the copy still retired once, and the rejecting
-        /// thread is never a driver callback.
-        @Override
-        public void doFinallyWithError(Throwable rejection) {
-            execute();
         }
     }
 }

@@ -520,6 +520,13 @@ numbers are medians unless said otherwise.
   device and the driver callback 155 and the host chain (retired-edge frame, fetch publication, owner hop) 41. The loads
   themselves, 0.4-0.6 ms of read per miss, set the token's pace.
 
+Found by that probe and fixed: **the expert cache's fetch retries.** A fetch that found the cache full published itself
+again: 20-25 million frames in a 66 s Flash-Next screen, all routed to the cache owner's one worker, which they kept
+busy; the frames that free the resource (`Release`, `Retire`) waited behind them, 0.4-1 ms in prefill and cold decode.
+The cache's bookkeeping is now a source of the lattice, polled by the workers like the artifact's reads: requests,
+releases and retirements are records in a lock-free queue, the one worker that polls applies them in order, and a
+request the cache cannot serve waits in the source until something was given back, with nothing running again meanwhile.
+
 Tried and not kept, each against a paired control (differences inside the run-to-run spread of 2-4%):
 
 - **Euhedral 0.2.1** (lock-free ingest, no monitor per publication): neutral on decode, prefill and Flash-Next.
@@ -533,10 +540,6 @@ Tried and not kept, each against a paired control (differences inside the run-to
 
 Known costs this leaves:
 
-- **Fetch retries.** A fetch that finds the cache full publishes itself again (the rule above). In a 66 s Flash-Next
-  screen that is 20-25 million frames on the cache owner's one worker, which keep it busy; the frames that free the
-  resource (`Release`, `Retire`) wait behind them: 0.4-1 ms in prefill and cold decode, 20-40 us in warm decode, where it
-  does not matter. Both are bounded by the disk, so nothing waits on it; the worker's time is what it costs.
 - **One owner for every admission.** `Admit` (85 us) serializes all sessions' admissions on one worker: capacity of about
   11,000 admissions a second, far beyond what one GPU's decode needs.
 - **Per-quantum fingerprints.** A third of `Admit` is the capture key: the allocation id of every state address, a
@@ -545,8 +548,8 @@ Known costs this leaves:
 ## No locks on the hot path
 
 Nothing that runs per quantum or per token takes a lock, waits blocking or starts a thread, in either model. State is
-confined by routing every frame that touches it to its owner: the workspace, the expert cache, the prefix cache. Device
-completions arrive as frames, and order comes from edges and from a sequence's admission order (`Sequencer`).
+confined by routing every frame that touches it to its owner (the workspace, the prefix cache) or by making it a source
+that one poller at a time owns (the expert cache). Device completions arrive as frames, and order comes from edges and from a sequence's admission order (`Sequencer`).
 `ArchitectureTest.theHotPathHoldsNoLockBlocksNorStartsThreads` scans `model/qwen38`, `model/qwen4`, `runtime`,
 `generation`, `prefix` and `state` for locks, blocking waits, `join`s, futures' blocking `get`s, threads and executors.
 It allows them only in named lifecycle and tool methods (opening lanes and pools, closing, the blocking caller-thread

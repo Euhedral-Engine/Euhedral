@@ -208,6 +208,8 @@ public final class ExecutionPlan implements AutoCloseable {
         this.expertOwner = new ExpertCacheOwner(model.expertCache(), runtime.lake());
         // The artifact's reads complete as frames: the workers poll their sink like every other.
         if (model.asyncReads() != null) runtime.lake().attach(model.asyncReads().getDelegate());
+        // The cache's bookkeeping is a source too: the workers poll it, and it applies what was posted to it.
+        runtime.lake().attach(this.expertOwner.getDelegate());
         this.embedding = this.weights.embedding();
         this.head = this.weights.head();
         // The workspace is allocated now, not by the first step: a model that cannot hold it fails to load, and the

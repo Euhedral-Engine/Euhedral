@@ -1,15 +1,13 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
-import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.model.qwen4.expert.RamTierShard;
 import io.euhedral_execution.inference.core.model.qwen4.expert.TierDirective;
 import io.euhedral_execution.inference.core.runtime.graph.AsyncReads;
 
 /// A prefetch: the artifact read of a record straight into the host tier slot the owner planned for it, ahead of any
-/// request, with no device copy. The owner's prefetch frame starts it; the read's completion is a frame on whichever
-/// worker reaps it, which gives the disk's read back and publishes the owner's frame that makes the slot ready (or
-/// returns it when the read failed). A request that finds the slot filling publishes itself again until it is
-/// ready, then copies from it.
+/// request, with no device copy. The owner's poll starts it; the read's completion is a frame on whichever worker
+/// reaps it, which gives the disk's read back and posts the record that makes the slot ready (or returns it when the
+/// read failed). A request that finds the slot filling waits in the owner until it is ready, then copies from it.
 final class TierFill {
     private final ExpertCacheOwner owner;
     private final RamTierShard tier;
@@ -44,7 +42,7 @@ final class TierFill {
             TierFill fill = TierFill.this;
             fill.owner.cache.store().completePart(fill.bank, fill.expert, -1, fill.directive, 0, 1, readNanos());
             fill.owner.readEnded();
-            fill.owner.lake.publish(new Settle(failure() == null));
+            fill.owner.post(new Settle(failure() == null));
         }
 
         @Override
@@ -53,33 +51,24 @@ final class TierFill {
         @Override
         public void doFinallyWithError(Throwable rejection) {
             TierFill.this.owner.readEnded();
-            TierFill.this.owner.lake.publish(new Settle(false));
+            TierFill.this.owner.post(new Settle(false));
         }
     }
 
     /// On the owner: the slot holds the record, or goes back.
-    private final class Settle extends AbstractFrame {
+    private final class Settle implements ExpertCacheOwner.Record {
         private final boolean read;
 
         Settle(boolean read) {
-            super(ExpertCacheOwner.HASH);
             this.read = read;
         }
 
         @Override
-        public void execute() {
+        public void apply() {
             TierFill fill = TierFill.this;
             if (this.read) fill.tier.filled(fill.directive);
             else fill.tier.abandoned(fill.directive);
             fill.owner.prefetchEnded(this.read);
-        }
-
-        @Override
-        public void doFinally() {}
-
-        @Override
-        public void doFinallyWithError(Throwable rejection) {
-            execute();
         }
     }
 }
