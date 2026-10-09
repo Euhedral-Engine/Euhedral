@@ -53,6 +53,9 @@ final class Shape implements GraphShape {
         PREDICT,
         PREFETCH,
         FETCH,
+        FETCHALL,
+        FETCHWAIT,
+        GROUP,
         EXPERT,
         FINISH,
         ENDINJECT,
@@ -163,12 +166,27 @@ final class Shape implements GraphShape {
             }
             // Every expert the block can name: its fetch, then its kernels. The finish's combine adds their outputs
             // in ascending expert order, after all of them.
-            Edge[] combined = new Edge[this.expertCap + 1];
-            for (int e = 0; e < this.expertCap; e++) {
-                int fetch = add(Kind.FETCH, layer, e, after(planned));
-                combined[e] = after(add(Kind.EXPERT, layer, e, after(fetch), after(planned)));
+            Edge[] combined;
+            if (groups()) {
+                // A decode block asks for all its experts at once. The experts the device holds are launched together,
+                // as consecutive runs; each of the others waits for its own load and is launched when it comes.
+                int fetchAll = add(Kind.FETCHALL, layer, -1, after(planned));
+                int group = add(Kind.GROUP, layer, -1, after(planned), after(fetchAll));
+                combined = new Edge[this.expertCap + 2];
+                for (int e = 0; e < this.expertCap; e++) {
+                    int fetch = add(Kind.FETCHWAIT, layer, e, after(fetchAll));
+                    combined[e] = after(add(Kind.EXPERT, layer, e, after(fetch), after(planned), after(group)));
+                }
+                combined[this.expertCap] = after(shared);
+                combined[this.expertCap + 1] = after(group);
+            } else {
+                combined = new Edge[this.expertCap + 1];
+                for (int e = 0; e < this.expertCap; e++) {
+                    int fetch = add(Kind.FETCH, layer, e, after(planned));
+                    combined[e] = after(add(Kind.EXPERT, layer, e, after(fetch), after(planned)));
+                }
+                combined[this.expertCap] = after(shared);
             }
-            combined[this.expertCap] = after(shared);
             previous = add(Kind.FINISH, layer, -1, combined);
             if (diagnostic) {
                 previous = add(Kind.ENDINJECT, layer, -1, retired(previous));
@@ -181,6 +199,14 @@ final class Shape implements GraphShape {
         this.builder.chain(
                 this.scratchUsers.stream().mapToInt(Integer::intValue).toArray());
     }
+
+    /// Whether a block launches the experts the device holds together: a decode token's, outside the diagnostic shape
+    /// (`EUHEDRAL_QWEN4_GROUP=0` launches each on its own).
+    boolean groups() {
+        return GROUPS && this.key.rows() == 1 && !this.key.diagnostic() && (this.key.variant() & 1) == 0;
+    }
+
+    private static final boolean GROUPS = !"0".equals(System.getenv("EUHEDRAL_QWEN4_GROUP"));
 
     /// Whether this shape's blocks look ahead: a prefill chunk's block asks for nearly every expert of its layer.
     boolean aheads() {
@@ -195,7 +221,7 @@ final class Shape implements GraphShape {
     /// conservatively.
     static boolean declaresWorkspace(Kind kind) {
         return switch (kind) {
-            case PLEIDS, PLEGATHER, MID, OBSERVE, PREFETCH, FETCH -> false;
+            case PLEIDS, PLEGATHER, MID, OBSERVE, PREFETCH, FETCH, FETCHALL, FETCHWAIT -> false;
             default -> true;
         };
     }

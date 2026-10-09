@@ -250,6 +250,48 @@ class ExpertCacheOwnerTest {
         this.cache.checkQuiescent();
     }
 
+    /// Requests made together are answered in one record: the experts the device holds are leased by the time the batch
+    /// is told, in order, and those it does not hold are still on their way.
+    @Test
+    void aBatchIsAnsweredInOneRecordAndTheResidentOnesAreLeasedWhenItIsTold() throws Exception {
+        build(8, 4);
+        ExpertTestSupport.acquire(this.cache, 2, 1).close();
+        drive(this.lake.ready::isEmpty);
+        drained();
+        Fetch[] targets = {new Fetch(), new Fetch(), new Fetch()};
+        int[] experts = {1, 5, 7};
+        ExpertCacheOwner.Request[] requests = new ExpertCacheOwner.Request[3];
+        for (int i = 0; i < 3; i++) {
+            requests[i] = new ExpertCacheOwner.Request(targets[i]);
+            requests[i].set(2, experts[i]);
+        }
+        List<String> told = new ArrayList<>();
+        ExpertCacheOwner.Batch batch = new ExpertCacheOwner.Batch() {
+            @Override
+            public int size() {
+                return 3;
+            }
+
+            @Override
+            public ExpertCacheOwner.Request request(int index) {
+                return requests[index];
+            }
+
+            @Override
+            public void asked() {
+                for (int i = 0; i < 3; i++) told.add(i + ":" + targets[i].leases.size());
+            }
+        };
+        this.owner.requestAll(batch);
+        this.owner.poll();
+        assertEquals(List.of("0:1", "1:0", "2:0"), told, "expert 1 was resident: leased when the batch was told");
+        drive(() -> targets[1].ended() && targets[2].ended());
+        drained();
+        for (Fetch target : targets) target.lease().close();
+        drained();
+        this.cache.checkQuiescent();
+    }
+
     @Test
     void aResidentExpertIsALeaseAtOnceWithNoFrame() throws Exception {
         build(4, 2);

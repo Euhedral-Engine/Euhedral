@@ -212,8 +212,30 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         post(request);
     }
 
+    /// Requests made together: the owner answers all of them in one record, in order, then tells the batch.
+    public interface Batch {
+        int size();
+
+        Request request(int index);
+
+        /// Every request was asked once: the experts the device held are leased, the others are being loaded or wait.
+        void asked();
+    }
+
+    /// Asks for all of `batch`'s experts in one record. Any thread.
+    public void requestAll(Batch batch) {
+        post(() -> {
+            for (int index = 0; index < batch.size(); index++) {
+                Request request = batch.request(index);
+                request.owner = this;
+                if (!ask(request)) block(request);
+            }
+            batch.asked();
+        });
+    }
+
     /// A fetch's request, and what it waits for while the cache is full. The fetch owns it and reuses it.
-    static final class Request implements Record {
+    public static final class Request implements Record {
         final Fetch target;
         ExpertCacheOwner owner;
         int bank;
@@ -223,8 +245,14 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         /// The epoch the cache was last asked at for this request.
         long askedAt;
 
-        Request(Fetch target) {
+        public Request(Fetch target) {
             this.target = target;
+        }
+
+        /// The expert this request asks for.
+        public void set(int bank, int expert) {
+            this.bank = bank;
+            this.expert = expert;
         }
 
         @Override

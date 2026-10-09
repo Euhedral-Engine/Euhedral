@@ -138,3 +138,46 @@ Paired screens (`EUHEDRAL_QWEN4_COPY_STREAMS`):
 | 1 to 4 | 4 | +4.8% (4/4) | +4.5% / +2.4% | +3.9% / +4.5% |
 
 Four is the default. Prefill 4096 reads at 6.4 GB/s with the disk busy 96% of the time.
+
+## Decode: where a token goes, and launching the experts together
+
+A decode token at 4096 context is about 1,800 kernels after this change (2,700 before), and a layer takes about 450 us.
+Bounds with the work removed (a temporary probe, results wrong, interleaved in one process, 24 pairs of 16 tokens):
+
+| arm | ms/token | tokens/s |
+|---|---|---|
+| everything | 24.6-28.0 | 36-41 |
+| fetches made, expert kernels not run | 19.2 | 52 |
+| nothing fetched, no expert kernels | 16.4 | 61 |
+
+So the attention chain and the router's round trip are two thirds of a token even with free experts. The chain is
+memory-bound: about 5 GB of weights a token (the hyper-connection mixers 2.2 GB in BF16, the output head 1.3 GB, the
+attention projections) at 650 GB/s of the card's 896. The misses cost the PCIe time of their records, about 185 MB a token
+at 37 GB/s, 5 ms, none of it hidden: a layer's compute is 100 us and its missing expert arrives 135 us after the router.
+
+Each expert was launched by a frame of its own: an 8-byte copy of its slot address, two kernel launches and a marker, 39 us
+of host time for 10 us of kernels, so the ten experts of a layer took 160 us (kernels started 16-20 us apart). A decode
+block now asks the cache for all its experts in one record (`FETCHALL`, `ExpertCacheOwner#requestAll`); the experts the
+device holds are leased by the time the owner answers, and one stage (`GROUP`) launches them as runs of consecutive
+experts, one launch of each kernel and one copy of the slot addresses per run (their work items are consecutive and each
+names its own expert's slot: no kernel changed, the sums are the same). An expert that must be loaded keeps its own fetch
+and expert stages and launches when it arrives. `EUHEDRAL_QWEN4_GROUP=0` launches each on its own.
+
+`DecodeAbCudaIntegrationTest` takes two arms of the plan in turn, 16-32 tokens each, on one sequence in one process, so
+that what moves on the machine cancels (`EUHEDRAL_QWEN4_AB=1,0`; variant bit 0 is per-expert launches):
+
+| run | per-expert launches | grouped | change | pairs ahead |
+|---|---|---|---|---|
+| 1 | 25.45 ms (39.3 tok/s) | 22.54 ms (44.4) | +12.9% (+-1.4) | 31/32 |
+| 2 | 23.99 ms (41.7) | 21.74 ms (46.0) | +9.4% (+-1.4) | 29/32 |
+| 3 | 25.41 ms (39.3) | 22.17 ms (45.1) | +14.7% (+-1.4) | 32/32 |
+
+### Not kept (same harness, 24 pairs)
+
+- The plan asks for the experts itself, one stage fewer: +0.4% (+-1.8%).
+- The owner applies the batch in the frame that posted it instead of waiting for a worker to poll it: +0.6% (+-2.2%).
+- The route's device-completion edge polled through a lattice source instead of the driver's callback (paired screens, 3
+  forks): decode cold 64 +0.7%, warm 64 0.0%, cold 4096 +2.1%, warm 4096 +0.3%.
+- Lanes 1 or 4 against 2: within the 5% noise between processes.
+- Protecting the experts the router predicts for the next layer from eviction (replay of the recording): the device miss
+  rate is unchanged at 28.9%.

@@ -103,6 +103,10 @@ public final class MoeLayer implements AutoCloseable {
     // The leases the block holds, by active expert: stored by the expert's fetch, closed by its expert stage, or
     // by an abandoned block.
     private final ExpertLease[] held;
+    /// The leases of the run [#submitExperts] launches: the graph's block, one at a time.
+    private final ExpertLease[] runLeases;
+    /// The decode block's requests for its experts, made together ([ExpertFetches]); none in a larger block.
+    private final ExpertFetches fetches;
     private int bank;
     private int lastUnique;
     private final Metrics metrics;
@@ -254,6 +258,8 @@ public final class MoeLayer implements AutoCloseable {
         this.ids = new int[maxPairs];
         this.weights = new short[maxPairs];
         this.held = new ExpertLease[this.routing.maxActive()];
+        this.runLeases = new ExpertLease[this.routing.maxActive()];
+        this.fetches = maxRows == 1 ? new ExpertFetches(this, this.routing.maxActive()) : null;
         this.routeIds = gpu.allocateReadbackBuffer(4L * maxPairs);
         this.routeWeights = gpu.allocateReadbackBuffer(2L * maxPairs);
         ExecutionGpu.UploadBuffer host = null;
@@ -433,6 +439,16 @@ public final class MoeLayer implements AutoCloseable {
         return this.held.length;
     }
 
+    /// The block's requests made together, or null in a block of more than one row.
+    ExpertFetches fetches() {
+        return this.fetches;
+    }
+
+    /// Whether the lease of the `index`-th active expert is held.
+    boolean isHeld(int index) {
+        return this.held[index] != null;
+    }
+
     /// Stores the lease of the `index`-th active expert, for its expert stage.
     public void hold(int index, ExpertLease lease) {
         this.held[index] = lease;
@@ -472,6 +488,44 @@ public final class MoeLayer implements AutoCloseable {
         } finally {
             if (fence != null) lease.close(fence);
             else lease.close();
+        }
+    }
+
+    /// The held experts `first` to `end - 1` (consecutive active experts) in one launch of each kernel, with one copy
+    /// of
+    /// their slot addresses: the expert stages' work for a run of experts whose records are on the device.
+    public void submitExperts(int first, int end, GpuStream stream, int lane, long input, Scratch scratch) {
+        ExpertLease[] leases = this.runLeases;
+        StreamFence fence = null;
+        try {
+            MemorySegment host = this.hostDescriptor.segment();
+            for (int index = first; index < end; index++) {
+                ExpertLease lease = this.held[index];
+                if (lease == null) throw new IllegalStateException("expert " + index + " of the block is not held");
+                this.held[index] = null;
+                leases[index - first] = lease;
+                this.routing.setSlot(host, index, lease.deviceAddress());
+            }
+            long entry = this.routing.slotsOffset() + 8L * first;
+            this.gpu.copyHostWeightsToDevice(this.deviceDescriptor + entry, host.address() + entry, 8L * (end - first));
+            for (int i = 0; i < end - first; i++)
+                if (leases[i].readyMarker() != 0) stream.await(leases[i].readyMarker());
+            ExpertOps.runExperts(
+                    this.gpu, this.geometry, this.routing, first, end, this.deviceDescriptor, input, scratch.experts());
+            long marker = laneFence(stream, lane);
+            stream.mark(marker);
+            for (int i = 0; i < end - first; i++) {
+                fence = new StreamFence(stream, marker);
+                leases[i].close(fence);
+                leases[i] = null;
+            }
+            this.metrics.leased.add(end - first);
+        } finally {
+            for (int i = 0; i < end - first; i++) {
+                if (leases[i] == null) continue;
+                leases[i].close();
+                leases[i] = null;
+            }
         }
     }
 

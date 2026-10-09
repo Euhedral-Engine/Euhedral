@@ -45,6 +45,9 @@ final class Stages {
             case PREDICT -> new Predict(graph, stage, shape, layer);
             case PREFETCH -> new Prefetch(graph, stage, shape, layer);
             case FETCH -> new Fetch(graph, stage, shape, layer, index);
+            case FETCHALL -> new FetchAll(graph, stage, shape, layer);
+            case FETCHWAIT -> new FetchWait(graph, stage, shape, layer, index);
+            case GROUP -> new Group(graph, stage, shape, layer);
             case EXPERT -> new Expert(graph, stage, shape, layer, index);
             case FINISH -> new Finish(graph, stage, shape, layer);
             case ENDINJECT -> new EndInject(graph, stage, shape, layer);
@@ -608,6 +611,97 @@ final class Stages {
         }
     }
 
+    /// Asks the cache's source for all of the block's experts in one record, and ends when the source has answered
+    /// them all: the experts the device holds are leased by then, the others are being loaded.
+    private static final class FetchAll extends Base {
+        private final Runnable done = this::completeDeferred;
+
+        FetchAll(StageGraph graph, int stage, Shape shape, int layer) {
+            super(graph, stage, shape, layer, false);
+        }
+
+        @Override
+        protected boolean host() {
+            return true;
+        }
+
+        @Override
+        protected void submit() {
+            deferCompletion();
+            if (quantum().stopRequested()) {
+                completeDeferred();
+                return;
+            }
+            ExpertFetches fetches = moe().fetches();
+            fetches.begin(quantum(), rows(), storage().bank, storage().experts, this.done);
+            plan().expertOwner().requestAll(fetches);
+        }
+    }
+
+    /// Ends when the `index`-th expert of the block was handed over by the source: at once for one the group takes,
+    /// when its load ends for one that was missing.
+    private static final class FetchWait extends Base implements ExpertFetches.Waiter {
+        private final int index;
+
+        FetchWait(StageGraph graph, int stage, Shape shape, int layer, int index) {
+            super(graph, stage, shape, layer, false);
+            this.index = index;
+        }
+
+        @Override
+        protected boolean host() {
+            return true;
+        }
+
+        @Override
+        protected boolean skips() {
+            return this.index >= storage().experts;
+        }
+
+        @Override
+        protected void submit() {
+            deferCompletion();
+            if (!moe().fetches().target(this.index).await(this)) completeDeferred();
+        }
+
+        @Override
+        public void arrived() {
+            completeDeferred();
+        }
+    }
+
+    /// The experts the device holds when the block's requests were answered, launched together as runs of consecutive
+    /// experts: one launch of each kernel and one copy of their slot addresses per run.
+    private static final class Group extends Base {
+        Group(StageGraph graph, int stage, Shape shape, int layer) {
+            super(graph, stage, shape, layer, false);
+        }
+
+        @Override
+        protected void submit() {
+            MoeLayer moe = moe();
+            ExpertFetches fetches = moe.fetches();
+            Workspace storage = storage();
+            int count = storage.experts;
+            int index = 0;
+            while (index < count) {
+                if (!ready(moe, fetches, index)) {
+                    index++;
+                    continue;
+                }
+                int end = index + 1;
+                while (end < count && ready(moe, fetches, end)) end++;
+                moe.submitExperts(index, end, laneStream(), laneIndex(), storage.mixed(), storage.moeBlock);
+                for (int taken = index; taken < end; taken++) fetches.grouped(taken, true);
+                index = end;
+            }
+        }
+
+        private static boolean ready(MoeLayer moe, ExpertFetches fetches, int index) {
+            return fetches.target(index).arrived() && moe.isHeld(index);
+        }
+    }
+
     /// The kernels of the `index`-th active expert, once it is held; its lease closes behind a marker of the
     /// lane. Independent of every other expert.
     private static final class Expert extends Base {
@@ -620,7 +714,8 @@ final class Stages {
 
         @Override
         protected boolean skips() {
-            return this.index >= storage().experts;
+            return this.index >= storage().experts
+                    || (this.shape.groups() && moe().fetches().grouped(this.index));
         }
 
         @Override
