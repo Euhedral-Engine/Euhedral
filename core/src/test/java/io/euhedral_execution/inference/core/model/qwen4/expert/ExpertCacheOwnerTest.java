@@ -24,11 +24,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/// The owner of the cache's bookkeeping: a miss becomes frames whose dependencies carry the load from the read to
-/// the device copy, and everything that changes the bookkeeping (the fetch, the retirement, a failure, a lease's
-/// release) is a frame routed with the owner's hash; the reads and the copy's submission are not. The tests are the
-/// lattice: the lake collects what is published
-/// and they run it, one frame at a time, as a worker would.
+/// The owner of the cache's bookkeeping, a source of the lattice: a miss becomes frames whose dependencies carry the
+/// load from the read to the device copy, and everything that changes the bookkeeping (the fetch, the retirement, a
+/// failure, a lease's release) is a record the source applies when a worker polls it; the reads and the copy's
+/// submission are frames. The tests are the lattice: the lake collects the frames that are published and they poll
+/// the source and run the frames, one at a time, as a worker would.
 class ExpertCacheOwnerTest {
 
     @TempDir
@@ -104,12 +104,6 @@ class ExpertCacheOwnerTest {
                     .filter(frame -> frame.getClass().getSimpleName().equals(kind))
                     .count();
         }
-
-        long readyForTheOwner() {
-            return this.ready.stream()
-                    .filter(frame -> frame.getRoutingHash() == ExpertCacheOwner.HASH)
-                    .count();
-        }
     }
 
     /// What a fetch records of what it is told.
@@ -117,9 +111,17 @@ class ExpertCacheOwnerTest {
         final List<ExpertLease> leases = Collections.synchronizedList(new ArrayList<>());
         final List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
 
+        volatile boolean stopped;
+        final AtomicInteger abandoned = new AtomicInteger();
+
         @Override
         public boolean stopped() {
-            return false;
+            return this.stopped;
+        }
+
+        @Override
+        public void abandoned() {
+            this.abandoned.incrementAndGet();
         }
 
         @Override
@@ -133,7 +135,7 @@ class ExpertCacheOwnerTest {
         }
 
         boolean ended() {
-            return this.leases.size() + this.failures.size() == 1;
+            return this.leases.size() + this.failures.size() + this.abandoned.get() == 1;
         }
 
         ExpertLease lease() {
@@ -141,13 +143,14 @@ class ExpertCacheOwnerTest {
         }
     }
 
-    /// Runs what is published, one frame at a time as a worker would, until `condition` holds; returns the frames
-    /// run.
+    /// Polls the source and runs what is published, one frame at a time as a worker would, until `condition` holds;
+    /// returns the frames run.
     private int drive(BooleanSupplier condition) throws InterruptedException {
         int frames = 0;
         long deadline = System.nanoTime() + 20_000_000_000L;
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) throw new AssertionError("the load did not get there");
+            this.owner.poll();
             if (this.reads != null) this.reads.getDelegate().pull(this.lake::publish, ready -> false, Long.MAX_VALUE);
             AbstractFrame frame = this.lake.ready.poll();
             if (frame == null) {
@@ -163,22 +166,20 @@ class ExpertCacheOwnerTest {
 
     /// Every load ended and the lake was told so.
     private void drained() throws InterruptedException {
-        drive(() -> this.owner.loadsInFlight() == 0 && this.lake.ready.isEmpty());
+        drive(() -> this.owner.loadsInFlight() == 0 && this.lake.ready.isEmpty() && !this.owner.hasRecords());
         assertEquals(this.lake.admitted.get(), this.lake.terminated.get());
     }
 
-    /// Fetches every expert of `bank` in `experts` as fetch stages do: a fetch that finds the cache full tries
-    /// again while the frames run, until each expert is held.
+    /// Requests every expert of `bank` in `experts` as fetch stages do: a request that finds the cache full waits in
+    /// the source while the frames run, until each expert is held.
     private List<Fetch> fetchAll(int bank, int... experts) throws InterruptedException {
         List<Fetch> targets = new ArrayList<>();
-        boolean[] started = new boolean[experts.length];
-        for (int i = 0; i < experts.length; i++) targets.add(new Fetch());
-        drive(() -> {
-            for (int i = 0; i < experts.length; i++)
-                if (!started[i])
-                    started[i] = this.owner.fetch(targets.get(i), bank, experts[i]) != ExpertCacheOwner.Outcome.FULL;
-            return targets.stream().allMatch(Fetch::ended);
-        });
+        for (int expert : experts) {
+            Fetch target = new Fetch();
+            targets.add(target);
+            this.owner.request(target, bank, expert);
+        }
+        drive(() -> targets.stream().allMatch(Fetch::ended));
         return targets;
     }
 
@@ -210,17 +211,18 @@ class ExpertCacheOwnerTest {
         build(4, 2);
         Fetch miss = fetch(2, 3, ExpertCacheOwner.Outcome.LOADING);
         assertEquals(1, this.lake.readyOf("Part"), "the load's first frame: its read, in one part");
-        assertEquals(0, this.lake.readyForTheOwner());
+        assertFalse(this.owner.hasRecords());
         assertEquals(2, drive(miss::ended), "the read, then the submission that hands the lease over");
         assertNotEquals(0, miss.lease().readyMarker(), "the lease carries the marker of its copy");
         drained();
-        assertEquals(1, this.lake.fromCallbacks.get(), "the copy's retirement is a frame a driver callback published");
+        assertTrue(
+                this.owner.loadsInFlight() == 0, "the copy's retirement, posted by the driver callback, was applied");
         assertArrayEquals(
                 this.fixture.record(2, 3),
                 this.gpu.readDevice(miss.lease().deviceAddress(), miss.lease().byteSize()));
         miss.lease().close();
         assertEquals(1, this.cache.openLeaseCount(), "a closed lease changes nothing until the owner runs its release");
-        assertEquals(1, this.lake.readyForTheOwner());
+        assertTrue(this.owner.hasRecords(), "the release is posted, and the owner applies it when it is polled");
         drained();
         assertEquals(0, this.cache.openLeaseCount());
         this.cache.checkQuiescent();
@@ -243,7 +245,7 @@ class ExpertCacheOwnerTest {
         assertEquals(0, this.lake.readyOf("Submit"), "the join waits for every part");
         this.lake.ready.poll().execute();
         assertEquals(1, this.lake.readyOf("Submit"), "the last part's arrival publishes the submission");
-        assertEquals(0, this.lake.readyForTheOwner(), "submitting the copy touches none of the owner's state");
+        assertFalse(this.owner.hasRecords(), "submitting the copy posts nothing to the owner");
         assertEquals(2, this.cache.store().stagingBuffers(), "the parts share one buffer: nothing more was pinned");
         drive(miss::ended);
         drained();
@@ -417,6 +419,82 @@ class ExpertCacheOwnerTest {
         drive(done::ended);
         b.lease().close();
         done.lease().close();
+        drained();
+        this.cache.checkQuiescent();
+    }
+
+    /// A request that finds the cache full waits in the source: polling it again and again asks the cache nothing
+    /// more, and it is served once a lease is released.
+    @Test
+    @org.junit.jupiter.api.Timeout(30)
+    void aRequestForAFullCacheWaitsInTheSourceUntilALeaseIsReleased() throws Exception {
+        build(2, 2);
+        Fetch a = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        Fetch b = fetch(2, 1, ExpertCacheOwner.Outcome.LOADING);
+        drive(() -> a.ended() && b.ended());
+        drained();
+        Fetch c = new Fetch();
+        this.owner.request(c, 2, 2);
+        this.owner.poll();
+        assertEquals(1, this.owner.blockedFetches(), "no slot is free or evictable: the request waits");
+        assertEquals(1, this.owner.fullFetches());
+        for (int poll = 0; poll < 1_000; poll++) this.owner.poll();
+        assertEquals(1, this.owner.fullFetches(), "polling a source whose cache did not change asks nothing");
+        assertFalse(c.ended());
+        a.lease().close();
+        drive(c::ended);
+        assertEquals(0, this.owner.blockedFetches());
+        drained();
+        b.lease().close();
+        c.lease().close();
+        drained();
+        this.cache.checkQuiescent();
+    }
+
+    /// Fetches that wait for the same thing are asked once per change, not once each: the first that finds the staging
+    /// buffers all in use is the answer for the ones behind it.
+    @Test
+    void fetchesWaitingForTheSameStagingBufferAreAskedOncePerChange() throws Exception {
+        build(8, 1);
+        Fetch first = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        List<Fetch> waiting = new ArrayList<>();
+        for (int expert = 1; expert < 5; expert++) {
+            Fetch target = new Fetch();
+            waiting.add(target);
+            this.owner.request(target, 2, expert);
+        }
+        this.owner.poll();
+        assertEquals(4, this.owner.blockedFetches());
+        long before = this.owner.fullFetches();
+        drive(first::ended);
+        drained();
+        first.lease().close();
+        drive(() -> waiting.stream().allMatch(Fetch::ended));
+        drained();
+        for (Fetch target : waiting) target.lease().close();
+        drained();
+        assertEquals(0, this.owner.blockedFetches());
+        assertTrue(this.owner.fullFetches() - before < 4 * 8, "waiting fetches were not asked again on every change");
+        this.cache.checkQuiescent();
+    }
+
+    /// A request whose quantum stopped while it waited is abandoned without anything having to free a slot.
+    @Test
+    @org.junit.jupiter.api.Timeout(30)
+    void aWaitingRequestOfAStoppedQuantumIsAbandoned() throws Exception {
+        build(1, 2);
+        Fetch held = fetch(2, 0, ExpertCacheOwner.Outcome.LOADING);
+        drive(held::ended);
+        drained();
+        Fetch waiting = new Fetch();
+        this.owner.request(waiting, 2, 1);
+        this.owner.poll();
+        assertEquals(1, this.owner.blockedFetches());
+        waiting.stopped = true;
+        drive(waiting::ended);
+        assertEquals(1, waiting.abandoned.get());
+        assertEquals(0, this.owner.blockedFetches());
+        held.lease().close();
         drained();
         this.cache.checkQuiescent();
     }

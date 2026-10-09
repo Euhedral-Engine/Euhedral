@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
-import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
@@ -65,13 +64,6 @@ final class Stages {
 
         Base(StageGraph graph, int stage, Shape shape, int layer) {
             this(graph, stage, shape, layer, false);
-        }
-
-        /// A stage routed to the owner of some state, by its hash.
-        Base(StageGraph graph, int stage, Shape shape, int layer, long ownerHash) {
-            super(graph, stage, ownerHash);
-            this.shape = shape;
-            this.layer = layer;
         }
 
         Base(StageGraph graph, int stage, Shape shape, int layer, boolean ordered) {
@@ -473,7 +465,7 @@ final class Stages {
         }
     }
 
-    /// Reads the prediction back on the host and hands it to the cache's owner, which reads what the device and the
+    /// Reads the prediction back on the host and posts it to the cache's owner, which reads what the device and the
     /// host tier lack into the tier; a demand recording also gets it.
     private static final class Prefetch extends Base {
         Prefetch(StageGraph graph, int stage, Shape shape, int layer) {
@@ -536,18 +528,16 @@ final class Stages {
         }
     }
 
-    /// Takes the `index`-th active expert of the block from the cache. It runs where the cache's bookkeeping
-    /// lives (its routing hash is the cache owner's, so it runs in order with every other frame that touches
-    /// that state): a resident expert is a lease at once and the stage ends; a missing one reserves a slot and
-    /// starts its load, and the stage ends when the load hands it the lease. When every slot that could hold
-    /// the expert is pinned, the stage publishes itself again and tries once more when the lattice runs it, as
-    /// any frame that finds its resource full does; no other expert waits for it.
+    /// Asks the cache's source for the `index`-th active expert of the block and ends when the source answers: a
+    /// resident expert is a lease at once; a missing one is loaded, and the stage ends when the load hands it the
+    /// lease; when every slot that could hold the expert is pinned, or the staging buffers or the disk's reads are
+    /// all in use, the request waits in the source until something frees one. No other expert waits for it, and
+    /// nothing here runs again meanwhile.
     private static final class Fetch extends Base implements ExpertCacheOwner.Fetch {
         private final int index;
-        private final Retry retry = new Retry();
 
         Fetch(StageGraph graph, int stage, Shape shape, int layer, int index) {
-            super(graph, stage, shape, layer, ExpertCacheOwner.HASH);
+            super(graph, stage, shape, layer, false);
             this.index = index;
         }
 
@@ -564,19 +554,11 @@ final class Stages {
         @Override
         protected void submit() {
             deferCompletion();
-            fetch();
-        }
-
-        /// Asks the cache for the expert. Runs on the owner's frames only (this stage, or its retry).
-        private void fetch() {
             if (stopped()) {
                 completeDeferred();
                 return;
             }
-            Workspace storage = storage();
-            int expert = moe().activeExpert(this.index);
-            if (plan().expertOwner().fetch(this, storage.bank, expert) == ExpertCacheOwner.Outcome.FULL)
-                graph().lake().publish(this.retry);
+            plan().expertOwner().request(this, storage().bank, moe().activeExpert(this.index));
         }
 
         @Override
@@ -590,6 +572,11 @@ final class Stages {
         }
 
         @Override
+        public void abandoned() {
+            completeDeferred();
+        }
+
+        @Override
         public void arrived(ExpertLease lease) {
             if (stopped()) lease.close();
             else moe().hold(this.index, lease);
@@ -600,26 +587,6 @@ final class Stages {
         public void failed(Throwable failure) {
             quantum().fail(failure);
             completeDeferred();
-        }
-
-        /// The fetch once more, routed to the owner.
-        private final class Retry extends AbstractFrame {
-            Retry() {
-                super(ExpertCacheOwner.HASH);
-            }
-
-            @Override
-            public void execute() {
-                fetch();
-            }
-
-            @Override
-            public void doFinally() {}
-
-            @Override
-            public void doFinallyWithError(Throwable rejection) {
-                failed(new IllegalStateException("the lattice rejected an expert fetch", rejection));
-            }
         }
     }
 

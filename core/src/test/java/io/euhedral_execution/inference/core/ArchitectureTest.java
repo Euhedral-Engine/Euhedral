@@ -230,9 +230,11 @@ class ArchitectureTest {
     }
 
     /// Loading experts is ordinary lattice work, not a subsystem attached to the lattice: frames, dependencies,
-    /// and state confined by routing every frame that touches it to its owner. Nothing in the expert path is a
-    /// source or a sink of its own, keeps a queue of work, admits work, groups experts into waves, binds a staging
-    /// buffer to a scheduling identity, or locks the owner's state.
+    /// and one source for the state they share. The cache's bookkeeping belongs to `ExpertCacheOwner`, a source
+    /// the lattice polls one worker at a time (so the state needs no lock): it applies the records posted to it
+    /// and keeps the requests it cannot serve yet. Nothing else in the expert path is a source or a sink of its
+    /// own, keeps a queue of work, admits work, groups experts into waves, binds a staging buffer to a scheduling
+    /// identity, or locks the owner's state.
     @Test
     void theExpertPathIsFramesAndDependenciesNotAScheduler() throws IOException {
         for (String gone : List.of(
@@ -244,9 +246,9 @@ class ArchitectureTest {
                 "model/qwen4/StagingPool.java",
                 "model/qwen4/ExpertWave.java"))
             assertTrue(!Files.exists(MAIN.resolve(gone)), "a scheduler of the expert path: " + gone);
-        Pattern scheduler = Pattern.compile("implements\\s+LatticeSource|extends\\s+AbstractIngestSink"
-                + "|(Deque|Queue|List)<(AbstractFrame|ExpertLoad|Claim)>|\\bclass\\s+(Lane|Claim)\\b"
-                + "|\\btryExclusive\\(|\\bfreeLane\\(|\\bwaveStart\\(|\\bWAVE\\b");
+        Pattern source = Pattern.compile("implements\\s+LatticeSource|extends\\s+AbstractIngestSink");
+        Pattern scheduler = Pattern.compile("(Deque|Queue|List)<(AbstractFrame|ExpertLoad|Claim)>"
+                + "|\\bclass\\s+(Lane|Claim)\\b|\\btryExclusive\\(|\\bfreeLane\\(|\\bwaveStart\\(|\\bWAVE\\b");
         List<Path> scanned = new ArrayList<>();
         scanned.addAll(javaFiles("model/qwen4", false));
         scanned.addAll(javaFiles("model/qwen4/expert", true));
@@ -255,15 +257,18 @@ class ArchitectureTest {
         for (Path file : scanned) {
             // The lattice's ingest sinks (the lake's) are its sources; the lake counts the units it admits for its
             // own completion. The asynchronous reads' sink is how the disk's completions reach the lattice, as driver
-            // callbacks publish the device's.
+            // callbacks publish the device's. The cache's owner is the one source of the expert path.
             String name = file.getFileName().toString();
             if (name.equals("InferenceLake.java") || name.equals("FrameLake.java") || name.equals("AsyncReads.java"))
                 continue;
+            boolean owner = name.equals("ExpertCacheOwner.java");
             List<String> lines = Files.readAllLines(file);
             for (int i = 0; i < lines.size(); i++) {
                 String code = lines.get(i).strip();
                 if (code.startsWith("///") || code.startsWith("//") || code.startsWith("*")) continue;
-                if (scheduler.matcher(code).find()) violations.add(relative(file) + ":" + (i + 1) + ": " + code);
+                if (scheduler.matcher(code).find()
+                        || (!owner && source.matcher(code).find()))
+                    violations.add(relative(file) + ":" + (i + 1) + ": " + code);
             }
         }
         assertTrue(violations.isEmpty(), "a scheduler in the expert path:\n" + String.join("\n", violations));

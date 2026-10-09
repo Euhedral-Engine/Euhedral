@@ -41,7 +41,7 @@ embed ────────────────────────�
 | `Quantum` | A `StageQuantum`: what the stages read, whether the step stopped, and the terminal work after retirement (commit the sequence, close leases a stopped block still holds, report to the listener). |
 | `EuhedralInferenceRuntime` | Unchanged lifecycle: admits a quantum of any model to an idle graph of its shape (building one when none is idle), publishes its roots, recycles the graph at retirement. `Qwen4Runtime` builds it with `Lanes.of(LANES)`. |
 | `ExpertCache` / `ExpertCacheShard` | The slab, the markers, the host store and the transfer; the directory, the slots' states and the recency. No lock, no wait. |
-| `ExpertCacheOwner` | The owner of the cache's bookkeeping (and the host tier's): the frames that change it carry its routing hash, so the lattice runs them in order, one at a time. |
+| `ExpertCacheOwner` | The owner of the cache's bookkeeping (and the host tier's), a source of the lattice: what changes it is a record posted to a lock-free queue, and a worker that polls the source applies the records in order, one poller at a time. |
 | `ExpertLoad` | One miss as frames: the read in parts and their join, or the copy out of RAM; the owner's submit and retire. |
 | `Join` | The fan-in of frames spawned at run time: the last arrival publishes the continuation. |
 | `AsyncReads` | File reads that hold no worker: a frame submits the read to io_uring, and the read's completion is a frame that the reads' sink emits when the workers poll it. |
@@ -51,8 +51,8 @@ embed ────────────────────────�
 ### The step is a stream
 
 - **No frame is ordered unless its state needs it.** The stages and the device-completion frames are ordered by the graph's
-  edges, not by a routing hash: each has a hash of its own, so whichever worker is free runs it. The only ordered frames are the
-  ones that change the expert cache's bookkeeping (below), which carry its owner's hash so that they run one at a time.
+  edges, not by a routing hash: each has a hash of its own, so whichever worker is free runs it. The expert cache's bookkeeping
+  needs no ordered frame either: it belongs to a source (below).
 - **Every expert is its own branch.** The plan stage groups the block's pairs by expert and copies the block's description to
   the device. For each expert the block names there is a fetch stage and an expert stage. The fetch takes the expert from the
   cache; the expert stage runs its kernels over its own work items as soon as its expert is held, whatever the other experts are
@@ -60,12 +60,15 @@ embed ────────────────────────�
   order the sum needs, on the device, after all of them) and combines the sum with the shared expert's gated output. A layer has
   as many fetch and expert stages as its largest block can name (ten for a decode token); the plan stage learns how many a block
   uses, and the rest complete in place.
-- **The cache's state is changed only by frames routed to its owner.** A fetch stage carries the owner's routing hash: a resident
-  expert is a lease at once and the stage ends; a missing one reserves a slot, makes the lease and starts its load, and the stage
-  ends when the load has submitted the copy and hands it the lease. When every slot that could hold the expert is pinned at that moment, the fetch publishes itself again and
-  tries once more when the lattice runs it, as any frame that finds its resource full does; no other expert waits for it. A lease
-  closing on an expert stage's thread publishes a release frame; a copy's retirement (a driver callback) publishes a retire frame;
-  both are the owner's.
+- **The cache's state is changed only by the source that owns it.** A fetch stage posts a request to the cache's owner and ends
+  when the owner answers: a resident expert is a lease at once; a missing one reserves a slot, makes the lease and starts its load,
+  and the stage ends when the load has submitted the copy and hands it the lease. When every slot that could hold the expert is
+  pinned, or the staging buffers or the disk's reads are all in use, the request waits in the owner, which asks the cache again
+  only when something was given back (a lease released, a read ended, a copy retired or submitted, a tier slot settled); the
+  requests that wait for the same staging buffer, read or shard are asked once per change, not once each. No other expert waits
+  for it, and no frame runs again meanwhile: a poll of a source with nothing to do returns at once. A lease closing on an expert
+  stage's thread posts a release, a copy's retirement (a driver callback, which may only enqueue) posts a retire record, a read's
+  completion posts the tier's; the owner applies them in order when a worker polls it.
 - **A miss is frames, and no frame waits for the disk.** The fetch reserves the slot and makes the lease (the slot's address and
   the marker its copy will record). A record read from the artifact is read in parts, page-aligned ranges read straight into their
   destination: each part's frame submits its read to the kernel (`AsyncReads`, io_uring) and ends, and the read's completion is a
@@ -107,10 +110,10 @@ independent work, describe its dependencies, route state to its owner, and let t
 | --- | --- | --- | --- |
 | A unit of work | A frame per item, published and never run by its producer | `EuhedralOperator` makes each element a `CallbackFrame` | A fetch, a read part, a copy, a submit, a retirement, a release, an expert's kernels |
 | Parallel work | A routing hash of its own | `flatMap` randomizes the hash | Every expert is a branch; reads and copies spread over the workers |
-| Owner-confined state | Every frame that touches it carries one fixed hash, so the lattice runs them in order on one lane | `concatMap` keeps the route | The cache's bookkeeping: fetches, submits, retirements, releases |
+| Owner-confined state | A source: what changes it is posted to it, and the one worker that polls it applies the records | `concatMap` keeps the route | The cache's bookkeeping: requests, retirements, releases |
 | Fan-in | Count arrivals; the last one continues | `FrameSequencer` marks a frame ready and drains | `Join` of a read's parts; the finish after every expert |
 | Continuation | A frame's own end, or a callback that only publishes | `giveToReceiver`, `doFinally` | A part's read completes as a frame; a part arrives at its join; a copy's retirement publishes its frame |
-| A full resource | Try again later | The sink's emit answers `RETRY` | A fetch that finds every slot pinned publishes itself again |
+| A full resource | Nothing to pull until it frees | The sink's emit answers `RETRY` | A fetch that finds every slot pinned waits in the owner's source, asked again when something was given back |
 
 Each load counts as a unit of the lake until its copy retired, so closing the runtime waits for it.
 
@@ -136,7 +139,7 @@ continuations occupy no worker; a driver-callback publication runs on a worker; 
 quantum's retirement). `InferenceLakeTest`: sinks attach once and lazily, frames route by hash, completion waits for every admitted
 unit. `JoinTest`: the last arrival publishes the continuation once. `ExpertCacheShardTest`: a lease before its bytes arrive carries the copy's marker, the slot stays
 unevictable until the copy retired, least-recently-used eviction, fences order a refill, shards partition slots and experts.
-`ExpertCacheOwnerTest`: a hit publishes nothing, a miss is a copy and the owner's submit and retire, a read in parts fans out from
+`ExpertCacheOwnerTest`: a hit publishes nothing, a miss is a copy and the owner's submit and retire, a request for a full cache waits in the source and is asked again only after a release, requests waiting for the same buffer are asked once per change, a stopped quantum's request is abandoned, a read in parts fans out from
 its first part and joins into the submit, loads in flight together each have a staging buffer and the store pins more when it runs
 out, a fetch that finds every slot pinned changes nothing and succeeds once a release ran, a closed lease reaches the cache only
 through the owner's release frame, failures return the slot and the buffer. `ExpertRoutingTest`: each expert's items are

@@ -30,7 +30,8 @@ Prefill of 4096 tokens, 64 records in flight, each read in four parts:
 - Per load: read 19 ms, submit hop 0.8 ms, copy 7.8 ms, retire hop 4.5 ms.
 - 5,300 fetches per token found the read bound or the staging pool full and published themselves again: about 2.4
   million frames a second, all routed to the cache's owner, whose frames run in order. The retirements that free a read
-  wait behind them.
+  wait behind them. (Since replaced: a fetch that finds the read bound or the staging pool full waits in the cache owner's
+  source, which asks it again only when a read, a buffer or a slot was given back.)
 
 ## Startup fill
 

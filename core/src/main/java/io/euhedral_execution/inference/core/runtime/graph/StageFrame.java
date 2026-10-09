@@ -92,16 +92,6 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         if (!ordered) randomizeHash(graph.nextRoutingSeed());
     }
 
-    /// A stage routed to the owner of some state: it keeps `ownerHash` as its routing hash, so the lattice
-    /// runs it in order with every other frame of that hash, one at a time, and the state it touches needs no
-    /// other protection.
-    protected StageFrame(StageGraph graph, int stage, long ownerHash) {
-        super(ownerHash);
-        this.graph = graph;
-        this.stage = stage;
-        this.inDegree = graph.topology().inDegree(stage);
-    }
-
     /// Submits this stage's device work. The quantum's stream is selected on the calling thread.
     protected abstract void submit();
 
