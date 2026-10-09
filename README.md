@@ -37,24 +37,34 @@ RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display,
 decoding with MTP speculative decoding (two drafted tokens for Q3, four for NVFP4); decode `tok/s` is output tokens per second
 after the first token. Prefill and time to first token (TTFT) include the whole prompt.
 
-| Artifact | Context (prompt tokens) | Prefill tok/s | TTFT | Decode tok/s (MTP) |
+Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128K = 128,000.
+
+**Prefill (tokens/s)**
+
+| Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 4K (3,964) | 1,867 | 2.13 s | 109.4 |
-| | 32K (32,612) | 1,543 | 21.2 s | 104.5 |
-| | 64K (63,362) | 1,294 | 49.1 s | 92.5 |
-| | 128K (128,000) | 967 | 133 s | 67.2 |
-| `q3-compressed` | 4K | 1,860 | 2.14 s | 94.6 |
-| | 32K | 1,547 | 21.1 s | 91.7 |
-| | 64K | 1,310 | 48.5 s | 82.2 |
-| | 128K | 995 | 129 s | 63.6 |
-| `nvfp4` | 4K | 3,929 | 1.02 s | 116.2 |
-| | 32K | 2,754 | 11.9 s | 101.1 |
-| | 64K | 2,088 | 30.5 s | 72.1 |
-| | 128K | 1,347 | 95.3 s | 29.8 |
-| `nvfp4-compressed` | 4K | 3,867 | 1.05 s | 146.4 |
-| | 32K | 2,727 | 12.0 s | 102.2 |
-| | 64K | 2,064 | 30.8 s | 87.7 |
-| | 128K | 1,356 | 94.7 s | 52.2 |
+| `q3` | 1,867 | 1,543 | 1,294 | 967 |
+| `q3-compressed` | 1,860 | 1,547 | 1,310 | 995 |
+| `nvfp4` | 3,929 | 2,754 | 2,088 | 1,347 |
+| `nvfp4-compressed` | 3,867 | 2,727 | 2,064 | 1,356 |
+
+**Time to first token**
+
+| Artifact | 4K | 32K | 64K | 128K |
+|---|---|---|---|---|
+| `q3` | 2.13 s | 21.2 s | 49.1 s | 133 s |
+| `q3-compressed` | 2.14 s | 21.1 s | 48.5 s | 129 s |
+| `nvfp4` | 1.02 s | 11.9 s | 30.5 s | 95.3 s |
+| `nvfp4-compressed` | 1.05 s | 12.0 s | 30.8 s | 94.7 s |
+
+**Decode (tokens/s, MTP)**
+
+| Artifact | 4K | 32K | 64K | 128K |
+|---|---|---|---|---|
+| `q3` | 109.4 | 104.5 | 92.5 | 67.2 |
+| `q3-compressed` | 94.6 | 91.7 | 82.2 | 63.6 |
+| `nvfp4` | 116.2 | 101.1 | 72.1 | 29.8 |
+| `nvfp4-compressed` | 146.4 | 102.2 | 87.7 | 52.2 |
 
 The 4K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
 and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are
