@@ -535,6 +535,8 @@ final class Stages {
     /// nothing here runs again meanwhile.
     private static final class Fetch extends Base implements ExpertCacheOwner.Fetch {
         private final int index;
+        /// The stage's request, posted once per run of the graph and answered before the run ends.
+        private final ExpertCacheOwner.Request request = new ExpertCacheOwner.Request(this);
 
         Fetch(StageGraph graph, int stage, Shape shape, int layer, int index) {
             super(graph, stage, shape, layer, false);
@@ -558,7 +560,7 @@ final class Stages {
                 completeDeferred();
                 return;
             }
-            plan().expertOwner().request(this, storage().bank, moe().activeExpert(this.index));
+            plan().expertOwner().request(this.request, storage().bank, moe().activeExpert(this.index));
         }
 
         @Override

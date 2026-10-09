@@ -39,15 +39,9 @@ final class ExpertLoad {
     private static final Logger LOG = LoggerFactory.getLogger(ExpertLoad.class);
 
     final ExpertCacheOwner owner;
-    final ExpertCacheOwner.Fetch target;
     final ExpertCacheShard.Load load;
-    final ExpertLease lease;
-    final RamTierShard tier;
-    final TierDirective directive;
-    /// Whether the load reads the artifact (one of the disk's reads in flight until its record is in).
-    final boolean reads;
-    /// Whether the load gave its read back.
-    private final java.util.concurrent.atomic.AtomicBoolean readGiven = new java.util.concurrent.atomic.AtomicBoolean();
+    /// What the load plans into and the tier settles: the slot's own, cleared for each load.
+    final TierDirective directive = new TierDirective();
     private final long seed;
     private final Part[] parts;
     private final Join join;
@@ -55,8 +49,20 @@ final class ExpertLoad {
     private final Submit submit;
     private final Retire retire;
     private final Fail fail;
+    private final long[] partEnd;
+    /// Whether the load gave its read back.
+    private final java.util.concurrent.atomic.AtomicBoolean readGiven = new java.util.concurrent.atomic.AtomicBoolean();
+
+    // The current load; set by [#begin].
+    ExpertCacheOwner.Fetch target;
+    ExpertLease lease;
+    RamTierShard tier;
+    /// Whether the load reads the artifact (one of the disk's reads in flight until its record is in).
+    boolean reads;
     /// The staging buffer the owner reserved for the load.
-    private final int buffer;
+    private int buffer;
+    /// The parts the record is read in: none for a record the host tier holds.
+    private int partCount;
 
     // Written by the frames; each is read by a frame that follows the writer across a dependency.
     private int stream;
@@ -67,46 +73,55 @@ final class ExpertLoad {
     private long ticket;
     // The load's timeline: fetched, started (first frame), read (record ready), submitting, submitted, retired
     // (callback), confirmed (retire frame).
-    final long fetchedAt;
+    long fetchedAt;
     volatile long startedAt;
-    private final long[] partEnd;
     long readAt;
     long submittingAt;
     long submittedAt;
     volatile long retiredAt;
     long confirmedAt;
 
-    ExpertLoad(
-            ExpertCacheOwner owner,
-            ExpertCacheOwner.Fetch target,
-            ExpertCacheShard.Load load,
-            int buffer,
-            RamTierShard tier,
-            TierDirective directive,
-            boolean reads,
-            long seed) {
+    /// The load context of one slot, made with the cache and kept for its life: a slot has one load at a time,
+    /// from its reservation until the copy retired (or the load failed), so a miss reuses the slot's context, its
+    /// frames and its join instead of making them. `seed` spreads the context's frames over the workers.
+    ExpertLoad(ExpertCacheOwner owner, ExpertCacheShard.Load load, long seed) {
         this.owner = owner;
-        this.target = target;
         this.load = load;
-        this.buffer = buffer;
-        this.lease = load.lease();
-        this.tier = tier;
         this.seed = seed;
-        this.fetchedAt = System.nanoTime();
-        this.directive = directive;
-        this.reads = reads;
-        int count = this.directive.mode() != TierDirective.Mode.HIT
-                        && owner.cache.store().rangedReads()
-                ? Math.max(1, owner.readParts)
-                : 0;
-        this.parts = new Part[count];
-        for (int part = 0; part < count; part++) this.parts[part] = new Part(part);
-        this.partEnd = new long[count];
+        int parts = owner.cache.store().rangedReads() ? Math.max(1, owner.readParts) : 0;
+        this.parts = new Part[parts];
+        for (int part = 0; part < parts; part++) this.parts[part] = new Part(part);
+        this.partEnd = new long[parts];
         this.submit = new Submit();
         this.retire = new Retire();
         this.fail = new Fail();
-        this.join = count == 0 ? null : new Join(owner.lake, this.submit);
-        this.copy = count == 0 ? new Copy() : null;
+        this.join = parts == 0 ? null : new Join(owner.lake, this.submit);
+        this.copy = new Copy();
+    }
+
+    /// Begins the slot's next load, whose slot, tier plan (in [#directive]) and staging buffer the owner reserved.
+    void begin(ExpertCacheOwner.Fetch target, int buffer, RamTierShard tier, boolean reads) {
+        this.target = target;
+        this.buffer = buffer;
+        this.tier = tier;
+        this.reads = reads;
+        this.readGiven.set(false);
+        this.partCount =
+                this.parts.length > 0 && this.directive.mode() != TierDirective.Mode.HIT ? this.parts.length : 0;
+        this.lease = this.load.lease();
+        this.stream = 0;
+        this.record = null;
+        this.read = false;
+        this.touched = false;
+        this.failure = null;
+        this.ticket = 0;
+        this.fetchedAt = System.nanoTime();
+        this.startedAt = 0;
+        this.readAt = 0;
+        this.submittingAt = 0;
+        this.submittedAt = 0;
+        this.retiredAt = 0;
+        this.confirmedAt = 0;
     }
 
     private HostExpertStore store() {
@@ -116,7 +131,7 @@ final class ExpertLoad {
     /// Publishes the load's first frames. Called by the owner's fetch. A record in a pinned tier needs no frame:
     /// its copy is submitted here, from its slot.
     void start() {
-        if (this.join == null && !store().stagesThrough(this.directive)) {
+        if (this.partCount == 0 && !store().stagesThrough(this.directive)) {
             this.startedAt = System.nanoTime();
             try {
                 this.record = store().open(this.load.bank(), this.load.expert(), this.buffer, this.directive);
@@ -132,9 +147,9 @@ final class ExpertLoad {
             this.target.arrived(this.lease);
             return;
         }
-        if (this.join != null) {
-            this.join.expect(this.parts.length);
-            for (Part part : this.parts) this.owner.lake.publish(part);
+        if (this.partCount > 0) {
+            this.join.expect(this.partCount);
+            for (int part = 0; part < this.partCount; part++) this.owner.lake.publish(this.parts[part]);
         } else this.owner.lake.publish(this.copy);
     }
 
@@ -201,7 +216,7 @@ final class ExpertLoad {
                                 buffer,
                                 load.directive,
                                 this.index,
-                                load.parts.length,
+                                load.partCount,
                                 this.read)) return;
                 load.store()
                         .readPart(
@@ -210,7 +225,7 @@ final class ExpertLoad {
                                 buffer,
                                 load.directive,
                                 this.index,
-                                load.parts.length);
+                                load.partCount);
             } catch (Throwable thrown) {
                 load.partEnd[this.index] = System.nanoTime();
                 load.join.fail(thrown);
@@ -251,7 +266,7 @@ final class ExpertLoad {
                                     load.buffer,
                                     load.directive,
                                     this.part.index,
-                                    load.parts.length,
+                                    load.partCount,
                                     readNanos());
                 } catch (Throwable copy) {
                     thrown = copy;

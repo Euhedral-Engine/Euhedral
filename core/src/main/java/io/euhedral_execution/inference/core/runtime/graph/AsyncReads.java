@@ -395,6 +395,11 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     /// The lattice calls `request` and `pull` on a registered source one thread at a time, so the rings'
     /// completion queues are reaped by one thread at a time.
     private final class Delegate extends AbstractIngestSink.Delegate {
+        /// The terminal's `push`, made once: a request is made on every poll, and a method reference made there
+        /// allocates each time.
+        private LatticeReceiver pushing;
+        private Consumer<AbstractFrame> push;
+
         @Override
         public long hookOnPull(
                 Consumer<AbstractFrame> consumer, Function<AbstractFrame, Boolean> stopCondition, long demand) {
@@ -403,7 +408,11 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
 
         @Override
         public void hookOnRequest(LatticeReceiver terminal, long demand) {
-            long emitted = reap(terminal::push, demand);
+            if (terminal != this.pushing) {
+                this.push = terminal::push;
+                this.pushing = terminal;
+            }
+            long emitted = reap(this.push, demand);
             if (emitted > 0) addAndGetDemand(-emitted);
         }
     }

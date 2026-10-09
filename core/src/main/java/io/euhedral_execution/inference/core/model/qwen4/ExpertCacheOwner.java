@@ -14,7 +14,6 @@ import io.euhedral_execution.inference.core.model.qwen4.expert.RamTierShard;
 import io.euhedral_execution.inference.core.model.qwen4.expert.TierDirective;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
-import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -129,8 +128,12 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
 
     /// What the bookkeeping must learn, from any thread; applied by the poll, in this order.
     private final MpscQueue<Record> records = new MpscQueue<>(1024, 4);
-    /// Fetches that found the cache full, oldest first, and what each waits for. Touched by the poll only.
-    private final ArrayList<Request> blocked = new ArrayList<>();
+    /// Fetches that found the cache full, oldest first, and what each waits for: `blockedCount` of them. Touched by
+    /// the poll only.
+    private Request[] blocked = new Request[64];
+    private int blockedCount;
+    /// The load context of every slot of every shard, made with the cache: a slot has one load at a time.
+    private final ExpertLoad[][] contexts;
     /// Counts what could let a blocked fetch proceed: a slot released, a staging buffer or a read given back, a tier
     /// slot settled, a copy submitted. Any thread.
     private final AtomicLong epoch = new AtomicLong();
@@ -147,8 +150,17 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         this.cache = cache;
         this.lake = lake;
         this.readParts = cache.store().readParts();
-        for (int shard = 0; shard < cache.shardCount(); shard++)
+        this.contexts = new ExpertLoad[cache.shardCount()][];
+        long seed = HasherApi.mix(0x1a4e_0000L);
+        for (int shard = 0; shard < cache.shardCount(); shard++) {
             cache.shard(shard).owner(new Releases(shard));
+            this.contexts[shard] = new ExpertLoad[cache.shard(shard).slotCount()];
+            for (int slot = 0; slot < this.contexts[shard].length; slot++) {
+                this.contexts[shard][slot] =
+                        new ExpertLoad(this, cache.shard(shard).loadOf(slot), seed);
+                seed += 64;
+            }
+        }
     }
 
     /// The leases of one shard report here: a close posts the release.
@@ -186,31 +198,46 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     }
 
     /// Asks for `expert` of `bank` for `target`: the source serves it when the cache can, now or once something
-    /// frees a slot, a staging buffer or a read. The fetch hears of the outcome through `target`.
+    /// frees a slot, a staging buffer or a read. The fetch hears of the outcome through `target`. Allocates: a
+    /// fetch stage keeps a [Request] of its own and uses [#request(Request, int, int)].
     public void request(Fetch target, int bank, int expert) {
-        post(new Request(target, bank, expert));
+        request(new Request(target), bank, expert);
     }
 
-    /// A fetch's request, and what it waits for while the cache is full.
-    private final class Request implements Record {
+    /// As above, with the request `target` keeps: one at a time, from the post until the owner answered it.
+    void request(Request request, int bank, int expert) {
+        request.owner = this;
+        request.bank = bank;
+        request.expert = expert;
+        post(request);
+    }
+
+    /// A fetch's request, and what it waits for while the cache is full. The fetch owns it and reuses it.
+    static final class Request implements Record {
         final Fetch target;
-        final int bank;
-        final int expert;
+        ExpertCacheOwner owner;
+        int bank;
+        int expert;
         Cause cause;
         int shard;
         /// The epoch the cache was last asked at for this request.
         long askedAt;
 
-        Request(Fetch target, int bank, int expert) {
+        Request(Fetch target) {
             this.target = target;
-            this.bank = bank;
-            this.expert = expert;
         }
 
         @Override
         public void apply() {
-            if (!ask(this)) ExpertCacheOwner.this.blocked.add(this);
+            if (!this.owner.ask(this)) this.owner.block(this);
         }
+    }
+
+    /// Keeps `request` until the cache can serve it.
+    private void block(Request request) {
+        if (this.blockedCount == this.blocked.length)
+            this.blocked = java.util.Arrays.copyOf(this.blocked, this.blockedCount * 2);
+        this.blocked[this.blockedCount++] = request;
     }
 
     // ---------------------------------------------------------------- the poll only
@@ -261,7 +288,9 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             this.cause = Cause.READS;
             return Outcome.FULL;
         }
-        TierDirective directive = new TierDirective();
+        ExpertLoad load = this.contexts[shardIndex][reserved.slot()];
+        TierDirective directive = load.directive;
+        directive.clear();
         if (tier != null) tier.plan(bank, expert, target.scan(), directive);
         boolean reads = directive.mode() != TierDirective.Mode.HIT;
         if (buffer >= 0 && !this.cache.store().stagesThrough(directive)) {
@@ -270,8 +299,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
             buffer = -1;
         }
         if (reads) this.reading.incrementAndGet();
-        ExpertLoad load = new ExpertLoad(this, target, reserved, buffer, tier, directive, reads, this.nextSeed);
-        this.nextSeed += 64;
+        load.begin(target, buffer, tier, reads);
         // The load is the quantum's continuation until its copy retired: the lake cannot finish without it.
         this.lake.admitDuringDrain();
         this.inFlight.incrementAndGet();
@@ -390,7 +418,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
                 LOG.error("an expert cache record failed", failure);
             }
         }
-        if (!this.blocked.isEmpty()) askBlocked();
+        if (this.blockedCount > 0) askBlocked();
     }
 
     /// A stopped quantum's fetches are found at least this often, even when nothing changed.
@@ -411,8 +439,8 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         boolean noReads = false;
         long noSlots = 0;
         int kept = 0;
-        for (int i = 0; i < this.blocked.size(); i++) {
-            Request request = this.blocked.get(i);
+        for (int i = 0; i < this.blockedCount; i++) {
+            Request request = this.blocked[i];
             if (request.target.stopped()) {
                 request.target.abandoned();
                 continue;
@@ -433,9 +461,10 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
                     if (request.cause == Cause.SLOTS) noSlots |= 1L << request.shard;
                 }
             }
-            this.blocked.set(kept++, request);
+            this.blocked[kept++] = request;
         }
-        this.blocked.subList(kept, this.blocked.size()).clear();
+        java.util.Arrays.fill(this.blocked, kept, this.blockedCount, null);
+        this.blockedCount = kept;
     }
 
     /// Asks the cache once for `request`; false, with what it waits for recorded, when the cache is full.
@@ -486,7 +515,7 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
 
     /// Fetches waiting for the cache. For tests, which play the worker that polls: the list is the poll's.
     public int blockedFetches() {
-        return this.blocked.size();
+        return this.blockedCount;
     }
 
     /// Whether a record is posted and not yet applied. Any thread.
