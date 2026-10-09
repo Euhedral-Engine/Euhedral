@@ -125,6 +125,9 @@ subprojects {
             // Teacher-forced quality measurement (TeacherForcedQualityCudaIntegrationTest).
             for (name in listOf("report", "artifact", "prefix", "steps", "host-mib"))
                 providers.gradleProperty("euhedral.quality.$name").orNull?.let { systemProperty("euhedral.quality.$name", it) }
+            // MTP drafting-confidence report (MtpDraftConfidenceCudaIntegrationTest).
+            for (name in listOf("prompts", "report", "drafts", "context"))
+                providers.gradleProperty("euhedral.mtp.$name").orNull?.let { systemProperty("euhedral.mtp.$name", it) }
             // Speculative decoding tests: artifact (defaults to the NVFP4 artifact), prompt length, rows.
             for (name in listOf("artifact", "prefix", "rows", "tokens", "host-mib"))
                 providers.gradleProperty("euhedral.speculative.$name").orNull?.let { systemProperty("euhedral.speculative.$name", it) }

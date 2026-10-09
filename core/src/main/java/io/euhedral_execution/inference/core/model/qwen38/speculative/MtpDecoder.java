@@ -90,6 +90,19 @@ public final class MtpDecoder implements SpeculativeDecoding {
         }
     }
 
+    /// Sees each verified step (tests and drafting-quality measurements): the position of the step's first row, its
+    /// token, every draft the step drafted with the natural log of the probability the draft head gave it (over the
+    /// head's shortlist), and the drafts the verification accepted.
+    public interface StepListener {
+        void verified(long position, int current, int[] drafts, float[] draftLogProbabilities, int acceptedDrafts);
+    }
+
+    /// Most drafts a step drafts; at most [#MAX_VERIFIED] of them are verified.
+    public static final int MAX_DRAFTS = 16;
+
+    /// Most drafts one verification checks.
+    public static final int MAX_VERIFIED = 7;
+
     /// Largest MTP catch-up quantum (prompt chunks are split).
     static final int CATCH_UP_ROWS = 128;
 
@@ -98,6 +111,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
     private final Sequence sequence;
     private final IntPredicate endOfGeneration;
     private final int depth;
+    /// Drafts each verification checks: the first `verified` of the step's `depth`.
+    private final int verified;
     private final int prefillChunk;
     private final int hidden;
     private final HostLogits baseLogits;
@@ -107,6 +122,11 @@ public final class MtpDecoder implements SpeculativeDecoding {
     private final boolean[] inShortlist;
     private final MtpCheckpoint checkpoint;
     private Statistics statistics;
+    private StepListener steps;
+    /// Whether each step commits one token, so that every output position starts a step.
+    private boolean everyPosition;
+    /// The latest draft's log-probability, when a listener reads the draft rows on the host.
+    private float draftLogProbability;
     /// The current generation's timing listener, or null.
     private GenerationTimingListener timing;
 
@@ -125,14 +145,31 @@ public final class MtpDecoder implements SpeculativeDecoding {
             IntPredicate endOfGeneration,
             int depth,
             int prefillChunk) {
+        this(runtime, plan, gpu, sequence, endOfGeneration, depth, prefillChunk, depth);
+    }
+
+    /// As the public constructor, drafting `depth` tokens per step (up to [#MAX_DRAFTS]) and verifying only the first
+    /// `verified` of them (up to [#MAX_VERIFIED]); drafts past them reach only the step listener.
+    public MtpDecoder(
+            Execution runtime,
+            ExecutionPlan plan,
+            ExecutionGpu gpu,
+            Sequence sequence,
+            IntPredicate endOfGeneration,
+            int depth,
+            int prefillChunk,
+            int verified) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
         this.plan = Objects.requireNonNull(plan, "plan");
         this.sequence = Objects.requireNonNull(sequence, "sequence");
         this.endOfGeneration = Objects.requireNonNull(endOfGeneration, "endOfGeneration");
         if (!plan.drafts()) throw new IllegalArgumentException("the plan has no MTP draft view");
-        if (depth < 1 || depth > 7) throw new IllegalArgumentException("depth must be 1 to 7");
+        if (depth < 1 || depth > MAX_DRAFTS) throw new IllegalArgumentException("depth must be 1 to " + MAX_DRAFTS);
+        if (verified < 1 || verified > Math.min(depth, MAX_VERIFIED))
+            throw new IllegalArgumentException("verified must be 1 to min(depth, " + MAX_VERIFIED + ")");
         if (prefillChunk <= 0) throw new IllegalArgumentException("prefillChunk must be positive");
         this.depth = depth;
+        this.verified = verified;
         this.prefillChunk = prefillChunk;
         this.hidden = plan.weights().config().hiddenSize();
         this.baseLogits = new HostLogits(gpu, plan.weights().config().vocabSize());
@@ -166,6 +203,43 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
     public Statistics statistics() {
         return this.statistics;
+    }
+
+    /// Reports every verified step to `listener` (null stops it). The draft rows then come back to the host, which
+    /// selects each draft as the device would and scores it. With `everyPosition`, each step commits only its first
+    /// output, so every output position starts a step: a measurement of the drafts from each position, at the
+    /// cost of one verification per token. The output is greedy decode's either way. Set between generations.
+    public void observe(StepListener listener, boolean everyPosition) {
+        this.steps = listener;
+        this.everyPosition = listener != null && everyPosition;
+        this.draftLogits.selectOnDevice(listener == null);
+    }
+
+    /// The draft head's row of the draft quantum that just retired: its greedy choice, as the device argmax makes it
+    /// (the lowest row among equal maxima). With a listener the row is on the host, and its log-softmax at that row
+    /// is kept in `draftLogProbability`.
+    private int draftRow() {
+        if (this.draftLogits.hasSelection()) return this.draftLogits.selectedToken();
+        MemorySegment row = this.draftLogits.row();
+        int count = this.draftLogits.vocabularySize();
+        int best = -1;
+        float max = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i < count; i++) {
+            float value = bf16(row.getAtIndex(ValueLayout.JAVA_SHORT, i));
+            if (value > max) {
+                max = value;
+                best = i;
+            }
+        }
+        if (best < 0) throw new IllegalArgumentException("draft logit row has no selectable token");
+        double sum = 0;
+        for (int i = 0; i < count; i++) sum += Math.exp(bf16(row.getAtIndex(ValueLayout.JAVA_SHORT, i)) - max);
+        this.draftLogProbability = (float) -Math.log(sum);
+        return best;
+    }
+
+    private static float bf16(short bits) {
+        return Float.intBitsToFloat((bits & 0xFFFF) << 16);
     }
 
     /// Prefills `prompt` and generates up to `maxNewTokens` tokens, exactly as greedy decode would,
@@ -215,7 +289,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
         if (prompt.length == 0 || maxNewTokens <= 0) throw new IllegalArgumentException("empty generation");
         if (startPosition < 0 || startPosition >= prompt.length)
             throw new IllegalArgumentException("startPosition must lie within the prompt");
-        this.statistics = new Statistics(this.depth);
+        this.statistics = new Statistics(this.verified);
         this.timing = timing;
         return new Run(prompt, maxNewTokens, onToken, timing, hooks, startPosition, ended).first();
     }
@@ -240,6 +314,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
         private final List<Integer> output = new ArrayList<>();
         private int first = -1;
         private int[] drafts;
+        private float[] draftLogProbabilities;
 
         // The prefill chunk in flight.
         private int offset;
@@ -267,6 +342,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
         // The recursion in flight.
         private int[] recursionDrafts;
+        private float[] recursionLogProbabilities;
         private int recursionIndex;
         private long recursionBase;
         private long recursionStarted;
@@ -507,7 +583,9 @@ public final class MtpDecoder implements SpeculativeDecoding {
                         this.catchUpOfPrompt ? "prompt-catch-up" : "catch-up", this.catchUpStarted, caughtUpAt);
             if (!this.catchUpDraft) return afterCatchUp(null);
             this.recursionDrafts = new int[depth];
-            this.recursionDrafts[0] = draftTokens[draftLogits.selectedToken()];
+            this.recursionLogProbabilities = new float[depth];
+            this.recursionDrafts[0] = draftTokens[draftRow()];
+            this.recursionLogProbabilities[0] = draftLogProbability;
             this.recursionIndex = 1;
             this.recursionBase = this.catchUpPosition + this.catchUpTokens.length;
             this.recursionStates = states();
@@ -535,7 +613,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
             @Override
             public StepPort retired(AbstractQuantum step) {
                 succeeded(step);
-                recursionDrafts[recursionIndex] = draftTokens[draftLogits.selectedToken()];
+                recursionDrafts[recursionIndex] = draftTokens[draftRow()];
+                recursionLogProbabilities[recursionIndex] = draftLogProbability;
                 recursionIndex++;
                 return recursionIndex < depth ? this : recursed();
             }
@@ -555,7 +634,10 @@ public final class MtpDecoder implements SpeculativeDecoding {
                     return prefillFrom(this.offset);
                 case AFTER_CHUNK:
                     statistics.promptCatchUpNanos += System.nanoTime() - this.promptCatchUpStarted;
-                    if (this.last) this.drafts = newDrafts;
+                    if (this.last) {
+                        this.drafts = newDrafts;
+                        this.draftLogProbabilities = this.recursionLogProbabilities;
+                    }
                     if (this.hooks == null || !this.hooks.wants(this.end)) return prefillFrom(this.end);
                     // Gives the prefix cache the state after the chunk, before the next chunk overwrites the seeds.
                     long seeds = states().draftSeedRows(this.end - this.offset, hidden);
@@ -563,6 +645,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
                     return this.capture;
                 default:
                     this.drafts = newDrafts;
+                    this.draftLogProbabilities = this.recursionLogProbabilities;
                     return this.verify;
             }
         }
@@ -599,11 +682,12 @@ public final class MtpDecoder implements SpeculativeDecoding {
         private final StepPort verify = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                rows = new int[depth + 1];
+                rows = new int[verified + 1];
                 rows[0] = current;
-                System.arraycopy(drafts, 0, rows, 1, depth);
+                System.arraycopy(drafts, 0, rows, 1, verified);
                 position = sequence.currentTokenPosition();
-                acceptance = new SpeculativeAcceptance(rows, endOfGeneration, maxNewTokens - output.size());
+                int budget = maxNewTokens - output.size();
+                acceptance = new SpeculativeAcceptance(rows, endOfGeneration, everyPosition ? 1 : budget);
                 started = System.nanoTime();
                 runtime.admit(
                         new Quantum(
@@ -635,6 +719,13 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 if (rejection == 1) statistics.rejectionsOutsideShortlist++;
                 if (timing != null)
                     timing.speculativeStep(started, executed, committed.length, acceptance.acceptedDrafts(), rejection);
+                if (steps != null)
+                    steps.verified(
+                            position,
+                            current,
+                            drafts.clone(),
+                            draftLogProbabilities.clone(),
+                            acceptance.acceptedDrafts());
                 for (int token : committed) {
                     output.add(token);
                     onToken.accept(token);
