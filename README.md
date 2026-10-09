@@ -305,6 +305,7 @@ the benchmark harness in [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md): the state kept between requests, its checkpoints and measured restore times.
 - [docs/MTP_SPECULATIVE.md](docs/MTP_SPECULATIVE.md), [docs/MTP_CONTRACT.md](docs/MTP_CONTRACT.md), [docs/MTP_VERIFIER.md](docs/MTP_VERIFIER.md): speculative decoding and its exactness contract.
 - [docs/DFLASH2.md](docs/DFLASH2.md): the DFlash2 drafter, its artifact, checkpoints, validation and measurements.
+- [docs/MTP_DRAFT_CONFIDENCE.md](docs/MTP_DRAFT_CONFIDENCE.md): MTP draft confidence per output position, and draft-length policies screened on it.
 - [docs/PREFILL_MX.md](docs/PREFILL_MX.md), [docs/NVFP4_NATIVE.md](docs/NVFP4_NATIVE.md), [docs/ATTENTION_DECODE.md](docs/ATTENTION_DECODE.md): the prefill, FP4 and attention kernels.
 - [docs/COMPACT_Q3_REFERENCE.md](docs/COMPACT_Q3_REFERENCE.md), [docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md), [docs/NVFP4_COMPRESSED.md](docs/NVFP4_COMPRESSED.md), [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md): the artifact formats and memory budgets.
 - [docs/FLASH_NEXT_ARTIFACT.md](docs/FLASH_NEXT_ARTIFACT.md), [docs/FLASH_NEXT_RESIDENCY.md](docs/FLASH_NEXT_RESIDENCY.md): the Qwen3.8-Flash-Next (`qwen4_exp`) artifact, and how its storage is placed and its experts cached.
