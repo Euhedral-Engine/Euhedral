@@ -228,6 +228,7 @@ final class Quantum extends AbstractQuantum implements ExecutionPlan.Handle {
         if (!this.prepared) return;
         tick(-1);
         this.moe.abandon();
+        if (ExpertCacheOwner.aheadDistance() > 0) this.plan.expertOwner().aheadReset();
         // The device stopped reading the tokens, every chunk's embedding retired, unless the GPU cannot prove its
         // work stopped: then a queued copy may still read them, and they are kept.
         if (this.promptUpload != null && this.plan.gpu().completionProven()) {

@@ -211,6 +211,28 @@ class ExpertCacheOwnerTest {
         this.cache.checkQuiescent();
     }
 
+    /// A quantum that stopped never reaches its layers' ends: its reset gives every held slot back, also those of
+    /// loads that arrive after it.
+    @Test
+    void aResetReleasesWhatTheLookaheadHoldsAndWhatArrivesAfterIt() throws Exception {
+        build(12, 4);
+        this.owner.publishAhead(3, 2, new int[] {0, 1, 2, 3});
+        drive(() -> this.owner.aheadLoads() == 4 && this.owner.loadsInFlight() == 0);
+        drive(() -> this.lake.ready.isEmpty() && !this.owner.hasRecords());
+        assertEquals(4, this.cache.openLeaseCount());
+        this.owner.publishAhead(4, 2, new int[] {5});
+        this.owner.poll();
+        this.owner.aheadReset();
+        drive(() -> this.cache.openLeaseCount() == 0 && this.owner.loadsInFlight() == 0 && !this.owner.hasRecords());
+        drained();
+        assertEquals(0, this.cache.openLeaseCount(), "the load that was under way gave its slot back");
+        this.owner.publishAhead(3, 2, new int[] {9});
+        drive(() -> this.owner.aheadLoads() >= 5 && this.owner.loadsInFlight() == 0);
+        this.owner.aheadReset();
+        drained();
+        this.cache.checkQuiescent();
+    }
+
     @Test
     void aLookaheadForALayerThatAsksForItsExpertsItselfLoadsNothing() throws Exception {
         build(9, 4);
