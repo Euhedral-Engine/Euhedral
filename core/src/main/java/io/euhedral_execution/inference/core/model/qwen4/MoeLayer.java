@@ -85,6 +85,8 @@ public final class MoeLayer implements AutoCloseable {
     // predictions of several layers may be in flight at once.
     private final java.util.Map<Integer, ExecutionGpu.ReadbackBuffer> predictedLogits =
             new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<Integer, ExecutionGpu.ReadbackBuffer> predictedIds =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final ExecutionGpu.ReadbackBuffer routeWeights;
     private final ExecutionGpu.UploadBuffer hostDescriptor;
     /// The device side: the description the kernels read and the predictions' logits, the workspace's (shared by
@@ -152,6 +154,18 @@ public final class MoeLayer implements AutoCloseable {
             this.descriptor = gpu.allocate(new ExpertRouting(experts, topK, maxRows).descriptorBytes());
         }
 
+        private final java.util.Map<Integer, long[]> predictionScratch = new java.util.concurrent.ConcurrentHashMap<>();
+
+        /// The logits, ids and weights of a row-wise prediction, one set for the graphs of this capacity: the
+        /// predictions of successive layers are ordered by the layers between them.
+        long[] predictionScratch(int experts, int topK, int maxRows) {
+            return this.predictionScratch.computeIfAbsent(0, key -> new long[] {
+                this.gpu.allocateAsync(2L * experts * maxRows),
+                this.gpu.allocateAsync(4L * topK * maxRows),
+                this.gpu.allocateAsync(2L * topK * maxRows)
+            });
+        }
+
         long predicted(int layer, int experts) {
             return this.predicted.computeIfAbsent(layer, l -> this.gpu.allocateAsync(2L * experts));
         }
@@ -162,6 +176,8 @@ public final class MoeLayer implements AutoCloseable {
             if (this.closed) return;
             this.closed = true;
             for (long buffer : this.predicted.values()) this.gpu.free(buffer);
+            for (long[] scratch : this.predictionScratch.values()) for (long buffer : scratch) this.gpu.free(buffer);
+            this.predictionScratch.clear();
             this.predicted.clear();
             this.gpu.free(this.descriptor);
         }
@@ -486,6 +502,7 @@ public final class MoeLayer implements AutoCloseable {
 
     private void release() {
         for (ExecutionGpu.ReadbackBuffer buffer : this.predictedLogits.values()) buffer.close();
+        for (ExecutionGpu.ReadbackBuffer buffer : this.predictedIds.values()) buffer.close();
         if (this.ownsDevice) this.device.close();
         this.hostDescriptor.close();
         this.routeIds.close();
@@ -505,6 +522,39 @@ public final class MoeLayer implements AutoCloseable {
         Ops.linearBf16(this.gpu, input, ahead.router().address(), device, 1, this.hidden, this.experts);
         this.gpu.copyDeviceToReadback(logits, device, 2L * this.experts);
     }
+
+    /// Queues a later layer's router (`ahead`) applied to `layer`'s `rows` rows, with the router's own top-k selection:
+    /// the experts the block will mostly ask for, read back for [#takePredictedSet].
+    void submitPredictionRows(int layer, Weights ahead, long input, int rows) {
+        long[] scratch = this.device.predictionScratch(this.experts, this.topK, this.maxRows);
+        Ops.linearBf16(this.gpu, input, ahead.router().address(), scratch[0], rows, this.hidden, this.experts);
+        MoeOps.router(this.gpu, scratch[0], scratch[1], scratch[2], rows, this.experts, this.topK);
+        ExecutionGpu.ReadbackBuffer ids = this.predictedIds.computeIfAbsent(
+                layer, l -> this.gpu.allocateReadbackBuffer(4L * this.maxRows * this.topK));
+        this.gpu.copyDeviceToReadback(ids, scratch[1], 4L * rows * this.topK);
+    }
+
+    /// The experts `layer`'s row-wise prediction ([#submitPredictionRows], retired) names for any of `rows` rows, the
+    /// most named first.
+    int[] takePredictedSet(int layer, int rows) {
+        MemorySegment ids = this.predictedIds.get(layer).segment();
+        int[] count = new int[this.experts];
+        for (int i = 0; i < rows * this.topK; i++) {
+            int id = ids.getAtIndex(INT_LAYOUT, i);
+            if (id >= 0 && id < this.experts) count[id]++;
+        }
+        int named = 0;
+        for (int c : count) if (c > 0) named++;
+        long[] keyed = new long[named];
+        int at = 0;
+        for (int e = 0; e < this.experts; e++) if (count[e] > 0) keyed[at++] = ((long) -count[e] << 32) | e;
+        java.util.Arrays.sort(keyed);
+        int[] set = new int[named];
+        for (int i = 0; i < named; i++) set[i] = (int) (keyed[i] & 0xFFFFFFFFL);
+        return set;
+    }
+
+    private static final java.lang.foreign.ValueLayout.OfInt INT_LAYOUT = java.lang.foreign.ValueLayout.JAVA_INT;
 
     /// The `k` experts `layer`'s prediction ([#submitPrediction], retired) ranks best, best first. A selection over
     /// the read-back logits: no sort, no boxing.
