@@ -80,12 +80,13 @@ public final class Qwen4Model implements AutoCloseable {
             Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_READ_PARTS", "1")));
 
     /// Copy streams the experts' device copies are spread over: an order of copies on the device,
-    /// independent of the staging buffers and of the loads in flight. One: one stream takes the copies
-    /// of every buffer and reaches the same transfer rate as several. `euhedral.qwen4.copy-streams`
+    /// independent of the staging buffers and of the loads in flight. Four: the copies of a layer's misses, or of a
+    /// prefill layer's records, then run side by side instead of one behind the other (one stream: decode -4%,
+    /// prefill 4096 -5%; eight streams are no better in decode). `euhedral.qwen4.copy-streams`
     /// (or `EUHEDRAL_QWEN4_COPY_STREAMS`) overrides it for benchmarks.
     static final int COPY_STREAMS = Integer.getInteger(
             "euhedral.qwen4.copy-streams",
-            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_COPY_STREAMS", "1")));
+            Integer.parseInt(System.getenv().getOrDefault("EUHEDRAL_QWEN4_COPY_STREAMS", "4")));
 
     /// Whether the RAM tier may be pinned host memory; `EUHEDRAL_QWEN4_PIN_TIER=0` keeps it pageable, for
     /// benchmarks.
