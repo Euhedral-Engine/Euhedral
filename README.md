@@ -48,15 +48,6 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | `nvfp4` | 3,929 | 2,754 | 2,088 | 1,347 |
 | `nvfp4-compressed` | 3,867 | 2,727 | 2,064 | 1,356 |
 
-**Time to first token**
-
-| Artifact | 4K | 32K | 64K | 128K |
-|---|---|---|---|---|
-| `q3` | 2.13 s | 21.2 s | 49.1 s | 133 s |
-| `q3-compressed` | 2.14 s | 21.1 s | 48.5 s | 129 s |
-| `nvfp4` | 1.02 s | 11.9 s | 30.5 s | 95.3 s |
-| `nvfp4-compressed` | 1.05 s | 12.0 s | 30.8 s | 94.7 s |
-
 **Decode (tokens/s, MTP)**
 
 | Artifact | 4K | 32K | 64K | 128K |
@@ -65,6 +56,15 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | `q3-compressed` | 94.6 | 91.7 | 82.2 | 63.6 |
 | `nvfp4` | 116.2 | 101.1 | 72.1 | 29.8 |
 | `nvfp4-compressed` | 146.4 | 102.2 | 87.7 | 52.2 |
+
+**Time to first token**
+
+| Artifact | 4K | 32K | 64K | 128K |
+|---|---|---|---|---|
+| `q3` | 2.13 s | 21.2 s | 49.1 s | 133 s |
+| `q3-compressed` | 2.14 s | 21.1 s | 48.5 s | 129 s |
+| `nvfp4` | 1.02 s | 11.9 s | 30.5 s | 95.3 s |
+| `nvfp4-compressed` | 1.05 s | 12.0 s | 30.8 s | 94.7 s |
 
 The 4K and 32K rows run with the default 32,768-token context; the 64K and 128K rows set `max-context-tokens` to 65,536
 and 131,072. Each prompt is followed by 128 generated tokens (64 at 128K). The 128K prompt is generated text; the others are
