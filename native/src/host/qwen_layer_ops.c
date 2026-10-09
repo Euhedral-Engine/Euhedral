@@ -40,6 +40,7 @@ static CUfunction gdn_gated_rms_norm;
 static CUfunction gdn_project_control, gdn_project_control_tiled;
 static CUfunction residual_add;
 static CUfunction argmax_bf16;
+static CUfunction argmax_logprob_bf16;
 static CUfunction residual_rms_norm, residual_rms_norm_row;
 static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
@@ -93,6 +94,12 @@ static void initialize_modules(void) {
     }
     init_status = euhedral_cuda_load_kernel(&sampling_anchor, "sampling/kernels.cu", "euhedral_argmax_bf16", &sampling_module, &argmax_bf16);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
+    {
+        const char* const names[] = {"euhedral_argmax_logprob_bf16"};
+        CUfunction* const functions[] = {&argmax_logprob_bf16};
+        init_status = load_functions(sampling_module, names, functions, 1);
+        if (init_status != CUDA_SUCCESS) return;
+    }
 
     init_status = euhedral_cuda_load_kernel(&attention_anchor, "attention/kernels.cu", "euhedral_attention_qk_norm_rope_bf16",
             &attention_module, &attention_qk_norm_rope);
@@ -122,6 +129,7 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(linear_bf16_to_float);
     euhedral_cuda_pdl_register(gdn_control);
     euhedral_cuda_pdl_register(argmax_bf16);
+    euhedral_cuda_pdl_register(argmax_logprob_bf16);
     euhedral_cuda_pdl_register(gdn_project_control);
     euhedral_cuda_pdl_register(residual_rms_norm);
     euhedral_cuda_pdl_register(residual_rms_norm_row);
@@ -402,6 +410,18 @@ int euhedral_cuda_argmax_bf16(const void* device_logits, uint32_t count, void* d
     CUdeviceptr result = (CUdeviceptr)(uintptr_t)device_result;
     void* parameters[] = {&logits, &count, &result};
     return launch_and_synchronize(argmax_bf16, 1, 1024, parameters);
+}
+
+int euhedral_cuda_argmax_logprob_bf16(const void* device_logits, uint32_t count, void* device_result) {
+    if (device_logits == NULL || device_result == NULL || count == 0) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    int status = euhedral_cuda_bind_thread_context();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    status = ensure_initialized();
+    if (status != EUHEDRAL_CUDA_SUCCESS) return status;
+    CUdeviceptr logits = (CUdeviceptr)(uintptr_t)device_logits;
+    CUdeviceptr result = (CUdeviceptr)(uintptr_t)device_result;
+    void* parameters[] = {&logits, &count, &result};
+    return launch_and_synchronize(argmax_logprob_bf16, 1, 1024, parameters);
 }
 
 int euhedral_cuda_swiglu_bf16(

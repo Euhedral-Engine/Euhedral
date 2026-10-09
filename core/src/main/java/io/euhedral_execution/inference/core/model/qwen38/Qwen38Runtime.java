@@ -191,7 +191,7 @@ public final class Qwen38Runtime implements ModelRuntime {
                 prefillChunkTokens,
                 release::accept);
         switch (speculation(options, this.profile, this.plan.drafts(), this.plan.draftsWithDFlash2())) {
-            case MTP -> session.enableSpeculativeDecoding(this.profile.speculativeDepth());
+            case MTP -> session.enableSpeculativeDecoding(this.profile.draftLength());
             case DFLASH2 -> session.useSpeculativeDecoding(DFlash2Decoder.factory(this.profile.speculativeDepth()));
             case NONE -> {}
         }

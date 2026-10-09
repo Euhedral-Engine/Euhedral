@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
@@ -72,32 +73,44 @@ class SpeculativeDecodeCudaIntegrationTest {
                         ordinaryPosition = ordinary.currentTokenPosition() - 1;
                         ordinary.complete();
                     }
-                    var speculative = new Sequence(++id);
-                    try (var decoder =
-                            new MtpDecoder(runtime, plan, gpu, speculative, tokenizer::isGenerationEosToken, 3, 512)) {
-                        List<Integer> actual = decoder.generate(prompt, budget, token -> {});
-                        System.out.println("prompt of " + prompt.length + " tokens, " + expected.size() + " generated: "
-                                + decoder.statistics());
-                        assertEquals(expected, actual, "speculative tokens");
-                        assertEquals(
-                                prompt.length
-                                        + expected.size()
-                                        - (tokenizer.isGenerationEosToken(expected.getLast()) ? 1 : 0),
-                                speculative.currentTokenPosition());
-                        assertEquals(ordinaryPosition, speculative.currentTokenPosition());
-                        try (var logits =
-                                new HostLogits(gpu, model.weights().config().vocabSize())) {
-                            logits.selectOnDevice(true);
+                    // A fixed length and a confidence-gated one: both are greedy decode.
+                    for (DraftLength length : List.of(DraftLength.fixed(3), new DraftLength(3, 7, 1, -0.5f))) {
+                        var speculative = new Sequence(++id);
+                        try (var decoder = new MtpDecoder(
+                                runtime,
+                                plan,
+                                gpu,
+                                speculative,
+                                tokenizer::isGenerationEosToken,
+                                length,
+                                512,
+                                length.most())) {
+                            List<Integer> actual = decoder.generate(prompt, budget, token -> {});
+                            System.out.println(length + ", prompt of " + prompt.length + " tokens, " + expected.size()
+                                    + " generated: " + decoder.statistics());
+                            assertEquals(expected, actual, "speculative tokens");
                             assertEquals(
-                                    expectedNext, probe(runtime, plan, speculative, logits), "decode after generation");
+                                    prompt.length
+                                            + expected.size()
+                                            - (tokenizer.isGenerationEosToken(expected.getLast()) ? 1 : 0),
+                                    speculative.currentTokenPosition());
+                            assertEquals(ordinaryPosition, speculative.currentTokenPosition());
+                            try (var logits =
+                                    new HostLogits(gpu, model.weights().config().vocabSize())) {
+                                logits.selectOnDevice(true);
+                                assertEquals(
+                                        expectedNext,
+                                        probe(runtime, plan, speculative, logits),
+                                        "decode after generation");
+                            }
+                            List<byte[]> actualState =
+                                    snapshot(gpu, model.weights().config().layerTypes(), speculative);
+                            assertEquals(expectedState.size(), actualState.size());
+                            for (int i = 0; i < expectedState.size(); i++)
+                                assertArrayEquals(expectedState.get(i), actualState.get(i), "state block " + i);
+                        } finally {
+                            speculative.complete();
                         }
-                        List<byte[]> actualState =
-                                snapshot(gpu, model.weights().config().layerTypes(), speculative);
-                        assertEquals(expectedState.size(), actualState.size());
-                        for (int i = 0; i < expectedState.size(); i++)
-                            assertArrayEquals(expectedState.get(i), actualState.get(i), "state block " + i);
-                    } finally {
-                        speculative.complete();
                     }
                 }
             } finally {

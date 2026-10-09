@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
@@ -74,7 +75,14 @@ class MtpDraftConfidenceCudaIntegrationTest {
                     int promptIndex = index;
                     long started = System.nanoTime();
                     try (var decoder = new MtpDecoder(
-                            runtime, plan, gpu, sequence, tokenizer::isGenerationEosToken, drafts, 512, 1)) {
+                            runtime,
+                            plan,
+                            gpu,
+                            sequence,
+                            tokenizer::isGenerationEosToken,
+                            DraftLength.fixed(drafts),
+                            512,
+                            1)) {
                         decoder.observe(
                                 (position, current, proposal, logProbabilities, accepted) -> {
                                     try {

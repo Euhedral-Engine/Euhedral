@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
@@ -52,9 +53,9 @@ class CapturedQuantaCudaIntegrationTest {
         var artifactData = loaded.artifact();
         try (var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
-            int depth = ArtifactProfile.of(artifactData).speculativeDepth();
-            Run captured = generate(gpu, lattice, plan, tokenizer, prompts, depth, true);
-            Run submitted = generate(gpu, lattice, plan, tokenizer, prompts, depth, false);
+            DraftLength length = ArtifactProfile.of(artifactData).draftLength();
+            Run captured = generate(gpu, lattice, plan, tokenizer, prompts, length, true);
+            Run submitted = generate(gpu, lattice, plan, tokenizer, prompts, length, false);
             assertTrue(captured.replayed() > 100, "replayed quanta: " + captured.replayed());
             assertEquals(0, submitted.replayed());
             assertEquals(submitted.tokens(), captured.tokens(), "generated tokens");
@@ -72,7 +73,7 @@ class CapturedQuantaCudaIntegrationTest {
             ExecutionPlan plan,
             QwenTokenizer tokenizer,
             List<int[]> prompts,
-            int depth,
+            DraftLength length,
             boolean capture)
             throws Exception {
         var runtime = new Execution(lattice, plan, gpu, EuhedralInferenceRuntime.laneCount(), capture);
@@ -82,8 +83,8 @@ class CapturedQuantaCudaIntegrationTest {
             long id = capture ? 300 : 400;
             for (int[] prompt : prompts) {
                 var speculative = new Sequence(++id);
-                try (var decoder =
-                        new MtpDecoder(runtime, plan, gpu, speculative, tokenizer::isGenerationEosToken, depth, 512)) {
+                try (var decoder = new MtpDecoder(
+                        runtime, plan, gpu, speculative, tokenizer::isGenerationEosToken, length, 512, length.most())) {
                     tokens.add(decoder.generate(prompt, 160, token -> {}));
                     accepted.add(decoder.statistics().acceptedDrafts.clone());
                 } finally {

@@ -15,6 +15,7 @@ import io.euhedral_execution.inference.core.generation.TokenRecord;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PromptCheckpoints;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeCheckpoint;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeDecoding;
@@ -147,9 +148,16 @@ public final class Session implements GenerationSession {
     /// `depth` drafts per verification: the same tokens and state as one-row greedy decode, in fewer
     /// sequential steps (docs/MTP_CONTRACT.md). Requires a plan with a loaded MTP layer and draft head.
     public void enableSpeculativeDecoding(int depth) {
-        if (depth < 0 || depth > 7) throw new IllegalArgumentException("depth must be 0 to 7");
-        if (depth > 0 && !this.plan.drafts()) throw new IllegalStateException("the model has no MTP draft view");
-        useSpeculativeDecoding(depth == 0 ? null : MtpDecoder.factory(depth));
+        if (depth < 0 || depth > MtpDecoder.MAX_VERIFIED)
+            throw new IllegalArgumentException("depth must be 0 to " + MtpDecoder.MAX_VERIFIED);
+        if (depth == 0) useSpeculativeDecoding(null);
+        else enableSpeculativeDecoding(DraftLength.fixed(depth));
+    }
+
+    /// As [#enableSpeculativeDecoding(int)], drafting `length` tokens per verification.
+    public void enableSpeculativeDecoding(DraftLength length) {
+        if (!this.plan.drafts()) throw new IllegalStateException("the model has no MTP draft view");
+        useSpeculativeDecoding(MtpDecoder.factory(length));
     }
 
     /// Generates greedy, unconstrained calls from a fresh sequence with the speculative strategy `factory`

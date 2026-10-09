@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Inventory;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import java.util.Locale;
 
 /// What an artifact is: its quantization, whether its projections are stored compressed, and which drafter it
@@ -36,16 +37,23 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         return this.speculation != Speculation.NONE;
     }
 
-    /// Drafts per verification: the depth that measured fastest for the artifact's quantization and
-    /// drafter (docs/MTP_VERIFIER.md, docs/DFLASH2.md). A Q3 verifier row costs more than an NVFP4 one,
-    /// whose decode kernels take 8 rows for little more than one, so Q3 drafts less deep. DFlash2 verifies
-    /// the first 6 of each block's 7 drafts.
+    /// Drafts per verification: [#draftLength]'s most for MTP; DFlash2 verifies the first 6 of each block's 7 drafts
+    /// (docs/DFLASH2.md).
     public int speculativeDepth() {
         return switch (this.speculation) {
             case NONE -> 0;
-            case MTP -> this.quantization == Quantization.Q3 ? 2 : 4;
+            case MTP -> draftLength().most();
             case DFLASH2 -> 6;
         };
+    }
+
+    /// How many tokens an MTP step drafts: the depth that measured fastest (docs/MTP_VERIFIER.md). A Q3 verifier row
+    /// costs more than an NVFP4 one, whose decode kernels take 8 rows for little more than one, so Q3 drafts less
+    /// deep. Lengths gated on the drafts' confidence measured no faster (docs/MTP_DRAFT_CONFIDENCE.md).
+    public DraftLength draftLength() {
+        if (this.speculation != Speculation.MTP)
+            throw new IllegalStateException("the artifact does not draft with MTP");
+        return DraftLength.fixed(this.quantization == Quantization.Q3 ? 2 : 4);
     }
 
     /// Reads the profile from a text layer's FFN down projection, which every artifact stores in its

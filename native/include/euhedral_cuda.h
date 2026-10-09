@@ -281,6 +281,9 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_residual_add_bf16(
  * is 0xFFFFFFFF minus the selected token ID (the lowest ID among equal maxima, never NaN or negative
  * infinity), or 0 when no logit is selectable. */
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_argmax_bf16(const void* device_logits, uint32_t count, void* device_result);
+/* As euhedral_cuda_argmax_bf16, writing 16 bytes: the key, then the selected logit's natural log softmax
+ * probability over the row as a float (0 when no logit is selectable). */
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_argmax_logprob_bf16(const void* device_logits, uint32_t count, void* device_result);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_swiglu_bf16(
         const void* device_gate_up,

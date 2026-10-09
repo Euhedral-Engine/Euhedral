@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Quantization;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -53,6 +54,8 @@ class ArtifactProfileTest {
         assertEquals(4, new ArtifactProfile(Quantization.NVFP4, false, true).speculativeDepth());
         assertEquals(4, new ArtifactProfile(Quantization.NVFP4, true, true).speculativeDepth());
         assertEquals(0, new ArtifactProfile(Quantization.NVFP4, false, false).speculativeDepth());
+        assertEquals(DraftLength.fixed(2), new ArtifactProfile(Quantization.Q3, true, true).draftLength());
+        assertEquals(DraftLength.fixed(4), new ArtifactProfile(Quantization.NVFP4, true, true).draftLength());
     }
 
     @Test

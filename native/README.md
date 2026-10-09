@@ -94,7 +94,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 | `test_attention_nvfp4.py` | NVFP4 KV format and attention against a mathematical oracle, the GQA decode kernel and the row twins bit for bit. |
 | `test_gdn_convolution.py`, `test_gdn_recurrence.py` | GDN convolution and recurrence against the frozen reference kernels. |
 | `test_qwen_regions.py` | Fused regions (control, residual norm, row-owned QK norm/RoPE) against the unfused numerical boundaries. |
-| `test_sampling_argmax.py` | Device greedy selection against the host argmax. |
+| `test_sampling_argmax.py` | Device greedy selection against the host argmax, and the scored selection against the host log-softmax. |
 | `test_products.py` | The installed CUDA products against `native-products.json`. |
 
 `native-products.json` defines the two supported targets: `x86_64-linux-gnu` (`linux-x64`)
