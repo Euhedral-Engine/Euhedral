@@ -409,6 +409,8 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     private int passedTag = -1;
 
     private int doneTag = -1;
+    /// Bumped by every reset: a load begun before it does not hold its slot.
+    private int aheadGeneration;
 
     private final java.util.ArrayList<ExpertLease>[] aheadHeld = newHolds();
     /// Whether the last lookahead load found the cache full, and the epoch it asked at.
@@ -474,6 +476,26 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
         });
     }
 
+    /// The quantum ended or stopped: every slot the lookahead holds is released and what is wanted is dropped, and
+    /// the loads still under way give their slots back when they arrive. Any thread.
+    public void aheadReset() {
+        if (AHEAD[0] <= 0) return;
+        post(() -> {
+            this.aheadGeneration++;
+            for (java.util.ArrayList<ExpertLease> held : this.aheadHeld) {
+                if (held == null) continue;
+                for (ExpertLease lease : held) lease.close();
+                this.aheadOutstanding -= held.size();
+                held.clear();
+            }
+            this.passedTag = -1;
+            this.doneTag = -1;
+            this.wantHead = 0;
+            this.wantCount = 0;
+            changed();
+        });
+    }
+
     /// Loads wanted records into device slots while the disk and the slots have room and no fetch waits. Called by
     /// the poll.
     private void pumpAhead() {
@@ -531,12 +553,14 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
     private static final class AheadTarget implements Fetch {
         private final ExpertCacheOwner owner;
         private final int tag;
+        private final int generation;
         /// Set by the poll once the load began, before any record of its arrival is applied.
         boolean loading;
 
         AheadTarget(ExpertCacheOwner owner, int tag) {
             this.owner = owner;
             this.tag = tag;
+            this.generation = owner.aheadGeneration;
         }
 
         @Override
@@ -554,7 +578,9 @@ public final class ExpertCacheOwner extends AbstractIngestSink {
                     lease.close();
                     return;
                 }
-                if (this.tag <= this.owner.doneTag || this.tag >= this.owner.aheadHeld.length) {
+                if (this.generation != this.owner.aheadGeneration
+                        || this.tag <= this.owner.doneTag
+                        || this.tag >= this.owner.aheadHeld.length) {
                     this.owner.aheadOutstanding--;
                     lease.close();
                     return;
