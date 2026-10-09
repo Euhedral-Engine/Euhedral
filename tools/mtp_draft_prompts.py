@@ -10,6 +10,9 @@ Three categories of eight prompts, rendered with the checkpoint's chat template 
   agentic  coding-agent transcripts with tool definitions, tool calls and real tool results (file reads, greps,
            test output), most with thinking enabled, ending where the agent's next turn starts.
 
+With --context TOKENS the set is long-context instead: the four chat document tasks over a document prefix of about
+TOKENS, and four agentic transcripts whose earlier turns read repository files until the prompt is about that long.
+
 Repository files are read at REV (default main), so the prompts do not depend on the working tree. Each line is
 {"name", "category", "thinking", "text"}.
 """
@@ -231,15 +234,75 @@ def prompts(revision: str):
     ]
 
 
+# Files an agent reads before the task, in order, to fill a long context.
+CONTEXT_FILES = [
+    "docs/MTP_CONTRACT.md",
+    "docs/MTP_VERIFIER.md",
+    SPECULATIVE + "SpeculativeDecoding.java",
+    SPECULATIVE + "MtpCheckpoint.java",
+    "docs/CUDA_GRAPHS.md",
+    "docs/DFLASH2.md",
+    SPECULATIVE + "DFlash2Decoder.java",
+    "docs/ATTENTION_DECODE.md",
+    "docs/NVFP4_NATIVE.md",
+    "docs/FRAME_MODEL.md",
+    "docs/PREFIX_CACHE.md",
+    "docs/NVFP4_RESIDENCY.md",
+]
+# English prose and code in this repository run about 3.6 characters per token.
+CHARACTERS_PER_TOKEN = 3.6
+
+
+def long_prompts(revision: str, tokens: int):
+    budget = int(tokens * CHARACTERS_PER_TOKEN)
+    document = show(revision, CORPUS).replace("\r\n", "\n")
+    quoted = []
+    for paragraph in document.split("\n\n"):
+        if sum(len(p) + 2 for p in quoted) + len(paragraph) > budget - 600:
+            break
+        quoted.append(paragraph)
+    prefix = "\n\n".join(quoted)
+    for index, task in enumerate(DOCUMENT_TASKS):
+        yield f"chat-document-{index}-{tokens}", "chat", False, None, [user("Here is a document:\n\n" + prefix + "\n\n" + task)]
+
+    decoder = show(revision, SPECULATIVE + "MtpDecoder.java")
+    acceptance = show(revision, SPECULATIVE + "SpeculativeAcceptance.java")
+    host_logits = show(revision, HOST_LOGITS)
+    tasks = [
+        ("agent-edit-statistics", "MtpDecoder.Statistics should also count verifications whose drafts were all accepted, "
+         "and print it in toString. Please add that.", SPECULATIVE + "MtpDecoder.java", decoder),
+        ("agent-explain-acceptance", "How does the MTP verifier decide how many drafts to accept, and what happens to the "
+         "state of rejected rows? Answer from the code.", SPECULATIVE + "SpeculativeAcceptance.java", acceptance),
+        ("agent-close-idempotent", "Make HostLogits.close() idempotent and add a test for it.", HOST_LOGITS, host_logits),
+        ("agent-tests-acceptance", "Write JUnit 5 tests for SpeculativeAcceptance covering partial, full and zero "
+         "acceptance and the output budget. Create the test file.", SPECULATIVE + "SpeculativeAcceptance.java", acceptance),
+    ]
+    for name, request, path, text in tasks:
+        messages = [{"role": "system", "content": AGENT_SYSTEM}, user(request)]
+        used, call_id = len(AGENT_SYSTEM) + len(request) + len(text) + 3000, 0
+        for context_path in CONTEXT_FILES:
+            content = show(revision, context_path)
+            if used + len(content) > budget:
+                continue
+            call_id += 1
+            messages += [turn([call(f"call_{call_id}", "read_file", {"path": context_path})]), result(f"call_{call_id}", content)]
+            used += len(content) + 200
+        call_id += 1
+        messages += [turn([call(f"call_{call_id}", "read_file", {"path": path})]), result(f"call_{call_id}", text)]
+        yield f"{name}-{tokens}", "agentic", True, TOOLS, messages
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("template")
     parser.add_argument("output")
     parser.add_argument("--revision", default="main")
+    parser.add_argument("--context", type=int, help="build the long-context set at about this many tokens")
     args = parser.parse_args(argv)
     template = compile_template(Path(args.template).read_text(encoding="utf-8"))
     with open(args.output, "w", encoding="utf-8") as out:
-        for name, category, thinking, tools, messages in prompts(args.revision):
+        entries = long_prompts(args.revision, args.context) if args.context else prompts(args.revision)
+        for name, category, thinking, tools, messages in entries:
             text = template.render(messages=messages, tools=tools, add_generation_prompt=True, enable_thinking=thinking)
             out.write(json.dumps({"name": name, "category": category, "thinking": thinking, "text": text}) + "\n")
     return 0

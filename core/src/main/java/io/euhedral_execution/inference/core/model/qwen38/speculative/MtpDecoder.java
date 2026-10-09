@@ -47,6 +47,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
     /// Per-generation measurements. `acceptedDrafts[a]` counts verifications that accepted a drafts.
     public static final class Statistics {
         public final long[] acceptedDrafts;
+        /// `draftLengths[n]` counts verifications that checked n drafts.
+        public final long[] draftLengths;
         public long verifications;
         public long outputTokens;
         public long verifyNanos;
@@ -62,6 +64,13 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
         Statistics(int depth) {
             this.acceptedDrafts = new long[depth + 1];
+            this.draftLengths = new long[depth + 1];
+        }
+
+        public double meanDraftLength() {
+            long sum = 0;
+            for (int n = 0; n < this.draftLengths.length; n++) sum += n * this.draftLengths[n];
+            return this.verifications == 0 ? 0 : (double) sum / this.verifications;
         }
 
         public double meanAcceptedDrafts() {
@@ -74,6 +83,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
         public String toString() {
             return "verifications " + this.verifications + ", output tokens " + this.outputTokens + ", accepted drafts "
                     + Arrays.toString(this.acceptedDrafts)
+                    + ", draft lengths "
+                    + Arrays.toString(this.draftLengths)
                     + ", shortlist rejections in/out " + this.rejectionsInShortlist + "/"
                     + this.rejectionsOutsideShortlist
                     + String.format(
@@ -110,8 +121,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
     private final ExecutionPlan plan;
     private final Sequence sequence;
     private final IntPredicate endOfGeneration;
-    private final int depth;
-    /// Drafts each verification checks: the first `verified` of the step's `depth`.
+    private final DraftLength length;
+    /// Drafts each verification checks at most: the first `verified` of the step's drafts.
     private final int verified;
     private final int prefillChunk;
     private final int hidden;
@@ -130,11 +141,12 @@ public final class MtpDecoder implements SpeculativeDecoding {
     /// The current generation's timing listener, or null.
     private GenerationTimingListener timing;
 
-    /// The MTP strategy at `depth` drafts per verification.
-    public static SpeculativeDecoding.Factory factory(int depth) {
-        if (depth < 1 || depth > 7) throw new IllegalArgumentException("depth must be 1 to 7");
+    /// The MTP strategy drafting `length` tokens per verification, all of them verified.
+    public static SpeculativeDecoding.Factory factory(DraftLength length) {
+        if (length.most() > MAX_VERIFIED)
+            throw new IllegalArgumentException("a verification checks at most " + MAX_VERIFIED + " drafts");
         return (runtime, plan, gpu, sequence, endOfGeneration, prefillChunk) ->
-                new MtpDecoder(runtime, plan, gpu, sequence, endOfGeneration, depth, prefillChunk);
+                new MtpDecoder(runtime, plan, gpu, sequence, endOfGeneration, length, prefillChunk, length.most());
     }
 
     public MtpDecoder(
@@ -145,10 +157,10 @@ public final class MtpDecoder implements SpeculativeDecoding {
             IntPredicate endOfGeneration,
             int depth,
             int prefillChunk) {
-        this(runtime, plan, gpu, sequence, endOfGeneration, depth, prefillChunk, depth);
+        this(runtime, plan, gpu, sequence, endOfGeneration, DraftLength.fixed(depth), prefillChunk, depth);
     }
 
-    /// As the public constructor, drafting `depth` tokens per step (up to [#MAX_DRAFTS]) and verifying only the first
+    /// As the public constructor, drafting `length` tokens per step (up to [#MAX_DRAFTS]) and verifying only the first
     /// `verified` of them (up to [#MAX_VERIFIED]); drafts past them reach only the step listener.
     public MtpDecoder(
             Execution runtime,
@@ -156,7 +168,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
             ExecutionGpu gpu,
             Sequence sequence,
             IntPredicate endOfGeneration,
-            int depth,
+            DraftLength length,
             int prefillChunk,
             int verified) {
         this.runtime = Objects.requireNonNull(runtime, "runtime");
@@ -164,11 +176,10 @@ public final class MtpDecoder implements SpeculativeDecoding {
         this.sequence = Objects.requireNonNull(sequence, "sequence");
         this.endOfGeneration = Objects.requireNonNull(endOfGeneration, "endOfGeneration");
         if (!plan.drafts()) throw new IllegalArgumentException("the plan has no MTP draft view");
-        if (depth < 1 || depth > MAX_DRAFTS) throw new IllegalArgumentException("depth must be 1 to " + MAX_DRAFTS);
-        if (verified < 1 || verified > Math.min(depth, MAX_VERIFIED))
-            throw new IllegalArgumentException("verified must be 1 to min(depth, " + MAX_VERIFIED + ")");
+        this.length = Objects.requireNonNull(length, "length");
+        if (verified < 1 || verified > Math.min(length.most(), MAX_VERIFIED))
+            throw new IllegalArgumentException("verified must be 1 to min(most drafts, " + MAX_VERIFIED + ")");
         if (prefillChunk <= 0) throw new IllegalArgumentException("prefillChunk must be positive");
-        this.depth = depth;
         this.verified = verified;
         this.prefillChunk = prefillChunk;
         this.hidden = plan.weights().config().hiddenSize();
@@ -176,6 +187,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
         this.draftLogits = new HostLogits(gpu, plan.draftVocabularySize());
         this.baseLogits.selectOnDevice(true);
         this.draftLogits.selectOnDevice(true);
+        this.draftLogits.scoreOnDevice(length.gated());
         this.draftTokens = draftTokenIds(gpu, plan);
         this.inShortlist = new boolean[plan.weights().config().vocabSize()];
         for (int token : this.draftTokens)
@@ -216,10 +228,13 @@ public final class MtpDecoder implements SpeculativeDecoding {
     }
 
     /// The draft head's row of the draft quantum that just retired: its greedy choice, as the device argmax makes it
-    /// (the lowest row among equal maxima). With a listener the row is on the host, and its log-softmax at that row
-    /// is kept in `draftLogProbability`.
+    /// (the lowest row among equal maxima). Its log-softmax at that row is kept in `draftLogProbability`: from the
+    /// device when the draft length is gated (NaN when unscored), or from the host row with a listener.
     private int draftRow() {
-        if (this.draftLogits.hasSelection()) return this.draftLogits.selectedToken();
+        if (this.draftLogits.hasSelection()) {
+            this.draftLogProbability = this.draftLogits.selectedLogProbability();
+            return this.draftLogits.selectedToken();
+        }
         MemorySegment row = this.draftLogits.row();
         int count = this.draftLogits.vocabularySize();
         int best = -1;
@@ -344,6 +359,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
         private int[] recursionDrafts;
         private float[] recursionLogProbabilities;
         private int recursionIndex;
+        private double recursionScore;
         private long recursionBase;
         private long recursionStarted;
         private AttentionStates recursionStates;
@@ -582,15 +598,16 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 this.timing.draftQuantum(
                         this.catchUpOfPrompt ? "prompt-catch-up" : "catch-up", this.catchUpStarted, caughtUpAt);
             if (!this.catchUpDraft) return afterCatchUp(null);
-            this.recursionDrafts = new int[depth];
-            this.recursionLogProbabilities = new float[depth];
+            this.recursionDrafts = new int[length.most()];
+            this.recursionLogProbabilities = new float[length.most()];
             this.recursionDrafts[0] = draftTokens[draftRow()];
             this.recursionLogProbabilities[0] = draftLogProbability;
+            this.recursionScore = draftLogProbability;
             this.recursionIndex = 1;
             this.recursionBase = this.catchUpPosition + this.catchUpTokens.length;
             this.recursionStates = states();
             this.recursionStarted = System.nanoTime();
-            return this.recursionIndex < depth ? this.recurse : recursed();
+            return length.continues(this.recursionIndex, this.recursionScore) ? this.recurse : recursed();
         }
 
         /// Recursive draft rows, each seeded by the MTP's own hidden of the previous row.
@@ -615,17 +632,19 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 succeeded(step);
                 recursionDrafts[recursionIndex] = draftTokens[draftRow()];
                 recursionLogProbabilities[recursionIndex] = draftLogProbability;
+                recursionScore += draftLogProbability;
                 recursionIndex++;
-                return recursionIndex < depth ? this : recursed();
+                return length.continues(recursionIndex, recursionScore) ? this : recursed();
             }
         };
 
         private StepPort recursed() {
             long recursedAt = System.nanoTime();
             if (!this.catchUpOfPrompt) statistics.recursionNanos += recursedAt - this.recursionStarted;
-            if (this.timing != null && depth > 1)
+            if (this.timing != null && this.recursionIndex > 1)
                 this.timing.draftQuantum("recursion", this.recursionStarted, recursedAt);
-            return afterCatchUp(this.recursionDrafts);
+            this.recursionLogProbabilities = Arrays.copyOf(this.recursionLogProbabilities, this.recursionIndex);
+            return afterCatchUp(Arrays.copyOf(this.recursionDrafts, this.recursionIndex));
         }
 
         private StepPort afterCatchUp(int[] newDrafts) {
@@ -682,9 +701,10 @@ public final class MtpDecoder implements SpeculativeDecoding {
         private final StepPort verify = new StepPort() {
             @Override
             public void admit(AbstractFrame select) {
-                rows = new int[verified + 1];
+                int checked = Math.min(drafts.length, verified);
+                rows = new int[checked + 1];
                 rows[0] = current;
-                System.arraycopy(drafts, 0, rows, 1, verified);
+                System.arraycopy(drafts, 0, rows, 1, checked);
                 position = sequence.currentTokenPosition();
                 int budget = maxNewTokens - output.size();
                 acceptance = new SpeculativeAcceptance(rows, endOfGeneration, everyPosition ? 1 : budget);
@@ -711,6 +731,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 statistics.verifyNanos += executed - started;
                 statistics.verifications++;
                 statistics.acceptedDrafts[acceptance.acceptedDrafts()]++;
+                statistics.draftLengths[rows.length - 1]++;
                 int[] committed = acceptance.outputs();
                 int rejected = acceptance.rejectedBaseToken();
                 boolean[] shortlist = inShortlist;

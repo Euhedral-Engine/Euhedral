@@ -1,6 +1,7 @@
 """Device greedy selection against the host argmax: strict comparison in token order, so the lowest
 token ID wins among equal maxima, and NaN or negative infinity never win."""
 import ctypes as C
+import math
 import random
 import struct
 import unittest
@@ -47,6 +48,43 @@ class SamplingArgmaxTest(unittest.TestCase):
             self.gpu.free(logits)
             self.gpu.free(result)
         return -1 if key == 0 else 0xFFFFFFFF - (key & 0xFFFFFFFF)
+
+    def select_scored(self, row, offset_elements=0):
+        data = struct.pack(f'<{offset_elements + len(row)}H', *([0] * offset_elements + row))
+        logits = self.gpu.upload(data)
+        result = self.gpu.zeros(16, fill=0xA5)
+        try:
+            self.gpu.launch('euhedral_argmax_logprob_bf16', 1,
+                            [C.c_uint64(logits + 2 * offset_elements), C.c_uint(len(row)), C.c_uint64(result)],
+                            block=1024)
+            key, log_probability = struct.unpack('<Qf', self.gpu.download(result, 12))
+        finally:
+            self.gpu.free(logits)
+            self.gpu.free(result)
+        return (-1 if key == 0 else 0xFFFFFFFF - (key & 0xFFFFFFFF)), log_probability
+
+    def test_scored_selection_matches_the_host_argmax_and_log_softmax(self):
+        rng = random.Random(99)
+        for count in (1, 9, 1024, 8193, 131072, 248320):
+            for offset in (0, 3):
+                # Logits of a trained head: mostly small, one or a few large.
+                row = [struct.unpack('<I', struct.pack('<f', rng.gauss(0.0, 3.0)))[0] >> 16 for _ in range(count)]
+                for _ in range(rng.randrange(1, 4)):
+                    row[rng.randrange(count)] = struct.unpack('<I', struct.pack('<f', rng.uniform(5.0, 30.0)))[0] >> 16
+                values = [to_float(bits) for bits in row]
+                peak = max(values)
+                expected = -math.log(sum(math.exp(v - peak) for v in values))
+                with self.subTest(count=count, offset=offset):
+                    token, log_probability = self.select_scored(row, offset)
+                    self.assertEqual(token, host_argmax(row))
+                    self.assertAlmostEqual(log_probability, expected, delta=1e-4 + 1e-5 * abs(expected))
+
+    def test_scored_selection_skips_unselectable_logits(self):
+        token, log_probability = self.select_scored([NAN, 0x3F80, NEG_INF, 0x3F80])
+        self.assertEqual(token, 1)
+        self.assertAlmostEqual(log_probability, -math.log(2.0), places=6)
+        token, log_probability = self.select_scored([NAN, NEG_INF] * 5)
+        self.assertEqual((token, log_probability), (-1, 0.0))
 
     def test_random_rows_match_the_host_argmax(self):
         rng = random.Random(4242)

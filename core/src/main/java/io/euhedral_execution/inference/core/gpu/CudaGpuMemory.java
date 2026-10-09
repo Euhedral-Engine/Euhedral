@@ -137,6 +137,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle dflashTopKBf16;
     private final MethodHandle dflashSelectBf16;
     private final MethodHandle argmaxBf16;
+    private final MethodHandle argmaxLogProbabilityBf16;
     private final MethodHandle zeroDeviceMemory;
     private final MethodHandle tableLaunch;
     private final MethodHandle tableKernelCount;
@@ -519,6 +520,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     "euhedral_cuda_dflash_select_bf16",
                     FunctionDescriptor.of(i32, p, p, p, p, p, p, i32, i32, p, p));
             this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
+            this.argmaxLogProbabilityBf16 = bind(linker, symbols, "euhedral_cuda_argmax_logprob_bf16", ARGMAX_BF16);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
             this.tableLaunch = bind(
                     linker,
@@ -2520,6 +2522,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (status == KERNEL_UNAVAILABLE) return false;
         if (status != 0) throw new GpuMemoryException("BF16 argmax", status);
+        return true;
+    }
+
+    @Override
+    public boolean argmaxLogProbabilityBf16(long logitsAddress, int count, long resultAddress) {
+        ensureOpen();
+        requireAddresses(logitsAddress, resultAddress);
+        if (count <= 0) throw new IllegalArgumentException("logit count must be positive");
+        int status;
+        try {
+            status = (int) argmaxLogProbabilityBf16.invokeExact(
+                    MemorySegment.ofAddress(logitsAddress), count, MemorySegment.ofAddress(resultAddress));
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("BF16 argmax with log-probability invocation failed", throwable);
+        }
+        if (status == KERNEL_UNAVAILABLE) return false;
+        if (status != 0) throw new GpuMemoryException("BF16 argmax with log-probability", status);
         return true;
     }
 

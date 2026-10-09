@@ -90,7 +90,72 @@ A gate that knew the outcome would draft exactly the drafts the verification acc
 4.09 tokens per verification over all prompts at 7 drafts (chat 3.47, code 4.64, agentic 4.71) and 4.43 at 16
 (3.60, 5.23, 5.44): that is the most a draft-length policy can extract from the head as it is.
 
+## In the decoder
+
+`DraftLength` (least, most, step, threshold) sets how many tokens an MTP step drafts:
+- the step drafts `least`, then continues in blocks of `step` while the drafts' summed log-probability stays at or
+  above the threshold, up to `most`;
+- `DraftLength.fixed(n)` is the fixed depth, which every artifact runs.
+
+With a gated length the draft quanta select with `euhedral_argmax_logprob_bf16`, which returns the shortlist
+argmax and its log-softmax in one pass over the row (`HostLogits.scoreOnDevice`). The host then applies the rule
+between recursion quanta. Gated lengths are greedy decode in tokens and state (`SpeculativeDecodeCudaIntegrationTest`),
+and the replay above reproduces their verification counts exactly.
+
+`MtpDraftLengthScreenCudaIntegrationTest` measures lengths in one process:
+- every arm generates every prompt, alternating per prompt;
+- each rate is committed tokens over verification, catch-up and drafting time;
+- every arm must generate the same tokens.
+
+Setup:
+- `nvfp4-compressed`, 256 tokens, one round;
+- the 24 prompts above, with residency planned for 16K;
+- `tools/mtp_draft_prompts.py --context` sets at 16K (four chat document tasks, four agent transcripts with earlier
+  file reads) and at 32K.
+
+Decode tok/s, all prompts / chat / code / agentic:
+
+| Context | Arm | Tok/s | Tokens / verification |
+|---|---|---|---|
+| 1-9K | MTP4 | 113.5 / 105.3 / 116.6 / 123.9 | 3.47 |
+| 1-9K | MTP6 | 117.2 / 103.9 / 122.5 / 135.7 | 3.95 |
+| 1-9K | per-token: 3-7, -0.5 | 115.3 / 102.5 / 124.2 / 125.9 | 3.81 |
+| 1-9K | blocks: 3 or 6, -0.5 | 115.8 / 105.1 / 122.4 / 125.8 | 3.79 |
+| 1-9K | blocks: 3 or 6, -0.25 | 115.4 / 105.0 / 121.0 / 126.0 | 3.70 |
+| 16K | MTP4 | 114.1 / 98.6 / - / 140.4 | 3.45 |
+| 16K | MTP6 | 117.0 / 96.2 / - / 157.5 | 3.88 |
+| 16K | blocks: 3 or 6, -0.5 | 114.5 / 94.5 / - / 153.2 | 3.77 |
+| 32K | MTP4 | 105.1 / 92.4 / - / 124.6 | 3.30 |
+| 32K | MTP5 | 104.2 / 91.7 / - / 123.5 | 3.46 |
+| 32K | MTP6 | 103.1 / 88.7 / - / 126.5 | 3.65 |
+
+A second process measured MTP4 at 113.4 and MTP6 at 116.4 on the 1-9K set. Processes vary by several percent on
+single prompts, so differences of 2-3% here are within noise.
+
+Step costs, averaged over the 1-9K set (ms per verification):
+
+| Arm | Verification | Catch-up | Drafting | Captured quanta replayed per verification |
+|---|---|---|---|---|
+| MTP4 | 25.97 | 1.31 | 3.26 | 3.63 |
+| MTP6 | 26.99 | 1.34 | 5.35 | 5.14 |
+| blocks: 3 or 6, -0.5 | 27.43 | 1.36 | 3.92 | 3.61 |
+| per-token: 3-7, -0.5 | 27.89 | 1.37 | 3.83 | 3.29 |
+
+Where the gated lengths' time goes:
+- **Drafts.** Each recursion draft costs 1.0-1.1 ms.
+- **Verified rows.** Each row costs 0.3-0.5 ms on these contexts.
+- **Fewer replays.** A verification's capture key holds its row count and the previous step's pending ReplaySSM rows
+  ([CUDA_GRAPHS.md](CUDA_GRAPHS.md)). Every length a gate chooses multiplies the keys a sequence must see twice
+  before replaying. Gated verifications therefore cost 1.2-1.9 ms more than MTP4's while checking 0.2-0.8 more drafts.
+
 ## Rejected
+
+- **Gated draft lengths in the decoder** (per-token 3-7 at -0.5; blocks of 3 or 6 at -0.25 and -0.5): 115.3-115.8
+  tok/s on the 1-9K set, 114.5 at 16K. They commit the drafts the replay predicts, but their extra drafts, rows
+  and capture keys cost what those drafts gain. The infrastructure stays, for screening a retrained head.
+- **MTP6 or MTP5 as the NVFP4 depth.** MTP6 measured 117.2 and 117.0 tok/s at 1-9K and 16K (agentic 135.7 and 157.5),
+  but 103.1 at 32K (chat 88.7). MTP5 measured 104.2 at 32K. Neither holds across contexts.
+- **More captures per stage graph** (32 instead of 8): MTP4 113.5 against 113.4 tok/s on the 1-9K set.
 
 - **Caps of 12 and 16 drafts** with the current head. Wider than 8 rows, verification pays for the exact 9-16-row
   linears, and the head's 0.70-0.85 per-draft acceptance rarely carries a chain that far. The best 16-draft policy
@@ -106,5 +171,7 @@ A gate that knew the outcome would draft exactly the drafts the verification acc
   0.70-0.85 per-draft acceptance, which bound every policy above. The training mix needs code and agentic data (tool
   calls, tool results, thinking) as well as chat: those sets fully accept 56-58% of MTP4 blocks, against 36% for chat,
   and gain the most from deeper drafts.
-- **A gated depth in the decoder**: the draft row's log-probability on the device (a log-sum-exp beside the shortlist
-  argmax), the stopping rule between recursion quanta, and VERIFY quanta captured at every row count from 2 to 8.
+- **Cheaper drafting.** Each recursion draft is one host-paced quantum of about 1 ms. Chaining a step's drafts on the
+  device, with the argmax feeding the next draft's embedding, would cut the per-draft cost that bounds every length.
+- **Capture keys independent of the pending ReplaySSM rows**, so that verifications after different acceptance counts
+  share captures.

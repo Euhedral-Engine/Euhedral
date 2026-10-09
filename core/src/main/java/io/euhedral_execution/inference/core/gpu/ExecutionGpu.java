@@ -505,6 +505,12 @@ public abstract class ExecutionGpu implements GpuMemory {
         return false;
     }
 
+    /// As [#argmaxBf16], writing 16 bytes: the key, then the selected logit's natural log softmax probability over
+    /// the row as a float (0 when no logit is selectable).
+    public boolean argmaxLogProbabilityBf16(long logitsAddress, int count, long resultAddress) {
+        return false;
+    }
+
     public void q3GateUpSwiGluBf16(
             long input, long weights, long output, int rows, int width, int outputs, long weightBytes) {
         throw new UnsupportedOperationException("Q3 gate/up SwiGLU region is not implemented");

@@ -359,6 +359,11 @@ public final class SynchronousReferenceGpu extends ExecutionGpu implements AutoC
     }
 
     @Override
+    public boolean argmaxLogProbabilityBf16(long logitsAddress, int count, long resultAddress) {
+        return this.delegate.argmaxLogProbabilityBf16(logitsAddress, count, resultAddress);
+    }
+
+    @Override
     public void selectRowExact(boolean enabled) {
         this.delegate.selectRowExact(enabled);
     }

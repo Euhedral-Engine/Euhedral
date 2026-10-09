@@ -16,8 +16,12 @@ import java.util.Objects;
 ///
 /// With device selection on, the quantum instead queues an argmax over the row and copies back its
 /// 8-byte result: the token the host argmax would choose, without the 0.5 MB row, its conversion or the
-/// host scan at the token boundary.
+/// host scan at the token boundary. With scoring on as well, the selection also carries the selected
+/// logit's log-probability under a softmax over the row (16 bytes).
 public final class HostLogits implements AutoCloseable {
+
+    /// A scored selection: the 8-byte key, then the log-probability as a float, padded.
+    private static final long SCORED_SELECTION_BYTES = 2 * Long.BYTES;
 
     private final ExecutionGpu gpu;
     private final int vocabularySize;
@@ -31,6 +35,10 @@ public final class HostLogits implements AutoCloseable {
     private int queuedRows;
     private int readyRows;
     private boolean selectOnDevice;
+    private boolean scoreOnDevice;
+    /// Whether the queued or latest retired selection carries a log-probability.
+    private boolean queuedScore;
+    private boolean scored;
     private boolean queued;
     private boolean queuedSelection;
     private boolean ready;
@@ -49,7 +57,10 @@ public final class HostLogits implements AutoCloseable {
     }
 
     public void fingerprint(CaptureFingerprint fingerprint) {
-        fingerprint.add(this.selectOnDevice ? 1 : 0).add(this.gpu, this.deviceSelection);
+        fingerprint
+                .add(this.selectOnDevice ? 1 : 0)
+                .add(this.scoreOnDevice ? 1 : 0)
+                .add(this.gpu, this.deviceSelection);
         fingerprint.add(this.gpu, this.deviceRowSelections);
         fingerprint.add(this.rowSelectionCapacity);
         for (ExecutionGpu.ReadbackBuffer buffer :
@@ -63,6 +74,12 @@ public final class HostLogits implements AutoCloseable {
         this.selectOnDevice = enabled;
     }
 
+    /// Whether device selections of the final row also score the selected logit ([#selectedLogProbability]).
+    /// Applies only with device selection on; set between quanta.
+    public void scoreOnDevice(boolean enabled) {
+        this.scoreOnDevice = enabled;
+    }
+
     /// Queues the copy of the last of `rows` BF16 logits rows at `logitsAddress`, or of its device
     /// selection. The quantum's logits stage calls it with the quantum's stream selected, after
     /// launching the rows' producer.
@@ -74,11 +91,21 @@ public final class HostLogits implements AutoCloseable {
         long finalRow = Math.addExact(logitsAddress, Math.multiplyExact((long) (rows - 1), this.rowBytes));
         if (this.selectOnDevice) {
             // Allocated and pinned once per session, while the host runs ahead of the device.
-            if (this.deviceSelection == 0) this.deviceSelection = this.gpu.allocateAsync(Long.BYTES);
-            if (this.selection == null) this.selection = this.gpu.allocateReadbackBuffer(Long.BYTES);
+            // Sized for a scored selection, so that turning scoring on later reuses them.
+            if (this.deviceSelection == 0) this.deviceSelection = this.gpu.allocateAsync(SCORED_SELECTION_BYTES);
+            if (this.selection == null) this.selection = this.gpu.allocateReadbackBuffer(SCORED_SELECTION_BYTES);
+            if (this.scoreOnDevice
+                    && this.gpu.argmaxLogProbabilityBf16(finalRow, this.vocabularySize, this.deviceSelection)) {
+                this.gpu.copyDeviceToReadback(this.selection, this.deviceSelection, SCORED_SELECTION_BYTES);
+                this.queuedSelection = true;
+                this.queuedScore = true;
+                this.queued = false;
+                return;
+            }
             if (this.gpu.argmaxBf16(finalRow, this.vocabularySize, this.deviceSelection)) {
                 this.gpu.copyDeviceToReadback(this.selection, this.deviceSelection, Long.BYTES);
                 this.queuedSelection = true;
+                this.queuedScore = false;
                 this.queued = false;
                 return;
             }
@@ -126,6 +153,8 @@ public final class HostLogits implements AutoCloseable {
     public void retired(boolean succeeded) {
         this.ready = succeeded && this.queued;
         this.selectionReady = succeeded && this.queuedSelection;
+        this.scored = succeeded && this.queuedSelection && this.queuedScore;
+        this.queuedScore = false;
         this.readyRows = succeeded ? this.queuedRows : 0;
         this.queued = false;
         this.queuedSelection = false;
@@ -158,6 +187,14 @@ public final class HostLogits implements AutoCloseable {
         long key = this.selection.segment().get(ValueLayout.JAVA_LONG, 0);
         if (key == 0) throw new IllegalArgumentException("logit row has no selectable token");
         return (int) (0xFFFF_FFFFL - (key & 0xFFFF_FFFFL));
+    }
+
+    /// The natural log of the selected token's softmax probability over the final row, when the selection was
+    /// scored on the device; NaN otherwise. Valid as [#selectedToken].
+    public float selectedLogProbability() {
+        if (!hasSelection()) throw new IllegalStateException("no retired device selection is available");
+        if (!this.scored) return Float.NaN;
+        return Float.intBitsToFloat(this.selection.segment().get(ValueLayout.JAVA_INT, Long.BYTES));
     }
 
     /// The final logits row, BF16 in vocabulary order. Valid after a successful quantum retired and
