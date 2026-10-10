@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from euhedral_artifacts import device, edrl, grouped, inventory, nvfp4, sources  # noqa: E402
+from euhedral_artifacts import device, edrl, grouped, importance, inventory, nvfp4, sources  # noqa: E402
 
 
 class GroupedQuantizationTest(unittest.TestCase):
@@ -239,6 +239,194 @@ class Nvfp4QuantizationTest(unittest.TestCase):
         data = output.getvalue()
         self.assertFalse(any(data[:table_offset]))
         self.assertEqual(struct.unpack("<f", data[table_offset + 16:table_offset + 20])[0], 0.0)
+
+
+def _torch_available():
+    try:
+        import torch  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _grouped_decode(scales, codes, group_size):
+    return (codes.reshape(scales.shape[0], -1, group_size).astype(np.float64)
+            * scales.astype(np.float64)[..., None]).reshape(scales.shape[0], -1)
+
+
+def _weighted_errors(restored, values, weights, block):
+    squared = (restored.astype(np.float64) - values) ** 2 * weights[None, :]
+    return squared.reshape(values.shape[0], -1, block).sum(axis=2)
+
+
+def _write_imatrix(path, entries):
+    """A llama.cpp importance-matrix GGUF: `entries` maps tensor names to (column sums, count)."""
+    tensors = []
+    for name, (sums, count) in entries.items():
+        tensors.append((name + ".in_sum2", np.asarray(sums, dtype="<f4")))
+        tensors.append((name + ".counts", np.asarray([count], dtype="<f4")))
+
+    def string(text):
+        data = text.encode()
+        return struct.pack("<Q", len(data)) + data
+
+    header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 1) + string("general.type") + struct.pack("<I", 8) + string("imatrix")
+    data, offset = b"", 0
+    for name, values in tensors:
+        header += string(name) + struct.pack("<IQIQ", 1, values.size, 0, offset)
+        padded = values.tobytes() + bytes(-len(values.tobytes()) % 32)
+        data += padded
+        offset += len(padded)
+    header += bytes(-len(header) % 32)
+    Path(path).write_bytes(header + data)
+
+
+class ImportanceMatrixTest(unittest.TestCase):
+    def test_reads_mean_squares_and_maps_objects_to_their_inputs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "imatrix.gguf"
+            _write_imatrix(path, {
+                "blk.3.attn_q.weight": ([2.0, 4.0, 6.0], 2.0),
+                "blk.4.attn_qkv.weight": ([1.0, 1.0, 1.0], 4.0),
+                "blk.4.ffn_down.weight": ([8.0, 0.0], 8.0),
+            })
+            matrix = importance.ImportanceMatrix(path)
+            np.testing.assert_array_equal(matrix.calibration("text/layers/3/attention/gate_value", 3).importance, [1, 2, 3])
+            np.testing.assert_array_equal(matrix.calibration("text/layers/4/gdn/value_z", 3).importance, [0.25] * 3)
+            np.testing.assert_array_equal(matrix.calibration("text/layers/4/mlp/down", 2).importance, [1, 0])
+            self.assertIsNone(matrix.calibration("text/output_head", 3).importance)
+            self.assertIsNone(matrix.calibration("mtp/layer/mlp/down", 2).importance)
+            with self.assertRaises(ValueError):
+                matrix.calibration("text/layers/4/mlp/down", 3)
+            with self.assertRaises(ValueError):
+                matrix.calibration("text/layers/5/mlp/gate_up", 3)
+
+    def test_weights_pad_with_zeros_or_are_uniform(self):
+        np.testing.assert_array_equal(importance.Calibration(np.array([3.0, 2.0])).weights(4), [3, 2, 0, 0])
+        np.testing.assert_array_equal(importance.Calibration().weights(3), [1, 1, 1])
+
+
+@unittest.skipUnless(_torch_available(), "PyTorch unavailable")
+class CalibratedQuantizationTest(unittest.TestCase):
+    """The calibrated (scale search) paths, run by PyTorch on the CPU."""
+
+    def setUp(self):
+        device.set_device("cpu")
+        self.rng = np.random.default_rng(21)
+        self.values = (self.rng.standard_normal((32, 256)) * self.rng.uniform(0.01, 2.0, (32, 1))).astype(np.float32)
+        self.weights = self.rng.uniform(0.0, 1.0, 256).astype(np.float32) ** 4
+
+    def test_grouped_search_never_loses_to_nearest_and_uses_the_negative_end(self):
+        for fmt in ("Q3G64_F16S", "Q4G64_F16S", "Q5G64_F16S"):
+            bits, group_size, qmin, qmax = grouped.QUANT[fmt]
+            with self.subTest(fmt=fmt):
+                scales, codes = grouped.quantize_group_codes_torch(self.values, group_size, qmin, qmax)
+                nearest = _grouped_decode(scales.numpy(), codes.numpy(), group_size)
+                scales, codes = grouped.search_group_codes_torch(self.values, group_size, qmin, qmax, self.weights)
+                searched = _grouped_decode(scales.numpy(), codes.numpy(), group_size)
+                before = _weighted_errors(nearest, self.values, self.weights, group_size)
+                after = _weighted_errors(searched, self.values, self.weights, group_size)
+                self.assertTrue((after <= before * (1 + 1e-12)).all())
+                self.assertLess(after.sum(), 0.8 * before.sum())
+                self.assertTrue((codes.numpy() == qmin).any())
+                self.assertTrue(np.isfinite(scales.numpy()).all() and (scales.numpy() >= 0).all())
+
+    def test_grouped_search_keeps_zero_groups_zero(self):
+        values = self.values.copy()
+        values[:, :64] = 0
+        scales, codes = grouped.search_group_codes_torch(values, 64, -4, 3, np.ones(256, np.float32))
+        self.assertFalse(scales.numpy()[:, 0].any())
+        self.assertFalse(codes.numpy().reshape(32, 4, 64)[:, 0].any())
+
+    def test_calibrated_matrix_writes_the_searched_planes(self):
+        matrix = sources.MatrixSource((32, 200), lambda begin, end: self.values[begin:end, :200])
+        output = io.BytesIO()
+        grouped.quantize_matrix(output, 0, matrix, "Q3G64_F16S", importance.Calibration(self.weights[:200]))
+        padded = np.zeros((32, 256), np.float32)
+        padded[:, :200] = self.values[:, :200]
+        weights = importance.Calibration(self.weights[:200]).weights(256)
+        scales, codes = grouped.search_group_codes_torch(padded, 64, -4, 3, weights)
+        base, _ = grouped.pack_codes_torch(codes, 3)
+        payload = output.getvalue()
+        scale_offset = edrl.align_up(len(base), 256)
+        self.assertEqual(payload[:len(base)], base)
+        self.assertEqual(payload[scale_offset:], scales.numpy().astype("<f2").tobytes())
+
+    def test_nvfp4_search_never_loses_to_nearest(self):
+        global_scale = nvfp4.nvfp4_global_scale(float(np.abs(self.values).max()))
+        nearest = nvfp4.dequantize_nvfp4_rows(*nvfp4.quantize_nvfp4_rows(self.values, global_scale), global_scale)
+        searched = nvfp4.dequantize_nvfp4_rows(*nvfp4.search_nvfp4_rows_torch(self.values, global_scale, self.weights),
+                                               global_scale)
+        before = _weighted_errors(nearest, self.values, self.weights, 16)
+        after = _weighted_errors(searched, self.values, self.weights, 16)
+        self.assertTrue((after <= before * (1 + 1e-9)).all())
+        self.assertLess(after.sum(), 0.9 * before.sum())
+
+    def test_calibrated_sd4_beats_uncalibrated_sd4_under_the_weights(self):
+        global_scale = nvfp4.nvfp4_global_scale(float(np.abs(self.values).max()))
+
+        def restored(weights, below):
+            table = nvfp4.sd4_table(nvfp4.sd4_costs_torch(self.values, global_scale, weights, below))
+            packed, indices = nvfp4.quantize_nvfp4_sd4_rows_torch(self.values, global_scale, table, weights, below)
+            return nvfp4.dequantize_nvfp4_rows(packed, nvfp4.expand_nvfp4_sd4(indices, table), global_scale)
+
+        plain = _weighted_errors(restored(None, nvfp4.SD4_BELOW), self.values, self.weights, 16).sum()
+        calibrated = _weighted_errors(restored(self.weights, nvfp4.SEARCH_BELOW), self.values, self.weights, 16).sum()
+        self.assertLess(calibrated, 0.9 * plain)
+
+    def test_uniform_weights_reproduce_the_uncalibrated_sd4_costs(self):
+        global_scale = nvfp4.nvfp4_global_scale(float(np.abs(self.values).max()))
+        # Weighted errors are ranked in float32.
+        np.testing.assert_allclose(nvfp4.sd4_costs_torch(self.values, global_scale, np.ones(256, np.float32)),
+                                   nvfp4.sd4_costs(self.values, global_scale), rtol=1e-5)
+
+    def test_device_rows_widen_bf16_words_exactly_through_every_view(self):
+        words = self.rng.integers(0, 1 << 16, size=(12, 200), dtype=np.uint16)
+        words[(words & 0x7F80) == 0x7F80] = 0x3F80  # no NaN or infinity
+        floats = sources.bf16_to_float32(words).copy()
+
+        def leaf(rows):
+            return sources.MatrixSource((rows.stop - rows.start, 200), lambda b, e: floats[rows][b:e].copy(),
+                                        lambda b, e: words[rows][b:e])
+
+        views = {
+            "leaf": leaf(slice(0, 12)),
+            "slice": sources.slice_matrix(leaf(slice(0, 12)), 3, 9),
+            "concat": sources.concat_matrix(leaf(slice(0, 5)), leaf(slice(5, 12))),
+        }
+        for name, matrix in views.items():
+            with self.subTest(view=name):
+                rows = matrix.shape[0]
+                actual = sources.device_rows(matrix, 1, rows, 256).cpu().numpy()
+                expected = np.zeros((rows - 1, 256), np.float32)
+                expected[:, :200] = matrix.read_rows(1, rows)
+                np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+
+    def test_calibrated_nvfp4_matrices_match_their_row_quantizers(self):
+        matrix = sources.MatrixSource((32, 256), lambda begin, end: self.values[begin:end])
+        calibration = importance.Calibration(self.weights)
+        global_scale = nvfp4.nvfp4_global_scale(float(np.abs(self.values).max()))
+
+        scale_offset, global_offset, size = nvfp4.nvfp4_offsets((32, 256))
+        output = io.BytesIO(bytes(size))
+        nvfp4.quantize_nvfp4_matrix(output, 0, matrix, calibration)
+        packed, scales = nvfp4.search_nvfp4_rows_torch(self.values, global_scale, self.weights)
+        data = output.getvalue()
+        self.assertEqual(data[:32 * 128], packed.tobytes())
+        self.assertEqual(data[scale_offset:scale_offset + 32 * 16], scales.tobytes())
+        self.assertEqual(data[global_offset:global_offset + 4], np.float32(global_scale).astype("<f4").tobytes())
+
+        index_offset, table_offset, size = nvfp4.nvfp4_sd4_offsets((32, 256))
+        output = io.BytesIO(bytes(size))
+        nvfp4.quantize_nvfp4_sd4_matrix(output, 0, matrix, calibration)
+        table = nvfp4.sd4_table(nvfp4.sd4_costs_torch(self.values, global_scale, self.weights, nvfp4.SEARCH_BELOW))
+        packed, indices = nvfp4.quantize_nvfp4_sd4_rows_torch(self.values, global_scale, table, self.weights,
+                                                              nvfp4.SEARCH_BELOW)
+        data = output.getvalue()
+        self.assertEqual(data[:32 * 128], packed.tobytes())
+        self.assertEqual(data[index_offset:index_offset + 32 * 8], indices.tobytes())
+        self.assertEqual(data[table_offset:table_offset + 16], table.tobytes())
 
 
 def _cuda_available():

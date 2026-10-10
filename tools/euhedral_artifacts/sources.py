@@ -8,6 +8,7 @@ import mmap
 from pathlib import Path
 import struct
 from typing import Any, Callable
+import warnings
 
 import numpy as np
 
@@ -147,13 +148,17 @@ class SourceStore:
 
 @dataclass
 class MatrixSource:
+    """Rows of a matrix: `read_rows` as float32, and `read_words` as the BF16 source words (uint16), which
+    device_rows widens on the GPU; None for sources that are not BF16."""
     shape: tuple[int, int]
     read_rows: Callable[[int, int], np.ndarray]
+    read_words: Callable[[int, int], np.ndarray] | None = None
 
 
 def source_matrix(store: SourceStore, name: str, shape: tuple[int, int]) -> MatrixSource:
     store.ref(name, shape)
-    return MatrixSource(shape, lambda begin, end: store.float_rows(name, begin, end, shape))
+    return MatrixSource(shape, lambda begin, end: store.float_rows(name, begin, end, shape),
+                        lambda begin, end: store.words(name, shape)[begin:end])
 
 
 
@@ -163,6 +168,8 @@ def slice_matrix(source: MatrixSource, begin: int, end: int) -> MatrixSource:
     return MatrixSource(
         (end - begin, source.shape[1]),
         lambda row_begin, row_end: source.read_rows(begin + row_begin, begin + row_end),
+        None if source.read_words is None
+        else lambda row_begin, row_end: source.read_words(begin + row_begin, begin + row_end),
     )
 
 
@@ -171,7 +178,7 @@ def concat_matrix(*sources: MatrixSource) -> MatrixSource:
         fail("matrix concatenation requires a common K dimension")
     shape = (sum(source.shape[0] for source in sources), sources[0].shape[1])
 
-    def read_rows(begin: int, end: int) -> np.ndarray:
+    def read(begin: int, end: int, words: bool) -> np.ndarray:
         parts: list[np.ndarray] = []
         cursor = 0
         for source in sources:
@@ -179,14 +186,16 @@ def concat_matrix(*sources: MatrixSource) -> MatrixSource:
             if begin < source_end and end > cursor:
                 local_begin = max(begin, cursor) - cursor
                 local_end = min(end, source_end) - cursor
-                parts.append(source.read_rows(local_begin, local_end))
+                parts.append((source.read_words if words else source.read_rows)(local_begin, local_end))
             cursor = source_end
         result = np.concatenate(parts, axis=0)
         if result.shape != (end - begin, shape[1]):
             fail("matrix concatenation produced an unexpected shape")
         return result
 
-    return MatrixSource(shape, read_rows)
+    all_words = all(source.read_words is not None for source in sources)
+    return MatrixSource(shape, lambda begin, end: read(begin, end, False),
+                        (lambda begin, end: read(begin, end, True)) if all_words else None)
 
 
 def head_part(store: SourceStore, name: str, gate: bool) -> MatrixSource:
@@ -195,14 +204,12 @@ def head_part(store: SourceStore, name: str, gate: bool) -> MatrixSource:
     store.ref(name, source_shape)
     base = 256 if gate else 0
 
-    def read_rows(begin: int, end: int) -> np.ndarray:
+    def source_rows(begin: int, end: int) -> np.ndarray:
         logical = np.arange(begin, end, dtype=np.int64)
-        heads = logical // 256
-        within = logical % 256
-        source_rows = heads * 512 + base + within
-        return store.float_indices(name, source_rows, source_shape)
+        return logical // 256 * 512 + base + logical % 256
 
-    return MatrixSource(shape, read_rows)
+    return MatrixSource(shape, lambda begin, end: store.float_indices(name, source_rows(begin, end), source_shape),
+                        lambda begin, end: store.words(name, source_shape)[source_rows(begin, end)])
 
 
 def gather_matrix(store: SourceStore, name: str, rows: np.ndarray) -> MatrixSource:
@@ -212,4 +219,27 @@ def gather_matrix(store: SourceStore, name: str, rows: np.ndarray) -> MatrixSour
     return MatrixSource(
         (int(rows.size), HIDDEN),
         lambda begin, end: store.float_indices(name, rows[begin:end], source_shape),
+        lambda begin, end: store.words(name, source_shape)[rows[begin:end]],
     )
+
+
+def device_rows(matrix: MatrixSource, begin: int, end: int, k_pad: int):
+    """Rows begin..end of `matrix` as a float32 tensor on the quantization device, zero-padded to `k_pad`
+    columns. BF16 sources are copied as their 16-bit words and widened on the device."""
+    from euhedral_artifacts import device
+    torch = device.torch()
+    if matrix.read_words is not None:
+        # The words are often a read-only view of the memory-mapped checkpoint; the host tensor over them is
+        # only copied to the device, never written, so PyTorch's warning about non-writable arrays does not apply.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            host = torch.from_numpy(np.ascontiguousarray(matrix.read_words(begin, end)).view(np.int16))
+        words = host.to(device.DEVICE)
+        values = ((words.to(torch.int32) & 0xFFFF) << 16).view(torch.float32)
+    else:
+        values = torch.from_numpy(np.ascontiguousarray(matrix.read_rows(begin, end), dtype=np.float32)).to(device.DEVICE)
+    if values.shape != (end - begin, matrix.shape[1]):
+        fail(f"matrix source returned {tuple(values.shape)}, expected {(end - begin, matrix.shape[1])}")
+    if k_pad != matrix.shape[1]:
+        values = torch.nn.functional.pad(values, (0, k_pad - matrix.shape[1]))
+    return values

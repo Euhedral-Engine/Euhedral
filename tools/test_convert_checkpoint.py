@@ -60,11 +60,17 @@ class ArgumentHandlingTest(unittest.TestCase):
         with mock.patch.object(convert_checkpoint, "convert") as convert:
             convert.return_value = {}
             self.assertEqual(run(*BASE, "--device", "cpu", "--jobs", "3", "--force")[0], 0)
-        model, out, recipe, ranking, draft_ids, jobs, force, draft, draft_projections = convert.call_args.args
+        model, out, recipe, ranking, draft_ids, jobs, force, draft, draft_projections, imatrix = convert.call_args.args
         self.assertEqual((model, out, ranking, draft_ids, jobs, force),
                          (Path("/m"), Path("/o.edrl"), None, Path("/a.edrl"), 3, True))
         self.assertEqual(recipe, recipes.Recipe("q3", False))
-        self.assertEqual((draft, draft_projections), (None, "bf16"))
+        self.assertEqual((draft, draft_projections, imatrix), (None, "bf16", None))
+
+    def test_imatrix_reaches_the_pipeline(self):
+        with mock.patch.object(convert_checkpoint, "convert") as convert:
+            convert.return_value = {}
+            self.assertEqual(run(*BASE, "--device", "cpu", "--imatrix", "/i.gguf")[0], 0)
+        self.assertEqual(convert.call_args.args[-1], Path("/i.gguf"))
 
     def test_extend_adds_the_drafter_to_an_existing_artifact(self):
         with mock.patch.object(convert_checkpoint, "extend") as extend:
@@ -129,7 +135,7 @@ class ArgumentHandlingTest(unittest.TestCase):
         options = set(re.findall(r"^\s+(--[a-z0-9-]+)", out, re.M)) | set(re.findall(r"(?<=\[)--[a-z0-9-]+", out))
         self.assertEqual(options, {"--model", "--out", "--quantization", "--compressed", "--draft-ids-from",
                                    "--ranking", "--device", "--jobs", "--force", "--dflash2",
-                                   "--dflash2-projections", "--extend"})
+                                   "--dflash2-projections", "--extend", "--imatrix"})
         for word in ("p2e2", "sd4", "nvmtp", "profile", "mtp-format", "reference"):
             self.assertNotIn(word, out.lower())
 
@@ -256,7 +262,8 @@ def tiny_q3_artifact(path: Path) -> None:
 
 class PipelineTest(unittest.TestCase):
     def convert(self, recipe, directory, **kwargs):
-        def write(model, config, output_path, recipe_, selected, jobs, draft=None, draft_projections="bf16"):
+        def write(model, config, output_path, recipe_, selected, jobs, draft=None, draft_projections="bf16",
+                  importance=None):
             tiny_q3_artifact(output_path)
 
         with mock.patch.object(pipeline, "write_artifact", write), \

@@ -48,6 +48,30 @@ python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --c
 For `q3-compressed` the uncompressed Q3 form is built beside the output, transcoded, and removed; every
 transcoded tensor is decoded back and compared byte for byte with its source before the output is published.
 
+## Calibrated rounding
+
+`--imatrix FILE` rounds every quantized object by calibrated scale search instead of taking each group's scale
+from its largest value. FILE is a llama.cpp importance matrix (GGUF, as `llama-imatrix` writes): the mean square
+of each linear layer's input columns over a calibration text. Each group's scale minimizes its squared error
+weighted by those column importances:
+
+- Q3, Q4 and Q5 try scales that map the group's largest magnitude to either end of the code range (so the most
+  negative code is used), refit each by weighted least squares, and keep the best after rounding to binary16;
+- NVFP4 tries the block scale codes from 6 below to 2 above the round-to-nearest code;
+- SD4 chooses its table and each block's entry under the weighted error.
+
+Objects the matrix does not cover (the token embedding, the LM and draft heads, the MTP layer) are searched
+with uniform weights. Formats and layouts are unchanged; the manifest records the matrix and its SHA-256.
+Calibrated rounding needs PyTorch.
+
+```bash
+python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 \
+    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --imatrix imatrix-qwen3.8-27b.gguf --out $OUT/qwen3_8_27b_q3.edrl
+```
+
+The importance matrix measured so far is the public one published with ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF
+(`imatrix-qwen3.8-27b.gguf`, 1000 chunks of 4096 tokens).
+
 ## DFlash2
 
 `--dflash2 DIR` adds the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`: `config.json`, `model.safetensors`) to a conversion, and
