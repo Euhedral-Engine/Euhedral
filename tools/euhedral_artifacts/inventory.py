@@ -10,6 +10,7 @@ import numpy as np
 
 from euhedral_artifacts.edrl import ObjectPlan, checked_product, fail, read_table, utf8
 from euhedral_artifacts.grouped import QUANT, quantize_matrix, row_split_size
+from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.nvfp4 import (nvfp4_offsets, nvfp4_sd4_offsets, quantize_nvfp4_matrix,
                                       quantize_nvfp4_sd4_matrix)
 from euhedral_artifacts.recipes import LAYOUT_SD4, NVFP4_FORMAT, Recipe, storage
@@ -77,23 +78,27 @@ def add_direct(plans: list[ObjectPlan], name: str, shape: tuple[int, ...], store
 
 
 
-def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: MatrixSource, q3_format: str) -> None:
-    """Adds the quantized object `name`, stored as `recipe` says; `q3_format` is its format in the q3 artifact."""
+def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: MatrixSource, q3_format: str,
+              importance: ImportanceMatrix | None = None) -> None:
+    """Adds the quantized object `name`, stored as `recipe` says; `q3_format` is its format in the q3 artifact.
+    With `importance` it is rounded by calibrated scale search."""
     format_name, layout = storage(recipe, name, q3_format)
+    calibration = importance.calibration(name, matrix.shape[1]) if importance is not None else None
     if layout == LAYOUT_SD4:
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, nvfp4_sd4_offsets(matrix.shape)[2],
-            lambda output, offset, source=matrix: quantize_nvfp4_sd4_matrix(output, offset, source),
+            lambda output, offset, source=matrix: quantize_nvfp4_sd4_matrix(output, offset, source, calibration),
         ))
     elif format_name == NVFP4_FORMAT:
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, payload_size(matrix.shape, format_name),
-            lambda output, offset, source=matrix: quantize_nvfp4_matrix(output, offset, source),
+            lambda output, offset, source=matrix: quantize_nvfp4_matrix(output, offset, source, calibration),
         ))
     elif format_name in QUANT:
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, row_split_size(matrix.shape, format_name),
-            lambda output, offset, source=matrix, fmt=format_name: quantize_matrix(output, offset, source, fmt),
+            lambda output, offset, source=matrix, fmt=format_name: quantize_matrix(output, offset, source, fmt,
+                                                                                    calibration),
         ))
     else:
         fail(f"unknown quantized format {format_name}")
@@ -104,13 +109,14 @@ def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, Matr
     return head_part(store, q_name, False), head_part(store, q_name, True)
 
 
-def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe) -> list[ObjectPlan]:
+def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
+                importance: ImportanceMatrix | None = None) -> list[ObjectPlan]:
     """The 785 text and MTP objects. Formats written here are the q3 artifact's; `recipe` maps them to
-    the artifact being built."""
+    the artifact being built. With `importance`, quantized objects are rounded by calibrated scale search."""
     plans: list[ObjectPlan] = []
 
     def quant(name: str, matrix: MatrixSource, q3_format: str) -> None:
-        add_quant(plans, recipe, name, matrix, q3_format)
+        add_quant(plans, recipe, name, matrix, q3_format, importance)
 
     quant("text/token_embedding", source_matrix(store, "model.language_model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
     for layer in range(64):

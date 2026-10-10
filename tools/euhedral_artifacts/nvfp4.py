@@ -15,7 +15,8 @@ import numpy as np
 
 from euhedral_artifacts import device
 from euhedral_artifacts.edrl import align_up, fail
-from euhedral_artifacts.sources import MatrixSource
+from euhedral_artifacts.importance import Calibration
+from euhedral_artifacts.sources import MatrixSource, device_rows
 
 # NVFP4: E2M1 values in blocks of 16 along K, one E4M3 scale per block, one FP32 scale per tensor.
 # A weight decodes to e2m1(code) * e4m3(block scale) * global scale; codes and scales round to
@@ -37,6 +38,12 @@ SD4_TABLE = 16
 SD4_BELOW = 0
 SD4_ABOVE = 40
 E4M3_CODES = 127
+# Calibrated rounding (needs PyTorch): each block takes, among the E4M3 codes from SEARCH_BELOW below its
+# round-to-nearest scale code to SEARCH_ABOVE above it, the one with the least squared error weighted by
+# the column importance; SD4 then also lets a block go SEARCH_BELOW codes under its nearest scale. Going
+# below clips the block's largest values, which the weights allow only where those columns matter little.
+SEARCH_BELOW = 6
+SEARCH_ABOVE = 2
 
 
 def nvfp4_offsets(shape: tuple[int, ...]) -> tuple[int, int, int]:
@@ -150,14 +157,14 @@ def sd4_costs(values: np.ndarray, global_scale: np.float32) -> np.ndarray:
     return sd4_cost_bounds(costs.reshape(E4M3_CODES, E4M3_CODES), energy, np.bincount(nearest, minlength=E4M3_CODES))
 
 
-def sd4_cost_bounds(costs: np.ndarray, energy: np.ndarray, counts: np.ndarray) -> np.ndarray:
+def sd4_cost_bounds(costs: np.ndarray, energy: np.ndarray, counts: np.ndarray, below: int = SD4_BELOW) -> np.ndarray:
     """Fills the codes outside each nearest code's measured window: too far below is not allowed, too
     far above costs the blocks' energy. Nearest codes without blocks cost nothing."""
     code = np.arange(E4M3_CODES)
-    below = code[None, :] < code[:, None] - SD4_BELOW
+    too_low = code[None, :] < code[:, None] - below
     above = code[None, :] > code[:, None] + SD4_ABOVE
     costs = np.where(above, energy[:, None], costs)
-    costs = np.where(below, np.inf, costs)
+    costs = np.where(too_low, np.inf, costs)
     return np.where(counts[:, None] > 0, costs, 0.0)
 
 
@@ -216,10 +223,23 @@ def expand_nvfp4_sd4(packed_indices: np.ndarray, table: np.ndarray) -> np.ndarra
     return table[indices]
 
 
-def quantize_nvfp4_matrix(output, base_offset: int, matrix: MatrixSource) -> None:
+def quantize_nvfp4_matrix(output, base_offset: int, matrix: MatrixSource, calibration: Calibration | None = None) -> None:
     n, k = matrix.shape
     k_pad = align_up(k, 128)
     scale_offset, global_offset, _ = nvfp4_offsets(matrix.shape)
+    if calibration is not None:
+        resident = _resident(matrix, k_pad)
+        global_scale = _resident_global_scale(resident)
+        weights = calibration.weights(k_pad)
+        for begin, values in _resident_chunks(resident):
+            packed, scales = search_nvfp4_rows_torch(values, global_scale, weights)
+            output.seek(base_offset + begin * (k_pad // 2))
+            output.write(packed.tobytes())
+            output.seek(base_offset + scale_offset + begin * (k_pad // NVFP4_BLOCK))
+            output.write(scales.tobytes())
+        output.seek(base_offset + global_offset)
+        output.write(np.float32(global_scale).astype("<f4").tobytes())
+        return
     # Small chunks: rounding allocates several index arrays per value, and many workers run at once.
     rows_per_chunk = max(1, 8 * 1024 * 1024 // max(k, 1))
     amax = 0.0
@@ -246,10 +266,13 @@ def quantize_nvfp4_matrix(output, base_offset: int, matrix: MatrixSource) -> Non
     output.write(np.float32(global_scale).astype("<f4").tobytes())
 
 
-def quantize_nvfp4_sd4_matrix(output, base_offset: int, matrix: MatrixSource) -> None:
+def quantize_nvfp4_sd4_matrix(output, base_offset: int, matrix: MatrixSource, calibration: Calibration | None = None) -> None:
     n, k = matrix.shape
     k_pad = align_up(k, 128)
     index_offset, table_offset, _ = nvfp4_sd4_offsets(matrix.shape)
+    if calibration is not None:
+        _calibrated_sd4_matrix(output, base_offset, matrix, calibration, k_pad, index_offset, table_offset)
+        return
     rows_per_chunk = max(1, 8 * 1024 * 1024 // max(k, 1))
 
     def chunks() -> Iterable[tuple[int, np.ndarray]]:
@@ -269,11 +292,11 @@ def quantize_nvfp4_sd4_matrix(output, base_offset: int, matrix: MatrixSource) ->
         amax = max(amax, float(np.max(np.abs(values))))
     global_scale = nvfp4_global_scale(amax)
     table = np.arange(SD4_TABLE, dtype=np.uint8)
+    measure = sd4_costs_torch if device.DEVICE != "cpu" else sd4_costs
+    quantize = quantize_nvfp4_sd4_rows_torch if device.DEVICE != "cpu" else quantize_nvfp4_sd4_rows
     if global_scale > 0:
-        measure = sd4_costs_torch if device.DEVICE != "cpu" else sd4_costs
         costs = sum(measure(values, global_scale) for _, values in chunks())
         table = sd4_table(costs)
-    quantize = quantize_nvfp4_sd4_rows_torch if device.DEVICE != "cpu" else quantize_nvfp4_sd4_rows
     for begin, values in chunks():
         packed, indices = quantize(values, global_scale, table)
         output.seek(base_offset + begin * (k_pad // 2))
@@ -323,13 +346,56 @@ def nvfp4_codes_torch(blocks, decode):
     return magnitude | (((blocks < 0) & (magnitude > 0)).to(torch.uint8) << 3)
 
 
-def block_error_torch(blocks, decode):
+def block_error_torch(blocks, decode, weights=None):
+    """Squared error of each block under `decode`, each value's weighted by `weights` (float64, the
+    shape of `blocks`) when given."""
     torch = device.torch()
     codes = nvfp4_codes_torch(blocks, decode).long()
     sign = torch.where((codes & 8) != 0, -1.0, 1.0).to(torch.float32)
     values = device.table("e2m1", E2M1_VALUES)[codes & 7] * sign * decode[:, None]
-    difference = (values - blocks).double()
-    return (difference * difference).sum(dim=1)
+    if weights is None:
+        difference = (values - blocks).double()
+        return (difference * difference).sum(dim=1)
+    # Weighted errors only rank candidates: float32 suffices, and consumer GPUs run float64 slowly.
+    difference = values - blocks
+    return (difference * difference * weights).sum(dim=1)
+
+
+def _block_weights(weights, rows: int):
+    """Column weights [K] -> per-value weights [rows * K / 16, 16] (float32), or None."""
+    if weights is None:
+        return None
+    torch = device.torch()
+    columns = torch.from_numpy(weights).to(device.DEVICE).view(1, -1, NVFP4_BLOCK)
+    return columns.expand(rows, -1, -1).reshape(-1, NVFP4_BLOCK)
+
+
+def search_nvfp4_rows_torch(values, global_scale: np.float32, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Like quantize_nvfp4_rows_torch, with each block's scale code chosen to minimize the squared error
+    weighted by `weights` (one per column) within SEARCH_BELOW / SEARCH_ABOVE codes of nearest. `values`
+    is float32 [rows, K], a NumPy array or a tensor on the device."""
+    torch = device.torch()
+    if global_scale <= 0:
+        return quantize_nvfp4_rows_torch(values.cpu().numpy() if torch.is_tensor(values) else values, global_scale)
+    rows, k = values.shape
+    blocks = _device(values).view(-1, NVFP4_BLOCK)
+    w = _block_weights(weights, rows)
+    e4m3 = device.table("e4m3", E4M3_VALUES)
+    g = torch.tensor(global_scale, dtype=torch.float32, device=device.DEVICE)
+    best = nearest_scale_codes_torch(blocks, global_scale)
+    best_error = block_error_torch(blocks, e4m3[best] * g, w)
+    nearest = best.clone()
+    for offset in range(-SEARCH_BELOW, SEARCH_ABOVE + 1):
+        if offset == 0:
+            continue
+        code = (nearest + offset).clamp(0, E4M3_CODES - 1)
+        error = block_error_torch(blocks, e4m3[code] * g, w)
+        better = error < best_error
+        best = torch.where(better, code, best)
+        best_error = torch.where(better, error, best_error)
+    codes = nvfp4_codes_torch(blocks, e4m3[best] * g).view(rows, k)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed.cpu().numpy(), best.view(rows, k // NVFP4_BLOCK).to(torch.uint8).cpu().numpy()
 
 
 def nearest_scale_codes_torch(blocks, global_scale: np.float32):
@@ -339,40 +405,106 @@ def nearest_scale_codes_torch(blocks, global_scale: np.float32):
             device.table("e4m3", E4M3_VALUES)).long()
 
 
-def sd4_costs_torch(values: np.ndarray, global_scale: np.float32) -> np.ndarray:
+def sd4_costs_torch(values: np.ndarray, global_scale: np.float32, weights: np.ndarray | None = None,
+                    below: int = SD4_BELOW) -> np.ndarray:
+    """sd4_costs on the device; with `weights` (one per column) each value's squared error is weighted.
+    `values` is a NumPy array or a tensor on the device."""
     torch = device.torch()
-    blocks = torch.from_numpy(values).to(device.DEVICE).view(-1, NVFP4_BLOCK)
+    blocks = _device(values).view(-1, NVFP4_BLOCK)
+    w = _block_weights(weights, values.shape[0])
     e4m3 = device.table("e4m3", E4M3_VALUES)
     g = torch.tensor(global_scale, dtype=torch.float32, device=device.DEVICE)
     nearest = nearest_scale_codes_torch(blocks, global_scale)
     costs = torch.zeros(E4M3_CODES * E4M3_CODES, dtype=torch.float64, device=device.DEVICE)
-    for offset in range(-SD4_BELOW, SD4_ABOVE + 1):
+    for offset in range(-below, SD4_ABOVE + 1):
         code = nearest + offset
         valid = (code >= 0) & (code < E4M3_CODES)
-        error = block_error_torch(blocks[valid], e4m3[code[valid]] * g)
-        costs += torch.bincount(nearest[valid] * E4M3_CODES + code[valid], weights=error, minlength=costs.numel())
-    energy = torch.bincount(nearest, weights=(blocks.double() ** 2).sum(dim=1), minlength=E4M3_CODES)
+        error = block_error_torch(blocks[valid], e4m3[code[valid]] * g, None if w is None else w[valid])
+        costs += torch.bincount(nearest[valid] * E4M3_CODES + code[valid], weights=error.double(), minlength=costs.numel())
+    energy_per_block = (blocks.double() ** 2).sum(dim=1) if w is None else (blocks * blocks * w).sum(dim=1).double()
+    energy = torch.bincount(nearest, weights=energy_per_block, minlength=E4M3_CODES)
     counts = torch.bincount(nearest, minlength=E4M3_CODES)
-    return sd4_cost_bounds(costs.view(E4M3_CODES, E4M3_CODES).cpu().numpy(), energy.cpu().numpy(), counts.cpu().numpy())
+    return sd4_cost_bounds(costs.view(E4M3_CODES, E4M3_CODES).cpu().numpy(), energy.cpu().numpy(), counts.cpu().numpy(),
+                           below)
 
 
-def quantize_nvfp4_sd4_rows_torch(values: np.ndarray, global_scale: np.float32, table: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def quantize_nvfp4_sd4_rows_torch(values: np.ndarray, global_scale: np.float32, table: np.ndarray,
+                                  weights: np.ndarray | None = None, below: int = SD4_BELOW) -> tuple[np.ndarray, np.ndarray]:
     torch = device.torch()
     rows, k = values.shape
-    blocks = torch.from_numpy(values).to(device.DEVICE).view(-1, NVFP4_BLOCK)
+    blocks = _device(values).view(-1, NVFP4_BLOCK)
+    w = _block_weights(weights, rows)
     e4m3 = device.table("e4m3", E4M3_VALUES)
     g = torch.tensor(global_scale, dtype=torch.float32, device=device.DEVICE)
     codes_table = torch.from_numpy(table.astype(np.int64)).to(device.DEVICE)
     nearest = nearest_scale_codes_torch(blocks, global_scale) if global_scale > 0 else torch.zeros(
             blocks.shape[0], dtype=torch.int64, device=device.DEVICE)
     best = torch.zeros(blocks.shape[0], dtype=torch.int64, device=device.DEVICE)
-    best_error = torch.full((blocks.shape[0],), float("inf"), dtype=torch.float64, device=device.DEVICE)
+    best_error = torch.full((blocks.shape[0],), float("inf"), dtype=torch.float64 if w is None else torch.float32,
+                            device=device.DEVICE)
     for index in range(len(table)):
-        error = block_error_torch(blocks, (e4m3[codes_table[index]] * g).expand(blocks.shape[0]))
-        better = (error < best_error) & (int(table[index]) >= nearest - SD4_BELOW)
+        error = block_error_torch(blocks, (e4m3[codes_table[index]] * g).expand(blocks.shape[0]), w)
+        better = (error < best_error) & (int(table[index]) >= nearest - below)
         best = torch.where(better, torch.full_like(best, index), best)
         best_error = torch.where(better, error, best_error)
     codes = nvfp4_codes_torch(blocks, e4m3[codes_table[best]] * g).view(rows, k)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     indices = best.view(rows, k // NVFP4_BLOCK).to(torch.uint8)
     return packed.cpu().numpy(), (indices[:, 0::2] | (indices[:, 1::2] << 4)).cpu().numpy()
+
+
+# Calibrated objects are uploaded once and kept on the device (as BF16 when the source is BF16, which is
+# exact), so the passes over them (global scale, SD4 costs, quantization) read no host memory.
+RESIDENT_CHUNK_VALUES = 16 * 1024 * 1024
+
+
+def _device(values):
+    torch = device.torch()
+    return values if torch.is_tensor(values) else torch.from_numpy(values).to(device.DEVICE)
+
+
+def _resident(matrix: MatrixSource, k_pad: int):
+    torch = device.torch()
+    n = matrix.shape[0]
+    dtype = torch.bfloat16 if matrix.read_words is not None else torch.float32
+    resident = torch.empty((n, k_pad), dtype=dtype, device=device.DEVICE)
+    rows = max(1, RESIDENT_CHUNK_VALUES // k_pad)
+    for begin in range(0, n, rows):
+        end = min(n, begin + rows)
+        resident[begin:end] = device_rows(matrix, begin, end, k_pad).to(dtype)
+    return resident
+
+
+def _resident_global_scale(resident) -> np.float32:
+    torch = device.torch()
+    amax = 0.0
+    for _, values in _resident_chunks(resident):
+        if not bool(torch.isfinite(values).all()):
+            fail("quantization source contains NaN or infinity")
+        amax = max(amax, float(values.abs().max()))
+    return nvfp4_global_scale(amax)
+
+
+def _resident_chunks(resident):
+    rows = max(1, RESIDENT_CHUNK_VALUES // resident.shape[1])
+    for begin in range(0, resident.shape[0], rows):
+        yield begin, resident[begin:begin + rows].float()
+
+
+def _calibrated_sd4_matrix(output, base_offset: int, matrix: MatrixSource, calibration: Calibration, k_pad: int,
+                           index_offset: int, table_offset: int) -> None:
+    resident = _resident(matrix, k_pad)
+    global_scale = _resident_global_scale(resident)
+    weights = calibration.weights(k_pad)
+    table = np.arange(SD4_TABLE, dtype=np.uint8)
+    if global_scale > 0:
+        costs = sum(sd4_costs_torch(values, global_scale, weights, SEARCH_BELOW) for _, values in _resident_chunks(resident))
+        table = sd4_table(costs)
+    for begin, values in _resident_chunks(resident):
+        packed, indices = quantize_nvfp4_sd4_rows_torch(values, global_scale, table, weights, SEARCH_BELOW)
+        output.seek(base_offset + begin * (k_pad // 2))
+        output.write(packed.tobytes())
+        output.seek(base_offset + index_offset + begin * (k_pad // 32))
+        output.write(indices.tobytes())
+    output.seek(base_offset + table_offset)
+    output.write(table.tobytes() + np.float32(global_scale).astype("<f4").tobytes())

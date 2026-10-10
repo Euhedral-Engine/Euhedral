@@ -16,6 +16,7 @@ import numpy as np
 from euhedral_artifacts import dflash2, q3_p2e2
 from euhedral_artifacts.edrl import (FORMAT_ORDINAL, HEADER_SIZE, LAYOUT_ORDINAL, MAGIC, VERSION, ObjectPlan,
                                      assign_offsets, encode_table, fail, read_table, sha256)
+from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.inventory import (VOCAB_SIZE, build_plans, draft_token_ids, encode_metadata, shortlist)
 from euhedral_artifacts.recipes import Recipe
 from euhedral_artifacts.sources import SourceStore, read_json
@@ -65,12 +66,14 @@ def check_checkpoint(config: dict[str, Any]) -> None:
 
 
 def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recipe: Recipe, selected: np.ndarray,
-                   jobs: int, draft: Path | None = None, draft_projections: str = "bf16") -> None:
+                   jobs: int, draft: Path | None = None, draft_projections: str = "bf16",
+                   importance: ImportanceMatrix | None = None) -> None:
     """Quantizes the checkpoint into the artifact `recipe` names (stored as is: for compressed q3, the
     uncompressed form), at `output_path`, through a temporary file renamed into place. With `draft` the
-    DFlash2 drafter checkpoint in that directory is added as `dflash2/` objects."""
+    DFlash2 drafter checkpoint in that directory is added as `dflash2/` objects; with `importance` the
+    weights are rounded by calibrated scale search."""
     with SourceStore(model) as store, contextlib.ExitStack() as drafts:
-        plans = build_plans(store, selected, recipe)
+        plans = build_plans(store, selected, recipe, importance)
         if draft is not None:
             draft_store = drafts.enter_context(SourceStore(draft))
             plans += dflash2.build_plans(draft_store, dflash2.check_draft(read_json(draft / "config.json")),
@@ -106,10 +109,11 @@ def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recip
 
 def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path | None = None,
             draft_ids_from: Path | None = None, jobs: int = 1, force: bool = False, draft: Path | None = None,
-            draft_projections: str = "bf16") -> dict[str, Any]:
+            draft_projections: str = "bf16", imatrix: Path | None = None) -> dict[str, Any]:
     """Converts the checkpoint directory `model` to the artifact `recipe` names. Exactly one of
     `ranking_path` (token frequency counts, to choose the draft-head shortlist) and `draft_ids_from`
-    (an existing artifact whose shortlist is reused) is required. `draft` adds the DFlash2 drafter."""
+    (an existing artifact whose shortlist is reused) is required. `draft` adds the DFlash2 drafter.
+    `imatrix` (a llama.cpp importance matrix) selects calibrated rounding."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     if (ranking_path is None) == (draft_ids_from is None):
@@ -117,6 +121,7 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     config = read_json(model / "config.json")
     check_checkpoint(config)
     selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)
+    importance = ImportanceMatrix(imatrix) if imatrix is not None else None
 
     # Compressed q3 is the q3 artifact transcoded: the q3 form is built beside the output and removed.
     transcode = recipe.quantization == "q3" and recipe.compressed
@@ -128,7 +133,7 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     else:
         built = output_path
     try:
-        write_artifact(model, config, built, recipe, selected, jobs, draft, draft_projections)
+        write_artifact(model, config, built, recipe, selected, jobs, draft, draft_projections, importance)
         stats = q3_p2e2.transcode(built, output_path, force=True) if transcode else {}
     finally:
         if transcode:
@@ -138,6 +143,8 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     manifest.update({"artifact": recipe.name, "source_model": str(model)})
     if draft is not None:
         manifest.update({"draft_model": str(draft), "draft_projections": draft_projections})
+    if imatrix is not None:
+        manifest.update({"imatrix": str(imatrix), "imatrix_sha256": sha256(imatrix)})
     manifest.update(stats)
     with Path(f"{output_path}.manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)

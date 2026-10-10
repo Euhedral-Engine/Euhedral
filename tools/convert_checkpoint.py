@@ -12,6 +12,10 @@ The draft head's token shortlist comes from --ranking (token frequency counts, i
 one per vocabulary entry) or from an existing artifact's shortlist (--draft-ids-from); pass one.
 Quantization runs on the GPU when PyTorch finds one, otherwise on the CPU. See tools/README.md.
 
+--imatrix FILE rounds by calibrated scale search: every group's scale minimizes its squared error weighted
+by the importance of each column (a llama.cpp importance matrix, the mean square of each input column over
+a calibration text). The formats and layouts are unchanged.
+
 --dflash2 DIR adds the DFlash2 drafter checkpoint (z-lab/Qwen3.8-27B-DFlash2), so the artifact drafts with
 DFlash2 instead of MTP. With --extend ARTIFACT it is added to an existing artifact, whose objects are copied
 byte for byte, instead of converting the target checkpoint again (--model is then not needed).
@@ -63,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="format of the drafter's attention and MLP projections (default: bf16)")
     parser.add_argument("--extend", type=Path, metavar="ARTIFACT",
                         help="add the --dflash2 drafter to this existing artifact instead of converting --model")
+    parser.add_argument("--imatrix", type=Path, metavar="IMATRIX.gguf",
+                        help="llama.cpp importance matrix: choose every group's scale by a search weighted by "
+                             "column importance instead of from its largest value (needs PyTorch)")
     parser.add_argument("--force", action="store_true", help="replace an existing artifact")
     return parser
 
@@ -92,10 +99,16 @@ def main(argv: list[str] | None = None) -> int:
     jobs = args.jobs if args.jobs is not None else (CUDA_JOBS if name == "cuda" else os.cpu_count() or 1)
     if jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.imatrix is not None:
+        try:
+            device.torch()
+        except ImportError:
+            parser.error("--imatrix needs PyTorch")
     device.set_device(name)
     try:
         manifest = convert(args.model, args.out, Recipe(args.quantization, args.compressed), args.ranking,
-                           args.draft_ids_from, jobs, args.force, args.dflash2, args.dflash2_projections)
+                           args.draft_ids_from, jobs, args.force, args.dflash2, args.dflash2_projections,
+                           args.imatrix)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
