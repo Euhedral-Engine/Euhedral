@@ -346,18 +346,27 @@ def nvfp4_codes_torch(blocks, decode):
     return magnitude | (((blocks < 0) & (magnitude > 0)).to(torch.uint8) << 3)
 
 
-def block_error_torch(blocks, decode, weights=None):
-    """Squared error of each block under `decode`, each value's weighted by `weights` (float64, the
-    shape of `blocks`) when given."""
+def block_error_torch(blocks, decode):
     torch = device.torch()
     codes = nvfp4_codes_torch(blocks, decode).long()
     sign = torch.where((codes & 8) != 0, -1.0, 1.0).to(torch.float32)
     values = device.table("e2m1", E2M1_VALUES)[codes & 7] * sign * decode[:, None]
-    if weights is None:
-        difference = (values - blocks).double()
-        return (difference * difference).sum(dim=1)
-    # Weighted errors only rank candidates: float32 suffices, and consumer GPUs run float64 slowly.
-    difference = values - blocks
+    difference = (values - blocks).double()
+    return (difference * difference).sum(dim=1)
+
+
+def weighted_block_error_torch(magnitudes, weights, decode):
+    """Squared error of each block of `magnitudes` (|values|, [n, 16]) under absolute block scales `decode`
+    [n], each value's weighted by `weights` ([n, 16]), in float32. A value's error depends only on its
+    magnitude, and at a tie between two E2M1 values either is equally far, so rounding in closed form gives
+    the same errors as nvfp4_codes_torch without its table search. Weighted errors only rank candidates."""
+    torch = device.torch()
+    scale = decode[:, None]
+    q = torch.where(scale > 0, magnitudes / scale, torch.zeros_like(magnitudes))
+    # E2M1 magnitudes 0, 0.5, 1, 1.5, 2 | 3 | 4 | 6, split at the midpoints 2.5, 3.5 and 5.
+    e2m1 = torch.where(q < 2.5, (torch.round(q * 2) * 0.5).clamp(max=2.0),
+                       torch.where(q < 3.5, 3.0, torch.where(q < 5.0, 4.0, 6.0)))
+    difference = magnitudes - e2m1 * scale
     return (difference * difference * weights).sum(dim=1)
 
 
@@ -382,14 +391,15 @@ def search_nvfp4_rows_torch(values, global_scale: np.float32, weights: np.ndarra
     w = _block_weights(weights, rows)
     e4m3 = device.table("e4m3", E4M3_VALUES)
     g = torch.tensor(global_scale, dtype=torch.float32, device=device.DEVICE)
+    magnitudes = blocks.abs()
     best = nearest_scale_codes_torch(blocks, global_scale)
-    best_error = block_error_torch(blocks, e4m3[best] * g, w)
+    best_error = weighted_block_error_torch(magnitudes, w, e4m3[best] * g)
     nearest = best.clone()
     for offset in range(-SEARCH_BELOW, SEARCH_ABOVE + 1):
         if offset == 0:
             continue
         code = (nearest + offset).clamp(0, E4M3_CODES - 1)
-        error = block_error_torch(blocks, e4m3[code] * g, w)
+        error = weighted_block_error_torch(magnitudes, w, e4m3[code] * g)
         better = error < best_error
         best = torch.where(better, code, best)
         best_error = torch.where(better, error, best_error)
@@ -416,11 +426,18 @@ def sd4_costs_torch(values: np.ndarray, global_scale: np.float32, weights: np.nd
     g = torch.tensor(global_scale, dtype=torch.float32, device=device.DEVICE)
     nearest = nearest_scale_codes_torch(blocks, global_scale)
     costs = torch.zeros(E4M3_CODES * E4M3_CODES, dtype=torch.float64, device=device.DEVICE)
+    magnitudes = blocks.abs() if w is not None else None
     for offset in range(-below, SD4_ABOVE + 1):
         code = nearest + offset
         valid = (code >= 0) & (code < E4M3_CODES)
-        error = block_error_torch(blocks[valid], e4m3[code[valid]] * g, None if w is None else w[valid])
-        costs += torch.bincount(nearest[valid] * E4M3_CODES + code[valid], weights=error.double(), minlength=costs.numel())
+        if w is None:
+            error = block_error_torch(blocks[valid], e4m3[code[valid]] * g)
+            costs += torch.bincount(nearest[valid] * E4M3_CODES + code[valid], weights=error, minlength=costs.numel())
+        else:
+            # Every block is measured at its clamped code, and codes outside the table cost nothing there.
+            clamped = code.clamp(0, E4M3_CODES - 1)
+            error = torch.where(valid, weighted_block_error_torch(magnitudes, w, e4m3[clamped] * g), 0.0)
+            costs += torch.bincount(nearest * E4M3_CODES + clamped, weights=error.double(), minlength=costs.numel())
     energy_per_block = (blocks.double() ** 2).sum(dim=1) if w is None else (blocks * blocks * w).sum(dim=1).double()
     energy = torch.bincount(nearest, weights=energy_per_block, minlength=E4M3_CODES)
     counts = torch.bincount(nearest, minlength=E4M3_CODES)
@@ -434,6 +451,7 @@ def quantize_nvfp4_sd4_rows_torch(values: np.ndarray, global_scale: np.float32, 
     rows, k = values.shape
     blocks = _device(values).view(-1, NVFP4_BLOCK)
     w = _block_weights(weights, rows)
+    magnitudes = blocks.abs() if w is not None else None
     e4m3 = device.table("e4m3", E4M3_VALUES)
     g = torch.tensor(global_scale, dtype=torch.float32, device=device.DEVICE)
     codes_table = torch.from_numpy(table.astype(np.int64)).to(device.DEVICE)
@@ -443,7 +461,8 @@ def quantize_nvfp4_sd4_rows_torch(values: np.ndarray, global_scale: np.float32, 
     best_error = torch.full((blocks.shape[0],), float("inf"), dtype=torch.float64 if w is None else torch.float32,
                             device=device.DEVICE)
     for index in range(len(table)):
-        error = block_error_torch(blocks, (e4m3[codes_table[index]] * g).expand(blocks.shape[0]), w)
+        decode = (e4m3[codes_table[index]] * g).expand(blocks.shape[0])
+        error = block_error_torch(blocks, decode) if w is None else weighted_block_error_torch(magnitudes, w, decode)
         better = (error < best_error) & (int(table[index]) >= nearest - below)
         best = torch.where(better, torch.full_like(best, index), best)
         best_error = torch.where(better, error, best_error)
