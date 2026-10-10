@@ -273,6 +273,11 @@ class PipelineTest(unittest.TestCase):
             return pipeline.convert(Path("/model"), directory / "artifact.edrl", recipe,
                                     draft_ids_from=Path("/ids"), **kwargs)
 
+    def test_calibrated_compressed_q3_is_refused_before_converting(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError) as raised:
+            self.convert(recipes.Recipe("q3", True), Path(tmp), imatrix=Path("/i.gguf"))
+        self.assertIn("P2E2", str(raised.exception))
+
     def test_q3_is_written_as_built(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = self.convert(recipes.Recipe("q3"), Path(tmp))
