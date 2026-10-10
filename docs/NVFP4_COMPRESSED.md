@@ -88,11 +88,14 @@ table entry.
 ## Converter
 
 ```bash
-python3 tools/convert_checkpoint.py --model /mnt/shared/qwen38-quant/source/qwen --quantization nvfp4 --compressed \
+python3 tools/convert_checkpoint.py --model /mnt/shared/qwen38-quant/source/swift-1.5 --quantization nvfp4 --compressed \
     --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl \
-    --imatrix /mnt/shared/qwen38-quant/imatrix/imatrix-qwen3.8-27b.gguf \
+    --imatrix /mnt/shared/qwen38-quant/imatrix/imatrix-swift15-v1mix.gguf \
     --out /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl
 ```
+
+The shipped artifact is converted from Swift-1.5 with its own importance matrix (see `tools/README.md`); for Qwen3.8-27B pass
+`--model` the Qwen3.8-27B checkpoint and `imatrix-qwen3.8-27b.gguf`.
 
 See `tools/README.md`. It runs on the GPU and takes about 6 minutes. With `--imatrix` the table and each block's entry are chosen
 under the error weighted by column importance, and a block may take an entry up to 6 codes below its round-to-nearest scale;

@@ -21,6 +21,9 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
+The `q3`, `q3-compressed` and `nvfp4` artifacts are converted from the Qwen3.8-27B checkpoint. The `nvfp4-compressed` artifact
+is converted from Swift-1.5 (`ukisai/Swift-1.5-Qwen3.8-27b`, UkisAI's fine-tune of Qwen3.8-27B); the converter takes either.
+
 The engine reads what an artifact is from the file and picks the fastest validated execution for it: kernels by row count,
 FP8 and FP4 tensor-core prefill, the attention implementation, the speculative-decoding depth and which weights stay in
 host memory. All of that is automatic.
@@ -89,8 +92,11 @@ Error is measured four separate ways because they answer different questions. Al
 that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint run in llama.cpp on the CPU as the reference.
 
 The `q3`, `nvfp4` and `nvfp4-compressed` artifacts are rounded by calibrated scale search: every group's scale minimizes its
-error weighted by the importance of each input column, from the public importance matrix of ISTA-DASLab's Qwen3.8-27B GSQ-RCO
-release (`tools/convert_checkpoint.py --imatrix`, see [tools/README.md](tools/README.md)). `q3-compressed` is still the
+error weighted by the importance of each input column (`tools/convert_checkpoint.py --imatrix`, see
+[tools/README.md](tools/README.md)). `q3` and `nvfp4` use the public importance matrix of ISTA-DASLab's Qwen3.8-27B GSQ-RCO
+release (`imatrix-qwen3.8-27b.gguf`) and are measured against the Qwen3.8-27B BF16 checkpoint; `nvfp4-compressed` uses
+UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`) and is
+measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` is still the
 round-to-nearest Q3: its lossless layout cannot store the Q3 code -4 that calibrated rounding uses
 ([docs/P2E2_FULL_RANGE.md](docs/P2E2_FULL_RANGE.md)).
 
@@ -98,18 +104,19 @@ round-to-nearest Q3: its lossless layout cannot store the Q3 code -4 that calibr
 
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
-| BF16 reference | 2.128 | 8.39 | | | |
+| Qwen3.8-27B BF16 reference | 2.128 | 8.39 | | | |
 | `q3` | 2.298 | 9.95 | +0.170 ± 0.021 | 0.293 | 76.2% |
 | `q3-compressed` | 2.403 | 11.05 | +0.275 ± 0.025 | 0.400 | 70.5% |
 | `nvfp4` | 2.156 | 8.64 | +0.029 ± 0.008 | 0.147 | 88.2% |
-| `nvfp4-compressed` | 2.162 | 8.68 | +0.034 ± 0.009 | 0.145 | 89.7% |
+| Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
+| `nvfp4-compressed` (Swift-1.5) | 2.170 | 8.76 | +0.028 ± 0.009 | 0.155 | 89.4% |
 
 **Compression-induced error** — the compressed artifact against its uncompressed one:
 
 | Pair | Result |
 |---|---|
 | `q3-compressed` against the round-to-nearest Q3 it stores | lossless: the 1279 logit vectors are bitwise equal, as is every drift measurement below |
-| `nvfp4-compressed` against `nvfp4` | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
+| NVFP4-SD4 against `nvfp4`, both converted from Qwen3.8-27B with the same importance matrix | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
 
 **Relaxed-execution drift** — the production kernels against the exact scalar kernels on the same weights, 1024 teacher-forced
 decode steps after a 512-token prefill (measured on the round-to-nearest artifacts):
@@ -131,7 +138,7 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest at short contexts:** `nvfp4-compressed` (perplexity 8.68): 146 tok/s at 4K. On a 16 GB
+- **Fastest at short contexts:** `nvfp4-compressed` (Swift-1.5; perplexity 8.76 against 8.51 for its BF16): 146 tok/s at 4K. On a 16 GB
   card it keeps 0.27 to 0.84 GiB of weights in host memory at 32K to 64K (1.97 GiB at 128K) and streams them in for every token,
   which slows it to 102 tok/s at 32K, 88 at 64K and 52 at 128K.
 - **Fastest at long contexts, and the one that fits everywhere:** `q3`: 109 tok/s at 4K, 105 at 32K, 93 at 64K and 67 at 128K,
