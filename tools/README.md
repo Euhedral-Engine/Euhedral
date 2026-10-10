@@ -69,8 +69,12 @@ python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 \
     --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --imatrix imatrix-qwen3.8-27b.gguf --out $OUT/qwen3_8_27b_q3.edrl
 ```
 
-The importance matrix measured so far is the public one published with ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF
-(`imatrix-qwen3.8-27b.gguf`, 1000 chunks of 4096 tokens).
+Use the importance matrix of the checkpoint being converted. Two public ones are measured:
+
+- Qwen3.8-27B: `imatrix-qwen3.8-27b.gguf` from ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF (1000 chunks of 4096 tokens), used
+  for `q3` and `nvfp4`;
+- Swift-1.5: `imatrix-swift15-v1mix.gguf` from ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF (309 chunks of 4096 tokens of web,
+  reasoning, multilingual and code text), used for `nvfp4-compressed`, which is converted from Swift-1.5.
 
 ## DFlash2
 

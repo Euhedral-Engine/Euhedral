@@ -23,6 +23,9 @@ llama-perplexity -m Qwen3.8-27B-BF16.gguf -f chat-corpus-v1-document.md -c 2560 
     --kl-divergence-base bf16.kld
 ```
 
+An artifact converted from another checkpoint is measured against that checkpoint's BF16 reference: for Swift-1.5, convert it
+with llama.cpp's `convert_hf_to_gguf.py --outtype bf16` and run the same command on the result.
+
 Each artifact is run over the same positions (prefix 1281, 1279 steps; the NVFP4 artifacts need
 `-Peuhedral.quality.host-mib=1280` on a 16 GB card):
 
