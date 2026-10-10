@@ -76,7 +76,12 @@ class TeacherForcedQualityCudaIntegrationTest {
                 short[] logits = null;
                 for (int begin = 0; begin < prefix; begin += InferenceConfig.PREFILL_CHUNK_TOKENS) {
                     int end = Math.min(prefix, begin + InferenceConfig.PREFILL_CHUNK_TOKENS);
-                    logits = run(runtime, gpu, plan, sequence, Quantum.ExecutionKind.PREFILL,
+                    logits = run(
+                            runtime,
+                            gpu,
+                            plan,
+                            sequence,
+                            Quantum.ExecutionKind.PREFILL,
                             Arrays.copyOfRange(document, begin, end));
                 }
                 for (int step = 0; step < steps; step++) {
