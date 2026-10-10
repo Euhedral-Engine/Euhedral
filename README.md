@@ -17,7 +17,7 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 | Artifact | Quantization | Representation | File size | Compression |
 |---|---|---|---|---|
 | `q3` | Q3 | uncompressed | 11.72 GiB (12.58 GB) | |
-| `q3-compressed` | Q3 | compressed | 10.16 GiB (10.91 GB) | lossless form of a round-to-nearest Q3 (see [quality](#quality)) |
+| `q3-compressed` | Q3 | compressed | 10.72 GiB (11.51 GB) | lossless layout of a Q3 limited to the codes -3..3 (see [quality](#quality)) |
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
@@ -47,7 +47,7 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
 | `q3` | 1,867 | 1,543 | 1,294 | 967 |
-| `q3-compressed` | 1,860 | 1,547 | 1,310 | 995 |
+| `q3-compressed`* | 1,860 | 1,547 | 1,310 | 995 |
 | `nvfp4` | 3,929 | 2,754 | 2,088 | 1,347 |
 | `nvfp4-compressed` | 3,867 | 2,727 | 2,064 | 1,356 |
 
@@ -56,7 +56,7 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
 | `q3` | 109.4 | 104.5 | 92.5 | 67.2 |
-| `q3-compressed` | 94.6 | 91.7 | 82.2 | 63.6 |
+| `q3-compressed`* | 94.6 | 91.7 | 82.2 | 63.6 |
 | `nvfp4` | 116.2 | 101.1 | 72.1 | 29.8 |
 | `nvfp4-compressed` | 146.4 | 102.2 | 87.7 | 52.2 |
 
@@ -65,7 +65,7 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
 | `q3` | 2.13 s | 21.2 s | 49.1 s | 133 s |
-| `q3-compressed` | 2.14 s | 21.1 s | 48.5 s | 129 s |
+| `q3-compressed`* | 2.14 s | 21.1 s | 48.5 s | 129 s |
 | `nvfp4` | 1.02 s | 11.9 s | 30.5 s | 95.3 s |
 | `nvfp4-compressed` | 1.05 s | 12.0 s | 30.8 s | 94.7 s |
 
@@ -76,9 +76,11 @@ chat prompts.
 | Artifact | File | Device memory in use at 32K / 64K / 128K | Host-backed weights at 32K / 64K / 128K | Longest context run |
 |---|---|---|---|---|
 | `q3` | 11.72 GiB | 12.8 / 13.4 / 14.1 GiB | none | 128K |
-| `q3-compressed` | 10.16 GiB | 11.4 / 11.9 / 13.1 GiB | none | 128K |
+| `q3-compressed`* | 10.16 GiB | 11.4 / 11.9 / 13.1 GiB | none | 128K |
 | `nvfp4` | 14.52 GiB | 14.2 / 14.2 / 14.2 GiB | 1.02 / 1.58 / 2.79 GiB | 128K |
 | `nvfp4-compressed` | 13.77 GiB | 14.2 / 14.2 / 14.3 GiB | 0.27 / 0.84 / 1.97 GiB | 128K |
+
+\* Measured on the earlier round-to-nearest `q3-compressed` (10.16 GiB); the current artifact is 10.72 GiB.
 
 Device memory is what the engine allocated at its peak during the run: the resident weights, the KV cache of the context, the
 sequence state, and the workspaces. The CUDA context and kernel modules come on top. An uncompressed NVFP4 model is larger than
@@ -91,14 +93,13 @@ Residency is described in [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md) and
 Error is measured four separate ways because they answer different questions. All use the 1279 teacher-forced tokens
 that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint run in llama.cpp on the CPU as the reference.
 
-The `q3`, `nvfp4` and `nvfp4-compressed` artifacts are rounded by calibrated scale search: every group's scale minimizes its
+All four artifacts are rounded by calibrated scale search: every group's scale minimizes its
 error weighted by the importance of each input column (`tools/convert_checkpoint.py --imatrix`, see
-[tools/README.md](tools/README.md)). `q3` and `nvfp4` use the public importance matrix of ISTA-DASLab's Qwen3.8-27B GSQ-RCO
+[tools/README.md](tools/README.md)). `q3`, `q3-compressed` and `nvfp4` use the public importance matrix of ISTA-DASLab's Qwen3.8-27B GSQ-RCO
 release (`imatrix-qwen3.8-27b.gguf`) and are measured against the Qwen3.8-27B BF16 checkpoint; `nvfp4-compressed` uses
 UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`) and is
-measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` is still the
-round-to-nearest Q3: its lossless layout cannot store the Q3 code -4 that calibrated rounding uses
-([docs/P2E2_FULL_RANGE.md](docs/P2E2_FULL_RANGE.md)).
+measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its Q3 tensors to the codes -3..3, which its lossless
+layout stores, while `q3` also uses -4 ([docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md)), so the two hold different values.
 
 **Model and quantization error** — the artifact against the BF16 checkpoint (reference: BF16 in llama.cpp on the CPU):
 
@@ -106,7 +107,7 @@ round-to-nearest Q3: its lossless layout cannot store the Q3 code -4 that calibr
 |---|---|---|---|---|---|
 | Qwen3.8-27B BF16 reference | 2.128 | 8.39 | | | |
 | `q3` | 2.298 | 9.95 | +0.170 ± 0.021 | 0.293 | 76.2% |
-| `q3-compressed` | 2.403 | 11.05 | +0.275 ± 0.025 | 0.400 | 70.5% |
+| `q3-compressed` | 2.336 | 10.34 | +0.208 ± 0.023 | 0.334 | 73.3% |
 | `nvfp4` | 2.156 | 8.64 | +0.029 ± 0.008 | 0.147 | 88.2% |
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
 | `nvfp4-compressed` (Swift-1.5) | 2.170 | 8.76 | +0.028 ± 0.009 | 0.155 | 89.4% |
@@ -115,7 +116,7 @@ round-to-nearest Q3: its lossless layout cannot store the Q3 code -4 that calibr
 
 | Pair | Result |
 |---|---|
-| `q3-compressed` against the round-to-nearest Q3 it stores | lossless: the 1279 logit vectors are bitwise equal, as is every drift measurement below |
+| `q3-compressed` against the row-split Q3 with the same values (`q3_p2e2 expand`) | lossless: every route's logits are bitwise equal (`P2e2CudaIntegrationTest`) |
 | NVFP4-SD4 against `nvfp4`, both converted from Qwen3.8-27B with the same importance matrix | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
 
 **Relaxed-execution drift** — the production kernels against the exact scalar kernels on the same weights, 1024 teacher-forced
@@ -143,9 +144,10 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
   which slows it to 102 tok/s at 32K, 88 at 64K and 52 at 128K.
 - **Fastest at long contexts, and the one that fits everywhere:** `q3`: 109 tok/s at 4K, 105 at 32K, 93 at 64K and 67 at 128K,
   with no host-backed weights (perplexity 9.95 against 8.39 for BF16 on the quality text).
-- **More room instead of speed:** `q3-compressed` holds a round-to-nearest Q3 (perplexity 11.05) in a file 1.56 GiB smaller, which leaves more
+- **More room instead of speed:** `q3-compressed` (perplexity 10.34) is a file about 1.0 GiB smaller than `q3`, which leaves more
   of the card to the KV cache of a long context (64 tok/s at 128K, against `q3`'s 67). Its kernels decode the compressed weights
-  as they read them, which costs about a seventh of `q3`'s decode speed (95 tok/s at 4K).
+  as they read them, which costs about a seventh of `q3`'s decode speed (95 tok/s at 4K; speeds measured on the earlier
+  round-to-nearest `q3-compressed`).
 - `nvfp4` (perplexity 8.64), the highest fidelity, keeps 1.0 to 1.6 GiB of weights in host memory at 32K to 64K (2.8 GiB at 128K) and decodes slower than
   `nvfp4-compressed` at every context in the table, at a quality difference within the noise of the measurement; its prefill is within 1%.
 - A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.

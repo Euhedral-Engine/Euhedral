@@ -62,7 +62,8 @@ weighted by those column importances:
 
 Objects the matrix does not cover (the token embedding, the LM and draft heads, the MTP layer) are searched
 with uniform weights. Formats and layouts are unchanged; the manifest records the matrix and its SHA-256.
-Calibrated rounding needs PyTorch.
+Calibrated rounding needs PyTorch. Compressed q3 limits its Q3 tensors to the codes -3..3, which its P2E2 layout stores
+(docs/COMPRESSED_Q3.md).
 
 ```bash
 python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 \

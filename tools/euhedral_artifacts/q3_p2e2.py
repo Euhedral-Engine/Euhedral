@@ -23,6 +23,8 @@ SLICE = 1024
 PAYLOAD_PAD_WORDS = 80
 ROW_CHUNK_CODES = 1 << 25
 BIG_VALUES = np.array([-3, -2, 2, 3], dtype=np.int8)
+# The most negative Q3 code P2E2 stores; Q3's -4 has no symbol.
+P2E2_LOWEST_CODE = -3
 
 
 def row_split_q3_size(rows: int, k: int) -> int:
@@ -97,7 +99,7 @@ def encode(source: bytes | np.ndarray, rows: int, k: int) -> bytes:
         end = min(rows, begin + chunk)
         codes = unpack_q3(data[begin * groups * 24:end * groups * 24], end - begin, k)
         if (codes == -4).any():
-            fail("code -4 cannot be represented; the Q3 converter never emits it")
+            fail("code -4 cannot be represented in P2E2; convert compressed q3 with codes -3..3")
         symbols = np.full(codes.shape, 3, dtype=np.uint32)
         symbols[codes == -1] = 0
         symbols[codes == 0] = 1
@@ -157,8 +159,10 @@ def decode(tensor: bytes | np.ndarray, rows: int, k: int) -> bytes:
     return out.tobytes()
 
 
-def transcode(input_path: Path, output_path: Path, force: bool = False) -> dict[str, Any]:
-    """Writes the P2E2 artifact of the Q3 artifact `input_path`; returns its manifest fields."""
+def transcode(input_path: Path, output_path: Path, force: bool = False, expand: bool = False) -> dict[str, Any]:
+    """Writes the P2E2 artifact of the Q3 artifact `input_path`; returns its manifest fields. With `expand`, the
+    reverse: the row-split Q3 artifact whose values the P2E2 artifact `input_path` stores (the reference that the
+    P2E2 kernels must reproduce bit for bit)."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     with input_path.open("rb") as source:
@@ -168,7 +172,10 @@ def transcode(input_path: Path, output_path: Path, force: bool = False) -> dict[
         cursor = data_offset
         for obj in objects:
             out = dict(obj)
-            if eligible(obj["shape"], obj["format"], obj["layout"]):
+            if expand and obj["layout"] == LAYOUT_P2E2:
+                out["layout"] = LAYOUT_ROW_SPLIT
+                out["bytes"] = None
+            elif not expand and eligible(obj["shape"], obj["format"], obj["layout"]):
                 out["layout"] = LAYOUT_P2E2
                 out["bytes"] = None
             planned.append(out)
@@ -187,8 +194,9 @@ def transcode(input_path: Path, output_path: Path, force: bool = False) -> dict[
                         fail(f"payload of {obj['name']} is truncated")
                     if out["bytes"] is None:
                         rows, k = obj["shape"]
-                        payload_out = encode(payload, rows, k)
-                        if decode(payload_out, rows, k) != payload:
+                        payload_out = decode(payload, rows, k) if expand else encode(payload, rows, k)
+                        back = encode(payload_out, rows, k) if expand else decode(payload_out, rows, k)
+                        if back != payload:
                             fail(f"P2E2 round trip of {obj['name']} is not exact")
                         stats["tensors"] += 1
                         stats["source_bytes"] += len(payload)
@@ -224,3 +232,11 @@ def transcode(input_path: Path, output_path: Path, force: bool = False) -> dict[
         "file_bytes": cursor,
         "round_trip": "exact",
     }
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 4 or sys.argv[1] != "expand":
+        print("usage: q3_p2e2.py expand P2E2_ARTIFACT OUTPUT_Q3_ARTIFACT", file=sys.stderr)
+        raise SystemExit(2)
+    print(transcode(Path(sys.argv[2]), Path(sys.argv[3]), expand=True))

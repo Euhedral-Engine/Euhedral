@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import struct
 from typing import Any
@@ -13,7 +14,8 @@ from euhedral_artifacts.grouped import QUANT, quantize_matrix, row_split_size
 from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.nvfp4 import (nvfp4_offsets, nvfp4_sd4_offsets, quantize_nvfp4_matrix,
                                       quantize_nvfp4_sd4_matrix)
-from euhedral_artifacts.recipes import LAYOUT_SD4, NVFP4_FORMAT, Recipe, storage
+from euhedral_artifacts.q3_p2e2 import P2E2_LOWEST_CODE
+from euhedral_artifacts.recipes import LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage
 from euhedral_artifacts.sources import (HIDDEN, VOCAB_SIZE, MatrixSource, SourceStore, bf16_to_float32,
                                         concat_matrix, gather_matrix, head_part, read_json, slice_matrix,
                                         source_matrix)
@@ -84,6 +86,9 @@ def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: Matrix
     With `importance` it is rounded by calibrated scale search."""
     format_name, layout = storage(recipe, name, q3_format)
     calibration = importance.calibration(name, matrix.shape[1]) if importance is not None else None
+    if calibration is not None and recipe.quantization == "q3" and recipe.compressed and format_name == Q3_FORMAT:
+        # Compressed q3 stores its Q3 tensors in P2E2, which holds the codes -3..3 (docs/COMPRESSED_Q3.md).
+        calibration = replace(calibration, lowest_code=P2E2_LOWEST_CODE)
     if layout == LAYOUT_SD4:
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, nvfp4_sd4_offsets(matrix.shape)[2],

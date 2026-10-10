@@ -16,7 +16,7 @@ TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 
 import convert_checkpoint  # noqa: E402
-from euhedral_artifacts import device, edrl, inventory, pipeline, q3_p2e2, recipes  # noqa: E402
+from euhedral_artifacts import device, edrl, importance, inventory, pipeline, q3_p2e2, recipes, sources  # noqa: E402
 from euhedral_artifacts.sources import SourceRef  # noqa: E402
 
 
@@ -273,10 +273,33 @@ class PipelineTest(unittest.TestCase):
             return pipeline.convert(Path("/model"), directory / "artifact.edrl", recipe,
                                     draft_ids_from=Path("/ids"), **kwargs)
 
-    def test_calibrated_compressed_q3_is_refused_before_converting(self):
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError) as raised:
-            self.convert(recipes.Recipe("q3", True), Path(tmp), imatrix=Path("/i.gguf"))
-        self.assertIn("P2E2", str(raised.exception))
+    def test_expand_restores_the_transcoded_artifact_byte_for_byte(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, compressed, expanded = Path(tmp) / "q3.edrl", Path(tmp) / "p2e2.edrl", Path(tmp) / "back.edrl"
+            tiny_q3_artifact(source)
+            q3_p2e2.transcode(source, compressed)
+            stats = q3_p2e2.transcode(compressed, expanded, expand=True)
+            self.assertEqual(stats["p2e2_tensor_count"], 1)
+            self.assertEqual(expanded.read_bytes(), source.read_bytes())
+
+    def test_compressed_q3_rounds_its_q3_objects_to_codes_the_p2e2_layout_holds(self):
+        class Importance:
+            def calibration(self, name, k):
+                return importance.Calibration()
+
+        seen = {}
+        matrix = sources.MatrixSource((2, 128), lambda b, e: np.zeros((e - b, 128), np.float32))
+        with mock.patch.object(inventory, "quantize_matrix",
+                               lambda output, offset, source, fmt, calibration: seen.__setitem__(fmt, calibration)):
+            for recipe in (recipes.Recipe("q3", True), recipes.Recipe("q3", False)):
+                plans = []
+                for fmt in ("Q3G64_F16S", "Q4G64_F16S"):
+                    inventory.add_quant(plans, recipe, "text/layers/0/mlp/down", matrix, fmt, Importance())
+                for plan in plans:
+                    plan.writer(None, 0)
+                expected = q3_p2e2.P2E2_LOWEST_CODE if recipe.compressed else None
+                self.assertEqual(seen["Q3G64_F16S"].lowest_code, expected)
+                self.assertIsNone(seen["Q4G64_F16S"].lowest_code)
 
     def test_q3_is_written_as_built(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -84,6 +84,8 @@ def quantize_matrix(output, base_offset: int, matrix: MatrixSource, format_name:
     """Rounds each group to nearest under scale max-abs / qmax, or, with `calibration`, under the scale
     search_group_codes_torch finds (needs PyTorch)."""
     bits, group_size, qmin, qmax = QUANT[format_name]
+    if calibration is not None and calibration.lowest_code is not None:
+        qmin = max(qmin, calibration.lowest_code)
     n, k = matrix.shape
     k_pad = align_up(k, 128)
     groups = k_pad // group_size

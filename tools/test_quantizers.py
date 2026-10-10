@@ -9,6 +9,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from euhedral_artifacts import device, edrl, grouped, importance, inventory, nvfp4, sources  # noqa: E402
+from euhedral_artifacts import q3_p2e2 as p2e2  # noqa: E402
 
 
 class GroupedQuantizationTest(unittest.TestCase):
@@ -331,6 +332,15 @@ class CalibratedQuantizationTest(unittest.TestCase):
                 self.assertLess(after.sum(), 0.8 * before.sum())
                 self.assertTrue((codes.numpy() == qmin).any())
                 self.assertTrue(np.isfinite(scales.numpy()).all() and (scales.numpy() >= 0).all())
+
+    def test_lowest_code_keeps_the_search_off_the_negative_end(self):
+        matrix = sources.MatrixSource((32, 256), lambda begin, end: self.values[begin:end])
+        for lowest, expect_minus_four in ((None, True), (-3, False)):
+            output = io.BytesIO()
+            grouped.quantize_matrix(output, 0, matrix, "Q3G64_F16S", importance.Calibration(self.weights, lowest))
+            codes = p2e2.unpack_q3(np.frombuffer(output.getvalue()[:32 * 4 * 24], np.uint8), 32, 256)
+            self.assertEqual(bool((codes == -4).any()), expect_minus_four)
+            self.assertTrue((codes >= -4).all() and (codes <= 3).all())
 
     def test_grouped_search_keeps_zero_groups_zero(self):
         values = self.values.copy()
