@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
@@ -71,8 +72,13 @@ class TeacherForcedQualityCudaIntegrationTest {
             byte[] row = new byte[vocabulary * Short.BYTES];
             double nll = 0;
             try {
-                short[] logits = run(
-                        runtime, gpu, plan, sequence, Quantum.ExecutionKind.PREFILL, Arrays.copyOf(document, prefix));
+                // The prefix is prefilled in production-sized chunks: the workspace is sized for one chunk.
+                short[] logits = null;
+                for (int begin = 0; begin < prefix; begin += InferenceConfig.PREFILL_CHUNK_TOKENS) {
+                    int end = Math.min(prefix, begin + InferenceConfig.PREFILL_CHUNK_TOKENS);
+                    logits = run(runtime, gpu, plan, sequence, Quantum.ExecutionKind.PREFILL,
+                            Arrays.copyOfRange(document, begin, end));
+                }
                 for (int step = 0; step < steps; step++) {
                     int next = document[prefix + step];
                     out.writeInt(Integer.reverseBytes(next));
