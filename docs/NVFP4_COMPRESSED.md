@@ -90,10 +90,13 @@ table entry.
 ```bash
 python3 tools/convert_checkpoint.py --model /mnt/shared/qwen38-quant/source/qwen --quantization nvfp4 --compressed \
     --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl \
+    --imatrix /mnt/shared/qwen38-quant/imatrix/imatrix-qwen3.8-27b.gguf \
     --out /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl
 ```
 
-See `tools/README.md`. It runs on the GPU and takes about 14 minutes. SD4's error pass costs about 60 times plain NVFP4's rounding.
+See `tools/README.md`. It runs on the GPU and takes about 6 minutes. With `--imatrix` the table and each block's entry are chosen
+under the error weighted by column importance, and a block may take an entry up to 6 codes below its round-to-nearest scale;
+without it, the round-to-nearest conversion above takes about 14 minutes, its error pass about 60 times plain NVFP4's rounding.
 `--jobs` 16 saturates the GPU and fills swap; the default of 4 on CUDA is enough.
 
 **The drafting stack stays plain NVFP4.** Drafts only propose, and plain drafting objects cost 33 MiB. Base-model objects are

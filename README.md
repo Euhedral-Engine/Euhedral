@@ -17,7 +17,7 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 | Artifact | Quantization | Representation | File size | Compression |
 |---|---|---|---|---|
 | `q3` | Q3 | uncompressed | 11.72 GiB (12.58 GB) | |
-| `q3-compressed` | Q3 | compressed | 10.16 GiB (10.91 GB) | lossless: the same values as `q3`, bit for bit |
+| `q3-compressed` | Q3 | compressed | 10.16 GiB (10.91 GB) | lossless form of a round-to-nearest Q3 (see [quality](#quality)) |
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
@@ -88,24 +88,31 @@ Residency is described in [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md) and
 Error is measured four separate ways because they answer different questions. All use the 1279 teacher-forced tokens
 that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint run in llama.cpp on the CPU as the reference.
 
+The `q3`, `nvfp4` and `nvfp4-compressed` artifacts are rounded by calibrated scale search: every group's scale minimizes its
+error weighted by the importance of each input column, from the public importance matrix of ISTA-DASLab's Qwen3.8-27B GSQ-RCO
+release (`tools/convert_checkpoint.py --imatrix`, see [tools/README.md](tools/README.md)). `q3-compressed` is still the
+round-to-nearest Q3: its lossless layout cannot store the Q3 code -4 that calibrated rounding uses
+([docs/P2E2_FULL_RANGE.md](docs/P2E2_FULL_RANGE.md)).
+
 **Model and quantization error** — the artifact against the BF16 checkpoint (reference: BF16 in llama.cpp on the CPU):
 
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | BF16 reference | 2.128 | 8.39 | | | |
-| `q3`, `q3-compressed` | 2.403 | 11.05 | +0.275 ± 0.025 | 0.400 | 70.5% |
-| `nvfp4` | 2.178 | 8.83 | +0.051 ± 0.011 | 0.163 | 86.4% |
-| `nvfp4-compressed` | 2.183 | 8.87 | +0.056 ± 0.011 | 0.161 | 86.9% |
+| `q3` | 2.298 | 9.95 | +0.170 ± 0.021 | 0.293 | 76.2% |
+| `q3-compressed` | 2.403 | 11.05 | +0.275 ± 0.025 | 0.400 | 70.5% |
+| `nvfp4` | 2.156 | 8.64 | +0.029 ± 0.008 | 0.147 | 88.2% |
+| `nvfp4-compressed` | 2.162 | 8.68 | +0.034 ± 0.009 | 0.145 | 89.7% |
 
 **Compression-induced error** — the compressed artifact against its uncompressed one:
 
 | Pair | Result |
 |---|---|
-| `q3-compressed` against `q3` | lossless: the 1279 logit vectors are bitwise equal, as is every drift measurement below |
-| `nvfp4-compressed` against `nvfp4` | NLL +0.005 ± 0.011, KL 0.062, top-1 agreement 87.0% |
+| `q3-compressed` against the round-to-nearest Q3 it stores | lossless: the 1279 logit vectors are bitwise equal, as is every drift measurement below |
+| `nvfp4-compressed` against `nvfp4` | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
 
 **Relaxed-execution drift** — the production kernels against the exact scalar kernels on the same weights, 1024 teacher-forced
-decode steps after a 512-token prefill:
+decode steps after a 512-token prefill (measured on the round-to-nearest artifacts):
 
 | Artifact | Hidden-state relative error | Mean KL | Top-1 agreement |
 |---|---|---|---|
@@ -124,15 +131,15 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest at short contexts, and the highest fidelity:** `nvfp4-compressed` (perplexity 8.87): 146 tok/s at 4K. On a 16 GB
+- **Fastest at short contexts:** `nvfp4-compressed` (perplexity 8.68): 146 tok/s at 4K. On a 16 GB
   card it keeps 0.27 to 0.84 GiB of weights in host memory at 32K to 64K (1.97 GiB at 128K) and streams them in for every token,
   which slows it to 102 tok/s at 32K, 88 at 64K and 52 at 128K.
 - **Fastest at long contexts, and the one that fits everywhere:** `q3`: 109 tok/s at 4K, 105 at 32K, 93 at 64K and 67 at 128K,
-  with no host-backed weights. Its error against BF16 is the largest of the four (perplexity 11.05 against 8.39 on the quality text).
-- **More room instead of speed:** `q3-compressed` returns exactly the `q3` outputs from a file 1.56 GiB smaller, which leaves more
+  with no host-backed weights (perplexity 9.95 against 8.39 for BF16 on the quality text).
+- **More room instead of speed:** `q3-compressed` holds a round-to-nearest Q3 (perplexity 11.05) in a file 1.56 GiB smaller, which leaves more
   of the card to the KV cache of a long context (64 tok/s at 128K, against `q3`'s 67). Its kernels decode the compressed weights
   as they read them, which costs about a seventh of `q3`'s decode speed (95 tok/s at 4K).
-- `nvfp4` (perplexity 8.83) keeps 1.0 to 1.6 GiB of weights in host memory at 32K to 64K (2.8 GiB at 128K) and decodes slower than
+- `nvfp4` (perplexity 8.64), the highest fidelity, keeps 1.0 to 1.6 GiB of weights in host memory at 32K to 64K (2.8 GiB at 128K) and decodes slower than
   `nvfp4-compressed` at every context in the table, at a quality difference within the noise of the measurement; its prefill is within 1%.
 - A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.
 

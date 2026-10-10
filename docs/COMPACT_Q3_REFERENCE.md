@@ -39,8 +39,10 @@ Canonical fused text objects:
 | Q4G64_F16S | -8..7 | 32 bytes, one nibble per code | none | same |
 | Q5G64_F16S | -16..15 | 32 bytes of low nibbles | 8 bytes of fifth bits | same |
 
-The planes are stored in the order base, high, scales. A scale is `fp16(max-abs / qmax)` and codes are quantized after the scale
-is rounded to binary16. Rows are padded on K to 128.
+The planes are stored in the order base, high, scales. A scale is binary16 and codes are quantized after the scale is rounded
+to it. Round-to-nearest conversion takes `fp16(max-abs / qmax)`; calibrated conversion (`--imatrix`, `tools/README.md`, used by
+the `q3` artifact) searches each group's scale and uses the whole code range, including the most negative code. Rows are padded
+on K to 128.
 
 The Java loader validates descriptor metadata, reads the exact payload range, allocates the exact byte count, uploads the bytes
 and keeps fused objects as fused `TensorHandle` instances. It does not quantize, dequantize, split or repack at load time.
