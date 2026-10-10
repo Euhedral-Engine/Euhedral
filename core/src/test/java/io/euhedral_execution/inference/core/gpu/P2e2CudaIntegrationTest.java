@@ -25,9 +25,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-/// The P2E2 artifact (tools/euhedral_artifacts/q3_p2e2.py) holds the compact artifact's Q3 values in
-/// less memory. Run through every route that reads them, it must reproduce the compact artifact's
-/// logits bit for bit: prefill regions and an all-token LM head (expanded, the head in output-row
+/// The P2E2 artifact (tools/euhedral_artifacts/q3_p2e2.py) holds Q3 values in less memory. Run through
+/// every route that reads them, it must reproduce, bit for bit, the logits of the row-split artifact with
+/// the same values (-Peuhedral.qwen.artifact; `python3 -m euhedral_artifacts.q3_p2e2 expand` writes it
+/// from the P2E2 artifact): prefill regions and an all-token LM head (expanded, the head in output-row
 /// chunks), short prompts on the small-row kernels, single-row decode on the P2E2 kernel, and exact
 /// numerics. Skipped unless -Peuhedral.qwen.q3-compressed-artifact names an existing artifact.
 @ModelGroup.OwnJvm // loads the compact and the P2E2 artifact in turn: with one shared they would not fit together
@@ -49,7 +50,7 @@ class P2e2CudaIntegrationTest {
         for (int i = 0; i < expected.logits().size(); i++) {
             assertArrayEquals(expected.logits().get(i), actual.logits().get(i), "logits of step " + i);
         }
-        assertTrue(actual.weightBytes() < expected.weightBytes() - (3L << 29), "P2E2 must save at least 1.5 GiB");
+        assertTrue(actual.weightBytes() < expected.weightBytes() - (7L << 27), "P2E2 must save at least 0.875 GiB");
         System.out.println("P2E2_BITWISE PASS steps=" + expected.logits().size()
                 + " compact_weight_bytes=" + expected.weightBytes()
                 + " p2e2_weight_bytes=" + actual.weightBytes()

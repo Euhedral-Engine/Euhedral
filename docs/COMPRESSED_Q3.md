@@ -62,6 +62,22 @@ with Huffman-only coding. The scale plane reaches 0.57, which nothing can read i
 and decompresses 12x slower than P2E2's expansion (160 us for gate_up); stacked on P2E2 it would save another 6% of the Q3 bytes,
 but only through expansion, even for decode.
 
+## Calibrated Q3 in P2E2
+
+Calibrated rounding (`--imatrix`, `tools/README.md`) chooses smaller group scales than round-to-nearest, so more codes are
+large: about 36% of calibrated Q3 codes have a magnitude of 2 or more, and 2.25% are -4, which occurs in 71% of groups. The
+codes then carry about 2.73 bits each, so no lossless layout stores them in much less than 91% of the row-split bytes.
+
+`q3-compressed` is therefore converted with calibrated rounding limited to the codes -3..3, which today's P2E2 stores: about 31%
+of its codes are large, and its Q3 tensors take about 88% of their row-split bytes. `q3` keeps the full range, so the two
+artifacts no longer hold the same values. `python3 -m euhedral_artifacts.q3_p2e2 expand` (run in `tools/`) writes the row-split
+artifact with the values a P2E2 artifact holds, which `P2e2CudaIntegrationTest` uses as the bitwise reference.
+
+**Rejected: a P2E2 that stores -4.** Wider payload units cost 3.09 bits per code, more than row-split Q3. An escape code (2-bit
+units for -2, 2 and 3, with an escape followed by one bit for -3 or -4) reaches about 2.80 bits per code, about 93% of the
+row-split bytes, and makes the payload units variable in length, which breaks the rank arithmetic every P2E2 kernel uses to
+place them.
+
 ## Rejected: faster multi-row decode
 
 Variants of the three-row kernel, timed on cold gate_up (three rows: 134 us as shipped):

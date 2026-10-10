@@ -118,9 +118,6 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
         fail(f"output already exists; pass --force: {output_path}")
     if (ranking_path is None) == (draft_ids_from is None):
         fail("pass exactly one of --ranking and --draft-ids-from")
-    if imatrix is not None and recipe.quantization == "q3" and recipe.compressed:
-        # Calibrated Q3 uses code -4, which the P2E2 layout cannot store (docs/P2E2_FULL_RANGE.md).
-        fail("--imatrix does not support compressed q3 yet: P2E2 cannot store Q3 code -4")
     config = read_json(model / "config.json")
     check_checkpoint(config)
     selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)

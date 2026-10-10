@@ -30,8 +30,10 @@ _STRING, _ARRAY = 8, 9
 @dataclass(frozen=True)
 class Calibration:
     """How one object is rounded: by scale search, weighting each column's squared error by `importance`
-    (length K), or uniformly when it is None."""
+    (length K), or uniformly when it is None. `lowest_code`, when set, is the most negative integer code the
+    search may use (the format's own range otherwise)."""
     importance: np.ndarray | None = None
+    lowest_code: int | None = None
 
     def weights(self, k_pad: int) -> np.ndarray:
         """Column weights padded to `k_pad` columns (padding columns hold zeros and weigh nothing)."""
