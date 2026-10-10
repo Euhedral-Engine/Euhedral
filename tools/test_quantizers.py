@@ -381,6 +381,21 @@ class CalibratedQuantizationTest(unittest.TestCase):
         np.testing.assert_allclose(nvfp4.sd4_costs_torch(self.values, global_scale, np.ones(256, np.float32)),
                                    nvfp4.sd4_costs(self.values, global_scale), rtol=1e-5)
 
+    def test_closed_form_weighted_error_equals_the_rounded_codes_error(self):
+        torch = device.torch()
+        blocks = torch.from_numpy(self.values.reshape(-1, 16).copy())
+        decode = torch.from_numpy(self.rng.uniform(0.0, 0.5, blocks.shape[0]).astype(np.float32))
+        decode[:4] = 0  # zero scales
+        # Exact ties between E2M1 values (0.25, 0.75, 2.5, 3.5, 5 times the scale) round either way at equal error.
+        blocks[4] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -5.0, -2.5, 7.0, 0, 6, 4, 3, 2, 1]) * decode[4]
+        weights = torch.from_numpy(self.rng.uniform(0.0, 1.0, blocks.shape).astype(np.float32))
+        codes = nvfp4.nvfp4_codes_torch(blocks, decode).long()
+        sign = torch.where((codes & 8) != 0, -1.0, 1.0)
+        rounded = torch.from_numpy(nvfp4.E2M1_VALUES)[codes & 7] * sign * decode[:, None]
+        expected = ((rounded - blocks) ** 2 * weights).sum(dim=1)
+        actual = nvfp4.weighted_block_error_torch(blocks.abs(), weights, decode)
+        np.testing.assert_allclose(actual.numpy(), expected.numpy(), rtol=1e-5, atol=1e-12)
+
     def test_device_rows_widen_bf16_words_exactly_through_every_view(self):
         words = self.rng.integers(0, 1 << 16, size=(12, 200), dtype=np.uint16)
         words[(words & 0x7F80) == 0x7F80] = 0x3F80  # no NaN or infinity
