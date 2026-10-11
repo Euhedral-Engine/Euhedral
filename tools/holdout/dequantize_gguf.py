@@ -118,7 +118,7 @@ def reorder_v_heads(tensor: np.ndarray, axis: int) -> np.ndarray:
     return np.swapaxes(tensor.reshape(split), axis, axis + 1).reshape(shape)
 
 
-def gguf_tensors(name: str, values: np.ndarray, pending: dict) -> list[tuple[str, np.ndarray]]:
+def gguf_parts(name: str, values: np.ndarray, pending: dict) -> list[tuple[str, np.ndarray]]:
     """The llama.cpp tensors of artifact object `name` (fused attention objects wait for their partner)."""
     if name == "text/token_embedding":
         return [("token_embd.weight", values)]
@@ -187,7 +187,7 @@ def main(argv: list[str]) -> int:
             if fmt not in ("Q3G64_F16S", "Q4G64_F16S", "Q5G64_F16S", "NVFP4") or obj["name"].startswith("mtp/") \
                     or obj["name"] == "text/draft_head":
                 continue
-            for gguf_name, values in gguf_tensors(obj["name"], dequantize(handle, obj, fmt, layout), pending):
+            for gguf_name, values in gguf_parts(obj["name"], dequantize(handle, obj, fmt, layout), pending):
                 if keep is not None and keep.search(gguf_name):
                     print(f"{gguf_name:32s} kept at BF16", flush=True)
                     continue
