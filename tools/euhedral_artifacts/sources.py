@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import mmap
+import os
 from pathlib import Path
 import struct
 from typing import Any, Callable
@@ -77,7 +77,6 @@ class SourceStore:
         self.model = model
         self.refs: dict[str, SourceRef] = {}
         self.files: dict[str, Any] = {}
-        self.maps: dict[str, mmap.mmap] = {}
         self.headers: dict[str, dict[str, Any]] = {}
         for shard_name in sorted(set(weight_map.values())):
             if not isinstance(shard_name, str):
@@ -87,7 +86,6 @@ class SourceStore:
             self.headers[shard_name] = header
             file = shard_path.open("rb")
             self.files[shard_name] = file
-            self.maps[shard_name] = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
             for name, entry in header.items():
                 if name not in weight_map or weight_map[name] != shard_name:
                     fail(f"source index/header mismatch for {name}")
@@ -108,8 +106,6 @@ class SourceStore:
             fail("source index does not match safetensors headers")
 
     def close(self) -> None:
-        for value in self.maps.values():
-            value.close()
         for value in self.files.values():
             value.close()
 
@@ -128,22 +124,52 @@ class SourceStore:
             fail(f"source tensor {name} has shape {value.shape}, expected {shape}")
         return value
 
+    # Shards are read with positioned reads, never memory-mapped: page faults on large mappings of the shared
+    # (exFAT) drive have hung the kernel. os.pread is position-independent, so forked workers can share the files.
+    def _read(self, shard: str, offset: int, size: int) -> bytes:
+        fd, parts, done = self.files[shard].fileno(), [], 0
+        while done < size:
+            part = os.pread(fd, size - done, offset + done)
+            if not part:
+                fail(f"source shard {shard} is truncated")
+            parts.append(part)
+            done += len(part)
+        return b"".join(parts)
+
     def words(self, name: str, shape: tuple[int, ...] | None = None) -> np.ndarray:
         ref = self.ref(name, shape)
-        count = checked_product(ref.shape, name)
-        return np.frombuffer(self.maps[ref.shard], dtype="<u2", count=count, offset=ref.offset).reshape(ref.shape)
+        return np.frombuffer(self.raw(name, shape), dtype="<u2").reshape(ref.shape)
 
     def raw(self, name: str, shape: tuple[int, ...] | None = None) -> bytes:
         ref = self.ref(name, shape)
-        return bytes(self.maps[ref.shard][ref.offset : ref.offset + checked_product(ref.shape, name) * 2])
+        return self._read(ref.shard, ref.offset, checked_product(ref.shape, name) * 2)
+
+    def word_rows(self, name: str, begin: int, end: int, shape: tuple[int, int]) -> np.ndarray:
+        ref = self.ref(name, shape)
+        row_bytes = 2 * shape[1]
+        data = self._read(ref.shard, ref.offset + begin * row_bytes, (end - begin) * row_bytes)
+        return np.frombuffer(data, dtype="<u2").reshape(end - begin, shape[1])
+
+    def word_indices(self, name: str, indices: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+        """Rows `indices` (in that order), read as runs of consecutive rows."""
+        indices = np.asarray(indices, dtype=np.int64)
+        out = np.empty((len(indices), shape[1]), dtype="<u2")
+        order = np.argsort(indices, kind="stable")
+        sorted_rows = indices[order]
+        start = 0
+        while start < len(sorted_rows):
+            end = start + 1
+            while end < len(sorted_rows) and sorted_rows[end] == sorted_rows[end - 1] + 1:
+                end += 1
+            out[order[start:end]] = self.word_rows(name, int(sorted_rows[start]), int(sorted_rows[end - 1]) + 1, shape)
+            start = end
+        return out
 
     def float_rows(self, name: str, begin: int, end: int, shape: tuple[int, int]) -> np.ndarray:
-        words = self.words(name, shape)[begin:end]
-        return np.ascontiguousarray(bf16_to_float32(words), dtype=np.float32)
+        return np.ascontiguousarray(bf16_to_float32(self.word_rows(name, begin, end, shape)), dtype=np.float32)
 
     def float_indices(self, name: str, indices: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-        words = self.words(name, shape)[indices]
-        return np.ascontiguousarray(bf16_to_float32(words), dtype=np.float32)
+        return np.ascontiguousarray(bf16_to_float32(self.word_indices(name, indices, shape)), dtype=np.float32)
 
 
 @dataclass
@@ -158,7 +184,7 @@ class MatrixSource:
 def source_matrix(store: SourceStore, name: str, shape: tuple[int, int]) -> MatrixSource:
     store.ref(name, shape)
     return MatrixSource(shape, lambda begin, end: store.float_rows(name, begin, end, shape),
-                        lambda begin, end: store.words(name, shape)[begin:end])
+                        lambda begin, end: store.word_rows(name, begin, end, shape))
 
 
 
@@ -209,7 +235,7 @@ def head_part(store: SourceStore, name: str, gate: bool) -> MatrixSource:
         return logical // 256 * 512 + base + logical % 256
 
     return MatrixSource(shape, lambda begin, end: store.float_indices(name, source_rows(begin, end), source_shape),
-                        lambda begin, end: store.words(name, source_shape)[source_rows(begin, end)])
+                        lambda begin, end: store.word_indices(name, source_rows(begin, end), source_shape))
 
 
 def gather_matrix(store: SourceStore, name: str, rows: np.ndarray) -> MatrixSource:
@@ -219,7 +245,7 @@ def gather_matrix(store: SourceStore, name: str, rows: np.ndarray) -> MatrixSour
     return MatrixSource(
         (int(rows.size), HIDDEN),
         lambda begin, end: store.float_indices(name, rows[begin:end], source_shape),
-        lambda begin, end: store.words(name, source_shape)[rows[begin:end]],
+        lambda begin, end: store.word_indices(name, rows[begin:end], source_shape),
     )
 
 

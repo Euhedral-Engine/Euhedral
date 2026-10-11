@@ -13,7 +13,7 @@ against the template: its relative RMS difference is the rounding error (a few t
 MAX_RELATIVE_ERROR the mapping is wrong and the tool stops. The MTP layer and the draft head are not written.
 --keep leaves the llama.cpp tensors whose names match REGEX at their BF16 values: the per-family sweep restores one
 family at a time and reads its share of the KL from the difference.
-Needs NumPy and llama.cpp's gguf-py on PYTHONPATH.
+Needs NumPy. Every file is read with ordinary reads, never memory-mapped.
 """
 from __future__ import annotations
 
@@ -27,9 +27,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from euhedral_artifacts import edrl, nvfp4, q3_p2e2  # noqa: E402
+from euhedral_artifacts.importance import gguf_tensors  # noqa: E402
 from euhedral_artifacts.edrl import align_up  # noqa: E402
 
 MAX_RELATIVE_ERROR = 0.6
+GGML_TYPE_BF16 = 30
 ROW_CHUNK = 16384
 # Qwen3.8-27B geometry (config.json text_config).
 HEADS, HEAD_DIM = 24, 256
@@ -172,15 +174,13 @@ def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
-    import gguf  # llama.cpp's gguf-py
     artifact, template, out = Path(argv[0]), Path(argv[1]), Path(argv[2])
-    reader = gguf.GGUFReader(template)
-    tensors = {t.name: t for t in reader.tensors}
+    tensors = gguf_tensors(template)
     print(f"copying {template} to {out}", flush=True)
     shutil.copyfile(template, out)
     names, kinds = formats(), layouts()
     pending, written = {}, 0
-    with artifact.open("rb") as handle, out.open("r+b") as sink:
+    with artifact.open("rb") as handle, out.open("r+b") as sink, template.open("rb") as source:
         _, _, objects = edrl.read_table(handle)
         for obj in objects:
             fmt, layout = names[obj["format"]], kinds[obj["layout"]]
@@ -192,15 +192,17 @@ def main(argv: list[str]) -> int:
                     print(f"{gguf_name:32s} kept at BF16", flush=True)
                     continue
                 target = tensors[gguf_name]
-                if target.tensor_type.name != "BF16" or int(target.n_elements) != values.size:
-                    raise SystemExit(f"{gguf_name}: template is {target.tensor_type.name} x {target.n_elements}, "
+                if target.kind != GGML_TYPE_BF16 or target.elements != values.size:
+                    raise SystemExit(f"{gguf_name}: template is type {target.kind} x {target.elements}, "
                                      f"artifact gives {values.shape}")
-                original = (np.asarray(target.data).view("<u2").reshape(values.shape).astype(np.uint32) << 16).view(np.float32)
+                source.seek(target.offset)
+                original = np.frombuffer(source.read(2 * values.size), "<u2").reshape(values.shape)
+                original = (original.astype(np.uint32) << 16).view(np.float32)
                 error = float(np.sqrt(np.mean((values - original) ** 2) / np.mean(original.astype(np.float64) ** 2)))
                 print(f"{gguf_name:32s} {fmt:11s} {layout:22s} relative RMS error {error:.4f}", flush=True)
                 if error > MAX_RELATIVE_ERROR:
                     raise SystemExit(f"{gguf_name}: relative error {error:.3f}; the object-to-tensor mapping is wrong")
-                sink.seek(int(target.data_offset))
+                sink.seek(target.offset)
                 sink.write(to_bf16(values).tobytes())
                 written += 1
     if pending:

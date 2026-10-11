@@ -74,6 +74,11 @@ those of one-row decode (checked on T1), and a 2560-token chunk takes about 21 s
 The BF16 references stream the weights from the page cache, so they need the 54 GB GGUF to stay cached: with nothing else
 holding memory a chunk takes about 10 seconds; beside a 29 GB process it took about 40.
 
+**Large files on a shared exFAT drive are read, never memory-mapped.** Page faults on big mappings of such a drive hung the
+kernel of the development machine (Linux 7.0) three times. The converter, `compare_reference.py` and
+`dequantize_gguf.py` use positioned reads; llama.cpp, which maps its models, reads them from a local ext4 disk (the BF16
+GGUFs and `weight_only.sh`'s work directory).
+
 ## Compression-induced error
 
 `compare_teacher_forced.py` compares reports with one another. `q3-compressed` is lossless, so its report is byte for byte the
