@@ -69,7 +69,7 @@ class CompareReferenceTest(unittest.TestCase):
         targets = tokens[:, first + 1:first + 1 + records]
         index = (np.arange(CHUNKS)[:, None], np.arange(records)[None, :], targets)
         nll, reference_nll = -q[index], -p[index]
-        kl = (np.exp(p) * (p - q)).sum(axis=-1)
+        kl = np.where(p > -16, np.exp(p) * (p - q), 0).sum(axis=-1)
         chunk_difference = (nll - reference_nll).mean(axis=1)
         line = out.getvalue().strip().splitlines()[-1].split()
         self.assertAlmostEqual(float(line[1]), nll.mean(), places=4)
@@ -77,6 +77,20 @@ class CompareReferenceTest(unittest.TestCase):
         self.assertAlmostEqual(float(line[4]), chunk_difference.std(ddof=1) / np.sqrt(CHUNKS), places=4)
         self.assertAlmostEqual(float(line[5]), kl.mean(), places=5)
         self.assertAlmostEqual(float(line[7]), (p.argmax(-1) == q.argmax(-1)).mean(), places=4)
+
+    def test_the_reference_floor_is_left_out_of_the_kl(self):
+        # The reference clamps entries 16 nats below its maximum; a candidate with the same head and a lower tail
+        # differs from it only below the floor.
+        head = np.array([0.0, -1.0, -2.0])
+        p = np.concatenate([head, np.full(3, -16.0)])[None, :]
+        p = p - np.log(np.exp(p).sum())
+        q = np.concatenate([head, np.full(3, -30.0)])[None, :]
+        q = q - np.log(np.exp(q).sum())
+        kl = compare_reference.kl_divergence(p, q)
+        above = p > -16
+        expected = (np.exp(p[above]) * (p[above] - q[above])).sum()
+        self.assertAlmostEqual(float(kl[0]), expected, places=12)
+        self.assertLess(float(kl[0]), 1e-5)
 
     def test_a_prefix_with_missing_chunks_is_refused(self):
         rng = np.random.default_rng(6)
