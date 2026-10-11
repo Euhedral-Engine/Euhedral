@@ -78,6 +78,8 @@ class ObjectPlan:
     byte_size: int
     writer: Callable[[Any, int], None]
     offset: int = 0
+    # Quantized objects: (MatrixSource, Calibration or None) they are rounded from, for tools that redo the rounding.
+    source: Any = None
 
 
 def encode_table(plans: list[ObjectPlan]) -> bytes:

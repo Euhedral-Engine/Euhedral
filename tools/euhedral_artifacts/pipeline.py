@@ -67,13 +67,13 @@ def check_checkpoint(config: dict[str, Any]) -> None:
 
 def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recipe: Recipe, selected: np.ndarray,
                    jobs: int, draft: Path | None = None, draft_projections: str = "bf16",
-                   importance: ImportanceMatrix | None = None) -> None:
+                   importance: ImportanceMatrix | None = None, codes_from: Path | None = None) -> None:
     """Quantizes the checkpoint into the artifact `recipe` names (stored as is: for compressed q3, the
     uncompressed form), at `output_path`, through a temporary file renamed into place. With `draft` the
     DFlash2 drafter checkpoint in that directory is added as `dflash2/` objects; with `importance` the
-    weights are rounded by calibrated scale search."""
+    weights are rounded by calibrated scale search; objects `codes_from` holds codes for take them from there."""
     with SourceStore(model) as store, contextlib.ExitStack() as drafts:
-        plans = build_plans(store, selected, recipe, importance)
+        plans = build_plans(store, selected, recipe, importance, codes_from)
         if draft is not None:
             draft_store = drafts.enter_context(SourceStore(draft))
             plans += dflash2.build_plans(draft_store, dflash2.check_draft(read_json(draft / "config.json")),
@@ -109,11 +109,13 @@ def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recip
 
 def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path | None = None,
             draft_ids_from: Path | None = None, jobs: int = 1, force: bool = False, draft: Path | None = None,
-            draft_projections: str = "bf16", imatrix: Path | None = None) -> dict[str, Any]:
+            draft_projections: str = "bf16", imatrix: Path | None = None,
+            codes_from: Path | None = None) -> dict[str, Any]:
     """Converts the checkpoint directory `model` to the artifact `recipe` names. Exactly one of
     `ranking_path` (token frequency counts, to choose the draft-head shortlist) and `draft_ids_from`
     (an existing artifact whose shortlist is reused) is required. `draft` adds the DFlash2 drafter.
-    `imatrix` (a llama.cpp importance matrix) selects calibrated rounding."""
+    `imatrix` (a llama.cpp importance matrix) selects calibrated rounding. `codes_from` (a directory of
+    pre-rounded codes, codes.py) supplies the objects it holds files for."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
     if (ranking_path is None) == (draft_ids_from is None):
@@ -133,7 +135,7 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     else:
         built = output_path
     try:
-        write_artifact(model, config, built, recipe, selected, jobs, draft, draft_projections, importance)
+        write_artifact(model, config, built, recipe, selected, jobs, draft, draft_projections, importance, codes_from)
         stats = q3_p2e2.transcode(built, output_path, force=True) if transcode else {}
     finally:
         if transcode:
@@ -145,6 +147,8 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
         manifest.update({"draft_model": str(draft), "draft_projections": draft_projections})
     if imatrix is not None:
         manifest.update({"imatrix": str(imatrix), "imatrix_sha256": sha256(imatrix)})
+    if codes_from is not None:
+        manifest.update({"codes_from": str(codes_from), "codes_from_objects": len(list(codes_from.glob("*.npz")))})
     manifest.update(stats)
     with Path(f"{output_path}.manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)

@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from euhedral_artifacts.codes import QuantState, check_state, state_file, state_size, write_state
 from euhedral_artifacts.edrl import ObjectPlan, checked_product, fail, read_table, utf8
 from euhedral_artifacts.grouped import QUANT, quantize_matrix, row_split_size
 from euhedral_artifacts.importance import ImportanceMatrix
@@ -81,10 +82,18 @@ def add_direct(plans: list[ObjectPlan], name: str, shape: tuple[int, ...], store
 
 
 def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: MatrixSource, q3_format: str,
-              importance: ImportanceMatrix | None = None) -> None:
+              importance: ImportanceMatrix | None = None, codes_from: Path | None = None) -> None:
     """Adds the quantized object `name`, stored as `recipe` says; `q3_format` is its format in the q3 artifact.
-    With `importance` it is rounded by calibrated scale search."""
+    With `importance` it is rounded by calibrated scale search; when `codes_from` holds a state file for it, its
+    codes and scales are taken from there instead."""
     format_name, layout = storage(recipe, name, q3_format)
+    if codes_from is not None and state_file(codes_from, name).is_file():
+        path = state_file(codes_from, name)
+        state = QuantState.load(path)
+        check_state(state, format_name, layout, matrix.shape)
+        plans.append(ObjectPlan(name, matrix.shape, "BF16", format_name, layout, state_size(state),
+                                lambda output, offset, path=path: write_state(output, offset, QuantState.load(path))))
+        return
     calibration = importance.calibration(name, matrix.shape[1]) if importance is not None else None
     if calibration is not None and recipe.quantization == "q3" and recipe.compressed and format_name == Q3_FORMAT:
         # Compressed q3 stores its Q3 tensors in P2E2, which holds the codes -3..3 (docs/COMPRESSED_Q3.md).
@@ -93,17 +102,20 @@ def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: Matrix
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, nvfp4_sd4_offsets(matrix.shape)[2],
             lambda output, offset, source=matrix: quantize_nvfp4_sd4_matrix(output, offset, source, calibration),
+            source=(matrix, calibration),
         ))
     elif format_name == NVFP4_FORMAT:
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, payload_size(matrix.shape, format_name),
             lambda output, offset, source=matrix: quantize_nvfp4_matrix(output, offset, source, calibration),
+            source=(matrix, calibration),
         ))
     elif format_name in QUANT:
         plans.append(ObjectPlan(
             name, matrix.shape, "BF16", format_name, layout, row_split_size(matrix.shape, format_name),
             lambda output, offset, source=matrix, fmt=format_name: quantize_matrix(output, offset, source, fmt,
                                                                                     calibration),
+            source=(matrix, calibration),
         ))
     else:
         fail(f"unknown quantized format {format_name}")
@@ -115,13 +127,14 @@ def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, Matr
 
 
 def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
-                importance: ImportanceMatrix | None = None) -> list[ObjectPlan]:
+                importance: ImportanceMatrix | None = None, codes_from: Path | None = None) -> list[ObjectPlan]:
     """The 785 text and MTP objects. Formats written here are the q3 artifact's; `recipe` maps them to
-    the artifact being built. With `importance`, quantized objects are rounded by calibrated scale search."""
+    the artifact being built. With `importance`, quantized objects are rounded by calibrated scale search;
+    those `codes_from` holds state files for are written from them (add_quant)."""
     plans: list[ObjectPlan] = []
 
     def quant(name: str, matrix: MatrixSource, q3_format: str) -> None:
-        add_quant(plans, recipe, name, matrix, q3_format, importance)
+        add_quant(plans, recipe, name, matrix, q3_format, importance, codes_from)
 
     quant("text/token_embedding", source_matrix(store, "model.language_model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
     for layer in range(64):
