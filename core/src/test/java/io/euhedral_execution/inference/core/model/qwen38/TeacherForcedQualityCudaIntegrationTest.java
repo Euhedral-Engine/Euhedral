@@ -47,6 +47,8 @@ class TeacherForcedQualityCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         Path artifact = Path.of(System.getProperty("euhedral.quality.artifact"));
         long hostBytes = Long.getLong("euhedral.quality.host-mib", 0L) << 20;
+        // Forced tokens per verification (1: one-row decode); the row-exact multi-row kernels take up to 8.
+        int rows = Integer.getInteger("euhedral.quality.rows", 8);
         String tokenFile = System.getProperty("euhedral.quality.tokens", "");
         List<int[]> chunks;
         int prefix;
@@ -95,6 +97,7 @@ class TeacherForcedQualityCudaIntegrationTest {
                             prefix,
                             steps,
                             vocabulary,
+                            rows,
                             out);
                     System.out.printf(
                             Locale.ROOT,
@@ -123,6 +126,7 @@ class TeacherForcedQualityCudaIntegrationTest {
             int prefix,
             int steps,
             int vocabulary,
+            int rows,
             Path report)
             throws Exception {
         try (OutputStream file = Files.newOutputStream(report);
@@ -143,16 +147,35 @@ class TeacherForcedQualityCudaIntegrationTest {
                         Quantum.ExecutionKind.PREFILL,
                         Arrays.copyOfRange(document, begin, end));
             }
+            // Step k forces token prefix + k. Its logits come from the prefill (k = 0), then from verifications of
+            // `rows` forced tokens at a time: row-exact, every row is bit for bit the one-row decode at its position.
+            short[][] pending = {logits};
+            int used = 0;
             for (int step = 0; step < steps; step++) {
+                if (used == pending.length) {
+                    int count = Math.min(rows, steps - step);
+                    int[] forced = Arrays.copyOfRange(document, prefix + step - 1, prefix + step - 1 + count);
+                    pending = rows == 1
+                            ? new short[][] {run(runtime, gpu, plan, sequence, Quantum.ExecutionKind.DECODE, forced)}
+                            : rows(
+                                    runtime,
+                                    gpu,
+                                    plan,
+                                    sequence,
+                                    Quantum.ExecutionKind.VERIFY,
+                                    forced,
+                                    LogitsRequirement.ALL_TOKENS);
+                    used = 0;
+                }
+                short[] current = pending[used++];
                 int next = document[prefix + step];
                 out.writeInt(Integer.reverseBytes(next));
                 for (int i = 0; i < vocabulary; i++) {
-                    row[2 * i] = (byte) logits[i];
-                    row[2 * i + 1] = (byte) (logits[i] >> 8);
+                    row[2 * i] = (byte) current[i];
+                    row[2 * i + 1] = (byte) (current[i] >> 8);
                 }
                 out.write(row);
-                nll += negativeLogLikelihood(logits, next);
-                logits = run(runtime, gpu, plan, sequence, Quantum.ExecutionKind.DECODE, new int[] {next});
+                nll += negativeLogLikelihood(current, next);
             }
             return nll / steps;
         } finally {
@@ -201,26 +224,43 @@ class TeacherForcedQualityCudaIntegrationTest {
             Quantum.ExecutionKind kind,
             int[] tokens)
             throws Exception {
-        AtomicReference<short[]> captured = new AtomicReference<>();
-        var context = new Quantum(
-                plan, sequence, kind, sequence.currentTokenPosition(), tokens, LogitsRequirement.LAST_TOKEN);
+        short[][] rows = rows(runtime, gpu, plan, sequence, kind, tokens, LogitsRequirement.LAST_TOKEN);
+        return rows[rows.length - 1];
+    }
+
+    /// Runs one quantum and returns its logits rows (the last one for LAST_TOKEN, one per token for ALL_TOKENS).
+    private static short[][] rows(
+            Execution runtime,
+            CudaGpuMemory gpu,
+            ExecutionPlan plan,
+            Sequence sequence,
+            Quantum.ExecutionKind kind,
+            int[] tokens,
+            LogitsRequirement requirement)
+            throws Exception {
+        AtomicReference<short[][]> captured = new AtomicReference<>();
+        var context = new Quantum(plan, sequence, kind, sequence.currentTokenPosition(), tokens, requirement);
         var outcome = runtime.submit(context, done -> {
                     try (Arena arena = Arena.ofConfined();
                             DeviceLogits logits = done.logitsOutput().orElseThrow()) {
                         int vocabulary = logits.vocabularySize();
-                        MemorySegment host = arena.allocate((long) vocabulary * Short.BYTES, Short.BYTES);
+                        int count = requirement == LogitsRequirement.ALL_TOKENS ? logits.tokenCount() : 1;
+                        int first = logits.tokenCount() - count;
+                        MemorySegment host = arena.allocate((long) count * vocabulary * Short.BYTES, Short.BYTES);
                         gpu.copyDeviceToHost(
                                 host,
-                                logits.deviceAddress() + (long) (logits.tokenCount() - 1) * vocabulary * Short.BYTES,
+                                logits.deviceAddress() + (long) first * vocabulary * Short.BYTES,
                                 host.byteSize());
-                        short[] values = new short[vocabulary];
-                        MemorySegment.copy(
-                                host,
-                                ValueLayout.JAVA_SHORT.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN),
-                                0,
-                                values,
-                                0,
-                                vocabulary);
+                        short[][] values = new short[count][vocabulary];
+                        for (int row = 0; row < count; row++) {
+                            MemorySegment.copy(
+                                    host,
+                                    ValueLayout.JAVA_SHORT.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN),
+                                    (long) row * vocabulary * Short.BYTES,
+                                    values[row],
+                                    0,
+                                    vocabulary);
+                        }
                         captured.set(values);
                     }
                 })
