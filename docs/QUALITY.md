@@ -82,10 +82,10 @@ Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE
 
 | Artifact | T1 (1 chunk) | T2 wikitext (25) | T3 code (24) | T4 own generations (25) |
 |---|---|---|---|---|
-| nvfp4-compressed | +0.028 ± 0.009 / 0.155 / 89.4% | +0.018 ± 0.007 / 0.182 / 91.2% | +0.046 ± 0.006 / 0.459 / 96.3% | +0.100 ± 0.036 / 0.607 / 91.5% |
-| nvfp4 | +0.030 ± 0.009 / 0.156 / 88.4% | +0.012 ± 0.007 / 0.182 / 91.4% | +0.044 ± 0.005 / 0.460 / 96.3% | +0.001 ± 0.029 / 0.602 / 91.6% |
-| q3 | +0.161 ± 0.021 / 0.296 / 76.3% | +0.117 ± 0.012 / 0.315 / 79.5% | +0.184 ± 0.021 / 0.561 / 91.7% | +0.069 ± 0.049 / 0.782 / 85.7% |
-| q3-compressed | +0.213 ± 0.023 / 0.339 / 73.7% | +0.118 ± 0.013 / 0.327 / 78.9% | +0.222 ± 0.026 / 0.587 / 90.5% | +0.189 ± 0.114 / 0.889 / 84.1% |
+| nvfp4-compressed | +0.028 ± 0.009 / 0.037 / 89.4% | +0.018 ± 0.007 / 0.047 / 91.2% | +0.046 ± 0.006 / 0.073 / 96.3% | +0.100 ± 0.036 / 0.228 / 91.5% |
+| nvfp4 | +0.030 ± 0.009 / 0.038 / 88.4% | +0.012 ± 0.007 / 0.046 / 91.4% | +0.044 ± 0.005 / 0.074 / 96.3% | +0.001 ± 0.029 / 0.220 / 91.6% |
+| q3 | +0.161 ± 0.021 / 0.193 / 76.3% | +0.117 ± 0.012 / 0.199 / 79.5% | +0.184 ± 0.021 / 0.254 / 91.7% | +0.069 ± 0.049 / 0.466 / 85.7% |
+| q3-compressed | +0.213 ± 0.023 / 0.240 / 73.7% | +0.118 ± 0.013 / 0.217 / 78.9% | +0.222 ± 0.026 / 0.292 / 90.5% | +0.189 ± 0.114 / 0.581 / 84.1% |
 
 On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix near-deterministic answer text with
 open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
@@ -121,6 +121,9 @@ Swift-1.5 BF16 (25 chunks; token-level standard errors):
 | GDN output (`ssm_out`, 5.6%) | +0.082 ± 0.004 | 0.186 | 1.37 | 79.5% |
 | GDN input projections (`attn_qkv`, `attn_gate`, 15.0%) | +0.114 ± 0.004 | 0.191 | 1.42 | 79.4% |
 | token embedding (4.7%) | +0.115 ± 0.004 | 0.193 | 1.46 | 79.4% |
+
+The engine adds little on top of its weights: on T2 its mean KL is 0.046 for `nvfp4` and 0.199 for `q3` (holdout table
+above), against 0.042 and 0.193 for the weights alone in llama.cpp.
 
 The LM head carries a third of the KL in 4.7% of the weights; the GDN input projections and the token embedding carry
 almost none. Per-token KL and top-1 order the families consistently; dNLL does not (quantization noise moves the forced token's

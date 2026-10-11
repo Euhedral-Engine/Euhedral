@@ -21,8 +21,8 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
-The `q3`, `q3-compressed` and `nvfp4` artifacts are converted from the Qwen3.8-27B checkpoint. The `nvfp4-compressed` artifact
-is converted from Swift-1.5 (`ukisai/Swift-1.5-Qwen3.8-27b`, UkisAI's fine-tune of Qwen3.8-27B); the converter takes either.
+All four artifacts are converted from Swift-1.5 (`ukisai/Swift-1.5-Qwen3.8-27b`, UkisAI's fine-tune of Qwen3.8-27B); the
+converter takes either checkpoint.
 
 The engine reads what an artifact is from the file and picks the fastest validated execution for it: kernels by row count,
 FP8 and FP4 tensor-core prefill, the attention implementation, the speculative-decoding depth and which weights stay in
@@ -93,22 +93,22 @@ that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint r
 
 All four artifacts are rounded by calibrated scale search: every group's scale minimizes its
 error weighted by the importance of each input column (`tools/convert_checkpoint.py --imatrix`, see
-[tools/README.md](tools/README.md)). `q3`, `q3-compressed` and `nvfp4` use the public importance matrix of ISTA-DASLab's Qwen3.8-27B GSQ-RCO
-release (`imatrix-qwen3.8-27b.gguf`) and are measured against the Qwen3.8-27B BF16 checkpoint; `nvfp4-compressed` uses
-UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`) and is
-measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its Q3 tensors to the codes -3..3, which its lossless
-layout stores, while `q3` also uses -4 ([docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md)), so the two hold different values.
+[tools/README.md](tools/README.md)) with UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from
+`ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`), and is measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its
+Q3 tensors to the codes -3..3, which its lossless layout stores, while `q3` also uses -4 ([docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md)), so the two hold different values.
 
 **Model and quantization error** — the artifact against the BF16 checkpoint (reference: BF16 in llama.cpp on the CPU):
 
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
-| Qwen3.8-27B BF16 reference | 2.128 | 8.39 | | | |
-| `q3` | 2.298 | 9.95 | +0.170 ± 0.021 | 0.293 | 76.2% |
-| `q3-compressed` | 2.336 | 10.34 | +0.208 ± 0.023 | 0.334 | 73.3% |
-| `nvfp4` | 2.156 | 8.64 | +0.029 ± 0.008 | 0.147 | 88.2% |
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `nvfp4-compressed` (Swift-1.5) | 2.170 | 8.76 | +0.028 ± 0.009 | 0.155 | 89.4% |
+| `q3` | 2.303 | 10.00 | +0.161 ± 0.021 | 0.193 | 76.3% |
+| `q3-compressed` | 2.355 | 10.54 | +0.213 ± 0.023 | 0.240 | 73.7% |
+| `nvfp4` | 2.171 | 8.77 | +0.030 ± 0.009 | 0.038 | 88.4% |
+| `nvfp4-compressed` | 2.170 | 8.76 | +0.028 ± 0.009 | 0.037 | 89.4% |
+
+Over a 75-chunk holdout of prose, code and the model's own chat answers, and with each artifact's weights alone in llama.cpp,
+the same order holds ([docs/QUALITY.md](docs/QUALITY.md#holdout-texts)).
 
 **Compression-induced error** — the compressed artifact against its uncompressed one:
 
@@ -137,17 +137,17 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest at short contexts:** `nvfp4-compressed` (Swift-1.5; perplexity 8.76 against 8.51 for its BF16): 136 tok/s at 4K. On a
+- **Fastest at short contexts:** `nvfp4-compressed` (perplexity 8.76 against 8.51 for BF16 on the quality text): 136 tok/s at 4K. On a
   16 GB card it keeps 0.08 to 0.65 GiB of weights in host memory at 32K to 64K (1.84 GiB at 128K) and streams them in for every
   token, which slows it to 104 tok/s at 32K, 87 at 64K and 59 at 128K.
 - **Fastest at long contexts, and the one that fits everywhere:** `q3`: 120 tok/s at 4K, 105 at 32K, 98 at 64K and 77 at 128K,
-  with no host-backed weights (perplexity 9.95 against 8.39 for BF16 on the quality text).
-- **More room instead of speed:** `q3-compressed` (perplexity 10.34) is a file about 1.0 GiB smaller than `q3`, which leaves more
+  with no host-backed weights (perplexity 10.00).
+- **More room instead of speed:** `q3-compressed` (perplexity 10.54) is a file about 1.0 GiB smaller than `q3`, which leaves more
   of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them, which costs 11 to
   22% of `q3`'s decode speed (94 tok/s at 4K and 32K, 81 at 64K, 62 at 128K).
-- `nvfp4` (perplexity 8.64), the highest fidelity, keeps 0.84 to 1.40 GiB of weights in host memory at 32K to 64K (2.59 GiB at
-  128K) and decodes slower than `nvfp4-compressed` at every context in the table; on the same checkpoint the two NVFP4 forms differ
-  by less than the noise of the quality measurement, and their prefill is within 4%.
+- `nvfp4` (perplexity 8.77), keeps 0.84 to 1.40 GiB of weights in host memory at 32K to 64K (2.59 GiB at
+  128K) and decodes slower than `nvfp4-compressed` at every context in the table; the two NVFP4 forms differ by less than the noise of the
+  quality measurement, and their prefill is within 4%.
 - A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.
 
 ## Quick start
