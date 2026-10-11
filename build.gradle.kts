@@ -123,7 +123,7 @@ subprojects {
             for (name in listOf("steps", "prefix", "report", "candidate"))
                 providers.gradleProperty("euhedral.numerics.drift.$name").orNull?.let { systemProperty("euhedral.numerics.drift.$name", it) }
             // Teacher-forced quality measurement (TeacherForcedQualityCudaIntegrationTest).
-            for (name in listOf("report", "artifact", "prefix", "steps", "host-mib"))
+            for (name in listOf("report", "artifact", "prefix", "steps", "host-mib", "tokens"))
                 providers.gradleProperty("euhedral.quality.$name").orNull?.let { systemProperty("euhedral.quality.$name", it) }
             // MTP drafting-confidence report and draft-length screen (MtpDraftConfidence/MtpDraftLengthScreen tests).
             for (name in listOf("prompts", "report", "drafts", "context", "arms", "rounds"))

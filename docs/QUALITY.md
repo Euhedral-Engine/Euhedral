@@ -40,6 +40,35 @@ python3 tools/compare_reference.py bf16.kld q3.bin nvfp4.bin
 error, the mean KL(reference || artifact) and the top-1 agreement. The reference's log-probabilities are stored in 16 bits over
 the 16 nats below each position's maximum, which bounds the KL resolution at about 1e-4.
 
+## Holdout texts
+
+One 1279-token document resolves about 0.02 nats on NVFP4 artifacts and 0.05 on Q3 ones, so changes of that size need the
+holdout: four texts of 25 chunks of 2560 tokens each (the second half of every chunk scored, about 32K scored tokens per
+text), every artifact scored against the BF16 checkpoint it was converted from.
+
+| Text | Content | Built by |
+|---|---|---|
+| T1 | `chat-corpus-v1-document.md`, one chunk | (the repository) |
+| T2 | wikitext-2 `wiki.test.raw`, the text public KL figures for this model use | `tools/holdout/texts.py` |
+| T3 | source code from CPython, the Go standard library, serde_json and cJSON at pinned tags, about 16K tokens each | `tools/holdout/texts.py` |
+| T4 | Swift-1.5's own answers, thinking and chat-template tokens included, to 150 public training-split prompts (GSM8K, MBPP, Hermes function calling) | `tools/holdout/t4_prompts.py`, `tools/holdout/t4_generate.py` |
+
+T4 is generated greedily by Swift-1.5 at Q8_0 (54 GB of BF16 does not fit the desktop's memory), through `llama-server`
+with `--jinja`; its documents are scored with `--parse-special`, so template tokens stay single tokens.
+
+**References** run in llama.cpp's CUDA build with the BF16 weights in host memory, streamed through the GPU (`-ngl 0`; a
+2560-token chunk takes 9 to 40 seconds, against 196 on the CPU). On T1 the GPU and CPU references differ by a mean KL of
+3e-5 and agree on the top-1 token at 99.8% of positions.
+
+```bash
+llama-perplexity -m Swift-1.5-BF16.gguf -f t2.txt -c 2560 -b 2560 -ub 2560 --chunks 25 -ngl 0 --kl-divergence-base swift_t2.kld
+tools/holdout/score.sh nvfp4c-t2 qwen3_8_27b_nvfp4_compressed.edrl swift_t2.kld results.txt
+```
+
+`score.sh` runs `TeacherForcedQualityCudaIntegrationTest` with `-Peuhedral.quality.tokens=REFERENCE.kld`, which forces
+every chunk of the reference on a fresh sequence, then `compare_reference.py --detail`, which reports chunk-level standard
+errors (tokens within a document are correlated), KL percentiles and delta-p.
+
 ## Compression-induced error
 
 `compare_teacher_forced.py` compares reports with one another. `q3-compressed` is lossless, so its report is byte for byte the
