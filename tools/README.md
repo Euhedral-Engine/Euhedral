@@ -97,6 +97,11 @@ python3 tools/fake_quant_parity.py --model $CHECKPOINT --artifact $OUT/qwen3_8_2
     --imatrix imatrix-swift15-v1mix.gguf [--objects REGEX] [--export DIR]
 ```
 
+On the shipped `q3`, `nvfp4` and `nvfp4-compressed` artifacts (calibrated, Swift-1.5) every quantized object, 328 per
+artifact, matches byte for byte and every module's forward pass equals its decoded weights exactly; a parity run takes
+5 to 11 minutes on the GPU. Converting `q3` and `nvfp4-compressed` again with the exported codes of layers 10 and 11, the
+LM head and the MTP input projection (`--codes-from`) reproduces each artifact's SHA-256.
+
 ## DFlash2
 
 `--dflash2 DIR` adds the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`: `config.json`, `model.safetensors`) to a conversion, and
