@@ -57,7 +57,7 @@ T4 is generated greedily by Swift-1.5 at Q8_0 (54 GB of BF16 does not fit the de
 with `--jinja`; its documents are scored with `--parse-special`, so template tokens stay single tokens.
 
 **References** run in llama.cpp's CUDA build with the BF16 weights in host memory, streamed through the GPU (`-ngl 0`; a
-2560-token chunk takes 9 to 40 seconds, against 196 on the CPU). On T1 the GPU and CPU references differ by a mean KL of
+2560-token chunk takes about 10 seconds, against 196 on the CPU). On T1 the GPU and CPU references differ by a mean KL of
 3e-5 and agree on the top-1 token at 99.8% of positions.
 
 ```bash
@@ -67,7 +67,12 @@ tools/holdout/score.sh nvfp4c-t2 qwen3_8_27b_nvfp4_compressed.edrl swift_t2.kld 
 
 `score.sh` runs `TeacherForcedQualityCudaIntegrationTest` with `-Peuhedral.quality.tokens=REFERENCE.kld`, which forces
 every chunk of the reference on a fresh sequence, then `compare_reference.py --detail`, which reports chunk-level standard
-errors (tokens within a document are correlated), KL percentiles and delta-p.
+errors (tokens within a document are correlated), KL percentiles and delta-p. The test forces 8 tokens per speculative
+verification (`-Peuhedral.quality.rows`, 1 for one-row decode): verification is row-exact, so its reports are byte for byte
+those of one-row decode (checked on T1), and a 2560-token chunk takes about 21 seconds instead of about 170.
+
+The BF16 references stream the weights from the page cache, so they need the 54 GB GGUF to stay cached: with nothing else
+holding memory a chunk takes about 10 seconds; beside a 29 GB process it took about 40.
 
 ## Compression-induced error
 
