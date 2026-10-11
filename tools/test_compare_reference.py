@@ -78,6 +78,25 @@ class CompareReferenceTest(unittest.TestCase):
         self.assertAlmostEqual(float(line[5]), kl.mean(), places=5)
         self.assertAlmostEqual(float(line[7]), (p.argmax(-1) == q.argmax(-1)).mean(), places=4)
 
+    def test_the_cuda_path_matches_the_numpy_path(self):
+        torch = compare_reference.cuda_torch()
+        if torch is None:
+            self.skipTest("no CUDA PyTorch")
+        rng = np.random.default_rng(7)
+        first = N_CTX // 2
+        records = N_CTX - 1 - first
+        tokens = rng.integers(0, VOCAB, (CHUNKS, N_CTX))
+        reference = log_softmax(rng.standard_normal((CHUNKS, records, VOCAB)) * 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_reference(Path(tmp) / "ref.kld", tokens, reference)
+            report = Path(tmp) / "cand.bin"
+            write_report(report, tokens[0, first + 1:first + 1 + records], rng.standard_normal((records, VOCAB)) * 8)
+            loaded = compare_reference.Reference(str(Path(tmp) / "ref.kld"))
+            cpu = compare_reference.score(loaded, 0, str(report))
+            gpu = compare_reference.score(loaded, 0, str(report), torch)
+        for key in cpu:
+            np.testing.assert_allclose(gpu[key], cpu[key], rtol=1e-12, atol=1e-12, err_msg=key)
+
     def test_the_reference_floor_is_left_out_of_the_kl(self):
         # The reference clamps entries 16 nats below its maximum; a candidate with the same head and a lower tail
         # differs from it only below the floor.
