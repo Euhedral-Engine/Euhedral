@@ -74,6 +74,18 @@ those of one-row decode (checked on T1), and a 2560-token chunk takes about 21 s
 The BF16 references stream the weights from the page cache, so they need the 54 GB GGUF to stay cached: with nothing else
 holding memory a chunk takes about 10 seconds; beside a 29 GB process it took about 40.
 
+Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE / mean KL / top-1`):
+
+| Artifact | T1 (1 chunk) | T2 wikitext (25) | T3 code (24) | T4 own generations (25) |
+|---|---|---|---|---|
+| nvfp4-compressed | +0.028 ± 0.009 / 0.155 / 89.4% | +0.018 ± 0.007 / 0.182 / 91.2% | +0.046 ± 0.006 / 0.459 / 96.3% | +0.100 ± 0.036 / 0.607 / 91.5% |
+| nvfp4 | +0.030 ± 0.009 / 0.156 / 88.4% | +0.012 ± 0.007 / 0.182 / 91.4% | +0.044 ± 0.005 / 0.460 / 96.3% | +0.001 ± 0.029 / 0.602 / 91.6% |
+| q3 | +0.161 ± 0.021 / 0.296 / 76.3% | +0.117 ± 0.012 / 0.315 / 79.5% | +0.184 ± 0.021 / 0.561 / 91.7% | +0.069 ± 0.049 / 0.782 / 85.7% |
+| q3-compressed | +0.213 ± 0.023 / 0.339 / 73.7% | +0.118 ± 0.013 / 0.327 / 78.9% | +0.222 ± 0.026 / 0.587 / 90.5% | +0.189 ± 0.114 / 0.889 / 84.1% |
+
+On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix near-deterministic answer text with
+open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
+
 **Large files on a shared exFAT drive are read, never memory-mapped.** Page faults on big mappings of such a drive hung the
 kernel of the development machine (Linux 7.0) three times. The converter, `compare_reference.py` and
 `dequantize_gguf.py` use positioned reads; llama.cpp, which maps its models, reads them from a local ext4 disk (the BF16
