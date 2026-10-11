@@ -10,8 +10,8 @@ with `euhedral.quality.tokens`, whose `REPORT-chunkNNN.bin` files cover every ch
 N / 2 + 1 and N / 2 - 1 steps, so that step k forces the token the reference's record k predicts.
 
 For each candidate: mean negative log-likelihood of the forced tokens, the paired difference to the reference with
-its standard error, the mean KL divergence KL(reference || candidate) with its standard error, and the top-1
-agreement. Over several chunks the standard errors are chunk-level (tokens within a document are correlated); over
+its standard error, the mean KL divergence KL(reference || candidate) over the reference entries above its 16-nat
+floor (as llama.cpp computes it) with its standard error, and the top-1 agreement. Over several chunks the standard errors are chunk-level (tokens within a document are correlated); over
 one chunk they are token-level. --detail adds the median, 95th, 99th percentile and maximum KL, the top-1 standard
 error, and the mean, RMS, 1st and 99th percentile of delta-p (the candidate's probability of the forced token minus
 the reference's). Needs NumPy.
@@ -25,6 +25,8 @@ import sys
 import numpy as np
 
 ROWS = 128
+# Reference entries at or below this log-probability are clamped and left out of the KL (llama.cpp's rule).
+FLOOR = -16.0
 
 
 def pread(fd: int, size: int, offset: int) -> bytes:
@@ -97,6 +99,14 @@ def log_softmax(rows: np.ndarray) -> np.ndarray:
     return logits - np.log(np.exp(logits).sum(axis=1, keepdims=True))
 
 
+def kl_divergence(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Per-row KL(reference || candidate) over the entries above the reference's floor, as llama.cpp computes it. The
+    reference clamps every entry more than 16 nats below its maximum to one floor value, about 2% of the probability
+    mass over the vocabulary; summing those entries would charge a candidate whose tail lies below the floor for the
+    clamping (0.02 nats per nat of gap, about 0.13 on real models)."""
+    return np.where(p > FLOOR, np.exp(p) * (p - q), 0.0).sum(axis=1)
+
+
 def reference_nll(reference: Reference, chunk: int) -> np.ndarray:
     targets, out = reference.targets(chunk), np.empty(reference.records)
     for begin in range(0, reference.records, ROWS):
@@ -121,7 +131,7 @@ def score(reference: Reference, chunk: int, path: str) -> dict[str, np.ndarray]:
         p = reference.log_probabilities(chunk, begin, end)
         q = log_softmax(report.rows(begin, end)[:, 4:])
         out["nll"][begin:end] = -q[index, targets[begin:end]]
-        out["kl"][begin:end] = (np.exp(p) * (p - q)).sum(axis=1)
+        out["kl"][begin:end] = kl_divergence(p, q)
         out["agree"][begin:end] = p.argmax(axis=1) == q.argmax(axis=1)
         out["delta_p"][begin:end] = np.exp(q[index, targets[begin:end]]) - np.exp(p[index, targets[begin:end]])
     return out

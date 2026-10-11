@@ -38,7 +38,10 @@ python3 tools/compare_reference.py bf16.kld q3.bin nvfp4.bin
 
 `compare_reference.py` prints the mean NLL of the forced tokens, the paired NLL difference to the reference with its standard
 error, the mean KL(reference || artifact) and the top-1 agreement. The reference's log-probabilities are stored in 16 bits over
-the 16 nats below each position's maximum, which bounds the KL resolution at about 1e-4.
+the 16 nats below each position's maximum, which bounds the KL resolution at about 1e-4. Entries further down are clamped to
+one floor value, about 2% of the probability mass over a 248K vocabulary, so the KL sums only the entries above
+log-probability -16, as llama.cpp's `--kl-divergence` does: a model's tail lies below that floor, and summing the clamped
+entries adds about 0.13 nats to every artifact's KL. The engine's reports hold BF16 logits, whose rounding adds about 0.02.
 
 ## Holdout texts
 
@@ -90,6 +93,37 @@ open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
 kernel of the development machine (Linux 7.0) three times. The converter, `compare_reference.py` and
 `dequantize_gguf.py` use positioned reads; llama.cpp, which maps its models, reads them from a local ext4 disk (the BF16
 GGUFs and `weight_only.sh`'s work directory).
+
+## Weight-only error
+
+`tools/holdout/weight_only.sh` writes an artifact's dequantized weights into a copy of the BF16 GGUF
+(`tools/holdout/dequantize_gguf.py`; tensors matching `--keep` stay BF16) and scores it with
+`llama-perplexity --kl-divergence` against the same reference. That isolates what the weights cost from what the engine's
+execution adds, and keeping one tensor family at BF16 measures how much of the error that family carries. On T2 against
+Swift-1.5 BF16 (25 chunks; token-level standard errors):
+
+| Weights | dNLL | Mean KL | KL p99 | Top-1 |
+|---|---|---|---|---|
+| `nvfp4` | +0.010 ± 0.002 | 0.042 | 0.36 | 91.6% |
+| `nvfp4-compressed` | +0.018 ± 0.002 | 0.043 | 0.36 | 91.6% |
+| `q3` | +0.112 ± 0.004 | 0.193 | 1.45 | 79.2% |
+| `q3-compressed` | +0.116 ± 0.004 | 0.214 | 1.72 | 78.7% |
+
+`q3` with one family kept at BF16 (in parentheses, the family's share of the main model's 26.9B matrix weights):
+
+| Kept at BF16 | dNLL | Mean KL | KL p99 | Top-1 |
+|---|---|---|---|---|
+| LM head (`output`, 4.7%) | +0.063 ± 0.004 | 0.132 | 1.34 | 85.0% |
+| MLP gate and up (42.5%) | +0.122 ± 0.004 | 0.151 | 1.09 | 81.6% |
+| MLP down (21.2%) | +0.099 ± 0.004 | 0.157 | 1.18 | 81.1% |
+| full-attention projections (6.2%) | +0.098 ± 0.004 | 0.184 | 1.35 | 79.5% |
+| GDN output (`ssm_out`, 5.6%) | +0.082 ± 0.004 | 0.186 | 1.37 | 79.5% |
+| GDN input projections (`attn_qkv`, `attn_gate`, 15.0%) | +0.114 ± 0.004 | 0.191 | 1.42 | 79.4% |
+| token embedding (4.7%) | +0.115 ± 0.004 | 0.193 | 1.46 | 79.4% |
+
+The LM head carries a third of the KL in 4.7% of the weights; the GDN input projections and the token embedding carry
+almost none. Per-token KL and top-1 order the families consistently; dNLL does not (quantization noise moves the forced token's
+probability either way), so allocation decisions use KL.
 
 ## Compression-induced error
 
