@@ -70,7 +70,8 @@ tools/holdout/score.sh nvfp4c-t2 qwen3_8_27b_nvfp4_compressed.edrl swift_t2.kld 
 
 `score.sh` runs `TeacherForcedQualityCudaIntegrationTest` with `-Peuhedral.quality.tokens=REFERENCE.kld`, which forces
 every chunk of the reference on a fresh sequence, then `compare_reference.py --detail`, which reports chunk-level standard
-errors (tokens within a document are correlated), KL percentiles and delta-p. The test forces 8 tokens per speculative
+errors (tokens within a document are correlated), KL percentiles and delta-p, on the GPU when PyTorch with CUDA is
+installed (about 2 seconds per chunk). The test forces 8 tokens per speculative
 verification (`-Peuhedral.quality.rows`, 1 for one-row decode): verification is row-exact, so its reports are byte for byte
 those of one-row decode (checked on T1), and a 2560-token chunk takes about 21 seconds instead of about 170.
 

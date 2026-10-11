@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare teacher-forced logits reports (TeacherForcedQualityCudaIntegrationTest) with a BF16 reference.
 
-Usage: compare_reference.py [--detail] REFERENCE.kld CANDIDATE [CANDIDATE ...]
+Usage: compare_reference.py [--detail] [--cpu] REFERENCE.kld CANDIDATE [CANDIDATE ...]
 
 REFERENCE.kld is the file `llama-perplexity --kl-divergence-base` writes for the BF16 checkpoint: for each chunk of
 N tokens it holds the reference log-probabilities of the chunk's second half, quantized to 16 bits over the 16 nats
@@ -14,7 +14,8 @@ its standard error, the mean KL divergence KL(reference || candidate) over the r
 floor (as llama.cpp computes it) with its standard error, and the top-1 agreement. Over several chunks the standard errors are chunk-level (tokens within a document are correlated); over
 one chunk they are token-level. --detail adds the median, 95th, 99th percentile and maximum KL, the top-1 standard
 error, and the mean, RMS, 1st and 99th percentile of delta-p (the candidate's probability of the forced token minus
-the reference's). Needs NumPy.
+the reference's). Needs NumPy; the per-token arithmetic runs on the GPU when PyTorch with CUDA is installed (--cpu
+keeps it on the CPU).
 """
 from __future__ import annotations
 
@@ -58,12 +59,16 @@ class Reference:
     def targets(self, chunk: int) -> np.ndarray:
         return self.tokens[chunk, self.first + 1:self.first + 1 + self.records]
 
-    def log_probabilities(self, chunk: int, begin: int, end: int) -> np.ndarray:
+    def rows(self, chunk: int, begin: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+        """(per-row float32 scale and minimum, uint16 codes) of records begin..end of `chunk`."""
         offset = self.data_offset + 2 * self.width * (chunk * self.records + begin)
         rows = np.frombuffer(pread(self.handle.fileno(), 2 * self.width * (end - begin), offset), "<u2")
         rows = rows.reshape(end - begin, self.width)
-        header = rows[:, :4].copy().view("<f4")
-        return header[:, 0, None] * rows[:, 4:4 + self.n_vocab].astype(np.float64) + header[:, 1, None]
+        return rows[:, :4].copy().view("<f4"), rows[:, 4:4 + self.n_vocab]
+
+    def log_probabilities(self, chunk: int, begin: int, end: int) -> np.ndarray:
+        header, codes = self.rows(chunk, begin, end)
+        return header[:, 0, None] * codes.astype(np.float64) + header[:, 1, None]
 
 
 class Report:
@@ -116,12 +121,48 @@ def reference_nll(reference: Reference, chunk: int) -> np.ndarray:
     return out
 
 
-def score(reference: Reference, chunk: int, path: str) -> dict[str, np.ndarray]:
-    """Per-token NLL, KL, top-1 agreement and delta-p of the report `path` for `chunk`."""
+def cuda_torch():
+    """PyTorch when it has a CUDA device, else None: the per-row arithmetic over the vocabulary is most of the
+    scorer's time on one CPU core, and a few milliseconds per block on the GPU."""
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch if torch.cuda.is_available() else None
+
+
+def score_cuda(torch, reference: Reference, chunk: int, report: Report, targets: np.ndarray) -> dict[str, np.ndarray]:
+    """score() on the GPU, in float64 like the NumPy path."""
+    n, device = reference.records, torch.device("cuda")
+    out = {key: np.empty(n) for key in ("nll", "kl", "delta_p")}
+    out["agree"] = np.empty(n, dtype=bool)
+    for begin in range(0, n, ROWS):
+        end = min(n, begin + ROWS)
+        header, codes = reference.rows(chunk, begin, end)
+        header = torch.from_numpy(header.astype(np.float64)).to(device)
+        codes = torch.from_numpy(np.ascontiguousarray(codes).view(np.int16)).to(device).to(torch.int32) & 0xFFFF
+        p = header[:, 0, None] * codes.to(torch.float64) + header[:, 1, None]
+        bits = torch.from_numpy(np.ascontiguousarray(report.rows(begin, end)[:, 4:]).view(np.int16)).to(device)
+        q = torch.log_softmax(((bits.to(torch.int32) & 0xFFFF) << 16).view(torch.float32).to(torch.float64), dim=1)
+        index = torch.arange(end - begin, device=device)
+        target = torch.from_numpy(targets[begin:end].astype(np.int64)).to(device)
+        q_target, p_target = q[index, target], p[index, target]
+        out["nll"][begin:end] = (-q_target).cpu().numpy()
+        out["kl"][begin:end] = torch.where(p > FLOOR, p.exp() * (p - q), 0.0).sum(dim=1).cpu().numpy()
+        out["agree"][begin:end] = (p.argmax(dim=1) == q.argmax(dim=1)).cpu().numpy()
+        out["delta_p"][begin:end] = (q_target.exp() - p_target.exp()).cpu().numpy()
+    return out
+
+
+def score(reference: Reference, chunk: int, path: str, torch=None) -> dict[str, np.ndarray]:
+    """Per-token NLL, KL, top-1 agreement and delta-p of the report `path` for `chunk` (on the GPU when `torch` is
+    given)."""
     targets = reference.targets(chunk)
     forced, report = read_report(path)
     if len(forced) != reference.records or not np.array_equal(forced, targets):
         raise SystemExit(f"{path} forced different tokens (steps {len(forced)}, expected {reference.records})")
+    if torch is not None:
+        return score_cuda(torch, reference, chunk, report, targets)
     n = reference.records
     out = {key: np.empty(n) for key in ("nll", "kl", "delta_p")}
     out["agree"] = np.empty(n, dtype=bool)
@@ -154,7 +195,8 @@ def standard_error(per_chunk: np.ndarray, per_token: np.ndarray) -> float:
 
 def main(argv: list[str]) -> int:
     detail = "--detail" in argv
-    argv = [a for a in argv if a != "--detail"]
+    torch = None if "--cpu" in argv else cuda_torch()
+    argv = [a for a in argv if a not in ("--detail", "--cpu")]
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
@@ -173,7 +215,7 @@ def main(argv: list[str]) -> int:
         files = chunk_files(candidate, chunks)
         if len(files) == 1 and chunks != 1:
             raise SystemExit(f"{candidate} is one report; the reference has {chunks} chunks")
-        scored = [score(reference, c, f) for c, f in enumerate(files)]
+        scored = [score(reference, c, f, torch) for c, f in enumerate(files)]
         tokens = {key: np.concatenate([s[key] for s in scored]) for key in scored[0]}
         difference = tokens["nll"] - reference_all
         chunk_difference = np.array([s["nll"].mean() - r.mean() for s, r in zip(scored, reference_by_chunk)])
