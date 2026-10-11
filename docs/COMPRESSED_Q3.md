@@ -1,23 +1,28 @@
 # Compressed Q3 weights (P2E2)
 
-P2E2 is the lossless layout of the `q3-compressed` artifact: the Q3G64_F16S tensors of the `q3` artifact stored in 81.5% of their
-row-split bytes (persistent layout `row-split-p2e2-v1`, `WeightLayout.ROW_SPLIT_P2E2_V1`). It keeps them resident on the GPU in
-less memory, with the same values. Each kernel decodes only the codes it consumes, in registers.
+P2E2 is the lossless layout of the `q3-compressed` artifact: Q3G64_F16S tensors whose codes are limited to -3..3, stored in about
+88% of their row-split bytes (persistent layout `row-split-p2e2-v1`, `WeightLayout.ROW_SPLIT_P2E2_V1`). It keeps them resident on
+the GPU in less memory, with the same values. Each kernel decodes only the codes it consumes, in registers.
 
 The artifact selects the layout per tensor, so no engine option exists: the engine reads the layout from the tensors
-(`ArtifactProfile`) and every Q3 route produces the same bits as on the `q3` artifact. See
+(`ArtifactProfile`) and every Q3 route produces the same bits as on the row-split artifact with the same values
+(`python3 -m euhedral_artifacts.q3_p2e2 expand`, run in `tools/`). See
 [COMPACT_Q3_REFERENCE.md](COMPACT_Q3_REFERENCE.md) for the artifact.
 
 ## Performance
 
 On an RTX 5070 Ti (16 GB):
 
-- **Memory.** The 195 Q3 tensors of the `q3` artifact are 8.45 GiB of its 11.72 GiB payload; at 81.5% they free about 1.56 GiB
-  (derived from the measured ratio). The expansion scratch takes back at most 128 MiB of weights plus the activation region (see
-  Execution routes), so the net is about 1.4-1.5 GiB more room for KV pages.
-- **Decode** (the fused P2E2 kernels): one row decodes at 58.9 tok/s at a 64-token context, 57.6 at 1024 and 56.1 at 4096, 128
-  generated tokens, greedy. With MTP2 (three-row verification) the model decodes 95.0 tok/s at 4K, 97.0 at 16K, 91.1 at 32K,
-  82.0 at 59K and 60.7 at 128K (chat corpus, 128 generated tokens; 64 at 128K). On cold weights at the model's shapes the kernels
+- **Memory.** The calibrated `q3-compressed` artifact is 11.51 GB, and its weights take 11,032,853,996 bytes of device memory
+  against 12,069,330,944 for the row-split artifact with the same values: 0.97 GiB less. The expansion scratch takes back at most
+  128 MiB of weights plus the activation region (see Execution routes).
+- **Fast path.** A warp decodes a slice on the fast path when every lane of its four rows has at most 31 BIG codes among its 32
+  and the slice's payload fits the 32 prefetched words. Calibrated codes are about 31% BIG; 0.1% of their slices take the slow
+  path.
+- **Decode** (the fused P2E2 kernels): with MTP2 (three-row verification) the calibrated artifact decodes 93.9 tok/s at 4K, 93.6
+  at 32K, 80.6 at 64K and 62.4 at 128K (the README's benchmark: chat corpus, 128 generated tokens, 64 at 128K; measured on
+  2026-10-11), and a verification step takes 24.5 ms at 4K. Measured on round-to-nearest codes, before the calibrated artifact: one
+  row decodes at 58.9 tok/s at a 64-token context, 57.6 at 1024 and 56.1 at 4096, 128 generated tokens, greedy. On cold weights at the model's shapes the kernels
   take, for gate_up (34816 x 5120) and down (5120 x 17408): one row 91 and 52 us, two rows 111 and 67 us, three rows 134 and 74 us,
   four rows 174 and 102 us.
 - **Prefill** (more than eight rows) expands each Q3 tensor into the row-split layout once per launch, at about the DRAM rate:
