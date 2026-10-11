@@ -46,13 +46,16 @@ class Calibration:
 
 
 class _Reader:
-    def __init__(self, data: bytes):
-        self.data, self.position = data, 0
+    """Sequential reads of a GGUF header from an open file (never a memory map: large mappings of the shared
+    exFAT drive have hung the kernel)."""
+
+    def __init__(self, handle):
+        self.handle, self.position = handle, 0
 
     def take(self, size: int) -> bytes:
-        if self.position + size > len(self.data):
-            fail("importance matrix is truncated")
-        chunk = self.data[self.position:self.position + size]
+        chunk = self.handle.read(size)
+        if len(chunk) != size:
+            fail("GGUF file is truncated")
         self.position += size
         return chunk
 
@@ -72,40 +75,55 @@ class _Reader:
             item_kind, count = self.u32(), self.u64()
             return [self.value(item_kind) for _ in range(count)]
         if kind not in _SCALARS:
-            fail(f"importance matrix has an unknown metadata type {kind}")
+            fail(f"GGUF file has an unknown metadata type {kind}")
         return struct.unpack(_SCALARS[kind], self.take(struct.calcsize(_SCALARS[kind])))[0]
+
+
+@dataclass(frozen=True)
+class GgufTensor:
+    """One tensor of a GGUF file: its ggml type, element count and absolute byte offset of its data."""
+    kind: int
+    elements: int
+    offset: int
+
+
+def gguf_tensors(path: Path) -> dict[str, GgufTensor]:
+    """The tensor table of the GGUF file `path`, read from its header only."""
+    with path.open("rb") as handle:
+        reader = _Reader(handle)
+        if reader.take(4) != GGUF_MAGIC:
+            fail(f"{path} is not a GGUF file")
+        if reader.u32() not in (2, 3):
+            fail(f"{path} has an unsupported GGUF version")
+        tensor_count, metadata_count = reader.u64(), reader.u64()
+        alignment = 32
+        for _ in range(metadata_count):
+            key = reader.string()
+            value = reader.value(reader.u32())
+            if key == "general.alignment":
+                alignment = int(value)
+        infos = []
+        for _ in range(tensor_count):
+            name = reader.string()
+            dims = [reader.u64() for _ in range(reader.u32())]
+            kind, offset = reader.u32(), reader.u64()
+            infos.append((name, int(np.prod(dims)), kind, offset))
+        base = (reader.position + alignment - 1) // alignment * alignment
+    return {name: GgufTensor(kind, count, base + offset) for name, count, kind, offset in infos}
 
 
 def read_gguf_f32(path: Path) -> dict[str, np.ndarray]:
     """The F32 tensors of the GGUF file `path`, flattened, by name."""
-    data = path.read_bytes()
-    reader = _Reader(data)
-    if reader.take(4) != GGUF_MAGIC:
-        fail(f"{path} is not a GGUF file")
-    if reader.u32() not in (2, 3):
-        fail(f"{path} has an unsupported GGUF version")
-    tensor_count, metadata_count = reader.u64(), reader.u64()
-    alignment = 32
-    for _ in range(metadata_count):
-        key = reader.string()
-        value = reader.value(reader.u32())
-        if key == "general.alignment":
-            alignment = int(value)
-    infos = []
-    for _ in range(tensor_count):
-        name = reader.string()
-        dims = [reader.u64() for _ in range(reader.u32())]
-        kind, offset = reader.u32(), reader.u64()
-        infos.append((name, int(np.prod(dims)), kind, offset))
-    base = (reader.position + alignment - 1) // alignment * alignment
     tensors = {}
-    for name, count, kind, offset in infos:
-        if kind != GGML_TYPE_F32:
-            fail(f"importance matrix tensor {name} is not F32")
-        begin = base + offset
-        if begin + count * 4 > len(data):
-            fail(f"importance matrix tensor {name} is truncated")
-        tensors[name] = np.frombuffer(data, dtype="<f4", count=count, offset=begin).astype(np.float32)
+    with path.open("rb") as handle:
+        for name, tensor in gguf_tensors(path).items():
+            if tensor.kind != GGML_TYPE_F32:
+                fail(f"importance matrix tensor {name} is not F32")
+            handle.seek(tensor.offset)
+            data = handle.read(4 * tensor.elements)
+            if len(data) != 4 * tensor.elements:
+                fail(f"importance matrix tensor {name} is truncated")
+            tensors[name] = np.frombuffer(data, dtype="<f4").astype(np.float32)
     return tensors
 
 

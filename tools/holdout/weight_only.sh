@@ -5,8 +5,9 @@
 #
 # Writes the artifact's weights into a copy of TEMPLATE (dequantize_gguf.py; tensors matching KEEP_REGEX stay BF16),
 # scores it against REFERENCE with `llama-perplexity --kl-divergence` through LLAMA_PERPLEXITY (default: the CUDA
-# build wrapper, weights streamed from host memory, F16 KV cache), appends llama.cpp's summary to RESULTS and deletes
-# the GGUF. Run from the repository root; WORK (default /tmp) must hold one BF16 GGUF (about 55 GB).
+# build run natively by the llama-gpu wrapper, weights streamed from host memory, F16 KV cache), appends llama.cpp's
+# summary to RESULTS and deletes the GGUF. Run from the repository root. WORK (default /tmp) must hold one BF16 GGUF
+# (about 55 GB) on a local Linux filesystem: llama.cpp memory-maps the model, and TEMPLATE belongs there too.
 set -euo pipefail
 name=$1 artifact=$2 template=$3 reference=$4 results=$5 keep=${6:-}
 work=${WORK:-/tmp}
@@ -15,9 +16,7 @@ perplexity=${LLAMA_PERPLEXITY:-/mnt/shared/qwen38-quant/quality/bin/llama-gpu ll
 gguf=$work/$name.gguf
 trap 'rm -f "$gguf"' EXIT
 "$python" tools/holdout/dequantize_gguf.py "$artifact" "$template" "$gguf" ${keep:+--keep "$keep"} > "$work/$name.dequantize.log"
-# The CUDA wrapper mounts /mnt/shared/qwen38-quant at /q and the current directory at /w.
-in_container() { case $1 in /mnt/shared/qwen38-quant/*) echo "/q/${1#/mnt/shared/qwen38-quant/}" ;; *) echo "$1" ;; esac; }
-(cd "$work" && $perplexity -m "$(in_container "$gguf")" --kl-divergence-base "$(in_container "$reference")" --kl-divergence \
+(cd "$work" && $perplexity -m "$gguf" --kl-divergence-base "$reference" --kl-divergence \
    -c 2560 -b 2560 -ub 2560 -ngl 0 -t 16 > "$work/$name.perplexity.log" 2>&1)
 {
   echo "# weight-only $name $(date -u +%FT%TZ) artifact $artifact keep '${keep}' reference $reference"

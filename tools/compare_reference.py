@@ -27,34 +27,68 @@ import numpy as np
 ROWS = 128
 
 
+def pread(fd: int, size: int, offset: int) -> bytes:
+    """Positioned read of exactly `size` bytes. The files are read, never memory-mapped: page faults on large
+    mappings of the shared (exFAT) drive have hung the kernel."""
+    parts, done = [], 0
+    while done < size:
+        part = os.pread(fd, size - done, offset + done)
+        if not part:
+            raise SystemExit("file is truncated")
+        parts.append(part)
+        done += len(part)
+    return b"".join(parts)
+
+
 class Reference:
     def __init__(self, path: str):
-        with open(path, "rb") as handle:
-            if handle.read(8) != b"_logits_":
-                raise SystemExit(f"{path} is not a llama.cpp logits file")
-            self.n_ctx, self.n_vocab, self.chunks = (int(v) for v in np.fromfile(handle, dtype="<i4", count=3))
-        self.tokens = np.memmap(path, dtype="<i4", mode="r", offset=20, shape=(self.chunks, self.n_ctx))
+        self.handle = open(path, "rb")
+        fd = self.handle.fileno()
+        if pread(fd, 8, 0) != b"_logits_":
+            raise SystemExit(f"{path} is not a llama.cpp logits file")
+        self.n_ctx, self.n_vocab, self.chunks = (int(v) for v in np.frombuffer(pread(fd, 12, 8), "<i4"))
+        self.tokens = np.frombuffer(pread(fd, 4 * self.chunks * self.n_ctx, 20), "<i4").reshape(self.chunks, self.n_ctx)
         self.first = self.n_ctx // 2
         self.records = self.n_ctx - 1 - self.first
-        width = 2 * ((self.n_vocab + 1) // 2) + 4
-        self.data = np.memmap(path, dtype="<u2", mode="r", offset=20 + 4 * self.chunks * self.n_ctx,
-                              shape=(self.chunks, self.records, width))
+        self.width = 2 * ((self.n_vocab + 1) // 2) + 4
+        self.data_offset = 20 + 4 * self.chunks * self.n_ctx
 
     def targets(self, chunk: int) -> np.ndarray:
-        return np.asarray(self.tokens[chunk, self.first + 1:self.first + 1 + self.records])
+        return self.tokens[chunk, self.first + 1:self.first + 1 + self.records]
 
     def log_probabilities(self, chunk: int, begin: int, end: int) -> np.ndarray:
-        rows = np.asarray(self.data[chunk, begin:end])
+        offset = self.data_offset + 2 * self.width * (chunk * self.records + begin)
+        rows = np.frombuffer(pread(self.handle.fileno(), 2 * self.width * (end - begin), offset), "<u2")
+        rows = rows.reshape(end - begin, self.width)
         header = rows[:, :4].copy().view("<f4")
         return header[:, 0, None] * rows[:, 4:4 + self.n_vocab].astype(np.float64) + header[:, 1, None]
 
 
+class Report:
+    """A teacher-forced report: int32 steps and vocabulary, then per step the int32 token and the BF16 logits row."""
+
+    def __init__(self, path: str):
+        self.handle = open(path, "rb")
+        steps, self.vocabulary = (int(v) for v in np.frombuffer(pread(self.handle.fileno(), 8, 0), "<i4"))
+        self.record = 4 + 2 * self.vocabulary
+        self.steps = steps
+
+    def rows(self, begin: int, end: int) -> np.ndarray:
+        data = pread(self.handle.fileno(), self.record * (end - begin), 8 + self.record * begin)
+        return np.frombuffer(data, np.uint8).reshape(end - begin, self.record)
+
+    def forced(self) -> np.ndarray:
+        out = np.empty(self.steps, np.int32)
+        for begin in range(0, self.steps, ROWS):
+            end = min(self.steps, begin + ROWS)
+            out[begin:end] = self.rows(begin, end)[:, :4].copy().view("<i4")[:, 0]
+        return out
+
+
 def read_report(path: str):
-    with open(path, "rb") as handle:
-        steps, vocabulary = np.frombuffer(handle.read(8), "<i4")
-    record = 4 + 2 * int(vocabulary)
-    data = np.memmap(path, dtype=np.uint8, mode="r", offset=8, shape=(int(steps), record))
-    return np.asarray(data[:, :4]).copy().view("<i4")[:, 0], data
+    """(forced tokens, Report) of a report file."""
+    report = Report(path)
+    return report.forced(), report
 
 
 def log_softmax(rows: np.ndarray) -> np.ndarray:
@@ -85,7 +119,7 @@ def score(reference: Reference, chunk: int, path: str) -> dict[str, np.ndarray]:
         end = min(n, begin + ROWS)
         index = np.arange(end - begin)
         p = reference.log_probabilities(chunk, begin, end)
-        q = log_softmax(report[begin:end, 4:])
+        q = log_softmax(report.rows(begin, end)[:, 4:])
         out["nll"][begin:end] = -q[index, targets[begin:end]]
         out["kl"][begin:end] = (np.exp(p) * (p - q)).sum(axis=1)
         out["agree"][begin:end] = p.argmax(axis=1) == q.argmax(axis=1)
