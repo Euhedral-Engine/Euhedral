@@ -75,6 +75,8 @@ static __device__ __forceinline__ unsigned int mad_u32(unsigned int a, unsigned 
 // without a BIG code, 64% of them, hit 9 broadcast entries in distinct banks).
 namespace decode {
 static constexpr int kRows = 4;
+// The most BIG codes (of a lane's 32) the fast path decodes: 62 bits of units behind the window's two zero bits.
+static constexpr unsigned int kFastBig = 31u;
 struct Table { float2 pair[256]; };
 
 static __device__ __forceinline__ void fill(Table& table) {
@@ -94,7 +96,9 @@ static __device__ __forceinline__ unsigned int nibble_offset(unsigned int word) 
 
 // Fast path: (lo, hi) holds this half's payload units behind two zero bits. Shifting right by twice the
 // number of BIG codes up to code 2i leaves code 2i's unit (if BIG) at bits 0-1 and code 2i + 1's at
-// bits 2-3; the doubled BIG mask of the pair clears the rest.
+// bits 2-3; the doubled BIG mask of the pair clears the rest. A lane's window is its units shifted left
+// by two in 64 bits, so it holds kFastBig units: the first half reads it from bit 0, the second half from
+// bit 2 * (BIG codes in the first half), and both fit while the lane has at most kFastBig BIG codes.
 template<int I>
 static __device__ __forceinline__ float2 pair(const char* table, unsigned int word, unsigned int big2,
         unsigned int lo, unsigned int hi) {
@@ -232,7 +236,7 @@ static __device__ __forceinline__ void p2e2_decode(
             const unsigned int l = __funnelshift_r(a, b, shift), h = __funnelshift_r(b, c, shift);
             lo[r] = l << 2;
             hi[r] = __funnelshift_l(l, h, 2);
-            any |= count[r] > 16u || word > 29u;
+            any |= count[r] > kFastBig || word > 29u;
         }
         if (!__any_sync(0xffffffffu, any)) {
             #pragma unroll
@@ -245,7 +249,7 @@ static __device__ __forceinline__ void p2e2_decode(
                 for (int t = 0; t < M; t++) sums[t][r] = fmaf(dot[t], sc[r], sums[t][r]);
             }
         } else {
-            // A lane with more than 16 BIG codes, or a slice whose units outrun the 32 prefetched words.
+            // A lane whose 32 codes are all BIG, or a slice whose units outrun the 32 prefetched words.
             #pragma unroll
             for (int r = 0; r < kRows; r++) {
                 const unsigned int unit = base[r] + before[r];

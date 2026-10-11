@@ -2,8 +2,9 @@
 
 The production q3 module and the embedding module are compiled with NVRTC. Tensors are built from
 code matrices with tools/euhedral_artifacts/q3_p2e2.py, the reference encoder. Each case covers
-the paths a kernel takes on its own data: lanes with more than 16 BIG codes, slices whose payload
-outruns the 32 prefetched words, rows without BIG codes, and realistic code distributions.
+the paths a kernel takes on its own data: lanes with 17 to 31 BIG codes split every way between their two
+halves (the fast path's edge), lanes with 32, slices whose payload outruns the 32 prefetched words, rows
+without BIG codes, and realistic and calibrated code distributions.
 """
 
 import contextlib
@@ -91,6 +92,33 @@ def row_split(codes, rng):
     return bytes(out), scale_offset
 
 
+def calibrated(rng, rows, k):
+    """The code distribution of a calibrated Q3 limited to -3..3: about 31% BIG codes."""
+    return rng.choice(np.arange(-3, 4, dtype=np.int8), size=(rows, k),
+                      p=[0.06, 0.12, 0.20, 0.24, 0.20, 0.11, 0.07])
+
+
+def lane_big(rng, k, first, second, every=4):
+    """A row in which every `every`-th lane has `first` BIG codes among its first 16 and `second` among its
+    last 16, at random positions and values, and the other lanes none, so that each slice's payload fits the
+    prefetched window and the dense lanes reach the fast path."""
+    codes = rng.choice(np.array([-1, 0, 1], np.int8), size=k)
+    for lane in range(0, k // 32, every):
+        for half, count in ((0, first), (1, second)):
+            spots = lane * 32 + half * 16 + rng.choice(16, size=count, replace=False)
+            codes[spots] = rng.choice(np.array([-3, -2, 2, 3], np.int8), size=count)
+    return codes
+
+
+# (first half, second half) BIG counts of the dense lanes, four rows per warp. Rows 4-7 are the fast path's
+# edge (31 = 16 + 15 and 15 + 16, then 30) and decode together on it; rows 8-11 put lanes with 32, which must
+# take the slow path, beside fast-path rows; rows 12-19 cover totals from 17 to 30.
+LANE_SPLITS = [(16, 15), (15, 16), (16, 14), (14, 16),
+               (16, 16), (9, 8), (12, 12), (8, 16),
+               (16, 1), (1, 16), (13, 4), (10, 10),
+               (11, 11), (13, 13), (14, 14), (15, 15)]
+
+
 def adversarial(rng, rows, k):
     """Rows that drive every decode path: dense BIG lanes, overflowing slices, empty rows."""
     codes = realistic(rng, rows, k)
@@ -101,6 +129,9 @@ def adversarial(rng, rows, k):
         codes[2] = lane_dense
     if rows > 3:
         codes[3, : k // 2] = 3
+    for row, (first, second) in enumerate(LANE_SPLITS, start=4):
+        if row < rows:
+            codes[row] = lane_big(rng, k, first, second)
     return codes
 
 
@@ -168,7 +199,8 @@ class P2e2KernelTest(unittest.TestCase):
 
     def test_decode_matches_contiguous_bitwise(self):
         for rows, k in ((16, 1024), (48, 3072), (32, 5120)):
-            for name, codes in (("realistic", realistic(self.rng, rows, k)), ("adversarial", adversarial(self.rng, rows, k))):
+            for name, codes in (("realistic", realistic(self.rng, rows, k)), ("calibrated", calibrated(self.rng, rows, k)),
+                                ("adversarial", adversarial(self.rng, rows, k))):
                 with self.subTest(rows=rows, k=k, codes=name):
                     expected, actual = self.decode_pair(codes)
                     self.assertNotIn(b"\xa5\xa5", expected[:2])
@@ -178,7 +210,8 @@ class P2e2KernelTest(unittest.TestCase):
         """Rows 2 to 4 of the fused kernels equal the contiguous one-row kernel on the row-split tensor, on
         every decode path (dense BIG lanes, overflowing slices, empty rows)."""
         rows, k = 64, 3072
-        for name, codes in (("realistic", realistic(self.rng, rows, k)), ("adversarial", adversarial(self.rng, rows, k))):
+        for name, codes in (("realistic", realistic(self.rng, rows, k)), ("calibrated", calibrated(self.rng, rows, k)),
+                            ("adversarial", adversarial(self.rng, rows, k))):
             source, scale_offset = row_split(codes, self.rng)
             tensor = p2e2.encode(source, rows, k)
             with contextlib.ExitStack() as stack:
