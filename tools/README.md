@@ -72,10 +72,30 @@ python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 \
 
 Use the importance matrix of the checkpoint being converted. Two public ones are measured:
 
-- Qwen3.8-27B: `imatrix-qwen3.8-27b.gguf` from ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF (1000 chunks of 4096 tokens), used
-  for `q3` and `nvfp4`;
+- Qwen3.8-27B: `imatrix-qwen3.8-27b.gguf` from ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF (1000 chunks of 4096 tokens);
 - Swift-1.5: `imatrix-swift15-v1mix.gguf` from ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF (309 chunks of 4096 tokens of web,
-  reasoning, multilingual and code text), used for `nvfp4-compressed`, which is converted from Swift-1.5.
+  reasoning, multilingual and code text), used for all four artifacts, which are converted from Swift-1.5.
+
+## Pre-rounded codes and fake quantization
+
+`--codes-from DIR` writes the quantized objects DIR holds files for from those files instead of rounding them, and
+rounds the rest as usual (with `--imatrix` if given). A file is one object's stored rounding
+(`euhedral_artifacts/codes.py`, `text.layers.10.mlp.down.npz` for `text/layers/10/mlp/down`): the integer codes and
+FP16 group scales of a Q3/Q4/Q5 object, or the E2M1 codes, E4M3 block scales (SD4: table indices and the table) and
+FP32 tensor scale of an NVFP4 object. It must match the object's format, layout and shape in the chosen artifact;
+the manifest records DIR and how many objects it supplied.
+
+`euhedral_artifacts/fake_quant.py` holds the same rounding as PyTorch modules for training: built from an object's
+weights with the converter's own scale selection, a module's codes and scales are the converter's byte for byte, its
+forward pass returns exactly the weights they decode to, and gradients reach the master weights and the scales
+through straight-through rounding. `state()` exports a file for `--codes-from`. `tools/fake_quant_parity.py` rebuilds
+every quantized object of an artifact as a module and compares its export with the artifact's bytes and its forward
+pass with the decoded weights:
+
+```bash
+python3 tools/fake_quant_parity.py --model $CHECKPOINT --artifact $OUT/qwen3_8_27b_q3.edrl --quantization q3 \
+    --imatrix imatrix-swift15-v1mix.gguf [--objects REGEX] [--export DIR]
+```
 
 ## DFlash2
 

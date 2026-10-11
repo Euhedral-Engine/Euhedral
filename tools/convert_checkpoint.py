@@ -16,6 +16,10 @@ Quantization runs on the GPU when PyTorch finds one, otherwise on the CPU. See t
 by the importance of each column (a llama.cpp importance matrix, the mean square of each input column over
 a calibration text). The formats and layouts are unchanged.
 
+--codes-from DIR writes the quantized objects DIR holds pre-rounded codes for (one file per object, written by
+euhedral_artifacts/fake_quant.py or a training tool) instead of rounding them; the other objects are rounded as
+usual. A file must match the object's format, layout and shape in the chosen artifact.
+
 --dflash2 DIR adds the DFlash2 drafter checkpoint (z-lab/Qwen3.8-27B-DFlash2), so the artifact drafts with
 DFlash2 instead of MTP. With --extend ARTIFACT it is added to an existing artifact, whose objects are copied
 byte for byte, instead of converting the target checkpoint again (--model is then not needed).
@@ -70,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imatrix", type=Path, metavar="IMATRIX.gguf",
                         help="llama.cpp importance matrix: choose every group's scale by a search weighted by "
                              "column importance instead of from its largest value (needs PyTorch)")
+    parser.add_argument("--codes-from", type=Path, metavar="DIR",
+                        help="take the codes and scales of the objects DIR holds files for (see above)")
     parser.add_argument("--force", action="store_true", help="replace an existing artifact")
     return parser
 
@@ -108,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         manifest = convert(args.model, args.out, Recipe(args.quantization, args.compressed), args.ranking,
                            args.draft_ids_from, jobs, args.force, args.dflash2, args.dflash2_projections,
-                           args.imatrix)
+                           args.imatrix, args.codes_from)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

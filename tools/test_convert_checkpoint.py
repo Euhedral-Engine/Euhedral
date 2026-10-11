@@ -16,7 +16,7 @@ TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 
 import convert_checkpoint  # noqa: E402
-from euhedral_artifacts import device, edrl, importance, inventory, pipeline, q3_p2e2, recipes, sources  # noqa: E402
+from euhedral_artifacts import codes, device, edrl, grouped, importance, inventory, pipeline, q3_p2e2, recipes, sources  # noqa: E402
 from euhedral_artifacts.sources import SourceRef  # noqa: E402
 
 
@@ -60,17 +60,23 @@ class ArgumentHandlingTest(unittest.TestCase):
         with mock.patch.object(convert_checkpoint, "convert") as convert:
             convert.return_value = {}
             self.assertEqual(run(*BASE, "--device", "cpu", "--jobs", "3", "--force")[0], 0)
-        model, out, recipe, ranking, draft_ids, jobs, force, draft, draft_projections, imatrix = convert.call_args.args
+        model, out, recipe, ranking, draft_ids, jobs, force, draft, draft_projections, imatrix, codes_from = convert.call_args.args
         self.assertEqual((model, out, ranking, draft_ids, jobs, force),
                          (Path("/m"), Path("/o.edrl"), None, Path("/a.edrl"), 3, True))
         self.assertEqual(recipe, recipes.Recipe("q3", False))
-        self.assertEqual((draft, draft_projections, imatrix), (None, "bf16", None))
+        self.assertEqual((draft, draft_projections, imatrix, codes_from), (None, "bf16", None, None))
 
     def test_imatrix_reaches_the_pipeline(self):
         with mock.patch.object(convert_checkpoint, "convert") as convert:
             convert.return_value = {}
             self.assertEqual(run(*BASE, "--device", "cpu", "--imatrix", "/i.gguf")[0], 0)
-        self.assertEqual(convert.call_args.args[-1], Path("/i.gguf"))
+        self.assertEqual(convert.call_args.args[-2], Path("/i.gguf"))
+
+    def test_codes_from_reaches_the_pipeline(self):
+        with mock.patch.object(convert_checkpoint, "convert") as convert:
+            convert.return_value = {}
+            self.assertEqual(run(*BASE, "--device", "cpu", "--codes-from", "/codes")[0], 0)
+        self.assertEqual(convert.call_args.args[-1], Path("/codes"))
 
     def test_extend_adds_the_drafter_to_an_existing_artifact(self):
         with mock.patch.object(convert_checkpoint, "extend") as extend:
@@ -135,7 +141,7 @@ class ArgumentHandlingTest(unittest.TestCase):
         options = set(re.findall(r"^\s+(--[a-z0-9-]+)", out, re.M)) | set(re.findall(r"(?<=\[)--[a-z0-9-]+", out))
         self.assertEqual(options, {"--model", "--out", "--quantization", "--compressed", "--draft-ids-from",
                                    "--ranking", "--device", "--jobs", "--force", "--dflash2",
-                                   "--dflash2-projections", "--extend", "--imatrix"})
+                                   "--dflash2-projections", "--extend", "--imatrix", "--codes-from"})
         for word in ("p2e2", "sd4", "nvmtp", "profile", "mtp-format", "reference"):
             self.assertNotIn(word, out.lower())
 
@@ -263,7 +269,7 @@ def tiny_q3_artifact(path: Path) -> None:
 class PipelineTest(unittest.TestCase):
     def convert(self, recipe, directory, **kwargs):
         def write(model, config, output_path, recipe_, selected, jobs, draft=None, draft_projections="bf16",
-                  importance=None):
+                  importance=None, codes_from=None):
             tiny_q3_artifact(output_path)
 
         with mock.patch.object(pipeline, "write_artifact", write), \
@@ -300,6 +306,32 @@ class PipelineTest(unittest.TestCase):
                 expected = q3_p2e2.P2E2_LOWEST_CODE if recipe.compressed else None
                 self.assertEqual(seen["Q3G64_F16S"].lowest_code, expected)
                 self.assertIsNone(seen["Q4G64_F16S"].lowest_code)
+
+    def test_objects_with_codes_are_written_from_them(self):
+        rng = np.random.default_rng(1)
+        matrix = sources.MatrixSource((4, 200), lambda b, e: np.zeros((e - b, 200), np.float32))
+        state = codes.QuantState("Q3G64_F16S", recipes.LAYOUT_ROW_SPLIT, (4, 200),
+                                 rng.integers(-4, 4, (4, 256)).astype(np.int8),
+                                 rng.uniform(0.01, 1, (4, 4)).astype(np.float16))
+        expected = io.BytesIO(bytes(grouped.row_split_size((4, 200), "Q3G64_F16S")))
+        codes.write_state(expected, 0, state)
+        with tempfile.TemporaryDirectory() as tmp:
+            state.save(codes.state_file(Path(tmp), "text/layers/0/mlp/down"))
+            plans = []
+            inventory.add_quant(plans, recipes.Recipe("q3"), "text/layers/0/mlp/down", matrix, "Q3G64_F16S", None, Path(tmp))
+            written = io.BytesIO(bytes(plans[0].byte_size))
+            plans[0].writer(written, 0)
+            self.assertEqual(written.getvalue(), expected.getvalue())
+            # A file for another format is refused; objects without a file are rounded as usual.
+            with self.assertRaises(ValueError):
+                inventory.add_quant([], recipes.Recipe("nvfp4"), "text/layers/0/mlp/down", matrix, "Q3G64_F16S", None,
+                                    Path(tmp))
+            with mock.patch.object(inventory, "quantize_matrix") as quantize:
+                plans = []
+                inventory.add_quant(plans, recipes.Recipe("q3"), "text/layers/0/mlp/gate_up", matrix, "Q3G64_F16S", None,
+                                    Path(tmp))
+                plans[0].writer(None, 0)
+                quantize.assert_called_once()
 
     def test_q3_is_written_as_built(self):
         with tempfile.TemporaryDirectory() as tmp:
