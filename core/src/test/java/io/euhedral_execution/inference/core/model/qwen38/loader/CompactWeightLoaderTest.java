@@ -199,6 +199,38 @@ class CompactWeightLoaderTest {
         assertThrows(WeightLoadException.class, () -> CompactWeightLoader.validateInventory(config(), descriptors));
     }
 
+    @Test
+    void acceptsAnyGroupedFormatWhereAGroupedOneIsRegistered() throws Exception {
+        Map<String, TensorDescriptor> descriptors = nvfp4Inventory();
+        // Q3 down and output slots in Q4, a Q5 value_z slot in Q4, a Q3 slot in Q5.
+        descriptors.put(
+                "text/layers/0/mlp/down",
+                descriptor("text/layers/0/mlp/down", new long[] {5120, 17408}, WeightFormat.Q4_G64_FP16));
+        descriptors.put(
+                "text/layers/0/gdn/output",
+                descriptor("text/layers/0/gdn/output", new long[] {5120, 6144}, WeightFormat.Q4_G64_FP16));
+        descriptors.put(
+                "text/layers/0/gdn/value_z",
+                descriptor("text/layers/0/gdn/value_z", new long[] {12288, 5120}, WeightFormat.Q4_G64_FP16));
+        descriptors.put(
+                "text/layers/3/attention/output",
+                descriptor("text/layers/3/attention/output", new long[] {5120, 6144}, WeightFormat.Q5_G64_FP16));
+        CompactWeightLoader.validateInventory(config(), descriptors);
+
+        // P2E2 stores Q3 only.
+        descriptors.put(
+                "text/layers/0/mlp/down",
+                new TensorDescriptor(
+                        "text/layers/0/mlp/down",
+                        new long[] {5120, 17408},
+                        TensorDataType.BF16,
+                        WeightFormat.Q4_G64_FP16,
+                        WeightLayout.ROW_SPLIT_P2E2_V1,
+                        0,
+                        1));
+        assertThrows(WeightLoadException.class, () -> CompactWeightLoader.validateInventory(config(), descriptors));
+    }
+
     /// The registered text and MTP inventory with every row-split object except the embedding in NVFP4.
     private static Map<String, TensorDescriptor> nvfp4Inventory() {
         Qwen38Config config = config();

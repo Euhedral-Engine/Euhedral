@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
+import io.euhedral_execution.inference.core.model.qwen38.Quantum.ExecutionKind;
 import io.euhedral_execution.inference.core.model.qwen38.loader.AttentionWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DenseFfnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.GdnWeights;
@@ -23,6 +24,7 @@ class FullModelExecutionPlanTest {
     private static final int VOCABULARY = 248320;
     private static long nextAddress = 10_000;
     private static java.util.function.Predicate<String> hostBacked = name -> false;
+    private static java.util.function.Function<String, WeightFormat> formatOverride = name -> null;
 
     @Test
     void stagesEveryHostBackedUseThroughTheRingInEveryView() {
@@ -114,6 +116,54 @@ class FullModelExecutionPlanTest {
                 .anyMatch(weight -> weight.name().equals("text/layers/63/mlp/down")));
         assertEquals("text/output_head", plan.instructions().getLast().weightName(0));
         assertEquals(VOCABULARY, plan.instructions().getLast().outputWidth());
+    }
+
+    @Test
+    void eachGroupedProjectionRunsTheKernelOfItsOwnFormat() {
+        // Q4 value_z, Q4 mixer outputs, and Q4 down projections in the first and last eight layers.
+        formatOverride = name -> name.endsWith("/gdn/value_z")
+                        || name.endsWith("/gdn/output")
+                        || name.endsWith("/attention/output")
+                        || name.matches("text/layers/([0-7]|5[6-9]|6[0-3])/mlp/down")
+                ? WeightFormat.Q4_G64_FP16
+                : null;
+        Weights weights;
+        try {
+            weights = fullModelWeights();
+        } finally {
+            formatOverride = name -> null;
+        }
+        ExecutionPlan plan = new ExecutionPlan(weights);
+
+        java.util.Map<ExecutionPlan.Kind, Long> kinds = plan.instructions().stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        ExecutionPlan.Instruction::kind, java.util.stream.Collectors.counting()));
+        assertEquals(64 + 48 + 1, kinds.get(ExecutionPlan.Kind.Q3_LINEAR));
+        assertEquals(64 + 48 + 64 + 16, kinds.get(ExecutionPlan.Kind.Q4_LINEAR));
+        assertEquals(16, kinds.get(ExecutionPlan.Kind.Q5_LINEAR));
+        assertEquals(ExecutionPlan.Kind.Q4_LINEAR, kindOf(plan, "text/layers/0/mlp/down"));
+        assertEquals(ExecutionPlan.Kind.Q3_LINEAR, kindOf(plan, "text/layers/8/mlp/down"));
+        // The GDN control region still goes ahead of the heavy projections in prefill.
+        var prefill = plan.forExecution(ExecutionKind.PREFILL, 256);
+        int control = prefill.instructions().stream()
+                .filter(i -> i.kind() == ExecutionPlan.Kind.GDN_PROJECT_CONTROL)
+                .findFirst()
+                .orElseThrow()
+                .id();
+        int heavy = prefill.instructions().stream()
+                .filter(i -> i.kind() == ExecutionPlan.Kind.Q4_LINEAR)
+                .findFirst()
+                .orElseThrow()
+                .id();
+        assertTrue(control < heavy);
+    }
+
+    private static ExecutionPlan.Kind kindOf(ExecutionPlan plan, String weight) {
+        return plan.instructions().stream()
+                .filter(i -> i.weights().stream().anyMatch(w -> w.name().equals(weight)))
+                .findFirst()
+                .orElseThrow()
+                .kind();
     }
 
     @Test
@@ -259,7 +309,8 @@ class FullModelExecutionPlanTest {
                 Math.multiplyExact(elements, bytesPerElement));
     }
 
-    private static TensorHandle quantized(String name, int rows, int columns, WeightFormat format) {
+    private static TensorHandle quantized(String name, int rows, int columns, WeightFormat requested) {
+        WeightFormat format = formatOverride.apply(name) != null ? formatOverride.apply(name) : requested;
         long[] shape = {rows, columns};
         long bytes = CompactTensorLayout.expectedByteSize(
                 shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1);

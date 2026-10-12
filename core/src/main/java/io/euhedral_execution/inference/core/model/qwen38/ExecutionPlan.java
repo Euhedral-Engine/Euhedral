@@ -975,12 +975,16 @@ public final class ExecutionPlan {
         return new PlanData(result, data.projectionWidths(), buffers, data.firstLayer());
     }
 
+    private static boolean grouped(Kind kind) {
+        return kind == Kind.Q3_LINEAR || kind == Kind.Q4_LINEAR || kind == Kind.Q5_LINEAR;
+    }
+
     private static List<Instruction> earlyControlOrder(List<Instruction> instructions) {
         List<Instruction> result = new ArrayList<>(instructions.size());
         for (int index = 0; index < instructions.size(); index++) {
             if (index + 4 < instructions.size()
-                    && instructions.get(index).kind() == Kind.Q4_LINEAR
-                    && instructions.get(index + 1).kind() == Kind.Q5_LINEAR
+                    && grouped(instructions.get(index).kind())
+                    && grouped(instructions.get(index + 1).kind())
                     && instructions.get(index + 2).kind() == Kind.BF16_LINEAR
                     && instructions.get(index + 3).kind() == Kind.BF16_LINEAR
                     && instructions.get(index + 4).kind() == Kind.GDN_CONTROL) {
@@ -1189,7 +1193,7 @@ public final class ExecutionPlan {
                 keyProjected));
         nodes.add(node(
                 3,
-                Kind.Q5_LINEAR,
+                linearKind(valueZ, Kind.Q5_LINEAR),
                 List.of(1),
                 List.of(valueZ),
                 List.of(Buffer.INPUT_NORMALIZED),
@@ -1252,7 +1256,7 @@ public final class ExecutionPlan {
                 valueProjected));
         nodes.add(node(
                 10,
-                Kind.Q3_LINEAR,
+                linearKind(gdnOutput, Kind.Q3_LINEAR),
                 List.of(9),
                 List.of(gdnOutput),
                 List.of(Buffer.GDN_NORMALIZED),
@@ -1297,7 +1301,7 @@ public final class ExecutionPlan {
                 intermediate));
         nodes.add(node(
                 15,
-                Kind.Q3_LINEAR,
+                linearKind(down, Kind.Q3_LINEAR),
                 List.of(14),
                 List.of(down),
                 List.of(Buffer.SWIGLU),
@@ -1815,7 +1819,7 @@ public final class ExecutionPlan {
                         gdnQueryKeyWidth);
                 int valueZId = addNode(
                         nodes,
-                        Kind.Q5_LINEAR,
+                        linearKind(valueZ, Kind.Q5_LINEAR),
                         layerIndex,
                         List.of(normId),
                         List.of(valueZ),
@@ -1885,7 +1889,7 @@ public final class ExecutionPlan {
                         gdnValueWidth);
                 mixerProjectionId = addNode(
                         nodes,
-                        Kind.Q3_LINEAR,
+                        linearKind(gdnOutput, Kind.Q3_LINEAR),
                         layerIndex,
                         List.of(gatedNormId),
                         List.of(gdnOutput),
@@ -1959,7 +1963,7 @@ public final class ExecutionPlan {
                         attentionQueryWidth);
                 mixerProjectionId = addNode(
                         nodes,
-                        Kind.Q3_LINEAR,
+                        linearKind(attentionOutput, Kind.Q3_LINEAR),
                         layerIndex,
                         List.of(attentionId),
                         List.of(attentionOutput),
@@ -2016,7 +2020,7 @@ public final class ExecutionPlan {
                     intermediate);
             int downId = addNode(
                     nodes,
-                    Kind.Q3_LINEAR,
+                    linearKind(down, Kind.Q3_LINEAR),
                     layerIndex,
                     List.of(swigluId),
                     List.of(down),
@@ -2241,6 +2245,23 @@ public final class ExecutionPlan {
         return validateQuantized(handle, rows, width, EMBEDDING_FORMAT);
     }
 
+    private static boolean grouped(WeightFormat format) {
+        return format == WeightFormat.Q3_G64_FP16
+                || format == WeightFormat.Q4_G64_FP16
+                || format == WeightFormat.Q5_G64_FP16;
+    }
+
+    /// The linear kind that runs `weight`: the artifact chooses each grouped projection's width (Q3, Q4 or Q5); NVFP4
+    /// weights keep the role's kind, which the stage dispatches by format.
+    private static Kind linearKind(TensorHandle weight, Kind role) {
+        return switch (weight.format()) {
+            case Q3_G64_FP16 -> Kind.Q3_LINEAR;
+            case Q4_G64_FP16 -> Kind.Q4_LINEAR;
+            case Q5_G64_FP16 -> Kind.Q5_LINEAR;
+            default -> role;
+        };
+    }
+
     private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat format) {
         Objects.requireNonNull(handle, "weight");
         long[] shape = handle.shape();
@@ -2251,9 +2272,12 @@ public final class ExecutionPlan {
                 || width % 64 != 0
                 || (handle.deviceAddress() == 0 && !handle.hostBacked())
                 || handle.dataType() != TensorDataType.BF16
-                || !(handle.format() == format || handle.format() == WeightFormat.NVFP4)
+                || !(handle.format() == format
+                        || handle.format() == WeightFormat.NVFP4
+                        || (grouped(format) && grouped(handle.format())))
                 || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
-                        || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1 && format == WeightFormat.Q3_G64_FP16)
+                        || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
+                                && handle.format() == WeightFormat.Q3_G64_FP16)
                         || (handle.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1
                                 && handle.format() == WeightFormat.NVFP4))
                 || !CompactTensorLayout.acceptsByteSize(

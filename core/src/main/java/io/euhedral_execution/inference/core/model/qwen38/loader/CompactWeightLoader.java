@@ -365,6 +365,14 @@ final class CompactWeightLoader {
         }
     }
 
+    /// Q3, Q4 and Q5 grouped formats: the artifact chooses each grouped projection's width, and the plan runs the
+    /// matching kernel (`ExecutionPlan.linearKind`).
+    private static boolean grouped(WeightFormat format) {
+        return format == WeightFormat.Q3_G64_FP16
+                || format == WeightFormat.Q4_G64_FP16
+                || format == WeightFormat.Q5_G64_FP16;
+    }
+
     private static void validateExpectedDescriptor(TensorDescriptor descriptor) throws WeightLoadException {
         String name = descriptor.name();
         if (descriptor.layout() == null) {
@@ -390,7 +398,8 @@ final class CompactWeightLoader {
                         || expected.dataType() != descriptor.dataType()
                         || !(expected.format() == descriptor.format()
                                 || (descriptor.format() == WeightFormat.NVFP4
-                                        && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1))
+                                        && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)
+                                || (grouped(expected.format()) && grouped(descriptor.format())))
                         || !(expected.layout() == descriptor.layout()
                                 || ((p2e2 || sd4) && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)))) {
             throw new WeightLoadException(
