@@ -165,7 +165,8 @@ def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
             source_matrix(store, source_prefix + "mlp.up_proj.weight", (INTERMEDIATE, HIDDEN))), "Q3G64_F16S")
         quant(object_prefix + "mlp/down", source_matrix(store, source_prefix + "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE)), "Q3G64_F16S")
     add_direct(plans, "text/final_norm", (HIDDEN,), store, "model.language_model.norm.weight", (HIDDEN,))
-    quant("text/output_head", source_matrix(store, "lm_head.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
+    # The LM head is NVFP4 in the q3 artifact too: in Q3 it carries a third of the model's weight-only KL (docs/QUALITY.md).
+    quant("text/output_head", source_matrix(store, "lm_head.weight", (VOCAB_SIZE, HIDDEN)), "NVFP4")
     quant("text/draft_head", gather_matrix(store, "lm_head.weight", selected), "Q3G64_F16S")
     add_direct(plans, "text/draft_head_token_ids", (DRAFT_ROWS,), store, "", (), kind="i32", extra=selected, format_name="I32", source_dtype="INT32")
 

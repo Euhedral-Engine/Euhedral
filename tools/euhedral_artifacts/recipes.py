@@ -1,6 +1,6 @@
 """The four artifacts the engine ships, and what each stores per object.
 
-    q3                Q3G64/Q4G64/Q5G64 text weights (grouped, row-split); NVFP4 MTP layer; Q3 draft head
+    q3                Q3G64/Q4G64/Q5G64 text weights (grouped, row-split); NVFP4 LM head and MTP layer; Q3 draft head
     q3 compressed     the q3 artifact with its Q3 tensors transcoded losslessly to P2E2
     nvfp4             NVFP4 text weights, MTP layer and draft head; Q3 token embedding
     nvfp4 compressed  NVFP4-SD4 text weights (4.25 bits per weight); plain NVFP4 MTP layer and draft head
