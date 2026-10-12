@@ -97,13 +97,13 @@ python3 tools/fake_quant_parity.py --model $CHECKPOINT --artifact $OUT/qwen3_8_2
     --imatrix imatrix-swift15-v1mix.gguf [--objects REGEX] [--export DIR]
 ```
 
-On the shipped `q3`, `nvfp4` and `nvfp4-compressed` artifacts (calibrated, Swift-1.5) every quantized object, 328 per
-artifact, matches byte for byte and every module's forward pass equals its decoded weights exactly; a parity run takes
+On the calibrated Swift-1.5 `q3` (with its LM head in Q3), `nvfp4` and `nvfp4-compressed` artifacts every quantized
+object, 328 per artifact, matches byte for byte and every module's forward pass equals its decoded weights exactly; a parity run takes
 5 to 11 minutes on the GPU. Converting `q3` and `nvfp4-compressed` again with the exported codes of layers 10 and 11, the
 LM head and the MTP input projection (`--codes-from`) reproduces each artifact's SHA-256.
 
 The fake-quant model and the engine running the artifact agree closely: with the modules' decoded weights in a BF16
-GGUF run by llama.cpp as the reference, the engine's teacher-forced KL over T2 (docs/QUALITY.md) is 0.0076 for `q3`
+GGUF run by llama.cpp as the reference, the engine's teacher-forced KL over T2 (docs/QUALITY.md) is 0.0076 for that `q3`
 (dNLL +0.005, top-1 agreement 96.5%) and 0.0081 for `nvfp4-compressed` (dNLL +0.001, 96.7%).
 
 ## DFlash2

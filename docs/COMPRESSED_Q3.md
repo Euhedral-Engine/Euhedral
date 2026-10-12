@@ -13,8 +13,8 @@ The artifact selects the layout per tensor, so no engine option exists: the engi
 
 On an RTX 5070 Ti (16 GB):
 
-- **Memory.** The calibrated `q3-compressed` artifact is 11.51 GB, and its weights take 11,032,853,996 bytes of device memory
-  against 12,069,330,944 for the row-split artifact with the same values: 0.97 GiB less. The expansion scratch takes back at most
+- **Memory.** The calibrated `q3-compressed` artifact is 11.77 GB. Loaded at a 32K context it takes 12,085,711,468 bytes of
+  device memory against 12,992,556,060 for `q3`: 0.84 GiB less. The expansion scratch takes back at most
   128 MiB of weights plus the activation region (see Execution routes).
 - **Fast path.** A warp decodes a slice on the fast path when every lane of its four rows has at most 31 BIG codes among its 32
   and the slice's payload fits the 32 prefetched words. Calibrated codes are about 31% BIG; 0.1% of their slices take the slow
