@@ -85,7 +85,7 @@ Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE
 | nvfp4-compressed | +0.028 ± 0.009 / 0.037 / 89.4% | +0.018 ± 0.007 / 0.047 / 91.2% | +0.046 ± 0.006 / 0.073 / 96.3% | +0.100 ± 0.036 / 0.228 / 91.5% |
 | nvfp4 | +0.030 ± 0.009 / 0.038 / 88.4% | +0.012 ± 0.007 / 0.046 / 91.4% | +0.044 ± 0.005 / 0.074 / 96.3% | +0.001 ± 0.029 / 0.220 / 91.6% |
 | q3 | +0.116 ± 0.018 / 0.134 / 81.2% | +0.071 ± 0.012 / 0.145 / 84.3% | +0.182 ± 0.022 / 0.248 / 91.9% | +0.017 ± 0.047 / 0.462 / 86.2% |
-| q3-compressed | +0.156 ± 0.020 / 0.176 / 78.8% | +0.073 ± 0.013 / 0.167 / 83.0% | +0.219 ± 0.026 / 0.286 / 90.8% | +0.159 ± 0.115 / 0.582 / 84.5% |
+| q3-compressed | +0.152 ± 0.020 / 0.161 / 80.1% | +0.066 ± 0.013 / 0.156 / 84.1% | +0.210 ± 0.025 / 0.277 / 90.9% | +0.039 ± 0.072 / 0.537 / 84.9% |
 
 On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix near-deterministic answer text with
 open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
@@ -108,7 +108,7 @@ Swift-1.5 BF16 (25 chunks; token-level standard errors):
 | `nvfp4` | +0.010 ± 0.002 | 0.042 | 0.36 | 91.6% |
 | `nvfp4-compressed` | +0.018 ± 0.002 | 0.043 | 0.36 | 91.6% |
 | `q3` | +0.066 ± 0.004 | 0.140 | 1.35 | 84.2% |
-| `q3-compressed` | +0.072 ± 0.004 | 0.164 | 1.58 | 83.0% |
+| `q3-compressed` (MLP down row-split, docs/COMPRESSED_Q3.md) | +0.066 ± 0.004 | 0.152 | 1.58 | 83.9% |
 
 llama.cpp's own types, quantized from the same BF16 GGUF with the same importance matrix (`llama-quantize --imatrix`;
 IQ3_XXS needs an importance entry for every tensor, so its MTP layer is pruned) and requantized to BF16 for scoring:
@@ -155,11 +155,12 @@ probability either way), so allocation decisions use KL.
 
 ## Compression-induced error
 
-`compare_teacher_forced.py` compares reports with one another. `q3-compressed` is lossless, so its report is byte for byte the
-`q3` report; `nvfp4-compressed` (SD4) is compared with `nvfp4`:
+`compare_teacher_forced.py` compares reports with one another. P2E2 is lossless, so a `q3-compressed` report is byte for byte the
+report of the row-split artifact with the same values (`q3_p2e2 expand`, docs/COMPRESSED_Q3.md); `nvfp4-compressed` (SD4) is
+compared with `nvfp4`:
 
 ```bash
-python3 tools/compare_teacher_forced.py q3.bin q3_compressed.bin
+python3 tools/compare_teacher_forced.py q3_compressed_expanded.bin q3_compressed.bin
 python3 tools/compare_teacher_forced.py nvfp4.bin nvfp4_compressed.bin
 ```
 

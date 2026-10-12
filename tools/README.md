@@ -7,7 +7,7 @@ the artifact: the quantization and the representation.
 | Artifact | Quantization | Representation | Weights |
 |---|---|---|---|
 | `q3` | `--quantization q3` | uncompressed | Q3 text weights (Q4/Q5 for the attention and GDN input projections), NVFP4 MTP layer, Q3 draft head |
-| `q3-compressed` | `--quantization q3 --compressed` | compressed | the `q3` artifact, losslessly transcoded: every tensor decodes to the same values |
+| `q3-compressed` | `--quantization q3 --compressed` | compressed | a Q3 artifact losslessly transcoded to P2E2, MLP down projections kept row-split: every tensor decodes to the values of its Q3 form |
 | `nvfp4` | `--quantization nvfp4` | uncompressed | NVFP4 text weights, MTP layer and draft head; Q3 token embedding |
 | `nvfp4-compressed` | `--quantization nvfp4 --compressed` | compressed | NVFP4 text weights at 4.25 bits per weight; plain NVFP4 MTP layer and draft head; Q3 token embedding |
 
@@ -62,8 +62,8 @@ weighted by those column importances:
 
 Objects the matrix does not cover (the token embedding, the LM and draft heads, the MTP layer) are searched
 with uniform weights. Formats and layouts are unchanged; the manifest records the matrix and its SHA-256.
-Calibrated rounding needs PyTorch. Compressed q3 limits its Q3 tensors to the codes -3..3, which its P2E2 layout stores
-(docs/COMPRESSED_Q3.md).
+Calibrated rounding needs PyTorch. Compressed q3 limits its Q3 tensors to the codes -3..3, which its P2E2 layout stores,
+except the MLP down projections, which it keeps row-split with the full range (docs/COMPRESSED_Q3.md).
 
 ```bash
 python3 tools/convert_checkpoint.py --model $CHECKPOINT --quantization q3 \
