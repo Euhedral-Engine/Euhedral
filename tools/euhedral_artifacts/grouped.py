@@ -159,17 +159,20 @@ def quantize_group_codes_torch(values: np.ndarray, group_size: int, qmin: int, q
 
 
 # Calibrated rounding tries, per group, scales that map the group's largest magnitude to either end of the
-# code range (qmax or -qmin, so the extra negative code is used) give or take SEARCH_STEPS tenths of a
-# code, refits each by weighted least squares over the codes it produces, rounds it to binary16 and
-# requantizes. The group keeps the candidate with the least weighted squared error; the round-to-nearest
-# scale is the first candidate, so no group gets worse.
+# code range (qmax or -qmin) give or take SEARCH_STEPS tenths of a code, refits each by weighted least squares
+# over the codes it produces, rounds it to binary16 and requantizes. Scales are signed: a candidate for the -qmin
+# end takes the sign that puts the group's largest magnitude on the extra negative code whether that value is
+# positive or negative. The group keeps the candidate with the least weighted squared error; the
+# round-to-nearest scale is the first candidate, so no group gets worse.
 SEARCH_STEPS = range(-9, 10)
 
 
 def _binary16_scales(raw, max_abs):
+    """Signed binary16 group scales; a nonzero group never gets a zero scale."""
     torch = device.torch()
-    scales = raw.clamp(0.0, 65504.0).float().half()
-    return torch.where((scales == 0) & (max_abs > 0), torch.full_like(scales, 2.0**-24), scales)
+    scales = raw.clamp(-65504.0, 65504.0).float().half()
+    tiny = torch.where(raw < 0, torch.full_like(scales, -2.0**-24), torch.full_like(scales, 2.0**-24))
+    return torch.where((scales == 0) & (max_abs > 0), tiny, scales)
 
 
 def search_group_codes_torch(values, group_size: int, qmin: int, qmax: int, weights: np.ndarray):
@@ -189,17 +192,22 @@ def search_group_codes_torch(values, group_size: int, qmin: int, qmax: int, weig
 
     def trial(scales):
         decode = scales.float()[..., None]
-        codes = torch.where(decode > 0, torch.round(x / decode), torch.zeros_like(x)).clamp(qmin, qmax)
+        codes = torch.where(decode != 0, torch.round(x / decode), torch.zeros_like(x)).clamp(qmin, qmax)
         error = (w * (codes * decode - x) ** 2).sum(dim=2)
         return codes, error
 
     best_scales = _binary16_scales(max_abs / qmax, max_abs)
     best_codes, best_error = trial(best_scales)
+    # The sign that puts the largest magnitude on -qmin: negative when that value is positive.
+    largest = torch.gather(x, 2, x.abs().argmax(dim=2, keepdim=True))[..., 0]
+    negative_end = torch.where(largest > 0, -1.0, 1.0)
     for end in sorted({qmax, -qmin}):
+        sign = negative_end if end == -qmin else 1.0
         for step in SEARCH_STEPS:
-            codes, _ = trial(_binary16_scales(max_abs / (end + 0.1 * step), max_abs))
+            start = sign * max_abs / (end + 0.1 * step)
+            codes, _ = trial(_binary16_scales(start, max_abs))
             numerator, denominator = (w * x * codes).sum(dim=2), (w * codes * codes).sum(dim=2)
-            refit = torch.where(denominator > 0, numerator / denominator, max_abs / (end + 0.1 * step))
+            refit = torch.where(denominator > 0, numerator / denominator, start)
             scales = _binary16_scales(refit, max_abs)
             codes, error = trial(scales)
             better = error < best_error
