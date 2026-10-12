@@ -30,9 +30,10 @@ host memory. All of that is automatic.
 
 Any artifact can also carry the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`): the converter appends it with
 `--extend ARTIFACT --dflash2 DIR`, and an artifact that holds it speculates with DFlash2 instead of MTP, with the same
-exact verification ([docs/DFLASH2.md](docs/DFLASH2.md)). On the compressed NVFP4 artifact it decodes 122.0 tok/s at 4K, 95.4 at 32K,
-77.1 at 64K and 38.5 at 128K tokens of context (chat corpus, 256 generated tokens, 64 at 128K; MTP on the same target: 130.8, 101.0,
-91.3 and 52.7); its larger drafter leaves less of the 16 GB for the target, and the four artifacts above draft with MTP.
+exact verification ([docs/DFLASH2.md](docs/DFLASH2.md)). On the compressed NVFP4 form of Qwen3.8-27B, the model the drafter was trained
+for, it decodes 131.9 tok/s at 4K, 112.3 at 32K, 87.3 at 64K and 57.3 at 128K tokens of context (chat corpus and 256 generated
+tokens; at 128K generated text and 64 tokens; MTP on the same target: 138.1, 128.6, 100.7 and 82.5); its larger drafter leaves
+less of the 16 GB for the target, and the four artifacts above draft with MTP.
 
 ## Performance
 
