@@ -55,8 +55,10 @@ from its largest value. FILE is a llama.cpp importance matrix (GGUF, as `llama-i
 of each linear layer's input columns over a calibration text. Each group's scale minimizes its squared error
 weighted by those column importances:
 
-- Q3, Q4 and Q5 try scales that map the group's largest magnitude to either end of the code range (so the most
-  negative code is used), refit each by weighted least squares, and keep the best after rounding to binary16;
+- Q3, Q4 and Q5 try scales that map the group's largest magnitude to either end of the code range, refit each by
+  weighted least squares, and keep the best after rounding to binary16. Scales are signed: a group whose largest
+  magnitude is positive reaches the most negative code (-4 for Q3) through a negative scale, which the kernels apply as
+  they apply any scale;
 - NVFP4 tries the block scale codes from 6 below to 2 above the round-to-nearest code;
 - SD4 chooses its table and each block's entry under the weighted error.
 

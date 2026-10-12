@@ -40,7 +40,8 @@ less of the 16 GB for the target, and the four artifacts above draft with MTP.
 RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display, Linux, one run per row after one warmup. Greedy
 decoding with MTP speculative decoding (two drafted tokens for Q3, four for NVFP4); decode `tok/s` is output tokens per second
 after the first token. Prefill and time to first token (TTFT) include the whole prompt. Measured on 2026-10-11 (commit 66f972c;
-`q3-compressed` on 2026-10-12, commit 604fa69) with the GPU at its stock clocks.
+`q3` and `q3-compressed` on 2026-10-12, commit 46986ca) with the GPU at its stock clocks. Decode depends on how many drafted
+tokens the verifier accepts on each prompt, which moves single rows by several percent.
 
 Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128K = 128,000.
 
@@ -48,8 +49,8 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 2,076 | 1,707 | 1,434 | 1,077 |
-| `q3-compressed` | 1,894 | 1,638 | 1,386 | 1,052 |
+| `q3` | 2,002 | 1,706 | 1,434 | 1,077 |
+| `q3-compressed` | 1,972 | 1,639 | 1,387 | 1,052 |
 | `nvfp4` | 4,118 | 2,885 | 2,185 | 1,418 |
 | `nvfp4-compressed` | 4,040 | 2,849 | 2,165 | 1,437 |
 
@@ -57,8 +58,8 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 137.6 | 122.1 | 112.1 | 69.1 |
-| `q3-compressed` | 102.2 | 104.0 | 96.1 | 74.2 |
+| `q3` | 126.1 | 114.7 | 110.1 | 88.8 |
+| `q3-compressed` | 98.5 | 98.3 | 97.2 | 64.6 |
 | `nvfp4` | 138.8 | 114.1 | 85.7 | 38.7 |
 | `nvfp4-compressed` | 142.0 | 109.3 | 93.7 | 82.1 |
 
@@ -66,8 +67,8 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 1.92 s | 19.2 s | 44.3 s | 119 s |
-| `q3-compressed` | 2.10 s | 20.0 s | 45.8 s | 122 s |
+| `q3` | 1.99 s | 19.2 s | 44.3 s | 119 s |
+| `q3-compressed` | 2.02 s | 20.0 s | 45.8 s | 122 s |
 | `nvfp4` | 0.97 s | 11.4 s | 29.1 s | 90.5 s |
 | `nvfp4-compressed` | 0.99 s | 11.5 s | 29.4 s | 89.3 s |
 
@@ -104,8 +105,8 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `q3` | 2.258 | 9.56 | +0.116 ± 0.018 | 0.134 | 81.2% |
-| `q3-compressed` | 2.293 | 9.91 | +0.152 ± 0.020 | 0.161 | 80.1% |
+| `q3` | 2.257 | 9.56 | +0.116 ± 0.017 | 0.122 | 82.2% |
+| `q3-compressed` | 2.269 | 9.67 | +0.127 ± 0.019 | 0.153 | 80.2% |
 | `nvfp4` | 2.171 | 8.77 | +0.030 ± 0.009 | 0.038 | 88.4% |
 | `nvfp4-compressed` | 2.170 | 8.76 | +0.028 ± 0.009 | 0.037 | 89.4% |
 
@@ -142,11 +143,11 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 - **Fastest at short contexts:** `nvfp4-compressed` (perplexity 8.76 against 8.51 for BF16 on the quality text): 142 tok/s at 4K. On a
   16 GB card it keeps 0.08 to 0.65 GiB of weights in host memory at 32K to 64K (1.78 GiB at 128K) and streams them in for every
   token: 109 tok/s at 32K, 94 at 64K and 82 at 128K.
-- **Fastest at 32K and 64K, and the one that fits everywhere:** `q3`: 138 tok/s at 4K, 122 at 32K, 112 at 64K and 69 at 128K,
+- **Fastest at 32K and 64K, and the one that fits everywhere:** `q3`: 126 tok/s at 4K, 115 at 32K, 110 at 64K and 89 at 128K,
   with no host-backed weights (perplexity 9.56).
-- **More room instead of speed:** `q3-compressed` (perplexity 9.91) is a file about 0.7 GiB smaller than `q3`, which leaves more
-  of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 102 tok/s at 4K,
-  104 at 32K, 96 at 64K and 74 at 128K.
+- **More room instead of speed:** `q3-compressed` (perplexity 9.67) is a file about 0.7 GiB smaller than `q3`, which leaves more
+  of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 99 tok/s at 4K,
+  98 at 32K, 97 at 64K and 65 at 128K.
 - `nvfp4` (perplexity 8.77) keeps 0.84 to 1.40 GiB of weights in host memory at 32K to 64K (2.59 GiB at 128K): it decodes
   as fast as `nvfp4-compressed` up to 32K and slower beyond; the two NVFP4 forms differ by less than the noise of the quality
   measurement, and their prefill is within 3%.
