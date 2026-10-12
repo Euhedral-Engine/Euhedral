@@ -16,8 +16,8 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 
 | Artifact | Quantization | Representation | File size | Compression |
 |---|---|---|---|---|
-| `q3` | Q3 | uncompressed | 11.72 GiB (12.58 GB) | |
-| `q3-compressed` | Q3 | compressed | 10.72 GiB (11.51 GB) | lossless layout of a Q3 limited to the codes -3..3 (see [quality](#quality)) |
+| `q3` | Q3 | uncompressed | 11.90 GiB (12.78 GB) | LM head in NVFP4 |
+| `q3-compressed` | Q3 | compressed | 10.96 GiB (11.77 GB) | lossless layout of a Q3 limited to the codes -3..3 (see [quality](#quality)); LM head in NVFP4 |
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
@@ -75,8 +75,8 @@ chat prompts.
 
 | Artifact | File | Device memory in use at 32K / 64K / 128K | Host-backed weights at 32K / 64K / 128K | Longest context run |
 |---|---|---|---|---|
-| `q3` | 11.72 GiB | 12.8 / 13.4 / 14.1 GiB | none | 128K |
-| `q3-compressed` | 10.72 GiB | 11.9 / 12.5 / 13.7 GiB | none | 128K |
+| `q3` | 11.90 GiB | 13.0 / 13.6 / 14.3 GiB | none | 128K |
+| `q3-compressed` | 10.96 GiB | 12.1 / 12.7 / 13.9 GiB | none | 128K |
 | `nvfp4` | 14.52 GiB | 14.4 / 14.4 / 14.4 GiB | 0.84 / 1.40 / 2.59 GiB | 128K |
 | `nvfp4-compressed` | 13.77 GiB | 14.4 / 14.4 / 14.4 GiB | 0.08 / 0.65 / 1.84 GiB | 128K |
 
@@ -102,8 +102,8 @@ Q3 tensors to the codes -3..3, which its lossless layout stores, while `q3` also
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `q3` | 2.303 | 10.00 | +0.161 ± 0.021 | 0.193 | 76.3% |
-| `q3-compressed` | 2.355 | 10.54 | +0.213 ± 0.023 | 0.240 | 73.7% |
+| `q3` | 2.258 | 9.56 | +0.116 ± 0.018 | 0.134 | 81.2% |
+| `q3-compressed` | 2.298 | 9.96 | +0.156 ± 0.020 | 0.176 | 78.8% |
 | `nvfp4` | 2.171 | 8.77 | +0.030 ± 0.009 | 0.038 | 88.4% |
 | `nvfp4-compressed` | 2.170 | 8.76 | +0.028 ± 0.009 | 0.037 | 89.4% |
 
@@ -141,8 +141,8 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
   16 GB card it keeps 0.08 to 0.65 GiB of weights in host memory at 32K to 64K (1.84 GiB at 128K) and streams them in for every
   token, which slows it to 104 tok/s at 32K, 87 at 64K and 59 at 128K.
 - **Fastest at long contexts, and the one that fits everywhere:** `q3`: 120 tok/s at 4K, 105 at 32K, 98 at 64K and 77 at 128K,
-  with no host-backed weights (perplexity 10.00).
-- **More room instead of speed:** `q3-compressed` (perplexity 10.54) is a file about 1.0 GiB smaller than `q3`, which leaves more
+  with no host-backed weights (perplexity 9.56).
+- **More room instead of speed:** `q3-compressed` (perplexity 9.96) is a file about 0.9 GiB smaller than `q3`, which leaves more
   of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them, which costs 11 to
   22% of `q3`'s decode speed (94 tok/s at 4K and 32K, 81 at 64K, 62 at 128K).
 - `nvfp4` (perplexity 8.77), keeps 0.84 to 1.40 GiB of weights in host memory at 32K to 64K (2.59 GiB at

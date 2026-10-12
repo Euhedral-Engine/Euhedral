@@ -84,8 +84,8 @@ Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE
 |---|---|---|---|---|
 | nvfp4-compressed | +0.028 ± 0.009 / 0.037 / 89.4% | +0.018 ± 0.007 / 0.047 / 91.2% | +0.046 ± 0.006 / 0.073 / 96.3% | +0.100 ± 0.036 / 0.228 / 91.5% |
 | nvfp4 | +0.030 ± 0.009 / 0.038 / 88.4% | +0.012 ± 0.007 / 0.046 / 91.4% | +0.044 ± 0.005 / 0.074 / 96.3% | +0.001 ± 0.029 / 0.220 / 91.6% |
-| q3 | +0.161 ± 0.021 / 0.193 / 76.3% | +0.117 ± 0.012 / 0.199 / 79.5% | +0.184 ± 0.021 / 0.254 / 91.7% | +0.069 ± 0.049 / 0.466 / 85.7% |
-| q3-compressed | +0.213 ± 0.023 / 0.240 / 73.7% | +0.118 ± 0.013 / 0.217 / 78.9% | +0.222 ± 0.026 / 0.292 / 90.5% | +0.189 ± 0.114 / 0.581 / 84.1% |
+| q3 | +0.116 ± 0.018 / 0.134 / 81.2% | +0.071 ± 0.012 / 0.145 / 84.3% | +0.182 ± 0.022 / 0.248 / 91.9% | +0.017 ± 0.047 / 0.462 / 86.2% |
+| q3-compressed | +0.156 ± 0.020 / 0.176 / 78.8% | +0.073 ± 0.013 / 0.167 / 83.0% | +0.219 ± 0.026 / 0.286 / 90.8% | +0.159 ± 0.115 / 0.582 / 84.5% |
 
 On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix near-deterministic answer text with
 open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
@@ -107,8 +107,8 @@ Swift-1.5 BF16 (25 chunks; token-level standard errors):
 |---|---|---|---|---|
 | `nvfp4` | +0.010 ± 0.002 | 0.042 | 0.36 | 91.6% |
 | `nvfp4-compressed` | +0.018 ± 0.002 | 0.043 | 0.36 | 91.6% |
-| `q3` | +0.112 ± 0.004 | 0.193 | 1.45 | 79.2% |
-| `q3-compressed` | +0.116 ± 0.004 | 0.214 | 1.72 | 78.7% |
+| `q3` | +0.066 ± 0.004 | 0.140 | 1.35 | 84.2% |
+| `q3-compressed` | +0.072 ± 0.004 | 0.164 | 1.58 | 83.0% |
 
 llama.cpp's own types, quantized from the same BF16 GGUF with the same importance matrix (`llama-quantize --imatrix`;
 IQ3_XXS needs an importance entry for every tensor, so its MTP layer is pruned) and requantized to BF16 for scoring:
@@ -119,10 +119,21 @@ IQ3_XXS needs an importance entry for every tensor, so its MTP layer is pruned) 
 | IQ3_S (LM head Q6_K, attention V and GDN QKV Q4_K) | 12.60 GB | +0.036 ± 0.003 | 0.072 | 0.72 | 90.0% |
 | Q3_K_M (LM head Q6_K, MLP down Q4_K/Q5_K, attention output, attention V and GDN QKV Q4_K) | 13.50 GB | +0.033 ± 0.003 | 0.062 | 0.63 | 90.3% |
 
-`q3` is 12.58 GB. IQ3_S, at the same size, stores the LM head in Q6_K and every other matrix but the Q4_K ones in a
+`q3` is 12.78 GB. IQ3_S, at about its size, stores the LM head in Q6_K and every other matrix but the Q4_K ones in a
 lattice codebook of 3.44 bits per weight.
 
-`q3` with one family kept at BF16 (in parentheses, the family's share of the main model's 26.9B matrix weights):
+The LM head of the Q3 artifacts is NVFP4. With every matrix in Q3 as the rest of `q3` stores it, the LM head included, the
+weights' KL is 0.193; the head's format alone moves it:
+
+| LM head | Head size | dNLL | Mean KL | KL p99 | Top-1 |
+|---|---|---|---|---|---|
+| Q3G64 | 0.50 GB | +0.112 ± 0.004 | 0.193 | 1.45 | 79.2% |
+| Q4G64 (rejected: the engine runs it only through new head dispatch, for more KL than NVFP4) | 0.67 GB | +0.071 ± 0.004 | 0.144 | 1.36 | 83.5% |
+| NVFP4 (shipped) | 0.71 GB | +0.066 ± 0.004 | 0.140 | 1.35 | 84.2% |
+| Q5G64 (rejected: new head dispatch and 0.12 GB more for 0.004 KL) | 0.83 GB | +0.067 ± 0.004 | 0.135 | 1.35 | 84.7% |
+| BF16 | 2.54 GB | +0.063 ± 0.004 | 0.132 | 1.34 | 85.0% |
+
+With the head in Q3, one family kept at BF16 (in parentheses, the family's share of the main model's 26.9B matrix weights):
 
 | Kept at BF16 | dNLL | Mean KL | KL p99 | Top-1 |
 |---|---|---|---|---|
@@ -135,8 +146,8 @@ lattice codebook of 3.44 bits per weight.
 | token embedding (4.7%) | +0.115 ± 0.004 | 0.193 | 1.46 | 79.4% |
 | full-attention Q, K and V only (Q4/Q5, 4.4%) | +0.105 ± 0.004 | 0.192 | 1.45 | 79.3% |
 
-The engine adds little on top of its weights: on T2 its mean KL is 0.046 for `nvfp4` and 0.199 for `q3` (holdout table
-above), against 0.042 and 0.193 for the weights alone in llama.cpp.
+The engine adds little on top of its weights: on T2 its mean KL is 0.046 for `nvfp4` and 0.145 for `q3` (holdout table
+above), against 0.042 and 0.140 for the weights alone in llama.cpp.
 
 The LM head carries a third of the KL in 4.7% of the weights. The Q4 and Q5 families (GDN input projections and
 full-attention Q, K and V) carry about 0.004 together, and the token embedding almost none. Per-token KL and top-1 order the families consistently; dNLL does not (quantization noise moves the forced token's
