@@ -188,9 +188,9 @@ class InventoryTest(unittest.TestCase):
     def test_q3_artifact(self):
         plans = {plan.name: plan for plan in plans_of(recipes.Recipe("q3"))}
         self.assertEqual(self.formats(recipes.Recipe("q3")), {
-            ("Q3G64_F16S", "row-split-k128-v1"): 1 + 64 * 3 + 1,  # embedding, layers, draft head
-            ("Q4G64_F16S", "row-split-k128-v1"): 64,
-            ("Q5G64_F16S", "row-split-k128-v1"): 64,
+            ("Q3G64_F16S", "row-split-k128-v1"): 1 + 64 + 52 + 1,  # embedding, gate_up, inner down, draft head
+            ("Q4G64_F16S", "row-split-k128-v1"): 64 + 48 + 64 + 12,  # query_key, value_z, mixer outputs, edge down
+            ("Q5G64_F16S", "row-split-k128-v1"): 16,  # attention gate_value
             ("NVFP4", "row-split-k128-v1"): 1 + 5,  # the LM head and the MTP layer
             ("BF16", "contiguous-le-v1"): 360,
             ("FP32", "contiguous-le-v1"): 96,
@@ -199,6 +199,9 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(plans["text/token_embedding"].format_name, "Q3G64_F16S")
         self.assertEqual(plans["text/draft_head"].format_name, "Q3G64_F16S")
         self.assertEqual(plans["text/output_head"].format_name, "NVFP4")
+        self.assertEqual(plans["text/layers/0/mlp/down"].format_name, "Q4G64_F16S")
+        self.assertEqual(plans["text/layers/6/mlp/down"].format_name, "Q3G64_F16S")
+        self.assertEqual(plans["text/layers/58/mlp/down"].format_name, "Q4G64_F16S")
         mtp = [plan for plan in plans.values() if plan.name.startswith("mtp/") and len(plan.shape) == 2]
         self.assertEqual({plan.format_name for plan in mtp}, {"NVFP4"})
         self.assertEqual(len(mtp), 5)
