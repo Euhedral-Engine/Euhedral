@@ -92,7 +92,7 @@ class GroupedFakeQuant(_module_base()):
             inverse = torch.where(scales > 0, (1.0 / scales.double()).float(), torch.zeros_like(max_abs))[..., None]
             codes = torch.round(x * inverse)
         else:
-            codes = torch.where(decode > 0, torch.round(x / decode), torch.zeros_like(x))
+            codes = torch.where(decode != 0, torch.round(x / decode), torch.zeros_like(x))
         return decode, codes.clamp(self.qmin, self.qmax)
 
     def forward(self):

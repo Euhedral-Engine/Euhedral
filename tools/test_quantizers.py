@@ -331,7 +331,22 @@ class CalibratedQuantizationTest(unittest.TestCase):
                 self.assertTrue((after <= before * (1 + 1e-12)).all())
                 self.assertLess(after.sum(), 0.8 * before.sum())
                 self.assertTrue((codes.numpy() == qmin).any())
-                self.assertTrue(np.isfinite(scales.numpy()).all() and (scales.numpy() >= 0).all())
+                self.assertTrue(np.isfinite(scales.numpy()).all())
+                # Signed scales: groups whose largest magnitude is positive reach the extra negative code too.
+                grouped_values = self.values.reshape(self.values.shape[0], -1, group_size)
+                largest = np.take_along_axis(grouped_values, np.abs(grouped_values).argmax(axis=2)[..., None], 2)[..., 0]
+                flipped = scales.numpy().astype(np.float32) < 0
+                self.assertTrue(flipped.any())
+                self.assertTrue((largest[flipped] > 0).all())
+
+    def test_signed_scales_put_a_positive_maximum_on_the_negative_code(self):
+        values = np.zeros((1, 64), np.float32)
+        values[0, :8] = [4.0, 1.0, -1.0, 2.0, -2.0, 3.0, 0.5, -0.5]
+        scales, codes = grouped.search_group_codes_torch(values, 64, -4, 3, np.ones(64, np.float32))
+        decode = codes.numpy().astype(np.float32) * scales.numpy().astype(np.float32)
+        self.assertLess(float(scales.numpy()[0, 0]), 0)
+        self.assertEqual(int(codes.numpy()[0, 0]), -4)
+        self.assertAlmostEqual(float(decode[0, 0]), 4.0, delta=0.2)
 
     def test_lowest_code_keeps_the_search_off_the_negative_end(self):
         matrix = sources.MatrixSource((32, 256), lambda begin, end: self.values[begin:end])
