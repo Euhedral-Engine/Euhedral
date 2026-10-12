@@ -1,7 +1,7 @@
 """The four artifacts the engine ships, and what each stores per object.
 
     q3                Q3G64/Q4G64/Q5G64 text weights (grouped, row-split); NVFP4 LM head and MTP layer; Q3 draft head
-    q3 compressed     the q3 artifact with its Q3 tensors transcoded losslessly to P2E2
+    q3 compressed     the q3 artifact with its Q3 tensors but the MLP down projections transcoded losslessly to P2E2
     nvfp4             NVFP4 text weights, MTP layer and draft head; Q3 token embedding
     nvfp4 compressed  NVFP4-SD4 text weights (4.25 bits per weight); plain NVFP4 MTP layer and draft head
 
@@ -11,6 +11,7 @@ No artifact holds the vision tower.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from euhedral_artifacts.edrl import fail
 
@@ -38,6 +39,12 @@ class Recipe:
 
 
 RECIPES = tuple(Recipe(quantization, compressed) for quantization in QUANTIZATIONS for compressed in (False, True))
+
+
+def stays_row_split(name: str) -> bool:
+    """Q3 objects compressed q3 keeps in row-split Q3 with the full code range instead of P2E2 (which holds -3..3): the
+    MLP down projections, where the restriction costs the most KL per byte it saves (docs/COMPRESSED_Q3.md)."""
+    return re.fullmatch(r"text/layers/\d+/mlp/down", name) is not None
 
 
 def is_drafting(name: str) -> bool:

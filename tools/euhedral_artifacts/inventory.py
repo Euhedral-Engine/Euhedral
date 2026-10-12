@@ -16,7 +16,7 @@ from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.nvfp4 import (nvfp4_offsets, nvfp4_sd4_offsets, quantize_nvfp4_matrix,
                                       quantize_nvfp4_sd4_matrix)
 from euhedral_artifacts.q3_p2e2 import P2E2_LOWEST_CODE
-from euhedral_artifacts.recipes import LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage
+from euhedral_artifacts.recipes import LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage, stays_row_split
 from euhedral_artifacts.sources import (HIDDEN, VOCAB_SIZE, MatrixSource, SourceStore, bf16_to_float32,
                                         concat_matrix, gather_matrix, head_part, read_json, slice_matrix,
                                         source_matrix)
@@ -95,8 +95,9 @@ def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: Matrix
                                 lambda output, offset, path=path: write_state(output, offset, QuantState.load(path))))
         return
     calibration = importance.calibration(name, matrix.shape[1]) if importance is not None else None
-    if calibration is not None and recipe.quantization == "q3" and recipe.compressed and format_name == Q3_FORMAT:
-        # Compressed q3 stores its Q3 tensors in P2E2, which holds the codes -3..3 (docs/COMPRESSED_Q3.md).
+    if calibration is not None and recipe.quantization == "q3" and recipe.compressed and format_name == Q3_FORMAT \
+            and not stays_row_split(name):
+        # Compressed q3 stores these Q3 tensors in P2E2, which holds the codes -3..3 (docs/COMPRESSED_Q3.md).
         calibration = replace(calibration, lowest_code=P2E2_LOWEST_CODE)
     if layout == LAYOUT_SD4:
         plans.append(ObjectPlan(

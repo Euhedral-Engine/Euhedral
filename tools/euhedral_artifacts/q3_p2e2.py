@@ -18,6 +18,7 @@ import numpy as np
 
 from euhedral_artifacts.edrl import (FORMAT_Q3, HEADER_FORMAT, LAYOUT_P2E2, LAYOUT_ROW_SPLIT, align_up,
                                      encode_descriptors, fail, read_table)
+from euhedral_artifacts.recipes import stays_row_split
 
 SLICE = 1024
 PAYLOAD_PAD_WORDS = 80
@@ -175,7 +176,7 @@ def transcode(input_path: Path, output_path: Path, force: bool = False, expand: 
             if expand and obj["layout"] == LAYOUT_P2E2:
                 out["layout"] = LAYOUT_ROW_SPLIT
                 out["bytes"] = None
-            elif not expand and eligible(obj["shape"], obj["format"], obj["layout"]):
+            elif not expand and eligible(obj["shape"], obj["format"], obj["layout"]) and not stays_row_split(obj["name"]):
                 out["layout"] = LAYOUT_P2E2
                 out["bytes"] = None
             planned.append(out)
