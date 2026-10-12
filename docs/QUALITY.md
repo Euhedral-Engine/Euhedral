@@ -110,6 +110,18 @@ Swift-1.5 BF16 (25 chunks; token-level standard errors):
 | `q3` | +0.112 ± 0.004 | 0.193 | 1.45 | 79.2% |
 | `q3-compressed` | +0.116 ± 0.004 | 0.214 | 1.72 | 78.7% |
 
+llama.cpp's own types, quantized from the same BF16 GGUF with the same importance matrix (`llama-quantize --imatrix`;
+IQ3_XXS needs an importance entry for every tensor, so its MTP layer is pruned) and requantized to BF16 for scoring:
+
+| Weights | File | dNLL | Mean KL | KL p99 | Top-1 |
+|---|---|---|---|---|---|
+| IQ3_XXS (LM head Q5_K, embedding IQ3_S, attention Q and K IQ2_S, attention V and GDN QKV Q4_K) | 11.19 GB | +0.066 ± 0.003 | 0.109 | 1.11 | 86.6% |
+| IQ3_S (LM head Q6_K, attention V and GDN QKV Q4_K) | 12.60 GB | +0.036 ± 0.003 | 0.072 | 0.72 | 90.0% |
+| Q3_K_M (LM head Q6_K, MLP down Q4_K/Q5_K, attention output, attention V and GDN QKV Q4_K) | 13.50 GB | +0.033 ± 0.003 | 0.062 | 0.63 | 90.3% |
+
+`q3` is 12.58 GB. IQ3_S, at the same size, stores the LM head in Q6_K and every other matrix but the Q4_K ones in a
+lattice codebook of 3.44 bits per weight.
+
 `q3` with one family kept at BF16 (in parentheses, the family's share of the main model's 26.9B matrix weights):
 
 | Kept at BF16 | dNLL | Mean KL | KL p99 | Top-1 |
@@ -121,12 +133,13 @@ Swift-1.5 BF16 (25 chunks; token-level standard errors):
 | GDN output (`ssm_out`, 5.6%) | +0.082 ± 0.004 | 0.186 | 1.37 | 79.5% |
 | GDN input projections (`attn_qkv`, `attn_gate`, 15.0%) | +0.114 ± 0.004 | 0.191 | 1.42 | 79.4% |
 | token embedding (4.7%) | +0.115 ± 0.004 | 0.193 | 1.46 | 79.4% |
+| full-attention Q, K and V only (Q4/Q5, 4.4%) | +0.105 ± 0.004 | 0.192 | 1.45 | 79.3% |
 
 The engine adds little on top of its weights: on T2 its mean KL is 0.046 for `nvfp4` and 0.199 for `q3` (holdout table
 above), against 0.042 and 0.193 for the weights alone in llama.cpp.
 
-The LM head carries a third of the KL in 4.7% of the weights; the GDN input projections and the token embedding carry
-almost none. Per-token KL and top-1 order the families consistently; dNLL does not (quantization noise moves the forced token's
+The LM head carries a third of the KL in 4.7% of the weights. The Q4 and Q5 families (GDN input projections and
+full-attention Q, K and V) carry about 0.004 together, and the token embedding almost none. Per-token KL and top-1 order the families consistently; dNLL does not (quantization noise moves the forced token's
 probability either way), so allocation decisions use KL.
 
 ## Compression-induced error
