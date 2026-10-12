@@ -127,6 +127,12 @@ def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, Matr
     return head_part(store, q_name, False), head_part(store, q_name, True)
 
 
+# Bits per family in the q3 artifact (docs/QUALITY.md, allocation probes): the GDN value_z projections and the mixer
+# outputs in Q4, and the MLP down projections in Q4 in the first and last six layers, which carry most of their family's
+# error, and in Q3 elsewhere.
+EDGE_DOWN_LAYERS = frozenset(range(6)) | frozenset(range(58, 64))
+
+
 def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
                 importance: ImportanceMatrix | None = None, codes_from: Path | None = None) -> list[ObjectPlan]:
     """The 785 text and MTP objects. Formats written here are the q3 artifact's; `recipe` maps them to
@@ -148,7 +154,7 @@ def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
             quant(object_prefix + "attention/gate_value", concat_matrix(gate, source_matrix(store, source_prefix + "self_attn.v_proj.weight", (1024, HIDDEN))), "Q5G64_F16S")
             add_direct(plans, object_prefix + "attention/query_norm", (256,), store, source_prefix + "self_attn.q_norm.weight", (256,))
             add_direct(plans, object_prefix + "attention/key_norm", (256,), store, source_prefix + "self_attn.k_norm.weight", (256,))
-            quant(object_prefix + "attention/output", source_matrix(store, source_prefix + "self_attn.o_proj.weight", (HIDDEN, 6144)), "Q3G64_F16S")
+            quant(object_prefix + "attention/output", source_matrix(store, source_prefix + "self_attn.o_proj.weight", (HIDDEN, 6144)), "Q4G64_F16S")
         else:
             qkv = source_matrix(store, source_prefix + "linear_attn.in_proj_qkv.weight", (10240, HIDDEN))
             add_direct(plans, object_prefix + "gdn/a_log", (48,), store, source_prefix + "linear_attn.A_log", (48,), kind="fp32", format_name="FP32")
@@ -157,14 +163,15 @@ def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
             add_direct(plans, object_prefix + "gdn/a_projection", (48, HIDDEN), store, source_prefix + "linear_attn.in_proj_a.weight", (48, HIDDEN))
             add_direct(plans, object_prefix + "gdn/b_projection", (48, HIDDEN), store, source_prefix + "linear_attn.in_proj_b.weight", (48, HIDDEN))
             quant(object_prefix + "gdn/query_key", slice_matrix(qkv, 0, 4096), "Q4G64_F16S")
-            quant(object_prefix + "gdn/value_z", concat_matrix(slice_matrix(qkv, 4096, 10240), source_matrix(store, source_prefix + "linear_attn.in_proj_z.weight", (6144, HIDDEN))), "Q5G64_F16S")
+            quant(object_prefix + "gdn/value_z", concat_matrix(slice_matrix(qkv, 4096, 10240), source_matrix(store, source_prefix + "linear_attn.in_proj_z.weight", (6144, HIDDEN))), "Q4G64_F16S")
             add_direct(plans, object_prefix + "gdn/norm", (128,), store, source_prefix + "linear_attn.norm.weight", (128,))
-            quant(object_prefix + "gdn/output", source_matrix(store, source_prefix + "linear_attn.out_proj.weight", (HIDDEN, 6144)), "Q3G64_F16S")
+            quant(object_prefix + "gdn/output", source_matrix(store, source_prefix + "linear_attn.out_proj.weight", (HIDDEN, 6144)), "Q4G64_F16S")
         add_direct(plans, object_prefix + "post_attention_norm", (HIDDEN,), store, source_prefix + "post_attention_layernorm.weight", (HIDDEN,))
         quant(object_prefix + "mlp/gate_up", concat_matrix(
             source_matrix(store, source_prefix + "mlp.gate_proj.weight", (INTERMEDIATE, HIDDEN)),
             source_matrix(store, source_prefix + "mlp.up_proj.weight", (INTERMEDIATE, HIDDEN))), "Q3G64_F16S")
-        quant(object_prefix + "mlp/down", source_matrix(store, source_prefix + "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE)), "Q3G64_F16S")
+        quant(object_prefix + "mlp/down", source_matrix(store, source_prefix + "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE)),
+              "Q4G64_F16S" if layer in EDGE_DOWN_LAYERS else "Q3G64_F16S")
     add_direct(plans, "text/final_norm", (HIDDEN,), store, "model.language_model.norm.weight", (HIDDEN,))
     # The LM head is NVFP4 in the q3 artifact too: in Q3 it carries a third of the model's weight-only KL (docs/QUALITY.md).
     quant("text/output_head", source_matrix(store, "lm_head.weight", (VOCAB_SIZE, HIDDEN)), "NVFP4")
