@@ -1,7 +1,7 @@
 # Compressed Q3 weights (P2E2)
 
-P2E2 is the lossless layout of the `q3-compressed` artifact: Q3G64_F16S tensors whose codes are limited to -3..3, stored in about
-88% of their row-split bytes (persistent layout `row-split-p2e2-v1`, `WeightLayout.ROW_SPLIT_P2E2_V1`). It keeps them resident on
+P2E2 is the lossless layout of the `q3-compressed` artifact's Q3G64_F16S tensors other than the MLP down projections (which stay
+row-split, see below): tensors whose codes are limited to -3..3, stored in about 88% of their row-split bytes (persistent layout `row-split-p2e2-v1`, `WeightLayout.ROW_SPLIT_P2E2_V1`). It keeps them resident on
 the GPU in less memory, with the same values. Each kernel decodes only the codes it consumes, in registers.
 
 The artifact selects the layout per tensor, so no engine option exists: the engine reads the layout from the tensors
@@ -13,15 +13,15 @@ The artifact selects the layout per tensor, so no engine option exists: the engi
 
 On an RTX 5070 Ti (16 GB):
 
-- **Memory.** The calibrated `q3-compressed` artifact is 11.77 GB. Loaded at a 32K context it takes 12,085,711,468 bytes of
-  device memory against 12,992,556,060 for `q3`: 0.84 GiB less. The expansion scratch takes back at most
+- **Memory.** The calibrated `q3-compressed` artifact is 12.05 GB. Loaded at a 32K context it takes 12,363,893,284 bytes of
+  device memory against 12,992,556,060 for `q3`: 0.59 GiB less. The expansion scratch takes back at most
   128 MiB of weights plus the activation region (see Execution routes).
 - **Fast path.** A warp decodes a slice on the fast path when every lane of its four rows has at most 31 BIG codes among its 32
   and the slice's payload fits the 32 prefetched words. Calibrated codes are about 31% BIG; 0.1% of their slices take the slow
   path.
-- **Decode** (the fused P2E2 kernels): with MTP2 (three-row verification) the calibrated artifact decodes 93.9 tok/s at 4K, 93.6
-  at 32K, 80.6 at 64K and 62.4 at 128K (the README's benchmark: chat corpus, 128 generated tokens, 64 at 128K; measured on
-  2026-10-11), and a verification step takes 24.5 ms at 4K. Measured on round-to-nearest codes, before the calibrated artifact: one
+- **Decode** (the fused P2E2 kernels): with MTP2 (three-row verification) the calibrated artifact decodes 102.2 tok/s at 4K,
+  104.0 at 32K, 96.1 at 64K and 74.2 at 128K (the README's benchmark: chat corpus, 128 generated tokens, 64 at 128K; measured on
+  2026-10-12), and a verification step takes 22.3 ms at 4K. Measured on round-to-nearest codes, before the calibrated artifact: one
   row decodes at 58.9 tok/s at a 64-token context, 57.6 at 1024 and 56.1 at 4096, 128 generated tokens, greedy. On cold weights at the model's shapes the kernels
   take, for gate_up (34816 x 5120) and down (5120 x 17408): one row 91 and 52 us, two rows 111 and 67 us, three rows 134 and 74 us,
   four rows 174 and 102 us.
@@ -77,6 +77,21 @@ codes then carry about 2.73 bits each, so no lossless layout stores them in much
 of its codes are large, and its Q3 tensors take about 88% of their row-split bytes. `q3` keeps the full range, so the two
 artifacts no longer hold the same values. `python3 -m euhedral_artifacts.q3_p2e2 expand` (run in `tools/`) writes the row-split
 artifact with the values a P2E2 artifact holds, which `P2e2CudaIntegrationTest` uses as the bitwise reference.
+
+**The MLP down projections stay row-split.** Limiting the codes to -3..3 costs the most where the P2E2 bytes it buys are
+fewest. Weight-only KL over wikitext-2 against Swift-1.5 BF16 (docs/QUALITY.md) with every Q3 family in P2E2 is 0.164; taking
+one family from `q3` instead (row-split, -4 available):
+
+| Family from `q3` | Mean KL | P2E2 saving it gives up |
+|---|---|---|
+| MLP down (kept) | 0.152 | 0.26 GiB |
+| MLP gate and up (rejected: twice the bytes for less) | 0.154 | 0.50 GiB |
+| GDN output (rejected) | 0.163 | 0.07 GiB |
+| attention output (rejected) | 0.164 | 0.02 GiB |
+| token embedding (rejected) | 0.164 | 0.05 GiB |
+
+With the down projections row-split, the MTP drafter's tokens are accepted 2.65 times per verification at 32K (chat corpus;
+2.31 with them in P2E2), and the verification step takes 23.1 ms.
 
 **Rejected: a P2E2 that stores -4.** Wider payload units cost 3.09 bits per code, more than row-split Q3. An escape code (2-bit
 units for -2, 2 and 3, with an escape followed by one bit for -3 or -4) reaches about 2.80 bits per code, about 93% of the
