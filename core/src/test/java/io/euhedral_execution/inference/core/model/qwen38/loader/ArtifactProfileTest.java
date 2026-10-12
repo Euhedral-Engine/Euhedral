@@ -25,7 +25,7 @@ class ArtifactProfileTest {
     private static Artifact artifact(WeightFormat format, WeightLayout layout, boolean speculative) {
         List<TensorDescriptor> tensors = new ArrayList<>();
         tensors.add(tensor("text/token_embedding", WeightFormat.Q3_G64_FP16, WeightLayout.ROW_SPLIT_K128_V1));
-        tensors.add(tensor("text/layers/0/mlp/down", format, layout));
+        tensors.add(tensor("text/layers/0/mlp/gate_up", format, layout));
         if (speculative) {
             tensors.add(tensor("mtp/input_projection", WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1));
             tensors.add(tensor("text/draft_head", WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1));

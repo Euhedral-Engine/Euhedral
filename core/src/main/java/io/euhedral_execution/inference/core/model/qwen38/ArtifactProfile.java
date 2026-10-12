@@ -56,8 +56,9 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         return DraftLength.fixed(this.quantization == Quantization.Q3 ? 2 : 4);
     }
 
-    /// Reads the profile from a text layer's FFN down projection, which every artifact stores in its
-    /// quantization, and from the presence of the MTP layer and draft head.
+    /// Reads the profile from a text layer's FFN gate-up projection, which every artifact stores in its
+    /// quantization and layout (compressed q3 keeps its down projections row-split), and from the presence of the
+    /// MTP layer and draft head.
     public static ArtifactProfile of(Artifact artifact) {
         TensorDescriptor probe = null;
         boolean mtp = false;
@@ -65,7 +66,7 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         boolean dflash2 = false;
         for (TensorDescriptor tensor : artifact.tensors()) {
             String name = tensor.name();
-            if (probe == null && name.startsWith("text/layers/") && name.endsWith("/mlp/down")) probe = tensor;
+            if (probe == null && name.startsWith("text/layers/") && name.endsWith("/mlp/gate_up")) probe = tensor;
             if (name.startsWith("mtp/")) mtp = true;
             if (name.startsWith("text/draft_head")) draftHead = true;
             if (name.startsWith(DFlash2Inventory.PREFIX)) dflash2 = true;

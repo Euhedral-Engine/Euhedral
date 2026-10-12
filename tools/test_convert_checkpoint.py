@@ -234,8 +234,8 @@ class InventoryTest(unittest.TestCase):
             self.assertGreater(len(edrl.encode_table(plans)), 0)
 
 
-def tiny_q3_artifact(path: Path) -> None:
-    """A valid artifact with one Q3 tensor (4 x 1024), one Q4 tensor and one BF16 vector."""
+def tiny_q3_artifact(path: Path, q3_names: tuple[str, ...] = ("a",)) -> None:
+    """A valid artifact with Q3 tensors (4 x 1024) named `q3_names`, one Q4 tensor and one BF16 vector."""
     rng = np.random.default_rng(3)
     codes = rng.choice(np.arange(-3, 4, dtype=np.int8), size=(4, 1024), p=[0.02, 0.08, 0.23, 0.34, 0.23, 0.08, 0.02])
     q3 = bytearray(q3_p2e2.row_split_q3_size(4, 1024))
@@ -246,7 +246,9 @@ def tiny_q3_artifact(path: Path) -> None:
     q4 = bytes(range(256)) * 8
     vector = np.arange(8, dtype="<u2").tobytes()
     plans = [
-        edrl.ObjectPlan("a", (4, 1024), "BF16", "Q3G64_F16S", "row-split-k128-v1", len(q3), lambda *_: None),
+        edrl.ObjectPlan(name, (4, 1024), "BF16", "Q3G64_F16S", "row-split-k128-v1", len(q3), lambda *_: None)
+        for name in q3_names
+    ] + [
         edrl.ObjectPlan("b", (8, 128), "BF16", "Q4G64_F16S", "row-split-k128-v1", len(q4), lambda *_: None),
         edrl.ObjectPlan("c", (8,), "BF16", "BF16", "contiguous-le-v1", len(vector), lambda *_: None),
     ]
@@ -261,7 +263,7 @@ def tiny_q3_artifact(path: Path) -> None:
     blob[:edrl.HEADER_SIZE] = header
     blob[edrl.HEADER_SIZE:edrl.HEADER_SIZE + len(metadata)] = metadata
     blob[edrl.HEADER_SIZE + len(metadata):data_base] = table
-    for plan, payload in zip(plans, (bytes(q3), q4, vector)):
+    for plan, payload in zip(plans, (bytes(q3),) * len(q3_names) + (q4, vector)):
         blob[plan.offset:plan.offset + len(payload)] = payload
     path.write_bytes(bytes(blob))
 
@@ -300,12 +302,33 @@ class PipelineTest(unittest.TestCase):
             for recipe in (recipes.Recipe("q3", True), recipes.Recipe("q3", False)):
                 plans = []
                 for fmt in ("Q3G64_F16S", "Q4G64_F16S"):
-                    inventory.add_quant(plans, recipe, "text/layers/0/mlp/down", matrix, fmt, Importance())
+                    inventory.add_quant(plans, recipe, "text/layers/0/mlp/gate_up", matrix, fmt, Importance())
                 for plan in plans:
                     plan.writer(None, 0)
                 expected = q3_p2e2.P2E2_LOWEST_CODE if recipe.compressed else None
                 self.assertEqual(seen["Q3G64_F16S"].lowest_code, expected)
                 self.assertIsNone(seen["Q4G64_F16S"].lowest_code)
+                # The MLP down projections stay row-split in compressed q3, with the full code range.
+                plans = []
+                inventory.add_quant(plans, recipe, "text/layers/0/mlp/down", matrix, "Q3G64_F16S", Importance())
+                plans[0].writer(None, 0)
+                self.assertIsNone(seen["Q3G64_F16S"].lowest_code)
+
+    def test_the_transcode_keeps_the_mlp_down_projections_row_split(self):
+        names = ("text/layers/0/mlp/gate_up", "text/layers/0/mlp/down")
+        with tempfile.TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "q3.edrl", Path(tmp) / "q3c.edrl"
+            tiny_q3_artifact(source, names)
+            q3_p2e2.transcode(source, target)
+            layouts = {}
+            for path in (source, target):
+                with path.open("rb") as handle:
+                    for obj in edrl.read_table(handle)[2]:
+                        handle.seek(obj["offset"])
+                        layouts.setdefault(obj["name"], []).append((obj["layout"], handle.read(obj["bytes"])))
+        self.assertEqual(layouts[names[0]][1][0], edrl.LAYOUT_P2E2)
+        self.assertEqual(layouts[names[1]][1][0], edrl.LAYOUT_ROW_SPLIT)
+        self.assertEqual(layouts[names[1]][1][1], layouts[names[1]][0][1])
 
     def test_objects_with_codes_are_written_from_them(self):
         rng = np.random.default_rng(1)
