@@ -161,7 +161,7 @@ class RecipeTest(unittest.TestCase):
             ("text/layers/0/mlp/down", "Q3G64_F16S"): [("Q3G64_F16S", rs)] * 2 + [("NVFP4", rs), ("NVFP4", sd4)],
             ("text/layers/3/attention/query_key", "Q4G64_F16S"): [("Q4G64_F16S", rs)] * 2 + [("NVFP4", rs), ("NVFP4", sd4)],
             ("text/layers/3/attention/gate_value", "Q5G64_F16S"): [("Q5G64_F16S", rs)] * 2 + [("NVFP4", rs), ("NVFP4", sd4)],
-            ("text/output_head", "Q3G64_F16S"): [("Q3G64_F16S", rs)] * 2 + [("NVFP4", rs), ("NVFP4", sd4)],
+            ("text/output_head", "NVFP4"): [("NVFP4", rs)] * 3 + [("NVFP4", sd4)],
             ("text/draft_head", "Q3G64_F16S"): [("Q3G64_F16S", rs)] * 2 + [("NVFP4", rs)] * 2,
             ("mtp/layer/mlp/down", "NVFP4"): [("NVFP4", rs)] * 4,
             ("mtp/input_projection", "NVFP4"): [("NVFP4", rs)] * 4,
@@ -188,17 +188,17 @@ class InventoryTest(unittest.TestCase):
     def test_q3_artifact(self):
         plans = {plan.name: plan for plan in plans_of(recipes.Recipe("q3"))}
         self.assertEqual(self.formats(recipes.Recipe("q3")), {
-            ("Q3G64_F16S", "row-split-k128-v1"): 1 + 64 * 3 + 2,  # embedding, layers, output and draft heads
+            ("Q3G64_F16S", "row-split-k128-v1"): 1 + 64 * 3 + 1,  # embedding, layers, draft head
             ("Q4G64_F16S", "row-split-k128-v1"): 64,
             ("Q5G64_F16S", "row-split-k128-v1"): 64,
-            ("NVFP4", "row-split-k128-v1"): 5,  # the MTP layer
+            ("NVFP4", "row-split-k128-v1"): 1 + 5,  # the LM head and the MTP layer
             ("BF16", "contiguous-le-v1"): 360,
             ("FP32", "contiguous-le-v1"): 96,
             ("I32", "contiguous-le-v1"): 1,
         })
         self.assertEqual(plans["text/token_embedding"].format_name, "Q3G64_F16S")
         self.assertEqual(plans["text/draft_head"].format_name, "Q3G64_F16S")
-        self.assertEqual(plans["text/output_head"].format_name, "Q3G64_F16S")
+        self.assertEqual(plans["text/output_head"].format_name, "NVFP4")
         mtp = [plan for plan in plans.values() if plan.name.startswith("mtp/") and len(plan.shape) == 2]
         self.assertEqual({plan.format_name for plan in mtp}, {"NVFP4"})
         self.assertEqual(len(mtp), 5)
