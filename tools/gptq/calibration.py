@@ -22,6 +22,7 @@ import io
 import json
 import random
 import sys
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -78,8 +79,19 @@ def prompts(out: Path, count: int, t4: Path) -> None:
 
 
 def generate(server: str, prompts_path: Path, out: Path, parallel: int, max_tokens: int) -> None:
+    """Answers every prompt not answered yet. A request the server rejects (HTTP error) is recorded in
+    OUT.failed.jsonl and skipped once it has failed twice: greedy decoding repeats a rejected answer (a tool call
+    whose arguments break the declared schema), while a worker crash fails whatever was in flight once. A refused
+    connection (the server is down) stops the run."""
+    failed_path = out.with_name(out.stem + ".failed.jsonl")
+    failures: dict[str, int] = {}
+    if failed_path.exists():
+        for line in failed_path.open():
+            key = json.loads(line)["id"]
+            failures[key] = failures.get(key, 0) + 1
     done = {json.loads(line)["id"] for line in out.open()} if out.exists() else set()
-    todo = [json.loads(line) for line in prompts_path.open() if json.loads(line)["id"] not in done]
+    todo = [prompt for prompt in (json.loads(line) for line in prompts_path.open())
+            if prompt["id"] not in done and failures.get(prompt["id"], 0) < 2]
 
     def ask(prompt: dict) -> dict:
         body = {"model": "default", "messages": prompt["messages"], "temperature": 0, "max_tokens": max_tokens}
@@ -87,12 +99,21 @@ def generate(server: str, prompts_path: Path, out: Path, parallel: int, max_toke
             body["tools"] = prompt["tools"]
         request = urllib.request.Request(f"{server}/v1/chat/completions", json.dumps(body).encode(),
                                          {"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=3600) as response:
-            message = json.load(response)["choices"][0]["message"]
+        try:
+            with urllib.request.urlopen(request, timeout=3600) as response:
+                message = json.load(response)["choices"][0]["message"]
+        except urllib.error.HTTPError as error:
+            return {"id": prompt["id"], "error": f"HTTP {error.code}: {error.read().decode(errors='replace')[:500]}"}
         return {**prompt, "answer": message}
 
-    with out.open("a", encoding="utf-8") as handle, concurrent.futures.ThreadPoolExecutor(parallel) as pool:
+    with out.open("a", encoding="utf-8") as handle, failed_path.open("a", encoding="utf-8") as failed, \
+            concurrent.futures.ThreadPoolExecutor(parallel) as pool:
         for count, result in enumerate(pool.map(ask, todo), start=1):
+            if "error" in result:
+                failed.write(json.dumps(result, ensure_ascii=False) + "\n")
+                failed.flush()
+                print(f"{count}/{len(todo)} {result['id']} failed: {result['error']}", flush=True)
+                continue
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             handle.flush()
             print(f"{count}/{len(todo)} {result['id']}", flush=True)
