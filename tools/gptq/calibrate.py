@@ -115,6 +115,7 @@ def round_objects(weights: dict[str, torch.Tensor], hessians: dict[str, torch.Te
     column loop launches kernels from one thread and leaves the GPU idle between them); replaces each with its decoded
     weights. The objects are independent, so the result is the sequential one."""
     device.table("e4m3", E4M3_VALUES), device.table("e2m1", E2M1_VALUES)  # shared tables, made before the threads
+    inverse_cholesky(torch.eye(2, device="cuda"), 0.0)  # torch.linalg initializes lazily, and not thread-safely
     torch.cuda.synchronize()
 
     def one(name: str) -> torch.Tensor:
