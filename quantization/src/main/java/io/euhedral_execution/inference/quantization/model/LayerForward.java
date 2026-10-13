@@ -52,20 +52,160 @@ public final class LayerForward implements AutoCloseable {
         Upload.longs(device.gpu, position, new long[] {0});
     }
 
+    public int hidden() {
+        return c.hidden();
+    }
+
     private long alloc(long bytes) {
         return device.gpu.allocate(bytes);
     }
 
-    /// Runs `layer` over `sequences` sequences of `length` tokens whose hidden states are `hidden` (BF16, device).
+    /// Runs `layer` over `sequences` sequences of `length` tokens whose hidden states are `hidden` (BF16, device),
+    /// every step on the calling thread's stream: [#head], then [#sequence] for each sequence, then [#tail].
     public void forward(LayerWeights layer, long hidden, int sequences, int length, Observer observer) {
-        int rows = sequences * length;
+        prepareSlots(sequences);
+        head(layer, hidden, sequences * length, observer);
+        for (int s = 0; s < sequences; s++) sequence(layer, s, length);
+        tail(layer, hidden, sequences * length, observer);
+    }
+
+    /// Makes the GDN states and attention caches of `sequences` slots (before frames use them concurrently).
+    public void prepareSlots(int sequences) {
+        while (gdnStates.size() < sequences) {
+            gdnStates.add(GdnState.allocate(
+                    device.gpu, c.keyHeads(), c.valueHeads(), c.keyDim(), c.valueDim(), c.convKernel()));
+        }
+        while (kvStates.size() < sequences) kvStates.add(new AttentionKvState(device.gpu, attentionKv));
+    }
+
+    /// The rows of all sequences at once: the input norm and the mixer's input projections (with GDN's a/b control).
+    public void head(LayerWeights layer, long hidden, int rows, Observer observer) {
         if (rows > maxRows) throw new IllegalArgumentException(rows + " rows exceed the workspace's " + maxRows);
         int h = c.hidden();
-        float eps = (float) c.eps();
+        device.gpu.rmsNormUnitOffsetBf16(hidden, layer.inputNorm, normalized, rows, h, (float) c.eps());
+        if (layer.attention) {
+            int width = attentionQ + attentionKv;
+            String fused = layer.prefix + "attention/query_key_gate_value";
+            if (layer.objects.containsKey(fused)) {
+                // The MTP block's one object holds the query_key rows, then the gate_value rows.
+                if (observer != null) observer.observe(fused, normalized, rows, h);
+                long weights = layer.objects.get(fused);
+                device.linear(normalized, weights, first, rows, h, width);
+                device.linear(normalized, weights + 2L * width * h, second, rows, h, width);
+            } else {
+                apply(layer, "attention/query_key", normalized, first, rows, h, width, observer);
+                apply(layer, "attention/gate_value", normalized, second, rows, h, width, observer);
+            }
+            return;
+        }
+        // query_key and value_z read the same rows: the observer sees them under both names.
+        apply(layer, "gdn/query_key", normalized, first, rows, h, qkWidth, observer);
+        apply(layer, "gdn/value_z", normalized, second, rows, h, vzWidth, observer);
+        device.gpu.gdnProjectControlFp32(
+                normalized,
+                layer.aProjection,
+                layer.bProjection,
+                layer.aLog,
+                layer.dtBias,
+                alpha,
+                beta,
+                rows,
+                h,
+                c.valueHeads());
+    }
+
+    /// Sequence `s` of `length` tokens: the GDN convolution and recurrence from fresh state, or the Q/K norm, RoPE and
+    /// causal attention over a fresh cache. Sequences are independent, so each can run on its own stream.
+    public void sequence(LayerWeights layer, int s, int length) {
         var gpu = device.gpu;
-        gpu.rmsNormUnitOffsetBf16(hidden, layer.inputNorm, normalized, rows, h, eps);
-        if (layer.attention) attention(layer, rows, sequences, length, observer);
-        else gdn(layer, rows, sequences, length, observer);
+        long offset = (long) s * length;
+        if (!layer.attention) {
+            GdnState state = gdnStates.get(s);
+            gpu.zeroDeviceMemory(state.convolutionStateAddress(), 2L * convolutionWidth * (c.convKernel() - 1));
+            gpu.zeroDeviceMemory(state.recurrentStateAddress(), 4L * c.valueHeads() * c.keyDim() * c.valueDim());
+            gpu.gdnConvolutionBf16(
+                    first + 2 * offset * qkWidth,
+                    second + 2 * offset * vzWidth,
+                    layer.convolution,
+                    state.convolutionStateAddress(),
+                    mixed + 2 * offset * convolutionWidth,
+                    length,
+                    qkWidth,
+                    gdnValueWidth,
+                    convolutionWidth,
+                    c.convKernel());
+            gpu.gdnRecurrenceBf16(
+                    mixed + 2 * offset * convolutionWidth,
+                    alpha + 4 * offset * c.valueHeads(),
+                    beta + 4 * offset * c.valueHeads(),
+                    state.recurrentStateAddress(),
+                    context + 2 * offset * gdnValueWidth,
+                    length,
+                    c.keyHeads(),
+                    c.valueHeads(),
+                    c.keyDim(),
+                    c.valueDim(),
+                    (float) (1.0 / Math.sqrt(c.keyDim())));
+            return;
+        }
+        int width = attentionQ + attentionKv;
+        long qk = first + 2 * offset * width, gv = second + 2 * offset * width, normed = mixed + 2 * offset * width;
+        gpu.attentionQkNormRopeBf16(
+                qk,
+                layer.queryNorm,
+                layer.keyNorm,
+                normed,
+                length,
+                c.heads(),
+                c.kvHeads(),
+                c.headDim(),
+                c.rotaryDim(),
+                0,
+                position,
+                (float) c.eps(),
+                c.theta());
+        AttentionKvState state = kvStates.get(s);
+        state.truncate(0);
+        state.prepareAppend(0, length);
+        gpu.attentionKvAppendNvfp4(
+                normed,
+                gv,
+                state.keyCacheAddress(),
+                state.valueCacheAddress(),
+                length,
+                attentionQ,
+                attentionKv,
+                0,
+                position);
+        state.appendSubmitted(length);
+        gpu.attentionCausalNvfp4(
+                normed,
+                gv,
+                state.keyCacheAddress(),
+                state.valueCacheAddress(),
+                context + 2 * offset * attentionQ,
+                length,
+                c.heads(),
+                c.kvHeads(),
+                c.headDim(),
+                length,
+                0,
+                position,
+                0);
+        state.commitAppended(length);
+    }
+
+    /// The rows of all sequences at once: the mixer's output (GDN's gated norm first), the residual and the MLP.
+    public void tail(LayerWeights layer, long hidden, int rows, Observer observer) {
+        var gpu = device.gpu;
+        int h = c.hidden();
+        float eps = (float) c.eps();
+        if (layer.attention) {
+            apply(layer, "attention/output", context, delta, rows, attentionQ, h, observer);
+        } else {
+            gpu.gdnGatedRmsNormBf16(context, second, layer.gdnNorm, first, rows, c.valueHeads(), c.valueDim(), eps);
+            apply(layer, "gdn/output", first, delta, rows, gdnValueWidth, h, observer);
+        }
         gpu.residualAddBf16(hidden, delta, hidden, rows, h);
         gpu.rmsNormUnitOffsetBf16(hidden, layer.postNorm, normalized, rows, h, eps);
         apply(layer, "mlp/gate_up", normalized, gateUp, rows, h, 2 * c.intermediate(), observer);
@@ -79,146 +219,6 @@ public final class LayerForward implements AutoCloseable {
         String name = layer.prefix + role;
         if (observer != null) observer.observe(name, input, rows, k);
         device.linear(input, layer.objects.get(name), output, rows, k, n);
-    }
-
-    private void gdn(LayerWeights layer, int rows, int sequences, int length, Observer observer) {
-        var gpu = device.gpu;
-        int h = c.hidden();
-        // query_key and value_z read the same rows: the observer sees them under both names.
-        apply(layer, "gdn/query_key", normalized, first, rows, h, qkWidth, observer);
-        apply(layer, "gdn/value_z", normalized, second, rows, h, vzWidth, observer);
-        gpu.gdnProjectControlFp32(
-                normalized,
-                layer.aProjection,
-                layer.bProjection,
-                layer.aLog,
-                layer.dtBias,
-                alpha,
-                beta,
-                rows,
-                h,
-                c.valueHeads());
-        float scale = (float) (1.0 / Math.sqrt(c.keyDim()));
-        for (int s = 0; s < sequences; s++) {
-            long offset = (long) s * length;
-            {
-                GdnState state = gdnState(s);
-                gpu.gdnConvolutionBf16(
-                        first + 2 * offset * qkWidth,
-                        second + 2 * offset * vzWidth,
-                        layer.convolution,
-                        state.convolutionStateAddress(),
-                        mixed + 2 * offset * convolutionWidth,
-                        length,
-                        qkWidth,
-                        gdnValueWidth,
-                        convolutionWidth,
-                        c.convKernel());
-                gpu.gdnRecurrenceBf16(
-                        mixed + 2 * offset * convolutionWidth,
-                        alpha + 4 * offset * c.valueHeads(),
-                        beta + 4 * offset * c.valueHeads(),
-                        state.recurrentStateAddress(),
-                        context + 2 * offset * gdnValueWidth,
-                        length,
-                        c.keyHeads(),
-                        c.valueHeads(),
-                        c.keyDim(),
-                        c.valueDim(),
-                        scale);
-            }
-        }
-        gpu.gdnGatedRmsNormBf16(
-                context, second, layer.gdnNorm, first, rows, c.valueHeads(), c.valueDim(), (float) c.eps());
-        apply(layer, "gdn/output", first, delta, rows, gdnValueWidth, h, observer);
-    }
-
-    private void attention(LayerWeights layer, int rows, int sequences, int length, Observer observer) {
-        var gpu = device.gpu;
-        int h = c.hidden(), width = attentionQ + attentionKv;
-        String fused = layer.prefix + "attention/query_key_gate_value";
-        if (layer.objects.containsKey(fused)) {
-            // The MTP block's one object holds the query_key rows, then the gate_value rows.
-            if (observer != null) observer.observe(fused, normalized, rows, h);
-            long weights = layer.objects.get(fused);
-            device.linear(normalized, weights, first, rows, h, width);
-            device.linear(normalized, weights + 2L * width * h, second, rows, h, width);
-        } else {
-            apply(layer, "attention/query_key", normalized, first, rows, h, width, observer);
-            apply(layer, "attention/gate_value", normalized, second, rows, h, width, observer);
-        }
-        for (int s = 0; s < sequences; s++) {
-            long offset = (long) s * length;
-            long qk = first + 2 * offset * width, gv = second + 2 * offset * width, normed = mixed + 2 * offset * width;
-            gpu.attentionQkNormRopeBf16(
-                    qk,
-                    layer.queryNorm,
-                    layer.keyNorm,
-                    normed,
-                    length,
-                    c.heads(),
-                    c.kvHeads(),
-                    c.headDim(),
-                    c.rotaryDim(),
-                    0,
-                    position,
-                    (float) c.eps(),
-                    c.theta());
-            {
-                AttentionKvState state = kvState(s);
-                state.prepareAppend(0, length);
-                gpu.attentionKvAppendNvfp4(
-                        normed,
-                        gv,
-                        state.keyCacheAddress(),
-                        state.valueCacheAddress(),
-                        length,
-                        attentionQ,
-                        attentionKv,
-                        0,
-                        position);
-                state.appendSubmitted(length);
-                gpu.attentionCausalNvfp4(
-                        normed,
-                        gv,
-                        state.keyCacheAddress(),
-                        state.valueCacheAddress(),
-                        context + 2 * offset * attentionQ,
-                        length,
-                        c.heads(),
-                        c.kvHeads(),
-                        c.headDim(),
-                        length,
-                        0,
-                        position,
-                        0);
-                state.commitAppended(length);
-            }
-        }
-        apply(layer, "attention/output", context, delta, rows, attentionQ, h, observer);
-    }
-
-    /// Sequence slot `s`'s GDN state, zeroed in stream order (one state per slot for the forward's lifetime: freeing
-    /// device memory synchronizes the device).
-    private GdnState gdnState(int s) {
-        while (gdnStates.size() <= s) {
-            gdnStates.add(GdnState.allocate(
-                    device.gpu, c.keyHeads(), c.valueHeads(), c.keyDim(), c.valueDim(), c.convKernel()));
-        }
-        GdnState state = gdnStates.get(s);
-        long convolutionBytes = 2L * convolutionWidth * (c.convKernel() - 1);
-        long recurrentBytes = 4L * c.valueHeads() * c.keyDim() * c.valueDim();
-        device.gpu.zeroDeviceMemory(state.convolutionStateAddress(), convolutionBytes);
-        device.gpu.zeroDeviceMemory(state.recurrentStateAddress(), recurrentBytes);
-        return state;
-    }
-
-    /// Sequence slot `s`'s attention cache, emptied (its pages are kept for the next sequence).
-    private AttentionKvState kvState(int s) {
-        while (kvStates.size() <= s) kvStates.add(new AttentionKvState(device.gpu, attentionKv));
-        AttentionKvState state = kvStates.get(s);
-        state.truncate(0);
-        return state;
     }
 
     @Override
