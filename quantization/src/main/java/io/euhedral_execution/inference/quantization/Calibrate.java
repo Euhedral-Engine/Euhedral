@@ -61,6 +61,7 @@ public final class Calibrate {
 
     private static final int HEAD_ROWS = 16384;
     private static final int CHECKPOINT_EVERY = 8;
+    private static final long CHECKPOINT_SLICE = 1L << 30;
     /// Objects of a layer rounded at once, each on its own stream (largest first): three fit a 16 GB card beside the
     /// layer and its Hessians.
     private static final int ROUNDING_FRAMES = 3;
@@ -631,8 +632,12 @@ public final class Calibrate {
         Path partial = settings.out().resolve("hidden.bin.partial");
         try (FileChannel channel = FileChannel.open(
                 partial, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-            ByteBuffer buffer = states.asByteBuffer();
-            while (buffer.hasRemaining()) channel.write(buffer);
+            // A ByteBuffer covers at most 2 GiB: write the states a slice at a time.
+            for (long at = 0; at < states.byteSize(); at += CHECKPOINT_SLICE) {
+                ByteBuffer buffer = states.asSlice(at, Math.min(CHECKPOINT_SLICE, states.byteSize() - at))
+                        .asByteBuffer();
+                while (buffer.hasRemaining()) channel.write(buffer);
+            }
         }
         Files.move(partial, checkpointFile(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         Files.writeString(settings.out().resolve("hidden.key"), checkpointKey(sequences, length) + "|" + layersDone);
@@ -647,12 +652,15 @@ public final class Calibrate {
         if (!saved.startsWith(prefix)) return 0;
         int layersDone = Integer.parseInt(saved.substring(prefix.length()).trim());
         try (FileChannel channel = FileChannel.open(checkpointFile(), StandardOpenOption.READ)) {
-            ByteBuffer buffer = states.asByteBuffer();
             long position = 0;
-            while (buffer.hasRemaining()) {
-                int read = channel.read(buffer, position);
-                if (read < 0) return 0;
-                position += read;
+            for (long at = 0; at < states.byteSize(); at += CHECKPOINT_SLICE) {
+                ByteBuffer buffer = states.asSlice(at, Math.min(CHECKPOINT_SLICE, states.byteSize() - at))
+                        .asByteBuffer();
+                while (buffer.hasRemaining()) {
+                    int read = channel.read(buffer, position);
+                    if (read < 0) return 0;
+                    position += read;
+                }
             }
         }
         log("resumed after layer " + (layersDone - 1));
