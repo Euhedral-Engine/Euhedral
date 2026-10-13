@@ -53,6 +53,7 @@ public final class Device implements AutoCloseable {
     public void bindThread() {
         cuda.bindThread();
         try {
+            clear.invokeExact(); // a thread selects one stream at a time
             int status = (int) select.invokeExact(stream);
             if (status != 0) throw new IllegalStateException("euhedral_cuda_stream_select failed: " + status);
         } catch (Throwable failure) {
@@ -74,6 +75,7 @@ public final class Device implements AutoCloseable {
         });
         cuda.bindThread();
         try {
+            clear.invokeExact(); // a thread selects one stream at a time
             int status = (int) select.invokeExact(own);
             if (status != 0) throw new IllegalStateException("euhedral_cuda_stream_select failed: " + status);
         } catch (Throwable failure) {

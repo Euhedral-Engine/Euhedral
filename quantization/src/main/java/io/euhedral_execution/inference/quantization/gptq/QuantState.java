@@ -43,10 +43,29 @@ public record QuantState(
             zip.setMethod(ZipOutputStream.STORED);
             entry(zip, "format_name", text(formatName));
             entry(zip, "layout", text(layout));
-            entry(zip, "shape", array("<i8", new long[] {2}, MemorySegment.ofArray(new long[] {rows, columns})));
+            entry(
+                    zip,
+                    "shape",
+                    array(
+                            "<i8",
+                            new long[] {2},
+                            MemorySegment.ofArray(ByteBuffer.allocate(16)
+                                    .order(ByteOrder.LITTLE_ENDIAN)
+                                    .putLong(rows)
+                                    .putLong(columns)
+                                    .array())));
             entry(zip, "codes", array(nvfp4 ? "|u1" : "|i1", new long[] {rows, columns}, codes));
             entry(zip, "scales", array(nvfp4 ? "|u1" : "<f2", new long[] {rows, groups}, scales));
-            entry(zip, "global_scale", array("<f4", new long[] {}, MemorySegment.ofArray(new float[] {globalScale})));
+            entry(
+                    zip,
+                    "global_scale",
+                    array(
+                            "<f4",
+                            new long[] {},
+                            MemorySegment.ofArray(ByteBuffer.allocate(4)
+                                    .order(ByteOrder.LITTLE_ENDIAN)
+                                    .putFloat(globalScale)
+                                    .array())));
             if (table != null)
                 entry(zip, "table", array("|u1", new long[] {table.length}, MemorySegment.ofArray(table)));
         }
