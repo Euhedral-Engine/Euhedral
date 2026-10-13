@@ -108,6 +108,30 @@ The fake-quant model and the engine running the artifact agree closely: with the
 GGUF run by llama.cpp as the reference, the engine's teacher-forced KL over T2 (docs/QUALITY.md) is 0.0076 for that `q3`
 (dNLL +0.005, top-1 agreement 96.5%) and 0.0081 for `nvfp4-compressed` (dNLL +0.001, 96.7%).
 
+## GPTQ
+
+`gptq/` rounds an artifact's decoder layers and heads by GPTQ and writes the codes for `--codes-from`
+(docs/QUALITY.md#gptq). It needs PyTorch with CUDA, `tokenizers` and `jinja2`, and the checkpoint's BF16 weights:
+
+```bash
+cd tools
+# the calibration set: prompts disjoint from T4, the served model's answers, prose and code
+python -m gptq.calibration prompts $C/prompts.jsonl $HOLDOUT/t4_prompts.jsonl
+python -m gptq.calibration generate http://localhost:8080 $C/prompts.jsonl $C/generations.jsonl --parallel 2
+python -m gptq.calibration tokens $CHECKPOINT $C            # writes $C/tokens.npy
+# the codes, one layer at a time on the GPU; then the artifact
+python -m gptq.calibrate --model $CHECKPOINT --quantization nvfp4 --compressed --tokens $C/tokens.npy \
+    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES
+python3 convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --compressed \
+    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --imatrix imatrix-swift15-v1mix.gguf --codes-from $CODES \
+    --out $OUT/qwen3_8_27b_nvfp4_compressed.edrl
+```
+
+`calibrate` holds the hidden states of all sequences in pinned host memory (5.4 GiB for 218 sequences of 2048 tokens)
+and fits a 16 GB card with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; `--sequences N` and `--layers N` make a
+short run. `test_gptq.py` checks that with a diagonal Hessian it reproduces the converter's calibrated rounding byte for
+byte, in every format and layout.
+
 ## DFlash2
 
 `--dflash2 DIR` adds the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`: `config.json`, `model.safetensors`) to a conversion, and

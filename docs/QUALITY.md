@@ -82,8 +82,8 @@ Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE
 
 | Artifact | T1 (1 chunk) | T2 wikitext (25) | T3 code (24) | T4 own generations (25) |
 |---|---|---|---|---|
-| nvfp4-compressed | +0.028 ± 0.009 / 0.037 / 89.4% | +0.018 ± 0.007 / 0.047 / 91.2% | +0.046 ± 0.006 / 0.073 / 96.3% | +0.100 ± 0.036 / 0.228 / 91.5% |
-| nvfp4 | +0.030 ± 0.009 / 0.038 / 88.4% | +0.012 ± 0.007 / 0.046 / 91.4% | +0.044 ± 0.005 / 0.074 / 96.3% | +0.001 ± 0.029 / 0.220 / 91.6% |
+| nvfp4-compressed | +0.033 ± 0.007 / 0.028 / 90.3% | +0.002 ± 0.005 / 0.032 / 93.2% | +0.038 ± 0.005 / 0.059 / 96.8% | +0.093 ± 0.021 / 0.149 / 93.9% |
+| nvfp4 | +0.024 ± 0.008 / 0.028 / 90.9% | +0.012 ± 0.005 / 0.032 / 93.1% | +0.035 ± 0.005 / 0.059 / 96.9% | +0.079 ± 0.027 / 0.148 / 93.4% |
 | q3 | +0.110 ± 0.017 / 0.115 / 83.0% | +0.054 ± 0.008 / 0.119 / 86.2% | +0.161 ± 0.019 / 0.228 / 92.3% | -0.088 ± 0.049 / 0.420 / 87.1% |
 | q3-compressed | +0.141 ± 0.019 / 0.153 / 80.1% | +0.067 ± 0.013 / 0.145 / 84.7% | +0.205 ± 0.025 / 0.271 / 91.1% | -0.012 ± 0.067 / 0.514 / 85.3% |
 
@@ -94,6 +94,32 @@ open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
 kernel of the development machine (Linux 7.0) three times. The converter, `compare_reference.py` and
 `dequantize_gguf.py` use positioned reads; llama.cpp, which maps its models, reads them from a local ext4 disk (the BF16
 GGUFs and `weight_only.sh`'s work directory).
+
+## GPTQ
+
+The NVFP4 artifacts' decoder layers, LM head and draft head are rounded by GPTQ (`tools/gptq/`, Frantar et al., 2022):
+each linear's columns are rounded in order, and each column's rounding error is carried into the columns not yet
+rounded through the Cholesky factor of the inverse Hessian H = XᵀX of the linear's inputs, so the rounding minimizes
+the output error on the calibration activations rather than the weight error. Scales are chosen as the converter
+chooses them (block scales by weighted search, the SD4 table by its error DP), weighted by diag(H), on the
+error-updated weights; the codes go into the converter with `--codes-from`, and the token embedding and the MTP layer
+are rounded by the converter (`--imatrix`).
+
+**Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
+Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
+Hermes function-calling prompts that T4 does not use, generated greedily by the engine serving `nvfp4-compressed`;
+64 of wikitext-2 train; 64 of CPython, Go, serde_json and cJSON source files other than T3's.
+
+**Calibration** (`tools/gptq/calibrate.py`) runs the sequences through a PyTorch port of the model (`tools/gptq/qwen38.py`;
+its BF16 forward pass on T1 is within KL 0.0005 of llama.cpp's BF16 reference) one layer at a time: the Hessians
+accumulate on the GPU while the sequences pass through the layer, the layer's objects are rounded, and the sequences
+pass through the rounded layer to give the next layer its inputs. The hidden states stay in pinned host memory. It takes
+49 minutes for `nvfp4` and 53 for `nvfp4-compressed` on the 16 GB card (52 s per layer), with damping 0.01.
+
+**Engine checks** of the GPTQ artifacts, `nvfp4-compressed` (`nvfp4`): 2.94 (2.99) tokens per verification at 4K and
+3.01 (3.17) at 32K over the benchmark's chat prompts, 118 (102) tok/s at 4K and 103 (105) at 32K. Acceptance varies by
+up to 0.75 tokens per verification between the four prompts of each length. Rounding the draft head by the converter
+instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ.
 
 ## Weight-only error
 
@@ -186,6 +212,11 @@ tokens, and reports per-step hidden-state error, KL and top-1 agreement against 
     -Peuhedral.qwen.artifact=/models/qwen3_8_27b_q3.edrl \
     -Peuhedral.numerics.drift.steps=512 -Peuhedral.numerics.drift.prefix=512
 ```
+
+It fails when the mean KL reaches 1e-2 at a starting position, when more than 2% of the positions flip the top-1 token
+where the exact arm's top-1 logit led the production arm's choice by more than 0.25 (flips within that lead, two BF16
+steps, are near-ties: 3 to 17 per 256 positions on the NVFP4 artifacts, depending on the weights), or when the median
+over the starting positions of the peak 32-step hidden-state error reaches 12% or of its late/early ratio exceeds 1.5.
 
 ## Exact speculative verifier
 
