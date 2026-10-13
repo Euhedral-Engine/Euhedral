@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
+import os
 import time
 from pathlib import Path
 
@@ -35,12 +37,49 @@ from gptq.qwen38 import HIDDEN, LAYERS, Checkpoint, Layer, Mtp, linear, rms_norm
 
 HEAD_ROWS = 16384
 ROUNDING_THREADS = 3
+CHECKPOINT_EVERY = 8
 
 
-class _Uniform:
-    """An importance stub: plans carry the recipe's calibration (lowest code) without an importance matrix."""
+def checkpoint_key(args, sequences: int) -> dict:
+    """What a hidden-state checkpoint depends on: a resumed run must match it."""
+    return {"tokens": str(Path(args.tokens).resolve()), "sequences": sequences, "quantization": args.quantization,
+            "compressed": args.compressed, "act_order": args.act_order, "damp": args.damp, "batch": args.batch}
 
-    def calibration(self, name: str, k: int) -> Calibration:
+
+def save_hidden(out: Path, hidden: torch.Tensor, layers_done: int, key: dict) -> None:
+    """The hidden states after `layers_done` layers (pinned host memory) as hidden-N.bin; hidden.json names the
+    newest complete one, and older ones are deleted after it does."""
+    name = f"hidden-{layers_done}.bin"
+    with open(out / (name + ".partial"), "wb") as handle:
+        handle.write(memoryview(hidden.view(torch.int16).numpy()).cast("B"))
+    os.replace(out / (name + ".partial"), out / name)
+    (out / "hidden.json.partial").write_text(json.dumps({**key, "layers_done": layers_done, "file": name}))
+    os.replace(out / "hidden.json.partial", out / "hidden.json")
+    for old in out.glob("hidden-*.bin"):
+        if old.name != name:
+            old.unlink()
+
+
+def drop_hidden(out: Path) -> None:
+    for path in [*out.glob("hidden-*.bin*"), out / "hidden.json"]:
+        path.unlink(missing_ok=True)
+
+
+def load_hidden(out: Path, hidden: torch.Tensor, key: dict) -> int:
+    """Layers done by a matching checkpoint, its hidden states read into `hidden`; 0 without one."""
+    meta = out / "hidden.json"
+    if not meta.is_file():
+        return 0
+    saved = json.loads(meta.read_text())
+    layers_done, name = saved.pop("layers_done"), saved.pop("file")
+    if saved != key or not (out / name).is_file():
+        return 0
+    with open(out / name, "rb") as handle:
+        handle.readinto(memoryview(hidden.view(torch.int16).numpy()).cast("B"))
+    return layers_done
+
+
+def calibration(self, name: str, k: int) -> Calibration:
         return Calibration()
 
 
@@ -210,15 +249,20 @@ def main(argv: list[str] | None = None) -> int:
         tokens = tokens[:args.sequences]
     sequences, length = tokens.shape
     with torch.inference_mode():
-        embedding = checkpoint.tensor("model.language_model.embed_tokens.weight")
         hidden = torch.empty(sequences, length, HIDDEN, dtype=torch.bfloat16, pin_memory=True)
         ids = torch.from_numpy(tokens.astype(np.int64))
-        for begin in range(0, sequences, args.batch):
-            hidden[begin:begin + args.batch] = embedding[ids[begin:begin + args.batch].cuda()].cpu()
-        del embedding
-        torch.cuda.empty_cache()
-        log(start, f"{sequences} sequences of {length} tokens embedded")
-        for index in range(args.layers):
+        key = checkpoint_key(args, sequences)
+        first = load_hidden(args.out, hidden, key)
+        if first:
+            log(start, f"resumed after layer {first - 1} from a checkpoint in {args.out}")
+        else:
+            embedding = checkpoint.tensor("model.language_model.embed_tokens.weight")
+            for begin in range(0, sequences, args.batch):
+                hidden[begin:begin + args.batch] = embedding[ids[begin:begin + args.batch].cuda()].cpu()
+            del embedding
+            torch.cuda.empty_cache()
+            log(start, f"{sequences} sequences of {length} tokens embedded")
+        for index in range(first, args.layers):
             layer = Layer(checkpoint, index)
             observe = Observer()
 
@@ -231,6 +275,9 @@ def main(argv: list[str] | None = None) -> int:
             torch.cuda.empty_cache()
             log(start, f"layer {index} done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
             torch.cuda.reset_peak_memory_stats()
+            if (index + 1) % CHECKPOINT_EVERY == 0 and index + 1 < args.layers:
+                save_hidden(args.out, hidden, index + 1, key)  # a crash resumes here (the codes are saved per object)
+        drop_hidden(args.out)
         final_norm = checkpoint.tensor("model.language_model.norm.weight")
         head_hessian = torch.zeros(HIDDEN, HIDDEN, device="cuda")
         draft_hessian = head_hessian
