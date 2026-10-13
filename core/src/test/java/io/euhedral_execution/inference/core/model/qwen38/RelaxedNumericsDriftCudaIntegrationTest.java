@@ -106,10 +106,11 @@ class RelaxedNumericsDriftCudaIntegrationTest {
                     "prefix %d: peak window hidden error %.4f, late/early %.3f, mean KL %.2e, top-1 %d/%d%n",
                     prefixLength, peak, late / (early + 1.0e-4), meanKl, agreements, metrics.size());
         }
-        // Single-ulp BF16 differences settle at a 5-9% hidden error in the 64-layer recurrent model; where one window
-        // peaks depends on the tokens and the weights. For the q3 artifacts measured on 2026-10-12 the peak window ran from
-        // 8% to 16% and the late/early ratio up to 1.7 with the starting position, so the hidden-state bounds apply to the median
-        // over the starting positions: a relaxed kernel that is wrong raises every position.
+        // Single-ulp BF16 differences settle at a 5-9% hidden error in the 64-layer recurrent model; where one
+        // window peaks depends on the tokens and the weights. For the q3 artifacts measured on 2026-10-12 the peak
+        // window ran from 8% to 16% and the late/early ratio up to 1.7 with the starting position, so the
+        // hidden-state bounds apply to the median over the starting positions: a relaxed kernel that is wrong raises
+        // every position.
         double peak = median(peaks);
         double growth = median(growths);
         assertTrue(peak < 0.12, "median peak window hidden error " + peak + " over " + peaks);
