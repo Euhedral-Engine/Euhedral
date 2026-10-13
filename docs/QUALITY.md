@@ -221,6 +221,41 @@ where the exact arm's top-1 logit led the production arm's choice by more than 0
 steps, are near-ties: 3 to 17 per 256 positions on the NVFP4 artifacts, depending on the weights), or when the median
 over the starting positions of the peak 32-step hidden-state error reaches 12% or of its late/early ratio exceeds 1.5.
 
+## KV cache
+
+The cache stores each key and value row after the H256 rotation as 4-bit codes with an E4M3 scale per 16 elements,
+144 bytes per 256-element row (`native/src/attention/nvfp4_kv.cuh`). Measurement builds swap the code grid inside the
+same rows: `EUHEDRAL_CUDA_KV_CODEC=1`, `2` or `3` in the environment of the process that compiles the kernels stores
+midrise integer grids, magnitudes m + 0.5 for m below 8, 4 and 2 (INT4, INT3 and INT2), with the scale chosen from the
+group's largest value as for E2M1; every kernel, the exact twins included, decodes the chosen grid. A fresh Gradle
+daemon carries the variable into the test JVM:
+
+```bash
+./gradlew --stop
+EUHEDRAL_CUDA_KV_CODEC=2 tools/holdout/score.sh int3-t2 qwen3_8_27b_nvfp4_compressed.edrl swift_t2.kld results.txt
+```
+
+T2 is also scored at a 32K context: four 32768-token chunks of the wikitext test text, the second half of each scored
+(65,532 positions 16K to 32K deep), against Swift-1.5 BF16 in llama.cpp with an F16 cache (`llama-perplexity -c 32768
+-b 4096 -ub 4096 --chunks 4 -ngl 0`, 14 minutes; the logits file is 32.5 GB). Mean KL / top-1 agreement:
+
+| Artifact, cache | T1 | T2 | T2 at 32K |
+|---|---|---|---|
+| `nvfp4-compressed`, E2M1 | 0.0279 / 90.3% | 0.0315 / 93.2% | 0.0288 / 93.4% |
+| `nvfp4-compressed`, INT4 midrise | 0.0254 / 90.7% | 0.0300 / 93.3% | 0.0269 / 93.6% |
+| `nvfp4-compressed`, INT3 midrise | 0.0369 / 89.7% | 0.0366 / 92.5% | 0.0357 / 92.6% |
+| `nvfp4-compressed`, INT2 midrise | 0.1253 / 82.7% | 0.0839 / 88.3% | 0.0765 / 88.7% |
+| `q3`, E2M1 | 0.0897 / 85.2% | 0.0798 / 89.2% | 0.0808 / 89.2% |
+| `q3`, INT4 midrise | 0.0891 / 84.9% | 0.0793 / 89.3% | 0.0804 / 89.2% |
+| `q3`, INT3 midrise | 0.1021 / 84.4% | 0.0845 / 88.9% | 0.0875 / 88.6% |
+| `q3`, INT2 midrise | 0.1912 / 79.6% | 0.1284 / 88.6% | 0.1188 / 86.1% |
+
+The `nvfp4-compressed` weights alone (dequantized into a BF16 GGUF, F16 cache in llama.cpp) score 0.0273 / 93.7% on T2
+and 0.0240 / 94.0% on T2 at 32K, so the cache, the FP4 prefill and the relaxed kernels together add 0.004 to 0.005 KL at
+both depths. KL at 32K is no higher than at 2,560 tokens with any grid: neither the cache nor the GDN state accumulates
+error with depth on this text. INT2 is rejected (2.5 to 4.5 times the KL). INT3 stays within 0.01 KL and 1 top-1 point
+of E2M1 at 32K on both artifacts; a 3-bit cache would still need long-context retrieval and a reasoning task.
+
 ## Exact speculative verifier
 
 Speculative decoding verifies drafts with the base model in row-exact mode: every row of a verification is bit for bit what a
