@@ -99,7 +99,14 @@ public final class Safetensors implements AutoCloseable {
             throw new IllegalArgumentException(
                     name + ": range " + skip + "+" + destination.byteSize() + " outside " + tensor.bytes() + " bytes");
         }
-        readFully(channels.get(tensor.shard()), destination.asByteBuffer(), tensor.offset() + skip);
+        long slice = 1L << 30; // a ByteBuffer covers at most 2 GiB
+        for (long at = 0; at < destination.byteSize(); at += slice) {
+            long bytes = Math.min(slice, destination.byteSize() - at);
+            readFully(
+                    channels.get(tensor.shard()),
+                    destination.asSlice(at, bytes).asByteBuffer(),
+                    tensor.offset() + skip + at);
+        }
     }
 
     /// Reads all of tensor `name` into `destination`, which must be exactly its size.
