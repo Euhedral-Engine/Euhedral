@@ -30,13 +30,13 @@ BLOCK = 128
 
 def inverse_cholesky(hessian: torch.Tensor, damp: float) -> torch.Tensor:
     """Upper Cholesky factor of (H + damp * mean(diag H) I)^-1, FP32. Columns no input reached get a unit diagonal."""
-    h = hessian.clone().double()
-    dead = torch.diag(h) == 0
-    h[dead, dead] = 1.0
-    h += damp * torch.mean(torch.diag(h)) * torch.eye(h.shape[0], dtype=h.dtype, device=h.device)
-    lower = torch.linalg.cholesky(h)
-    inverse = torch.cholesky_inverse(lower)
-    return torch.linalg.cholesky(inverse, upper=True).float()
+    h = hessian.float().clone()
+    diagonal = h.diagonal()
+    diagonal[diagonal == 0] = 1.0
+    diagonal += damp * torch.mean(diagonal)
+    torch.linalg.cholesky(h, out=h)
+    h = torch.cholesky_inverse(h)
+    return torch.linalg.cholesky(h, upper=True, out=h)
 
 
 class _Grouped:

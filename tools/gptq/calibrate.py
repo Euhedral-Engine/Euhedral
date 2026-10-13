@@ -64,7 +64,12 @@ def round_object(name, weight, hessian, plan, out, damp, start, rows=None):
         first.codes = np.concatenate([s.codes for s in states])
         first.scales = np.concatenate([s.scales for s in states])
     first.save(state_file(out, name))
-    error = float(((weight.float() - decoded.float()) ** 2).sum() / (weight.float() ** 2).sum()) ** 0.5
+    difference = total = 0.0
+    for begin in range(0, weight.shape[0], rows):
+        w = weight[begin:begin + rows].float()
+        difference += float(((w - decoded[begin:begin + rows].float()) ** 2).sum())
+        total += float((w ** 2).sum())
+    error = (difference / total) ** 0.5
     log(start, f"{name} {plan.format_name}/{plan.layout} relative error {error:.4f}")
     return decoded
 
@@ -80,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sequences", type=int, default=0, help="use the first N sequences (default: all)")
     parser.add_argument("--batch", type=int, default=8, help="sequences per forward batch")
     parser.add_argument("--damp", type=float, default=0.01)
+    parser.add_argument("--layers", type=int, default=LAYERS, help="calibrate the first N layers only (a smoke run)")
     args = parser.parse_args(argv)
     device.set_device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -102,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         del embedding
         torch.cuda.empty_cache()
         log(start, f"{sequences} sequences of {length} tokens embedded")
-        for index in range(LAYERS):
+        for index in range(args.layers):
             layer = Layer(checkpoint, index)
             hessians: dict[str, torch.Tensor] = {}
 
