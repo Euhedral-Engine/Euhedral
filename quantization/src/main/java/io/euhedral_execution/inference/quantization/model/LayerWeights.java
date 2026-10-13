@@ -12,6 +12,9 @@ import java.util.Map;
 /// One decoder layer's (or the MTP block's) weights on the device in BF16, read from the checkpoint: the quantized
 /// objects fused as the converter fuses them, which calibration replaces with their decoded rounding, and the rest
 /// (norms, GDN convolution, a/b projections, FP32 A_log and dt_bias) as the engine's kernels take them.
+///
+/// Loading has two steps so that a worker can read the next layer while the GPU runs the current one: [#stage]
+/// reads and converts everything into host memory, [#upload] copies it to the device.
 public final class LayerWeights implements AutoCloseable {
 
     public final String prefix;
@@ -24,93 +27,142 @@ public final class LayerWeights implements AutoCloseable {
     private final CudaGpuMemory gpu;
     private final Map<String, Long> owned = new LinkedHashMap<>();
 
+    /// A layer read into host memory, not yet on the device.
+    public static final class Staged implements AutoCloseable {
+        final String prefix;
+        final boolean attention;
+        final Map<String, MemorySegment> parts = new LinkedHashMap<>();
+        final Map<String, long[]> shapes = new LinkedHashMap<>();
+        private final Arena arena = Arena.ofShared();
+
+        Staged(String prefix, boolean attention) {
+            this.prefix = prefix;
+            this.attention = attention;
+        }
+
+        @Override
+        public void close() {
+            arena.close();
+        }
+    }
+
     private LayerWeights(CudaGpuMemory gpu, String prefix, boolean attention) {
         this.gpu = gpu;
         this.prefix = prefix;
         this.attention = attention;
     }
 
-    /// Decoder layer `index`.
+    /// Decoder layer `index` (read and uploaded).
     public static LayerWeights layer(CudaGpuMemory gpu, Qwen38Objects checkpoint, int index) throws IOException {
-        boolean attention = checkpoint.config.fullAttention()[index];
-        String p = "model.language_model.layers." + index + ".";
-        var weights = new LayerWeights(gpu, "text/layers/" + index + "/", attention);
-        for (String name : checkpoint.layerObjects(index)) weights.object(checkpoint, name);
-        weights.common(checkpoint, p, attention ? null : "linear_attn.");
-        return weights;
+        try (Staged staged = stage(checkpoint, index)) {
+            return upload(gpu, staged);
+        }
     }
 
     /// The MTP block (a full-attention layer with one fused q/k/gate/v object).
     public static LayerWeights mtp(CudaGpuMemory gpu, Qwen38Objects checkpoint) throws IOException {
-        var weights = new LayerWeights(gpu, "mtp/layer/", true);
-        for (String name : Qwen38Objects.MTP_OBJECTS) {
-            if (name.startsWith("mtp/layer/")) weights.object(checkpoint, name);
+        try (Staged staged = new Staged("mtp/layer/", true)) {
+            for (String name : Qwen38Objects.MTP_OBJECTS) {
+                if (name.startsWith("mtp/layer/")) object(staged, checkpoint, name);
+            }
+            common(staged, checkpoint, "mtp.layers.0.", null);
+            return upload(gpu, staged);
         }
-        weights.common(checkpoint, "mtp.layers.0.", null);
+    }
+
+    /// Reads decoder layer `index` into host memory.
+    public static Staged stage(Qwen38Objects checkpoint, int index) throws IOException {
+        boolean attention = checkpoint.config.fullAttention()[index];
+        var staged = new Staged("text/layers/" + index + "/", attention);
+        for (String name : checkpoint.layerObjects(index)) object(staged, checkpoint, name);
+        common(staged, checkpoint, "model.language_model.layers." + index + ".", attention ? null : "linear_attn.");
+        return staged;
+    }
+
+    /// Copies a staged layer to the device.
+    public static LayerWeights upload(CudaGpuMemory gpu, Staged staged) {
+        var weights = new LayerWeights(gpu, staged.prefix, staged.attention);
+        for (var part : staged.parts.entrySet()) {
+            long address = gpu.allocate(part.getValue().byteSize());
+            gpu.copyHostToDevice(address, part.getValue(), part.getValue().byteSize());
+            weights.owned.put(part.getKey(), address);
+            switch (part.getKey()) {
+                case "inputNorm" -> weights.inputNorm = address;
+                case "postNorm" -> weights.postNorm = address;
+                case "queryNorm" -> weights.queryNorm = address;
+                case "keyNorm" -> weights.keyNorm = address;
+                case "aProjection" -> weights.aProjection = address;
+                case "bProjection" -> weights.bProjection = address;
+                case "gdnNorm" -> weights.gdnNorm = address;
+                case "aLog" -> weights.aLog = address;
+                case "dtBias" -> weights.dtBias = address;
+                case "convolution" -> weights.convolution = address;
+                default -> {
+                    weights.objects.put(part.getKey(), address);
+                    weights.shapes.put(part.getKey(), staged.shapes.get(part.getKey()));
+                }
+            }
+        }
         return weights;
     }
 
-    private void common(Qwen38Objects checkpoint, String p, String gdn) throws IOException {
-        inputNorm = tensor(checkpoint, p + "input_layernorm.weight");
-        postNorm = tensor(checkpoint, p + "post_attention_layernorm.weight");
-        if (attention) {
-            queryNorm = tensor(checkpoint, p + "self_attn.q_norm.weight");
-            keyNorm = tensor(checkpoint, p + "self_attn.k_norm.weight");
+    private static void common(Staged staged, Qwen38Objects checkpoint, String p, String gdn) throws IOException {
+        tensor(staged, checkpoint, "inputNorm", p + "input_layernorm.weight");
+        tensor(staged, checkpoint, "postNorm", p + "post_attention_layernorm.weight");
+        if (staged.attention) {
+            tensor(staged, checkpoint, "queryNorm", p + "self_attn.q_norm.weight");
+            tensor(staged, checkpoint, "keyNorm", p + "self_attn.k_norm.weight");
             return;
         }
-        aProjection = tensor(checkpoint, p + gdn + "in_proj_a.weight");
-        bProjection = tensor(checkpoint, p + gdn + "in_proj_b.weight");
-        gdnNorm = tensor(checkpoint, p + gdn + "norm.weight");
-        aLog = floats(checkpoint, p + gdn + "A_log");
-        dtBias = floats(checkpoint, p + gdn + "dt_bias");
-        convolution = transposedConvolution(checkpoint, p + gdn + "conv1d.weight");
+        tensor(staged, checkpoint, "aProjection", p + gdn + "in_proj_a.weight");
+        tensor(staged, checkpoint, "bProjection", p + gdn + "in_proj_b.weight");
+        tensor(staged, checkpoint, "gdnNorm", p + gdn + "norm.weight");
+        floats(staged, checkpoint, "aLog", p + gdn + "A_log");
+        floats(staged, checkpoint, "dtBias", p + gdn + "dt_bias");
+        transposedConvolution(staged, checkpoint, "convolution", p + gdn + "conv1d.weight");
     }
 
-    private void object(Qwen38Objects checkpoint, String name) throws IOException {
+    private static void object(Staged staged, Qwen38Objects checkpoint, String name) throws IOException {
         var source = checkpoint.object(name);
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment host = arena.allocate(source.bytes(), 16);
-            checkpoint.read(source, host);
-            long address = upload(name, host);
-            objects.put(name, address);
-            shapes.put(name, new long[] {source.rows(), source.columns()});
-        }
+        MemorySegment host = staged.arena.allocate(source.bytes(), 16);
+        checkpoint.read(source, host);
+        staged.parts.put(name, host);
+        staged.shapes.put(name, new long[] {source.rows(), source.columns()});
     }
 
-    private long tensor(Qwen38Objects checkpoint, String tensor) throws IOException {
-        long bytes = checkpoint.store().tensor(tensor).bytes();
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment host = arena.allocate(bytes, 16);
-            checkpoint.readTensor(tensor, host);
-            return upload(tensor, host);
-        }
+    private static void tensor(Staged staged, Qwen38Objects checkpoint, String role, String tensor) throws IOException {
+        MemorySegment host =
+                staged.arena.allocate(checkpoint.store().tensor(tensor).bytes(), 16);
+        checkpoint.readTensor(tensor, host);
+        staged.parts.put(role, host);
     }
 
     /// A BF16 vector as FP32 (the engine's GDN control takes A_log and dt_bias in FP32).
-    private long floats(Qwen38Objects checkpoint, String tensor) throws IOException {
+    private static void floats(Staged staged, Qwen38Objects checkpoint, String role, String tensor) throws IOException {
         long elements = checkpoint.store().tensor(tensor).elements();
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment bf16 = arena.allocate(2 * elements, 16);
             checkpoint.readTensor(tensor, bf16);
-            MemorySegment fp32 = arena.allocate(4 * elements, 16);
+            MemorySegment fp32 = staged.arena.allocate(4 * elements, 16);
             for (long i = 0; i < elements; i++) {
                 fp32.setAtIndex(
                         ValueLayout.JAVA_FLOAT,
                         i,
                         Float.intBitsToFloat(bf16.getAtIndex(ValueLayout.JAVA_SHORT, i) << 16));
             }
-            return upload(tensor, fp32);
+            staged.parts.put(role, fp32);
         }
     }
 
     /// conv1d.weight [channels, 1, taps] as [taps, channels] (the converter's gdn/convolution layout).
-    private long transposedConvolution(Qwen38Objects checkpoint, String tensor) throws IOException {
+    private static void transposedConvolution(Staged staged, Qwen38Objects checkpoint, String role, String tensor)
+            throws IOException {
         long[] shape = checkpoint.store().tensor(tensor).shape();
         int channels = (int) shape[0], taps = (int) shape[2];
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment source = arena.allocate(2L * channels * taps, 16);
             checkpoint.readTensor(tensor, source);
-            MemorySegment transposed = arena.allocate(2L * channels * taps, 16);
+            MemorySegment transposed = staged.arena.allocate(2L * channels * taps, 16);
             for (int c = 0; c < channels; c++) {
                 for (int t = 0; t < taps; t++) {
                     transposed.setAtIndex(
@@ -119,15 +171,8 @@ public final class LayerWeights implements AutoCloseable {
                             source.getAtIndex(ValueLayout.JAVA_SHORT, (long) c * taps + t));
                 }
             }
-            return upload(tensor, transposed);
+            staged.parts.put(role, transposed);
         }
-    }
-
-    private long upload(String name, MemorySegment host) {
-        long address = gpu.allocate(host.byteSize());
-        gpu.copyHostToDevice(address, host, host.byteSize());
-        owned.put(name, address);
-        return address;
     }
 
     /// Replaces object `name` with `decoded` (BF16, same shape, device), which this layer then owns.

@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.quantization.gpu.Device;
 import io.euhedral_execution.inference.quantization.model.LayerForward;
 import io.euhedral_execution.inference.quantization.model.LayerWeights;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
@@ -18,10 +19,18 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /// GPTQ calibration of an artifact recipe on the engine's kernels: writes each quantized object's rounding to OUT as
 /// the .npz files `convert_checkpoint.py --codes-from` takes (tools/gptq/calibrate.py, natively).
@@ -51,18 +60,25 @@ public final class Calibrate {
 
     private static final int HEAD_ROWS = 16384;
     private static final int CHECKPOINT_EVERY = 8;
+    /// Objects of a layer rounded at once, each on its own stream (largest first): three fit a 16 GB card beside the
+    /// layer and its Hessians.
+    private static final int ROUNDING_FRAMES = 3;
+    private static final int WORKERS = 6;
 
     private final Settings settings;
     private final Device device;
+    private final CalibrationLattice lattice;
+    private final Map<Long, Gptq> streamGptq = new ConcurrentHashMap<>();
     private final Qwen38Objects checkpoint;
     private final Gptq gptq;
     private final Cuda.Function gatherRows;
     private final int hidden;
     private final long start = System.nanoTime();
 
-    private Calibrate(Settings settings, Device device, Qwen38Objects checkpoint) {
+    private Calibrate(Settings settings, Device device, Qwen38Objects checkpoint, CalibrationLattice lattice) {
         this.settings = settings;
         this.device = device;
+        this.lattice = lattice;
         this.checkpoint = checkpoint;
         this.gptq = new Gptq(device.cuda, device.gpu, device.stream);
         this.gatherRows =
@@ -73,8 +89,9 @@ public final class Calibrate {
     public static void run(Settings settings, Path library) throws IOException {
         Files.createDirectories(settings.out());
         try (Safetensors store = Safetensors.open(settings.model());
-                Device device = new Device(library)) {
-            new Calibrate(settings, device, new Qwen38Objects(store, settings.model())).calibrate();
+                Device device = new Device(library);
+                CalibrationLattice lattice = CalibrationLattice.start(WORKERS, Set.of(8, 9))) {
+            new Calibrate(settings, device, new Qwen38Objects(store, settings.model()), lattice).calibrate();
         }
     }
 
@@ -94,8 +111,11 @@ public final class Calibrate {
         try (LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows)) {
             int first = resume(states, sequences, length);
             if (first == 0) embed(tokens, states, batchStates);
+            CompletableFuture<LayerWeights.Staged> next = stageLayer(first);
             for (int index = first; index < settings.layers(); index++) {
-                calibrateLayer(index, forward, states, batchStates, sequences, length);
+                LayerWeights.Staged staged = next.join();
+                next = index + 1 < settings.layers() ? stageLayer(index + 1) : null; // read while this one runs
+                calibrateLayer(index, staged, forward, states, batchStates, sequences, length);
                 if ((index + 1) % CHECKPOINT_EVERY == 0 && index + 1 < settings.layers()) {
                     saveCheckpoint(states, index + 1, sequences, length);
                 }
@@ -111,10 +131,30 @@ public final class Calibrate {
 
     // ---- decoder layers ----
 
+    /// Reads decoder layer `index` into host memory on a lattice worker.
+    private CompletableFuture<LayerWeights.Staged> stageLayer(int index) {
+        return lattice.submit(() -> {
+            try {
+                return LayerWeights.stage(checkpoint, index);
+            } catch (IOException failure) {
+                throw new UncheckedIOException(failure);
+            }
+        });
+    }
+
     private void calibrateLayer(
-            int index, LayerForward forward, MemorySegment states, long batchStates, int sequences, int length)
-            throws IOException {
-        try (LayerWeights layer = LayerWeights.layer(device.gpu, checkpoint, index)) {
+            int index,
+            LayerWeights.Staged staged,
+            LayerForward forward,
+            MemorySegment states,
+            long batchStates,
+            int sequences,
+            int length) {
+        LayerWeights uploaded;
+        try (staged) {
+            uploaded = LayerWeights.upload(device.gpu, staged);
+        }
+        try (LayerWeights layer = uploaded) {
             Map<String, Long> hessians = observeAll(layer, forward, states, batchStates, sequences, length);
             roundAll(layer, hessians);
             batches(
@@ -168,20 +208,67 @@ public final class Calibrate {
         return hessians;
     }
 
-    /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded weights.
-    private void roundAll(LayerWeights layer, Map<String, Long> hessians) throws IOException {
-        var freed = new java.util.HashSet<Long>();
-        for (String name : List.copyOf(layer.objects.keySet())) {
-            long[] shape = layer.shapes.get(name);
-            long decoded = roundObject(name, layer.objects.get(name), shape[0], (int) shape[1], hessians.get(name));
-            layer.replace(name, decoded);
+    /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded weights:
+    /// each object is a lattice frame on its worker's own stream, at most ROUNDING_FRAMES at once, largest first.
+    private void roundAll(LayerWeights layer, Map<String, Long> hessians) {
+        device.synchronize(); // the Hessians are complete before other streams read them
+        List<String> names = new ArrayList<>(layer.objects.keySet());
+        names.sort(Comparator.comparingLong(
+                (String name) -> -layer.shapes.get(name)[0] * layer.shapes.get(name)[1]));
+        Map<String, Long> decoded = new ConcurrentHashMap<>();
+        var next = new AtomicInteger();
+        var failure = new AtomicReference<Throwable>();
+        List<CompletableFuture<Void>> lanes = new ArrayList<>();
+        for (int lane = 0; lane < Math.min(ROUNDING_FRAMES, names.size()); lane++) {
+            lanes.add(lane(names, next, layer, hessians, decoded, failure));
         }
+        lanes.forEach(CompletableFuture::join);
+        if (failure.get() != null) throw new IllegalStateException("rounding failed", failure.get());
+        for (var entry : decoded.entrySet()) layer.replace(entry.getKey(), entry.getValue());
+        var freed = new HashSet<Long>();
         for (long h : hessians.values()) if (freed.add(h)) device.gpu.free(h);
+    }
+
+    /// One rounding lane: rounds the next object in a frame, then continues with the next until none is left.
+    private CompletableFuture<Void> lane(
+            List<String> names,
+            AtomicInteger next,
+            LayerWeights layer,
+            Map<String, Long> hessians,
+            Map<String, Long> decoded,
+            AtomicReference<Throwable> failure) {
+        int index = next.getAndIncrement();
+        if (index >= names.size() || failure.get() != null) return CompletableFuture.completedFuture(null);
+        String name = names.get(index);
+        return lattice.<Void>submit(() -> {
+                    long stream = device.bindOwnStream();
+                    Gptq own = streamGptq.computeIfAbsent(stream, s -> new Gptq(device.cuda, device.gpu, s));
+                    long[] shape = layer.shapes.get(name);
+                    try {
+                        decoded.put(
+                                name,
+                                roundObject(
+                                        own,
+                                        name,
+                                        layer.objects.get(name),
+                                        shape[0],
+                                        (int) shape[1],
+                                        hessians.get(name)));
+                    } catch (Throwable error) {
+                        failure.compareAndSet(null, error);
+                    }
+                    return null;
+                })
+                .thenCompose(ignored -> lane(names, next, layer, hessians, decoded, failure));
     }
 
     /// GPTQ of one object (BF16 [rows, k] on the device) under `hessian`, in row slices of HEAD_ROWS sharing one factor
     /// and tensor scales; saves its state and returns its decoded weights (BF16, device, owned by the caller).
     private long roundObject(String name, long weight, long rows, int k, long hessian) throws IOException {
+        return roundObject(gptq, name, weight, rows, k, hessian);
+    }
+
+    private long roundObject(Gptq gptq, String name, long weight, long rows, int k, long hessian) throws IOException {
         Gptq.Format format = settings.recipe().format(name);
         Gptq.Factor factor = gptq.factor(hessian, k, settings.damp(), settings.actOrder());
         long decoded = device.gpu.allocate(2L * rows * k);
