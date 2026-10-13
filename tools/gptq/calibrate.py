@@ -34,6 +34,7 @@ from gptq.gptq import column_order, gptq, inverse_cholesky, nvfp4_tensor_scales
 from gptq.qwen38 import HIDDEN, LAYERS, Checkpoint, Layer, Mtp, linear, rms_norm
 
 HEAD_ROWS = 16384
+ROUNDING_THREADS = 3
 
 
 class _Uniform:
@@ -124,10 +125,12 @@ def round_objects(weights: dict[str, torch.Tensor], hessians: dict[str, torch.Te
             decoded = round_object(name, weights[name], hessians[name], plans[name], args.out, args.damp, start,
                                    act_order=args.act_order)
         stream.synchronize()
+        hessians[name] = None  # released as each object finishes (shared Hessians when both have)
         return decoded
 
-    names = list(weights)
-    with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
+    # Largest first, at most ROUNDING_THREADS at once: five objects together peaked above a 16 GB card.
+    names = sorted(weights, key=lambda name: weights[name].numel() + hessians[name].numel(), reverse=True)
+    with concurrent.futures.ThreadPoolExecutor(ROUNDING_THREADS) as pool:
         for name, decoded in zip(names, pool.map(one, names)):
             weights[name] = decoded
     hessians.clear()
