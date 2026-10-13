@@ -108,19 +108,35 @@ def nvfp4_tensor_scales(weight: torch.Tensor, hessian: torch.Tensor, layout: str
     return global_scale, table
 
 
+def column_order(hessian: torch.Tensor) -> torch.Tensor:
+    """Act-order: the columns by decreasing diag(H), so the columns that matter most are rounded first, while the
+    most columns are left to absorb their error."""
+    return torch.argsort(torch.diag(hessian), descending=True, stable=True)
+
+
 def gptq(weight: torch.Tensor, hessian: torch.Tensor, fmt: str, layout: str, shape: tuple[int, int],
          lowest_code: int | None = None, damp: float = 0.01, upper: torch.Tensor | None = None,
-         tensor: tuple[np.float32, np.ndarray | None] | None = None) -> tuple[QuantState, torch.Tensor]:
+         tensor: tuple[np.float32, np.ndarray | None] | None = None,
+         order: torch.Tensor | None = None) -> tuple[QuantState, torch.Tensor]:
     """(the QuantState of `weight` [N, K] rounded by GPTQ under `hessian` [K, K], the decoded weights [N, K]).
     `shape` is the object's shape (K a multiple of 128 here). `lowest_code` limits grouped codes (compressed q3).
+    `order` (column_order) rounds the columns in that order; each group's scale is chosen when its first column comes
+    up, from the current values of all its columns. `upper` is then the factor of H permuted into that order.
     Rows are independent, so a large object can be rounded in row slices that share `upper` (inverse_cholesky)
     and, for NVFP4, `tensor` (nvfp4_tensor_scales of the whole object)."""
-    w = weight.float().clone()
-    n, k = w.shape
+    n, k = weight.shape
     importance = torch.diag(hessian).float()
-    w[:, importance == 0] = 0
+    if order is None:
+        order = torch.arange(k, device=weight.device)
+    permuted = hessian[order][:, order] if upper is None else None
+    w = weight.float()[:, order].clone()
+    w[:, importance[order] == 0] = 0
     if upper is None:
-        upper = inverse_cholesky(hessian, damp)
+        upper = inverse_cholesky(permuted, damp)
+        del permuted
+    position = torch.empty_like(order)
+    position[order] = torch.arange(k, device=order.device)
+    columns = order.tolist()
     weights_np = importance.cpu().numpy().astype(np.float32)
     if fmt == NVFP4_FORMAT:
         global_scale, table = tensor if tensor is not None else nvfp4_tensor_scales(weight, hessian, layout)
@@ -131,23 +147,30 @@ def gptq(weight: torch.Tensor, hessian: torch.Tensor, fmt: str, layout: str, sha
         rounder = _Grouped(fmt, lowest_code)
         codes = torch.zeros(n, k, dtype=torch.int8, device=w.device)
         scales = torch.zeros(n, k // rounder.group, dtype=torch.float16, device=w.device)
-    decoded = torch.zeros_like(w)
+    decoded = torch.zeros(n, k, dtype=torch.float32, device=w.device)
     group = rounder.group
-    decode = None
+    decodes: list[torch.Tensor | None] = [None] * (k // group)
     for begin in range(0, k, BLOCK):
         end = min(k, begin + BLOCK)
         block = w[:, begin:end].clone()
         errors = torch.zeros_like(block)
         for i in range(end - begin):
-            column = begin + i
-            if column % group == 0:
-                chosen, decode = rounder.choose(block[:, i:i + group], weights_np[column:column + group])
-                scales[:, column // group] = chosen.reshape(-1).to(scales.dtype)
-            code, value = rounder.round(block[:, i], decode)
+            column = columns[begin + i]
+            g = column // group
+            if decodes[g] is None:
+                # None of the group's columns is rounded yet: their current values are in this block or later.
+                at = position[g * group:(g + 1) * group]
+                values = w[:, at].clone()
+                inside = at < end
+                values[:, inside] = block[:, at[inside] - begin]
+                chosen, decodes[g] = rounder.choose(values, weights_np[g * group:(g + 1) * group])
+                scales[:, g] = chosen.reshape(-1).to(scales.dtype)
+            code, value = rounder.round(block[:, i], decodes[g])
             codes[:, column] = code.to(codes.dtype)
             decoded[:, column] = value
-            error = (block[:, i] - value) / upper[column, column]
-            block[:, i:] -= error[:, None] * upper[column, begin + i:end][None, :]
+            j = begin + i
+            error = (block[:, i] - value) / upper[j, j]
+            block[:, i:] -= error[:, None] * upper[j, j:end][None, :]
             errors[:, i] = error
         w[:, end:] -= errors @ upper[begin:end, end:]
     if fmt == NVFP4_FORMAT:
