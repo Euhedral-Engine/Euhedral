@@ -188,8 +188,8 @@ class InventoryTest(unittest.TestCase):
     def test_q3_artifact(self):
         plans = {plan.name: plan for plan in plans_of(recipes.Recipe("q3"))}
         self.assertEqual(self.formats(recipes.Recipe("q3")), {
-            ("Q3G64_F16S", "row-split-k128-v1"): 1 + 64 + 52 + 1,  # embedding, gate_up, inner down, draft head
-            ("Q4G64_F16S", "row-split-k128-v1"): 64 + 48 + 64 + 12,  # query_key, value_z, mixer outputs, edge down
+            ("Q3G64_F16S", "row-split-k128-v1"): 1 + 64 + 64 + 52 + 1,  # embedding, gate_up, mixer outputs, inner down, draft head
+            ("Q4G64_F16S", "row-split-k128-v1"): 64 + 48 + 12,  # query_key, value_z, edge down
             ("Q5G64_F16S", "row-split-k128-v1"): 16,  # attention gate_value
             ("NVFP4", "row-split-k128-v1"): 1 + 5,  # the LM head and the MTP layer
             ("BF16", "contiguous-le-v1"): 360,
