@@ -264,6 +264,26 @@ public final class Cuda {
             float beta,
             long c,
             int ldc) {
+        gemmBf16(handle, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, false);
+    }
+
+    /// As gemmBf16, with C BF16 (FP32 accumulation, rounded once) when `bf16Output`.
+    public void gemmBf16(
+            long handle,
+            int transA,
+            int transB,
+            int m,
+            int n,
+            int k,
+            float alpha,
+            long a,
+            int lda,
+            long b,
+            int ldb,
+            float beta,
+            long c,
+            int ldc,
+            boolean bf16Output) {
         try (Arena local = Arena.ofConfined()) {
             MemorySegment alphaValue = local.allocateFrom(ValueLayout.JAVA_FLOAT, alpha);
             MemorySegment betaValue = local.allocateFrom(ValueLayout.JAVA_FLOAT, beta);
@@ -283,7 +303,7 @@ public final class Cuda {
                     ldb,
                     betaValue.address(),
                     c,
-                    CUDA_R_32F,
+                    bf16Output ? CUDA_R_16BF : CUDA_R_32F,
                     ldc,
                     CUBLAS_COMPUTE_32F,
                     CUBLAS_GEMM_DEFAULT));
