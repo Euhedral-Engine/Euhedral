@@ -17,6 +17,7 @@ columns by decreasing diag(H). The token embedding (a lookup) is left to the con
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import time
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from euhedral_artifacts import device
 from euhedral_artifacts.codes import state_file
 from euhedral_artifacts.importance import Calibration
 from euhedral_artifacts.inventory import build_plans, draft_token_ids
+from euhedral_artifacts.nvfp4 import E2M1_VALUES, E4M3_VALUES
 from euhedral_artifacts.recipes import Recipe
 from gptq.gptq import column_order, gptq, inverse_cholesky, nvfp4_tensor_scales
 from gptq.qwen38 import HIDDEN, LAYERS, Checkpoint, Layer, Mtp, linear, rms_norm
@@ -77,6 +79,28 @@ def round_object(name, weight, hessian, plan, out, damp, start, rows=None, act_o
     return decoded
 
 
+def round_objects(weights: dict[str, torch.Tensor], hessians: dict[str, torch.Tensor], plans, args, start) -> None:
+    """Rounds every object of `weights` under its Hessian at once, each on its own thread and CUDA stream (one object's
+    column loop launches kernels from one thread and leaves the GPU idle between them); replaces each with its decoded
+    weights. The objects are independent, so the result is the sequential one."""
+    device.table("e4m3", E4M3_VALUES), device.table("e2m1", E2M1_VALUES)  # shared tables, made before the threads
+    torch.cuda.synchronize()
+
+    def one(name: str) -> torch.Tensor:
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            decoded = round_object(name, weights[name], hessians[name], plans[name], args.out, args.damp, start,
+                                   act_order=args.act_order)
+        stream.synchronize()
+        return decoded
+
+    names = list(weights)
+    with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
+        for name, decoded in zip(names, pool.map(one, names)):
+            weights[name] = decoded
+    hessians.clear()
+
+
 def mtp_pass(checkpoint, hidden, ids, final_norm, head_hessian, plans, args, start) -> torch.Tensor:
     """Accumulates the LM head's Hessian from the base final norm's output, rounds the MTP layer on the rows the engine
     feeds it (docs/MTP_CONTRACT.md: base normed hidden at p with the embedding of token p + 1, at position p), and
@@ -115,9 +139,7 @@ def mtp_pass(checkpoint, hidden, ids, final_norm, head_hessian, plans, args, sta
 
     for begin in range(0, sequences, batch):
         mtp.layer.forward(rows[begin:begin + batch].cuda(), observe)
-    for name in list(mtp.layer.weights):
-        mtp.layer.weights[name] = round_object(name, mtp.layer.weights[name], hessians.pop(name), plans[name], args.out,
-                                               args.damp, start, act_order=args.act_order)
+    round_objects(mtp.layer.weights, hessians, plans, args, start)
     draft_hessian = torch.zeros(HIDDEN, HIDDEN, device="cuda")
     for begin in range(0, sequences, batch):
         m = rms_norm(mtp.layer.forward(rows[begin:begin + batch].cuda()), mtp.final_norm, checkpoint.eps)
@@ -176,10 +198,7 @@ def main(argv: list[str] | None = None) -> int:
 
             for begin in range(0, sequences, args.batch):
                 layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True), observe)
-            for name in list(layer.weights):
-                decoded = round_object(name, layer.weights[name], hessians.pop(name), plans[name], args.out,
-                                       args.damp, start, act_order=args.act_order)
-                layer.weights[name] = decoded
+            round_objects(layer.weights, hessians, plans, args, start)
             for begin in range(0, sequences, args.batch):
                 hidden[begin:begin + args.batch] = layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True)).cpu()
             del layer, hessians
