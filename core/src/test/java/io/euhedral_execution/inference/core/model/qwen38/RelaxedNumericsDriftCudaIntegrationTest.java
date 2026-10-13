@@ -38,6 +38,8 @@ import org.junit.jupiter.api.Timeout;
 class RelaxedNumericsDriftCudaIntegrationTest {
 
     private static final int BURN_IN = 128;
+    /// Logit lead of the exact top-1 token over the relaxed one at or below which a flip counts as a near-tie.
+    private static final double NEAR_TIE = 0.25;
 
     private record Step(short[] hidden, float[] logits) {}
 
@@ -48,7 +50,9 @@ class RelaxedNumericsDriftCudaIntegrationTest {
             double logitMax,
             double logitRelative,
             double kl,
-            boolean topAgrees) {}
+            boolean topAgrees,
+            // Exact logit of the exact top-1 token minus that of the relaxed top-1 token (0 when they agree).
+            double flipLead) {}
 
     @Test
     @Timeout(value = 600, unit = TimeUnit.SECONDS)
@@ -72,10 +76,18 @@ class RelaxedNumericsDriftCudaIntegrationTest {
             // Outputs must agree at every starting position.
             double meanKl = metrics.stream().mapToDouble(Metrics::kl).average().orElseThrow();
             long agreements = metrics.stream().filter(Metrics::topAgrees).count();
+            var decided = metrics.stream()
+                    .filter(m -> !m.topAgrees() && m.flipLead() > NEAR_TIE)
+                    .map(Metrics::flipLead)
+                    .toList();
             assertTrue(meanKl < 1.0e-2, "mean KL divergence " + meanKl + " after prefix " + prefixLength);
+            // Top-1 flips where the exact logits nearly tie depend on how many near-ties the weights give the text
+            // (3 to 17 per 256 positions over the NVFP4 artifacts measured on 2026-10-13, almost all leads of 0 to
+            // 0.25, two BF16 steps at these logits); a wrong kernel flips decided positions.
             assertTrue(
-                    agreements >= 0.95 * metrics.size(),
-                    "top-1 agreement " + agreements + "/" + metrics.size() + " after prefix " + prefixLength);
+                    decided.size() <= 0.02 * metrics.size(),
+                    "top-1 flips with an exact lead above " + NEAR_TIE + ": " + decided + " after prefix "
+                            + prefixLength);
             int window = Math.max(1, metrics.size() / 8);
             double peak = 0;
             for (int start = 0; start < metrics.size(); start += window) {
@@ -103,8 +115,8 @@ class RelaxedNumericsDriftCudaIntegrationTest {
             peaks.add(peak);
             growths.add(late / (early + 1.0e-4));
             System.out.printf(
-                    "prefix %d: peak window hidden error %.4f, late/early %.3f, mean KL %.2e, top-1 %d/%d%n",
-                    prefixLength, peak, late / (early + 1.0e-4), meanKl, agreements, metrics.size());
+                    "prefix %d: peak window hidden error %.4f, late/early %.3f, mean KL %.2e, top-1 %d/%d, decided flips %d%n",
+                    prefixLength, peak, late / (early + 1.0e-4), meanKl, agreements, metrics.size(), decided.size());
         }
         // Single-ulp BF16 differences settle at a 5-9% hidden error in the 64-layer recurrent model; where one
         // window peaks depends on the tokens and the weights. For the q3 artifacts measured on 2026-10-12 the peak
@@ -267,7 +279,8 @@ class RelaxedNumericsDriftCudaIntegrationTest {
                 logitMax,
                 Math.sqrt(logitDifference / logitNorm),
                 Math.max(kl, 0),
-                topP == topQ);
+                topP == topQ,
+                p[topP] - p[topQ]);
     }
 
     private static void report(List<Metrics> metrics) throws Exception {
