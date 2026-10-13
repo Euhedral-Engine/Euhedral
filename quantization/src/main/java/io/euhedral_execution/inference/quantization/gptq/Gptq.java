@@ -343,21 +343,21 @@ public final class Gptq implements AutoCloseable {
         int k = factor.k();
         int group = format.group();
         int groups = k / group;
-        long w = gpu.allocate(4L * n * k);
-        long decoded = gpu.allocate(4L * n * k);
-        long codes = gpu.allocate(2L * n * k);
-        long decodes = gpu.allocate(4L * n * groups);
-        long scales = gpu.allocate((format.nvfp4() ? 1L : 2L) * n * groups);
-        long block = gpu.allocate(4L * n * BLOCK);
-        long errors = gpu.allocate(4L * n * BLOCK);
-        long values = gpu.allocate(4L * n * group);
-        long orderDevice = upload(factor.order());
-        long positionDevice = upload(factor.position());
+        long w = gpu.allocateAsync(4L * n * k);
+        long decoded = gpu.allocateAsync(4L * n * k);
+        long codes = gpu.allocateAsync(2L * n * k);
+        long decodes = gpu.allocateAsync(4L * n * groups);
+        long scales = gpu.allocateAsync((format.nvfp4() ? 1L : 2L) * n * groups);
+        long block = gpu.allocateAsync(4L * n * BLOCK);
+        long errors = gpu.allocateAsync(4L * n * BLOCK);
+        long values = gpu.allocateAsync(4L * n * group);
+        long orderDevice = uploadAsync(factor.order());
+        long positionDevice = uploadAsync(factor.position());
         int[] groupOf = new int[k];
         for (int j = 0; j < k; j++) groupOf[j] = factor.order()[j] / group;
-        long groupDevice = upload(groupOf);
-        long tableDevice = format.sd4() ? uploadBytes(tensor.table()) : 0L;
-        long weightsDevice = upload(factor.importance());
+        long groupDevice = uploadAsync(groupOf);
+        long tableDevice = format.sd4() ? uploadAsync(tensor.table()) : 0L;
+        long weightsDevice = uploadAsync(factor.importance());
         try {
             cuda.launch(
                     bf16ToFloatPermuted,
@@ -376,7 +376,7 @@ public final class Gptq implements AutoCloseable {
                     .filter(j -> factor.importance()[factor.order()[j]] == 0.0f)
                     .toArray();
             if (dead.length > 0) {
-                long deadDevice = upload(dead);
+                long deadDevice = uploadAsync(dead);
                 cuda.launch(
                         zeroColumns,
                         blocks((long) n * dead.length, 256),
@@ -391,7 +391,7 @@ public final class Gptq implements AutoCloseable {
                                 .pointer(deadDevice)
                                 .integer(dead.length));
                 cuda.synchronize(stream);
-                gpu.free(deadDevice);
+                gpu.freeAsync(deadDevice);
             }
             zero(decodes, 4L * n * groups);
             boolean[] chosen = new boolean[groups];
@@ -525,8 +525,8 @@ public final class Gptq implements AutoCloseable {
                 positionDevice,
                 groupDevice,
                 weightsDevice
-            }) gpu.free(address);
-            if (tableDevice != 0) gpu.free(tableDevice);
+            }) gpu.freeAsync(address);
+            if (tableDevice != 0) gpu.freeAsync(tableDevice);
         }
     }
 
@@ -689,8 +689,21 @@ public final class Gptq implements AutoCloseable {
         return address;
     }
 
-    private long uploadBytes(byte[] values) {
-        long address = gpu.allocate(Math.max(1, values.length));
+    /// Stream-ordered uploads for round(), freed with freeAsync on the same stream.
+    private long uploadAsync(int[] values) {
+        long address = gpu.allocateAsync(4L * Math.max(1, values.length));
+        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), 4L * values.length);
+        return address;
+    }
+
+    private long uploadAsync(float[] values) {
+        long address = gpu.allocateAsync(4L * Math.max(1, values.length));
+        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), 4L * values.length);
+        return address;
+    }
+
+    private long uploadAsync(byte[] values) {
+        long address = gpu.allocateAsync(Math.max(1, values.length));
         gpu.copyHostToDevice(address, MemorySegment.ofArray(values), values.length);
         return address;
     }

@@ -177,8 +177,14 @@ public final class Cuda {
         }
     }
 
-    /// Compiles a kernel source shipped with the module (resource `/cuda/NAME`).
+    private final java.util.Map<String, List<Function>> compiled = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /// Compiles a kernel source shipped with the module (resource `/cuda/NAME`), once per name and function list.
     public List<Function> compileResource(String name, List<String> functions) {
+        return compiled.computeIfAbsent(name + functions, key -> compileResourceNow(name, functions));
+    }
+
+    private List<Function> compileResourceNow(String name, List<String> functions) {
         try (var input = Cuda.class.getResourceAsStream("/cuda/" + name)) {
             if (input == null) throw new IllegalArgumentException("no kernel source " + name);
             return compile(name, new String(input.readAllBytes(), StandardCharsets.UTF_8), functions);
