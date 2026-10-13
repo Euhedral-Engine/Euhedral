@@ -110,3 +110,14 @@ tasks.named<JavaExec>("run") {
 tasks.withType<Test>().configureEach {
     providers.gradleProperty("euhedral.quantization.checkpoint").orNull?.let { systemProperty("euhedral.quantization.checkpoint", it) }
 }
+
+// The CUDA test tasks the root build registers also need this module's cuBLAS/cuSOLVER and the CUDA headers its
+// kernels compile against.
+tasks.withType<Test>().matching { it.name.startsWith("cuda") }.configureEach {
+    dependsOn(cudaMathLibraries)
+    environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
+    environment(
+        "LD_LIBRARY_PATH",
+        listOf(hostRuntimeDirectory, cudaMathDirectory.get().asFile.absolutePath, System.getenv("LD_LIBRARY_PATH") ?: "")
+            .joinToString(File.pathSeparator))
+}
