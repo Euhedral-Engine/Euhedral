@@ -101,6 +101,22 @@ class GptqTest(unittest.TestCase):
                 plain_error = float(((x @ (self.weight - decode(plain)).T) ** 2).sum())
                 self.assertLess(ordered_error, 0.8 * plain_error)
 
+    def test_the_fused_kernel_is_the_column_loop_bit_for_bit(self):
+        if not torch.cuda.is_available():
+            self.skipTest("needs CUDA")
+        rng = np.random.default_rng(8)
+        mixing = rng.standard_normal((K, K)).astype(np.float32) * 0.3 + np.eye(K, dtype=np.float32)
+        x = torch.from_numpy(rng.standard_normal((4096, K)).astype(np.float32) @ mixing).to(device.DEVICE)
+        hessian = x.T @ x
+        for fmt, layout in (("Q3G64_F16S", LAYOUT_ROW_SPLIT), ("Q5G64_F16S", LAYOUT_ROW_SPLIT),
+                            (NVFP4_FORMAT, LAYOUT_ROW_SPLIT), (NVFP4_FORMAT, LAYOUT_SD4)):
+            for order in (None, self.gptq.column_order(hessian)):
+                with self.subTest(fmt=fmt, layout=layout, act_order=order is not None):
+                    loop, loop_decoded = self.gptq.gptq(self.weight, hessian, fmt, layout, (N, K), order=order, fused=False)
+                    fused, fused_decoded = self.gptq.gptq(self.weight, hessian, fmt, layout, (N, K), order=order)
+                    self.assertEqual(written(loop), written(fused))
+                    self.assertTrue(torch.equal(loop_decoded, fused_decoded))
+
 def decode(state):
     if state.format_name == NVFP4_FORMAT:
         scale_codes = state.table[state.scales] if state.table is not None else state.scales

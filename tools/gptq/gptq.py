@@ -68,20 +68,20 @@ class _Nvfp4:
     def choose(self, values: torch.Tensor, weights: np.ndarray):
         if self.table is not None:
             # The table entry with the least weighted error, no more than `below` codes under the nearest scale
-            # (quantize_nvfp4_sd4_rows_torch, one block at a time).
-            magnitudes = values.abs()
-            w = torch.from_numpy(weights).to(device.DEVICE)[None, :].expand_as(values).contiguous()
+            # (quantize_nvfp4_sd4_rows_torch); all entries at once, each row's error reduced as for one entry, and the
+            # first least entry kept, as a loop over the entries with a strict comparison keeps it.
+            entries = self.table.size
+            n = values.shape[0]
+            magnitudes = values.abs()[:, None, :].expand(n, entries, -1).reshape(-1, NVFP4_BLOCK)
+            w = torch.from_numpy(weights).to(device.DEVICE)[None, :].expand(n * entries, -1).contiguous()
             nearest = nearest_scale_codes_torch(values.contiguous(), self.global_scale)
-            best = torch.zeros(values.shape[0], dtype=torch.int64, device=device.DEVICE)
-            best_error = torch.full((values.shape[0],), float("inf"), device=device.DEVICE)
-            for index, code in enumerate(self.table.tolist()):
-                decode = (self.e4m3[code] * self.g).expand(values.shape[0])
-                error = weighted_block_error_torch(magnitudes, w, decode)
-                better = (error < best_error) & (code >= nearest - self.below)
-                best = torch.where(better, torch.full_like(best, index), best)
-                best_error = torch.where(better, error, best_error)
-            code = torch.from_numpy(self.table.astype(np.int64)).to(device.DEVICE)[best]
-            return best.to(torch.uint8), self.e4m3[code] * self.g
+            table = torch.from_numpy(self.table.astype(np.int64)).to(device.DEVICE)
+            decode = (self.e4m3[table] * self.g)[None, :].expand(n, -1).reshape(-1)
+            error = weighted_block_error_torch(magnitudes.contiguous(), w, decode).view(n, entries)
+            allowed = table[None, :] >= (nearest - self.below)[:, None]
+            error = torch.where(allowed, error, torch.full_like(error, float("inf")))
+            best = torch.argmin(error, dim=1)
+            return best.to(torch.uint8), self.e4m3[table[best]] * self.g
         _, codes = search_nvfp4_rows_torch(values.contiguous(), self.global_scale, weights)
         code = torch.from_numpy(codes[:, 0].astype(np.int64)).to(device.DEVICE)
         return code.to(torch.uint8), self.e4m3[code] * self.g
@@ -115,16 +115,85 @@ def column_order(hessian: torch.Tensor) -> torch.Tensor:
     return torch.argsort(torch.diag(hessian), descending=True, stable=True)
 
 
+def _choose(rounder, w, block, begin, end, position, weights_np, g, scales):
+    """The scale of group g, from the current values of its columns (none of them rounded yet: they are in this block
+    or later)."""
+    group = rounder.group
+    at = position[g * group:(g + 1) * group]
+    values = w[:, at].clone()
+    inside = at < end
+    values[:, inside] = block[:, at[inside] - begin]
+    chosen, decode = rounder.choose(values, weights_np[g * group:(g + 1) * group])
+    scales[:, g] = chosen.reshape(-1).to(scales.dtype)
+    return decode  # the rounder's own shape: [N, 1] grouped, [N] NVFP4
+
+
+def _column_loop(w, upper, rounder, columns, position, weights_np, codes, scales, decoded, group):
+    """The reference loop: a few PyTorch launches per column."""
+    n, k = w.shape
+    decodes: list[torch.Tensor | None] = [None] * (k // group)
+    for begin in range(0, k, BLOCK):
+        end = min(k, begin + BLOCK)
+        block = w[:, begin:end].clone()
+        errors = torch.zeros_like(block)
+        for i in range(end - begin):
+            column = columns[begin + i]
+            g = column // group
+            if decodes[g] is None:
+                decodes[g] = _choose(rounder, w, block, begin, end, position, weights_np, g, scales)
+            code, value = rounder.round(block[:, i], decodes[g])
+            codes[:, column] = code.to(codes.dtype)
+            decoded[:, column] = value
+            j = begin + i
+            error = (block[:, i] - value) / upper[j, j]
+            block[:, i:] -= error[:, None] * upper[j, j:end][None, :]
+            errors[:, i] = error
+        w[:, end:] -= errors @ upper[begin:end, end:]
+
+
+def _fused_loop(w, upper, rounder, columns, position, weights_np, codes, scales, decoded, fmt):
+    """The loop in runs: between two scale choices, one kernel launch rounds every column of the run."""
+    from gptq import kernels
+    n, k = w.shape
+    group = rounder.group
+    decodes = torch.zeros(n, k // group, dtype=torch.float32, device=w.device)
+    chosen = [False] * (k // group)
+    kind = kernels.NVFP4 if fmt == NVFP4_FORMAT else kernels.GROUPED
+    qmin, qmax = (0.0, 0.0) if kind == kernels.NVFP4 else (float(rounder.qmin), float(rounder.qmax))
+    order = torch.tensor(columns, dtype=torch.int32, device=w.device)
+    group_of = order // group
+    for begin in range(0, k, BLOCK):
+        end = min(k, begin + BLOCK)
+        block = w[:, begin:end].contiguous().clone()
+        errors = torch.zeros_like(block)
+        block_groups = group_of[begin:end].contiguous()
+        block_columns = order[begin:end].contiguous()
+        first = 0
+        for i in range(end - begin):
+            g = columns[begin + i] // group
+            if not chosen[g]:
+                if i > first:
+                    kernels.segment(block, errors, upper, decodes, block_groups, block_columns, codes, decoded,
+                                    begin, first, i, kind, qmin, qmax)
+                    first = i
+                decodes[:, g] = _choose(rounder, w, block, begin, end, position, weights_np, g, scales).reshape(-1)
+                chosen[g] = True
+        kernels.segment(block, errors, upper, decodes, block_groups, block_columns, codes, decoded,
+                        begin, first, end - begin, kind, qmin, qmax)
+        w[:, end:] -= errors @ upper[begin:end, end:]
+
+
 def gptq(weight: torch.Tensor, hessian: torch.Tensor, fmt: str, layout: str, shape: tuple[int, int],
          lowest_code: int | None = None, damp: float = 0.01, upper: torch.Tensor | None = None,
          tensor: tuple[np.float32, np.ndarray | None] | None = None,
-         order: torch.Tensor | None = None) -> tuple[QuantState, torch.Tensor]:
+         order: torch.Tensor | None = None, fused: bool = True) -> tuple[QuantState, torch.Tensor]:
     """(the QuantState of `weight` [N, K] rounded by GPTQ under `hessian` [K, K], the decoded weights [N, K]).
     `shape` is the object's shape (K a multiple of 128 here). `lowest_code` limits grouped codes (compressed q3).
     `order` (column_order) rounds the columns in that order; each group's scale is chosen when its first column comes
     up, from the current values of all its columns. `upper` is then the factor of H permuted into that order.
     Rows are independent, so a large object can be rounded in row slices that share `upper` (inverse_cholesky)
-    and, for NVFP4, `tensor` (nvfp4_tensor_scales of the whole object)."""
+    and, for NVFP4, `tensor` (nvfp4_tensor_scales of the whole object). `fused` rounds runs of columns with the Triton
+    kernel (kernels.py), bit for bit the column loop it replaces."""
     n, k = weight.shape
     importance = torch.diag(hessian).float()
     if order is None:
@@ -150,30 +219,10 @@ def gptq(weight: torch.Tensor, hessian: torch.Tensor, fmt: str, layout: str, sha
         scales = torch.zeros(n, k // rounder.group, dtype=torch.float16, device=w.device)
     decoded = torch.zeros(n, k, dtype=torch.float32, device=w.device)
     group = rounder.group
-    decodes: list[torch.Tensor | None] = [None] * (k // group)
-    for begin in range(0, k, BLOCK):
-        end = min(k, begin + BLOCK)
-        block = w[:, begin:end].clone()
-        errors = torch.zeros_like(block)
-        for i in range(end - begin):
-            column = columns[begin + i]
-            g = column // group
-            if decodes[g] is None:
-                # None of the group's columns is rounded yet: their current values are in this block or later.
-                at = position[g * group:(g + 1) * group]
-                values = w[:, at].clone()
-                inside = at < end
-                values[:, inside] = block[:, at[inside] - begin]
-                chosen, decodes[g] = rounder.choose(values, weights_np[g * group:(g + 1) * group])
-                scales[:, g] = chosen.reshape(-1).to(scales.dtype)
-            code, value = rounder.round(block[:, i], decodes[g])
-            codes[:, column] = code.to(codes.dtype)
-            decoded[:, column] = value
-            j = begin + i
-            error = (block[:, i] - value) / upper[j, j]
-            block[:, i:] -= error[:, None] * upper[j, j:end][None, :]
-            errors[:, i] = error
-        w[:, end:] -= errors @ upper[begin:end, end:]
+    if fused and w.is_cuda:
+        _fused_loop(w, upper, rounder, columns, position, weights_np, codes, scales, decoded, fmt)
+    else:
+        _column_loop(w, upper, rounder, columns, position, weights_np, codes, scales, decoded, group)
     if fmt == NVFP4_FORMAT:
         state = QuantState(NVFP4_FORMAT, layout, shape, codes.to(torch.uint8).cpu().numpy(), scales.cpu().numpy(),
                            rounder.global_scale, rounder.table)
