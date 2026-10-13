@@ -150,7 +150,7 @@ class Layer:
         vz = self._linear("gdn/value_z", x, observe)
         a = x.float() @ self.a_projection.float().T  # [b, n, 48], FP32
         beta_in = x.float() @ self.b_projection.float().T
-        alpha = torch.exp(-torch.exp(self.a_log) * F.softplus(a + self.dt_bias))
+        decay = -torch.exp(self.a_log) * F.softplus(a + self.dt_bias)  # log alpha
         beta = torch.sigmoid(beta_in)
         value_width = VALUE_HEADS * VALUE_DIM
         channels = torch.cat([qk, vz[..., :value_width]], dim=-1).float()  # [b, n, 10240]
@@ -165,7 +165,7 @@ class Layer:
         # Value head h reads key head h // 3.
         q = q.repeat_interleave(VALUE_HEADS // KEY_HEADS, dim=2)
         k = k.repeat_interleave(VALUE_HEADS // KEY_HEADS, dim=2)
-        out = recurrence(q, k, v, alpha, beta) * VALUE_DIM ** -0.5  # VALUE_DIM == KEY_DIM == 128
+        out = gated_delta_rule(q, k, v, decay, beta)
         out = out.to(torch.bfloat16).float()  # [b, n, 48, 128]
         z = vz[..., value_width:].float().view(b, n, VALUE_HEADS, VALUE_DIM)
         inv = torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -216,6 +216,21 @@ class Mtp:
         """[RMSNorm(embedding of token p + 1); RMSNorm(base hidden at p after the final norm)], [b, n, 10240]."""
         return torch.cat([rms_norm(embedded, self.embedding_norm, self.eps),
                           rms_norm(normed_hidden, self.hidden_norm, self.eps)], dim=-1)
+
+
+def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, decay: torch.Tensor,
+                     beta: torch.Tensor) -> torch.Tensor:
+    """S . q / sqrt(128) per token of the gated delta rule (recurrence) with alpha = exp(decay), [b, n, H, 128] FP32:
+    with flash-linear-attention
+    installed, its chunked kernel (a few launches per batch; relative difference about 1.5e-3 from the token loop),
+    otherwise the token loop."""
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    except ImportError:
+        return recurrence(q, k, v, torch.exp(decay), beta) * VALUE_DIM ** -0.5  # VALUE_DIM == KEY_DIM == 128
+    out, _ = chunk_gated_delta_rule(q.float().contiguous(), k.float().contiguous(), v.float().contiguous(),
+                                    decay.float().contiguous(), beta.float().contiguous(), scale=VALUE_DIM ** -0.5)
+    return out.float()
 
 
 def recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
