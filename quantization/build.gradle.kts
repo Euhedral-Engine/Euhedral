@@ -42,14 +42,17 @@ val cudaMathArchives = mapOf(
         "593c9fa25ccb72b37de40873ee22135a55c441754841983fd43858157f1e3373",
     "libnvjitlink/linux-x86_64/libnvjitlink-linux-x86_64-13.1.80-archive.tar.xz" to
         "850cba213192691046441b5334588daa796c3dbce71253131fbf3c77e29ca18d",
+    // cuSOLVER links cuSPARSE.
+    "libcusparse/linux-x86_64/libcusparse-linux-x86_64-12.7.2.19-archive.tar.xz" to
+        "7366b71dd438e06ebc744aa3c272a0423ec4c156bd5254f6cb1a58d5f61c570a",
 )
 val cudaMathDirectory = layout.buildDirectory.dir("cuda-math/lib")
 
 val cudaMathLibraries = tasks.register("cudaMathLibraries") {
     group = "build"
-    description = "Download cuBLAS, cuSOLVER and nvJitLink shared libraries for the quantization tools."
+    description = "Download cuBLAS, cuSOLVER, cuSPARSE and nvJitLink shared libraries for the quantization tools."
     outputs.dir(cudaMathDirectory)
-    outputs.upToDateWhen { cudaMathDirectory.get().file("libcusolver.so.12").asFile.isFile }
+    outputs.upToDateWhen { cudaMathDirectory.get().file("libcusparse.so.12").asFile.isFile }
     doLast {
         val cache = gradle.gradleUserHomeDir.toPath().resolve("caches/euhedral-cuda/13.1.80")
         val destination = cudaMathDirectory.get().asFile.toPath()
@@ -100,6 +103,7 @@ tasks.named<JavaExec>("run") {
     environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
     val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
     dependsOn(cudaMathLibraries)
+    systemProperty("euhedral.quantization.cuda-libraries", cudaMathDirectory.get().asFile.absolutePath)
     environment(
         searchVariable,
         listOf(hostRuntimeDirectory, cudaMathDirectory.get().asFile.absolutePath, System.getenv(searchVariable) ?: "")
@@ -115,6 +119,7 @@ tasks.withType<Test>().configureEach {
 // kernels compile against.
 tasks.withType<Test>().matching { it.name.startsWith("cuda") }.configureEach {
     dependsOn(cudaMathLibraries)
+    systemProperty("euhedral.quantization.cuda-libraries", cudaMathDirectory.get().asFile.absolutePath)
     environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
     environment(
         "LD_LIBRARY_PATH",

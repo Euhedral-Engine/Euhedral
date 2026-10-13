@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.Upload;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -36,8 +37,8 @@ class GptqCudaIntegrationTest {
             Cuda cuda = new Cuda();
             Gptq gptq = new Gptq(cuda, gpu, 0L);
             long weightDevice = gpu.allocate(2L * n * k), hessianDevice = gpu.allocate(4L * k * k);
-            gpu.copyHostToDevice(weightDevice, MemorySegment.ofBuffer(weight.data()), 2L * n * k);
-            gpu.copyHostToDevice(hessianDevice, MemorySegment.ofArray(h), 4L * k * k);
+            Upload.segment(gpu, weightDevice, MemorySegment.ofBuffer(weight.data()), 2L * n * k);
+            Upload.floats(gpu, hessianDevice, h);
             float[] w = new float[n * k];
             for (int i = 0; i < n * k; i++)
                 w[i] = Float.intBitsToFloat(weight.data().getShort(2 * i) << 16);

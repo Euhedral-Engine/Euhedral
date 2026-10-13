@@ -4,7 +4,7 @@ import io.euhedral_execution.inference.core.model.qwen38.GdnState;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import io.euhedral_execution.inference.quantization.gpu.Device;
-import java.lang.foreign.MemorySegment;
+import io.euhedral_execution.inference.quantization.gpu.Upload;
 
 /// One Qwen3.8 decoder layer (or the MTP block) over a batch of whole sequences on the engine's kernels, with BF16
 /// projection weights. Each quantized linear's input rows go to the observer first (for its Hessian). Sequences start
@@ -49,7 +49,7 @@ public final class LayerForward implements AutoCloseable {
         alpha = alloc(4L * maxRows * c.valueHeads());
         beta = alloc(4L * maxRows * c.valueHeads());
         position = alloc(8);
-        device.gpu.copyHostToDevice(position, MemorySegment.ofArray(new long[] {0}), 8);
+        Upload.longs(device.gpu, position, new long[] {0});
     }
 
     private long alloc(long bytes) {
