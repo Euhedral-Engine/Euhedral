@@ -28,8 +28,14 @@ static __device__ __forceinline__ unsigned e2m1_pair_bits(unsigned byte) {
 #pragma unroll
     for (int i = 0; i < 2; i++) {
         const unsigned code = (byte >> (4 * i)) & 15u, magnitude = code & 7u;
+#if EUHEDRAL_KV_CODEC != 0
+        // (m + 0.5) in FP16: exponent of 2m + 1 minus one, its fraction bits below the leading one.
+        const unsigned odd = 2u * magnitude + 1u, top = 31u - __clz(odd);
+        const unsigned bits = (((top + 14u) << 10) | ((odd << (10u - top)) & 0x3ffu)) | ((code & 8u) << 12);
+#else
         const unsigned bits = (magnitude < 2u ? magnitude * 0x3800u : ((((magnitude >> 1) + 14u) << 10) | ((magnitude & 1u) << 9)))
                 | ((code & 8u) << 12);
+#endif
         pair |= bits << (16 * i);
     }
     return pair;

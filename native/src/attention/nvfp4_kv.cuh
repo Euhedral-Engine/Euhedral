@@ -17,19 +17,28 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+// EUHEDRAL_KV_CODEC (measurement builds, set through EUHEDRAL_CUDA_KV_CODEC): 0 is E2M1; 1, 2 and 3 store
+// midrise integer grids in the same nibbles, magnitudes (m + 0.5) for m < 8, 4 and 2 (INT4, INT3, INT2).
+#ifndef EUHEDRAL_KV_CODEC
+#define EUHEDRAL_KV_CODEC 0
+#endif
+
 namespace nvfp4kv {
+
+constexpr unsigned int kMidriseLevels = EUHEDRAL_KV_CODEC == 1 ? 8u : EUHEDRAL_KV_CODEC == 2 ? 4u : 2u;
 
 constexpr int kHeadDim = 256;
 constexpr int kGroup = 16;
 constexpr int kGroups = kHeadDim / kGroup;
 constexpr int kCodeBytes = kHeadDim / 2;
-constexpr float kMaxFinite = 6.0f;
+constexpr float kMaxFinite = EUHEDRAL_KV_CODEC == 0 ? 6.0f : kMidriseLevels - 0.5f;
 constexpr float kScaleMinimum = 1.0f / 512.0f;
 constexpr float kScaleMaximum = 448.0f;
 
 // E2M1 magnitudes indexed by the low three code bits.
 __device__ __forceinline__ float e2m1_magnitude(unsigned int code) {
     const unsigned int magnitude = code & 7u;
+    if (EUHEDRAL_KV_CODEC != 0) return static_cast<float>(magnitude) + 0.5f;
     // E2M1 bias is one. Codes 0 and 1 are zero and the 0.5 subnormal;
     // normal codes map directly to the FP32 exponent and leading fraction bit.
     // A dynamically indexed local table otherwise emits eight local stores per
@@ -43,6 +52,10 @@ __device__ __forceinline__ float e2m1_magnitude(unsigned int code) {
 __device__ __forceinline__ unsigned int e2m1_encode(float value) {
     const float a = fabsf(value);
     unsigned int code;
+    if (EUHEDRAL_KV_CODEC != 0) {
+        code = min(static_cast<unsigned int>(a), kMidriseLevels - 1u);  // nearest (m + 0.5), saturating
+        return code | ((__float_as_uint(value) >> 28) & 8u);
+    }
     if (a <= 0.25f) code = 0;
     else if (a < 0.75f) code = 1;
     else if (a <= 1.25f) code = 2;
