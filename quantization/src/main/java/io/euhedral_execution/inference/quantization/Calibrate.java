@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import io.euhedral_execution.inference.quantization.gptq.QuantState;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
 import io.euhedral_execution.inference.quantization.gpu.Device;
+import io.euhedral_execution.inference.quantization.gpu.Upload;
 import io.euhedral_execution.inference.quantization.model.LayerForward;
 import io.euhedral_execution.inference.quantization.model.LayerWeights;
 import java.io.IOException;
@@ -341,7 +342,7 @@ public final class Calibrate {
 
     private void gather(long table, int[] ids, long out) {
         long idsDevice = device.gpu.allocate(4L * ids.length);
-        device.gpu.copyHostToDevice(idsDevice, MemorySegment.ofArray(ids), 4L * ids.length);
+        Upload.ints(device.gpu, idsDevice, ids);
         long vectors = (long) ids.length * hidden / 8;
         device.cuda.launch(
                 gatherRows,

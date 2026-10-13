@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.quantization.gptq;
 
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
+import io.euhedral_execution.inference.quantization.gpu.Upload;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -679,32 +680,32 @@ public final class Gptq implements AutoCloseable {
 
     private long upload(int[] values) {
         long address = gpu.allocate(4L * Math.max(1, values.length));
-        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), 4L * values.length);
+        Upload.ints(gpu, address, values);
         return address;
     }
 
     private long upload(float[] values) {
         long address = gpu.allocate(4L * Math.max(1, values.length));
-        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), 4L * values.length);
+        Upload.floats(gpu, address, values);
         return address;
     }
 
     /// Stream-ordered uploads for round(), freed with freeAsync on the same stream.
     private long uploadAsync(int[] values) {
         long address = gpu.allocateAsync(4L * Math.max(1, values.length));
-        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), 4L * values.length);
+        Upload.ints(gpu, address, values);
         return address;
     }
 
     private long uploadAsync(float[] values) {
         long address = gpu.allocateAsync(4L * Math.max(1, values.length));
-        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), 4L * values.length);
+        Upload.floats(gpu, address, values);
         return address;
     }
 
     private long uploadAsync(byte[] values) {
         long address = gpu.allocateAsync(Math.max(1, values.length));
-        gpu.copyHostToDevice(address, MemorySegment.ofArray(values), values.length);
+        Upload.bytes(gpu, address, values);
         return address;
     }
 

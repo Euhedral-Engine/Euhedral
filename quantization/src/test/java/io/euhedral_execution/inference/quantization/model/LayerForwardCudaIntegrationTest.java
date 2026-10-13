@@ -20,9 +20,8 @@ import org.junit.jupiter.api.Test;
 
 /// Layers 0 (GDN) and 3 (attention) on the engine's kernels against tools/gptq/qwen38.py's BF16 forward of the same
 /// input (fixture: quantization/src/test/python/make_forward_fixture.py, written to build/forward-fixture). Each
-/// layer's
-/// update of the hidden states is compared; attention differs more, because the engine keeps its keys and values in
-/// the NVFP4 cache.
+/// layer's update of the hidden states is compared. The engine keeps attention's keys and values in its NVFP4 cache,
+/// so layer 3 is held to the reference with the same cache codec, and its distance from plain BF16 is reported.
 class LayerForwardCudaIntegrationTest {
 
     @Test
@@ -50,24 +49,33 @@ class LayerForwardCudaIntegrationTest {
                         device.synchronize();
                     }
                     device.gpu.copyDeviceToHost(host, states, host.byteSize());
-                    float[] expected = bf16(fixture.resolve("layer" + index + ".npy"));
-                    double difference = 0, norm = 0;
-                    for (int i = 0; i < rows * hidden; i++) {
-                        float actual = Float.intBitsToFloat(host.getAtIndex(ValueLayout.JAVA_SHORT, i) << 16);
-                        double reference = expected[i] - input[i];
-                        difference += Math.pow((actual - input[i]) - reference, 2);
-                        norm += reference * reference;
-                    }
-                    double relative = Math.sqrt(difference / norm);
+                    double plain =
+                            difference(host, input, bf16(fixture.resolve("layer" + index + ".npy")), rows * hidden);
+                    double relative = index == 0
+                            ? plain
+                            : difference(host, input, bf16(fixture.resolve("layer3-kv.npy")), rows * hidden);
                     System.out.printf(
-                            "layer %d: relative difference of the update %.4f, observed %s%n",
-                            index, relative, observed);
+                            "layer %d: relative difference of the update %.4f (from plain BF16 %.4f), observed %s%n",
+                            index, relative, plain, observed);
                     assertEquals(objects.layerObjects(index), observed);
-                    assertTrue(relative < (index == 0 ? 0.02 : 0.05), "layer " + index + ": " + relative);
+                    // The engine's attention multiplies probabilities and values in FP16 (1.85% on this fixture).
+                    assertTrue(relative < (index == 0 ? 0.01 : 0.03), "layer " + index + ": " + relative);
                 }
                 device.gpu.free(states);
             }
         }
+    }
+
+    /// |actual update - expected update| / |expected update| over the hidden states.
+    private static double difference(MemorySegment actual, float[] input, float[] expected, int count) {
+        double difference = 0, norm = 0;
+        for (int i = 0; i < count; i++) {
+            float value = Float.intBitsToFloat(actual.getAtIndex(ValueLayout.JAVA_SHORT, i) << 16);
+            double reference = expected[i] - input[i];
+            difference += Math.pow((value - input[i]) - reference, 2);
+            norm += reference * reference;
+        }
+        return Math.sqrt(difference / norm);
     }
 
     private static MemorySegment raw(Path npy) throws Exception {

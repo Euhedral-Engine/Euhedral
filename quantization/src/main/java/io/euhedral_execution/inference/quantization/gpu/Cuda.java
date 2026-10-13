@@ -8,6 +8,8 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -39,8 +41,10 @@ public final class Cuda {
     public Cuda() {
         SymbolLookup driver = SymbolLookup.libraryLookup("libcuda.so.1", arena);
         SymbolLookup nvrtc = SymbolLookup.libraryLookup("libnvrtc.so.13", arena);
-        SymbolLookup cublas = SymbolLookup.libraryLookup("libcublas.so.13", arena);
-        SymbolLookup cusolver = SymbolLookup.libraryLookup("libcusolver.so.12", arena);
+        // cuBLAS and cuSOLVER come from the module's download (cudaMathLibraries), loaded by absolute path with their
+        // dependencies first, so no library path needs them.
+        SymbolLookup cublas = mathLibrary("libnvJitLink.so.13", "libcublasLt.so.13", "libcublas.so.13");
+        SymbolLookup cusolver = mathLibrary("libcusolver.so.12");
         cuInit = bind(driver, "cuInit", INT, INT);
         cuDeviceGet = bind(driver, "cuDeviceGet", INT, PTR, INT);
         cuDeviceGetAttribute = bind(driver, "cuDeviceGetAttribute", INT, PTR, INT, INT);
@@ -107,6 +111,18 @@ public final class Cuda {
             throw rethrow(failure);
         }
         bindThread();
+    }
+
+    private SymbolLookup mathLibrary(String... names) {
+        String directory = System.getProperty("euhedral.quantization.cuda-libraries", "");
+        SymbolLookup last = null;
+        for (String name : names) {
+            Path path = directory.isBlank() ? null : Path.of(directory, name);
+            last = path != null && Files.isRegularFile(path)
+                    ? SymbolLookup.libraryLookup(path, arena)
+                    : SymbolLookup.libraryLookup(name, arena);
+        }
+        return last;
     }
 
     /// Makes the primary context current on the calling thread (each thread that calls the driver API needs it).
