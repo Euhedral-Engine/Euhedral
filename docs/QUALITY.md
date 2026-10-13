@@ -84,8 +84,8 @@ Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE
 |---|---|---|---|---|
 | nvfp4-compressed | +0.033 ± 0.007 / 0.028 / 90.3% | +0.002 ± 0.005 / 0.032 / 93.2% | +0.038 ± 0.005 / 0.059 / 96.8% | +0.093 ± 0.021 / 0.149 / 93.9% |
 | nvfp4 | +0.024 ± 0.008 / 0.028 / 90.9% | +0.012 ± 0.005 / 0.032 / 93.1% | +0.035 ± 0.005 / 0.059 / 96.9% | +0.079 ± 0.027 / 0.148 / 93.4% |
-| q3 | +0.110 ± 0.017 / 0.115 / 83.0% | +0.054 ± 0.008 / 0.119 / 86.2% | +0.161 ± 0.019 / 0.228 / 92.3% | -0.088 ± 0.049 / 0.420 / 87.1% |
-| q3-compressed | +0.141 ± 0.019 / 0.153 / 80.1% | +0.067 ± 0.013 / 0.145 / 84.7% | +0.205 ± 0.025 / 0.271 / 91.1% | -0.012 ± 0.067 / 0.514 / 85.3% |
+| q3 | +0.106 ± 0.016 / 0.090 / 85.2% | +0.030 ± 0.006 / 0.080 / 89.2% | +0.133 ± 0.017 / 0.190 / 93.6% | +0.006 ± 0.034 / 0.294 / 89.8% |
+| q3-compressed | +0.101 ± 0.017 / 0.106 / 84.0% | +0.022 ± 0.013 / 0.102 / 87.8% | +0.165 ± 0.021 / 0.225 / 92.7% | +0.070 ± 0.031 / 0.292 / 90.0% |
 
 On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix near-deterministic answer text with
 open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
@@ -97,11 +97,12 @@ GGUFs and `weight_only.sh`'s work directory).
 
 ## GPTQ
 
-The NVFP4 artifacts' decoder layers, LM head and draft head are rounded by GPTQ (`tools/gptq/`, Frantar et al., 2022):
+Every artifact's decoder layers, LM head and draft head are rounded by GPTQ (`tools/gptq/`, Frantar et al., 2022):
 each linear's columns are rounded in order, and each column's rounding error is carried into the columns not yet
 rounded through the Cholesky factor of the inverse Hessian H = XᵀX of the linear's inputs, so the rounding minimizes
 the output error on the calibration activations rather than the weight error. Scales are chosen as the converter
-chooses them (block scales by weighted search, the SD4 table by its error DP), weighted by diag(H), on the
+chooses them (group scales by weighted search within the codes the layout stores, -3..3 for `q3-compressed`'s
+P2E2 tensors; block scales by weighted search; the SD4 table by its error DP), weighted by diag(H), on the
 error-updated weights; the codes go into the converter with `--codes-from`, and the token embedding and the MTP layer
 are rounded by the converter (`--imatrix`).
 
@@ -114,12 +115,13 @@ Hermes function-calling prompts that T4 does not use, generated greedily by the 
 its BF16 forward pass on T1 is within KL 0.0005 of llama.cpp's BF16 reference) one layer at a time: the Hessians
 accumulate on the GPU while the sequences pass through the layer, the layer's objects are rounded, and the sequences
 pass through the rounded layer to give the next layer its inputs. The hidden states stay in pinned host memory. It takes
-49 minutes for `nvfp4` and 53 for `nvfp4-compressed` on the 16 GB card (52 s per layer), with damping 0.01.
+46 to 53 minutes per artifact on the 16 GB card (about 45 s per layer), with damping 0.01.
 
 **Engine checks** of the GPTQ artifacts, `nvfp4-compressed` (`nvfp4`): 2.94 (2.99) tokens per verification at 4K and
 3.01 (3.17) at 32K over the benchmark's chat prompts, 118 (102) tok/s at 4K and 103 (105) at 32K. Acceptance varies by
 up to 0.75 tokens per verification between the four prompts of each length. Rounding the draft head by the converter
-instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ.
+instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ. `q3` (`q3-compressed`): 2.45 (2.47) tokens per
+verification at 4K and 2.47 (2.50) at 32K, 122 (107) tok/s at 4K and 111 (97) at 32K.
 
 ## Weight-only error
 
@@ -127,7 +129,8 @@ instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ.
 (`tools/holdout/dequantize_gguf.py`; tensors matching `--keep` stay BF16) and scores it with
 `llama-perplexity --kl-divergence` against the same reference. That isolates what the weights cost from what the engine's
 execution adds, and keeping one tensor family at BF16 measures how much of the error that family carries. On T2 against
-Swift-1.5 BF16 (25 chunks; token-level standard errors):
+Swift-1.5 BF16 (25 chunks; token-level standard errors), measured on artifacts rounded by calibrated scale search
+throughout (before GPTQ):
 
 | Weights | dNLL | Mean KL | KL p99 | Top-1 |
 |---|---|---|---|---|
@@ -184,8 +187,8 @@ one family's format:
 | GDN and attention outputs Q3 to Q4 | 0.118 | +0.25 GB | rejected: on T4 (the model's own generations) dNLL +0.18 in the engine |
 | query_key Q4 to Q3 | 0.135 | -0.20 GB | rejected |
 
-The engine adds little on top of its weights: on T2 its mean KL is 0.046 for `nvfp4` and 0.119 for `q3` (holdout table
-above), against 0.042 and 0.116 for the weights alone in llama.cpp.
+The engine adds little on top of its weights: with those scale-search weights its mean KL on T2 was 0.046 for `nvfp4`
+and 0.119 for `q3`, against 0.042 and 0.116 for the weights alone in llama.cpp.
 
 The LM head carries a third of the KL in 4.7% of the weights. The Q4 and Q5 families (GDN input projections and
 full-attention Q, K and V) carry about 0.004 together, and the token embedding almost none. Per-token KL and top-1 order the families consistently; dNLL does not (quantization noise moves the forced token's

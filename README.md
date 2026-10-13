@@ -94,10 +94,10 @@ Residency is described in [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md) and
 Error is measured four separate ways because they answer different questions. All use the 1279 teacher-forced tokens
 that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint run in llama.cpp on the CPU as the reference.
 
-The two NVFP4 artifacts' decoder layers and heads are rounded by GPTQ: each linear's rounding minimizes the error of
+All four artifacts' decoder layers and heads are rounded by GPTQ: each linear's rounding minimizes the error of
 its outputs on calibration activations of the quantized model, each column's error carried into the columns not yet
-rounded (`tools/gptq`, [docs/QUALITY.md](docs/QUALITY.md#gptq)). Every other quantized object, and every object of the Q3
-artifacts, is rounded by calibrated scale search: every group's scale minimizes its
+rounded (`tools/gptq`, [docs/QUALITY.md](docs/QUALITY.md#gptq)). The token embedding and the MTP layer are rounded by
+calibrated scale search: every group's scale minimizes its
 error weighted by the importance of each input column (`tools/convert_checkpoint.py --imatrix`, see
 [tools/README.md](tools/README.md)) with UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from
 `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`), and is measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its
@@ -108,8 +108,8 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `q3` | 2.252 | 9.51 | +0.110 ± 0.017 | 0.115 | 83.0% |
-| `q3-compressed` | 2.283 | 9.81 | +0.141 ± 0.019 | 0.153 | 80.1% |
+| `q3` | 2.248 | 9.47 | +0.106 ± 0.016 | 0.090 | 85.2% |
+| `q3-compressed` | 2.242 | 9.42 | +0.101 ± 0.017 | 0.106 | 84.0% |
 | `nvfp4` | 2.166 | 8.72 | +0.024 ± 0.008 | 0.028 | 90.9% |
 | `nvfp4-compressed` | 2.174 | 8.80 | +0.033 ± 0.007 | 0.028 | 90.3% |
 
@@ -147,8 +147,8 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
   16 GB card it keeps 0.08 to 0.65 GiB of weights in host memory at 32K to 64K (1.78 GiB at 128K) and streams them in for every
   token: 109 tok/s at 32K, 94 at 64K and 82 at 128K.
 - **Fastest at 32K and 64K, and the one that fits everywhere:** `q3`: 137 tok/s at 4K, 114 at 32K, 108 at 64K and 83 at 128K,
-  with no host-backed weights (perplexity 9.51).
-- **More room instead of speed:** `q3-compressed` (perplexity 9.81) is a file about 0.7 GiB smaller than `q3`, which leaves more
+  with no host-backed weights (perplexity 9.47).
+- **More room instead of speed:** `q3-compressed` (perplexity 9.42) is a file about 0.7 GiB smaller than `q3`, which leaves more
   of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 106 tok/s at 4K,
   105 at 32K, 103 at 64K and 63 at 128K.
 - `nvfp4` (perplexity 8.72) keeps 0.84 to 1.40 GiB of weights in host memory at 32K to 64K (2.59 GiB at 128K): it decodes
