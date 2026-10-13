@@ -52,8 +52,15 @@ def round_object(name, weight, hessian, plan, out, damp, start, rows=None, act_o
     """GPTQ of one object (in row slices of `rows` when given), saved to `out`; returns the decoded weights (BF16)."""
     shape = tuple(plan.shape)
     lowest = plan.source[1].lowest_code if plan.source[1] is not None else None
-    order = column_order(hessian) if act_order else torch.arange(hessian.shape[0], device=hessian.device)
-    upper = inverse_cholesky(hessian[order][:, order], damp)
+    if act_order:
+        order = column_order(hessian)
+        permuted = hessian[order]
+        permuted = permuted[:, order]  # one 1.2 GB copy at a time for mlp/down
+        upper = inverse_cholesky(permuted, damp, consume=True)
+        del permuted
+    else:
+        order = torch.arange(hessian.shape[0], device=hessian.device)
+        upper = inverse_cholesky(hessian, damp)
     tensor = nvfp4_tensor_scales(weight, hessian, plan.layout) if plan.format_name == "NVFP4" else None
     rows = rows or weight.shape[0]
     states, decoded = [], torch.empty_like(weight, dtype=torch.bfloat16)
@@ -222,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
                 hidden[begin:begin + args.batch] = layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True)).cpu()
             del layer, observe
             torch.cuda.empty_cache()
-            log(start, f"layer {index} done")
+            log(start, f"layer {index} done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+            torch.cuda.reset_peak_memory_stats()
         final_norm = checkpoint.tensor("model.language_model.norm.weight")
         head_hessian = torch.zeros(HIDDEN, HIDDEN, device="cuda")
         draft_hessian = head_hessian
