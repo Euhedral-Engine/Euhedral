@@ -79,6 +79,37 @@ def round_object(name, weight, hessian, plan, out, damp, start, rows=None, act_o
     return decoded
 
 
+def accumulate(hessian: torch.Tensor, x: torch.Tensor) -> None:
+    """hessian += x^T x for BF16 rows x [n, K]: BF16 tensor-core products, exact, accumulated in FP32 in place."""
+    x = x.to(torch.bfloat16)
+    torch.addmm(hessian, x.T, x, out_dtype=torch.float32, out=hessian)
+
+
+class Observer:
+    """The Hessians of a layer's linears, accumulated by `observe(name, x)`; linears that read the same input rows in
+    a batch (query_key and gate_value or value_z) share one Hessian instead of computing it twice."""
+
+    def __init__(self):
+        self.hessians: dict[str, torch.Tensor] = {}
+        self.alias: dict[str, str] = {}
+        self.last: tuple[int, tuple[int, ...], str] | None = None
+
+    def __call__(self, name: str, x: torch.Tensor) -> None:
+        key = (x.data_ptr(), tuple(x.shape))
+        if self.last is not None and self.last[:2] == key and name not in self.hessians:
+            self.alias[name] = self.last[2]
+            return
+        if name in self.alias:
+            return
+        if name not in self.hessians:
+            self.hessians[name] = torch.zeros(x.shape[1], x.shape[1], device="cuda")
+        accumulate(self.hessians[name], x)
+        self.last = (*key, name)
+
+    def result(self) -> dict[str, torch.Tensor]:
+        return {**self.hessians, **{name: self.hessians[source] for name, source in self.alias.items()}}
+
+
 def round_objects(weights: dict[str, torch.Tensor], hessians: dict[str, torch.Tensor], plans, args, start) -> None:
     """Rounds every object of `weights` under its Hessian at once, each on its own thread and CUDA stream (one object's
     column loop launches kernels from one thread and leaves the GPU idle between them); replaces each with its decoded
@@ -116,10 +147,8 @@ def mtp_pass(checkpoint, hidden, ids, final_norm, head_hessian, plans, args, sta
     stem_hessian = torch.zeros(2 * HIDDEN, 2 * HIDDEN, device="cuda")
     for begin in range(0, sequences, batch):
         normed, x = stem(begin)
-        flat = normed.reshape(-1, HIDDEN).float()
-        head_hessian.addmm_(flat.T, flat)
-        flat = x.reshape(-1, 2 * HIDDEN).float()
-        stem_hessian.addmm_(flat.T, flat)
+        accumulate(head_hessian, normed.reshape(-1, HIDDEN))
+        accumulate(stem_hessian, x.reshape(-1, 2 * HIDDEN))
     projection = round_object("mtp/input_projection", mtp.input_projection, stem_hessian, plans["mtp/input_projection"],
                               args.out, args.damp, start, act_order=args.act_order)
     del stem_hessian
@@ -129,22 +158,14 @@ def mtp_pass(checkpoint, hidden, ids, final_norm, head_hessian, plans, args, sta
     del embedding, projection
     torch.cuda.empty_cache()
     rows = hidden[:, :-1]
-    hessians: dict[str, torch.Tensor] = {}
-
-    def observe(name: str, x: torch.Tensor) -> None:
-        xf = x.float()
-        if name not in hessians:
-            hessians[name] = torch.zeros(xf.shape[1], xf.shape[1], device="cuda")
-        hessians[name].addmm_(xf.T, xf)
-
+    observe = Observer()
     for begin in range(0, sequences, batch):
         mtp.layer.forward(rows[begin:begin + batch].cuda(), observe)
-    round_objects(mtp.layer.weights, hessians, plans, args, start)
+    round_objects(mtp.layer.weights, observe.result(), plans, args, start)
     draft_hessian = torch.zeros(HIDDEN, HIDDEN, device="cuda")
     for begin in range(0, sequences, batch):
         m = rms_norm(mtp.layer.forward(rows[begin:begin + batch].cuda()), mtp.final_norm, checkpoint.eps)
-        flat = m.reshape(-1, HIDDEN).float()
-        draft_hessian.addmm_(flat.T, flat)
+        accumulate(draft_hessian, m.reshape(-1, HIDDEN))
     log(start, "MTP layer done")
     return draft_hessian
 
@@ -188,20 +209,14 @@ def main(argv: list[str] | None = None) -> int:
         log(start, f"{sequences} sequences of {length} tokens embedded")
         for index in range(args.layers):
             layer = Layer(checkpoint, index)
-            hessians: dict[str, torch.Tensor] = {}
-
-            def observe(name: str, x: torch.Tensor) -> None:
-                xf = x.float()
-                if name not in hessians:
-                    hessians[name] = torch.zeros(xf.shape[1], xf.shape[1], device="cuda")
-                hessians[name].addmm_(xf.T, xf)
+            observe = Observer()
 
             for begin in range(0, sequences, args.batch):
                 layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True), observe)
-            round_objects(layer.weights, hessians, plans, args, start)
+            round_objects(layer.weights, observe.result(), plans, args, start)
             for begin in range(0, sequences, args.batch):
                 hidden[begin:begin + args.batch] = layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True)).cpu()
-            del layer, hessians
+            del layer, observe
             torch.cuda.empty_cache()
             log(start, f"layer {index} done")
         final_norm = checkpoint.tensor("model.language_model.norm.weight")
@@ -209,8 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         draft_hessian = head_hessian
         if args.skip_mtp:
             for begin in range(0, sequences, args.batch):
-                x = rms_norm(hidden[begin:begin + args.batch].cuda(), final_norm, checkpoint.eps).reshape(-1, HIDDEN).float()
-                head_hessian.addmm_(x.T, x)
+                accumulate(head_hessian, rms_norm(hidden[begin:begin + args.batch].cuda(), final_norm,
+                                                  checkpoint.eps).reshape(-1, HIDDEN))
         else:
             draft_hessian = mtp_pass(checkpoint, hidden, ids, final_norm, head_hessian, plans, args, start)
         del hidden
