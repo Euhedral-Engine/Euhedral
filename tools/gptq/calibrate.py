@@ -157,6 +157,34 @@ class Observer:
         return {**self.hessians, **{name: self.hessians[source] for name, source in self.alias.items()}}
 
 
+def batches(hidden: torch.Tensor, batch: int, step, write: bool = False) -> None:
+    """step(rows on the GPU) for each batch of the pinned `hidden`, the next batch copied in on a side stream while the
+    current one computes; with `write`, the result goes back into `hidden` without stopping the GPU."""
+    copier = torch.cuda.Stream()
+    compute = torch.cuda.current_stream()
+
+    def load(begin):
+        with torch.cuda.stream(copier):
+            rows = hidden[begin:begin + batch].to("cuda", non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(copier)
+        return rows, ready
+
+    starts = list(range(0, hidden.shape[0], batch))
+    pending = load(starts[0])
+    for index, begin in enumerate(starts):
+        rows, ready = pending
+        compute.wait_event(ready)
+        rows.record_stream(compute)
+        if index + 1 < len(starts):
+            # The next batch is never one this loop writes back before it (write-back goes to this batch only).
+            pending = load(starts[index + 1])
+        result = step(rows)
+        if write:
+            hidden[begin:begin + batch].copy_(result, non_blocking=True)
+    torch.cuda.synchronize()
+
+
 def round_objects(weights: dict[str, torch.Tensor], hessians: dict[str, torch.Tensor], plans, args, start) -> None:
     """Rounds every object of `weights` under its Hessian at once, each on its own thread and CUDA stream (one object's
     column loop launches kernels from one thread and leaves the GPU idle between them); replaces each with its decoded
@@ -266,11 +294,9 @@ def main(argv: list[str] | None = None) -> int:
             layer = Layer(checkpoint, index)
             observe = Observer()
 
-            for begin in range(0, sequences, args.batch):
-                layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True), observe)
+            batches(hidden, args.batch, lambda rows: layer.forward(rows, observe))
             round_objects(layer.weights, observe.result(), plans, args, start)
-            for begin in range(0, sequences, args.batch):
-                hidden[begin:begin + args.batch] = layer.forward(hidden[begin:begin + args.batch].cuda(non_blocking=True)).cpu()
+            batches(hidden, args.batch, layer.forward, write=True)
             del layer, observe
             torch.cuda.empty_cache()
             log(start, f"layer {index} done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
