@@ -13,14 +13,14 @@ The artifact selects the layout per tensor, so no engine option exists: the engi
 
 On an RTX 5070 Ti (16 GB):
 
-- **Memory.** The calibrated `q3-compressed` artifact is 12.05 GB. Loaded at a 32K context it takes 12,363,893,284 bytes of
-  device memory against 12,992,556,060 for `q3`: 0.59 GiB less. The expansion scratch takes back at most
+- **Memory.** The calibrated `q3-compressed` artifact is 11.81 GB. Loaded at a 32K context it takes 12,120,099,364 bytes of
+  device memory against 12,748,762,140 for `q3`: 0.59 GiB less. The expansion scratch takes back at most
   128 MiB of weights plus the activation region (see Execution routes).
 - **Fast path.** A warp decodes a slice on the fast path when every lane of its four rows has at most 31 BIG codes among its 32
   and the slice's payload fits the 32 prefetched words. Calibrated codes are about 31% BIG; 0.1% of their slices take the slow
   path.
-- **Decode** (the fused P2E2 kernels): with MTP2 (three-row verification) the calibrated artifact decodes 98.5 tok/s at 4K,
-  98.3 at 32K, 97.2 at 64K and 64.6 at 128K (the README's benchmark: chat corpus, 128 generated tokens, 64 at 128K; measured on
+- **Decode** (the fused P2E2 kernels): with MTP2 (three-row verification) the calibrated artifact decodes 105.8 tok/s at 4K,
+  105.0 at 32K, 102.6 at 64K and 63.3 at 128K (the README's benchmark: chat corpus, 128 generated tokens, 64 at 128K; measured on
   2026-10-12). Measured on round-to-nearest codes, before the calibrated artifact: one
   row decodes at 58.9 tok/s at a 64-token context, 57.6 at 1024 and 56.1 at 4096, 128 generated tokens, greedy. On cold weights at the model's shapes the kernels
   take, for gate_up (34816 x 5120) and down (5120 x 17408): one row 91 and 52 us, two rows 111 and 67 us, three rows 134 and 74 us,
@@ -90,7 +90,7 @@ Q3 family in P2E2 it is 0.164; taking one family from `q3` instead (row-split, -
 | attention output (rejected) | 0.164 | 0.02 GiB |
 | token embedding (rejected) | 0.164 | 0.05 GiB |
 
-With the down projections row-split, the MTP drafter's tokens are accepted 2.50 times per verification over seven 32K chat
+With the down projections row-split, the MTP drafter's tokens are accepted 2.48 times per verification over seven 32K chat
 prompts.
 
 **Rejected: a P2E2 that stores -4.** Wider payload units cost 3.09 bits per code, more than row-split Q3. An escape code (2-bit

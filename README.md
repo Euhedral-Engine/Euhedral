@@ -16,8 +16,8 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 
 | Artifact | Quantization | Representation | File size | Compression |
 |---|---|---|---|---|
-| `q3` | Q3 | uncompressed | 11.90 GiB (12.78 GB) | LM head in NVFP4 |
-| `q3-compressed` | Q3 | compressed | 11.22 GiB (12.05 GB) | lossless layout of a Q3 limited to the codes -3..3, MLP down projections in row-split Q3 (see [quality](#quality)); LM head in NVFP4 |
+| `q3` | Q3 | uncompressed | 11.68 GiB (12.54 GB) | LM head in NVFP4 |
+| `q3-compressed` | Q3 | compressed | 11.00 GiB (11.81 GB) | lossless layout of a Q3 limited to the codes -3..3, MLP down projections in row-split Q3 (see [quality](#quality)); LM head in NVFP4 |
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
@@ -40,7 +40,7 @@ less of the 16 GB for the target, and the four artifacts above draft with MTP.
 RTX 5070 Ti (16 GB, 70 SMs) in a desktop that also uses the GPU for its display, Linux, one run per row after one warmup. Greedy
 decoding with MTP speculative decoding (two drafted tokens for Q3, four for NVFP4); decode `tok/s` is output tokens per second
 after the first token. Prefill and time to first token (TTFT) include the whole prompt. Measured on 2026-10-11 (commit 66f972c;
-`q3` and `q3-compressed` on 2026-10-12, commit 46986ca) with the GPU at its stock clocks. Decode depends on how many drafted
+`q3` and `q3-compressed` on 2026-10-12, commit 01b4b44) with the GPU at its stock clocks. Decode depends on how many drafted
 tokens the verifier accepts on each prompt, which moves single rows by several percent.
 
 Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128K = 128,000.
@@ -49,8 +49,8 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 2,002 | 1,706 | 1,434 | 1,077 |
-| `q3-compressed` | 1,972 | 1,639 | 1,387 | 1,052 |
+| `q3` | 2,101 | 1,728 | 1,449 | 1,087 |
+| `q3-compressed` | 1,997 | 1,659 | 1,400 | 1,060 |
 | `nvfp4` | 4,118 | 2,885 | 2,185 | 1,418 |
 | `nvfp4-compressed` | 4,040 | 2,849 | 2,165 | 1,437 |
 
@@ -58,8 +58,8 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 126.1 | 114.7 | 110.1 | 88.8 |
-| `q3-compressed` | 98.5 | 98.3 | 97.2 | 64.6 |
+| `q3` | 136.5 | 113.9 | 107.8 | 83.2 |
+| `q3-compressed` | 105.8 | 105.0 | 102.6 | 63.3 |
 | `nvfp4` | 138.8 | 114.1 | 85.7 | 38.7 |
 | `nvfp4-compressed` | 142.0 | 109.3 | 93.7 | 82.1 |
 
@@ -67,8 +67,8 @@ Context is the prompt length: 4K = 3,964 tokens, 32K = 32,612, 64K = 63,362, 128
 
 | Artifact | 4K | 32K | 64K | 128K |
 |---|---|---|---|---|
-| `q3` | 1.99 s | 19.2 s | 44.3 s | 119 s |
-| `q3-compressed` | 2.02 s | 20.0 s | 45.8 s | 122 s |
+| `q3` | 1.90 s | 18.9 s | 43.9 s | 118 s |
+| `q3-compressed` | 2.00 s | 19.7 s | 45.4 s | 121 s |
 | `nvfp4` | 0.97 s | 11.4 s | 29.1 s | 90.5 s |
 | `nvfp4-compressed` | 0.99 s | 11.5 s | 29.4 s | 89.3 s |
 
@@ -78,8 +78,8 @@ chat prompts.
 
 | Artifact | File | Device memory in use at 32K / 64K / 128K | Host-backed weights at 32K / 64K / 128K | Longest context run |
 |---|---|---|---|---|
-| `q3` | 11.90 GiB | 13.0 / 13.6 / 14.3 GiB | none | 128K |
-| `q3-compressed` | 11.22 GiB | 12.4 / 13.0 / 14.2 GiB | none | 128K |
+| `q3` | 11.68 GiB | 12.8 / 13.4 / 14.1 GiB | none | 128K |
+| `q3-compressed` | 11.00 GiB | 12.2 / 12.8 / 14.0 GiB | none | 128K |
 | `nvfp4` | 14.52 GiB | 14.4 / 14.4 / 14.4 GiB | 0.84 / 1.40 / 2.59 GiB | 128K |
 | `nvfp4-compressed` | 13.77 GiB | 14.4 / 14.4 / 14.4 GiB | 0.08 / 0.65 / 1.78 GiB | 128K |
 
@@ -105,8 +105,8 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `q3` | 2.257 | 9.56 | +0.116 ± 0.017 | 0.122 | 82.2% |
-| `q3-compressed` | 2.269 | 9.67 | +0.127 ± 0.019 | 0.153 | 80.2% |
+| `q3` | 2.252 | 9.51 | +0.110 ± 0.017 | 0.115 | 83.0% |
+| `q3-compressed` | 2.283 | 9.81 | +0.141 ± 0.019 | 0.153 | 80.1% |
 | `nvfp4` | 2.171 | 8.77 | +0.030 ± 0.009 | 0.038 | 88.4% |
 | `nvfp4-compressed` | 2.170 | 8.76 | +0.028 ± 0.009 | 0.037 | 89.4% |
 
@@ -143,11 +143,11 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 - **Fastest at short contexts:** `nvfp4-compressed` (perplexity 8.76 against 8.51 for BF16 on the quality text): 142 tok/s at 4K. On a
   16 GB card it keeps 0.08 to 0.65 GiB of weights in host memory at 32K to 64K (1.78 GiB at 128K) and streams them in for every
   token: 109 tok/s at 32K, 94 at 64K and 82 at 128K.
-- **Fastest at 32K and 64K, and the one that fits everywhere:** `q3`: 126 tok/s at 4K, 115 at 32K, 110 at 64K and 89 at 128K,
-  with no host-backed weights (perplexity 9.56).
-- **More room instead of speed:** `q3-compressed` (perplexity 9.67) is a file about 0.7 GiB smaller than `q3`, which leaves more
-  of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 99 tok/s at 4K,
-  98 at 32K, 97 at 64K and 65 at 128K.
+- **Fastest at 32K and 64K, and the one that fits everywhere:** `q3`: 137 tok/s at 4K, 114 at 32K, 108 at 64K and 83 at 128K,
+  with no host-backed weights (perplexity 9.51).
+- **More room instead of speed:** `q3-compressed` (perplexity 9.81) is a file about 0.7 GiB smaller than `q3`, which leaves more
+  of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 106 tok/s at 4K,
+  105 at 32K, 103 at 64K and 63 at 128K.
 - `nvfp4` (perplexity 8.77) keeps 0.84 to 1.40 GiB of weights in host memory at 32K to 64K (2.59 GiB at 128K): it decodes
   as fast as `nvfp4-compressed` up to 32K and slower beyond; the two NVFP4 forms differ by less than the noise of the quality
   measurement, and their prefill is within 3%.
