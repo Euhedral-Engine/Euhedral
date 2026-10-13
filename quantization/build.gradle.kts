@@ -1,4 +1,8 @@
 import java.io.File
+import java.net.URI
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 
 plugins {
     java
@@ -28,6 +32,64 @@ dependencies {
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 
+
+// cuBLAS (Hessian accumulation) and cuSOLVER (Cholesky factors) for this module only, from NVIDIA's CUDA 13.1
+// redistributables (redistrib_13.1.0.json, matching the engine's cudart 13.1.80); Linux x86-64.
+val cudaMathArchives = mapOf(
+    "libcublas/linux-x86_64/libcublas-linux-x86_64-13.2.0.9-archive.tar.xz" to
+        "e23c85f0d80b0c8af5e76a87dc400a123f455e4a603524ed6219616c33283cda",
+    "libcusolver/linux-x86_64/libcusolver-linux-x86_64-12.0.7.41-archive.tar.xz" to
+        "593c9fa25ccb72b37de40873ee22135a55c441754841983fd43858157f1e3373",
+    "libnvjitlink/linux-x86_64/libnvjitlink-linux-x86_64-13.1.80-archive.tar.xz" to
+        "850cba213192691046441b5334588daa796c3dbce71253131fbf3c77e29ca18d",
+)
+val cudaMathDirectory = layout.buildDirectory.dir("cuda-math/lib")
+
+val cudaMathLibraries = tasks.register("cudaMathLibraries") {
+    group = "build"
+    description = "Download cuBLAS, cuSOLVER and nvJitLink shared libraries for the quantization tools."
+    outputs.dir(cudaMathDirectory)
+    outputs.upToDateWhen { cudaMathDirectory.get().file("libcusolver.so.12").asFile.isFile }
+    doLast {
+        val cache = gradle.gradleUserHomeDir.toPath().resolve("caches/euhedral-cuda/13.1.80")
+        val destination = cudaMathDirectory.get().asFile.toPath()
+        Files.createDirectories(destination)
+        for ((relative, sha) in cudaMathArchives) {
+            val archive = cache.resolve(relative.substringAfterLast('/'))
+            fun digest(): String = MessageDigest.getInstance("SHA-256").let { md ->
+                Files.newInputStream(archive).use { input ->
+                    val buffer = ByteArray(1 shl 20)
+                    while (true) { val n = input.read(buffer); if (n < 0) break; md.update(buffer, 0, n) }
+                }
+                md.digest().joinToString("") { "%02x".format(it) }
+            }
+            if (!Files.isRegularFile(archive) || digest() != sha) {
+                Files.createDirectories(cache)
+                val partial = archive.resolveSibling(archive.fileName.toString() + ".partial")
+                URI("https://developer.download.nvidia.com/compute/cuda/redist/$relative").toURL().openStream().use {
+                    Files.copy(it, partial, StandardCopyOption.REPLACE_EXISTING)
+                }
+                Files.move(partial, archive, StandardCopyOption.REPLACE_EXISTING)
+                check(digest() == sha) { "checksum mismatch for $relative" }
+            }
+            val unpacked = temporaryDir.resolve(archive.fileName.toString().removeSuffix(".tar.xz"))
+            unpacked.deleteRecursively()
+            unpacked.mkdirs()
+            val tar = ProcessBuilder("tar", "-xJf", archive.toString(), "-C", unpacked.absolutePath).inheritIO().start()
+            check(tar.waitFor() == 0) { "could not unpack $archive" }
+            unpacked.walkTopDown().filter { it.isFile && it.name.contains(".so") && it.parentFile.name == "lib" }.forEach {
+                Files.copy(it.toPath(), destination.resolve(it.name), StandardCopyOption.REPLACE_EXISTING)
+            }
+            unpacked.walkTopDown().filter { Files.isSymbolicLink(it.toPath()) && it.parentFile.name == "lib" }.forEach {
+                val link = destination.resolve(it.name)
+                Files.deleteIfExists(link)
+                Files.createSymbolicLink(link, Files.readSymbolicLink(it.toPath()))
+            }
+            unpacked.deleteRecursively()
+        }
+    }
+}
+
 val hostProductId = rootProject.extra["euhedral.native.host.id"] as String
 val hostIncludeDirectory = rootProject.extra["euhedral.native.host.include"] as String
 val hostRuntimeDirectory = rootProject.extra["euhedral.native.host.runtime"] as String
@@ -37,7 +99,11 @@ tasks.named<JavaExec>("run") {
     workingDir = rootProject.projectDir
     environment("EUHEDRAL_CUDA_INCLUDE_DIR", hostIncludeDirectory)
     val searchVariable = if (System.getProperty("os.name").startsWith("Windows")) "PATH" else "LD_LIBRARY_PATH"
-    environment(searchVariable, hostRuntimeDirectory + File.pathSeparator + (System.getenv(searchVariable) ?: ""))
+    dependsOn(cudaMathLibraries)
+    environment(
+        searchVariable,
+        listOf(hostRuntimeDirectory, cudaMathDirectory.get().asFile.absolutePath, System.getenv(searchVariable) ?: "")
+            .joinToString(File.pathSeparator))
 }
 
 // The BF16 checkpoint for the tests that read it (they skip without one): -Peuhedral.quantization.checkpoint=DIR
