@@ -85,6 +85,22 @@ class GptqTest(unittest.TestCase):
                 self.assertTrue(torch.equal(decoded, decode(state)))
 
 
+    def test_act_order_rounds_in_its_order_and_keeps_the_state_consistent(self):
+        rng = np.random.default_rng(7)
+        scales = np.exp(rng.standard_normal(K)).astype(np.float32)
+        mixing = rng.standard_normal((K, K)).astype(np.float32) * 0.3 + np.eye(K, dtype=np.float32)
+        x = torch.from_numpy((rng.standard_normal((4096, K)).astype(np.float32) @ mixing) * scales).to(device.DEVICE)
+        hessian = x.T @ x
+        order = self.gptq.column_order(hessian)
+        for fmt, layout in (("Q3G64_F16S", LAYOUT_ROW_SPLIT), (NVFP4_FORMAT, LAYOUT_SD4)):
+            with self.subTest(fmt=fmt, layout=layout):
+                state, decoded = self.gptq.gptq(self.weight, hessian, fmt, layout, (N, K), order=order)
+                self.assertTrue(torch.equal(decoded, decode(state)))
+                plain, _ = self.gptq.gptq(self.weight, torch.diag(torch.diag(hessian)), fmt, layout, (N, K), damp=0.0)
+                ordered_error = float(((x @ (self.weight - decoded).T) ** 2).sum())
+                plain_error = float(((x @ (self.weight - decode(plain)).T) ** 2).sum())
+                self.assertLess(ordered_error, 0.8 * plain_error)
+
 def decode(state):
     if state.format_name == NVFP4_FORMAT:
         scale_codes = state.table[state.scales] if state.table is not None else state.scales

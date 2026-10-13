@@ -113,9 +113,12 @@ class Layer:
         return (m.float() + down.float()).to(torch.bfloat16)
 
     def _attention(self, x: torch.Tensor, observe: Observe | None) -> torch.Tensor:
-        b, n, _ = x.shape
         qk = self._linear("attention/query_key", x, observe)
         gv = self._linear("attention/gate_value", x, observe)
+        return self._attend(qk, gv, observe)
+
+    def _attend(self, qk: torch.Tensor, gv: torch.Tensor, observe: Observe | None) -> torch.Tensor:
+        b, n, _ = qk.shape
         q = qk[..., :HEADS * HEAD_DIM].view(b, n, HEADS, HEAD_DIM)
         k = qk[..., HEADS * HEAD_DIM:].view(b, n, KV_HEADS, HEAD_DIM)
         gate = gv[..., :HEADS * HEAD_DIM].view(b, n, HEADS, HEAD_DIM)
@@ -168,6 +171,51 @@ class Layer:
         inv = torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
         gated = (out * inv * self.gdn_norm.float() * F.silu(z)).to(torch.bfloat16).reshape(b, n, value_width)
         return self._linear("gdn/output", gated, observe)
+
+
+class MtpLayer(Layer):
+    """The MTP block (docs/MTP_CONTRACT.md): a full-attention layer whose q, k, gate and v are one object, rows
+    [q 6144; k 1024; gate 6144; v 1024], under the `mtp/layer/` object names."""
+
+    def __init__(self, checkpoint: Checkpoint):
+        self.index, self.eps, self.theta = -1, checkpoint.eps, checkpoint.theta
+        self.attention = True
+        p, t = "mtp.layers.0.", checkpoint.tensor
+        self.input_norm, self.post_norm = t(p + "input_layernorm.weight"), t(p + "post_attention_layernorm.weight")
+        q = t(p + "self_attn.q_proj.weight").view(HEADS, 2, HEAD_DIM, HIDDEN)
+        query, gate = q[:, 0].reshape(-1, HIDDEN), q[:, 1].reshape(-1, HIDDEN)
+        self.weights = {
+            "mtp/layer/attention/query_key_gate_value": torch.cat(
+                [query, t(p + "self_attn.k_proj.weight"), gate, t(p + "self_attn.v_proj.weight")]),
+            "mtp/layer/attention/output": t(p + "self_attn.o_proj.weight"),
+            "mtp/layer/mlp/gate_up": torch.cat([t(p + "mlp.gate_proj.weight"), t(p + "mlp.up_proj.weight")]),
+            "mtp/layer/mlp/down": t(p + "mlp.down_proj.weight"),
+        }
+        self.query_norm, self.key_norm = t(p + "self_attn.q_norm.weight"), t(p + "self_attn.k_norm.weight")
+        self.prefix = "mtp/layer/"
+
+    def _attention(self, x: torch.Tensor, observe: Observe | None) -> torch.Tensor:
+        fused = self._linear("attention/query_key_gate_value", x, observe)
+        half = HEADS * HEAD_DIM + KV_HEADS * HEAD_DIM
+        return self._attend(fused[..., :half], fused[..., half:], observe)
+
+
+class Mtp:
+    """The MTP stem and output norm around MtpLayer: row p reads the base model's normed hidden at p and the
+    embedding of token p + 1, at position p, and its normed output is what the draft head reads."""
+
+    def __init__(self, checkpoint: Checkpoint):
+        t = checkpoint.tensor
+        self.eps = checkpoint.eps
+        self.embedding_norm, self.hidden_norm = t("mtp.pre_fc_norm_embedding.weight"), t("mtp.pre_fc_norm_hidden.weight")
+        self.final_norm = t("mtp.norm.weight")
+        self.input_projection = t("mtp.fc.weight")
+        self.layer = MtpLayer(checkpoint)
+
+    def stem(self, embedded: torch.Tensor, normed_hidden: torch.Tensor) -> torch.Tensor:
+        """[RMSNorm(embedding of token p + 1); RMSNorm(base hidden at p after the final norm)], [b, n, 10240]."""
+        return torch.cat([rms_norm(embedded, self.embedding_norm, self.eps),
+                          rms_norm(normed_hidden, self.hidden_norm, self.eps)], dim=-1)
 
 
 def recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
