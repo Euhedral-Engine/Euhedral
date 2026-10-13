@@ -83,6 +83,13 @@ def calibration(self, name: str, k: int) -> Calibration:
         return Calibration()
 
 
+class _Uniform:
+    """An importance stub: plans carry the recipe's calibration (lowest code) without an importance matrix."""
+
+    def calibration(self, name: str, k: int) -> Calibration:
+        return Calibration()
+
+
 def log(start: float, message: str) -> None:
     print(f"[{time.time() - start:7.0f} s] {message}", flush=True)
 
