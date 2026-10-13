@@ -93,25 +93,39 @@ class _Nvfp4:
         return magnitude | (negative.long() << 3), value
 
 
+def nvfp4_tensor_scales(weight: torch.Tensor, hessian: torch.Tensor, layout: str,
+                        chunk_rows: int = 16384) -> tuple[np.float32, np.ndarray | None]:
+    """(FP32 global scale, SD4 table or None) of a whole NVFP4 object, the table chosen under diag(hessian)."""
+    global_scale = nvfp4_global_scale(float(weight.abs().max()))
+    if layout != LAYOUT_SD4:
+        return global_scale, None
+    table = np.arange(SD4_TABLE, dtype=np.uint8)
+    if global_scale > 0:
+        weights_np = torch.diag(hessian).float().cpu().numpy()
+        costs = sum(sd4_costs_torch(weight[b:b + chunk_rows].float().contiguous(), global_scale, weights_np, SEARCH_BELOW)
+                    for b in range(0, weight.shape[0], chunk_rows))
+        table = sd4_table(costs)
+    return global_scale, table
+
+
 def gptq(weight: torch.Tensor, hessian: torch.Tensor, fmt: str, layout: str, shape: tuple[int, int],
-         lowest_code: int | None = None, damp: float = 0.01) -> tuple[QuantState, torch.Tensor]:
+         lowest_code: int | None = None, damp: float = 0.01, upper: torch.Tensor | None = None,
+         tensor: tuple[np.float32, np.ndarray | None] | None = None) -> tuple[QuantState, torch.Tensor]:
     """(the QuantState of `weight` [N, K] rounded by GPTQ under `hessian` [K, K], the decoded weights [N, K]).
-    `shape` is the object's shape (K a multiple of 128 here). `lowest_code` limits grouped codes (compressed q3)."""
+    `shape` is the object's shape (K a multiple of 128 here). `lowest_code` limits grouped codes (compressed q3).
+    Rows are independent, so a large object can be rounded in row slices that share `upper` (inverse_cholesky)
+    and, for NVFP4, `tensor` (nvfp4_tensor_scales of the whole object)."""
     w = weight.float().clone()
     n, k = w.shape
     importance = torch.diag(hessian).float()
     w[:, importance == 0] = 0
-    upper = inverse_cholesky(hessian, damp)
+    if upper is None:
+        upper = inverse_cholesky(hessian, damp)
     weights_np = importance.cpu().numpy().astype(np.float32)
     if fmt == NVFP4_FORMAT:
-        global_scale = nvfp4_global_scale(float(weight.abs().max()))
-        table, below = None, SEARCH_BELOW
-        if layout == LAYOUT_SD4:
-            table = np.arange(SD4_TABLE, dtype=np.uint8)
-            if global_scale > 0:
-                table = sd4_table(sd4_costs_torch(weight.float().contiguous(), global_scale, weights_np, below))
-        rounder = _Nvfp4(global_scale, table, below)
-        codes = torch.zeros(n, k, dtype=torch.int64, device=w.device)
+        global_scale, table = tensor if tensor is not None else nvfp4_tensor_scales(weight, hessian, layout)
+        rounder = _Nvfp4(global_scale, table, SEARCH_BELOW)
+        codes = torch.zeros(n, k, dtype=torch.int16, device=w.device)
         scales = torch.zeros(n, k // NVFP4_BLOCK, dtype=torch.uint8, device=w.device)
     else:
         rounder = _Grouped(fmt, lowest_code)
