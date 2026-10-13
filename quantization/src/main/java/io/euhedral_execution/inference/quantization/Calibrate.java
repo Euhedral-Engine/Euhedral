@@ -303,6 +303,7 @@ public final class Calibrate {
     }
 
     /// Runs `step` on each batch of whole sequences, copied into `batchStates`; with `write`, copies the result back.
+    /// `states` is pinned, so the copies queue on the stream without stopping the host.
     private void batches(
             MemorySegment states,
             long batchStates,
@@ -313,10 +314,10 @@ public final class Calibrate {
         long sequenceBytes = 2L * hidden * length;
         for (int s = 0; s < sequences; s += settings.batch()) {
             int count = Math.min(settings.batch(), sequences - s);
-            MemorySegment slice = states.asSlice(s * sequenceBytes, count * sequenceBytes);
-            device.gpu.copyHostToDevice(batchStates, slice, slice.byteSize());
+            long host = states.address() + s * sequenceBytes, bytes = count * sequenceBytes;
+            device.gpu.copyHostToDeviceAsync(batchStates, host, bytes);
             step.accept(count);
-            if (write) device.gpu.copyDeviceToHost(slice, batchStates, slice.byteSize());
+            if (write) device.gpu.copyDeviceToHostAsync(host, batchStates, bytes);
         }
         device.synchronize();
     }

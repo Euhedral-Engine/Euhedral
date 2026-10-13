@@ -22,6 +22,8 @@ public final class LayerForward implements AutoCloseable {
     private final Qwen38Objects.Config c;
     private final int maxRows;
     private final long normalized, first, second, mixed, context, gateUp, swiglu, delta, alpha, beta, position;
+    private final java.util.List<GdnState> gdnStates = new java.util.ArrayList<>();
+    private final java.util.List<AttentionKvState> kvStates = new java.util.ArrayList<>();
     private final int qkWidth, vzWidth, gdnValueWidth, convolutionWidth, attentionQ, attentionKv;
 
     public LayerForward(Device device, Qwen38Objects.Config config, int maxRows) {
@@ -99,8 +101,8 @@ public final class LayerForward implements AutoCloseable {
         float scale = (float) (1.0 / Math.sqrt(c.keyDim()));
         for (int s = 0; s < sequences; s++) {
             long offset = (long) s * length;
-            try (GdnState state =
-                    GdnState.allocate(gpu, c.keyHeads(), c.valueHeads(), c.keyDim(), c.valueDim(), c.convKernel())) {
+            {
+                GdnState state = gdnState(s);
                 gpu.gdnConvolutionBf16(
                         first + 2 * offset * qkWidth,
                         second + 2 * offset * vzWidth,
@@ -162,7 +164,8 @@ public final class LayerForward implements AutoCloseable {
                     position,
                     (float) c.eps(),
                     c.theta());
-            try (AttentionKvState state = new AttentionKvState(gpu, attentionKv)) {
+            {
+                AttentionKvState state = kvState(s);
                 state.prepareAppend(0, length);
                 gpu.attentionKvAppendNvfp4(
                         normed,
@@ -189,14 +192,39 @@ public final class LayerForward implements AutoCloseable {
                         0,
                         position,
                         0);
-                device.synchronize();
+                state.commitAppended(length);
             }
         }
         apply(layer, "attention/output", context, delta, rows, attentionQ, h, observer);
     }
 
+    /// Sequence slot `s`'s GDN state, zeroed in stream order (one state per slot for the forward's lifetime: freeing
+    /// device memory synchronizes the device).
+    private GdnState gdnState(int s) {
+        while (gdnStates.size() <= s) {
+            gdnStates.add(GdnState.allocate(
+                    device.gpu, c.keyHeads(), c.valueHeads(), c.keyDim(), c.valueDim(), c.convKernel()));
+        }
+        GdnState state = gdnStates.get(s);
+        long convolutionBytes = 2L * convolutionWidth * (c.convKernel() - 1);
+        long recurrentBytes = 4L * c.valueHeads() * c.keyDim() * c.valueDim();
+        device.gpu.zeroDeviceMemory(state.convolutionStateAddress(), convolutionBytes);
+        device.gpu.zeroDeviceMemory(state.recurrentStateAddress(), recurrentBytes);
+        return state;
+    }
+
+    /// Sequence slot `s`'s attention cache, emptied (its pages are kept for the next sequence).
+    private AttentionKvState kvState(int s) {
+        while (kvStates.size() <= s) kvStates.add(new AttentionKvState(device.gpu, attentionKv));
+        AttentionKvState state = kvStates.get(s);
+        state.truncate(0);
+        return state;
+    }
+
     @Override
     public void close() {
+        gdnStates.forEach(GdnState::close);
+        kvStates.forEach(AttentionKvState::close);
         for (long address :
                 new long[] {normalized, first, second, mixed, context, gateUp, swiglu, delta, alpha, beta, position}) {
             device.gpu.free(address);
