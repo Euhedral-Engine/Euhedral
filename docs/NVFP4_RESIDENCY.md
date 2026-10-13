@@ -24,7 +24,7 @@ Measured on 2026-10-01 on an RTX 5070 Ti (16 GB) with an i9-14900K.
 | Graph and workspace pools after the first run | +0.16 GiB (they persist) |
 | KV (NVFP4 pages, 16 attention layers, 4 KV heads, D256, 144-byte rows) | 18 KiB per token: 0.56 GiB at 32K, 2.25 GiB at 128K |
 | GDN state (48 layers, 48 x 128 x 128 FP32, plus convolution) | about 0.15 GiB per sequence |
-| `q3` artifact payload (text, NVFP4 LM head, MTP layer, draft head) | 11.90 GiB |
+| `q3` artifact payload (text, NVFP4 LM head, MTP layer, draft head) | 11.68 GiB |
 | `nvfp4` artifact payload (Q3 embedding) | 14.52 GiB; about 0.19 GiB free after loading, so it cannot run fully resident |
 | `nvfp4-compressed` artifact payload (SD4 scales) | 13.77 GiB |
 | MTP layer + draft head, NVFP4 | 0.57 GiB |
