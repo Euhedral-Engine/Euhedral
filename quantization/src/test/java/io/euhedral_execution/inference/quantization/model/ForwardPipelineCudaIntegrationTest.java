@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /// The frame pipeline (sequences on their own streams, frames on the lattice) gives the hidden states of the
-/// sequential forward bit for bit, for a GDN layer and an attention layer, over two batches, and observes as many rows.
+/// sequential forward bit for bit, for a GDN layer and an attention layer, in batches of one sequence (chained
+/// batches) and of two (sequences overlapping on two streams), and observes as many rows.
 class ForwardPipelineCudaIntegrationTest {
 
     @Test
@@ -26,7 +27,7 @@ class ForwardPipelineCudaIntegrationTest {
         String checkpoint = System.getProperty("euhedral.quantization.checkpoint", "");
         Path fixture = Path.of(System.getProperty("euhedral.quantization.forward-fixture", "build/forward-fixture"));
         assumeTrue(!checkpoint.isBlank() && Files.isDirectory(fixture), "needs the checkpoint and the forward fixture");
-        int sequences = 2, length = 256, hidden = 5120, batch = 1, rows = sequences * length;
+        int sequences = 2, length = 256, hidden = 5120, rows = sequences * length;
         long bytes = 2L * rows * hidden;
         byte[] input = Files.readAllBytes(fixture.resolve("input.npy"));
         int header = 10 + Short.toUnsignedInt((short) ((input[8] & 0xff) | (input[9] & 0xff) << 8));
@@ -41,45 +42,48 @@ class ForwardPipelineCudaIntegrationTest {
             long pinned = device.gpu.allocateHostWeights(bytes);
             MemorySegment states = MemorySegment.ofAddress(pinned).reinterpret(bytes);
             MemorySegment expected = arena.allocate(bytes);
-            long sequential = device.gpu.allocate(bytes), batchStates = device.gpu.allocate(bytes / sequences);
+            long sequential = device.gpu.allocate(bytes), batchStates = device.gpu.allocate(bytes);
             try (LayerForward forward = new LayerForward(device, objects.config, rows);
                     ForwardPipeline pipeline =
-                            new ForwardPipeline(device, forward, lattice.lake(), completions, batch)) {
-                for (int index : new int[] {0, 3}) {
-                    try (LayerWeights layer = LayerWeights.layer(device.gpu, objects, index)) {
-                        MemorySegment.copy(MemorySegment.ofArray(input), header, expected, 0, bytes);
-                        device.gpu.copyHostToDevice(sequential, expected, bytes);
-                        AtomicInteger sequentialRows = new AtomicInteger();
-                        forward.forward(
-                                layer,
-                                sequential,
-                                sequences,
-                                length,
-                                (n, a, count, c) -> sequentialRows.addAndGet(count));
-                        device.synchronize();
-                        device.gpu.copyDeviceToHost(expected, sequential, bytes);
-                        MemorySegment.copy(MemorySegment.ofArray(input), header, states, 0, bytes);
-                        AtomicInteger pipelineRows = new AtomicInteger();
-                        pipeline.run(
-                                        layer,
-                                        pinned,
-                                        batchStates,
-                                        sequences,
-                                        length,
-                                        batch,
-                                        (n, a, count, c) -> pipelineRows.addAndGet(count),
-                                        true)
-                                .join();
-                        long differing = 0;
-                        for (long i = 0; i < bytes / 2; i++) {
-                            if (states.getAtIndex(ValueLayout.JAVA_SHORT, i)
-                                    != expected.getAtIndex(ValueLayout.JAVA_SHORT, i)) differing++;
+                            new ForwardPipeline(device, forward, lattice.lake(), completions, sequences)) {
+                for (int index : new int[] {0, 3})
+                    for (int batch = 1; batch <= sequences; batch++) {
+                        try (LayerWeights layer = LayerWeights.layer(device.gpu, objects, index)) {
+                            MemorySegment.copy(MemorySegment.ofArray(input), header, expected, 0, bytes);
+                            device.gpu.copyHostToDevice(sequential, expected, bytes);
+                            AtomicInteger sequentialRows = new AtomicInteger();
+                            forward.forward(
+                                    layer,
+                                    sequential,
+                                    sequences,
+                                    length,
+                                    (n, a, count, c) -> sequentialRows.addAndGet(count));
+                            device.synchronize();
+                            device.gpu.copyDeviceToHost(expected, sequential, bytes);
+                            MemorySegment.copy(MemorySegment.ofArray(input), header, states, 0, bytes);
+                            AtomicInteger pipelineRows = new AtomicInteger();
+                            pipeline.run(
+                                            layer,
+                                            pinned,
+                                            batchStates,
+                                            sequences,
+                                            length,
+                                            batch,
+                                            (n, a, count, c) -> pipelineRows.addAndGet(count),
+                                            true)
+                                    .join();
+                            long differing = 0;
+                            for (long i = 0; i < bytes / 2; i++) {
+                                if (states.getAtIndex(ValueLayout.JAVA_SHORT, i)
+                                        != expected.getAtIndex(ValueLayout.JAVA_SHORT, i)) differing++;
+                            }
+                            System.out.printf(
+                                    "layer %d, batches of %d: %d of %d values differ%n",
+                                    index, batch, differing, bytes / 2);
+                            assertEquals(0, differing, "layer " + index);
+                            assertEquals(sequentialRows.get(), pipelineRows.get(), "observed rows, layer " + index);
                         }
-                        System.out.printf("layer %d: %d of %d values differ%n", index, differing, bytes / 2);
-                        assertEquals(0, differing, "layer " + index);
-                        assertEquals(sequentialRows.get(), pipelineRows.get(), "observed rows, layer " + index);
                     }
-                }
             } finally {
                 device.gpu.free(sequential);
                 device.gpu.free(batchStates);
