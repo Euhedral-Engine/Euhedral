@@ -28,9 +28,10 @@ from euhedral_artifacts.recipes import LAYOUT_ROW_SPLIT, LAYOUT_SD4, NVFP4_FORMA
 BLOCK = 128
 
 
-def inverse_cholesky(hessian: torch.Tensor, damp: float) -> torch.Tensor:
-    """Upper Cholesky factor of (H + damp * mean(diag H) I)^-1, FP32. Columns no input reached get a unit diagonal."""
-    h = hessian.float().clone()
+def inverse_cholesky(hessian: torch.Tensor, damp: float, consume: bool = False) -> torch.Tensor:
+    """Upper Cholesky factor of (H + damp * mean(diag H) I)^-1, FP32. Columns no input reached get a unit diagonal.
+    With `consume`, an FP32 `hessian` is overwritten instead of copied (a 17408-wide H is 1.2 GB)."""
+    h = hessian if consume and hessian.dtype == torch.float32 else hessian.float().clone()
     diagonal = h.diagonal()
     diagonal[diagonal == 0] = 1.0
     diagonal += damp * torch.mean(diagonal)
@@ -94,7 +95,7 @@ class _Nvfp4:
 
 
 def nvfp4_tensor_scales(weight: torch.Tensor, hessian: torch.Tensor, layout: str,
-                        chunk_rows: int = 16384) -> tuple[np.float32, np.ndarray | None]:
+                        chunk_rows: int = 4096) -> tuple[np.float32, np.ndarray | None]:
     """(FP32 global scale, SD4 table or None) of a whole NVFP4 object, the table chosen under diag(hessian)."""
     global_scale = nvfp4_global_scale(float(weight.abs().max()))
     if layout != LAYOUT_SD4:
