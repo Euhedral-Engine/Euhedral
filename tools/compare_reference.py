@@ -132,25 +132,38 @@ def cuda_torch():
 
 
 def score_cuda(torch, reference: Reference, chunk: int, report: Report, targets: np.ndarray) -> dict[str, np.ndarray]:
-    """score() on the GPU, in float64 like the NumPy path."""
+    """score() on the GPU, in float64 like the NumPy path. A reader thread fetches the next rows of both files while
+    the GPU scores the current ones."""
+    import concurrent.futures
     n, device = reference.records, torch.device("cuda")
     out = {key: np.empty(n) for key in ("nll", "kl", "delta_p")}
     out["agree"] = np.empty(n, dtype=bool)
-    for begin in range(0, n, ROWS):
-        end = min(n, begin + ROWS)
+    ranges = [(begin, min(n, begin + ROWS)) for begin in range(0, n, ROWS)]
+
+    def fetch(span):
+        begin, end = span
         header, codes = reference.rows(chunk, begin, end)
-        header = torch.from_numpy(header.astype(np.float64)).to(device)
-        codes = torch.from_numpy(np.ascontiguousarray(codes).view(np.int16)).to(device).to(torch.int32) & 0xFFFF
-        p = header[:, 0, None] * codes.to(torch.float64) + header[:, 1, None]
-        bits = torch.from_numpy(np.ascontiguousarray(report.rows(begin, end)[:, 4:]).view(np.int16)).to(device)
-        q = torch.log_softmax(((bits.to(torch.int32) & 0xFFFF) << 16).view(torch.float32).to(torch.float64), dim=1)
-        index = torch.arange(end - begin, device=device)
-        target = torch.from_numpy(targets[begin:end].astype(np.int64)).to(device)
-        q_target, p_target = q[index, target], p[index, target]
-        out["nll"][begin:end] = (-q_target).cpu().numpy()
-        out["kl"][begin:end] = torch.where(p > FLOOR, p.exp() * (p - q), 0.0).sum(dim=1).cpu().numpy()
-        out["agree"][begin:end] = (p.argmax(dim=1) == q.argmax(dim=1)).cpu().numpy()
-        out["delta_p"][begin:end] = (q_target.exp() - p_target.exp()).cpu().numpy()
+        return header, np.ascontiguousarray(codes), np.ascontiguousarray(report.rows(begin, end)[:, 4:])
+
+    with concurrent.futures.ThreadPoolExecutor(1) as reader:
+        pending = reader.submit(fetch, ranges[0])
+        for index_of_range, (begin, end) in enumerate(ranges):
+            header, codes, bits = pending.result()
+            if index_of_range + 1 < len(ranges):
+                pending = reader.submit(fetch, ranges[index_of_range + 1])
+            header = torch.from_numpy(header.astype(np.float64)).to(device)
+            codes = torch.from_numpy(codes.view(np.int16)).to(device).to(torch.int32) & 0xFFFF
+            p = header[:, 0, None] * codes.to(torch.float64) + header[:, 1, None]
+            bits = torch.from_numpy(bits.view(np.int16)).to(device)
+            q = torch.log_softmax(((bits.to(torch.int32) & 0xFFFF) << 16).view(torch.float32).to(torch.float64), dim=1)
+            index = torch.arange(end - begin, device=device)
+            target = torch.from_numpy(targets[begin:end].astype(np.int64)).to(device)
+            q_target, p_target = q[index, target], p[index, target]
+            results = torch.stack([-q_target, torch.where(p > FLOOR, p.exp() * (p - q), 0.0).sum(dim=1),
+                                   (p.argmax(dim=1) == q.argmax(dim=1)).to(torch.float64),
+                                   q_target.exp() - p_target.exp()]).cpu().numpy()
+            out["nll"][begin:end], out["kl"][begin:end] = results[0], results[1]
+            out["agree"][begin:end], out["delta_p"][begin:end] = results[2] != 0, results[3]
     return out
 
 
