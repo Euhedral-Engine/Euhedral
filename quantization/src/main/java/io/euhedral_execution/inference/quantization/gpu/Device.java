@@ -18,7 +18,9 @@ public final class Device implements AutoCloseable {
     public final Cuda cuda;
     public final long stream;
     public final long cublas;
-    private final MethodHandle select, clear, destroy;
+    private final MethodHandle create, select, clear, destroy;
+    /// Each worker thread's own stream (lattice frames that run concurrently), destroyed with the device.
+    private final java.util.Map<Thread, Long> threadStreams = new java.util.concurrent.ConcurrentHashMap<>();
 
     public Device(Path library) {
         this.gpu = new CudaGpuMemory(library);
@@ -26,7 +28,7 @@ public final class Device implements AutoCloseable {
         Arena global = Arena.global();
         SymbolLookup engine = SymbolLookup.libraryLookup(library, global);
         Linker linker = Linker.nativeLinker();
-        MethodHandle create = linker.downcallHandle(
+        create = linker.downcallHandle(
                 engine.find("euhedral_cuda_stream_create").orElseThrow(), FunctionDescriptor.of(ValueLayout.JAVA_LONG));
         select = linker.downcallHandle(
                 engine.find("euhedral_cuda_stream_select").orElseThrow(),
@@ -58,6 +60,28 @@ public final class Device implements AutoCloseable {
         }
     }
 
+    /// Binds the calling thread to a stream of its own (created on first use) and returns it: for work that runs
+    /// concurrently with the main stream, such as rounding objects on lattice workers.
+    public long bindOwnStream() {
+        long own = threadStreams.computeIfAbsent(Thread.currentThread(), thread -> {
+            try {
+                long created = (long) create.invokeExact();
+                if (created == 0) throw new IllegalStateException("could not create a CUDA stream");
+                return created;
+            } catch (Throwable failure) {
+                throw new IllegalStateException(failure);
+            }
+        });
+        cuda.bindThread();
+        try {
+            int status = (int) select.invokeExact(own);
+            if (status != 0) throw new IllegalStateException("euhedral_cuda_stream_select failed: " + status);
+        } catch (Throwable failure) {
+            throw new IllegalStateException(failure);
+        }
+        return own;
+    }
+
     public void synchronize() {
         cuda.synchronize(stream);
     }
@@ -78,6 +102,10 @@ public final class Device implements AutoCloseable {
             synchronize();
             clear.invokeExact();
             int ignored = (int) destroy.invokeExact(stream);
+            for (long own : threadStreams.values()) {
+                cuda.synchronize(own);
+                ignored = (int) destroy.invokeExact(own);
+            }
         } catch (Throwable failure) {
             throw new IllegalStateException(failure);
         } finally {
