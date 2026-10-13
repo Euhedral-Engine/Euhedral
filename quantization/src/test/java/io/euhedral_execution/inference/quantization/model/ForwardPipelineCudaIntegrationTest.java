@@ -47,17 +47,20 @@ class ForwardPipelineCudaIntegrationTest {
                     ForwardPipeline pipeline =
                             new ForwardPipeline(device, forward, lattice.lake(), completions, sequences)) {
                 for (int index : new int[] {0, 3})
-                    for (int batch = 1; batch <= sequences; batch++) {
+                    for (int batch = sequences; batch >= 1; batch--) {
                         try (LayerWeights layer = LayerWeights.layer(device.gpu, objects, index)) {
                             MemorySegment.copy(MemorySegment.ofArray(input), header, expected, 0, bytes);
                             device.gpu.copyHostToDevice(sequential, expected, bytes);
                             AtomicInteger sequentialRows = new AtomicInteger();
-                            forward.forward(
-                                    layer,
-                                    sequential,
-                                    sequences,
-                                    length,
-                                    (n, a, count, c) -> sequentialRows.addAndGet(count));
+                            // The reference runs in batches of the same size: cuBLAS may sum other shapes differently.
+                            for (int first = 0; first < sequences; first += batch) {
+                                forward.forward(
+                                        layer,
+                                        sequential + 2L * first * length * hidden,
+                                        Math.min(batch, sequences - first),
+                                        length,
+                                        (n, a, count, c) -> sequentialRows.addAndGet(count));
+                            }
                             device.synchronize();
                             device.gpu.copyDeviceToHost(expected, sequential, bytes);
                             MemorySegment.copy(MemorySegment.ofArray(input), header, states, 0, bytes);
@@ -73,14 +76,20 @@ class ForwardPipelineCudaIntegrationTest {
                                             true)
                                     .join();
                             long differing = 0;
+                            double difference = 0, norm = 0;
                             for (long i = 0; i < bytes / 2; i++) {
-                                if (states.getAtIndex(ValueLayout.JAVA_SHORT, i)
-                                        != expected.getAtIndex(ValueLayout.JAVA_SHORT, i)) differing++;
+                                short got = states.getAtIndex(ValueLayout.JAVA_SHORT, i);
+                                short want = expected.getAtIndex(ValueLayout.JAVA_SHORT, i);
+                                if (got != want) differing++;
+                                double x = Float.intBitsToFloat(got << 16), y = Float.intBitsToFloat(want << 16);
+                                difference += (x - y) * (x - y);
+                                norm += y * y;
                             }
+                            double relative = Math.sqrt(difference / norm);
                             System.out.printf(
-                                    "layer %d, batches of %d: %d of %d values differ%n",
-                                    index, batch, differing, bytes / 2);
-                            assertEquals(0, differing, "layer " + index);
+                                    "layer %d, batches of %d: %d of %d values differ, relative %.2e%n",
+                                    index, batch, differing, bytes / 2, relative);
+                            assertEquals(0, differing, "layer " + index + ", batches of " + batch);
                             assertEquals(sequentialRows.get(), pipelineRows.get(), "observed rows, layer " + index);
                         }
                     }
