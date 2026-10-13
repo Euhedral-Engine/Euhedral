@@ -70,6 +70,16 @@ public final class CalibrationLattice implements AutoCloseable {
         return new CalibrationLattice(lattice, lake, new HostTasks(lake));
     }
 
+    /// The lake frames are published into.
+    public InferenceLake lake() {
+        return lake;
+    }
+
+    /// Attaches a source the lattice polls along with the lake (completed with it).
+    public void attach(io.euhedral_execution.core.ingest.AbstractIngestSink source) {
+        lake.attach(source.getDelegate());
+    }
+
     /// Runs `work` as a frame on a worker.
     public <T> CompletableFuture<T> submit(Supplier<T> work) {
         return tasks.onWorker(work);

@@ -21,6 +21,7 @@ public final class Device implements AutoCloseable {
     private final MethodHandle create, select, clear, destroy;
     /// Each worker thread's own stream (lattice frames that run concurrently), destroyed with the device.
     private final java.util.Map<Thread, Long> threadStreams = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.List<Long> extraStreams = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     public Device(Path library) {
         this.gpu = new CudaGpuMemory(library);
@@ -84,6 +85,30 @@ public final class Device implements AutoCloseable {
         return own;
     }
 
+    /// A new stream (destroyed with the device).
+    public long newStream() {
+        try {
+            long created = (long) create.invokeExact();
+            if (created == 0) throw new IllegalStateException("could not create a CUDA stream");
+            extraStreams.add(created);
+            return created;
+        } catch (Throwable failure) {
+            throw new IllegalStateException(failure);
+        }
+    }
+
+    /// Binds the calling thread to `stream`: the primary context, and the stream for the engine's operations.
+    public void select(long stream) {
+        cuda.bindThread();
+        try {
+            clear.invokeExact();
+            int status = (int) select.invokeExact(stream);
+            if (status != 0) throw new IllegalStateException("euhedral_cuda_stream_select failed: " + status);
+        } catch (Throwable failure) {
+            throw new IllegalStateException(failure);
+        }
+    }
+
     public void synchronize() {
         cuda.synchronize(stream);
     }
@@ -104,6 +129,10 @@ public final class Device implements AutoCloseable {
             synchronize();
             clear.invokeExact();
             int ignored = (int) destroy.invokeExact(stream);
+            for (long extra : extraStreams) {
+                cuda.synchronize(extra);
+                ignored = (int) destroy.invokeExact(extra);
+            }
             for (long own : threadStreams.values()) {
                 cuda.synchronize(own);
                 ignored = (int) destroy.invokeExact(own);

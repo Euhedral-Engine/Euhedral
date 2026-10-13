@@ -8,6 +8,8 @@ import io.euhedral_execution.inference.quantization.gptq.QuantState;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import io.euhedral_execution.inference.quantization.gpu.Upload;
+import io.euhedral_execution.inference.quantization.lattice.GpuCompletions;
+import io.euhedral_execution.inference.quantization.model.ForwardPipeline;
 import io.euhedral_execution.inference.quantization.model.LayerForward;
 import io.euhedral_execution.inference.quantization.model.LayerWeights;
 import java.io.IOException;
@@ -70,6 +72,8 @@ public final class Calibrate {
     private final Settings settings;
     private final Device device;
     private final CalibrationLattice lattice;
+    /// The decoder layers' passes as lattice frames (set while calibrate runs).
+    private ForwardPipeline pipeline;
     private final Map<Long, Gptq> streamGptq = new ConcurrentHashMap<>();
     private final Qwen38Objects checkpoint;
     private final Gptq gptq;
@@ -110,7 +114,11 @@ public final class Calibrate {
         MemorySegment states = MemorySegment.ofAddress(statesAddress).reinterpret(statesBytes);
         long batchRows = (long) batch * length;
         long batchStates = device.gpu.allocate(batchRows * rowBytes);
-        try (LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows)) {
+        GpuCompletions completions = new GpuCompletions(device.cuda);
+        lattice.attach(completions);
+        try (LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows);
+                ForwardPipeline pipeline = new ForwardPipeline(device, forward, lattice.lake(), completions, batch)) {
+            this.pipeline = pipeline;
             int first = resume(states, sequences, length);
             if (first == 0) embed(tokens, states, batchStates);
             CompletableFuture<LayerWeights.Staged> next = stageLayer(first);
@@ -159,13 +167,8 @@ public final class Calibrate {
         try (LayerWeights layer = uploaded) {
             Map<String, Long> hessians = observeAll(layer, forward, states, batchStates, sequences, length);
             roundAll(layer, hessians);
-            batches(
-                    states,
-                    batchStates,
-                    sequences,
-                    length,
-                    true,
-                    count -> forward.forward(layer, batchStates, count, length, null));
+            pipeline.run(layer, states.address(), batchStates, sequences, length, settings.batch(), null, true)
+                    .join();
         }
         log("layer " + index + " done");
     }
@@ -199,13 +202,8 @@ public final class Calibrate {
             previous[1] = count;
             previousName[0] = name;
         };
-        batches(
-                states,
-                batchStates,
-                sequences,
-                length,
-                false,
-                count -> forward.forward(layer, batchStates, count, length, observer));
+        pipeline.run(layer, states.address(), batchStates, sequences, length, settings.batch(), observer, false)
+                .join();
         for (var share : shares.entrySet()) hessians.put(share.getKey(), hessians.get(share.getValue()));
         return hessians;
     }

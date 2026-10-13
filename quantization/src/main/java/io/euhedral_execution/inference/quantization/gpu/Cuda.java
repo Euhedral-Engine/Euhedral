@@ -31,6 +31,7 @@ public final class Cuda {
     private final Arena arena = Arena.ofShared();
     private final MethodHandle cuInit, cuDeviceGet, cuDeviceGetAttribute, cuDevicePrimaryCtxRetain, cuCtxSetCurrent;
     private final MethodHandle cuModuleLoadData, cuModuleGetFunction, cuLaunchKernel, cuStreamSynchronize;
+    private final MethodHandle cuEventCreate, cuEventRecord, cuEventQuery, cuStreamWaitEvent, cuEventDestroy;
     private final MethodHandle nvrtcCreateProgram, nvrtcCompileProgram, nvrtcGetProgramLogSize, nvrtcGetProgramLog;
     private final MethodHandle nvrtcGetCUBINSize, nvrtcGetCUBIN, nvrtcDestroyProgram;
     private final MethodHandle cublasCreate, cublasSetStream, cublasGemmEx, cublasSgemm;
@@ -54,6 +55,11 @@ public final class Cuda {
         cuModuleGetFunction = bind(driver, "cuModuleGetFunction", INT, PTR, PTR, PTR);
         cuLaunchKernel = bind(driver, "cuLaunchKernel", INT, PTR, INT, INT, INT, INT, INT, INT, INT, PTR, PTR, PTR);
         cuStreamSynchronize = bind(driver, "cuStreamSynchronize", INT, PTR);
+        cuEventCreate = bind(driver, "cuEventCreate", INT, PTR, INT);
+        cuEventRecord = bind(driver, "cuEventRecord", INT, PTR, PTR);
+        cuEventQuery = bind(driver, "cuEventQuery", INT, PTR);
+        cuStreamWaitEvent = bind(driver, "cuStreamWaitEvent", INT, PTR, PTR, INT);
+        cuEventDestroy = bind(driver, "cuEventDestroy_v2", INT, PTR);
         nvrtcCreateProgram = bind(nvrtc, "nvrtcCreateProgram", INT, PTR, PTR, PTR, INT, PTR, PTR);
         nvrtcCompileProgram = bind(nvrtc, "nvrtcCompileProgram", INT, PTR, INT, PTR);
         nvrtcGetProgramLogSize = bind(nvrtc, "nvrtcGetProgramLogSize", INT, PTR, PTR);
@@ -244,6 +250,54 @@ public final class Cuda {
             }
             check("cuLaunchKernel " + function.name(), (int) cuLaunchKernel.invokeExact(
                     function.handle(), gridX, gridY, 1, blockX, 1, 1, shared, stream, pointers.address(), 0L));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// A CUDA event without timing (CU_EVENT_DISABLE_TIMING).
+    public long createEvent() {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment event = local.allocate(PTR);
+            check("cuEventCreate", (int) cuEventCreate.invokeExact(event.address(), 2));
+            return event.get(PTR, 0);
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    public void recordEvent(long event, long stream) {
+        try {
+            check("cuEventRecord", (int) cuEventRecord.invokeExact(event, stream));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Whether the work before the event's last record has completed; never waits.
+    public boolean eventDone(long event) {
+        try {
+            int status = (int) cuEventQuery.invokeExact(event);
+            if (status == 600) return false; // CUDA_ERROR_NOT_READY
+            check("cuEventQuery", status);
+            return true;
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Orders work submitted to `stream` from now on behind the event's last record, on the device.
+    public void waitEvent(long stream, long event) {
+        try {
+            check("cuStreamWaitEvent", (int) cuStreamWaitEvent.invokeExact(stream, event, 0));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    public void destroyEvent(long event) {
+        try {
+            check("cuEventDestroy", (int) cuEventDestroy.invokeExact(event));
         } catch (Throwable failure) {
             throw rethrow(failure);
         }
