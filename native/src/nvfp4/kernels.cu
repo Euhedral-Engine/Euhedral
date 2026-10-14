@@ -34,3 +34,30 @@ EUHEDRAL_NVFP4_DECODE_ROWS(5)
 EUHEDRAL_NVFP4_DECODE_ROWS(6)
 EUHEDRAL_NVFP4_DECODE_ROWS(7)
 EUHEDRAL_NVFP4_DECODE_ROWS(8)
+
+// 9 to 32 token rows (batched verification of several sequences): G groups of 8 rows share each weight fragment's
+// dequantization; each row is bit for bit the one-row call on it. `rows` of the 8 G are real.
+#define EUHEDRAL_NVFP4_DECODE_GROUPS(G)                                                                     \
+    extern "C" __global__ __launch_bounds__(256) void euhedral_nvfp4_decode_groups##G##_w8(                  \
+            const unsigned short* input, const unsigned char* weights, unsigned short* output,             \
+            unsigned int in_features, unsigned int out_features, unsigned int rows) {                       \
+        nvfp4::decode_row_groups<G, false, 1, 8>(input, weights, output, in_features, out_features, rows);   \
+    }                                                                                                       \
+    extern "C" __global__ __launch_bounds__(256) void euhedral_nvfp4_decode_groups##G##_w8_sd4(              \
+            const unsigned short* input, const unsigned char* weights, unsigned short* output,             \
+            unsigned int in_features, unsigned int out_features, unsigned int rows) {                       \
+        nvfp4::decode_row_groups<G, true, 1, 8>(input, weights, output, in_features, out_features, rows);    \
+    }                                                                                                       \
+    extern "C" __global__ __launch_bounds__(128) void euhedral_nvfp4_decode_groups##G##_w4(                  \
+            const unsigned short* input, const unsigned char* weights, unsigned short* output,             \
+            unsigned int in_features, unsigned int out_features, unsigned int rows) {                       \
+        nvfp4::decode_row_groups<G, false, 2, 4>(input, weights, output, in_features, out_features, rows);   \
+    }                                                                                                       \
+    extern "C" __global__ __launch_bounds__(128) void euhedral_nvfp4_decode_groups##G##_w4_sd4(              \
+            const unsigned short* input, const unsigned char* weights, unsigned short* output,             \
+            unsigned int in_features, unsigned int out_features, unsigned int rows) {                       \
+        nvfp4::decode_row_groups<G, true, 2, 4>(input, weights, output, in_features, out_features, rows);    \
+    }
+EUHEDRAL_NVFP4_DECODE_GROUPS(2)
+EUHEDRAL_NVFP4_DECODE_GROUPS(3)
+EUHEDRAL_NVFP4_DECODE_GROUPS(4)

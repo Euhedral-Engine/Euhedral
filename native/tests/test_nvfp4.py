@@ -133,6 +133,27 @@ class Nvfp4KernelTest(unittest.TestCase):
                             self.assertTrue(np.array_equal(together[row].view(np.uint32), alone[0].view(np.uint32)),
                                             f"row {row}")
 
+    def decode_groups(self, tile, x, weights, n, suffix=""):
+        """Grouped decode kernel (9 to 32 rows: ceil(rows / 8) groups of 8 sharing each weight fragment) on x's rows."""
+        rows, k = x.shape
+        per_cta, block = TILES[tile]
+        return self.run_kernel(f"euhedral_nvfp4_decode_groups{(rows + 7) // 8}_{tile}{suffix}", n // per_cta, x, weights,
+                               n, [C.c_uint(k), C.c_uint(n), C.c_uint(rows)], rows, block)
+
+    def test_grouped_decode_is_bitwise_one_row_decode(self):
+        for k, n in ((5120, 64), (17408, 32)):
+            weights, _ = tensor(self.rng, n, k)
+            sd4, plain = sd4_tensor(self.rng, n, k)
+            for tile in TILES:
+                for rows in (9, 16, 21, 24, 32):
+                    with self.subTest(tile=tile, k=k, rows=rows):
+                        x = bf16(self.rng.standard_normal((rows, k)).astype(np.float32))
+                        together = self.decode_groups(tile, x, weights, n)
+                        for row in range(rows):
+                            self.assert_bitwise(together[row], self.decode(tile, x[row:row + 1], weights, n)[0])
+                        self.assert_bitwise(self.decode_groups(tile, x, sd4, n, "_sd4"),
+                                            self.decode_groups(tile, x, plain, n))
+
     def test_scalar_reference_matches_the_float64_dequantization(self):
         for rows, k, n in ((1, 1024, 16), (3, 2048, 24), (9, 5120, 40)):
             with self.subTest(rows=rows, k=k, n=n):

@@ -91,13 +91,16 @@ static __device__ __forceinline__ float scale(const float* table, unsigned int b
 // one-row and multi-row calls on a tensor always agree. Requirements (checked by host dispatch):
 // in_features a multiple of 128, out_features a multiple of 16 * R, 16-byte aligned input and
 // weights, blockDim.x = 32 * W.
-template <int M, bool kSd4, int R, int W>
-static __device__ __forceinline__ void decode_rows(
+// Groups: G groups of 8 token rows (up to 8 G rows, `rows` of them real) share each weight fragment's
+// dequantization, one MMA per group; token row 8 k + g is column g of group k's MMA, so it is computed exactly as
+// in the one-row call. Batched verification runs several sequences' rows in one launch this way.
+template <int G, bool kSd4, int R, int W>
+static __device__ __forceinline__ void decode_row_groups(
         const unsigned short* input, const unsigned char* weights, unsigned short* output,
-        unsigned int in_features, unsigned int out_features) {
+        unsigned int in_features, unsigned int out_features, unsigned int rows) {
     __shared__ unsigned int pair_table[256];   // byte -> two E2M1 values as BF16x2 (low nibble in the low half)
     __shared__ float scale_table[16];
-    __shared__ float partial[W][16 * R][8];
+    __shared__ float partial[W][16 * R][8 * G];
     for (unsigned int i = threadIdx.x; i < 256u; i += blockDim.x) {
         const __nv_bfloat162 v = __floats2bfloat162_rn(e2m1_value(i & 15u), e2m1_value(i >> 4));
         pair_table[i] = *reinterpret_cast<const unsigned int*>(&v);
@@ -110,20 +113,29 @@ static __device__ __forceinline__ void decode_rows(
     const unsigned int row0 = blockIdx.x * 16u * R;
     const LayoutT<kSd4> w(weights, in_features, out_features);
     const unsigned int chunks = in_features / 128u;
-    float acc[R][4];
+    float acc[R][G][4];
     #pragma unroll
-    for (int r = 0; r < R; r++) acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = 0.0f;
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int k = 0; k < G; k++) acc[r][k][0] = acc[r][k][1] = acc[r][k][2] = acc[r][k][3] = 0.0f;
     euhedral_pdl_begin();
-    const unsigned short* x = input + (unsigned long long)g * in_features;
     #pragma unroll 2
     for (unsigned int c = warp; c < chunks; c += (unsigned int)W) {
         const unsigned int k0 = c * 128u + 32u * q;
-        uint4 xa[4];
+        unsigned int xs[G][16];
         #pragma unroll
-        for (int i = 0; i < 4; i++)
-            xa[i] = (int)g < M ? reinterpret_cast<const uint4*>(x + k0)[i] : make_uint4(0, 0, 0, 0);
-        const unsigned int xs[16] = {xa[0].x, xa[0].y, xa[0].z, xa[0].w, xa[1].x, xa[1].y, xa[1].z, xa[1].w,
-                                     xa[2].x, xa[2].y, xa[2].z, xa[2].w, xa[3].x, xa[3].y, xa[3].z, xa[3].w};
+        for (int k = 0; k < G; k++) {
+            const unsigned int token = 8u * k + g;
+            const unsigned short* x = input + (unsigned long long)token * in_features;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = token < rows ? reinterpret_cast<const uint4*>(x + k0)[i] : make_uint4(0, 0, 0, 0);
+                xs[k][4 * i] = v.x;
+                xs[k][4 * i + 1] = v.y;
+                xs[k][4 * i + 2] = v.z;
+                xs[k][4 * i + 3] = v.w;
+            }
+        }
         #pragma unroll
         for (int r = 0; r < R; r++) {
             const unsigned int rg = row0 + 16u * r + g, rh = rg + 8u;
@@ -147,29 +159,41 @@ static __device__ __forceinline__ void decode_rows(
                     __nv_bfloat162 vh1 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&ph1), bh);
                     const unsigned int a0 = *reinterpret_cast<unsigned int*>(&vg0), a1 = *reinterpret_cast<unsigned int*>(&vh0);
                     const unsigned int a2 = *reinterpret_cast<unsigned int*>(&vg1), a3 = *reinterpret_cast<unsigned int*>(&vh1);
-                    asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                            "{%0,%1,%2,%3};\n"
-                            : "+f"(acc[r][0]), "+f"(acc[r][1]), "+f"(acc[r][2]), "+f"(acc[r][3])
-                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xs[2 * s]), "r"(xs[2 * s + 1]));
+                    #pragma unroll
+                    for (int k = 0; k < G; k++)
+                        asm volatile(
+                                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                                "{%0,%1,%2,%3};\n"
+                                : "+f"(acc[r][k][0]), "+f"(acc[r][k][1]), "+f"(acc[r][k][2]), "+f"(acc[r][k][3])
+                                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xs[k][2 * s]), "r"(xs[k][2 * s + 1]));
                 }
             }
         }
     }
     #pragma unroll
-    for (int r = 0; r < R; r++) {
-        partial[warp][16 * r + g][2 * q] = acc[r][0];
-        partial[warp][16 * r + g][2 * q + 1] = acc[r][1];
-        partial[warp][16 * r + g + 8][2 * q] = acc[r][2];
-        partial[warp][16 * r + g + 8][2 * q + 1] = acc[r][3];
-    }
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int k = 0; k < G; k++) {
+            partial[warp][16 * r + g][8 * k + 2 * q] = acc[r][k][0];
+            partial[warp][16 * r + g][8 * k + 2 * q + 1] = acc[r][k][1];
+            partial[warp][16 * r + g + 8][8 * k + 2 * q] = acc[r][k][2];
+            partial[warp][16 * r + g + 8][8 * k + 2 * q + 1] = acc[r][k][3];
+        }
     __syncthreads();
-    for (unsigned int index = threadIdx.x; index < 16u * R * (unsigned int)M; index += blockDim.x) {
+    for (unsigned int index = threadIdx.x; index < 16u * R * rows; index += blockDim.x) {
         const unsigned int r = index % (16u * R), t = index / (16u * R);
         float sum = partial[0][r][t];
         #pragma unroll
         for (int v = 1; v < W; v++) sum += partial[v][r][t];
         q3::write_bf16(output + (unsigned long long)t * out_features, 0, row0 + r, out_features, sum * w.global);
     }
+}
+
+// 1 to 8 token rows: one group.
+template <int M, bool kSd4, int R, int W>
+static __device__ __forceinline__ void decode_rows(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int in_features, unsigned int out_features) {
+    decode_row_groups<1, kSd4, R, W>(input, weights, output, in_features, out_features, (unsigned int)M);
 }
 }  // namespace nvfp4
