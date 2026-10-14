@@ -23,13 +23,14 @@ import java.util.stream.IntStream;
 /// `globalScale` (sampled-tile scale search), `ldlq` (error feedback strip by strip through the Viterbi),
 /// `refitScales` (two rounds of closed-form refit of the fp16 scales in the Hessian metric). Nothing synchronizes
 /// inside the strip loop; the host reads back the diagonal mean, one Cholesky status per attempt, the tile energies
-/// and two candidate grids of the scale search, and at the end the packed tensors and the error sums.
+/// and two candidate grids of the scale search, and at the end the packed tensors and the error sums. Callers must have
+/// the instance's stream bound on the thread (`Device.bindOwnStream`), because the uploads use the bound stream.
 ///
-/// Peak device memory for `k` inputs and `n` outputs, on top of the caller's weight and Hessian: the original
-/// weight, its regularized copy, the decoded matrix and the feedback cache (`4 * k * n` bytes each) and the factor
-/// `L` (`4 * k * k`) while rounding; afterwards the original weight, the decoded matrix, `H W` and one product
+/// Peak device memory for `k` inputs and `n` outputs, on top of the caller's weight and Hessian: the regularized
+/// weight, the decoded matrix and the feedback cache (`4 * k * n` bytes each) and the factor `L` (`4 * k * k`) while
+/// rounding; afterwards the original weight (rebuilt from the BF16 input), the decoded matrix, `H W` and one product
 /// (`4 * k * n` each) and the refit's system (`4 * k * k`); plus the 256 MiB Viterbi scratch. Measured whole-device
-/// peaks: 2.3 GB for `k = 5120`, `n = 17408` and 4.5 GB for `k = 17408`, `n = 5120` (1.4 GB of it the caller's).
+/// peaks: 2.1 GB for `k = 5120`, `n = 17408` and 4.3 GB for `k = 17408`, `n = 5120` (1.4 GB of it the caller's).
 public final class TrellisQuantizer implements AutoCloseable {
 
     /// Share of the mean Hessian diagonal added as damping, and (twice) per Cholesky retry.
@@ -44,10 +45,17 @@ public final class TrellisQuantizer implements AutoCloseable {
     /// The packed trellis `[k / 16][n / 16][16 * bits]` int16 words, the fp16 bits of `suh` and `svh`, the BF16 `[n,
     /// k]`
     /// weight they reconstruct to (device address, owned by the caller), the proxy error `tr(E H Eᵀ) / tr(W H Wᵀ)`
-    /// (the mean squared error of the regularized weight when uncalibrated) and the global scale that was folded
-    /// into `suh`.
+    /// (the mean squared error of the regularized weight when uncalibrated), the global scale that was folded
+    /// into `suh` and the number of refit rounds whose input-side factorization failed (those left the input scales
+    /// alone).
     public record Result(
-            short[] trellis, short[] suh, short[] svh, long decoded, double proxyError, float globalScale) {}
+            short[] trellis,
+            short[] suh,
+            short[] svh,
+            long decoded,
+            double proxyError,
+            float globalScale,
+            int refitFailures) {}
 
     private final Cuda cuda;
     private final CudaGpuMemory gpu;
@@ -104,6 +112,7 @@ public final class TrellisQuantizer implements AutoCloseable {
 
             long regularized = allocate(4 * kn);
             launch("copy_floats", elementwise(kn), 1, 256, original, regularized, kn);
+            release(original);
             long su = allocate(4L * k), sv = allocate(4L * n);
             float scale = regularize(regularized, n, k, suSigns, svSigns, su, sv, applyOutScales, bits);
 
@@ -129,18 +138,31 @@ public final class TrellisQuantizer implements AutoCloseable {
             launch("scale_floats", (n + 255) / 256, k, 256, decoded, k, n, su, 0, 0);
             kernels.hadamardColumns(decoded, k, n);
             launch("scale_floats", (n + 255) / 256, k, 256, decoded, k, n, sv, 1, 0);
-            if (!fallback)
-                proxy = refitScales(original, decoded, hessian, (float) (SIGMA_REG * diagonalMean), su, sv, n, k);
+            int refitFailures = 0;
+            if (!fallback) {
+                original = allocate(4 * kn);
+                launch("bf16_to_float_transposed", (k + 31) / 32, (n + 31) / 32, 256, weight, n, k, original);
+                double[] refit =
+                        refitScales(original, decoded, hessian, (float) (SIGMA_REG * diagonalMean), su, sv, n, k);
+                proxy = refit[0];
+                refitFailures = (int) refit[1];
+                release(original);
+            }
 
             long suh = allocate(2L * k), svh = allocate(2L * n);
             launch("float_to_half", elementwise(k), 1, 256, su, (long) k, suh);
             launch("float_to_half", elementwise(n), 1, 256, sv, (long) n, svh);
             long rebuilt = gpu.allocate(2 * kn);
-            kernels.reconstruct(words, suh, svh, k, n, bits, rebuilt, decoded);
-            cuda.synchronize(stream);
-            short[] trellis = readShorts(words, tiles * wordsPerTile);
-            short[] suhHost = readShorts(suh, k), svhHost = readShorts(svh, n);
-            return new Result(trellis, suhHost, svhHost, rebuilt, proxy, scale);
+            try {
+                kernels.reconstruct(words, suh, svh, k, n, bits, rebuilt, decoded);
+                cuda.synchronize(stream);
+                short[] trellis = readShorts(words, tiles * wordsPerTile);
+                short[] suhHost = readShorts(suh, k), svhHost = readShorts(svh, n);
+                return new Result(trellis, suhHost, svhHost, rebuilt, proxy, scale, refitFailures);
+            } catch (RuntimeException | Error failure) {
+                gpu.free(rebuilt);
+                throw failure;
+            }
         } finally {
             releaseAll();
         }
@@ -361,13 +383,13 @@ public final class TrellisQuantizer implements AutoCloseable {
     /// Two rounds of closed-form refit of the scales to the rounded weight `q` (original basis, `[k, n]`, scaled in
     /// place) in the Hessian metric with the damping `d`: each output channel `c = qᵀ H w / qᵀ H q` (into `q` and
     /// `sv`), then the input scales solve `((Q Qᵀ) ∘ H) r = rowsum(Q ∘ H W)` (into `q` and `su`). A failed
-    /// factorization leaves a round's input scales alone. Returns the proxy error `tr(E H Eᵀ) / tr(W H Wᵀ)` of the
-    /// refitted weight with the undamped H.
-    private double refitScales(long original, long q, long hessian, float damping, long su, long sv, int n, int k) {
+    /// factorization leaves a round's input scales alone and is counted. Returns the proxy error
+    /// `tr(E H Eᵀ) / tr(W H Wᵀ)` of the refitted weight with the undamped H, and that count.
+    private double[] refitScales(long original, long q, long hessian, float damping, long su, long sv, int n, int k) {
         long kn = (long) k * n;
         long hw = allocate(4 * kn), product = allocate(4 * kn), system = allocate(4L * k * k);
         long numerator = allocate(4L * Math.max(n, k)), denominator = allocate(4L * n);
-        launch("fill_floats", 1, 1, 32, small + 16, 8L, 0f);
+        launch("fill_floats", 1, 1, 32, small + 16, 9L, 0f);
         gemmH(original, hessian, hw, n, k);
         launch("sum_products", Math.min(1024, elementwise(kn)), 1, 256, original, hw, kn, small + 16);
         launch("axpy_floats", elementwise(kn), 1, 256, hw, original, kn, damping);
@@ -388,7 +410,7 @@ public final class TrellisQuantizer implements AutoCloseable {
             launch("row_dots", k, 1, 256, q, hw, k, n, numerator);
             cuda.cholesky(cusolver, false, Cuda.FILL_UPPER, k, system, workspace, workspaceFloats, small + 8);
             cuda.solveCholesky(cusolver, Cuda.FILL_UPPER, k, 1, system, numerator, small + 12);
-            launch("clean_row_scales", (k + 255) / 256, 1, 256, numerator, small + 8, k);
+            launch("clean_row_scales", (k + 255) / 256, 1, 256, numerator, small + 8, k, small + 48);
             launch("scale_floats", (n + 255) / 256, k, 256, q, k, n, numerator, 0, 0);
             launch("scale_floats", 1, k, 1, su, k, 1, numerator, 0, 0);
         }
@@ -397,8 +419,9 @@ public final class TrellisQuantizer implements AutoCloseable {
         launch("sum_products", Math.min(1024, elementwise(kn)), 1, 256, product, hw, kn, small + 24);
         cuda.synchronize(stream);
         double[] sums = readDoubles(small + 16, 2);
+        int failures = readInts(small + 48, 1)[0];
         release(hw, product, system, numerator, denominator, workspace);
-        return sums[1] / Math.max(sums[0], 1e-30);
+        return new double[] {sums[1] / Math.max(sums[0], 1e-30), failures};
     }
 
     /// `out [k, n] = H [k, k] x [k, n]`, row-major, FP32.

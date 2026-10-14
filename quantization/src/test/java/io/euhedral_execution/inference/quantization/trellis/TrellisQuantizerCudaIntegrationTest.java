@@ -30,6 +30,7 @@ class TrellisQuantizerCudaIntegrationTest {
                     + ", global scale " + result.globalScale() + " against "
                     + meta.get("g_scale").asDouble());
             assertEquals(expected, result.proxyError(), 0.10 * expected, "proxy error");
+            assertEquals(0, result.refitFailures());
             f.gpu.free(result.decoded());
         }
     }
@@ -39,14 +40,27 @@ class TrellisQuantizerCudaIntegrationTest {
         try (Fixture f = new Fixture(1024, 512)) {
             f.gpu.zeroDeviceMemory(f.hessian, 4L * 1024 * 1024);
             var result = f.quantizer.quantize(f.weight, 512, 1024, f.hessian, 0, 3.0, 0, true);
-            assertTrue(Double.isFinite(result.proxyError()) || Double.isNaN(result.proxyError()));
+            assertTrue(Double.isFinite(result.proxyError()), "fallback proxy is a mean squared error");
             for (short s : result.suh()) assertTrue(Float.isFinite(Float.float16ToFloat(s)), "finite suh");
             f.gpu.free(result.decoded());
         }
     }
 
     @Test
-    void illConditionedHessianRetries() throws Exception {
+    void zeroedHessianWithCountFallsBack() throws Exception {
+        try (Fixture f = new Fixture(1024, 512)) {
+            f.gpu.zeroDeviceMemory(f.hessian, 4L * 1024 * 1024);
+            var result = f.quantizer.quantize(f.weight, 512, 1024, f.hessian, 4096, 3.0, 0, true);
+            assertTrue(Double.isFinite(result.proxyError()), "mean diagonal below 1e-20 takes the uncalibrated path");
+            assertEquals(0, result.refitFailures());
+            for (short s : result.suh()) assertTrue(Float.isFinite(Float.float16ToFloat(s)), "finite suh");
+            for (short s : result.svh()) assertTrue(Float.isFinite(Float.float16ToFloat(s)), "finite svh");
+            f.gpu.free(result.decoded());
+        }
+    }
+
+    @Test
+    void zeroedLeadingBlockQuantizesAfterDamping() throws Exception {
         try (Fixture f = new Fixture(1024, 512)) {
             // rank-deficient H: the fixture's H with its first 512 rows and columns zeroed
             f.zeroLeading(512);
