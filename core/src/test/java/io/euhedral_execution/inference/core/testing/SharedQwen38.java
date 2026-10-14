@@ -13,7 +13,7 @@ import java.nio.file.Path;
 /// class that asks and kept for the rest of the group ([Shared]).
 public final class SharedQwen38 {
     static final String Q3_DEFAULT = "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl";
-    static final String NVFP4_DEFAULT = "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl";
+    public static final String NVFP4_DEFAULT = "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl";
 
     /// A model on the device, with the file and the parsed artifact it came from. Closing it is the registry's job.
     public record Loaded(CudaGpuMemory gpu, Qwen38Model model, Path path, Artifact artifact) {}
