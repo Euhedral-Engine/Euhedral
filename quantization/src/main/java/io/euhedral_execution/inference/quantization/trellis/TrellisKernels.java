@@ -36,47 +36,75 @@ public final class TrellisKernels {
 
     /// Words (int16) per packed 256-weight tile.
     public static int wordsPerTile(double bits) {
+        validate(bits);
         return (int) Math.round(16 * bits);
     }
 
     /// Bytes of Viterbi scratch for `count` tiles. Integer rates keep one history byte per position and state,
     /// `[count, 256, 65536 >> K]`; half-step rates also keep two cost arrays and 16-bit history (K the lower rate).
     public static long scratchBytes(int count, double bits) {
+        validate(bits);
         int k = (int) Math.floor(bits);
         long edges = 65536L >> k;
         if (bits == k) return (long) count * 256 * edges;
         return (long) count * (2 * 2 * edges + 2 * 256 * edges);
     }
 
+    private static void validate(double bits) {
+        int k = (int) Math.floor(bits);
+        boolean supported = bits != k ? (bits == 2.5 || bits == 3.5) : k >= 2 && k <= 6;
+        if (!supported) throw new IllegalArgumentException("unsupported rate " + bits);
+    }
+
+    private static void validate(int count) {
+        if (count < 0) throw new IllegalArgumentException("negative tile count " + count);
+    }
+
+    /// Tiles whose Viterbi scratch fits in `bytes` (at least one).
+    public static int scratchTiles(long bytes, double bits) {
+        return (int) Math.max(1, Math.min(Integer.MAX_VALUE, bytes / scratchBytes(1, bits)));
+    }
+
     private Cuda.Function function(String kind, double bits) {
+        validate(bits);
         int k = (int) Math.floor(bits);
         boolean frac = bits != k;
-        boolean supported = frac ? (bits == 2.5 || bits == 3.5) : k >= 2 && k <= 6;
-        if (!supported) throw new IllegalArgumentException("unsupported rate " + bits);
         return functions.get(kind + (frac ? "_frac_k" : "_k") + k);
     }
 
-    /// Quantizes `count` float32 tiles `[count, 256]` to trellis states (uint16 `indices`) and the float32 codebook
-    /// values they decode to. `scratch` is [scratchBytes] bytes.
-    public void viterbi(long tiles, int count, double bits, long indices, long decoded, long scratch) {
+    /// Quantizes `count` float32 tiles `[count, 256]` to trellis states (uint16 `indices`) and the float32
+    /// codebook values they decode to. `scratch` holds `scratchBytes(scratchTiles, bits)`. Tiles run in chunks of
+    /// at most `scratchTiles` (and of the resident wave) on the stream, reusing the scratch; blocks are
+    /// independent, so chunking does not change any result.
+    public void viterbi(
+            long tiles, int count, double bits, long indices, long decoded, long scratch, int scratchTiles) {
+        validate(count);
         if (count == 0) return;
+        if (scratchTiles < 1) throw new IllegalArgumentException("scratch holds no tile");
         int k = (int) Math.floor(bits);
         boolean frac = bits != k;
         int threads = frac ? FRAC_THREADS : viterbiThreads(k);
         int shared = frac ? fracShared() : viterbiShared(k);
-        cuda.launch(
-                function("viterbi", bits),
-                count,
-                1,
-                threads,
-                shared,
-                stream,
-                new Cuda.Arguments()
-                        .pointer(tiles)
-                        .integer(count)
-                        .pointer(indices)
-                        .pointer(decoded)
-                        .pointer(scratch));
+        Cuda.Function f = function("viterbi", bits);
+        int wave = Math.max(1, cuda.blocksPerMultiprocessor(f, threads, shared)) * cuda.multiprocessors();
+        int chunk = Math.min(scratchTiles, wave);
+        for (int start = 0; start < count; start += chunk) {
+            int n = Math.min(chunk, count - start);
+            long offset = 256L * start;
+            cuda.launch(
+                    f,
+                    n,
+                    1,
+                    threads,
+                    shared,
+                    stream,
+                    new Cuda.Arguments()
+                            .pointer(tiles + 4 * offset)
+                            .integer(n)
+                            .pointer(indices + 2 * offset)
+                            .pointer(decoded + 4 * offset)
+                            .pointer(scratch));
+        }
     }
 
     private static int viterbiThreads(int k) {
@@ -95,6 +123,7 @@ public final class TrellisKernels {
 
     /// Packs uint16 states `[count, 256]` into `[count, 16 * bits]` int16 words, MSB first.
     public void pack(long indices, int count, double bits, long words) {
+        validate(count);
         if (count == 0) return;
         boolean frac = bits != Math.floor(bits);
         int blocks = frac ? (count + 127) / 128 : count;
@@ -110,6 +139,7 @@ public final class TrellisKernels {
 
     /// Decodes packed words back to float32 codebook values `[count, 256]`.
     public void decode(long words, int count, double bits, long decoded) {
+        validate(count);
         if (count == 0) return;
         cuda.launch(
                 function("decode", bits),

@@ -22,6 +22,17 @@ class TrellisKernelsCudaIntegrationTest {
     @ParameterizedTest
     @ValueSource(strings = {"2", "3", "4", "5", "6", "2.5", "3.5"})
     void matchesExllamav3(String rate) throws Exception {
+        run(rate, 64);
+    }
+
+    /// The same tiles through a scratch of 16 tiles: chunking is exact.
+    @ParameterizedTest
+    @ValueSource(strings = {"2", "2.5", "4", "3.5"})
+    void chunkedScratchIsExact(String rate) throws Exception {
+        run(rate, 16);
+    }
+
+    private void run(String rate, int scratchTiles) throws Exception {
         double bits = Double.parseDouble(rate);
         Npy in = read("tiles-in.npy");
         short[] idx = shorts(read("tiles-" + rate + "-idx.npy"));
@@ -36,9 +47,9 @@ class TrellisKernelsCudaIntegrationTest {
             long tiles = gpu.allocate(4L * count * 256), indices = gpu.allocate(2L * count * 256);
             long decoded = gpu.allocate(4L * count * 256), packedDevice = gpu.allocate(2L * count * words);
             long decodedAgain = gpu.allocate(4L * count * 256);
-            long scratch = gpu.allocate(TrellisKernels.scratchBytes(count, bits));
+            long scratch = gpu.allocate(TrellisKernels.scratchBytes(scratchTiles, bits));
             Upload.segment(gpu, tiles, MemorySegment.ofBuffer(in.data()), 4L * count * 256);
-            kernels.viterbi(tiles, count, bits, indices, decoded, scratch);
+            kernels.viterbi(tiles, count, bits, indices, decoded, scratch, scratchTiles);
             kernels.pack(indices, count, bits, packedDevice);
             kernels.decode(packedDevice, count, bits, decodedAgain);
             cuda.synchronize(0L);
