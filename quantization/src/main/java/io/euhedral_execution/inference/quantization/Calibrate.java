@@ -29,7 +29,6 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -96,7 +95,7 @@ public final class Calibrate {
         Files.createDirectories(settings.out());
         try (Safetensors store = Safetensors.open(settings.model());
                 Device device = new Device(library);
-                CalibrationLattice lattice = CalibrationLattice.start(WORKERS, Set.of(8, 9))) {
+                CalibrationLattice lattice = CalibrationLattice.start(WORKERS)) {
             new Calibrate(settings, device, new Qwen38Objects(store, settings.model()), lattice).calibrate();
         }
     }
