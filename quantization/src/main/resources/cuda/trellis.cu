@@ -48,7 +48,7 @@ __device__ __forceinline__ uint32_t warp_min(uint32_t value) {
 
 __host__ __device__ constexpr int viterbi_threads(int K) { return K == 5 || K == 6 ? 512 : 1024; }
 
-/// Dense tail-biting Viterbi of one tile for K = 2..6 (one block per tile). Costs live in shared memory, the history
+/// Dense tail-biting Viterbi of one tile for K = 2..6 (one block per tile: the grid must equal the tile count). Costs live in shared memory, the history
 /// is one byte per (position, state) in `temp_edges`, [256, 65536 >> K] per tile.
 template <int K>
 __device__ __forceinline__ void viterbi_body(
@@ -422,7 +422,7 @@ __device__ __forceinline__ void frac_body(
     backward(0, true, end_state);
 }
 
-/// Integer-rate packing of one tile: K low bits of each state, MSB first, 16 spans of 16 weights, 16-bit halves of
+/// Integer-rate packing of one tile (one block of 128 threads per tile, grid == tile count): K low bits of each state, MSB first, 16 spans of 16 weights, 16-bit halves of
 /// each 32-bit word swapped (pack.cu).
 template <int K>
 __device__ __forceinline__ void pack_body(uint16_t* __restrict__ g_packed, const uint16_t* __restrict__ g_unpacked) {
@@ -499,7 +499,7 @@ __device__ __forceinline__ void pack_frac_tile(
     for (int w = 0; w < nw; ++w) out[w] = words[w];
 }
 
-/// Decodes one tile (one block of 256 threads) of packed words, integer or fractional: weight i is the codebook
+/// Decodes one tile (grid == tile count, blockDim must be 256: one thread per weight) of packed words, integer or fractional: weight i is the codebook
 /// value of the 16-bit window ending at ring position S(i) (frac.cu unpack, exl3_dq.cuh window).
 __device__ __forceinline__ void decode_tile(
         const uint16_t* __restrict__ g_packed, float* __restrict__ g_decoded, int ka, uint32_t mask, int bpb) {

@@ -31,7 +31,8 @@ public final class Cuda {
     private final Arena arena = Arena.ofShared();
     private final MethodHandle cuInit, cuDeviceGet, cuDeviceGetAttribute, cuDevicePrimaryCtxRetain, cuCtxSetCurrent;
     private final MethodHandle cuModuleLoadData, cuModuleGetFunction, cuLaunchKernel, cuStreamSynchronize;
-    private final MethodHandle cuFuncSetAttribute;
+    private final MethodHandle cuFuncSetAttribute, cuOccupancy;
+    private final int multiprocessors;
     private final MethodHandle cuEventCreate, cuEventRecord, cuEventQuery, cuStreamWaitEvent, cuEventDestroy;
     private final MethodHandle nvrtcCreateProgram, nvrtcCompileProgram, nvrtcGetProgramLogSize, nvrtcGetProgramLog;
     private final MethodHandle nvrtcGetCUBINSize, nvrtcGetCUBIN, nvrtcDestroyProgram;
@@ -57,6 +58,7 @@ public final class Cuda {
         cuLaunchKernel = bind(driver, "cuLaunchKernel", INT, PTR, INT, INT, INT, INT, INT, INT, INT, PTR, PTR, PTR);
         cuStreamSynchronize = bind(driver, "cuStreamSynchronize", INT, PTR);
         cuFuncSetAttribute = bind(driver, "cuFuncSetAttribute", INT, PTR, INT, INT);
+        cuOccupancy = bind(driver, "cuOccupancyMaxActiveBlocksPerMultiprocessor", INT, PTR, PTR, INT, PTR);
         cuEventCreate = bind(driver, "cuEventCreate", INT, PTR, INT);
         cuEventRecord = bind(driver, "cuEventRecord", INT, PTR, PTR);
         cuEventQuery = bind(driver, "cuEventQuery", INT, PTR);
@@ -113,6 +115,8 @@ public final class Cuda {
             int major = value.get(INT, 0);
             check("cuDeviceGetAttribute", (int) cuDeviceGetAttribute.invokeExact(value.address(), 76, ordinal));
             architecture = "sm_" + major + value.get(INT, 0);
+            check("cuDeviceGetAttribute", (int) cuDeviceGetAttribute.invokeExact(value.address(), 16, ordinal));
+            multiprocessors = value.get(INT, 0);
             MemorySegment ctx = local.allocate(PTR);
             check("cuDevicePrimaryCtxRetain", (int) cuDevicePrimaryCtxRetain.invokeExact(ctx.address(), ordinal));
             context = ctx.get(PTR, 0);
@@ -138,6 +142,24 @@ public final class Cuda {
     public void bindThread() {
         try {
             check("cuCtxSetCurrent", (int) cuCtxSetCurrent.invokeExact(context));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Streaming multiprocessors on the device.
+    public int multiprocessors() {
+        return multiprocessors;
+    }
+
+    /// Blocks of `function` (with `blockSize` threads and `shared` dynamic shared bytes) resident on one
+    /// multiprocessor.
+    public int blocksPerMultiprocessor(Function function, int blockSize, int shared) {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment blocks = local.allocate(INT);
+            check("cuOccupancyMaxActiveBlocksPerMultiprocessor", (int)
+                    cuOccupancy.invokeExact(blocks.address(), function.handle(), blockSize, (long) shared));
+            return blocks.get(INT, 0);
         } catch (Throwable failure) {
             throw rethrow(failure);
         }
