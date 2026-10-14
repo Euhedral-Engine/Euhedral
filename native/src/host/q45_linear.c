@@ -22,6 +22,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static CUmodule module;
 /* [format]: 0 Q4, 1 Q5. */
 static CUfunction decode_one[2], decode_rows[2][EUHEDRAL_DECODE_MAX_ROWS + 1];
+static CUfunction decode_tokens[2];  /* 9 to EUHEDRAL_DECODE_TOKENS_MAX rows */
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static void initialize(void) {
@@ -33,6 +34,12 @@ static void initialize(void) {
     }
     for (int format = 0; format < 2; format++) {
         euhedral_cuda_pdl_register(decode_one[format]);
+        char tokens[48];
+        snprintf(tokens, sizeof(tokens), "euhedral_q%d_decode_contiguous_tokens", 4 + format);
+        if (cuModuleGetFunction(&decode_tokens[format], module, tokens) != CUDA_SUCCESS)
+            init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+        else
+            euhedral_cuda_pdl_register(decode_tokens[format]);
         for (unsigned int m = 2; m <= EUHEDRAL_DECODE_MAX_ROWS; m++) {
             char name[48];
             snprintf(name, sizeof(name), "euhedral_q%d_decode_contiguous_rows%u", 4 + format, m);
@@ -90,7 +97,7 @@ int euhedral_cuda_linear_quantized_bf16(
     if ((uint64_t)rows * out_features > UINT32_MAX) return EUHEDRAL_CUDA_SIZE_OVERFLOW;
     status = euhedral_cuda_bind_thread_context();
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    const int qualified = rows <= EUHEDRAL_DECODE_MAX_ROWS && euhedral_q45_decode_shape(in_features, out_features)
+    const int qualified = rows <= EUHEDRAL_DECODE_TOKENS_MAX && euhedral_q45_decode_shape(in_features, out_features)
             && (((uintptr_t)device_weights | (uintptr_t)device_input) & 15u) == 0u;
     if (euhedral_cuda_exact_numerics() || !qualified)
         return euhedral_reference_q45(device_input, device_weights, device_output, rows, in_features, out_features, bits);
@@ -102,8 +109,11 @@ int euhedral_cuda_linear_quantized_bf16(
     CUdeviceptr output = (CUdeviceptr)(uintptr_t)device_output;
     uint32_t rows_arg = rows, in_arg = in_features, out_arg = out_features;
     void* parameters[] = {&input, &weights, &output, &rows_arg, &in_arg, &out_arg};
-    CUresult result = euhedral_launch_kernel(rows == 1 ? decode_one[format] : decode_rows[format][rows], out_features / 8u,
-            1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), parameters, NULL);
+    CUresult result = rows > EUHEDRAL_DECODE_MAX_ROWS
+            ? euhedral_launch_kernel(decode_tokens[format], out_features / 4u, 1, 1, 128, 1, 1, 0,
+                      euhedral_cuda_submission_stream(), parameters, NULL)
+            : euhedral_launch_kernel(rows == 1 ? decode_one[format] : decode_rows[format][rows], out_features / 8u,
+                      1, 1, 128, 1, 1, 0, euhedral_cuda_submission_stream(), parameters, NULL);
     if (result != CUDA_SUCCESS) return (int)result;
     if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t sync = cudaDeviceSynchronize();

@@ -32,3 +32,15 @@ EUHEDRAL_Q45_DECODE_CONTIGUOUS_ROWS_ALL(4)
 EUHEDRAL_Q45_DECODE_CONTIGUOUS_ROWS_ALL(5)
 #undef EUHEDRAL_Q45_DECODE_CONTIGUOUS_ROWS_ALL
 #undef EUHEDRAL_Q45_DECODE_CONTIGUOUS_ROWS
+
+// 9 to 32 rows (batched verification of several sequences): row t is bit for bit the one-row kernel's output for
+// it, the weights read once. 128 threads, 4 weight rows per CTA (grid out_features / 4).
+#define EUHEDRAL_Q45_DECODE_CONTIGUOUS_TOKENS(B) \
+extern "C" __global__ __launch_bounds__(128) void euhedral_q##B##_decode_contiguous_tokens( \
+        const unsigned short* input, const unsigned char* weights, unsigned short* output, \
+        unsigned int rows, unsigned int in_features, unsigned int out_features) { \
+    q45::contiguous_decode_tokens<B>(input, weights, output, rows, in_features, out_features); \
+}
+EUHEDRAL_Q45_DECODE_CONTIGUOUS_TOKENS(4)
+EUHEDRAL_Q45_DECODE_CONTIGUOUS_TOKENS(5)
+#undef EUHEDRAL_Q45_DECODE_CONTIGUOUS_TOKENS

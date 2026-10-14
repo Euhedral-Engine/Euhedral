@@ -14,5 +14,8 @@ static inline int euhedral_q45_decode_shape(uint32_t in_features, uint32_t out_f
 
 /* Most rows a decode kernel takes in one launch: the single-row kernel and its 2 to 8 row twins. */
 #define EUHEDRAL_DECODE_MAX_ROWS 8u
+/* Most rows the token-row twins of the contiguous decode kernels take (batched verification of several sequences),
+ * each row still bit for bit the one-row kernel's. */
+#define EUHEDRAL_DECODE_TOKENS_MAX 32u
 
 #endif

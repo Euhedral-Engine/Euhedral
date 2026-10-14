@@ -32,6 +32,14 @@ EUHEDRAL_Q3_DECODE_CONTIGUOUS_ROWS(7)
 EUHEDRAL_Q3_DECODE_CONTIGUOUS_ROWS(8)
 #undef EUHEDRAL_Q3_DECODE_CONTIGUOUS_ROWS
 
+// 9 to 32 rows (batched verification of several sequences): row t is bit for bit the one-row kernel's output for
+// it, the weights read once. 128 threads, 4 weight rows per CTA (grid out_features / 4); per-row requirements as above.
+extern "C" __global__ __launch_bounds__(128) void euhedral_q3_decode_contiguous_tokens(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output,
+        unsigned int rows, unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
+    q3::contiguous_decode_tokens(input, weights, output, rows, in_features, out_features, scale_offset);
+}
+
 // P2E2 tensors (p2e2.cuh, docs/COMPRESSED_Q3.md).
 // Single-row decode from the compressed layout, bitwise identical to euhedral_q3_decode_contiguous on
 // the row-split tensor it encodes. 128 threads, 16 rows per CTA; same shape requirements.

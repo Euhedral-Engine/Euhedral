@@ -157,6 +157,27 @@ class Q45KernelTest(unittest.TestCase):
                                                     xt, w, 1, width, outputs)
                             self.assertEqual(together[t * outputs * 2:(t + 1) * outputs * 2], alone, f"row {t}")
 
+    def test_token_row_twins_are_bitwise_one_row_decode(self):
+        """Each row of euhedral_q{4,5}_decode_contiguous_tokens (9 to 32 rows) is bit for bit the one-row contiguous
+        kernel's output for that row."""
+        width, outputs = 5120, 104
+        for bits in (4, 5):
+            with contextlib.ExitStack() as stack:
+                payload = make_weights(self.rng, bits, width, outputs,
+                                       lambda i: self.rng.randrange(0x2000, 0x2c00) | (self.rng.randrange(2) << 15))
+                w = self.owned(stack, self.gpu.upload(payload))
+                for m in (9, 20, 32):
+                    with self.subTest(bits=bits, m=m):
+                        values = [to_bf16(self.rng.uniform(-2, 2)) for _ in range(m * width)]
+                        x = self.owned(stack, self.gpu.upload(struct.pack(f"<{m * width}H", *values)))
+                        together = self.run_kernel(stack, f"euhedral_q{bits}_decode_contiguous_tokens", outputs // 4,
+                                                   x, w, m, width, outputs)
+                        for t in range(m):
+                            xt = self.owned(stack, self.gpu.upload(struct.pack(f"<{width}H", *values[t * width:(t + 1) * width])))
+                            alone = self.run_kernel(stack, f"euhedral_q{bits}_decode_contiguous", outputs // 8,
+                                                    xt, w, 1, width, outputs)
+                            self.assertEqual(together[t * outputs * 2:(t + 1) * outputs * 2], alone, f"row {t}")
+
     def test_capped_grid_matches_one_block_per_output_bitwise(self):
         """The reference strides over outputs, so a grid smaller than rows * outputs gives the same bits."""
         bits, rows, width, outputs = 5, 3, 256, 37
