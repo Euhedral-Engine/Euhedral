@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
+import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.testing.SharedQwen38;
@@ -24,8 +26,10 @@ import org.junit.jupiter.api.Timeout;
 /// A batched verification ([Quantum#batch]) must compute every sequence's rows bit for bit as that sequence's own
 /// verification, and leave each sequence the same state: three sequences with prompts of different lengths verify
 /// their forced tokens together, twice (8 + 8 + 8 rows, then 5 + 8 + 3), while three twins verify the same tokens one
-/// sequence at a time. Every logits row, the positions, and every GDN and attention state must match.
-@ModelGroup.Nvfp4
+/// sequence at a time. Every logits row, the positions, and every GDN and attention state must match. The NVFP4
+/// artifact keeps 2304 MiB of its weights in host memory (`euhedral.batched.host-mib`), so six sequences fit beside it
+/// on a 16 GB card, and the staged weights are exercised too.
+@ModelGroup.OwnJvm
 class BatchedVerifyCudaIntegrationTest {
 
     @Test
@@ -38,10 +42,17 @@ class BatchedVerifyCudaIntegrationTest {
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
         int[] prefixes = {300, 411, 530};
         int[][] rounds = {{8, 8, 8}, {5, 8, 3}};
-        var loaded = SharedQwen38.nvfp4();
-        CudaGpuMemory gpu = loaded.gpu();
-        Qwen38Model model = loaded.model();
-        try (var lattice = new PullingLattice()) {
+        Path artifact = Path.of(System.getProperty("euhedral.qwen.nvfp4-artifact", SharedQwen38.NVFP4_DEFAULT));
+        long hostBytes = Long.getLong("euhedral.batched.host-mib", 2304L) << 20;
+        var data = ArtifactReader.read(artifact);
+        try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
+                Qwen38Model model = Qwen38Model.load(
+                        artifact,
+                        data,
+                        gpu,
+                        ArtifactProfile.Speculation.NONE,
+                        HostWeightSelection.select(data, hostBytes));
+                var lattice = new PullingLattice()) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice, plan, gpu);
             List<Sequence> batched = new ArrayList<>(), alone = new ArrayList<>();
