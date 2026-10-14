@@ -194,15 +194,33 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         read.pending = next;
         this.state[slot] = READING;
         this.inFlight.incrementAndGet();
-        if (!this.reads.submit(fd, this.window.slotHost(slot), length, use.alignedOffset(), read)) {
-            // The ring is full: the next poll asks again.
-            this.inFlight.decrementAndGet();
-            this.state[slot] = IDLE;
-            read.pending = null;
+        boolean submitted;
+        Throwable refusal = null;
+        try {
+            submitted = this.reads.submit(fd, this.window.slotHost(slot), length, use.alignedOffset(), read);
+        } catch (RuntimeException failure) {
+            submitted = false;
+            refusal = failure;
+        }
+        if (submitted) {
+            this.queues[slot].poll();
+            given(next.quantum());
             return;
         }
+        // This thread cannot submit (no ring of its own, or the submission failed): the use is read here, or
+        // fails its quantum; either way the flag rises, so the device never waits for a read that will not come.
+        this.inFlight.decrementAndGet();
+        read.pending = null;
         this.queues[slot].poll();
         given(next.quantum());
+        try {
+            if (refusal != null) throw refusal;
+            readPositionally(slot, use);
+        } catch (Throwable failure) {
+            failed(next, failure);
+        }
+        this.state[slot] = FILLED;
+        this.window.raise(slot);
     }
 
     /// One more use of `quantum` has its slot.
@@ -215,6 +233,11 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
 
     private void readPositionally(int slot, DiskUse use) throws IOException {
         long length = use.lead() + use.byteSize();
+        if (this.channel == null) {
+            // io_uring is there but this thread cannot submit to it: a blocking read of the buffered descriptor.
+            AsyncReads.readBlocking(this.bufferedFd, this.window.slotHost(slot), length, use.alignedOffset());
+            return;
+        }
         ByteBuffer target = this.window.slotSegment(slot).asSlice(0, length).asByteBuffer();
         long position = use.alignedOffset();
         while (target.hasRemaining()) {
@@ -246,6 +269,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         @Override
         public void execute() {
             Pending done = this.pending;
+            // A completion the lattice runs twice (rejected after running) ends its read once.
+            if (done == null) return;
             this.pending = null;
             IOException failure = failure();
             if (failure != null) failed(done, failure);
@@ -253,6 +278,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
             int slot = this.slot;
             try {
                 if (!DiskReader.this.closed) post(() -> DiskReader.this.state[slot] = FILLED);
+            } catch (RuntimeException closing) {
+                // The reader closed between the check and the post: no later use needs the slot.
             } finally {
                 DiskReader.this.inFlight.decrementAndGet();
             }

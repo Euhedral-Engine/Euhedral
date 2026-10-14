@@ -80,11 +80,22 @@ public record HostBudget(long pinnableBytes, long residentBytes, Source source) 
 
     /// The budget of this machine and process: automatic, or as stated by [#ENVIRONMENT] (or the property).
     public static HostBudget system() {
+        return system(true);
+    }
+
+    /// [#system], with the n-gram rows' page cache in the runtime's reserve only when `ngramRows` (the
+    /// models that read them).
+    public static HostBudget system(boolean ngramRows) {
         return of(
                 System.getenv(ENVIRONMENT),
                 System.getProperty("euhedral.host.memory-mib"),
                 availableBytes(),
-                runtimeReserve());
+                runtimeReserve() - (ngramRows ? 0 : NGRAM_WORKING_SET));
+    }
+
+    /// The pinned memory this budget allows: as stated when stated, else what the machine can spare.
+    public long pinnedBytes() {
+        return this.source == Source.EXPLICIT ? this.residentBytes : Math.min(this.pinnableBytes, this.residentBytes);
     }
 
     /// As [#system] over explicit sources, with no runtime reserve.
