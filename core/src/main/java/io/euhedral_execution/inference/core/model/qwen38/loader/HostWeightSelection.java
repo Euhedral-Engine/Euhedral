@@ -1,7 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
-import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -56,11 +56,9 @@ public final class HostWeightSelection {
         if (remaining <= 0) return selected;
         Map<String, List<TensorDescriptor>> families = new HashMap<>();
         for (TensorDescriptor tensor : artifact.tensors()) {
+            if (!stageable(tensor)) continue;
             Matcher matcher = LAYER_OBJECT.matcher(tensor.name());
-            if (!matcher.matches()
-                    || !(tensor.layout() == WeightLayout.ROW_SPLIT_K128_V1
-                            || tensor.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1)) continue;
-            if (FAMILIES.contains(matcher.group(2)))
+            if (matcher.matches())
                 families.computeIfAbsent(matcher.group(2), ignored -> new ArrayList<>())
                         .add(tensor);
         }
@@ -84,6 +82,19 @@ public final class HostWeightSelection {
             if (remaining <= 0) break;
         }
         return selected;
+    }
+
+    /// Whether `tensor` is a layer projection of the listed families that a transfer can stage whole: grouped
+    /// (`ROW_SPLIT_K128_V1`, `ROW_SPLIT_K128_SD4_V1`) or BF16 (`CONTIGUOUS_LE_V1`). A P2E2 payload is never staged:
+    /// its row offsets index the payload where it was loaded.
+    public static boolean stageable(TensorDescriptor tensor) {
+        Matcher matcher = LAYER_OBJECT.matcher(tensor.name());
+        if (!matcher.matches() || !FAMILIES.contains(matcher.group(2))) return false;
+        return switch (tensor.layout()) {
+            case ROW_SPLIT_K128_V1, ROW_SPLIT_K128_SD4_V1 -> true;
+            case CONTIGUOUS_LE_V1 -> tensor.format() == WeightFormat.BF16;
+            default -> false;
+        };
     }
 
     private static int layer(TensorDescriptor tensor) {

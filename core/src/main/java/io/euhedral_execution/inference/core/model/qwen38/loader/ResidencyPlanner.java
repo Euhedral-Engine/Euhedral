@@ -6,13 +6,15 @@ import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.Set;
 
 /// Decides which weights stay on the device so that a context of `maxContextTokens` fits in the memory
-/// the device has free. Nothing is host-backed when everything fits; otherwise the smallest selection
-/// of [HostWeightSelection] that makes room is taken, because every host-backed byte costs decode time.
+/// the device has free. Nothing is offloaded when everything fits; otherwise the smallest selection
+/// of [HostWeightSelection] that makes room is taken, because every offloaded byte costs decode time. The
+/// selection goes to pinned host memory up to the host budget and the rest stays in the artifact file (disk).
 ///
 /// The device budget is the resident weights, the staging ring for host-backed projections, the KV pages
 /// of one sequence of `maxContextTokens` and a fixed reserve for the per-sequence GDN state, the
@@ -54,9 +56,11 @@ public final class ResidencyPlanner {
         return Math.multiplyExact(layers * pages, 2 * AttentionKvState.planePageBytes(width, format));
     }
 
-    /// Plans residency with at most `hostBytes` of pinned host memory and a KV cache in `kvFormat`: objects
-    /// beyond what the device and that host memory hold are left in the artifact file. The disk tier is planned
-    /// by the offload work; until then, nothing is disk-backed and the host budget is not enforced.
+    /// Plans residency with at most `hostBytes` of pinned host memory and a KV cache in `kvFormat`. Objects leave
+    /// the device in [HostWeightSelection]'s order, as many as the device needs; they go to host memory in that
+    /// order while it holds them beside the disk window, and the rest stay in the artifact file. The plan does not
+    /// fit when the device cannot make room, or when host memory cannot hold the token embedding (a gather, read in
+    /// place) and the window.
     public static Plan plan(
             Artifact artifact,
             ArtifactProfile profile,
@@ -64,36 +68,77 @@ public final class ResidencyPlanner {
             int maxContextTokens,
             long hostBytes,
             KvFormat kvFormat) {
-        return plan(artifact, profile, freeBytes, maxContextTokens, kvFormat);
-    }
-
-    /// Plans residency for `artifact` on a device with `freeBytes` free, or returns the plan that comes
-    /// closest (`fits` false) when even the largest host-backed selection does not make room.
-    public static Plan plan(Artifact artifact, ArtifactProfile profile, long freeBytes, int maxContextTokens) {
-        return plan(artifact, profile, freeBytes, maxContextTokens, KvFormat.NVFP4);
-    }
-
-    private static Plan plan(
-            Artifact artifact, ArtifactProfile profile, long freeBytes, int maxContextTokens, KvFormat kvFormat) {
         long fixed = kvBytes(artifact.config(), maxContextTokens, kvFormat) + RESERVE_BYTES;
         Plan resident = deviceNeed(artifact, profile, Set.of());
-        if (resident.deviceBytes() + fixed <= freeBytes) return withFixed(artifact, resident, fixed, true);
+        if (resident.deviceBytes() + fixed <= freeBytes) return tiers(artifact, resident, fixed, hostBytes, true);
         long all = artifactBytes(artifact, profile);
-        // Grow the host-backed bytes until the device need fits. The ring grows with the largest selected
+        // Grow the offloaded bytes until the device need fits. The ring grows with the largest selected
         // tensor, so each step re-evaluates the whole selection.
         long step = 64L << 20;
         for (long bytes = step; ; bytes += step) {
             Plan candidate = deviceNeed(artifact, profile, HostWeightSelection.select(artifact, bytes));
-            if (candidate.deviceBytes() + fixed <= freeBytes) return withFixed(artifact, candidate, fixed, true);
-            if (bytes > all) return withFixed(artifact, candidate, fixed, false);
+            if (candidate.deviceBytes() + fixed <= freeBytes) return tiers(artifact, candidate, fixed, hostBytes, true);
+            if (bytes > all) return tiers(artifact, candidate, fixed, hostBytes, false);
         }
     }
 
-    private static Plan withFixed(Artifact artifact, Plan plan, long fixed, boolean fits) {
-        long host = 0;
-        for (TensorDescriptor tensor : artifact.tensors())
-            if (plan.hostBacked().contains(tensor.name())) host += tensor.byteSize();
-        return new Plan(plan.hostBacked(), Set.of(), plan.deviceBytes() + fixed, host, 0L, fits);
+    /// Plans residency for `artifact` on a device with `freeBytes` free, with unlimited host memory, or returns the
+    /// plan that comes closest (`fits` false) when even the largest host-backed selection does not make room.
+    public static Plan plan(Artifact artifact, ArtifactProfile profile, long freeBytes, int maxContextTokens) {
+        return plan(artifact, profile, freeBytes, maxContextTokens, Long.MAX_VALUE, KvFormat.NVFP4);
+    }
+
+    /// Splits `plan`'s offloaded objects (its `hostBacked`, in selection order) between host memory and the
+    /// artifact file. The embedding stays in host memory; then each object goes to host memory while the arena and
+    /// the window that the remaining objects would need fit in `hostBytes`, and from the first that does not, every
+    /// object goes to disk.
+    private static Plan tiers(Artifact artifact, Plan plan, long fixed, long hostBytes, boolean deviceFits) {
+        java.util.Map<String, TensorDescriptor> tensors = new java.util.HashMap<>();
+        for (TensorDescriptor tensor : artifact.tensors()) tensors.put(tensor.name(), tensor);
+        java.util.List<String> order = java.util.List.copyOf(plan.hostBacked());
+        long total = 0;
+        for (String name : order) total += tensors.get(name).byteSize();
+        if (total <= hostBytes)
+            return new Plan(plan.hostBacked(), Set.of(), plan.deviceBytes() + fixed, total, 0L, deviceFits);
+        // The largest object at or after each position: the window the objects from there on would need.
+        long[] largestFrom = new long[order.size() + 1];
+        for (int index = order.size() - 1; index >= 0; index--) {
+            String name = order.get(index);
+            long size = name.equals(HostWeightSelection.EMBEDDING)
+                    ? 0
+                    : tensors.get(name).byteSize();
+            largestFrom[index] = Math.max(largestFrom[index + 1], size);
+        }
+        Set<String> host = new java.util.LinkedHashSet<>();
+        Set<String> disk = new java.util.LinkedHashSet<>();
+        long arena = 0;
+        long largestDisk = 0;
+        for (int index = 0; index < order.size(); index++) {
+            String name = order.get(index);
+            long size = tensors.get(name).byteSize();
+            boolean embedding = name.equals(HostWeightSelection.EMBEDDING);
+            if (disk.isEmpty() && (embedding || arena + size + windowBytes(largestFrom[index + 1]) <= hostBytes)) {
+                host.add(name);
+                arena += size;
+            } else {
+                disk.add(name);
+                largestDisk = Math.max(largestDisk, size);
+            }
+        }
+        long window = windowBytes(largestDisk);
+        boolean fits = deviceFits && arena + window <= hostBytes;
+        return new Plan(
+                java.util.Collections.unmodifiableSet(host),
+                java.util.Collections.unmodifiableSet(disk),
+                plan.deviceBytes() + fixed,
+                arena,
+                window,
+                fits);
+    }
+
+    /// Pinned bytes of a disk window whose largest object has `largest` bytes; 0 for none.
+    private static long windowBytes(long largest) {
+        return largest == 0 ? 0 : DiskWindow.SLOTS * DiskWindow.slotBytesFor(largest);
     }
 
     private static long artifactBytes(Artifact artifact, ArtifactProfile profile) {
