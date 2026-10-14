@@ -38,6 +38,8 @@ public final class Ops {
             "gate_forward",
             "gate_backward",
             "squared_error",
+            "top_k_log_softmax",
+            "top_k_distillation",
             "adam");
 
     public final Cuda cuda;
@@ -587,6 +589,48 @@ public final class Ops {
                         .pointer(count)
                         .real(scale)
                         .pointer(dy)
+                        .pointer(loss));
+    }
+
+    /// The `k` (at most 64) largest logits of each row as token ids and log-probabilities, descending.
+    public void topKLogSoftmax(long logits, int rows, int vocabulary, int k, long ids, long logProbs) {
+        rowwise(
+                "top_k_log_softmax",
+                rows,
+                THREADS,
+                0,
+                new Cuda.Arguments()
+                        .pointer(logits)
+                        .integer(vocabulary)
+                        .integer(k)
+                        .pointer(ids)
+                        .pointer(logProbs));
+    }
+
+    /// KL(teacher top-k || student) per row added to loss (one double); dLogits = (softmax - teacher) * scale.
+    public void topKDistillation(
+            long logits,
+            int rows,
+            int vocabulary,
+            int k,
+            long ids,
+            long logProbs,
+            float scale,
+            long dLogits,
+            long loss) {
+        rowwise(
+                "top_k_distillation",
+                rows,
+                THREADS,
+                0,
+                new Cuda.Arguments()
+                        .pointer(logits)
+                        .integer(vocabulary)
+                        .integer(k)
+                        .pointer(ids)
+                        .pointer(logProbs)
+                        .real(scale)
+                        .pointer(dLogits)
                         .pointer(loss));
     }
 
