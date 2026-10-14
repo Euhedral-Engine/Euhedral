@@ -612,3 +612,136 @@ extern "C" __global__ void adam(float* p, float* g, float* m, float* v, long lon
     p[i] -= lr * (mHat / (sqrtf(vHat) + eps) + decay * p[i]);
     g[i] = 0.0f;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Distillation to a teacher's top-k: the teacher's k most likely tokens of each row with their log-probabilities, and
+// the student's KL(teacher top-k renormalized || student) with its gradient on the student's logits.
+
+// For each row of `logits` [rows, vocabulary] (FP32): the `k` largest entries (k <= 64), in descending order, as
+// token ids and log-probabilities under the full softmax. Each thread keeps the best 16 of its strided entries; the
+// k best of those candidates (at most 4096) are chosen in shared memory. One block of 256 threads per row.
+extern "C" __global__ void top_k_log_softmax(const float* logits, int vocabulary, int k, int* ids, float* logProbs) {
+    constexpr int kLocal = 16;
+    __shared__ float values[kThreads * kLocal];
+    __shared__ int indices[kThreads * kLocal];
+    __shared__ float shared[32];
+    const float* row = logits + (long long)blockIdx.x * vocabulary;
+    float best[kLocal];
+    int bestIndex[kLocal];
+    for (int i = 0; i < kLocal; i++) {
+        best[i] = -3.0e38f;
+        bestIndex[i] = -1;
+    }
+    float maximum = -3.0e38f;
+    for (int j = threadIdx.x; j < vocabulary; j += kThreads) {
+        float v = row[j];
+        maximum = fmaxf(maximum, v);
+        if (v > best[kLocal - 1]) {
+            int position = kLocal - 1;
+            while (position > 0 && best[position - 1] < v) {
+                best[position] = best[position - 1];
+                bestIndex[position] = bestIndex[position - 1];
+                position--;
+            }
+            best[position] = v;
+            bestIndex[position] = j;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset));
+    if (threadIdx.x % 32 == 0) shared[threadIdx.x / 32] = maximum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = shared[0];
+        for (int w = 1; w < kThreads / 32; w++) m = fmaxf(m, shared[w]);
+        shared[0] = m;
+    }
+    __syncthreads();
+    maximum = shared[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < vocabulary; j += kThreads) sum += expf(row[j] - maximum);
+    float logZ = maximum + logf(block_sum(sum, shared));
+    for (int i = 0; i < kLocal; i++) {
+        values[threadIdx.x * kLocal + i] = best[i];
+        indices[threadIdx.x * kLocal + i] = bestIndex[i];
+    }
+    __syncthreads();
+    // k rounds of a block-wide argmax over the candidates.
+    for (int round = 0; round < k; round++) {
+        float v = -3.0e38f;
+        int at = -1;
+        for (int c = threadIdx.x; c < kThreads * kLocal; c += kThreads)
+            if (values[c] > v || (values[c] == v && indices[c] >= 0 && (at < 0 || indices[c] < indices[at]))) {
+                v = values[c];
+                at = c;
+            }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffu, v, offset);
+            int oa = __shfl_down_sync(0xffffffffu, at, offset);
+            if (ov > v) { v = ov; at = oa; }
+        }
+        __shared__ float warpValue[32];
+        __shared__ int warpAt[32];
+        if (threadIdx.x % 32 == 0) {
+            warpValue[threadIdx.x / 32] = v;
+            warpAt[threadIdx.x / 32] = at;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float bv = warpValue[0];
+            int ba = warpAt[0];
+            for (int w = 1; w < kThreads / 32; w++)
+                if (warpValue[w] > bv) { bv = warpValue[w]; ba = warpAt[w]; }
+            ids[(long long)blockIdx.x * k + round] = indices[ba];
+            logProbs[(long long)blockIdx.x * k + round] = bv - logZ;
+            values[ba] = -3.0e38f;
+        }
+        __syncthreads();
+    }
+}
+
+// For each row of student logits [rows, vocabulary]: with the teacher's top-k (ids, log-probabilities) renormalized
+// to p, loss[0] += sum_i p_i (log p_i - log q_i) and dLogits = (q - p) * scale, q = softmax(logits). One block per row.
+extern "C" __global__ void top_k_distillation(const float* logits, int vocabulary, int k, const int* ids,
+                                              const float* logProbs, float scale, float* dLogits, double* loss) {
+    __shared__ float shared[32];
+    __shared__ float teacher[64];
+    const float* row = logits + (long long)blockIdx.x * vocabulary;
+    float* d = dLogits + (long long)blockIdx.x * vocabulary;
+    const int* rowIds = ids + (long long)blockIdx.x * k;
+    float maximum = -3.0e38f;
+    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) maximum = fmaxf(maximum, row[j]);
+    for (int offset = 16; offset > 0; offset >>= 1) maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset));
+    if (threadIdx.x % 32 == 0) shared[threadIdx.x / 32] = maximum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = shared[0];
+        for (int w = 1; w < blockDim.x / 32; w++) m = fmaxf(m, shared[w]);
+        shared[0] = m;
+    }
+    __syncthreads();
+    maximum = shared[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) sum += expf(row[j] - maximum);
+    float logZ = maximum + logf(block_sum(sum, shared));
+    // The teacher's renormalized top-k.
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < k; i++) total += expf(logProbs[(long long)blockIdx.x * k + i]);
+        for (int i = 0; i < k; i++) teacher[i] = expf(logProbs[(long long)blockIdx.x * k + i]) / total;
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) d[j] = expf(row[j] - logZ) * scale;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double l = 0.0;
+        for (int i = 0; i < k; i++) {
+            float p = teacher[i];
+            if (p <= 0.0f) continue;
+            l += (double)p * ((double)logf(p) - ((double)row[rowIds[i]] - logZ));
+            d[rowIds[i]] -= p * scale;
+        }
+        atomicAdd(loss, l);
+    }
+}

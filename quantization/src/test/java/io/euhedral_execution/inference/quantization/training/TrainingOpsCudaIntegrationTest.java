@@ -502,4 +502,51 @@ class TrainingOpsCudaIntegrationTest {
                 for (int row = 0; row < rows; row++) expected[o * in + i] += r[row * out + o] * x[row * in + i];
         assertClose(expected, download(gw, out * in), 1e-5, "linear dw");
     }
+
+    @Test
+    void distillation() {
+        int rows = 3, vocabulary = 3000, k = 64;
+        double[] logits = random(rows * vocabulary, 3), student = random(rows * vocabulary, 3);
+        long teacher = upload(logits), ids = zeros(rows * k), logProbs = zeros(rows * k);
+        ops.topKLogSoftmax(teacher, rows, vocabulary, k, ids, logProbs);
+        double[] idBits = download(ids, rows * k);
+        int[] chosen = new int[rows * k];
+        double[] lp = download(logProbs, rows * k);
+        for (int i = 0; i < rows * k; i++) chosen[i] = Float.floatToRawIntBits((float) idBits[i]);
+        double[] expected = new double[rows * k], expectedIds = new double[rows * k], actualIds = new double[rows * k];
+        for (int r = 0; r < rows; r++) {
+            Integer[] order = new Integer[vocabulary];
+            for (int j = 0; j < vocabulary; j++) order[j] = j;
+            int row = r;
+            java.util.Arrays.sort(
+                    order, (a, b) -> Double.compare(logits[row * vocabulary + b], logits[row * vocabulary + a]));
+            double max = logits[r * vocabulary + order[0]], sum = 0;
+            for (int j = 0; j < vocabulary; j++) sum += Math.exp(logits[r * vocabulary + j] - max);
+            for (int i = 0; i < k; i++) {
+                expectedIds[r * k + i] = order[i];
+                actualIds[r * k + i] = chosen[r * k + i];
+                expected[r * k + i] = logits[r * vocabulary + order[i]] - max - Math.log(sum);
+            }
+        }
+        assertClose(expectedIds, actualIds, 0, "top-k ids");
+        assertClose(expected, lp, 1e-5, "top-k log-probabilities");
+        Function<double[], double[]> loss = z -> {
+            double total = 0;
+            for (int r = 0; r < rows; r++) {
+                double max = Double.NEGATIVE_INFINITY, sum = 0, norm = 0;
+                for (int j = 0; j < vocabulary; j++) max = Math.max(max, z[r * vocabulary + j]);
+                for (int j = 0; j < vocabulary; j++) sum += Math.exp(z[r * vocabulary + j] - max);
+                for (int i = 0; i < k; i++) norm += Math.exp(lp[r * k + i]);
+                for (int i = 0; i < k; i++) {
+                    double p = Math.exp(lp[r * k + i]) / norm;
+                    total += p * (Math.log(p) - (z[r * vocabulary + chosen[r * k + i]] - max - Math.log(sum)));
+                }
+            }
+            return new double[] {total};
+        };
+        long z = upload(student), dz = zeros(rows * vocabulary), scalar = zeros(2);
+        ops.topKDistillation(z, rows, vocabulary, k, ids, logProbs, 1, dz, scalar);
+        double[] numeric = numericGradient(loss, student, new double[] {1});
+        assertClose(numeric, download(dz, rows * vocabulary), 1e-3, "distillation gradient");
+    }
 }
