@@ -6,6 +6,7 @@
 // A 256-weight tile is a tail-biting ring of 16 * K bits. Weight i is quantized to a 16-bit state whose low K bits are
 // new; the codebook value of a state is the mul1 product, summed bytewise, scaled in fp16. Costs are fp16; ties go to
 // the lowest predecessor, so the result is exactly the reference's.
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 typedef unsigned char uint8_t;
@@ -499,18 +500,43 @@ __device__ __forceinline__ void pack_frac_tile(
     for (int w = 0; w < nw; ++w) out[w] = words[w];
 }
 
-/// Decodes one tile (grid == tile count, blockDim must be 256: one thread per weight) of packed words, integer or fractional: weight i is the codebook
-/// value of the 16-bit window ending at ring position S(i) (frac.cu unpack, exl3_dq.cuh window).
-__device__ __forceinline__ void decode_tile(
-        const uint16_t* __restrict__ g_packed, float* __restrict__ g_decoded, int ka, uint32_t mask, int bpb) {
+/// Decodes tile `tile` of packed words (blockDim must be 256: one thread per weight), integer or fractional: the value
+/// at tensor-core position t is the codebook value of the 16-bit window ending at ring position S(t) (frac.cu unpack,
+/// exl3_dq.cuh window).
+__device__ __forceinline__ float decode_tile_value(
+        const uint16_t* __restrict__ g_packed, size_t tile, int ka, uint32_t mask, int bpb) {
     __shared__ uint32_t words[kFracMaxWords];
-    const int tile = blockIdx.x;
     const int t = threadIdx.x;
     const int nw = bpb / 2;
-    for (int w = t; w < nw; w += blockDim.x) words[w] = ((const uint32_t*)(g_packed + (size_t)tile * bpb))[w];
     __syncthreads();
-    g_decoded[(size_t)tile * 256 + t] =
-            __half2float(decode_mul1(frac_window(words, nw, frac_s(t, ka, mask, bpb) - 16)));
+    for (int w = t; w < nw; w += blockDim.x) words[w] = ((const uint32_t*)(g_packed + tile * bpb))[w];
+    __syncthreads();
+    return __half2float(decode_mul1(frac_window(words, nw, frac_s(t, ka, mask, bpb) - 16)));
+}
+
+__device__ __forceinline__ void decode_tile(
+        const uint16_t* __restrict__ g_packed, float* __restrict__ g_decoded, int ka, uint32_t mask, int bpb) {
+    g_decoded[(size_t)blockIdx.x * 256 + threadIdx.x] = decode_tile_value(g_packed, blockIdx.x, ka, mask, bpb);
+}
+
+/// Row-major element (r * 16 + c) of a 16x16 tile at tensor-core position `pos`: for t = pos / 8, r0 = (t % 4) * 2 and
+/// c0 = t / 4, the eight positions of t are rows r0, r0 + 1, r0 + 8, r0 + 9 at columns c0, then c0 + 8.
+__device__ __forceinline__ int tensor_core_element(int pos) {
+    const int t = pos >> 3, j = pos & 7;
+    const int r0 = (t & 3) * 2;
+    const int row = r0 + ((j & 3) >> 1) * 8 + (j & 1);
+    const int col = (t >> 2) + (j >> 2) * 8;
+    return row * 16 + col;
+}
+
+/// Decodes tile (blockIdx.x) of a `[k / 16, n / 16]` grid into the row-major float32 matrix `w` `[k, n]`.
+__device__ __forceinline__ void reconstruct_tile(const uint16_t* __restrict__ g_packed, float* __restrict__ w, int n,
+        int ka, uint32_t mask, int bpb) {
+    const int tiles_n = n >> 4;
+    const int ti = blockIdx.x / tiles_n, tj = blockIdx.x % tiles_n;
+    const float v = decode_tile_value(g_packed, blockIdx.x, ka, mask, bpb);
+    const int e = tensor_core_element(threadIdx.x);
+    w[(size_t)(ti * 16 + (e >> 4)) * n + tj * 16 + (e & 15)] = v;
 }
 
 }  // namespace
@@ -575,3 +601,112 @@ DECODE(6)
     }
 DECODE_FRAC(2)
 DECODE_FRAC(3)
+
+#define RECONSTRUCT(K)                                                                                       \
+    extern "C" __global__ __launch_bounds__(256) void reconstruct_k##K(                                      \
+            const uint16_t* words, int n, float* w) {                                                        \
+        reconstruct_tile(words, w, n, K, 0u, 16 * K);                                                        \
+    }
+RECONSTRUCT(2)
+RECONSTRUCT(3)
+RECONSTRUCT(4)
+RECONSTRUCT(5)
+RECONSTRUCT(6)
+
+#define RECONSTRUCT_FRAC(KA)                                                                                 \
+    extern "C" __global__ __launch_bounds__(256) void reconstruct_frac_k##KA(                                \
+            const uint16_t* words, int n, float* w) {                                                        \
+        reconstruct_tile(words, w, n, KA, 0xaaaau, 16 * KA + 8);                                             \
+    }
+RECONSTRUCT_FRAC(2)
+RECONSTRUCT_FRAC(3)
+
+namespace {
+
+constexpr float kInvSqrt128 = 0.08838834764831845f;
+
+/// Walsh-Hadamard butterflies below are Sylvester natural order, H[i][j] = (-1)^popcount(i & j).
+}  // namespace
+
+/// x[b * 128 + i, c] <- sum_j H[i][j] x[b * 128 + j, c] / sqrt(128) for every 128-row block b and column c. Block:
+/// 32 columns x 8 row lanes; grid (ceil(cols / 32), rows / 128). The shared tile is padded against bank conflicts.
+extern "C" __global__ __launch_bounds__(256) void hadamard128_rows(float* x, int rows, int cols) {
+    __shared__ float s[128][33];
+    const int lane = threadIdx.x & 31, sub = threadIdx.x >> 5;
+    const int c = blockIdx.x * 32 + lane;
+    float* base = x + (size_t)blockIdx.y * 128 * cols;
+    for (int r = sub; r < 128; r += 8) s[r][lane] = c < cols ? base[(size_t)r * cols + c] : 0.f;
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        for (int p = sub; p < 64; p += 8) {
+            const int i = ((p / h) * 2 * h) + (p % h);
+            const float a = s[i][lane], b = s[i + h][lane];
+            s[i][lane] = a + b;
+            s[i + h][lane] = a - b;
+        }
+        __syncthreads();
+    }
+    if (c < cols)
+        for (int r = sub; r < 128; r += 8) base[(size_t)r * cols + c] = s[r][lane] * kInvSqrt128;
+}
+
+/// x[r, b * 128 + i] <- sum_j H[i][j] x[r, b * 128 + j] / sqrt(128) for every row r and 128-column block b. Block: 128
+/// threads on one segment; grid (cols / 128, rows).
+extern "C" __global__ __launch_bounds__(128) void hadamard128_columns(float* x, int rows, int cols) {
+    __shared__ float s[128];
+    float* base = x + (size_t)blockIdx.y * cols + (size_t)blockIdx.x * 128;
+    const int t = threadIdx.x;
+    s[t] = base[t];
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        if (t < 64) {
+            const int i = ((t / h) * 2 * h) + (t % h);
+            const float a = s[i], b = s[i + h];
+            s[i] = a + b;
+            s[i + h] = a - b;
+        }
+        __syncthreads();
+    }
+    base[t] = s[t] * kInvSqrt128;
+}
+
+/// Gathers the 16-row strip of `w` `[k, n]` starting at `first_row` into n / 16 tiles of 256 values in tensor-core
+/// order (`inverse` false), or scatters the tiles back into the strip (`inverse` true). One thread per value.
+extern "C" __global__ __launch_bounds__(256) void strip_tiles(
+        float* w, int n, int first_row, float* tiles, int inverse) {
+    const int tile = blockIdx.x, pos = threadIdx.x;
+    const int e = tensor_core_element(pos);
+    float* element = w + (size_t)(first_row + (e >> 4)) * n + tile * 16 + (e & 15);
+    float* slot = tiles + (size_t)tile * 256 + pos;
+    if (inverse) *element = *slot;
+    else *slot = *element;
+}
+
+/// w[r, :] *= s[r] for fp16 s; grid (ceil(n / 256), k).
+extern "C" __global__ void scale_rows_fp16(float* w, const __half* s, int k, int n) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < n) w[(size_t)blockIdx.y * n + c] *= __half2float(s[blockIdx.y]);
+}
+
+/// w[:, c] *= s[c] for fp16 s; grid (ceil(n / 256), k).
+extern "C" __global__ void scale_columns_fp16(float* w, const __half* s, int k, int n) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < n) w[(size_t)blockIdx.y * n + c] *= __half2float(s[c]);
+}
+
+/// out[c, r] = bf16(w[r, c]) (round to nearest even) for w `[k, n]`, out `[n, k]`. Block 256 as 32 x 8; grid
+/// (ceil(n / 32), ceil(k / 32)).
+extern "C" __global__ __launch_bounds__(256) void transpose_to_bf16(
+        const float* w, int k, int n, __nv_bfloat16* out) {
+    __shared__ float s[32][33];
+    const int x = threadIdx.x & 31, y = threadIdx.x >> 5;
+    for (int j = y; j < 32; j += 8) {
+        const int r = blockIdx.y * 32 + j, c = blockIdx.x * 32 + x;
+        if (r < k && c < n) s[j][x] = w[(size_t)r * n + c];
+    }
+    __syncthreads();
+    for (int j = y; j < 32; j += 8) {
+        const int c = blockIdx.x * 32 + j, r = blockIdx.y * 32 + x;
+        if (r < k && c < n) out[(size_t)c * k + r] = __float2bfloat16_rn(s[x][j]);
+    }
+}
