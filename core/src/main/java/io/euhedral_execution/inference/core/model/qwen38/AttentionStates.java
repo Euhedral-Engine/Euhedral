@@ -4,6 +4,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2State;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.Objects;
 
 /// Persistent per-layer key/value caches for one Qwen sequence.
@@ -11,6 +12,7 @@ public final class AttentionStates implements AutoCloseable {
 
     private final AttentionKvState[] states;
     private final ExecutionGpu gpu;
+    private final KvFormat format;
     private boolean closed;
     /// Speculative drafting: base hidden rows that seed MTP rows, and the MTP's own hidden for its next
     /// recursive row (docs/MTP_CONTRACT.md §4). Allocated by the first quantum that needs them.
@@ -26,9 +28,10 @@ public final class AttentionStates implements AutoCloseable {
     private int decodeScratchHeads;
     private int decodeScratchRows;
 
-    private AttentionStates(ExecutionGpu gpu, AttentionKvState[] states) {
+    private AttentionStates(ExecutionGpu gpu, AttentionKvState[] states, KvFormat format) {
         this.gpu = gpu;
         this.states = states;
+        this.format = format;
     }
 
     public static AttentionStates allocate(ExecutionGpu gpu, LayerType[] layerTypes, int keyValueWidth) {
@@ -38,15 +41,27 @@ public final class AttentionStates implements AutoCloseable {
     /// With `mtpLayer`, the MTP layer's own cache follows the base layers, at index layerTypes.length.
     public static AttentionStates allocate(
             ExecutionGpu gpu, LayerType[] layerTypes, int keyValueWidth, boolean mtpLayer) {
+        return allocate(gpu, layerTypes, keyValueWidth, mtpLayer, KvFormat.NVFP4);
+    }
+
+    /// As [#allocate(ExecutionGpu, LayerType[], int, boolean)], every cache in `format`.
+    public static AttentionStates allocate(
+            ExecutionGpu gpu, LayerType[] layerTypes, int keyValueWidth, boolean mtpLayer, KvFormat format) {
         Objects.requireNonNull(gpu, "gpu");
         Objects.requireNonNull(layerTypes, "layerTypes");
+        Objects.requireNonNull(format, "format");
         AttentionKvState[] states = new AttentionKvState[layerTypes.length + (mtpLayer ? 1 : 0)];
         for (int index = 0; index < states.length; index++) {
             if (index == layerTypes.length || layerTypes[index] == LayerType.FULL_ATTENTION) {
-                states[index] = new AttentionKvState(gpu, keyValueWidth);
+                states[index] = new AttentionKvState(gpu, keyValueWidth, format);
             }
         }
-        return new AttentionStates(gpu, states);
+        return new AttentionStates(gpu, states, format);
+    }
+
+    /// The format every cache of the sequence stores its rows in.
+    public KvFormat format() {
+        return this.format;
     }
 
     /// Base post-final-norm hidden rows (BF16) for the next MTP catch-up, holding at least `rows` rows.

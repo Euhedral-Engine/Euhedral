@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Inventory;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.Locale;
 
 /// What an artifact is: its quantization, whether its projections are stored compressed, and which drafter it
@@ -54,6 +55,19 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         if (this.speculation != Speculation.MTP)
             throw new IllegalStateException("the artifact does not draft with MTP");
         return DraftLength.fixed(this.quantization == Quantization.Q3 ? 2 : 4);
+    }
+
+    /// The attention cache format the artifact's sequences take unless the engine selects one: NVFP4, which every
+    /// quantized artifact's attention runs on.
+    public KvFormat kvFormat() {
+        return KvFormat.NVFP4;
+    }
+
+    /// `selected`, or when it is null the cache format of an artifact with `profile` (null: an unprofiled artifact,
+    /// NVFP4).
+    public static KvFormat kvFormat(KvFormat selected, ArtifactProfile profile) {
+        if (selected != null) return selected;
+        return profile == null ? KvFormat.NVFP4 : profile.kvFormat();
     }
 
     /// Reads the profile from a text layer's FFN gate-up projection, which every artifact stores in its

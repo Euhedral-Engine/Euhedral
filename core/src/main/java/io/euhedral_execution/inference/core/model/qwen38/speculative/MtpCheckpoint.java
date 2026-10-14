@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixLayout;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.ToLongFunction;
@@ -29,9 +30,14 @@ public final class MtpCheckpoint implements SpeculativeCheckpoint {
     private volatile long seedRowAddress;
 
     public MtpCheckpoint(Qwen38Config config) {
+        this(config, KvFormat.NVFP4);
+    }
+
+    /// The checkpoint of sequences whose attention caches are in `format`.
+    public MtpCheckpoint(Qwen38Config config, KvFormat format) {
         this.mtpLayer = config.numHiddenLayers();
         this.hidden = config.hiddenSize();
-        this.pageBytes = PrefixLayout.pageBytes(config);
+        this.pageBytes = PrefixLayout.pageBytes(config, format);
         this.hiddenRowBytes = (long) config.hiddenSize() * Short.BYTES;
     }
 

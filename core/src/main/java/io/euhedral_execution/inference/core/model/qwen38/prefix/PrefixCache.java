@@ -18,6 +18,7 @@ import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.prefix.PrefixTree;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
@@ -88,6 +89,7 @@ public final class PrefixCache implements AutoCloseable {
     private final Runnable release;
     private final GpuStream stream;
     private final int intervalTokens;
+    private final KvFormat format;
     private final AtomicLong lookups = new AtomicLong();
     private final AtomicLong captureNanos = new AtomicLong();
     private final AtomicLong restores = new AtomicLong();
@@ -103,11 +105,19 @@ public final class PrefixCache implements AutoCloseable {
     /// cannot be pinned.
     public static PrefixCache create(
             ExecutionGpu gpu, FrameLake lake, Qwen38Config config, long bytes, int intervalTokens) {
+        return create(gpu, lake, config, bytes, intervalTokens, KvFormat.NVFP4);
+    }
+
+    /// As [#create(ExecutionGpu, FrameLake, Qwen38Config, long, int)], for sequences whose attention caches are in
+    /// `format`.
+    public static PrefixCache create(
+            ExecutionGpu gpu, FrameLake lake, Qwen38Config config, long bytes, int intervalTokens, KvFormat format) {
         if (bytes <= 0) throw new IllegalArgumentException("bytes must be positive");
         long address = gpu.allocateHostWeights(bytes);
         MemorySegment arena = MemorySegment.ofAddress(address).reinterpret(bytes);
         try {
-            return new PrefixCache(gpu, lake, config, arena, () -> gpu.freeHostWeights(address), intervalTokens);
+            return new PrefixCache(
+                    gpu, lake, config, arena, () -> gpu.freeHostWeights(address), intervalTokens, format);
         } catch (RuntimeException | Error failure) {
             gpu.freeHostWeights(address);
             throw failure;
@@ -121,12 +131,26 @@ public final class PrefixCache implements AutoCloseable {
             MemorySegment arena,
             Runnable release,
             int intervalTokens) {
+        this(gpu, lake, config, arena, release, intervalTokens, KvFormat.NVFP4);
+    }
+
+    /// A cache of the state of sequences whose attention caches are in `format`; it neither stores nor restores
+    /// another format's.
+    public PrefixCache(
+            ExecutionGpu gpu,
+            FrameLake lake,
+            Qwen38Config config,
+            MemorySegment arena,
+            Runnable release,
+            int intervalTokens,
+            KvFormat format) {
         if (intervalTokens <= 0 || intervalTokens % InferenceConfig.PREFILL_CHUNK_TOKENS != 0)
             throw new IllegalArgumentException(
                     "the checkpoint interval must be a positive multiple of " + InferenceConfig.PREFILL_CHUNK_TOKENS);
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         this.lake = Objects.requireNonNull(lake, "lake");
-        this.layout = PrefixLayout.of(config);
+        this.format = Objects.requireNonNull(format, "format");
+        this.layout = PrefixLayout.of(config, format);
         this.arena = Objects.requireNonNull(arena, "arena");
         this.release = Objects.requireNonNull(release, "release");
         this.extents = new HostExtents(arena.byteSize());
@@ -204,6 +228,16 @@ public final class PrefixCache implements AutoCloseable {
                 }
         if (this.closed) {
             released(hit, false, new IllegalStateException("the prefix cache is closed"), steps, next);
+            return;
+        }
+        if (sequence.kvFormat() != this.format) {
+            released(
+                    hit,
+                    false,
+                    new IllegalArgumentException("the sequence keeps its attention caches in " + sequence.kvFormat()
+                            + ", the prefix cache in " + this.format),
+                    steps,
+                    next);
             return;
         }
         if (cancelled(sequence)) {
@@ -348,6 +382,7 @@ public final class PrefixCache implements AutoCloseable {
             if (this.closed
                     || !(sequence.recurrentState() instanceof GdnStates gdn)
                     || !(sequence.kvCacheState() instanceof AttentionStates attention)
+                    || attention.format() != this.format
                     || attention.forLayer(this.layout.kvLayers()[0]).length() < position) {
                 settle(work, sequence, () -> captured(parent, null, steps, next));
                 return;

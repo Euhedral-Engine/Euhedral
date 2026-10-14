@@ -24,6 +24,7 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -112,7 +113,13 @@ public final class InferenceEngine implements AutoCloseable {
             Artifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath());
             ArtifactProfile profile = artifact == null ? null : ArtifactProfile.of(artifact);
-            model = bootstrap.loadModel(config.artifactPath(), artifact, profile, gpu, config.maxContextTokens());
+            model = bootstrap.loadModel(
+                    config.artifactPath(),
+                    artifact,
+                    profile,
+                    gpu,
+                    config.maxContextTokens(),
+                    ArtifactProfile.kvFormat(config.kvCache(), profile));
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             Qwen38Runtime dense = Qwen38Runtime.open(config, tokenizer, gpu, model, artifact, profile, lattice);
@@ -510,9 +517,14 @@ public final class InferenceEngine implements AutoCloseable {
         }
 
         /// Loads the artifact's executed objects, keeping in host memory only as many weights as a context
-        /// of `maxContextTokens` needs to fit in the device's free memory.
+        /// of `maxContextTokens`, its attention caches in `kvFormat`, needs to fit in the free device memory.
         Qwen38Model loadModel(
-                Path path, Artifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContextTokens)
+                Path path,
+                Artifact artifact,
+                ArtifactProfile profile,
+                ExecutionGpu gpu,
+                int maxContextTokens,
+                KvFormat kvFormat)
                 throws IOException {
             int positions = artifact.config().maxPositionEmbeddings();
             if (maxContextTokens > positions)
@@ -523,7 +535,7 @@ public final class InferenceEngine implements AutoCloseable {
             long free = Math.min(
                     memoryInfo(gpu).freeBytes(),
                     Long.getLong("euhedral.residency.device-budget-bytes", Long.MAX_VALUE));
-            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens);
+            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, Long.MAX_VALUE, kvFormat);
             if (!plan.fits())
                 throw new IOException("a context of " + maxContextTokens + " tokens does not fit in the "
                         + (free >> 20) + " MiB free on this GPU, even with the weights in host memory; set a "

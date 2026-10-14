@@ -23,6 +23,7 @@ import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.runtime.PromptSink;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.tokenizer.IncrementalDecoder;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenConstraint;
@@ -132,6 +133,11 @@ public final class Session implements GenerationSession {
         this.hostLogits = new HostLogits(gpu, plan.weights().config().vocabSize());
         this.frames = new GenerationFrames(runtime.lake());
         this.decoder = tokenizer.newIncrementalDecoder();
+    }
+
+    /// Keeps the sequence's attention caches in `format`. Set before the first prompt.
+    public void useKvFormat(KvFormat format) {
+        this.sequence.useKvFormat(format);
     }
 
     /// Reuses and stores the state of this session's first prompt in `cache`; null stops using one. Set before

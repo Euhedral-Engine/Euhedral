@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.IntStream;
@@ -39,6 +40,11 @@ public final class PrefixLayout {
     }
 
     static PrefixLayout of(Qwen38Config config) {
+        return of(config, KvFormat.NVFP4);
+    }
+
+    /// The layout of sequences whose attention caches are in `format`.
+    static PrefixLayout of(Qwen38Config config, KvFormat format) {
         LayerType[] types = config.layerTypes();
         int[] gdn = IntStream.range(0, types.length)
                 .filter(i -> types[i] == LayerType.GATED_DELTA_NET)
@@ -53,13 +59,18 @@ public final class PrefixLayout {
                 * config.linearKeyHeadDim()
                 * config.linearValueHeadDim()
                 * Float.BYTES;
-        return new PrefixLayout(gdn, attention, convolution, recurrent, pageBytes(config));
+        return new PrefixLayout(gdn, attention, convolution, recurrent, pageBytes(config, format));
     }
 
-    /// Bytes of one 256-token KV page (K and V planes) of one full-attention layer.
+    /// Bytes of one 256-token NVFP4 KV page (K and V planes) of one full-attention layer.
     public static long pageBytes(Qwen38Config config) {
-        long width = (long) config.numKeyValueHeads() * config.attentionHeadDim();
-        return 2L * PAGE * AttentionKvState.HEAD_ROW_BYTES * (width / 256);
+        return pageBytes(config, KvFormat.NVFP4);
+    }
+
+    /// Bytes of one 256-token KV page (K and V planes) of one full-attention layer in `format`.
+    public static long pageBytes(Qwen38Config config, KvFormat format) {
+        int width = config.numKeyValueHeads() * config.attentionHeadDim();
+        return 2L * AttentionKvState.planePageBytes(width, format);
     }
 
     int[] kvLayers() {

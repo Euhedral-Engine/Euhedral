@@ -27,6 +27,7 @@ import io.euhedral_execution.inference.core.prefix.PrefixNode;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
 import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.List;
@@ -147,8 +148,12 @@ class PrefixCacheTest {
     private final Frames frames = new Frames();
 
     private PrefixCache cache(long bytes, int interval) {
+        return cache(bytes, interval, KvFormat.NVFP4);
+    }
+
+    private PrefixCache cache(long bytes, int interval, KvFormat format) {
         Arena arena = Arena.ofShared();
-        return new PrefixCache(this.gpu, this.frames, CONFIG, arena.allocate(bytes), arena::close, interval);
+        return new PrefixCache(this.gpu, this.frames, CONFIG, arena.allocate(bytes), arena::close, interval, format);
     }
 
     private PrefixNode capture(PrefixCache cache, Sequence sequence, PrefixNode parent, int[] tokens, int position) {
@@ -205,7 +210,12 @@ class PrefixCacheTest {
 
     /// A sequence with `rows` committed rows and recognizable state, as a prefill leaves it.
     private Sequence sequence(int rows, int seed) {
+        return sequence(rows, seed, KvFormat.NVFP4);
+    }
+
+    private Sequence sequence(int rows, int seed, KvFormat format) {
         var sequence = new Sequence(1);
+        sequence.useKvFormat(format);
         var held = HeldWork.admit(sequence);
         Quantum.attachSequenceState(plan(), sequence, this.gpu);
         var attention = (AttentionStates) sequence.kvCacheState();
@@ -258,6 +268,42 @@ class PrefixCacheTest {
                 this.gpu.bytes(restoredGdn.recurrentStateAddress(), (int) restoredGdn.recurrentBytes()));
         assertEquals(1, cache.stats().hits());
         assertEquals(1024, cache.stats().reusedTokens());
+    }
+
+    @Test
+    void aBf16CacheStoresAndRestoresBf16Pages() {
+        PrefixCache cache = cache(16L << 20, 1024, KvFormat.BF16);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        Sequence source = sequence(1024, 4, KvFormat.BF16);
+        var sourceKv = ((AttentionStates) source.kvCacheState()).forLayer(1);
+        assertEquals(KvFormat.BF16, sourceKv.format());
+        assertEquals(1024, capture(cache, source, cache.root(), tokens, 1024).position());
+        var hit = lookup(cache, tokens);
+        var target = new Sequence(2);
+        target.useKvFormat(KvFormat.BF16);
+        assertTrue(restored(restore(cache, target, hit)));
+        var restoredKv = ((AttentionStates) target.kvCacheState()).forLayer(1);
+        assertEquals(KvFormat.BF16, restoredKv.format());
+        int pageBytes = (int) (2 * sourceKv.planePageBytes());
+        assertEquals(PrefixLayout.pageBytes(CONFIG, KvFormat.BF16), pageBytes);
+        for (int page = 0; page < 4; page++)
+            assertArrayEquals(
+                    this.gpu.bytes(sourceKv.pageAddresses().get(page), pageBytes),
+                    this.gpu.bytes(restoredKv.pageAddresses().get(page), pageBytes),
+                    "page " + page);
+    }
+
+    @Test
+    void aCacheNeitherStoresNorRestoresAnotherFormatsState() {
+        PrefixCache cache = cache(16L << 20, 1024, KvFormat.BF16);
+        int[] tokens = IntStream.range(0, 1100).toArray();
+        assertSame(cache.root(), capture(cache, sequence(1024, 4), cache.root(), tokens, 1024));
+        assertEquals(0, cache.stats().captured(), "an NVFP4 sequence is not stored");
+        capture(cache, sequence(1024, 4, KvFormat.BF16), cache.root(), tokens, 1024);
+        var hit = lookup(cache, tokens);
+        var outcome = restore(cache, new Sequence(2), hit);
+        assertFalse(outcome.restored);
+        assertInstanceOf(IllegalArgumentException.class, outcome.failure);
     }
 
     @Test

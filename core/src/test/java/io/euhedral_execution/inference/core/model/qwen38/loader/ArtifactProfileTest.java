@@ -13,6 +13,7 @@ import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Quantization;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -93,5 +94,15 @@ class ArtifactProfileTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> ArtifactProfile.of(new Artifact(null, null, new TensorDescriptor[0])));
+    }
+
+    @Test
+    void theCacheFormatIsTheArtifactsUnlessSelected() {
+        var profile = new ArtifactProfile(Quantization.Q3, false, ArtifactProfile.Speculation.MTP);
+        assertEquals(KvFormat.NVFP4, profile.kvFormat());
+        assertEquals(KvFormat.NVFP4, ArtifactProfile.kvFormat(null, profile));
+        assertEquals(KvFormat.NVFP4, ArtifactProfile.kvFormat(null, null));
+        assertEquals(KvFormat.BF16, ArtifactProfile.kvFormat(KvFormat.BF16, profile));
+        assertEquals(KvFormat.BF16, ArtifactProfile.kvFormat(KvFormat.BF16, null));
     }
 }

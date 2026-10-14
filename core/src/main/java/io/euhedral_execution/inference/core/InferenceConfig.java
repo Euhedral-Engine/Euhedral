@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core;
 
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
@@ -11,7 +12,8 @@ import java.util.Objects;
 /// the engine keeps device memory for: weights that do not fit beside that much KV cache stay in pinned
 /// host memory, chosen automatically. `prefixCacheBytes` is the pinned host memory that keeps the state of
 /// earlier prompts for reuse (0 turns the cache off) and `prefixCacheCheckpointTokens` the prompt tokens between
-/// stored checkpoints, a multiple of the prefill chunk.
+/// stored checkpoints, a multiple of the prefill chunk. `kvCache` is the format sequences keep their attention
+/// caches in; null takes the artifact's.
 public record InferenceConfig(
         Path artifactPath,
         Path tokenizerDirectory,
@@ -20,7 +22,8 @@ public record InferenceConfig(
         int maxContextTokens,
         Duration shutdownTimeout,
         long prefixCacheBytes,
-        int prefixCacheCheckpointTokens) {
+        int prefixCacheCheckpointTokens,
+        KvFormat kvCache) {
     /// Prompt tokens per prefill quantum, and the grain the prefix cache's checkpoints are aligned to.
     public static final int PREFILL_CHUNK_TOKENS = 512;
 
@@ -43,6 +46,28 @@ public record InferenceConfig(
         if (prefixCacheCheckpointTokens <= 0 || prefixCacheCheckpointTokens % PREFILL_CHUNK_TOKENS != 0)
             throw new IllegalArgumentException(
                     "prefixCacheCheckpointTokens must be a positive multiple of " + PREFILL_CHUNK_TOKENS);
+    }
+
+    /// The artifact's attention cache format.
+    public InferenceConfig(
+            Path artifactPath,
+            Path tokenizerDirectory,
+            Path cudaLibraryPath,
+            BitSet workerCpus,
+            int maxContextTokens,
+            Duration shutdownTimeout,
+            long prefixCacheBytes,
+            int prefixCacheCheckpointTokens) {
+        this(
+                artifactPath,
+                tokenizerDirectory,
+                cudaLibraryPath,
+                workerCpus,
+                maxContextTokens,
+                shutdownTimeout,
+                prefixCacheBytes,
+                prefixCacheCheckpointTokens,
+                null);
     }
 
     /// Without a prefix cache: programmatic callers (tests, the benchmark) opt in explicitly.

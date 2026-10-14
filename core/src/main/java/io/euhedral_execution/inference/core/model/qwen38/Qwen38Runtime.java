@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Deco
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -42,6 +43,7 @@ public final class Qwen38Runtime implements ModelRuntime {
     private final Execution execution;
     private final PrefixCache prefixCache;
     private final ArtifactProfile profile;
+    private final KvFormat kvFormat;
     private final InferenceRunSnapshot.Model identity;
 
     private Qwen38Runtime(
@@ -52,6 +54,7 @@ public final class Qwen38Runtime implements ModelRuntime {
             Execution execution,
             PrefixCache prefixCache,
             ArtifactProfile profile,
+            KvFormat kvFormat,
             InferenceRunSnapshot.Model identity) {
         this.tokenizer = tokenizer;
         this.gpu = gpu;
@@ -60,6 +63,7 @@ public final class Qwen38Runtime implements ModelRuntime {
         this.execution = execution;
         this.prefixCache = prefixCache;
         this.profile = profile;
+        this.kvFormat = kvFormat;
         this.identity = identity;
     }
 
@@ -83,8 +87,9 @@ public final class Qwen38Runtime implements ModelRuntime {
                 EuhedralInferenceRuntime.CAPTURE_GRAPHS,
                 Integer.getInteger("euhedral.workspace.rows", InferenceConfig.PREFILL_CHUNK_TOKENS));
         var identity = identity(config.artifactPath(), artifact, model);
+        KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);
         // Last, so nothing that can fail follows the pinned arena.
-        PrefixCache prefixCache = openPrefixCache(config, gpu, plan, execution);
+        PrefixCache prefixCache = openPrefixCache(config, gpu, plan, execution, kvFormat);
         return new Qwen38Runtime(
                 Objects.requireNonNull(tokenizer, "tokenizer"),
                 gpu,
@@ -93,13 +98,14 @@ public final class Qwen38Runtime implements ModelRuntime {
                 execution,
                 prefixCache,
                 profile,
+                kvFormat,
                 identity);
     }
 
     /// The cache is an optimisation: when it is off, the plan is not a full model, or its host memory cannot be
     /// pinned, the model serves without it.
     private static PrefixCache openPrefixCache(
-            InferenceConfig config, ExecutionGpu gpu, ExecutionPlan plan, Execution execution) {
+            InferenceConfig config, ExecutionGpu gpu, ExecutionPlan plan, Execution execution, KvFormat kvFormat) {
         if (config.prefixCacheBytes() == 0 || plan.weights().layers().length <= 1) return null;
         try {
             PrefixCache cache = PrefixCache.create(
@@ -107,7 +113,8 @@ public final class Qwen38Runtime implements ModelRuntime {
                     execution.lake(),
                     plan.weights().config(),
                     config.prefixCacheBytes(),
-                    config.prefixCacheCheckpointTokens());
+                    config.prefixCacheCheckpointTokens(),
+                    kvFormat);
             LOG.info(
                     "Prefix cache: {} MiB pinned, a checkpoint every {} tokens",
                     config.prefixCacheBytes() >> 20,
@@ -190,6 +197,7 @@ public final class Qwen38Runtime implements ModelRuntime {
                 Objects.requireNonNull(config, "config"),
                 prefillChunkTokens,
                 release::accept);
+        session.useKvFormat(this.kvFormat);
         switch (speculation(options, this.profile, this.plan.drafts(), this.plan.draftsWithDFlash2())) {
             case MTP -> session.enableSpeculativeDecoding(this.profile.draftLength());
             case DFLASH2 -> session.useSpeculativeDecoding(DFlash2Decoder.factory(this.profile.speculativeDepth()));
@@ -292,6 +300,11 @@ public final class Qwen38Runtime implements ModelRuntime {
 
     public ArtifactProfile profile() {
         return this.profile;
+    }
+
+    /// The format the sessions' sequences keep their attention caches in.
+    public KvFormat kvFormat() {
+        return this.kvFormat;
     }
 
     public Qwen38Config config() {

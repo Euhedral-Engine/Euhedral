@@ -840,7 +840,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                             gpu,
                             config.layerTypes(),
                             config.numKeyValueHeads() * config.attentionHeadDim(),
-                            plan.weights().mtp() != null);
+                            plan.weights().mtp() != null,
+                            sequence.kvFormat());
                 } else {
                     createdRecurrent = GdnState.allocate(
                             gpu,
