@@ -126,7 +126,12 @@ the converter's `--output-head`; 0.12 GiB more), it gave KL 0.084 / 0.079 / 0.18
 October 10, give KL 0.193 / 0.199 / 0.254 / 0.466 (`q3`) and 0.037 / 0.047 / 0.073 / 0.228 (`nvfp4-compressed`). On
 the 118 T4 prompts, Swift-1.5 thinks 248.6 tokens on average before answering; greedy, `q3` thinks 269.9 (the
 pre-calibration `q3` 366.6) and `nvfp4-compressed` 261.5 (282.3). MTP tokens per verification at 4K / 32K: `q3` 2.431
-/ 2.466 (2.454 / 2.454), `nvfp4-compressed` 2.936 / 3.006 (2.953 / 3.117).
+/ 2.466 (2.454 / 2.454), `nvfp4-compressed` 2.936 / 3.006 (2.953 / 3.117). A residual-stream rotation (`quantization rotate`: Q = diag(s) (H_20 ⊗ H_256) /
+sqrt(5120), norm weights folded into the linears they feed, the MTP layer left unrotated so the artifact does not
+draft), then GPTQ in the rotated basis, gave KL 0.080 / 0.077 / 0.178 / 0.255 for `q3` (dNLL T2 +0.022) and 0.031 /
+0.030 / 0.058 / 0.154 for `nvfp4` (dNLL T4 +0.180). Rotation makes every weight family's groups of 64 Gaussian (excess
+kurtosis -0.09, the value for 64 Gaussian samples); before it, only the attention key/value and GDN a/b projections
+had heavier tails (0.5 to 1.2).
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
