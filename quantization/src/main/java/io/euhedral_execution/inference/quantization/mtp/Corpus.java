@@ -54,7 +54,8 @@ public final class Corpus {
         return entries;
     }
 
-    /// Appends sequences to a corpus; a corpus left with rows beyond its index (a stopped run) is cut back to it.
+    /// Appends sequences to a corpus, from one owner; a corpus left with rows beyond its index (a stopped run) is cut
+    /// back to it.
     public static final class Writer implements AutoCloseable {
         private final FileChannel tokens, hidden, index;
         private final int width;
@@ -93,8 +94,7 @@ public final class Corpus {
         }
 
         /// Appends a sequence: `length` tokens of which `prompt` are the prompt, and `rows` hidden rows from `source`.
-        public synchronized void write(
-                String id, int[] values, int length, int prompt, MemorySegment source, int rows) {
+        public void write(String id, int[] values, int length, int prompt, MemorySegment source, int rows) {
             if (rows != length - 1) throw new IllegalArgumentException("a sequence keeps a hidden row per token run");
             try {
                 ByteBuffer buffer = ByteBuffer.allocate(4 * length).order(ByteOrder.LITTLE_ENDIAN);
