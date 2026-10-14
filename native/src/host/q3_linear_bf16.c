@@ -24,6 +24,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 #endif
 static CUmodule module;
 static CUfunction decode_one, decode_rows[EUHEDRAL_DECODE_MAX_ROWS + 1];  /* [M]: 2..8 rows */
+static CUfunction decode_tokens;  /* 9 to EUHEDRAL_DECODE_TOKENS_MAX rows */
 static CUfunction p2e2_decode_rows[5], p2e2_expand;  /* [M]: 1..4 rows */
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
@@ -34,6 +35,10 @@ static int get_function(CUfunction* function, const char* name) {
 static void initialize(void) {
     init_status = euhedral_cuda_load_kernel((const void*)&once, "q3/kernels.cu", "euhedral_q3_decode_contiguous", &module, &decode_one);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
+    if (cuModuleGetFunction(&decode_tokens, module, "euhedral_q3_decode_contiguous_tokens") != CUDA_SUCCESS)
+        init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    else
+        euhedral_cuda_pdl_register(decode_tokens);
     for (unsigned int m = 2; m <= EUHEDRAL_DECODE_MAX_ROWS; m++) {
         char name[48];
         snprintf(name, sizeof(name), "euhedral_q3_decode_contiguous_rows%u", m);
@@ -62,8 +67,9 @@ static BOOL CALLBACK initialize_once(PINIT_ONCE state, PVOID parameter, PVOID* c
 
 static int ensure_initialized(void);
 
-/* Production dispatch: 1 to 8 rows on the contiguous decode kernels, every row bit for bit as a one-row call.
- * Larger batches belong to the FP8 route, so what reaches here is the scalar reference. */
+/* Production dispatch: 1 to 8 rows on the contiguous decode kernels, and 9 to 32 (row-exact batched verification)
+ * on their token-row twin, every row bit for bit as a one-row call. Other batches belong to the FP8 route, so what
+ * reaches here is the scalar reference. */
 int euhedral_cuda_linear_q3_bf16(const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
     if (input == NULL || weights == NULL || output == NULL || rows == 0 || in_features == 0 || out_features == 0 || weights_byte_size == 0)
@@ -73,7 +79,7 @@ int euhedral_cuda_linear_q3_bf16(const void* input, const void* weights, void* o
     const uint64_t k_pad = ((uint64_t)in_features + 127u) / 128u * 128u, groups = k_pad / 64u;
     const uint64_t scale_offset = (((uint64_t)out_features * groups * 24u) + 255u) & ~255ull;
     if (scale_offset + (uint64_t)out_features * groups * 2u != weights_byte_size) return EUHEDRAL_CUDA_FORMAT_MISMATCH;
-    const int qualified = rows <= EUHEDRAL_DECODE_MAX_ROWS && euhedral_q3_decode_shape(in_features, out_features)
+    const int qualified = rows <= EUHEDRAL_DECODE_TOKENS_MAX && euhedral_q3_decode_shape(in_features, out_features)
             && ((uintptr_t)input & 15u) == 0u && ((uintptr_t)weights & 3u) == 0u;
     if (euhedral_cuda_exact_numerics() || !qualified)
         return euhedral_reference_q3(input, weights, output, rows, in_features, out_features, weights_byte_size);
@@ -84,8 +90,11 @@ int euhedral_cuda_linear_q3_bf16(const void* input, const void* weights, void* o
     unsigned int rows_arg = rows, in_arg = in_features, out_arg = out_features;
     unsigned long long scale_arg = scale_offset;
     void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &rows_arg, &in_arg, &out_arg, &scale_arg};
-    CUresult result = euhedral_launch_kernel(rows == 1 ? decode_one : decode_rows[rows], out_features / 16u, 1, 1, 128, 1, 1, 0,
-            euhedral_cuda_submission_stream(), params, NULL);
+    CUresult result = rows > EUHEDRAL_DECODE_MAX_ROWS
+            ? euhedral_launch_kernel(decode_tokens, out_features / 4u, 1, 1, 128, 1, 1, 0,
+                      euhedral_cuda_submission_stream(), params, NULL)
+            : euhedral_launch_kernel(rows == 1 ? decode_one : decode_rows[rows], out_features / 16u, 1, 1, 128, 1, 1, 0,
+                      euhedral_cuda_submission_stream(), params, NULL);
     if (result != CUDA_SUCCESS) return (int)result;
     if (euhedral_cuda_submission_stream() != NULL) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t sync = cudaDeviceSynchronize();

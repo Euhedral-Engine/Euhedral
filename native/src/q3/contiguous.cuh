@@ -171,4 +171,55 @@ static __device__ __forceinline__ void contiguous_decode_rows(
     }
 }
 
+// Up to kMaxTokens activation rows (batched verification of several sequences), `rows` of them real: one weight
+// row per warp, so the sums of every token row fit in registers. A token row's arithmetic is contiguous_decode's for
+// that weight row (same half groups, FMA order, scale and warp reduction), so its output is bit for bit the one-row
+// kernel's. 128 threads, 4 weight rows per CTA; same per-row requirements.
+static constexpr int kMaxTokens = 32;
+static __device__ __forceinline__ void contiguous_decode_tokens(
+        const unsigned short* input, const unsigned char* weights, unsigned short* output, unsigned int rows,
+        unsigned int in_features, unsigned int out_features, unsigned long long scale_offset) {
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    const Layout w(weights, in_features, scale_offset);
+    const unsigned int slices = in_features / 1024u, groups = in_features / 64u;
+    const unsigned long long row_words = (unsigned long long)groups * 6u;
+    const unsigned int* codes = reinterpret_cast<const unsigned int*>(w.codes);
+    float sums[kMaxTokens] = {};
+    euhedral_pdl_begin();
+    for (unsigned int slice = 0; slice < slices; slice++) {
+        const unsigned int* p = codes + row * row_words + slice * 96u + 3u * lane;
+        const unsigned int w0 = p[0], w1 = p[1], w2 = p[2];
+        const float scale = __half2float(__ushort_as_half(w.scales[row * (unsigned long long)groups + slice * 16u
+                + (lane >> 1)]));
+        #pragma unroll
+        for (int t = 0; t < kMaxTokens; t++) {
+            if ((unsigned int)t >= rows) break;
+            float x[32];
+            const uint4* activation = reinterpret_cast<const uint4*>(
+                    input + (unsigned long long)t * in_features + slice * 1024u + 32u * lane);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint4 v = activation[i];
+                const unsigned int pairs[4] = {v.x, v.y, v.z, v.w};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    x[i * 8 + j * 2] = __uint_as_float(pairs[j] << 16);
+                    x[i * 8 + j * 2 + 1] = __uint_as_float(pairs[j] & 0xffff0000u);
+                }
+            }
+            const float dot = contiguous::Dot<0>::run(x, w0, w1, w2, 0.0f);
+            sums[t] = fmaf(dot, scale, sums[t]);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < kMaxTokens; t++) {
+        if ((unsigned int)t >= rows) break;
+        float sum = sums[t];
+        #pragma unroll
+        for (int distance = 16; distance; distance >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, distance);
+        if (lane == 0) write_bf16(output + (unsigned long long)t * out_features, 0, row, out_features, sum);
+    }
+}
+
 }  // namespace q3

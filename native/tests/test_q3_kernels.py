@@ -144,6 +144,18 @@ class Q3KernelTest(unittest.TestCase):
             for r in range(rows):
                 np.testing.assert_array_equal(actual[r], single[r], f"rows={rows} row={r}")
 
+    def test_token_row_twin_is_bitwise_one_row_decode(self):
+        k, outputs = 2048, 48
+        data, scale_offset, _ = tensor(self.rng, outputs, k)
+        x = self.activations(32, k)
+        single = [self.run_kernel("euhedral_q3_decode_contiguous", data, scale_offset, x[r:r + 1], 1, k, outputs,
+                                  outputs // 16) for r in range(32)]
+        for rows in (9, 17, 24, 32):
+            actual = self.run_kernel("euhedral_q3_decode_contiguous_tokens", data, scale_offset, x[:rows], rows, k,
+                                     outputs, outputs // 4).reshape(rows, outputs)
+            for r in range(rows):
+                np.testing.assert_array_equal(actual[r], single[r], f"rows={rows} row={r}")
+
 
 if __name__ == "__main__":
     unittest.main()
