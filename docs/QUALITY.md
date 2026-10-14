@@ -112,7 +112,11 @@ gave `nvfp4-compressed` KL 0.035 on T2 and was rejected. A wider NVFP4 block-sca
 the nearest scale, global scale `amax / (6 M)`) was measured with act-order and the MTP layer: `nvfp4-compressed` at
 5 / 256 gave KL 0.028 / 0.030 / 0.058 / 0.156 and at 6 / 448 0.028 / 0.031 / 0.058 / 0.153 (the SD4 table already takes
 the wider reach); `nvfp4` at 5 / 256 gave 0.026 / 0.031 / 0.057 / 0.157. Neither beats the shipped artifacts on T4, so
-the search stays at 2 codes above the nearest scale with E4M3's 448.
+the search stays at 2 codes above the nearest scale with E4M3's 448. Block-wise training of `q3` (`quantization train-blocks`: every layer in turn trains
+its group scales and norms, codes fixed, so that it maps the quantized model's hidden states onto the BF16 layer's
+outputs; 200 calibration sequences, 2 epochs) cut each block's held-out output error by about 36% on its own (layers 10
+and 11) and gave KL 0.088 / 0.080 / 0.202 / 0.225 on T1-T4: the model's own generations improve, code gets worse, so
+`q3` keeps its GPTQ scales.
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
