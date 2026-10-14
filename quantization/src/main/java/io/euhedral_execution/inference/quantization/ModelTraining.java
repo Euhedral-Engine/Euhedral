@@ -31,7 +31,9 @@ import java.util.Map;
 
 /// End-to-end distillation of a quantized artifact's scales and norms: every decoder layer's quantized linears train
 /// their group scales (codes fixed) and the layers' norms their weights, against the BF16 checkpoint's own output
-/// distribution, the KL to its top-k tokens at every position of the calibration sequences.
+/// distribution: at every position of the calibration sequences, the KL over its top-k tokens and one bucket for the
+/// rest of the vocabulary (the teacher's tail mass is kept, so the student is not pushed to zero probability outside
+/// the top k; `top_k_distillation`).
 ///
 /// The teacher runs once: the BF16 layers over every sequence, then the final norm and LM head, keeping each
 /// position's top-k log-probabilities. Each step then runs one sequence through all the layers on the training kernels

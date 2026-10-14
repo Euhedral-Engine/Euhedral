@@ -530,17 +530,22 @@ class TrainingOpsCudaIntegrationTest {
         }
         assertClose(expectedIds, actualIds, 0, "top-k ids");
         assertClose(expected, lp, 1e-5, "top-k log-probabilities");
+        // KL over the teacher's top-k (their full-softmax probabilities) and one bucket for the rest of each side.
         Function<double[], double[]> loss = z -> {
             double total = 0;
             for (int r = 0; r < rows; r++) {
-                double max = Double.NEGATIVE_INFINITY, sum = 0, norm = 0;
+                double max = Double.NEGATIVE_INFINITY, sum = 0, teacherTop = 0, studentTop = 0;
                 for (int j = 0; j < vocabulary; j++) max = Math.max(max, z[r * vocabulary + j]);
                 for (int j = 0; j < vocabulary; j++) sum += Math.exp(z[r * vocabulary + j] - max);
-                for (int i = 0; i < k; i++) norm += Math.exp(lp[r * k + i]);
                 for (int i = 0; i < k; i++) {
-                    double p = Math.exp(lp[r * k + i]) / norm;
-                    total += p * (Math.log(p) - (z[r * vocabulary + chosen[r * k + i]] - max - Math.log(sum)));
+                    double p = Math.exp(lp[r * k + i]);
+                    double logQ = z[r * vocabulary + chosen[r * k + i]] - max - Math.log(sum);
+                    total += p * (Math.log(p) - logQ);
+                    teacherTop += p;
+                    studentTop += Math.exp(logQ);
                 }
+                double teacherRest = 1 - teacherTop, studentRest = 1 - studentTop;
+                total += teacherRest * (Math.log(teacherRest) - Math.log(studentRest));
             }
             return new double[] {total};
         };

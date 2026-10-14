@@ -700,15 +700,37 @@ extern "C" __global__ void top_k_log_softmax(const float* logits, int vocabulary
     }
 }
 
-// For each row of student logits [rows, vocabulary]: with the teacher's top-k (ids, log-probabilities) renormalized
-// to p, loss[0] += sum_i p_i (log p_i - log q_i) and dLogits = (q - p) * scale, q = softmax(logits). One block per row.
+// For each row of student logits [rows, vocabulary]: the KL from the teacher's top-k (ids, log-probabilities under its
+// full softmax) plus one bucket holding the rest of its probability, p_rest = 1 - sum p_i, to the student's same
+// partition, q_rest = the student's probability outside those k tokens:
+//   loss[0] += sum_i p_i (log p_i - log q_i) + p_rest (log p_rest - log q_rest),
+//   dLogits[j] = (q_j - p_j) * scale for j in the top-k, q_j (1 - p_rest / q_rest) * scale elsewhere.
+// The teacher's tail is kept as one mass rather than dropped, so an uncertain teacher does not push the student to
+// zero probability outside its top k. q_rest is summed over the tokens outside the top k directly (not 1 - sum q_i).
+// One block per row; k <= 64.
 extern "C" __global__ void top_k_distillation(const float* logits, int vocabulary, int k, const int* ids,
                                               const float* logProbs, float scale, float* dLogits, double* loss) {
     __shared__ float shared[32];
+    __shared__ int sorted[64];
     __shared__ float teacher[64];
+    __shared__ float teacherRest, restRatio;
     const float* row = logits + (long long)blockIdx.x * vocabulary;
     float* d = dLogits + (long long)blockIdx.x * vocabulary;
     const int* rowIds = ids + (long long)blockIdx.x * k;
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < k; i++) {
+            teacher[i] = expf(logProbs[(long long)blockIdx.x * k + i]);
+            total += teacher[i];
+            int id = rowIds[i], at = i;
+            while (at > 0 && sorted[at - 1] > id) {
+                sorted[at] = sorted[at - 1];
+                at--;
+            }
+            sorted[at] = id;
+        }
+        teacherRest = fmaxf(0.0f, 1.0f - total);
+    }
     float maximum = -3.0e38f;
     for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) maximum = fmaxf(maximum, row[j]);
     for (int offset = 16; offset > 0; offset >>= 1) maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset));
@@ -722,26 +744,36 @@ extern "C" __global__ void top_k_distillation(const float* logits, int vocabular
     __syncthreads();
     maximum = shared[0];
     __syncthreads();
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) sum += expf(row[j] - maximum);
-    float logZ = maximum + logf(block_sum(sum, shared));
-    // The teacher's renormalized top-k.
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < k; i++) total += expf(logProbs[(long long)blockIdx.x * k + i]);
-        for (int i = 0; i < k; i++) teacher[i] = expf(logProbs[(long long)blockIdx.x * k + i]) / total;
+    float sum = 0.0f, outside = 0.0f;
+    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) {
+        float e = expf(row[j] - maximum);
+        sum += e;
+        int low = 0, high = k;
+        while (low < high) {
+            int middle = (low + high) / 2;
+            if (sorted[middle] < j) low = middle + 1;
+            else high = middle;
+        }
+        if (low >= k || sorted[low] != j) outside += e;
     }
+    float total = block_sum(sum, shared);
+    float logZ = maximum + logf(total);
+    float studentRest = block_sum(outside, shared) / total;
+    if (threadIdx.x == 0) restRatio = studentRest > 0.0f ? teacherRest / studentRest : 0.0f;
     __syncthreads();
-    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) d[j] = expf(row[j] - logZ) * scale;
+    for (int j = threadIdx.x; j < vocabulary; j += blockDim.x) d[j] = expf(row[j] - logZ) * (1.0f - restRatio) * scale;
     __syncthreads();
     if (threadIdx.x == 0) {
         double l = 0.0;
         for (int i = 0; i < k; i++) {
             float p = teacher[i];
-            if (p <= 0.0f) continue;
-            l += (double)p * ((double)logf(p) - ((double)row[rowIds[i]] - logZ));
-            d[rowIds[i]] -= p * scale;
+            float q = expf(row[rowIds[i]] - logZ);
+            // In the top k the gradient is q - p: undo the outside factor written above.
+            d[rowIds[i]] = (q - p) * scale;
+            if (p > 0.0f) l += (double)p * ((double)logf(p) - ((double)row[rowIds[i]] - logZ));
         }
+        if (teacherRest > 0.0f && studentRest > 0.0f)
+            l += (double)teacherRest * ((double)logf(teacherRest) - (double)logf(studentRest));
         atomicAdd(loss, l);
     }
 }
