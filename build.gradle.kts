@@ -83,6 +83,10 @@ subprojects {
                     providers.gradleProperty("euhedral.qwen.nvfp4-artifact")
                             .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl")
                             .get())
+            // Optional unquantized artifact (tools/convert_checkpoint.py --quantization bf16), on local disk.
+            providers.gradleProperty("euhedral.qwen.bf16-artifact").orNull?.let {
+                systemProperty("euhedral.qwen.bf16-artifact", it)
+            }
             // Optional Qwen3.8-Flash-Next artifact (qwen4_exp).
             systemProperty(
                     "euhedral.qwen4.artifact",
