@@ -43,14 +43,17 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /// The MTP drafter's training corpus ([Corpus]): the artifact's own greedy answers to chat prompts, with the
-/// post-final-norm hidden of every row the base model ran, which is what seeds the drafter (docs/MTP_CONTRACT.md §2).
+/// post-final-norm hidden of every row the base model ran, which is what seeds the drafter
+/// (docs/MTP_CONTRACT.md §2).
 ///
-/// Each prompt is rendered by the checkpoint's chat template (thinking on, as the template defaults) and prefilled in
-/// the engine's 512-row chunks, as the server prefills it. Up to `batch` sequences then decode together, one row each
-/// per batched verification quantum: every row is bit for bit what the artifact's own greedy decode computes, and the
-/// weights are read once per step for all of them. A sequence ends at a stop token or after `maxTokens`.
+/// Each prompt is rendered by the checkpoint's chat template (thinking on, as the template defaults) and
+/// prefilled in the engine's 512-row chunks, as the server prefills it. Up to `batch` sequences then decode
+/// together, one row each per batched verification quantum: every row is bit for bit what the artifact's own
+/// greedy decode computes, and the weights are read once per step for all of them. A sequence ends at a stop
+/// token or after `maxTokens`.
 ///
-/// The run's bookkeeping belongs to a lattice source ([Generation]); quanta report to it through posted records.
+/// The run's bookkeeping belongs to a lattice source ([Generation]); quanta report to it through posted
+/// records.
 public final class Generate {
 
     /// CUDA's per-thread default stream: the argmax launches of concurrent quanta never share a stream.
@@ -97,20 +100,6 @@ public final class Generate {
     public static void run(Settings settings) throws Exception {
         if (settings.batch() < 1 || settings.batch() > 32)
             throw new IllegalArgumentException("--batch is 1 to 32 sequences (one row each per step)");
-        QwenTokenizer tokenizer = QwenTokenizer.load(settings.tokenizer());
-        QwenChatTemplate template = QwenChatTemplate.load(settings.tokenizer());
-        Files.createDirectories(settings.out());
-        List<Prompt> prompts = new ArrayList<>();
-        try (Corpus.Writer existing = Corpus.Writer.open(settings.out(), 0)) {
-            Set<String> done = existing.ids();
-            for (Path file : settings.prompts()) {
-                for (Prompt prompt : Prompt.read(file, template, tokenizer)) {
-                    if (!done.contains(prompt.id())) prompts.add(prompt);
-                    if (settings.limit() > 0 && prompts.size() >= settings.limit()) break;
-                }
-            }
-            System.out.printf(Locale.ROOT, "%d prompts to answer, %d done%n", prompts.size(), done.size());
-        }
         var data = ArtifactReader.read(settings.artifact());
         try (Device device = new Device(settings.library());
                 Qwen38Model model = Qwen38Model.load(
@@ -123,19 +112,51 @@ public final class Generate {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             if (!plan.drafts()) throw new IllegalArgumentException(settings.artifact() + " has no MTP drafter");
             var runtime = new Execution(lattice.terminal(), plan, device.gpu);
-            try (Corpus.Writer writer =
-                    Corpus.Writer.open(settings.out(), plan.weights().config().hiddenSize())) {
-                var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds());
-                var generation = generate.new Generation(prompts, writer);
-                lattice.attach(generation);
-                try {
-                    generation.finished.get();
-                } finally {
-                    generation.complete();
-                }
+            try {
+                // On the lattice: the prompts rendered and the generator set up, then the generation's frames. This
+                // thread only waits.
+                runtime.onWorker(() -> start(settings, device, runtime, plan, lattice))
+                        .thenCompose(generation -> generation.finished.whenComplete((ignored, failure) -> {
+                            generation.complete();
+                            try {
+                                generation.writer.close();
+                            } catch (IOException closing) {
+                                throw new java.io.UncheckedIOException(closing);
+                            }
+                        }))
+                        .get();
             } finally {
                 runtime.close();
             }
+        }
+    }
+
+    /// Renders the prompts not yet answered and attaches a generation of them to the lattice.
+    private static Generation start(
+            Settings settings, Device device, Execution runtime, ExecutionPlan plan, CalibrationLattice lattice) {
+        try {
+            QwenTokenizer tokenizer = QwenTokenizer.load(settings.tokenizer());
+            QwenChatTemplate template = QwenChatTemplate.load(settings.tokenizer());
+            Files.createDirectories(settings.out());
+            List<Prompt> prompts = new ArrayList<>();
+            try (Corpus.Writer existing = Corpus.Writer.open(settings.out(), 0)) {
+                Set<String> done = existing.ids();
+                for (Path file : settings.prompts()) {
+                    for (Prompt prompt : Prompt.read(file, template, tokenizer)) {
+                        if (!done.contains(prompt.id())) prompts.add(prompt);
+                        if (settings.limit() > 0 && prompts.size() >= settings.limit()) break;
+                    }
+                }
+                System.out.printf(Locale.ROOT, "%d prompts to answer, %d done%n", prompts.size(), done.size());
+            }
+            Corpus.Writer writer =
+                    Corpus.Writer.open(settings.out(), plan.weights().config().hiddenSize());
+            var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds());
+            var generation = generate.new Generation(prompts, writer);
+            lattice.attach(generation);
+            return generation;
+        } catch (IOException failure) {
+            throw new java.io.UncheckedIOException(failure);
         }
     }
 
@@ -186,7 +207,8 @@ public final class Generate {
             this.rows = arena.allocate((long) capacity * hidden * Short.BYTES, 16);
         }
 
-        /// Copies `count` hidden rows from the sequence's draft seed rows, which the quantum that ran them wrote.
+        /// Copies `count` hidden rows from the sequence's draft seed rows, which the quantum that ran them
+        /// wrote.
         void keep(int count) {
             long bytes = (long) count * hidden * Short.BYTES;
             long seeds = ((AttentionStates) sequence.kvCacheState()).seedRows();
@@ -205,15 +227,15 @@ public final class Generate {
         }
     }
 
-    /// The owner of a run: which prompts are answered, which sequences decode, whether a step is in flight, and the
-    /// corpus. Its fields change only while a worker polls it, which the lattice does one thread at a time; quanta
-    /// report what they did by posting records, which the poll applies in order before it starts prefills and the
-    /// next step.
+    /// The owner of a run: which prompts are answered, which sequences decode, whether a step is in flight, and
+    /// the corpus. Its fields change only while a worker polls it, which the lattice does one thread at a time;
+    /// quanta report what they did by posting records, which the poll applies in order before it starts
+    /// prefills and the next step.
     final class Generation extends AbstractIngestSink {
         final CompletableFuture<Void> finished = new CompletableFuture<>();
         private final MpscQueue<Runnable> records = new MpscQueue<>(256, 4);
         private final List<Prompt> prompts;
-        private final Corpus.Writer writer;
+        final Corpus.Writer writer;
         private final List<Slot> active = new ArrayList<>();
         private final ArrayDeque<Integer> lanes = new ArrayDeque<>();
         private final Delegate delegate = new Delegate();
@@ -311,8 +333,8 @@ public final class Generate {
             return delegate.isComplete();
         }
 
-        /// The lattice calls `request` and `pull` of a source one thread at a time: the generation's state needs no
-        /// other protection.
+        /// The lattice calls `request` and `pull` of a source one thread at a time: the generation's state
+        /// needs no other protection.
         private final class Delegate extends AbstractIngestSink.Delegate {
             @Override
             public long hookOnPull(
@@ -328,8 +350,8 @@ public final class Generate {
         }
     }
 
-    /// Prefills a slot's prompt in the engine's chunks, keeping every row's hidden; the last chunk's logits give the
-    /// first token to feed.
+    /// Prefills a slot's prompt in the engine's chunks, keeping every row's hidden; the last chunk's logits
+    /// give the first token to feed.
     private CompletableFuture<Void> prefill(Slot slot) {
         int[] prompt = slot.prompt.tokens();
         CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
@@ -359,7 +381,8 @@ public final class Generate {
         return chain;
     }
 
-    /// One batched verification of each slot's next token: keeps each row's hidden; completes with the next choices.
+    /// One batched verification of each slot's next token: keeps each row's hidden; completes with the next
+    /// choices.
     private CompletableFuture<int[]> step(List<Slot> slots) {
         List<Quantum.Part> parts = new ArrayList<>(slots.size());
         for (Slot slot : slots)
@@ -376,8 +399,8 @@ public final class Generate {
                 .thenApply(ignored -> chosen[0]);
     }
 
-    /// The greedy token of each of `rows` BF16 logits rows from `logits`, through the mapped ints at `out`, on the
-    /// calling thread's own default stream.
+    /// The greedy token of each of `rows` BF16 logits rows from `logits`, through the mapped ints at `out`, on
+    /// the calling thread's own default stream.
     private int[] choose(long logits, int rows, long out) {
         device.cuda.bindThread();
         device.cuda.launch(

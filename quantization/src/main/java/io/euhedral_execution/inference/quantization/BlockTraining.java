@@ -23,22 +23,22 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
-/// Block-wise training of a quantized artifact's layers (block reconstruction): the calibration sequences run through
-/// the BF16 checkpoint (the target stream) and through the layers decoded from a codes directory (the quantized
-/// stream, as `calibrate` wrote the codes). At each layer to train, the layer's quantized linears train their group
-/// scales and its norms their weights ([TrainableLayer]) so that the layer on the quantized stream's input matches the
-/// BF16 layer's output on the target stream's input, by squared error; held-out sequences measure the error before
-/// and after. The codes stay as GPTQ chose them.
+/// Block-wise training of a quantized artifact's layers (block reconstruction): the calibration sequences run
+/// through the BF16 checkpoint (the target stream) and through the layers decoded from a codes directory (the
+/// quantized stream, as `calibrate` wrote the codes). At each layer to train, the layer's quantized linears
+/// train their group scales and its norms their weights ([TrainableLayer]) so that the layer on the quantized
+/// stream's input matches the BF16 layer's output on the target stream's input, by squared error; held-out
+/// sequences measure the error before and after. The codes stay as GPTQ chose them.
 ///
-/// Each trained layer's scales (rounded to float16) and norms then run the quantized stream for the layers after it.
-/// They go to `out`, a codes directory for `convert_checkpoint.py --codes-from` (the objects of untrained layers, the
-/// heads and the MTP layer copied as they were), and the norms to `out/norms`; `overlay` is then a checkpoint
-/// directory that reads as the source checkpoint with the trained norms in place. A layer with `out/layer-N.done` is
-/// not trained again: a stopped run resumes.
+/// Each trained layer's scales (rounded to float16) and norms then run the quantized stream for the layers
+/// after it. They go to `out`, a codes directory for `convert_checkpoint.py --codes-from` (the objects of
+/// untrained layers, the heads and the MTP layer copied as they were), and the norms to `out/norms`; `overlay`
+/// is then a checkpoint directory that reads as the source checkpoint with the trained norms in place. A layer
+/// with `out/layer-N.done` is not trained again: a stopped run resumes.
 public final class BlockTraining {
 
-    /// Command-line settings: which layers train, on how many sequences (the last `holdout` held out), how long and
-    /// how fast.
+    /// Command-line settings: which layers train, on how many sequences (the last `holdout` held out), how long
+    /// and how fast.
     public record Settings(
             Path model,
             Path codes,
@@ -56,7 +56,8 @@ public final class BlockTraining {
     private final Settings settings;
     private final Device device;
     private final Qwen38Objects checkpoint;
-    private final Ops ops;
+    /// The training kernels on the main stream, compiled by the run's first frame.
+    private Ops ops;
     private final int hidden;
     private final long start = System.nanoTime();
 
@@ -64,7 +65,6 @@ public final class BlockTraining {
         this.settings = settings;
         this.device = device;
         this.checkpoint = checkpoint;
-        this.ops = new Ops(device.cuda, device.stream, device.cublas);
         this.hidden = checkpoint.config.hidden();
     }
 
@@ -72,7 +72,14 @@ public final class BlockTraining {
         try (Safetensors store = Safetensors.open(settings.model());
                 Device device = new Device(library);
                 CalibrationLattice lattice = CalibrationLattice.start(6)) {
-            new BlockTraining(settings, device, new Qwen38Objects(store, settings.model())).train(lattice);
+            var training = new BlockTraining(settings, device, new Qwen38Objects(store, settings.model()));
+            // On the lattice: the setup, then each layer continuing the next through its pipeline passes. This
+            // thread only waits.
+            lattice.submit(() -> training.train(lattice))
+                    .thenCompose(chain -> chain)
+                    .get();
+        } catch (InterruptedException | java.util.concurrent.ExecutionException failure) {
+            throw new IOException(failure);
         }
     }
 
@@ -80,42 +87,103 @@ public final class BlockTraining {
         System.out.printf(Locale.ROOT, "[%7.0f s] %s%n", (System.nanoTime() - start) / 1e9, message);
     }
 
-    private void train(CalibrationLattice lattice) throws IOException {
-        int[][] tokens = Calibrate.readTokens(settings.tokens(), settings.sequences());
-        int sequences = tokens.length, length = tokens[0].length;
-        long sequenceBytes = 2L * hidden * length, streamBytes = sequenceBytes * sequences;
-        long targetAddress = device.gpu.allocateHostWeights(streamBytes);
-        long quantizedAddress = device.gpu.allocateHostWeights(streamBytes);
-        MemorySegment target = MemorySegment.ofAddress(targetAddress).reinterpret(streamBytes);
-        MemorySegment quantized = MemorySegment.ofAddress(quantizedAddress).reinterpret(streamBytes);
-        long batchRows = (long) settings.batch() * length;
-        long batchStates = device.gpu.allocate(batchRows * 2 * hidden);
-        GpuCompletions completions = new GpuCompletions(device.cuda);
-        lattice.attach(completions);
-        int last = settings.layers().stream().mapToInt(Integer::intValue).max().orElseThrow();
-        try (LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows);
-                ForwardPipeline pipeline =
-                        new ForwardPipeline(device, forward, lattice.lake(), completions, settings.batch())) {
+    /// Sets the run up and returns its chain: each layer's BF16 pass, training (when chosen) and quantized
+    /// pass, one layer after the other, then the output. Runs on a worker; the chain continues on the workers
+    /// that finish each pass.
+    private java.util.concurrent.CompletableFuture<Void> train(CalibrationLattice lattice) {
+        try {
+            device.select(device.stream);
+            ops = new Ops(device.cuda, device.stream, device.cublas);
+            int[][] tokens = Calibrate.readTokens(settings.tokens(), settings.sequences());
+            int sequences = tokens.length, length = tokens[0].length;
+            long sequenceBytes = 2L * hidden * length, streamBytes = sequenceBytes * sequences;
+            long targetAddress = device.gpu.allocateHostWeights(streamBytes);
+            long quantizedAddress = device.gpu.allocateHostWeights(streamBytes);
+            MemorySegment target = MemorySegment.ofAddress(targetAddress).reinterpret(streamBytes);
+            MemorySegment quantized = MemorySegment.ofAddress(quantizedAddress).reinterpret(streamBytes);
+            long batchRows = (long) settings.batch() * length;
+            long batchStates = device.gpu.allocate(batchRows * 2 * hidden);
+            GpuCompletions completions = new GpuCompletions(device.cuda);
+            lattice.attach(completions);
+            int last =
+                    settings.layers().stream().mapToInt(Integer::intValue).max().orElseThrow();
+            LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows);
+            ForwardPipeline pipeline =
+                    new ForwardPipeline(device, forward, lattice.lake(), completions, settings.batch());
             embed(tokens, target, batchStates);
             MemorySegment.copy(target, 0, quantized, 0, streamBytes);
-            for (int index = 0; index <= last; index++) {
-                LayerWeights uploaded;
-                try (LayerWeights.Staged staged = LayerWeights.stage(checkpoint, index)) {
-                    uploaded = LayerWeights.upload(device.gpu, staged);
-                }
-                try (LayerWeights layer = uploaded) {
-                    // The target stream: the BF16 layer.
-                    pipeline.run(layer, targetAddress, batchStates, sequences, length, settings.batch(), null, true)
-                            .join();
-                    boolean trains = settings.layers().contains(index);
-                    boolean trained = trains && Files.exists(done(index));
-                    if (trains && !trained) trainLayer(index, layer, target, quantized, sequences, length);
-                    // The quantized stream: the layer decoded from its codes, trained when it was.
-                    Path codes = trains ? settings.out() : settings.codes();
-                    for (String name : List.copyOf(layer.objects.keySet())) layer.replace(name, decode(codes, name));
-                    if (trains) applyNorms(index, layer);
-                    pipeline.run(layer, quantizedAddress, batchStates, sequences, length, settings.batch(), null, true)
-                            .join();
+            var chain = java.util.concurrent.CompletableFuture.<Void>completedFuture(null);
+            for (int i = 0; i <= last; i++) {
+                int index = i;
+                chain = chain.thenCompose(ignored -> layer(
+                        index,
+                        pipeline,
+                        target,
+                        quantized,
+                        targetAddress,
+                        quantizedAddress,
+                        batchStates,
+                        sequences,
+                        length));
+            }
+            return chain.thenRun(() -> {
+                        try {
+                            finish();
+                        } catch (IOException failure) {
+                            throw new java.io.UncheckedIOException(failure);
+                        }
+                    })
+                    .whenComplete((ignored, failure) -> {
+                        device.select(device.stream);
+                        pipeline.close();
+                        forward.close();
+                        device.gpu.free(batchStates);
+                        device.gpu.freeHostWeights(targetAddress);
+                        device.gpu.freeHostWeights(quantizedAddress);
+                    });
+        } catch (IOException failure) {
+            return java.util.concurrent.CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    /// Layer `index`: its BF16 pass over the target stream, its training when chosen, its quantized pass.
+    private java.util.concurrent.CompletableFuture<Void> layer(
+            int index,
+            ForwardPipeline pipeline,
+            MemorySegment target,
+            MemorySegment quantized,
+            long targetAddress,
+            long quantizedAddress,
+            long batchStates,
+            int sequences,
+            int length) {
+        device.select(device.stream);
+        LayerWeights layer;
+        try (LayerWeights.Staged staged = LayerWeights.stage(checkpoint, index)) {
+            layer = LayerWeights.upload(device.gpu, staged);
+        } catch (IOException failure) {
+            return java.util.concurrent.CompletableFuture.failedFuture(failure);
+        }
+        boolean trains = settings.layers().contains(index);
+        return pipeline.run(layer, targetAddress, batchStates, sequences, length, settings.batch(), null, true)
+                .thenCompose(ignored -> {
+                    device.select(device.stream);
+                    try {
+                        if (trains && !Files.exists(done(index)))
+                            trainLayer(index, layer, target, quantized, sequences, length);
+                        // The quantized stream: the layer decoded from its codes, trained when it was.
+                        Path codes = trains ? settings.out() : settings.codes();
+                        for (String name : List.copyOf(layer.objects.keySet()))
+                            layer.replace(name, decode(codes, name));
+                        if (trains) applyNorms(index, layer);
+                    } catch (IOException failure) {
+                        throw new java.io.UncheckedIOException(failure);
+                    }
+                    return pipeline.run(
+                            layer, quantizedAddress, batchStates, sequences, length, settings.batch(), null, true);
+                })
+                .thenRun(() -> {
+                    device.select(device.stream);
                     if (trains) {
                         log(String.format(
                                 Locale.ROOT,
@@ -123,15 +191,9 @@ public final class BlockTraining {
                                 index,
                                 heldOutError(quantized, target, sequences, length)));
                     }
-                }
-                log("layer " + index + " done");
-            }
-            finish();
-        } finally {
-            device.gpu.free(batchStates);
-            device.gpu.freeHostWeights(targetAddress);
-            device.gpu.freeHostWeights(quantizedAddress);
-        }
+                    log("layer " + index + " done");
+                })
+                .whenComplete((ignored, failure) -> layer.close());
     }
 
     // ---- training one layer ----
@@ -340,7 +402,8 @@ public final class BlockTraining {
         return total / (sequences - first);
     }
 
-    /// The squared error of the quantized stream against the target stream over the held-out sequences (per value).
+    /// The squared error of the quantized stream against the target stream over the held-out sequences (per
+    /// value).
     private double heldOutError(MemorySegment quantized, MemorySegment target, int sequences, int length) {
         long count = (long) length * hidden, sequenceBytes = 2 * count;
         long a = device.gpu.allocate(sequenceBytes), b = device.gpu.allocate(sequenceBytes);
@@ -497,7 +560,8 @@ public final class BlockTraining {
         }
     }
 
-    /// Completes `out` with the objects it lacks (copied from the source codes) and writes the overlay checkpoint.
+    /// Completes `out` with the objects it lacks (copied from the source codes) and writes the overlay
+    /// checkpoint.
     private void finish() throws IOException {
         try (var files = Files.list(settings.codes())) {
             for (Path file : (Iterable<Path>) files::iterator) {
