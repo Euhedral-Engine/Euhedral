@@ -56,8 +56,9 @@ public final class QuantizationMain {
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
         if (args[0].equals("train-blocks")) {
             java.util.Set<Integer> layers = new java.util.TreeSet<>();
-            for (String layer : required(options, "train-layers").split(","))
-                layers.add(Integer.parseInt(layer.trim()));
+            String chosen = required(options, "train-layers");
+            if (chosen.equals("all")) for (int layer = 0; layer < 64; layer++) layers.add(layer);
+            else for (String layer : chosen.split(",")) layers.add(Integer.parseInt(layer.trim()));
             BlockTraining.run(
                     new BlockTraining.Settings(
                             Path.of(required(options, "model")),
