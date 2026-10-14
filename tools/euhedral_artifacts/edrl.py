@@ -96,10 +96,14 @@ def encode_table(plans: list[ObjectPlan]) -> bytes:
     return bytes(result)
 
 
+PAYLOAD_ALIGNMENT = 4096
+
+
 def assign_offsets(plans: list[ObjectPlan], data_base: int) -> int:
     cursor = data_base
     for plan in plans:
-        plan.offset = align_up(cursor, 256)
+        # Block-aligned, so the engine can read payloads past the page cache (O_DIRECT).
+        plan.offset = align_up(cursor, PAYLOAD_ALIGNMENT)
         cursor = plan.offset + plan.byte_size
     return cursor
 

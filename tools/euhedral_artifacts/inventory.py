@@ -16,7 +16,8 @@ from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.nvfp4 import (nvfp4_offsets, nvfp4_sd4_offsets, quantize_nvfp4_matrix,
                                       quantize_nvfp4_sd4_matrix)
 from euhedral_artifacts.q3_p2e2 import P2E2_LOWEST_CODE
-from euhedral_artifacts.recipes import LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage, stays_row_split
+from euhedral_artifacts.recipes import (BF16_FORMAT, LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage,
+                                       stays_row_split)
 from euhedral_artifacts.sources import (HIDDEN, VOCAB_SIZE, MatrixSource, SourceStore, bf16_to_float32,
                                         concat_matrix, gather_matrix, head_part, read_json, slice_matrix,
                                         source_matrix)
@@ -87,6 +88,12 @@ def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: Matrix
     With `importance` it is rounded by calibrated scale search; when `codes_from` holds a state file for it, its
     codes and scales are taken from there instead."""
     format_name, layout = storage(recipe, name, q3_format)
+    if format_name == BF16_FORMAT:
+        if matrix.read_words is None:
+            fail(f"{name} has no BF16 source to store")
+        plans.append(ObjectPlan(name, matrix.shape, "BF16", format_name, layout, 2 * matrix.shape[0] * matrix.shape[1],
+                                lambda output, offset, source=matrix: write_bf16_matrix(output, offset, source)))
+        return
     if codes_from is not None and state_file(codes_from, name).is_file():
         path = state_file(codes_from, name)
         state = QuantState.load(path)
@@ -120,6 +127,14 @@ def add_quant(plans: list[ObjectPlan], recipe: Recipe, name: str, matrix: Matrix
         ))
     else:
         fail(f"unknown quantized format {format_name}")
+
+
+def write_bf16_matrix(output, offset: int, source: MatrixSource, rows: int = 4096) -> None:
+    """The source's BF16 words, row-major, at `offset`, a block of rows at a time."""
+    output.seek(offset)
+    for begin in range(0, source.shape[0], rows):
+        words = source.read_words(begin, min(begin + rows, source.shape[0]))
+        output.write(np.ascontiguousarray(words).astype("<u2", copy=False).tobytes())
 
 
 def attention_parts(store: SourceStore, prefix: str) -> tuple[MatrixSource, MatrixSource]:

@@ -147,6 +147,21 @@ class ArgumentHandlingTest(unittest.TestCase):
 
 
 class RecipeTest(unittest.TestCase):
+    def test_bf16_recipe_stores_every_object_in_bf16(self):
+        recipe = recipes.Recipe("bf16")
+        for name, q3 in (("text/layers/0/mlp/gate_up", "Q3G64_F16S"), ("text/output_head", "NVFP4"),
+                         ("text/token_embedding", "Q3G64_F16S"), ("mtp/input_projection", "NVFP4")):
+            self.assertEqual(recipes.storage(recipe, name, q3), ("BF16", "contiguous-le-v1"))
+        with self.assertRaises(ValueError):
+            recipes.Recipe("bf16", True)
+
+    def test_payloads_are_block_aligned(self):
+        from euhedral_artifacts.edrl import ObjectPlan, assign_offsets
+        plans = [ObjectPlan(f"o{i}", (1,), "BF16", "BF16", "contiguous-le-v1", size, None)
+                 for i, size in enumerate((100, 5000, 4096 * 3 + 1))]
+        assign_offsets(plans, 777)
+        self.assertTrue(all(plan.offset % 4096 == 0 for plan in plans))
+
     def test_there_are_four_recipes(self):
         self.assertEqual([r.name for r in recipes.RECIPES], ["q3", "q3-compressed", "nvfp4", "nvfp4-compressed"])
         with self.assertRaises(ValueError):

@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from euhedral_artifacts.edrl import (FORMAT_Q3, HEADER_FORMAT, LAYOUT_P2E2, LAYOUT_ROW_SPLIT, align_up,
+from euhedral_artifacts.edrl import (FORMAT_Q3, HEADER_FORMAT, LAYOUT_P2E2, LAYOUT_ROW_SPLIT, PAYLOAD_ALIGNMENT, align_up,
                                      encode_descriptors, fail, read_table)
 from euhedral_artifacts.recipes import stays_row_split
 
@@ -204,7 +204,7 @@ def transcode(input_path: Path, output_path: Path, force: bool = False, expand: 
                         stats["p2e2_bytes"] += len(payload_out)
                         payload = payload_out
                         out["bytes"] = len(payload)
-                    out["offset"] = align_up(cursor, 256)
+                    out["offset"] = align_up(cursor, PAYLOAD_ALIGNMENT)
                     sink.seek(out["offset"])
                     sink.write(payload)
                     cursor = out["offset"] + len(payload)
