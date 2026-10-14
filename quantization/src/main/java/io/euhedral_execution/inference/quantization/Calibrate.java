@@ -211,6 +211,11 @@ public final class Calibrate {
     /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded weights:
     /// each object is a lattice frame on its worker's own stream, at most ROUNDING_FRAMES at once, largest first.
     private void roundAll(LayerWeights layer, Map<String, Long> hessians) {
+        var mirrored = new HashSet<Long>();
+        for (String name : layer.objects.keySet()) {
+            long h = hessians.get(name);
+            if (mirrored.add(h)) device.symmetrize(h, (int) layer.shapes.get(name)[1]);
+        }
         device.synchronize(); // the Hessians are complete before other streams read them
         List<String> names = new ArrayList<>(layer.objects.keySet());
         names.sort(Comparator.comparingLong(
@@ -265,6 +270,7 @@ public final class Calibrate {
     /// GPTQ of one object (BF16 [rows, k] on the device) under `hessian`, in row slices of HEAD_ROWS sharing one factor
     /// and tensor scales; saves its state and returns its decoded weights (BF16, device, owned by the caller).
     private long roundObject(String name, long weight, long rows, int k, long hessian) throws IOException {
+        device.symmetrize(hessian, k); // on the main stream, where it was accumulated and the main Gptq reads it
         return roundObject(gptq, name, weight, rows, k, hessian);
     }
 
