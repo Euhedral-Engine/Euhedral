@@ -307,6 +307,24 @@ void euhedral_cuda_stream_clear(void) {
     selected_stream = NULL;
 }
 
+/* A wait on the selected stream until the host-mapped 32-bit word at `device_address` equals `value`. Without a
+   selected stream it would stall the legacy default stream, so it is refused. */
+int euhedral_cuda_wait_host_flag(uint64_t device_address, uint32_t value) {
+    cudaStream_t stream = euhedral_cuda_submission_stream();
+    if (device_address == 0 || stream == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    CUresult status = euhedral_submit_wait_value((CUdeviceptr)device_address, value, stream);
+    return status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
+/* A write of `value` to the host-mapped 32-bit word at `device_address` on the selected stream, after the work queued
+   before it. */
+int euhedral_cuda_write_host_flag(uint64_t device_address, uint32_t value) {
+    cudaStream_t stream = euhedral_cuda_submission_stream();
+    if (device_address == 0 || stream == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    CUresult status = euhedral_submit_write_value((CUdeviceptr)device_address, value, stream);
+    return status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+}
+
 uint64_t euhedral_cuda_completion_event_create(void) {
     cudaEvent_t event = NULL;
     if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) return 0;

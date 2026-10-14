@@ -371,6 +371,10 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_destroy(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_synchronize(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_stream_select(uint64_t stream);
 EUHEDRAL_CUDA_EXPORT void euhedral_cuda_stream_clear(void);
+/// Queues on the selected stream a wait until the host-mapped 32-bit word at `device_address` equals `value`.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_wait_host_flag(uint64_t device_address, uint32_t value);
+/// Queues on the selected stream a write of `value` to the host-mapped 32-bit word at `device_address`.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_write_host_flag(uint64_t device_address, uint32_t value);
 EUHEDRAL_CUDA_EXPORT uint64_t euhedral_cuda_completion_event_create(void);
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_completion_event_record(uint64_t event, uint64_t stream);
 /// Orders work submitted to `stream` afterwards behind the work recorded in `event` (device side).

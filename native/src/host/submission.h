@@ -5,6 +5,7 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Every launch, copy and memset a quantum submits goes through these functions, so a calling thread can
  * select how its submissions are handled:
@@ -27,6 +28,10 @@ cudaError_t euhedral_submit_copy(void* destination, const void* source, size_t b
 cudaError_t euhedral_submit_copy_2d(void* destination, size_t destination_pitch, const void* source,
         size_t source_pitch, size_t width, size_t height, enum cudaMemcpyKind kind, cudaStream_t stream);
 cudaError_t euhedral_submit_memset(void* destination, int value, size_t bytes, cudaStream_t stream);
+/* Stream memory operations on a 32-bit word: a wait until it equals `value`, and a write of `value` after the work
+ * queued before it. Both capture into graphs; the hash covers the address and the value. */
+CUresult euhedral_submit_wait_value(CUdeviceptr address, uint32_t value, cudaStream_t stream);
+CUresult euhedral_submit_write_value(CUdeviceptr address, uint32_t value, cudaStream_t stream);
 
 /* Whether the calling thread is checking: its submissions must not run. */
 int euhedral_submission_checking(void);

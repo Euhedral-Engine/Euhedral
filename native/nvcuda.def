@@ -14,4 +14,6 @@ EXPORTS
     cuModuleGetFunction
     cuModuleLoadData
     cuModuleUnload
+    cuStreamWaitValue32_v2
+    cuStreamWriteValue32_v2
     cuTensorMapEncodeTiled
