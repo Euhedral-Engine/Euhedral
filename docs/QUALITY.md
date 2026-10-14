@@ -82,7 +82,7 @@ Swift-1.5 artifacts, each scored against Swift-1.5 BF16 (`dNLL ± chunk-level SE
 |---|---|---|---|---|
 | nvfp4-compressed | +0.033 ± 0.007 / 0.028 / 90.3% | +0.002 ± 0.005 / 0.032 / 93.2% | +0.038 ± 0.005 / 0.059 / 96.8% | +0.093 ± 0.021 / 0.149 / 93.9% |
 | nvfp4 | +0.024 ± 0.008 / 0.028 / 90.9% | +0.012 ± 0.005 / 0.032 / 93.1% | +0.035 ± 0.005 / 0.059 / 96.9% | +0.079 ± 0.027 / 0.148 / 93.4% |
-| q3 | +0.106 ± 0.016 / 0.090 / 85.2% | +0.030 ± 0.006 / 0.080 / 89.2% | +0.133 ± 0.017 / 0.190 / 93.6% | +0.006 ± 0.034 / 0.294 / 89.8% |
+| q3 | +0.088 ± 0.014 / 0.086 / 84.6% | +0.040 ± 0.005 / 0.080 / 89.2% | +0.130 ± 0.015 / 0.183 / 93.6% | +0.081 ± 0.035 / 0.263 / 90.6% |
 | q3-compressed | +0.101 ± 0.017 / 0.106 / 84.0% | +0.022 ± 0.013 / 0.102 / 87.8% | +0.165 ± 0.021 / 0.225 / 92.7% | +0.070 ± 0.031 / 0.292 / 90.0% |
 
 On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix near-deterministic answer text with
@@ -101,8 +101,14 @@ rounded through the Cholesky factor of the inverse Hessian H = XᵀX of the line
 the output error on the calibration activations rather than the weight error. Scales are chosen as the converter
 chooses them (group scales by weighted search within the codes the layout stores, -3..3 for `q3-compressed`'s
 P2E2 tensors; block scales by weighted search; the SD4 table by its error DP), weighted by diag(H), on the
-error-updated weights; the codes go into the converter with `--codes-from`, and the token embedding and the MTP layer
-are rounded by the converter (`--imatrix`).
+error-updated weights; the codes go into the converter with `--codes-from`, and the token embedding is rounded by the
+converter (`--imatrix`). `q3` is rounded in act-order (columns by decreasing diag(H), each group's scale chosen when
+its first column comes up) with its MTP layer rounded by GPTQ too, on the rows the engine feeds it; the other three
+artifacts round their columns in order and leave the MTP layer to the converter. Act-order with the MTP layer was
+measured on all four recipes (KL T1 / T2 / T3 / T4): `q3` 0.086 / 0.080 / 0.183 / 0.263, adopted; `q3-compressed`
+0.105 / 0.096 / 0.220 / 0.307, `nvfp4-compressed` 0.028 / 0.029 / 0.058 / 0.151 and `nvfp4` 0.029 / 0.032 / 0.061 /
+0.158, not adopted (no clear gain over the table above, T4 worse). A calibration set of 384 sequences (737 answers)
+gave `nvfp4-compressed` KL 0.035 on T2 and was rejected.
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
@@ -118,8 +124,8 @@ takes about 13 minutes per artifact on the 16 GB card, with damping 0.01.
 **Engine checks** of the GPTQ artifacts, `nvfp4-compressed` (`nvfp4`): 2.94 (2.99) tokens per verification at 4K and
 3.01 (3.17) at 32K over the benchmark's chat prompts, 118 (102) tok/s at 4K and 103 (105) at 32K. Acceptance varies by
 up to 0.75 tokens per verification between the four prompts of each length. Rounding the draft head by the converter
-instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ. `q3` (`q3-compressed`): 2.45 (2.47) tokens per
-verification at 4K and 2.47 (2.50) at 32K, 122 (107) tok/s at 4K and 111 (97) at 32K.
+instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ. `q3` (`q3-compressed`): 2.43 (2.47) tokens per
+verification at 4K and 2.47 (2.50) at 32K, 127 (107) tok/s at 4K and 112 (97) at 32K.
 
 ## Weight-only error
 

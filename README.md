@@ -96,8 +96,8 @@ that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint r
 
 All four artifacts' decoder layers and heads are rounded by GPTQ: each linear's rounding minimizes the error of
 its outputs on calibration activations of the quantized model, each column's error carried into the columns not yet
-rounded (`tools/gptq`, [docs/QUALITY.md](docs/QUALITY.md#gptq)). The token embedding and the MTP layer are rounded by
-calibrated scale search: every group's scale minimizes its
+rounded (the `quantization` module, [docs/QUALITY.md](docs/QUALITY.md#gptq)); `q3` also rounds its MTP layer by GPTQ.
+The token embedding (and the other artifacts' MTP layer) are rounded by calibrated scale search: every group's scale minimizes its
 error weighted by the importance of each input column (`tools/convert_checkpoint.py --imatrix`, see
 [tools/README.md](tools/README.md)) with UkisAI's Swift-1.5 importance matrix (`imatrix-swift15-v1mix.gguf`, from
 `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`), and is measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its
@@ -108,7 +108,7 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `q3` | 2.248 | 9.47 | +0.106 ± 0.016 | 0.090 | 85.2% |
+| `q3` | 2.229 | 9.30 | +0.088 ± 0.014 | 0.086 | 84.6% |
 | `q3-compressed` | 2.242 | 9.42 | +0.101 ± 0.017 | 0.106 | 84.0% |
 | `nvfp4` | 2.166 | 8.72 | +0.024 ± 0.008 | 0.028 | 90.9% |
 | `nvfp4-compressed` | 2.174 | 8.80 | +0.033 ± 0.007 | 0.028 | 90.3% |
