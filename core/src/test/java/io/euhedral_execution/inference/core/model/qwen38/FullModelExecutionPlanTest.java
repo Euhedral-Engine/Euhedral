@@ -121,13 +121,7 @@ class FullModelExecutionPlanTest {
 
     @Test
     void everyBf16ObjectRunsAsARowExactBf16Projection() {
-        formatOverride = name -> WeightFormat.BF16;
-        Weights weights;
-        try {
-            weights = fullModelWeights();
-        } finally {
-            formatOverride = name -> null;
-        }
+        Weights weights = fullModelWeights(name -> false, name -> false, name -> WeightFormat.BF16);
         ExecutionPlan plan = new ExecutionPlan(weights);
         java.util.Map<ExecutionPlan.Kind, Long> kinds = plan.instructions().stream()
                 .collect(java.util.stream.Collectors.groupingBy(
@@ -144,13 +138,8 @@ class FullModelExecutionPlanTest {
 
     @Test
     void aBf16HeadOnAGroupedModelRunsInItsOwnFormat() {
-        formatOverride = name -> name.equals("text/output_head") ? WeightFormat.BF16 : null;
-        Weights weights;
-        try {
-            weights = fullModelWeights();
-        } finally {
-            formatOverride = name -> null;
-        }
+        Weights weights = fullModelWeights(
+                name -> false, name -> false, name -> name.equals("text/output_head") ? WeightFormat.BF16 : null);
         ExecutionPlan plan = new ExecutionPlan(weights);
         assertEquals(ExecutionPlan.Kind.BF16_PROJECTION, kindOf(plan, "text/output_head"));
         assertEquals(ExecutionPlan.Kind.Q3_LINEAR, kindOf(plan, "text/layers/8/mlp/down"));
