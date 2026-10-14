@@ -14,6 +14,7 @@ import java.util.Locale;
 ///
 /// - Q3: Q3G64_F16S projections. Compressed: P2E2 (lossless).
 /// - NVFP4: block-scaled NVFP4 projections. Compressed: SD4 scale tables.
+/// - BF16: the unquantized model, every object in BF16; its attention caches are BF16 too.
 /// - Speculation: DFlash2 when the artifact holds the DFlash2 drafter (`dflash2/`), else MTP when it holds the MTP
 ///   layer and draft head, else none.
 public record ArtifactProfile(Quantization quantization, boolean compressed, Speculation speculation) {
@@ -52,7 +53,8 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
 
     /// How many tokens an MTP step drafts: the depth that measured fastest (docs/MTP_VERIFIER.md). A Q3 verifier row
     /// costs more than an NVFP4 one, whose decode kernels take 8 rows for little more than one, so Q3 drafts less
-    /// deep. Lengths gated on the drafts' confidence measured no faster (docs/MTP_DRAFT_CONFIDENCE.md).
+    /// deep. Lengths gated on the drafts' confidence measured no faster (docs/MTP_DRAFT_CONFIDENCE.md). BF16 drafts
+    /// as deep as NVFP4: its tensor-core verifier rows cost about what one row does.
     public DraftLength draftLength() {
         if (this.speculation != Speculation.MTP)
             throw new IllegalStateException("the artifact does not draft with MTP");
@@ -107,8 +109,8 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         return new ArtifactProfile(quantization, compressed, speculation);
     }
 
-    /// The artifact's name in logs and run records: `q3`, `q3-compressed`, `nvfp4`, `nvfp4-compressed`, with
-    /// `-dflash2` when it drafts with DFlash2.
+    /// The artifact's name in logs and run records: `q3`, `q3-compressed`, `nvfp4`, `nvfp4-compressed`, `bf16`,
+    /// with `-dflash2` when it drafts with DFlash2.
     public String artifactName() {
         return this.quantization.name().toLowerCase(Locale.ROOT)
                 + (this.compressed ? "-compressed" : "")

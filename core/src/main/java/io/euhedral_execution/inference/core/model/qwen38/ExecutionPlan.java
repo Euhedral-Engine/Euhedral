@@ -1090,8 +1090,12 @@ public final class ExecutionPlan {
         return new PlanData(result, data.projectionWidths(), buffers, data.firstLayer());
     }
 
+    /// The heavy projections prefill orders behind the GDN control region: grouped and BF16 ones.
     private static boolean grouped(Kind kind) {
-        return kind == Kind.Q3_LINEAR || kind == Kind.Q4_LINEAR || kind == Kind.Q5_LINEAR;
+        return kind == Kind.Q3_LINEAR
+                || kind == Kind.Q4_LINEAR
+                || kind == Kind.Q5_LINEAR
+                || kind == Kind.BF16_PROJECTION;
     }
 
     private static List<Instruction> earlyControlOrder(List<Instruction> instructions) {
@@ -2283,7 +2287,7 @@ public final class ExecutionPlan {
             }
         }
         List<Integer> widths = nodes.stream()
-                .filter(instruction -> instruction.kind() == Kind.Q3_LINEAR)
+                .filter(instruction -> grouped(instruction.kind()) || instruction.kind() == Kind.BF16_PROJECTION)
                 .map(Instruction::outputWidth)
                 .toList();
         return new PlanData(List.copyOf(nodes), widths, List.of(), false);
