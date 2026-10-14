@@ -189,6 +189,13 @@ final class StageGraphFixtures {
         }
 
         @Override
+        protected void abandoned(GpuStream home) {
+            if (graph().quantum() instanceof TestQuantum quantum) quantum.abandoned.add(stage());
+            if (home instanceof RecordingStream recording)
+                recording.submit(() -> recording.kernel("abandoned" + stage()), false);
+        }
+
+        @Override
         protected void retired(boolean committed) {
             this.retirements.add(committed);
             ((TestQuantum) graph().quantum()).events.add((committed ? "commit:" : "release:") + stage());
@@ -198,6 +205,8 @@ final class StageGraphFixtures {
     /// A quantum binding that records its terminal sequence.
     static final class TestQuantum implements StageQuantum {
         final List<String> events = Collections.synchronizedList(new ArrayList<>());
+        /// The stages handed their [StageFrame#abandoned] turn, in order.
+        final List<Integer> abandoned = Collections.synchronizedList(new ArrayList<>());
         final AtomicReference<Throwable> failure = new AtomicReference<>();
         final CompletableFuture<String> outcome = new CompletableFuture<>();
         final AtomicInteger outcomes = new AtomicInteger();

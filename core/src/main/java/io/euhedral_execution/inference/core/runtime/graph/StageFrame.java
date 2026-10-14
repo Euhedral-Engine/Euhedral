@@ -135,6 +135,12 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
         return false;
     }
 
+    /// Runs at the boundary of a quantum whose device work does not include this stage's: it never
+    /// submitted, and no captured graph ran in its place. The quantum's other lanes have joined `home`; a
+    /// stage whose device work later work waits for in order (a read's flag) queues its stand-in there,
+    /// before the boundary that later graphs await.
+    protected void abandoned(GpuStream home) {}
+
     /// Runs once per quantum on the retiring worker for a stage that attempted submission, after
     /// the quantum's device work has retired. `committed` is true only when the whole quantum
     /// succeeded: publish externally visible state then, and release temporary resources either

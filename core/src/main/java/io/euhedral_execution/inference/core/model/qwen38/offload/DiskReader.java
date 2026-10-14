@@ -283,12 +283,12 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
     }
 
     /// Stops reading, waits for the reads in flight (their completions run while the lattice polls the reads) and
-    /// closes the file. Called once every quantum retired, before the window is freed.
+    /// closes the file. Called once every quantum retired, before the window is freed; the lake that polls it
+    /// completes it.
     @Override
     public void close() {
         if (this.closed) return;
         this.closed = true;
-        complete();
         long deadline = System.nanoTime() + CLOSE_WAIT_NANOS;
         while (this.inFlight.get() > 0 && System.nanoTime() < deadline) LockSupport.parkNanos(100_000L);
         if (this.inFlight.get() > 0)

@@ -580,6 +580,34 @@ class StageGraphTest {
         assertEquals(List.of(1), List.of(topology.retiredSuccessors(0)[0]));
     }
 
+    @Test
+    void stagesThatNeverSubmittedAreAbandonedInOrderBeforeTheBoundary() {
+        StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        stage(graph, 1).failure = new IllegalStateException("launch failed");
+        run(take(this.source).getFirst());
+        run(take(this.source).getFirst());
+        assertEquals(List.of(1, 2), quantum.abandoned, "the failed stage and the one that never ran");
+        List<String> kernels = this.stream.kernels;
+        assertEquals("abandoned2", kernels.get(kernels.size() - 1));
+        assertEquals("abandoned1", kernels.get(kernels.size() - 2));
+        assertEquals(1, this.stream.armed(), "the boundary follows them");
+        this.stream.retireNext(true);
+        drain(this.source);
+        assertEquals("FAILED", quantum.outcome.join());
+    }
+
+    @Test
+    void aQuantumWhoseStagesAllSubmittedAbandonsNothing() {
+        StageGraph graph = graph(LINEAR, this.stream, this.source, this.recycler);
+        TestQuantum quantum = start(graph);
+        drain(this.source);
+        this.stream.retireNext(true);
+        drain(this.source);
+        assertEquals("SUCCESS", quantum.outcome.join());
+        assertTrue(quantum.abandoned.isEmpty());
+    }
+
     private TestQuantum start(StageGraph graph) {
         this.source.admit();
         TestQuantum quantum = new TestQuantum();

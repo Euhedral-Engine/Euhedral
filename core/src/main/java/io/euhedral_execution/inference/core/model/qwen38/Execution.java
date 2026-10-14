@@ -4,16 +4,22 @@ import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse;
 import io.euhedral_execution.inference.core.runtime.EuhedralInferenceRuntime;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.PromptSink;
 import io.euhedral_execution.inference.core.runtime.graph.AbstractQuantum;
+import io.euhedral_execution.inference.core.runtime.graph.AsyncReads;
+import io.euhedral_execution.inference.core.runtime.graph.ChunkedShape;
 import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import io.euhedral_execution.inference.core.runtime.graph.LanePool;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -46,6 +52,11 @@ public final class Execution implements AutoCloseable {
     private final SharedWorkspace shared;
     /// The prompt graphs' shapes; confined to the workspace's owner.
     private final PromptShapes prompts;
+    /// The reader of disk-backed weights and the reads it submits; null when no weight is disk-backed.
+    private final DiskReader diskReader;
+    private final AsyncReads asyncReads;
+    /// The number of the next admitted quantum with disk uses; confined to the workspace's owner.
+    private long nextDiskTicket;
     private boolean closed;
 
     /// An execution whose lane pool has one lane per available processor.
@@ -73,6 +84,19 @@ public final class Execution implements AutoCloseable {
             int laneCount,
             boolean captureGraphs,
             int maxRows) {
+        this(lattice, plan, gpu, laneCount, captureGraphs, maxRows, null);
+    }
+
+    /// As above, reading the plan's disk-backed weights from `artifact` (null when none is disk-backed): a
+    /// [DiskReader] and the reads it submits are sources of the lake.
+    public Execution(
+            LatticeTerminal lattice,
+            ExecutionPlan plan,
+            ExecutionGpu gpu,
+            int laneCount,
+            boolean captureGraphs,
+            int maxRows,
+            Path artifact) {
         this.plan = Objects.requireNonNull(plan, "plan");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
@@ -88,6 +112,46 @@ public final class Execution implements AutoCloseable {
                 new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs),
                 SharedWorkspace.bufferCount(this.plan));
         this.prompts = new PromptShapes(this.runtime);
+        if (this.plan.window() == null) {
+            this.asyncReads = null;
+            this.diskReader = null;
+            return;
+        }
+        if (artifact == null) throw new IllegalArgumentException("disk-backed weights need their artifact");
+        AsyncReads reads = openAsyncReads();
+        try {
+            this.diskReader = new DiskReader(this.plan.window(), reads, artifact);
+        } catch (IOException | RuntimeException failure) {
+            if (reads != null) reads.close();
+            this.runtime.close();
+            throw new IllegalStateException("the artifact cannot be read for its disk-backed weights", failure);
+        }
+        this.asyncReads = reads;
+        if (reads != null) this.lake.attach(reads.getDelegate());
+        this.lake.attach(this.diskReader.getDelegate());
+    }
+
+    /// The machine's asynchronous reads, or null: the disk reader then reads positionally on its poll.
+    private static AsyncReads openAsyncReads() {
+        if (!AsyncReads.available()) return null;
+        try {
+            return AsyncReads.open();
+        } catch (RuntimeException unavailable) {
+            LOG.warn("disk-backed weights are read positionally: {}", unavailable.getMessage());
+            return null;
+        }
+    }
+
+    /// The reads of the disk uses of the quantum that runs `shape`, in the order its device work consumes each
+    /// window slot's: a prompt's chunks one after another.
+    static List<DiskUse> diskUses(GraphShape shape) {
+        if (shape instanceof Shape view) return view.diskUses();
+        if (shape instanceof CheckpointView checkpointed)
+            return checkpointed.view().diskUses();
+        if (!(shape instanceof ChunkedShape chunked)) return List.of();
+        List<DiskUse> uses = new ArrayList<>();
+        for (int chunk = 0; chunk < chunked.chunks(); chunk++) uses.addAll(diskUses(chunked.template(chunk)));
+        return uses;
     }
 
     /// The rows the workspace holds: the largest quantum it admits.
@@ -213,16 +277,24 @@ public final class Execution implements AutoCloseable {
         // A prompt of several chunks runs as one graph of them.
         GraphShape admitted =
                 context.chunkCount() > 1 || !context.checkpointChunks().isEmpty() ? this.prompts.shape(context) : view;
+        // Its disk uses are registered once it started, in admission order: the order of each window slot's copies.
+        List<DiskUse> uses = this.diskReader == null ? List.of() : diskUses(admitted);
+        long ticket = uses.isEmpty() ? -1 : this.nextDiskTicket++;
+        if (ticket >= 0) context.readsFromDisk(this.diskReader, ticket);
+        boolean[] began = new boolean[1];
         try {
             this.runtime.admit(
                     admitted,
                     context,
-                    (stream, storage) ->
+                    (stream, storage) -> began[0] =
                             context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage, this.shared));
         } catch (RuntimeException | Error refused) {
             LOG.debug("a quantum was refused; its continuation carries the failure", refused);
+            // Prepared and then refused at binding: its graph may have started, and drains what it leaves.
+            if (ticket >= 0 && began[0]) this.diskReader.enqueue(ticket, uses, context::fail);
             return refused;
         }
+        if (ticket >= 0 && began[0]) this.diskReader.enqueue(ticket, uses, context::fail);
         return null;
     }
 
@@ -312,12 +384,29 @@ public final class Execution implements AutoCloseable {
             if (failure == null) failure = closeFailure;
             else failure.addSuppressed(closeFailure);
         }
+        // Every quantum retired, so every read its device work waited for completed; the reader closes the file.
+        if (this.diskReader != null) {
+            try {
+                this.diskReader.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
+        }
         try {
             this.lake.completeGracefully();
             this.lake.awaitTermination();
         } catch (RuntimeException completionFailure) {
             if (failure == null) failure = completionFailure;
             else failure.addSuppressed(completionFailure);
+        }
+        if (this.asyncReads != null && (this.diskReader == null || this.diskReader.readsInFlight() == 0)) {
+            try {
+                this.asyncReads.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else failure.addSuppressed(closeFailure);
+            }
         }
         // Every quantum retired: the workspace is idle. A poisoned GPU keeps it, as it keeps the graphs' storage.
         if (this.gpu.completionProven()) {

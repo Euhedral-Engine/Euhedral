@@ -4,7 +4,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
 import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
 import io.euhedral_execution.inference.core.runtime.graph.WorkspaceUse;
@@ -48,6 +51,73 @@ class StagingEdgesTest {
                     "a slot's last accessor reads it");
         }
         assertTrue(decode.workspaceBufferCount() > SharedWorkspace.stagingBuffer(plan, SLOTS - 1));
+    }
+
+    /// A window no device sees, over memory nothing touches: the plan only computes its addresses.
+    private static DiskWindow window(long largest) {
+        long slotBytes = DiskWindow.slotBytesFor(largest);
+        return new DiskWindow(
+                java.lang.foreign.MemorySegment.ofAddress(1L << 42).reinterpret(slotBytes * DiskWindow.SLOTS),
+                java.lang.foreign.MemorySegment.ofAddress(1L << 43).reinterpret(4096),
+                slotBytes);
+    }
+
+    @Test
+    void diskUsesTransferThroughTheWindowInPlanOrder() {
+        var weights = FullModelExecutionPlanTest.fullModelWeights(
+                name -> name.endsWith("/gdn/output"), name -> name.endsWith("/mlp/down"));
+        long largest = 5120L * 17408;
+        var staging = new WeightStaging(1L << 40, WeightStaging.slotBytesFor(largest), WeightStaging.SLOTS);
+        DiskWindow window = window(largest);
+        ExecutionPlan plan = new ExecutionPlan(weights, staging, window);
+        for (Shape view : List.of(
+                plan.forExecution(Quantum.ExecutionKind.DECODE, 1),
+                plan.forExecution(Quantum.ExecutionKind.PREFILL, 512))) {
+            List<ExecutionPlan.Instruction> transfers = view.instructions().stream()
+                    .filter(i -> i.kind() == ExecutionPlan.Kind.DISK_TRANSFER)
+                    .toList();
+            List<DiskUse> uses = view.diskUses();
+            assertEquals(64, uses.size(), "every FFN down, once per quantum");
+            assertEquals(uses.size(), transfers.size());
+            int[] perStagingSlot = new int[WeightStaging.SLOTS];
+            for (int d = 0; d < transfers.size(); d++) {
+                ExecutionPlan.Instruction transfer = transfers.get(d);
+                DiskUse use = uses.get(d);
+                TensorHandle weight = transfer.weight();
+                assertEquals(weight.name(), use.name());
+                int stagingSlot = (int) ((weight.deviceAddress() - staging.slotAddress(0)) / staging.slotBytes());
+                int expected = stagingSlot + WeightStaging.SLOTS * (perStagingSlot[stagingSlot]++ % 2);
+                assertEquals(expected, transfer.outputBufferIndex(), "use " + d);
+                assertEquals(expected, use.slot());
+                assertEquals(window.slotHost(use.slot()) + use.lead(), weight.hostAddress());
+                assertEquals(256, use.lead());
+                // Its consumer reads the staging slot after it.
+                ExecutionPlan.Instruction consumer = view.instructions().stream()
+                        .filter(i -> i.dependencies().contains(transfer.id())
+                                && i.kind() != ExecutionPlan.Kind.DISK_TRANSFER
+                                && i.kind() != ExecutionPlan.Kind.WEIGHT_TRANSFER)
+                        .findFirst()
+                        .orElseThrow();
+                assertTrue(consumer.weights().stream().anyMatch(w -> w.deviceAddress() == weight.deviceAddress()));
+            }
+            // Each window slot's uses are consumed in list order: a later use into a staging slot follows the
+            // consumer of the one before it, which follows that use's transfer.
+            for (int d = 0; d < transfers.size(); d++)
+                for (int e = d + 1; e < transfers.size(); e++)
+                    if (uses.get(d).slot() == uses.get(e).slot())
+                        assertTrue(transfers.get(d).id() < transfers.get(e).id());
+            for (ExecutionPlan.Instruction instruction : view.instructions())
+                for (TensorHandle weight : instruction.weights()) assertFalse(weight.diskBacked(), weight.name());
+        }
+    }
+
+    @Test
+    void aDiskBackedPlanNeedsAWindow() {
+        var weights = FullModelExecutionPlanTest.fullModelWeights(name -> false, name -> name.endsWith("/mlp/down"));
+        long largest = 5120L * 17408;
+        var staging = new WeightStaging(1L << 40, WeightStaging.slotBytesFor(largest), WeightStaging.SLOTS);
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> new ExecutionPlan(weights, staging));
     }
 
     @Test

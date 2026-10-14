@@ -24,6 +24,7 @@ class FullModelExecutionPlanTest {
     private static final int VOCABULARY = 248320;
     private static long nextAddress = 10_000;
     private static java.util.function.Predicate<String> hostBacked = name -> false;
+    private static java.util.function.Predicate<String> diskBacked = name -> false;
     private static java.util.function.Function<String, WeightFormat> formatOverride = name -> null;
 
     @Test
@@ -209,11 +210,19 @@ class FullModelExecutionPlanTest {
     }
 
     static Weights fullModelWeights(java.util.function.Predicate<String> host) {
+        return fullModelWeights(host, name -> false);
+    }
+
+    /// Weights whose `host` objects are host-backed and `disk` objects disk-backed, each at an unaligned offset.
+    static Weights fullModelWeights(
+            java.util.function.Predicate<String> host, java.util.function.Predicate<String> disk) {
         hostBacked = host;
+        diskBacked = disk;
         try {
             return buildFullModelWeights();
         } finally {
             hostBacked = name -> false;
+            diskBacked = name -> false;
         }
     }
 
@@ -314,6 +323,18 @@ class FullModelExecutionPlanTest {
         long[] shape = {rows, columns};
         long bytes = CompactTensorLayout.expectedByteSize(
                 shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1);
+        if (diskBacked.test(name))
+            return new TensorHandle(
+                    name,
+                    shape,
+                    TensorDataType.BF16,
+                    format,
+                    WeightLayout.ROW_SPLIT_K128_V1,
+                    0L,
+                    bytes,
+                    0L,
+                    false,
+                    (nextAddress++ << 24) + 256);
         if (hostBacked.test(name))
             return new TensorHandle(
                     name, shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1, 0L, bytes, nextAddress++);

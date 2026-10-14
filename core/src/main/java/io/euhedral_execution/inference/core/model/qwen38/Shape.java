@@ -63,6 +63,8 @@ public final class Shape implements GraphShape {
     /// The scratch route each stage takes, or null for a stage that takes none.
     private final ScratchUse[] scratchUses;
 
+    private final List<io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse> diskUses;
+
     Shape(View view, ExecutionPlan plan, ExecutionPlan.PlanData data, boolean reuseStorage, boolean prefetchesRing) {
         this.view = Objects.requireNonNull(view, "view");
         this.plan = Objects.requireNonNull(plan, "plan");
@@ -71,6 +73,7 @@ public final class Shape implements GraphShape {
         this.projectionWidths = List.copyOf(data.projectionWidths());
         this.bufferSpecs = List.copyOf(data.bufferSpecs());
         this.firstLayer = data.firstLayer();
+        this.diskUses = data.diskUses();
         this.reuseStorage = reuseStorage;
         List<List<Integer>> edges = new ArrayList<>();
         for (int index = 0; index < this.instructions.size(); index++) edges.add(new ArrayList<>());
@@ -289,9 +292,16 @@ public final class Shape implements GraphShape {
                 .orElseThrow(() -> new IllegalArgumentException("buffer is not in this plan: " + buffer));
     }
 
+    /// The reads of this view's disk transfers, in the order the device consumes each window slot's.
+    public List<io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse> diskUses() {
+        return this.diskUses;
+    }
+
     /// Whether this view copies host-backed weights into the staging ring.
     public boolean stagesWeights() {
-        return this.instructions.stream().anyMatch(i -> i.kind() == ExecutionPlan.Kind.WEIGHT_TRANSFER);
+        return this.instructions.stream()
+                .anyMatch(i ->
+                        i.kind() == ExecutionPlan.Kind.WEIGHT_TRANSFER || i.kind() == ExecutionPlan.Kind.DISK_TRANSFER);
     }
 
     /// Whether this view (a DFlash2 block) leaves the decode view's first ring slots loaded when it completes.
