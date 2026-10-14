@@ -217,20 +217,20 @@ public final class ModelTraining {
                         log(String.format(Locale.ROOT, "step %d: training KL %.6f (last 10)", step, total / 10));
                     if (step % 10 == 0) total = 0;
                     if (settings.evaluateEvery() > 0 && step % settings.evaluateEvery() == 0) {
-                        double kl = student.evaluate(training, sequences);
-                        log(String.format(Locale.ROOT, "step %d: held-out KL %.6f", step, kl));
-                        if (kl < best) {
-                            best = kl;
+                        double heldOut = student.evaluate(training, sequences);
+                        log(String.format(Locale.ROOT, "step %d: held-out KL %.6f", step, heldOut));
+                        if (heldOut < best) {
+                            best = heldOut;
                             save();
                         }
                     }
                 }
                 if (step % settings.accumulate() != 0)
                     student.apply(step % settings.accumulate(), step / settings.accumulate() + 1);
-                double kl = student.evaluate(training, sequences);
-                log(String.format(Locale.ROOT, "epoch %d: held-out KL %.6f", epoch, kl));
-                if (kl < best) {
-                    best = kl;
+                double heldOut = student.evaluate(training, sequences);
+                log(String.format(Locale.ROOT, "epoch %d: held-out KL %.6f", epoch, heldOut));
+                if (heldOut < best) {
+                    best = heldOut;
                     save();
                 }
             }
