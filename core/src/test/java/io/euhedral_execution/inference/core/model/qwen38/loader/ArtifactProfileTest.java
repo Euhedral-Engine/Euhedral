@@ -49,6 +49,22 @@ class ArtifactProfileTest {
     }
 
     @Test
+    void theUnquantizedModelIsRecognizedAndKeepsABf16Cache() {
+        var bf16 = ArtifactProfile.of(artifact(WeightFormat.BF16, WeightLayout.CONTIGUOUS_LE_V1, true));
+        assertEquals(new ArtifactProfile(Quantization.BF16, false, true), bf16);
+        assertEquals("bf16", bf16.artifactName());
+        assertEquals(io.euhedral_execution.inference.core.state.KvFormat.BF16, bf16.kvFormat());
+        assertEquals(DraftLength.fixed(4), bf16.draftLength());
+        assertEquals(
+                io.euhedral_execution.inference.core.state.KvFormat.NVFP4,
+                ArtifactProfile.of(artifact(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1, true))
+                        .kvFormat());
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> ArtifactProfile.of(artifact(WeightFormat.BF16, WeightLayout.ROW_SPLIT_K128_V1, true)));
+    }
+
+    @Test
     void speculativeDepthFollowsTheQuantization() {
         assertEquals(2, new ArtifactProfile(Quantization.Q3, false, true).speculativeDepth());
         assertEquals(2, new ArtifactProfile(Quantization.Q3, true, true).speculativeDepth());
@@ -87,7 +103,7 @@ class ArtifactProfileTest {
     void unsupportedArtifactsAreRejected() {
         assertThrows(
                 IllegalArgumentException.class,
-                () -> ArtifactProfile.of(artifact(WeightFormat.BF16, WeightLayout.CONTIGUOUS_LE_V1, false)));
+                () -> ArtifactProfile.of(artifact(WeightFormat.FP16, WeightLayout.CONTIGUOUS_LE_V1, false)));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> ArtifactProfile.of(artifact(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_P2E2_V1, false)));

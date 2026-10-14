@@ -272,7 +272,18 @@ final class CompactWeightLoader {
     /// ordinary attention layer (docs/MTP_CONTRACT.md §1).
     private static void splitMtpAttention(Map<String, TensorHandle> handles, GpuMemory gpu) {
         TensorHandle packed = handles.get(MTP_ATTENTION);
-        if (packed == null || packed.hostBacked()) return;
+        if (packed == null || packed.hostBacked() || packed.diskBacked()) return;
+        if (packed.format() == WeightFormat.BF16) {
+            long half = packed.shape()[0] / 2;
+            handles.put(
+                    "mtp/layer/attention/query_key", bf16Rows(packed, 0, half, "mtp/layer/attention/query_key", gpu));
+            handles.put(
+                    "mtp/layer/attention/gate_value",
+                    bf16Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
+            handles.remove(MTP_ATTENTION);
+            gpu.free(packed.deviceAddress());
+            return;
+        }
         if (packed.format() != WeightFormat.NVFP4) return;
         long rows = packed.shape()[0], k = packed.shape()[1];
         long half = rows / 2;
@@ -281,6 +292,26 @@ final class CompactWeightLoader {
                 "mtp/layer/attention/gate_value", nvfp4Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
         handles.remove(MTP_ATTENTION);
         gpu.free(packed.deviceAddress());
+    }
+
+    /// Rows `first .. first + rows` of a BF16 matrix, copied into an allocation of their own.
+    private static TensorHandle bf16Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
+        long k = source.shape()[1], bytes = rows * k * Short.BYTES;
+        long address = gpu.allocate(bytes);
+        try {
+            gpu.copyDeviceToDevice(address, source.deviceAddress() + first * k * Short.BYTES, bytes);
+        } catch (RuntimeException | Error failure) {
+            gpu.free(address);
+            throw failure;
+        }
+        return new TensorHandle(
+                name,
+                new long[] {rows, k},
+                source.dataType(),
+                WeightFormat.BF16,
+                WeightLayout.CONTIGUOUS_LE_V1,
+                address,
+                bytes);
     }
 
     private static TensorHandle nvfp4Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
@@ -445,18 +476,34 @@ final class CompactWeightLoader {
             throw new WeightLoadException("direct runtime object has unsupported layout: " + name);
         }
         Expected expected = expectedDescriptor(name);
-        if (expected != null
-                && (!java.util.Arrays.equals(expected.shape(), descriptor.shape())
-                        || expected.dataType() != descriptor.dataType()
-                        || !(expected.format() == descriptor.format()
-                                || (descriptor.format() == WeightFormat.NVFP4
-                                        && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)
-                                || (grouped(expected.format()) && grouped(descriptor.format())))
-                        || !(expected.layout() == descriptor.layout()
-                                || ((p2e2 || sd4) && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)))) {
+        if (expected != null && !accepts(expected, descriptor)) {
             throw new WeightLoadException(
                     "compact runtime metadata conflicts with the registered layout for '" + name + "'");
         }
+    }
+
+    /// Whether `descriptor` may stand for the registered `expected` object: the same shape and data type, and the
+    /// expected format and layout, any grouped width where a grouped one is expected, NVFP4 (plain, or SD4) where
+    /// a row-split object is, P2E2 for row-split Q3, or BF16 values (contiguous) for any quantized object.
+    static boolean accepts(Expected expected, TensorDescriptor descriptor) {
+        boolean p2e2 = descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
+                && descriptor.format() == WeightFormat.Q3_G64_FP16;
+        boolean sd4 =
+                descriptor.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1 && descriptor.format() == WeightFormat.NVFP4;
+        boolean bf16 = descriptor.format() == WeightFormat.BF16
+                && descriptor.layout() == WeightLayout.CONTIGUOUS_LE_V1
+                && (grouped(expected.format()) || expected.format() == WeightFormat.NVFP4);
+        if (bf16)
+            return java.util.Arrays.equals(expected.shape(), descriptor.shape())
+                    && expected.dataType() == descriptor.dataType();
+        return !(!java.util.Arrays.equals(expected.shape(), descriptor.shape())
+                || expected.dataType() != descriptor.dataType()
+                || !(expected.format() == descriptor.format()
+                        || (descriptor.format() == WeightFormat.NVFP4
+                                && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)
+                        || (grouped(expected.format()) && grouped(descriptor.format())))
+                || !(expected.layout() == descriptor.layout()
+                        || ((p2e2 || sd4) && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)));
     }
 
     static Expected expectedDescriptor(String name) {

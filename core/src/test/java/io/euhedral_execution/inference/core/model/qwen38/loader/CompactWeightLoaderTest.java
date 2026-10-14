@@ -432,4 +432,35 @@ class CompactWeightLoaderTest {
         @Override
         public void free(long address) {}
     }
+
+    @Test
+    void bf16ValuesStandForAnyQuantizedObjectOfTheSameShape() {
+        var gateUp = CompactWeightLoader.expectedDescriptor("text/layers/0/mlp/gate_up");
+        var head = CompactWeightLoader.expectedDescriptor("text/output_head");
+        org.junit.jupiter.api.Assertions.assertTrue(CompactWeightLoader.accepts(gateUp, bf16(gateUp.shape())));
+        org.junit.jupiter.api.Assertions.assertTrue(CompactWeightLoader.accepts(head, bf16(head.shape())));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                CompactWeightLoader.accepts(gateUp, bf16(new long[] {gateUp.shape()[0], 4096})));
+        org.junit.jupiter.api.Assertions.assertFalse(CompactWeightLoader.accepts(
+                gateUp,
+                new io.euhedral_execution.inference.core.artifact.TensorDescriptor(
+                        "text/layers/0/mlp/gate_up",
+                        gateUp.shape(),
+                        io.euhedral_execution.inference.core.artifact.TensorDataType.BF16,
+                        io.euhedral_execution.inference.core.artifact.WeightFormat.BF16,
+                        io.euhedral_execution.inference.core.artifact.WeightLayout.ROW_SPLIT_K128_V1,
+                        0,
+                        2)));
+    }
+
+    private static io.euhedral_execution.inference.core.artifact.TensorDescriptor bf16(long[] shape) {
+        return new io.euhedral_execution.inference.core.artifact.TensorDescriptor(
+                "object",
+                shape,
+                io.euhedral_execution.inference.core.artifact.TensorDataType.BF16,
+                io.euhedral_execution.inference.core.artifact.WeightFormat.BF16,
+                io.euhedral_execution.inference.core.artifact.WeightLayout.CONTIGUOUS_LE_V1,
+                0,
+                2 * shape[0] * shape[1]);
+    }
 }
