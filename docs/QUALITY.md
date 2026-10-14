@@ -108,7 +108,11 @@ artifacts round their columns in order and leave the MTP layer to the converter.
 measured on all four recipes (KL T1 / T2 / T3 / T4): `q3` 0.086 / 0.080 / 0.183 / 0.263, adopted; `q3-compressed`
 0.105 / 0.096 / 0.220 / 0.307, `nvfp4-compressed` 0.028 / 0.029 / 0.058 / 0.151 and `nvfp4` 0.029 / 0.032 / 0.061 /
 0.158, not adopted (no clear gain over the table above, T4 worse). A calibration set of 384 sequences (737 answers)
-gave `nvfp4-compressed` KL 0.035 on T2 and was rejected.
+gave `nvfp4-compressed` KL 0.035 on T2 and was rejected. A wider NVFP4 block-scale search (`calibrate --nvfp4-above N --nvfp4-scale-max M`: up to N E4M3 codes above
+the nearest scale, global scale `amax / (6 M)`) was measured with act-order and the MTP layer: `nvfp4-compressed` at
+5 / 256 gave KL 0.028 / 0.030 / 0.058 / 0.156 and at 6 / 448 0.028 / 0.031 / 0.058 / 0.153 (the SD4 table already takes
+the wider reach); `nvfp4` at 5 / 256 gave 0.026 / 0.031 / 0.057 / 0.157. Neither beats the shipped artifacts on T4, so
+the search stays at 2 codes above the nearest scale with E4M3's 448.
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
