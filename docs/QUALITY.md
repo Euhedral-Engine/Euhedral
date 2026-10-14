@@ -116,7 +116,11 @@ the search stays at 2 codes above the nearest scale with E4M3's 448. Block-wise 
 its group scales and norms, codes fixed, so that it maps the quantized model's hidden states onto the BF16 layer's
 outputs; 200 calibration sequences, 2 epochs) cut each block's held-out output error by about 36% on its own (layers 10
 and 11) and gave KL 0.088 / 0.080 / 0.202 / 0.225 on T1-T4: the model's own generations improve, code gets worse, so
-`q3` keeps its GPTQ scales.
+`q3` keeps its GPTQ scales. End-to-end distillation from there (`quantization train-model`: the same scales and norms
+trained through all 64 layers at once against the BF16 model's top-64 log-probabilities plus one bucket for the rest of
+the vocabulary; 200 sequences, Adam over 8 sequences per update, 1 epoch) lowered the held-out calibration KL from 0.173
+to 0.165 and gave KL 0.087 / 0.081 / 0.194 / 0.310 on T1-T4: the model's own generations get much worse, so it is not
+adopted either.
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
