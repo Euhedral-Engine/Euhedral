@@ -141,12 +141,21 @@ class ArgumentHandlingTest(unittest.TestCase):
         options = set(re.findall(r"^\s+(--[a-z0-9-]+)", out, re.M)) | set(re.findall(r"(?<=\[)--[a-z0-9-]+", out))
         self.assertEqual(options, {"--model", "--out", "--quantization", "--compressed", "--draft-ids-from",
                                    "--ranking", "--device", "--jobs", "--force", "--dflash2",
-                                   "--dflash2-projections", "--extend", "--imatrix", "--codes-from"})
+                                   "--dflash2-projections", "--extend", "--imatrix", "--codes-from",
+                                   "--output-head"})
         for word in ("p2e2", "sd4", "nvmtp", "profile", "mtp-format", "reference"):
             self.assertNotIn(word, out.lower())
 
 
 class RecipeTest(unittest.TestCase):
+    def test_output_head_overrides_only_the_lm_head(self):
+        recipe = recipes.Recipe("q3", output_head="Q5G64_F16S")
+        self.assertEqual(recipes.storage(recipe, "text/output_head", "NVFP4"), ("Q5G64_F16S", recipes.LAYOUT_ROW_SPLIT))
+        self.assertEqual(recipes.storage(recipe, "text/draft_head", "Q3G64_F16S"), ("Q3G64_F16S", recipes.LAYOUT_ROW_SPLIT))
+        nvfp4 = recipes.Recipe("nvfp4", True, "Q5G64_F16S")
+        self.assertEqual(recipes.storage(nvfp4, "text/output_head", "NVFP4"), ("Q5G64_F16S", recipes.LAYOUT_ROW_SPLIT))
+        with self.assertRaises(ValueError):
+            recipes.Recipe("q3", output_head="Q8")
     def test_bf16_recipe_stores_every_object_in_bf16(self):
         recipe = recipes.Recipe("bf16")
         for name, q3 in (("text/layers/0/mlp/gate_up", "Q3G64_F16S"), ("text/output_head", "NVFP4"),

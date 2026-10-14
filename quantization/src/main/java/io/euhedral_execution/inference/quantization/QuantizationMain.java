@@ -10,7 +10,8 @@ import java.util.Map;
 /// Command line of the quantization tools:
 ///
 /// ```
-/// calibrate --model CHECKPOINT --quantization nvfp4|q3 [--compressed] --tokens TOKENS.npy --draft-ids-from ARTIFACT
+/// calibrate --model CHECKPOINT --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens TOKENS.npy
+/// --draft-ids-from ARTIFACT
 /// --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
 /// [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
 /// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
@@ -35,9 +36,10 @@ public final class QuantizationMain {
         if (args.length == 0
                 || !List.of("calibrate", "score", "generate", "train-blocks", "train-model")
                         .contains(args[0])) {
-            System.err.println("usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] --tokens T.npy "
-                    + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
-                    + "[--layers N] [--skip-mtp] [--library PATH]");
+            System.err.println(
+                    "usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens T.npy "
+                            + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
+                            + "[--layers N] [--skip-mtp] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
                     + "[--rows 8] [--host-mib N] [--batch 4] [--workers 6] [--library PATH]");
             System.err.println(
@@ -142,7 +144,10 @@ public final class QuantizationMain {
         }
         var settings = new Calibrate.Settings(
                 Path.of(required(options, "model")),
-                new Recipe(required(options, "quantization"), options.containsKey("compressed")),
+                new Recipe(
+                        required(options, "quantization"),
+                        options.containsKey("compressed"),
+                        options.get("output-head")),
                 Path.of(required(options, "tokens")),
                 Path.of(required(options, "draft-ids-from")),
                 Path.of(required(options, "out")),

@@ -27,14 +27,21 @@ BF16_FORMAT = "BF16"
 LAYOUT_CONTIGUOUS = "contiguous-le-v1"
 
 
+HEAD_FORMATS = ("NVFP4", "Q3G64_F16S", "Q4G64_F16S", "Q5G64_F16S")
+
+
 @dataclass(frozen=True)
 class Recipe:
     quantization: str
     compressed: bool = False
+    output_head: str | None = None
+    """The LM head's format (row-split) in place of the recipe's."""
 
     def __post_init__(self) -> None:
         if self.quantization not in QUANTIZATIONS:
             fail(f"unknown quantization {self.quantization!r}; expected one of {', '.join(QUANTIZATIONS)}")
+        if self.output_head is not None and self.output_head not in HEAD_FORMATS:
+            fail(f"unknown LM head format {self.output_head!r}; expected one of {', '.join(HEAD_FORMATS)}")
         if self.quantization == "bf16" and self.compressed:
             fail("the bf16 recipe has no compressed form")
 
@@ -60,6 +67,8 @@ def is_drafting(name: str) -> bool:
 
 def storage(recipe: Recipe, name: str, q3_format: str) -> tuple[str, str]:
     """(format, layout) of the quantized object `name`. `q3_format` is its format in the q3 artifact."""
+    if name == "text/output_head" and recipe.output_head is not None:
+        return recipe.output_head, LAYOUT_ROW_SPLIT
     if recipe.quantization == "bf16":
         return BF16_FORMAT, LAYOUT_CONTIGUOUS
     if recipe.quantization == "q3" or name == TOKEN_EMBEDDING:
