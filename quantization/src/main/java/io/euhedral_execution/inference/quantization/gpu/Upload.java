@@ -23,6 +23,12 @@ public final class Upload {
         }
     }
 
+    public static void shorts(CudaGpuMemory gpu, long device, short[] values) {
+        try (Arena arena = Arena.ofConfined()) {
+            gpu.copyHostToDevice(device, arena.allocateFrom(ValueLayout.JAVA_SHORT, values), 2L * values.length);
+        }
+    }
+
     public static void longs(CudaGpuMemory gpu, long device, long[] values) {
         try (Arena arena = Arena.ofConfined()) {
             gpu.copyHostToDevice(device, arena.allocateFrom(ValueLayout.JAVA_LONG, values), 8L * values.length);

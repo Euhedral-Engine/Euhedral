@@ -19,6 +19,40 @@ public final class TrellisKernels {
     /// Position in a tensor-core ordered tile to its row-major element (`row * 16 + column`) of the 16x16 tile.
     public static final int[] TENSOR_CORE_ORDER = tensorCoreOrder();
 
+    /// Kernels of the per-linear quantizer (Hessian preparation, block LDL, regularization, scale search, LDLQ strips,
+    /// refit), launched by [TrellisQuantizer].
+    private static final List<String> QUANTIZER_KERNELS = List.of(
+            "fill_floats",
+            "copy_floats",
+            "float_to_half",
+            "axpy_floats",
+            "subtract_floats",
+            "sum_products",
+            "strided_mean",
+            "add_diagonal",
+            "diagonal_io",
+            "triangle",
+            "scale_floats",
+            "bf16_to_float_transposed",
+            "invert_diagonal_blocks",
+            "right_multiply_blocks",
+            "column_rms",
+            "row_rms",
+            "output_scales",
+            "input_scales",
+            "tile_mean_square",
+            "gather_tiles",
+            "candidate_tiles",
+            "candidate_mse",
+            "strip_gather_sum",
+            "strip_error",
+            "column_dots",
+            "row_dots",
+            "column_ratio",
+            "hessian_product",
+            "clean_row_scales",
+            "scale_scalar");
+
     private final Cuda cuda;
     private final long stream;
     private final Map<String, Cuda.Function> functions = new HashMap<>();
@@ -39,12 +73,18 @@ public final class TrellisKernels {
                 "scale_rows_fp16",
                 "scale_columns_fp16",
                 "transpose_to_bf16"));
+        names.addAll(QUANTIZER_KERNELS);
         for (Cuda.Function f : cuda.compileResource("trellis.cu", names)) functions.put(f.name(), f);
         for (int k : INTEGER) {
             Cuda.Function f = functions.get("viterbi_k" + k);
             int shared = viterbiShared(k);
             if (shared > 48 * 1024) cuda.allowSharedMemory(f, shared);
         }
+    }
+
+    /// A quantizer kernel by name.
+    Cuda.Function kernel(String name) {
+        return functions.get(name);
     }
 
     /// Words (int16) per packed 256-weight tile.
