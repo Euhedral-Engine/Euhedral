@@ -142,7 +142,8 @@ device ring of `WeightStaging.SLOTS` = 4 slots on every use.
   the per-sequence GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. The
   planner compares that need with the device's free memory at startup and grows the host-backed bytes in 64 MiB steps until it
   fits; if even the largest selection does not fit, startup fails and asks for a smaller maximum context. Nothing is host-backed
-  when everything fits. There are no user options for host weight size, staging slots or residency.
+  when everything fits. The host budget bounds the host-backed bytes (see Disk-backed weights); there are no options for
+  staging slots or residency.
 - **Selection:** the token embedding first (it is a gather read in place over the bus, a few KiB per token). Then whole families
   smallest tensor first (GDN query_key, GDN output, attention output, ...); within the last family the layers are spread evenly, so
   the ring holds the smallest possible slot. The LM head is never host-backed, and the MTP layer and draft head never are
@@ -181,6 +182,36 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
   that pushes more weights to the host, and the copies are bound by bandwidth, not by how far they run ahead.
 - **The staging DAG without its copies** costs 2% (47.2 against 48.1 tok/s).
 
+## Disk-backed weights
+
+Weights the device cannot hold go to pinned host memory only up to the host budget (`EUHEDRAL_HOST_MEMORY_MIB`, or what the
+machine can spare: `HostBudget`); the rest of the selection stays in the artifact file and is read on every use. This works for
+every staged format: Q3/Q4/Q5 grouped, NVFP4 and NVFP4-SD4 projections (P2E2 is never staged).
+
+- **Planner:** `ResidencyPlanner.plan(..., hostBytes, kvFormat)` takes the same selection as above, then walks it in order: the
+  embedding stays in host memory (a gather; a host budget below it fails startup), and each projection goes to host memory
+  while the arena and the disk window still fit the budget; from the first that does not, every later one is disk-backed. A
+  budget too small for the window fails startup with the bytes it needs.
+- **Window:** `DiskWindow`, 8 pinned, host-mapped slots (two per staging slot) of the largest disk-backed tensor plus one 4 KiB
+  block, each with a 32-bit ready flag. Reads cover the aligned blocks around a payload (`O_DIRECT` where the file system has
+  it), and the payload starts `lead` bytes into its slot.
+- **Reader:** `DiskReader`, a lattice source. Each admitted quantum registers its disk uses (`DiskUse`) in admission order; every
+  window slot keeps its own queue, and a poll gives a free slot (flag 0) its next use, read through `AsyncReads` (io_uring); the
+  read's completion frame raises the flag. Without io_uring the poll reads positionally.
+- **Execution:** a disk-backed use's transfer is a `DISK_TRANSFER` stage on the transfer lane: `cuStreamWaitValue32` until the
+  slot's flag is 1, the copy into the staging slot, and `cuStreamWriteValue32` of 0. The three capture into CUDA graphs. Window
+  slot `s + 4 (k mod 2)` serves the `k`-th disk use of staging slot `s`, so each window slot is consumed in the order the ring
+  already imposes on its staging slot, within a graph and across graphs.
+- **Failure:** a quantum whose device work leaves some disk transfers out (a failed or cancelled quantum) queues, at its
+  retirement boundary and before the marker later graphs await, a wait and a flag write for each of them in stage order, and
+  tells the reader to raise its remaining uses unread. Every later use of a slot finds its own bytes. A failed read fails its
+  quantum and still raises the flag.
+- **Shutdown:** the execution closes the reader once every quantum retired; it waits for reads in flight before the model frees
+  the window.
+
+The disk tier changes no numerics: a disk-backed run computes the same bytes as the same weights staged from host memory
+(`DiskTierCudaIntegrationTest`).
+
 ## Where it lives
 
 - `tools/convert_checkpoint.py --quantization nvfp4`: the NVFP4 artifacts, quantized on the GPU by default (`tools/README.md`).
@@ -190,3 +221,5 @@ at the copy rate: 2.15 GB in 52 ms is 41 GB/s, against 43.7 GB/s for bare copies
   `euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16`, plan and frame dispatch for NVFP4 weights.
 - Residency: `ArtifactProfile`, `ResidencyPlanner`, `HostWeightSelection`, `WeightStaging`, `WeightTransferFrame`, the transfer
   lane in `LanePool`, and `euhedral_cuda_host_weights_malloc`.
+- Disk tier: `model/qwen38/offload` (`DiskWindow`, `DiskReader`, `DiskUse`), `Stages.DiskTransfer`, `StageFrame.abandoned`,
+  and `euhedral_cuda_wait_host_flag` / `euhedral_cuda_write_host_flag`.

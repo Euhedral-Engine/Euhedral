@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
@@ -18,11 +19,17 @@ public final class Qwen38Model implements AutoCloseable {
     private final Allocations allocations;
     private final Weights weights;
     private final WeightStaging staging;
+    /// The pinned window disk-backed weights are read into, and the artifact they are read from; null without any.
+    private final DiskWindow window;
+    private final Path artifactPath;
 
-    private Qwen38Model(Allocations allocations, Weights weights, WeightStaging staging) {
+    private Qwen38Model(
+            Allocations allocations, Weights weights, WeightStaging staging, DiskWindow window, Path artifactPath) {
         this.allocations = allocations;
         this.weights = Objects.requireNonNull(weights);
         this.staging = staging;
+        this.window = window;
+        this.artifactPath = artifactPath;
     }
 
     /// Loads every object the artifact's text generation executes onto the device.
@@ -56,7 +63,18 @@ public final class Qwen38Model implements AutoCloseable {
         return load(
                 gpu,
                 memory -> WeightLoader.load(path, artifact, memory, speculation, hostBacked, diskBacked),
-                hostBacked.isEmpty() && diskBacked.isEmpty() ? 0 : WeightStaging.SLOTS);
+                hostBacked.isEmpty() && diskBacked.isEmpty() ? 0 : WeightStaging.SLOTS,
+                path);
+    }
+
+    /// The pinned window disk-backed weights are read into, or null when none is disk-backed. The model owns it.
+    public DiskWindow window() {
+        return this.window;
+    }
+
+    /// The artifact disk-backed weights are read from, or null when none is disk-backed.
+    public Path artifactPath() {
+        return this.artifactPath;
     }
 
     /// The device staging ring for host-backed weights, or null when every weight is resident.
@@ -78,10 +96,10 @@ public final class Qwen38Model implements AutoCloseable {
     }
 
     public static Qwen38Model load(GpuMemory memory, Loader loader) throws IOException {
-        return load(memory, loader, 0);
+        return load(memory, loader, 0, null);
     }
 
-    private static Qwen38Model load(GpuMemory memory, Loader loader, int stagingSlots) throws IOException {
+    private static Qwen38Model load(GpuMemory memory, Loader loader, int stagingSlots, Path path) throws IOException {
         var allocations = new Allocations(Objects.requireNonNull(memory));
         try {
             Weights weights = loader.load(allocations);
@@ -94,7 +112,12 @@ public final class Qwen38Model implements AutoCloseable {
                 staging = new WeightStaging(
                         allocations.allocate(Math.multiplyExact(slotBytes, stagingSlots)), slotBytes, stagingSlots);
             }
-            return new Qwen38Model(allocations, weights, staging);
+            // The window holds the largest disk-backed weight in each slot, with the blocks around it.
+            long largestDisk = 0;
+            for (var handle : weights.diskBacked()) largestDisk = Math.max(largestDisk, handle.byteSize());
+            DiskWindow window =
+                    largestDisk == 0 ? null : new DiskWindow(allocations, DiskWindow.slotBytesFor(largestDisk));
+            return new Qwen38Model(allocations, weights, staging, window, window == null ? null : path);
         } catch (IOException | RuntimeException | Error failure) {
             try {
                 allocations.close();

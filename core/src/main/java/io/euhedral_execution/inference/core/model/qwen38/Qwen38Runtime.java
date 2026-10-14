@@ -77,7 +77,7 @@ public final class Qwen38Runtime implements ModelRuntime {
             Artifact artifact,
             ArtifactProfile profile,
             LatticeTerminal lattice) {
-        ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging());
+        ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
         // The workspace is sized at load for the widest quantum: the prefill chunk, unless a diagnostic widens it.
         Execution execution = new Execution(
                 lattice,
@@ -85,7 +85,8 @@ public final class Qwen38Runtime implements ModelRuntime {
                 gpu,
                 EuhedralInferenceRuntime.laneCount(),
                 EuhedralInferenceRuntime.CAPTURE_GRAPHS,
-                Integer.getInteger("euhedral.workspace.rows", InferenceConfig.PREFILL_CHUNK_TOKENS));
+                Integer.getInteger("euhedral.workspace.rows", InferenceConfig.PREFILL_CHUNK_TOKENS),
+                model.artifactPath());
         var identity = identity(config.artifactPath(), artifact, model);
         KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);
         // Last, so nothing that can fail follows the pinned arena.
@@ -268,6 +269,13 @@ public final class Qwen38Runtime implements ModelRuntime {
         long bytes = 0;
         for (var handle : this.model.weights().runtimeObjects().values())
             if (handle.hostBacked()) bytes += handle.byteSize();
+        return bytes;
+    }
+
+    /// Bytes of weights read from the artifact file on use.
+    public long diskBackedWeightBytes() {
+        long bytes = 0;
+        for (var handle : this.model.weights().diskBacked()) bytes += handle.byteSize();
         return bytes;
     }
 
