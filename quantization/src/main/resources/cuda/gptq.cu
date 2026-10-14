@@ -1,4 +1,4 @@
-// GPTQ for the artifact formats (tools/gptq/gptq.py, tools/euhedral_artifacts/grouped.py and nvfp4.py).
+// GPTQ for the artifact formats (the converter's tools/euhedral_artifacts/grouped.py and nvfp4.py).
 //
 // Elementwise arithmetic rounds as the Python reference does: division, multiplication and subtraction each round to
 // nearest (no fused multiply-add), codes round half to even. The weighted error sums that rank candidate scales add
@@ -181,7 +181,7 @@ extern "C" __global__ void sd4_costs(const float* values, long long blocks, int 
     atomicAdd(counts + nearest, 1ull);
 }
 
-// One run of GPTQ columns (tools/gptq/kernels.py): block [rows, width] holds columns begin.. of the permuted weights;
+// One run of GPTQ columns: block [rows, width] holds columns begin.. of the permuted weights;
 // columns first..last-1 round with their group's decode (decodes[row * groups + group[j]]), their codes and values go
 // to codes / decoded at weight column column_of[j], their error to errors[:, j], and the error times row begin+j of the
 // upper factor (element (i, c) at upper[i * upper_row + c * upper_column]) leaves the later columns of the block.

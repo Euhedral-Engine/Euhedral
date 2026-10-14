@@ -11,8 +11,8 @@ import java.util.HexFormat;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
-/// The fused objects read from the BF16 checkpoint equal tools/gptq/qwen38.py's byte for byte (SHA-256 fixture written
-/// from Swift-1.5: layers 0 and 3 and the MTP layer).
+/// The fused objects read from the BF16 checkpoint equal those of a PyTorch reference of the calibration (tools/gptq,
+/// last at commit 9ff02525) byte for byte (SHA-256 fixture from Swift-1.5: layers 0 and 3 and the MTP layer).
 class Qwen38ObjectsTest {
 
     @Test

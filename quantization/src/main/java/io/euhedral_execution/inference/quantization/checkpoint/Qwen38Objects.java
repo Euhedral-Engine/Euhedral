@@ -9,7 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /// The quantized objects of a Qwen3.8 artifact as row ranges of the BF16 checkpoint tensors, fused exactly as the
-/// converter fuses them (tools/euhedral_artifacts/inventory.py, tools/gptq/qwen38.py):
+/// converter fuses them (tools/euhedral_artifacts/inventory.py):
 /// - full attention: q_proj interleaves per head [query 256 rows; gate 256 rows], split into `query_key` =
 ///   [query (6144); k_proj (1024)] and `gate_value` = [gate (6144); v_proj (1024)];
 /// - GDN: `query_key` = in_proj_qkv rows 0..4095, `value_z` = [in_proj_qkv rows 4096..10239; in_proj_z];

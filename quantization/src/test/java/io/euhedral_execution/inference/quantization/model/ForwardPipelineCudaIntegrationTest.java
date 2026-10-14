@@ -25,7 +25,8 @@ class ForwardPipelineCudaIntegrationTest {
     @Test
     void pipelineEqualsTheSequentialForward() throws Exception {
         String checkpoint = System.getProperty("euhedral.quantization.checkpoint", "");
-        Path fixture = Path.of(System.getProperty("euhedral.quantization.forward-fixture", "build/forward-fixture"));
+        Path fixture = Path.of(System.getProperty(
+                "euhedral.quantization.forward-fixture", "/mnt/shared/qwen38-quant/quality/fixtures/forward-fixture"));
         assumeTrue(!checkpoint.isBlank() && Files.isDirectory(fixture), "needs the checkpoint and the forward fixture");
         int sequences = 2, length = 256, hidden = 5120, rows = sequences * length;
         long bytes = 2L * rows * hidden;
