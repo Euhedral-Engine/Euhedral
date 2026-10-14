@@ -37,42 +37,16 @@ final class CompactWeightLoader {
             GpuMemory gpuMemory,
             Map<String, TensorDescriptor> descriptors,
             ArtifactProfile.Speculation speculation,
-            Set<String> hostBacked)
+            Set<String> hostBacked,
+            Set<String> diskBacked)
             throws IOException {
         Qwen38Config config = artifact.config();
         validateConfig(config);
         DFlash2Config dflash2 = DFlash2Inventory.read(artifactPath, descriptors);
         validateInventory(config, descriptors, dflash2);
-        // The DFlash2 selector's codebooks are always read in place from mapped host memory.
-        Set<String> mapped = new java.util.HashSet<>();
-        if (speculation == ArtifactProfile.Speculation.DFLASH2) mapped.addAll(DFlash2Inventory.MAPPED);
-        Set<String> host = new java.util.HashSet<>(hostBacked);
-        host.addAll(mapped);
-
-        Map<String, TensorHandle> handles = new LinkedHashMap<>();
-        long hostArena = 0;
+        Map<String, TensorHandle> handles =
+                loadObjects(artifactPath, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked);
         try {
-            // Host-backed objects share one pinned arena, allocated before any payload is read: huge
-            // pages are far likelier to be available then than between reads.
-            long hostBytes = 0;
-            for (TensorDescriptor descriptor : descriptors.values()) {
-                if (uploads(descriptor.name(), speculation) && host.contains(descriptor.name()))
-                    hostBytes += hostSlot(descriptor.byteSize());
-            }
-            if (hostBytes > 0) hostArena = gpuMemory.allocateHostWeights(hostBytes);
-            long hostOffset = 0;
-            for (TensorDescriptor descriptor : descriptors.values()) {
-                if (!uploads(descriptor.name(), speculation)) continue;
-                if (host.contains(descriptor.name())) {
-                    TensorHandle loaded = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
-                    // The embedding and the codebooks are gathers: kernels read their rows in place instead of
-                    // staging them.
-                    if (descriptor.name().equals(HostWeightSelection.EMBEDDING) || mapped.contains(descriptor.name()))
-                        loaded = mapped(loaded, gpuMemory.hostWeightsDeviceAddress(loaded.hostAddress()));
-                    handles.put(descriptor.name(), loaded);
-                    hostOffset += hostSlot(descriptor.byteSize());
-                } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
-            }
             // Only an MTP load prepares the MTP layer for execution.
             if (speculation == ArtifactProfile.Speculation.MTP) splitMtpAttention(handles, gpuMemory);
             Weights weights = assemble(config, handles);
@@ -88,6 +62,63 @@ final class CompactWeightLoader {
                     DFlash2Inventory.assemble(dflash2, handles));
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);
+            freeArena(handles.values(), gpuMemory, failure);
+            return propagate(failure);
+        }
+    }
+
+    /// Places each object `speculation` loads: those named in `hostBacked` in one pinned host arena, those named in
+    /// `diskBacked` nowhere (their handles name their offset in the file, which execution reads them from), every
+    /// other one on the device. A disk-backed object must be one a transfer stages
+    /// ([HostWeightSelection#stageable]).
+    static Map<String, TensorHandle> loadObjects(
+            Path artifactPath,
+            java.util.Collection<TensorDescriptor> descriptors,
+            GpuMemory gpuMemory,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked)
+            throws IOException {
+        // The DFlash2 selector's codebooks are always read in place from mapped host memory.
+        Set<String> mapped = new java.util.HashSet<>();
+        if (speculation == ArtifactProfile.Speculation.DFLASH2) mapped.addAll(DFlash2Inventory.MAPPED);
+        Set<String> host = new java.util.HashSet<>(hostBacked);
+        host.addAll(mapped);
+        for (TensorDescriptor descriptor : descriptors) {
+            if (!diskBacked.contains(descriptor.name())) continue;
+            if (host.contains(descriptor.name()) || !HostWeightSelection.stageable(descriptor))
+                throw new IllegalArgumentException(descriptor.name() + " cannot be read from disk");
+        }
+
+        Map<String, TensorHandle> handles = new LinkedHashMap<>();
+        long hostArena = 0;
+        try {
+            // Host-backed objects share one pinned arena, allocated before any payload is read: huge
+            // pages are far likelier to be available then than between reads.
+            long hostBytes = 0;
+            for (TensorDescriptor descriptor : descriptors) {
+                if (uploads(descriptor.name(), speculation) && host.contains(descriptor.name()))
+                    hostBytes += hostSlot(descriptor.byteSize());
+            }
+            if (hostBytes > 0) hostArena = gpuMemory.allocateHostWeights(hostBytes);
+            long hostOffset = 0;
+            for (TensorDescriptor descriptor : descriptors) {
+                if (!uploads(descriptor.name(), speculation)) continue;
+                if (diskBacked.contains(descriptor.name())) {
+                    handles.put(descriptor.name(), TensorHandle.disk(descriptor));
+                } else if (host.contains(descriptor.name())) {
+                    TensorHandle loaded = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
+                    // The embedding and the codebooks are gathers: kernels read their rows in place instead of
+                    // staging them.
+                    if (descriptor.name().equals(HostWeightSelection.EMBEDDING) || mapped.contains(descriptor.name()))
+                        loaded = mapped(loaded, gpuMemory.hostWeightsDeviceAddress(loaded.hostAddress()));
+                    handles.put(descriptor.name(), loaded);
+                    hostOffset += hostSlot(descriptor.byteSize());
+                } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
+            }
+            return handles;
+        } catch (Throwable failure) {
+            freeAll(handles.values(), gpuMemory, failure);
             if (hostArena != 0) {
                 try {
                     gpuMemory.freeHostWeights(hostArena);
@@ -95,8 +126,29 @@ final class CompactWeightLoader {
                     failure.addSuppressed(cleanupFailure);
                 }
             }
-            return propagate(failure);
+            throw propagateObjects(failure);
         }
+    }
+
+    /// Frees the host arena of `handles`: the lowest host address among them, where the arena starts.
+    private static void freeArena(java.util.Collection<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
+        long arena = 0;
+        for (TensorHandle handle : handles)
+            if (handle.hostAddress() != 0 && (arena == 0 || Long.compareUnsigned(handle.hostAddress(), arena) < 0))
+                arena = handle.hostAddress();
+        if (arena == 0) return;
+        try {
+            gpuMemory.freeHostWeights(arena);
+        } catch (Throwable cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+        }
+    }
+
+    private static IOException propagateObjects(Throwable failure) throws IOException {
+        if (failure instanceof IOException exception) throw exception;
+        if (failure instanceof RuntimeException exception) throw exception;
+        if (failure instanceof Error error) throw error;
+        throw new AssertionError(failure);
     }
 
     /// Whether a load places the named object on the device (or in host memory for it): the MTP layer and draft
@@ -549,7 +601,8 @@ final class CompactWeightLoader {
 
     private static void freeAll(Iterable<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
         for (TensorHandle handle : handles) {
-            if (handle.hostAddress() != 0) continue; // in the host arena
+            // In the host arena, or in the file.
+            if (handle.hostAddress() != 0 || handle.diskBacked()) continue;
             try {
                 gpuMemory.free(handle.deviceAddress());
             } catch (Throwable cleanupFailure) {

@@ -40,10 +40,23 @@ public final class Qwen38Model implements AutoCloseable {
             ArtifactProfile.Speculation speculation,
             Set<String> hostBacked)
             throws IOException {
+        return load(path, artifact, gpu, speculation, hostBacked, Set.of());
+    }
+
+    /// As above, leaving the objects named in `diskBacked` in the artifact file; the staging ring holds the largest
+    /// host-backed or disk-backed object.
+    public static Qwen38Model load(
+            Path path,
+            Artifact artifact,
+            GpuMemory gpu,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked)
+            throws IOException {
         return load(
                 gpu,
-                memory -> WeightLoader.load(path, artifact, memory, speculation, hostBacked),
-                hostBacked.isEmpty() ? 0 : WeightStaging.SLOTS);
+                memory -> WeightLoader.load(path, artifact, memory, speculation, hostBacked, diskBacked),
+                hostBacked.isEmpty() && diskBacked.isEmpty() ? 0 : WeightStaging.SLOTS);
     }
 
     /// The device staging ring for host-backed weights, or null when every weight is resident.
@@ -74,7 +87,7 @@ public final class Qwen38Model implements AutoCloseable {
             Weights weights = loader.load(allocations);
             long largest = 0;
             for (var handle : weights.runtimeObjects().values())
-                if (handle.hostBacked()) largest = Math.max(largest, handle.byteSize());
+                if (handle.hostBacked() || handle.diskBacked()) largest = Math.max(largest, handle.byteSize());
             WeightStaging staging = null;
             if (largest > 0) {
                 long slotBytes = WeightStaging.slotBytesFor(largest);

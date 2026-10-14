@@ -32,6 +32,18 @@ public final class WeightLoader {
             ArtifactProfile.Speculation speculation,
             Set<String> hostBacked)
             throws IOException {
+        return load(artifactPath, artifact, gpuMemory, speculation, hostBacked, Set.of());
+    }
+
+    /// As above, leaving the objects named in `diskBacked` in the artifact file: execution reads them from there.
+    public static Weights load(
+            Path artifactPath,
+            Artifact artifact,
+            GpuMemory gpuMemory,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked)
+            throws IOException {
         Objects.requireNonNull(artifactPath, "artifactPath");
         Objects.requireNonNull(artifact, "artifact");
         Objects.requireNonNull(gpuMemory, "gpuMemory");
@@ -43,7 +55,8 @@ public final class WeightLoader {
                 gpuMemory,
                 indexDescriptors(requireDescriptors(artifact)),
                 speculation,
-                hostBacked);
+                hostBacked,
+                diskBacked);
     }
 
     /// Loads the actual embedding and model-declared GDN layer zero without uploading later layers.

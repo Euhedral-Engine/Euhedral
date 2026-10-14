@@ -1,8 +1,10 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
@@ -10,13 +12,18 @@ import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightLoadException;
+import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class CompactWeightLoaderTest {
 
@@ -326,5 +333,103 @@ class CompactWeightLoaderTest {
                 false,
                 true,
                 1);
+    }
+
+    @TempDir
+    Path directory;
+
+    /// Three BF16 objects in a file: the embedding (host memory), layer 0's down projection (disk) and the final
+    /// norm (device).
+    private Map<String, TensorDescriptor> smallFile(Path file) throws Exception {
+        String[] names = {"text/token_embedding", "text/layers/0/mlp/down", "text/final_norm"};
+        Map<String, TensorDescriptor> descriptors = new LinkedHashMap<>();
+        byte[] contents = new byte[3 * 8192];
+        for (int index = 0; index < contents.length; index++) contents[index] = (byte) (index * 7);
+        for (int index = 0; index < names.length; index++)
+            descriptors.put(
+                    names[index],
+                    new TensorDescriptor(
+                            names[index],
+                            new long[] {64, 32},
+                            TensorDataType.BF16,
+                            WeightFormat.BF16,
+                            WeightLayout.CONTIGUOUS_LE_V1,
+                            256 + 8192L * index,
+                            4096));
+        Files.write(file, contents);
+        return descriptors;
+    }
+
+    @Test
+    void diskBackedObjectsStayInTheFile() throws Exception {
+        Path file = directory.resolve("small.edrl");
+        Map<String, TensorDescriptor> descriptors = smallFile(file);
+        var gpu = new CountingGpuMemory();
+        Map<String, TensorHandle> handles = CompactWeightLoader.loadObjects(
+                file,
+                descriptors.values(),
+                gpu,
+                ArtifactProfile.Speculation.NONE,
+                Set.of("text/token_embedding"),
+                Set.of("text/layers/0/mlp/down"));
+        TensorHandle down = handles.get("text/layers/0/mlp/down");
+        assertTrue(down.diskBacked());
+        assertFalse(down.hostBacked());
+        assertEquals(descriptors.get("text/layers/0/mlp/down").dataOffset(), down.fileOffset());
+        assertEquals(0L, down.deviceAddress());
+        assertEquals(4096, down.byteSize());
+        assertFalse(handles.get("text/final_norm").diskBacked());
+        assertFalse(handles.get("text/token_embedding").diskBacked());
+        // The final norm on the device, the embedding in a one-object arena; nothing for the disk-backed object.
+        assertEquals(4096, gpu.deviceBytes);
+        assertEquals(4096, gpu.hostBytes);
+    }
+
+    @Test
+    void anObjectThatCannotBeStagedIsNeverDiskBacked() throws Exception {
+        Path file = directory.resolve("small.edrl");
+        Map<String, TensorDescriptor> descriptors = smallFile(file);
+        var failure = assertThrows(
+                IllegalArgumentException.class,
+                () -> CompactWeightLoader.loadObjects(
+                        file,
+                        descriptors.values(),
+                        new CountingGpuMemory(),
+                        ArtifactProfile.Speculation.NONE,
+                        Set.of(),
+                        Set.of("text/final_norm")));
+        assertTrue(failure.getMessage().contains("text/final_norm cannot be read from disk"));
+    }
+
+    private static final class CountingGpuMemory implements io.euhedral_execution.inference.core.gpu.GpuMemory {
+        long deviceBytes;
+        long hostBytes;
+        private long next = 0x10000;
+
+        @Override
+        public long allocate(long byteSize) {
+            this.deviceBytes += byteSize;
+            return this.next += byteSize + 256;
+        }
+
+        @Override
+        public long allocateHostWeights(long byteSize) {
+            this.hostBytes += byteSize;
+            return java.lang.foreign.Arena.global().allocate(byteSize, 4096).address();
+        }
+
+        @Override
+        public long hostWeightsDeviceAddress(long hostAddress) {
+            return hostAddress;
+        }
+
+        @Override
+        public void copyHostToDevice(long destination, java.lang.foreign.MemorySegment source, long byteSize) {}
+
+        @Override
+        public void copyDeviceToHost(java.lang.foreign.MemorySegment destination, long source, long byteSize) {}
+
+        @Override
+        public void free(long address) {}
     }
 }
