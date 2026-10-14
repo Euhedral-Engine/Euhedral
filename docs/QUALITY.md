@@ -122,7 +122,11 @@ the vocabulary; 200 sequences, Adam over 8 sequences per update, 1 epoch) lowere
 to 0.165 and gave KL 0.087 / 0.081 / 0.194 / 0.310 on T1-T4: the model's own generations get much worse, so it is not
 adopted either. The LM head stays NVFP4: rounded by GPTQ in Q5G64 instead (`calibrate --output-head Q5G64_F16S`,
 the converter's `--output-head`; 0.12 GiB more), it gave KL 0.084 / 0.079 / 0.183 / 0.264 for `q3` and 0.027 / 0.031 /
-0.061 / 0.159 for `nvfp4` on T1-T4.
+0.061 / 0.159 for `nvfp4` on T1-T4. The pre-calibration recipes, converted from Swift-1.5 with the converter of
+October 10, give KL 0.193 / 0.199 / 0.254 / 0.466 (`q3`) and 0.037 / 0.047 / 0.073 / 0.228 (`nvfp4-compressed`). On
+the 118 T4 prompts, Swift-1.5 thinks 248.6 tokens on average before answering; greedy, `q3` thinks 269.9 (the
+pre-calibration `q3` 366.6) and `nvfp4-compressed` 261.5 (282.3). MTP tokens per verification at 4K / 32K: `q3` 2.431
+/ 2.466 (2.454 / 2.454), `nvfp4-compressed` 2.936 / 3.006 (2.953 / 3.117).
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
