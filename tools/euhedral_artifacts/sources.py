@@ -87,8 +87,11 @@ class SourceStore:
             file = shard_path.open("rb")
             self.files[shard_name] = file
             for name, entry in header.items():
-                if name not in weight_map or weight_map[name] != shard_name:
+                if name not in weight_map:
                     fail(f"source index/header mismatch for {name}")
+                if weight_map[name] != shard_name:
+                    # An overlay checkpoint routes a replaced tensor to its own shard; the original copy is not read.
+                    continue
                 if not isinstance(entry, dict) or entry.get("dtype") != "BF16":
                     fail(f"source tensor {name} is not BF16")
                 shape = entry.get("shape")

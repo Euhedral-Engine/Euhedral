@@ -10,7 +10,6 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
@@ -33,15 +32,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// Teacher-forced scoring of an artifact against llama.cpp BF16 references (`llama-perplexity
-/// --kl-divergence-base`, docs/QUALITY.md). Each chunk of N reference tokens is forced on a fresh sequence: a prefill
-/// of N / 2 + 1 tokens, then verifications of `rows` forced tokens, so that step k's logits row predicts the token the
-/// reference's record k does. Every row is scored on the device where the engine left it (`score.cu`), against the
-/// reference row a reader frame has already fetched into mapped host memory; nothing is copied. `batch` chunks run
-/// together, one sequence each, their verifications batched into one quantum (at most 32 rows), so each weight is
-/// read once per step group of all of them. The summary line per reference: name, mean NLL, perplexity, dNLL and its
-/// standard
-/// error, KL and its standard error, top-1 agreement, then KL median, p95, p99, maximum, the top-1 standard error and
-/// delta-p mean, RMS, p1 and p99.
+/// --kl-divergence-base`, docs/QUALITY.md). Each chunk of N reference tokens is forced on a fresh sequence: a
+/// prefill of N / 2 + 1 tokens, then verifications of `rows` forced tokens, so that step k's logits row
+/// predicts the token the reference's record k does. Every row is scored on the device where the engine left it
+/// (`score.cu`), against the reference row a reader frame has already fetched into mapped host memory; nothing
+/// is copied. `batch` chunks run together, one sequence each, their verifications batched into one quantum (at
+/// most 32 rows), so each weight is read once per step group of all of them. The summary line per reference:
+/// name, mean NLL, perplexity, dNLL and its standard error, KL and its standard error, top-1 agreement, then KL
+/// median, p95, p99, maximum, the top-1 standard error and delta-p mean, RMS, p1 and p99.
 public final class Score {
 
     /// Command-line settings.
@@ -72,6 +70,7 @@ public final class Score {
         this.device = device;
         this.runtime = runtime;
         this.plan = plan;
+        device.cuda.bindThread(); // the worker's thread compiles the scorer's kernel; the engine selects streams here
         this.scoreStream = device.newStream();
         this.kernel =
                 device.cuda.compileResource("score.cu", List.of("score_rows")).getFirst();
@@ -84,69 +83,109 @@ public final class Score {
                 || settings.batch() * settings.rows() > 32)
             throw new IllegalArgumentException("--rows (at most 8) times --batch must be at most 32");
         var data = ArtifactReader.read(settings.artifact());
+        int context = 0;
+        for (Path path : settings.references())
+            try (Reference reference = Reference.open(path)) {
+                context = Math.max(context, reference.context);
+            }
         try (Device device = new Device(settings.library());
                 Qwen38Model model = Qwen38Model.load(
                         settings.artifact(),
                         data,
                         device.gpu,
                         ArtifactProfile.Speculation.NONE,
-                        HostWeightSelection.select(data, settings.hostBytes()));
+                        Residency.hostBacked(
+                                data,
+                                ArtifactProfile.Speculation.NONE,
+                                device.gpu,
+                                settings.hostBytes(),
+                                settings.batch(),
+                                context));
                 var lattice = CalibrationLattice.start(settings.workers())) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice.terminal(), plan, device.gpu);
             try {
-                var score = new Score(settings, device, runtime, plan);
-                for (int r = 0; r < settings.references().size(); r++) {
-                    score.reference(
-                            settings.references().get(r), settings.names().get(r));
-                }
+                // On the lattice's workers: the scorer's setup, then each reference in turn, each chunk group's
+                // verifications continuing the next. This thread only waits.
+                runtime.onWorker(() -> new Score(settings, device, runtime, plan))
+                        .thenCompose(score -> {
+                            CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+                            for (int r = 0; r < settings.references().size(); r++) {
+                                Path path = settings.references().get(r);
+                                String name = settings.names().get(r);
+                                chain = chain.thenCompose(ignored -> score.reference(path, name));
+                            }
+                            return chain;
+                        })
+                        .get();
             } finally {
                 runtime.close();
             }
         }
     }
 
-    /// Scores every chunk of `path` and appends the summary to the results file (and standard output).
-    private void reference(Path path, String name) throws Exception {
+    /// Scores every chunk of `path` and appends the summary to the results file (and standard output);
+    /// completes on a worker once the last group has.
+    private CompletableFuture<Void> reference(Path path, String name) {
         long started = System.nanoTime();
-        try (Reference reference = Reference.open(path)) {
-            int vocabulary = plan.weights().config().vocabSize();
-            if (vocabulary != reference.vocabulary) {
-                throw new IllegalArgumentException(
-                        path + " has a vocabulary of " + reference.vocabulary + ", the artifact " + vocabulary);
-            }
-            double[][] scored = new double[reference.chunks][];
-            int batch = Math.min(settings.batch(), reference.chunks);
-            Lane[] lanes = new Lane[batch];
-            for (int k = 0; k < batch; k++) lanes[k] = new Lane(reference);
-            try {
-                for (int first = 0; first < reference.chunks; first += batch) {
-                    int[] chunks = new int[Math.min(batch, reference.chunks - first)];
-                    for (int k = 0; k < chunks.length; k++) chunks[k] = first + k;
-                    new Group(reference, chunks, lanes).run(scored).get();
-                }
-            } finally {
-                for (Lane lane : lanes) lane.close();
-            }
-            String summary = Summary.lines(name, path, settings.artifact(), reference, scored);
-            System.out.print(summary);
-            Files.writeString(
-                    settings.results(),
-                    summary,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.APPEND,
-                    StandardOpenOption.WRITE);
-            System.out.printf(
-                    Locale.ROOT,
-                    "scored %s: %d chunks in %.1f s%n",
-                    name,
-                    reference.chunks,
-                    (System.nanoTime() - started) / 1e9);
+        Reference reference;
+        try {
+            reference = Reference.open(path);
+        } catch (IOException failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+        int vocabulary = plan.weights().config().vocabSize();
+        if (vocabulary != reference.vocabulary) {
+            closeQuietly(reference);
+            return CompletableFuture.failedFuture(new IllegalArgumentException(
+                    path + " has a vocabulary of " + reference.vocabulary + ", the artifact " + vocabulary));
+        }
+        double[][] scored = new double[reference.chunks][];
+        int batch = Math.min(settings.batch(), reference.chunks);
+        Lane[] lanes = new Lane[batch];
+        for (int k = 0; k < batch; k++) lanes[k] = new Lane(reference);
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (int first = 0; first < reference.chunks; first += batch) {
+            int[] chunks = new int[Math.min(batch, reference.chunks - first)];
+            for (int k = 0; k < chunks.length; k++) chunks[k] = first + k;
+            chain = chain.thenCompose(ignored -> new Group(reference, chunks, lanes).run(scored));
+        }
+        return chain.thenRun(() -> {
+                    String summary = Summary.lines(name, path, settings.artifact(), reference, scored);
+                    System.out.print(summary);
+                    try {
+                        Files.writeString(
+                                settings.results(),
+                                summary,
+                                StandardOpenOption.CREATE,
+                                StandardOpenOption.APPEND,
+                                StandardOpenOption.WRITE);
+                    } catch (IOException failure) {
+                        throw new java.io.UncheckedIOException(failure);
+                    }
+                    System.out.printf(
+                            Locale.ROOT,
+                            "scored %s: %d chunks in %.1f s%n",
+                            name,
+                            reference.chunks,
+                            (System.nanoTime() - started) / 1e9);
+                })
+                .whenComplete((ignored, failure) -> {
+                    for (Lane lane : lanes) lane.close();
+                    closeQuietly(reference);
+                });
+    }
+
+    private static void closeQuietly(Reference reference) {
+        try {
+            reference.close();
+        } catch (IOException ignored) {
+            // A read-only file: nothing to lose.
         }
     }
 
-    /// One slot of a group: the mapped buffers of the chunk it scores (two reference row blocks, the targets and the
-    /// results).
+    /// One slot of a group: the mapped buffers of the chunk it scores (two reference row blocks, the targets
+    /// and the results).
     private final class Lane implements AutoCloseable {
         final long[] blocks = new long[2];
         final long targets, results;
@@ -166,8 +205,8 @@ public final class Score {
         }
     }
 
-    /// Chunks scored together, one sequence each, in lockstep (every chunk of a reference has the same prefix and
-    /// steps): each prefill on its own, then each step group of every chunk in one batched verification.
+    /// Chunks scored together, one sequence each, in lockstep (every chunk of a reference has the same prefix
+    /// and steps): each prefill on its own, then each step group of every chunk in one batched verification.
     private final class Group {
         final Reference reference;
         final int[] chunks;
@@ -240,7 +279,8 @@ public final class Score {
             });
         }
 
-        /// Reads every chunk's reference rows of `group` (its first step `first`) into the lanes' blocks, on workers.
+        /// Reads every chunk's reference rows of `group` (its first step `first`) into the lanes' blocks, on
+        /// workers.
         CompletableFuture<Void> read(int group, int first) {
             int count = group == 0 ? 1 : Math.min(settings.rows(), reference.records - first);
             CompletableFuture<?>[] reads = new CompletableFuture<?>[chunks.length];
@@ -295,9 +335,9 @@ public final class Score {
             }));
         }
 
-        /// Scores `count` logits rows from `row` against lane `lane`'s block of `group`. The kernel reads
-        /// the reference rows and writes its results in mapped host memory; the caller waits for it
-        /// before the logits are released.
+        /// Scores `count` logits rows from `row` against lane `lane`'s block of `group`. The kernel reads the
+        /// reference rows and writes its results in mapped host memory; the caller waits for it before the
+        /// logits are released.
         void score(long row, int lane, int group, int first, int count) {
             device.cuda.bindThread();
             device.cuda.launch(
@@ -324,8 +364,9 @@ public final class Score {
         });
     }
 
-    /// A llama.cpp logits file: "_logits_", int32 context, vocabulary and chunk count, the chunks' tokens, then per
-    /// chunk the records of its second half, each two FP32 values (scale, minimum) and a uint16 code per token.
+    /// A llama.cpp logits file: "_logits_", int32 context, vocabulary and chunk count, the chunks' tokens, then
+    /// per chunk the records of its second half, each two FP32 values (scale, minimum) and a uint16 code per
+    /// token.
     static final class Reference implements AutoCloseable {
         final FileChannel channel;
         final int context, vocabulary, chunks, records, width;
@@ -372,8 +413,8 @@ public final class Score {
             return buffer.flip();
         }
 
-        /// Records `begin` to `begin + count` of `chunk` into the host memory at `address` (positioned reads: the
-        /// references are never memory-mapped).
+        /// Records `begin` to `begin + count` of `chunk` into the host memory at `address` (positioned reads:
+        /// the references are never memory-mapped).
         void read(int chunk, int begin, int count, long address) {
             long bytes = 2L * width * count;
             ByteBuffer target =

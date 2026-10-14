@@ -49,7 +49,27 @@ the reference entries above its 16-nat floor, top-1 agreement with standard erro
 the KL median, p95, p99 and maximum, and delta-p of the forced token. Each chunk of N tokens prefills N / 2 + 1 and
 verifies the rest `--rows` (8) forced tokens at a time; each logits row is scored where the engine left it, by
 `score.cu` reading the reference row a reader frame fetched into mapped host memory. `--batch` (4) chunks run together
-on their own sequences, each step group of all of them in one batched verification (at most 32 rows); `--host-mib` (2304) keeps that much of the weights in host memory.
+on their own sequences, each step group of all of them in one batched verification (at most 32 rows).
+`score` and `generate` keep weights in host memory only when the artifact, every sequence's KV and state and the
+engine's reserve do not fit in the memory free on the GPU, the smallest selection that makes room, as the engine plans
+it; `--host-mib N` sets the host-backed weights instead.
+
+## MTP drafter corpus
+
+```bash
+./gradlew :quantization:run --args="generate --artifact qwen3_8_27b_nvfp4_compressed.edrl --tokenizer /path/to/checkpoint \
+    --out corpus/ --prompts prompts.jsonl --max-tokens 4096 --batch 8"
+```
+
+Answers chat prompts (`{"id", "messages", "tools"?}` per line; `tools/gptq/calibration.py prompts ... --chat N`) with the
+artifact's own greedy decode and keeps what the MTP drafter learns from: every token, and the post-final-norm hidden
+of every row the base model ran, which is what seeds the drafter (docs/MTP_CONTRACT.md §2). Prompts are rendered by
+the checkpoint's chat template with thinking on and prefilled in the engine's 512-row chunks, as the server does; then
+up to `--batch` sequences (at most 32) decode together, one row each per batched verification, so every row is bit
+for bit the artifact's own one-row decode. The corpus (`Corpus`) is `tokens.bin`, `hidden.bin` (BF16) and
+`index.jsonl`; a stopped run resumes by prompt id. The run's bookkeeping is a lattice source that quanta post records
+to. Each sequence holds about 336 MiB of device memory (144 MiB of it GDN state), so a larger `--batch` moves more
+weights to host memory on a 16 GB card.
 
 ## Libraries
 

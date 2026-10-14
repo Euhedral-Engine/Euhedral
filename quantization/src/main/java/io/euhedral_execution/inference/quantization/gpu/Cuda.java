@@ -31,10 +31,11 @@ public final class Cuda {
     private final Arena arena = Arena.ofShared();
     private final MethodHandle cuInit, cuDeviceGet, cuDeviceGetAttribute, cuDevicePrimaryCtxRetain, cuCtxSetCurrent;
     private final MethodHandle cuModuleLoadData, cuModuleGetFunction, cuLaunchKernel, cuStreamSynchronize;
+    private final MethodHandle cuFuncSetAttribute;
     private final MethodHandle cuEventCreate, cuEventRecord, cuEventQuery, cuStreamWaitEvent, cuEventDestroy;
     private final MethodHandle nvrtcCreateProgram, nvrtcCompileProgram, nvrtcGetProgramLogSize, nvrtcGetProgramLog;
     private final MethodHandle nvrtcGetCUBINSize, nvrtcGetCUBIN, nvrtcDestroyProgram;
-    private final MethodHandle cublasCreate, cublasSetStream, cublasGemmEx, cublasSgemm;
+    private final MethodHandle cublasCreate, cublasSetStream, cublasGemmEx, cublasSgemm, cublasSetMathMode;
     private final MethodHandle cusolverDnCreate, cusolverDnSetStream, potrfBufferSize, potrf, potriBufferSize, potri;
     private final long context;
     private final String architecture;
@@ -55,6 +56,7 @@ public final class Cuda {
         cuModuleGetFunction = bind(driver, "cuModuleGetFunction", INT, PTR, PTR, PTR);
         cuLaunchKernel = bind(driver, "cuLaunchKernel", INT, PTR, INT, INT, INT, INT, INT, INT, INT, PTR, PTR, PTR);
         cuStreamSynchronize = bind(driver, "cuStreamSynchronize", INT, PTR);
+        cuFuncSetAttribute = bind(driver, "cuFuncSetAttribute", INT, PTR, INT, INT);
         cuEventCreate = bind(driver, "cuEventCreate", INT, PTR, INT);
         cuEventRecord = bind(driver, "cuEventRecord", INT, PTR, PTR);
         cuEventQuery = bind(driver, "cuEventQuery", INT, PTR);
@@ -67,6 +69,7 @@ public final class Cuda {
         nvrtcGetCUBINSize = bind(nvrtc, "nvrtcGetCUBINSize", INT, PTR, PTR);
         nvrtcGetCUBIN = bind(nvrtc, "nvrtcGetCUBIN", INT, PTR, PTR);
         nvrtcDestroyProgram = bind(nvrtc, "nvrtcDestroyProgram", INT, PTR);
+        cublasSetMathMode = bind(cublas, "cublasSetMathMode", INT, PTR, INT);
         cublasCreate = bind(cublas, "cublasCreate_v2", INT, PTR);
         cublasSetStream = bind(cublas, "cublasSetStream_v2", INT, PTR, PTR);
         cublasGemmEx = bind(
@@ -233,6 +236,11 @@ public final class Cuda {
             values.add(value);
             return this;
         }
+
+        public Arguments real64(double value) {
+            values.add(value);
+            return this;
+        }
     }
 
     public void launch(
@@ -245,11 +253,33 @@ public final class Cuda {
                 MemorySegment slot = local.allocate(8, 8);
                 if (value instanceof Long address) slot.set(PTR, 0, address);
                 else if (value instanceof Integer integer) slot.set(INT, 0, integer);
+                else if (value instanceof Double real64) slot.set(ValueLayout.JAVA_DOUBLE, 0, real64);
                 else slot.set(ValueLayout.JAVA_FLOAT, 0, (Float) value);
                 pointers.setAtIndex(PTR, i, slot.address());
             }
             check("cuLaunchKernel " + function.name(), (int) cuLaunchKernel.invokeExact(
                     function.handle(), gridX, gridY, 1, blockX, 1, 1, shared, stream, pointers.address(), 0L));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Lets `function` take up to `bytes` of dynamic shared memory (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES),
+    /// above the default 48 KiB.
+    public void allowSharedMemory(Function function, int bytes) {
+        try {
+            check("cuFuncSetAttribute " + function.name(), (int)
+                    cuFuncSetAttribute.invokeExact(function.handle(), 8, bytes));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Lets `handle`'s FP32 products run on TF32 tensor cores (CUBLAS_TF32_TENSOR_OP_MATH): inputs rounded to a
+    /// 10-bit mantissa, FP32 accumulation.
+    public void tensorCoreMath(long handle) {
+        try {
+            check("cublasSetMathMode", (int) cublasSetMathMode.invokeExact(handle, 3));
         } catch (Throwable failure) {
             throw rethrow(failure);
         }

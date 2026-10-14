@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
+import io.euhedral_execution.inference.quantization.checkpoint.ResumeFile;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import io.euhedral_execution.inference.quantization.gptq.QuantState;
@@ -29,21 +30,22 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-/// GPTQ calibration of an artifact recipe on the engine's kernels: writes each quantized object's rounding to OUT as
-/// the .npz files `convert_checkpoint.py --codes-from` takes.
+/// GPTQ calibration of an artifact recipe on the engine's kernels: writes each quantized object's rounding to
+/// OUT as the .npz files `convert_checkpoint.py --codes-from` takes.
 ///
-/// The calibration sequences run through the checkpoint one decoder layer at a time: the layer's quantized linears'
-/// input rows accumulate into their Hessians, every object is rounded by GPTQ in the format the recipe stores it, the
-/// decoded weights replace the layer's, and the sequences run through it again to give the next layer its inputs.
-/// Then the LM head is rounded under the final norm's output, the MTP layer on the rows the engine feeds it (the
-/// normed hidden at p with the embedding of token p + 1), and the draft head under the MTP output it reads. The
-/// hidden states stay in pinned host memory; every 8 layers they are checkpointed, and a run with the same settings
-/// resumes there.
+/// The calibration sequences run through the checkpoint one decoder layer at a time: the layer's quantized
+/// linears' input rows accumulate into their Hessians, every object is rounded by GPTQ in the format the recipe
+/// stores it, the decoded weights replace the layer's, and the sequences run through it again to give the next
+/// layer its inputs. Then the LM head is rounded under the final norm's output, the MTP layer on the rows the
+/// engine feeds it (the normed hidden at p with the embedding of token p + 1), and the draft head under the MTP
+/// output it reads. The hidden states stay in pinned host memory; every 8 layers they are checkpointed, and a
+/// run with the same settings resumes there.
 public final class Calibrate {
 
     /// Command-line settings.
@@ -58,13 +60,13 @@ public final class Calibrate {
             int batch,
             int sequences,
             int layers,
-            boolean skipMtp) {}
+            boolean skipMtp,
+            Gptq.Nvfp4Search nvfp4) {}
 
     private static final int HEAD_ROWS = 16384;
     private static final int CHECKPOINT_EVERY = 8;
-    private static final long CHECKPOINT_SLICE = 1L << 30;
-    /// Objects of a layer rounded at once, each on its own stream (largest first): three fit a 16 GB card beside the
-    /// layer and its Hessians.
+    /// Objects of a layer rounded at once, each on its own stream (largest first): three fit a 16 GB card
+    /// beside the layer and its Hessians.
     private static final int ROUNDING_FRAMES = 3;
     private static final int WORKERS = 6;
 
@@ -85,18 +87,32 @@ public final class Calibrate {
         this.device = device;
         this.lattice = lattice;
         this.checkpoint = checkpoint;
-        this.gptq = new Gptq(device.cuda, device.gpu, device.stream);
+        this.gptq = new Gptq(device.cuda, device.gpu, device.stream, settings.nvfp4());
         this.gatherRows =
                 device.cuda.compileResource("rows.cu", List.of("gather_rows")).getFirst();
         this.hidden = checkpoint.config.hidden();
     }
 
+    /// Starts the calibration on the lattice and waits for it: the setup, then each layer continuing the next,
+    /// then the heads, all on the lattice's workers.
     public static void run(Settings settings, Path library) throws IOException {
-        Files.createDirectories(settings.out());
         try (Safetensors store = Safetensors.open(settings.model());
                 Device device = new Device(library);
                 CalibrationLattice lattice = CalibrationLattice.start(WORKERS)) {
-            new Calibrate(settings, device, new Qwen38Objects(store, settings.model()), lattice).calibrate();
+            var checkpoint = new Qwen38Objects(store, settings.model());
+            lattice.submit(() -> {
+                        try {
+                            Files.createDirectories(settings.out());
+                            device.select(device.stream);
+                            return new Calibrate(settings, device, checkpoint, lattice).calibrate();
+                        } catch (IOException failure) {
+                            throw new UncheckedIOException(failure);
+                        }
+                    })
+                    .thenCompose(chain -> chain)
+                    .get();
+        } catch (InterruptedException | java.util.concurrent.ExecutionException failure) {
+            throw new IOException(failure);
         }
     }
 
@@ -104,7 +120,9 @@ public final class Calibrate {
         System.out.printf("[%7.0f s] %s%n", (System.nanoTime() - start) / 1e9, message);
     }
 
-    private void calibrate() throws IOException {
+    /// Sets the calibration up and returns its chain: each layer once its read is done (the next one read while
+    /// it runs), checkpoints, then the heads.
+    private CompletableFuture<Void> calibrate() throws IOException {
         int[][] tokens = readTokens(settings.tokens(), settings.sequences());
         int sequences = tokens.length, length = tokens[0].length, batch = settings.batch();
         long rowBytes = 2L * hidden;
@@ -115,27 +133,46 @@ public final class Calibrate {
         long batchStates = device.gpu.allocate(batchRows * rowBytes);
         GpuCompletions completions = new GpuCompletions(device.cuda);
         lattice.attach(completions);
-        try (LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows);
-                ForwardPipeline pipeline = new ForwardPipeline(device, forward, lattice.lake(), completions, batch)) {
-            this.pipeline = pipeline;
-            int first = resume(states, sequences, length);
-            if (first == 0) embed(tokens, states, batchStates);
-            CompletableFuture<LayerWeights.Staged> next = stageLayer(first);
-            for (int index = first; index < settings.layers(); index++) {
-                LayerWeights.Staged staged = next.join();
-                next = index + 1 < settings.layers() ? stageLayer(index + 1) : null; // read while this one runs
-                calibrateLayer(index, staged, forward, states, batchStates, sequences, length);
-                if ((index + 1) % CHECKPOINT_EVERY == 0 && index + 1 < settings.layers()) {
-                    saveCheckpoint(states, index + 1, sequences, length);
-                }
-            }
-            dropCheckpoint();
-            heads(tokens, forward, states, batchStates, sequences, length);
-        } finally {
-            device.gpu.free(batchStates);
-            device.gpu.freeHostWeights(statesAddress);
+        LayerForward forward = new LayerForward(device, checkpoint.config, (int) batchRows);
+        ForwardPipeline pipeline = new ForwardPipeline(device, forward, lattice.lake(), completions, batch);
+        this.pipeline = pipeline;
+        int first = resume(states, sequences, length);
+        if (first == 0) embed(tokens, states, batchStates);
+        var reading = new AtomicReference<CompletableFuture<LayerWeights.Staged>>(stageLayer(first));
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (int i = first; i < settings.layers(); i++) {
+            int index = i;
+            chain = chain.thenCompose(ignored -> reading.get()).thenCompose(staged -> {
+                if (index + 1 < settings.layers()) reading.set(stageLayer(index + 1)); // read while this one runs
+                return calibrateLayer(index, staged, forward, states, batchStates, sequences, length)
+                        .thenRun(() -> {
+                            if ((index + 1) % CHECKPOINT_EVERY == 0 && index + 1 < settings.layers()) {
+                                try {
+                                    saveCheckpoint(states, index + 1, sequences, length);
+                                } catch (IOException failure) {
+                                    throw new UncheckedIOException(failure);
+                                }
+                            }
+                        });
+            });
         }
-        log("done");
+        return chain.thenRun(() -> {
+                    try {
+                        device.select(device.stream);
+                        dropCheckpoint();
+                        heads(tokens, forward, states, batchStates, sequences, length);
+                    } catch (IOException failure) {
+                        throw new UncheckedIOException(failure);
+                    }
+                    log("done");
+                })
+                .whenComplete((ignored, failure) -> {
+                    device.select(device.stream);
+                    pipeline.close();
+                    forward.close();
+                    device.gpu.free(batchStates);
+                    device.gpu.freeHostWeights(statesAddress);
+                });
     }
 
     // ---- decoder layers ----
@@ -151,7 +188,8 @@ public final class Calibrate {
         });
     }
 
-    private void calibrateLayer(
+    /// Layer `index`: its Hessians observed, its objects rounded and swapped in, then its pass over the states.
+    private CompletableFuture<Void> calibrateLayer(
             int index,
             LayerWeights.Staged staged,
             LayerForward forward,
@@ -159,22 +197,24 @@ public final class Calibrate {
             long batchStates,
             int sequences,
             int length) {
-        LayerWeights uploaded;
+        device.select(device.stream);
+        LayerWeights layer;
         try (staged) {
-            uploaded = LayerWeights.upload(device.gpu, staged);
+            layer = LayerWeights.upload(device.gpu, staged);
         }
-        try (LayerWeights layer = uploaded) {
-            Map<String, Long> hessians = observeAll(layer, forward, states, batchStates, sequences, length);
-            roundAll(layer, hessians);
-            pipeline.run(layer, states.address(), batchStates, sequences, length, settings.batch(), null, true)
-                    .join();
-        }
-        log("layer " + index + " done");
+        return observeAll(layer, forward, states, batchStates, sequences, length)
+                .thenCompose(hessians -> roundAll(layer, hessians))
+                .thenCompose(ignored -> pipeline.run(
+                        layer, states.address(), batchStates, sequences, length, settings.batch(), null, true))
+                .whenComplete((ignored, failure) -> {
+                    layer.close();
+                    if (failure == null) log("layer " + index + " done");
+                });
     }
 
-    /// Runs the layer over every batch (its outputs discarded), accumulating each quantized object's Hessian; objects
-    /// that read the same rows in the same call share one.
-    private Map<String, Long> observeAll(
+    /// Runs the layer over every batch (its outputs discarded), accumulating each quantized object's Hessian;
+    /// objects that read the same rows in the same call share one.
+    private CompletableFuture<Map<String, Long>> observeAll(
             LayerWeights layer,
             LayerForward forward,
             MemorySegment states,
@@ -201,15 +241,18 @@ public final class Calibrate {
             previous[1] = count;
             previousName[0] = name;
         };
-        pipeline.run(layer, states.address(), batchStates, sequences, length, settings.batch(), observer, false)
-                .join();
-        for (var share : shares.entrySet()) hessians.put(share.getKey(), hessians.get(share.getValue()));
-        return hessians;
+        return pipeline.run(layer, states.address(), batchStates, sequences, length, settings.batch(), observer, false)
+                .thenApply(ignored -> {
+                    for (var share : shares.entrySet()) hessians.put(share.getKey(), hessians.get(share.getValue()));
+                    return hessians;
+                });
     }
 
-    /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded weights:
-    /// each object is a lattice frame on its worker's own stream, at most ROUNDING_FRAMES at once, largest first.
-    private void roundAll(LayerWeights layer, Map<String, Long> hessians) {
+    /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded
+    /// weights: each object is a lattice frame on its worker's own stream, at most ROUNDING_FRAMES at once,
+    /// largest first.
+    private CompletableFuture<Void> roundAll(LayerWeights layer, Map<String, Long> hessians) {
+        device.select(device.stream);
         var mirrored = new HashSet<Long>();
         for (String name : layer.objects.keySet()) {
             long h = hessians.get(name);
@@ -226,11 +269,13 @@ public final class Calibrate {
         for (int lane = 0; lane < Math.min(ROUNDING_FRAMES, names.size()); lane++) {
             lanes.add(lane(names, next, layer, hessians, decoded, failure));
         }
-        lanes.forEach(CompletableFuture::join);
-        if (failure.get() != null) throw new IllegalStateException("rounding failed", failure.get());
-        for (var entry : decoded.entrySet()) layer.replace(entry.getKey(), entry.getValue());
-        var freed = new HashSet<Long>();
-        for (long h : hessians.values()) if (freed.add(h)) device.gpu.free(h);
+        return CompletableFuture.allOf(lanes.toArray(CompletableFuture[]::new)).thenRun(() -> {
+            if (failure.get() != null) throw new IllegalStateException("rounding failed", failure.get());
+            device.select(device.stream);
+            for (var entry : decoded.entrySet()) layer.replace(entry.getKey(), entry.getValue());
+            var freed = new HashSet<Long>();
+            for (long h : hessians.values()) if (freed.add(h)) device.gpu.free(h);
+        });
     }
 
     /// One rounding lane: rounds the next object in a frame, then continues with the next until none is left.
@@ -246,7 +291,8 @@ public final class Calibrate {
         String name = names.get(index);
         return lattice.<Void>submit(() -> {
                     long stream = device.bindOwnStream();
-                    Gptq own = streamGptq.computeIfAbsent(stream, s -> new Gptq(device.cuda, device.gpu, s));
+                    Gptq own = streamGptq.computeIfAbsent(
+                            stream, s -> new Gptq(device.cuda, device.gpu, s, settings.nvfp4()));
                     long[] shape = layer.shapes.get(name);
                     try {
                         decoded.put(
@@ -266,8 +312,9 @@ public final class Calibrate {
                 .thenCompose(ignored -> lane(names, next, layer, hessians, decoded, failure));
     }
 
-    /// GPTQ of one object (BF16 [rows, k] on the device) under `hessian`, in row slices of HEAD_ROWS sharing one factor
-    /// and tensor scales; saves its state and returns its decoded weights (BF16, device, owned by the caller).
+    /// GPTQ of one object (BF16 [rows, k] on the device) under `hessian`, in row slices of HEAD_ROWS sharing
+    /// one factor and tensor scales; saves its state and returns its decoded weights (BF16, device, owned by
+    /// the caller).
     private long roundObject(String name, long weight, long rows, int k, long hessian) throws IOException {
         device.symmetrize(hessian, k); // on the main stream, where it was accumulated and the main Gptq reads it
         return roundObject(gptq, name, weight, rows, k, hessian);
@@ -307,8 +354,8 @@ public final class Calibrate {
         return decoded;
     }
 
-    /// Runs `step` on each batch of whole sequences, copied into `batchStates`; with `write`, copies the result back.
-    /// `states` is pinned, so the copies queue on the stream without stopping the host.
+    /// Runs `step` on each batch of whole sequences, copied into `batchStates`; with `write`, copies the result
+    /// back. `states` is pinned, so the copies queue on the stream without stopping the host.
     private void batches(
             MemorySegment states,
             long batchStates,
@@ -424,7 +471,8 @@ public final class Calibrate {
         }
     }
 
-    /// Accumulates the LM head's Hessian, rounds the MTP layer and returns the draft head's Hessian (the MTP output's).
+    /// Accumulates the LM head's Hessian, rounds the MTP layer and returns the draft head's Hessian (the MTP
+    /// output's).
     private long mtp(
             int[][] tokens,
             LayerForward forward,
@@ -631,47 +679,33 @@ public final class Calibrate {
                 + settings.actOrder() + "|" + settings.damp();
     }
 
+    /// Overwrites the checkpoint file in place: the header names the run and the layers done once the states
+    /// are written.
     private void saveCheckpoint(MemorySegment states, int layersDone, int sequences, int length) throws IOException {
-        Path partial = settings.out().resolve("hidden.bin.partial");
-        try (FileChannel channel = FileChannel.open(
-                partial, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-            // A ByteBuffer covers at most 2 GiB: write the states a slice at a time.
-            for (long at = 0; at < states.byteSize(); at += CHECKPOINT_SLICE) {
-                ByteBuffer buffer = states.asSlice(at, Math.min(CHECKPOINT_SLICE, states.byteSize() - at))
-                        .asByteBuffer();
-                while (buffer.hasRemaining()) channel.write(buffer);
-            }
+        try (ResumeFile file = new ResumeFile(checkpointFile())) {
+            file.header(new Properties());
+            file.write(ResumeFile.HEADER, states);
+            Properties header = new Properties();
+            header.setProperty("key", checkpointKey(sequences, length));
+            header.setProperty("layers", Integer.toString(layersDone));
+            file.header(header);
         }
-        Files.move(partial, checkpointFile(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        Files.writeString(settings.out().resolve("hidden.key"), checkpointKey(sequences, length) + "|" + layersDone);
         log("checkpoint after layer " + (layersDone - 1));
     }
 
     private int resume(MemorySegment states, int sequences, int length) throws IOException {
-        Path key = settings.out().resolve("hidden.key");
-        if (!Files.isRegularFile(key) || !Files.isRegularFile(checkpointFile())) return 0;
-        String saved = Files.readString(key);
-        String prefix = checkpointKey(sequences, length) + "|";
-        if (!saved.startsWith(prefix)) return 0;
-        int layersDone = Integer.parseInt(saved.substring(prefix.length()).trim());
-        try (FileChannel channel = FileChannel.open(checkpointFile(), StandardOpenOption.READ)) {
-            long position = 0;
-            for (long at = 0; at < states.byteSize(); at += CHECKPOINT_SLICE) {
-                ByteBuffer buffer = states.asSlice(at, Math.min(CHECKPOINT_SLICE, states.byteSize() - at))
-                        .asByteBuffer();
-                while (buffer.hasRemaining()) {
-                    int read = channel.read(buffer, position);
-                    if (read < 0) return 0;
-                    position += read;
-                }
-            }
+        if (!Files.isRegularFile(checkpointFile())) return 0;
+        try (ResumeFile file = new ResumeFile(checkpointFile())) {
+            Properties header = file.header();
+            if (!checkpointKey(sequences, length).equals(header.getProperty("key"))) return 0;
+            int layersDone = Integer.parseInt(header.getProperty("layers"));
+            file.read(ResumeFile.HEADER, states);
+            log("resumed after layer " + (layersDone - 1));
+            return layersDone;
         }
-        log("resumed after layer " + (layersDone - 1));
-        return layersDone;
     }
 
     private void dropCheckpoint() throws IOException {
         Files.deleteIfExists(checkpointFile());
-        Files.deleteIfExists(settings.out().resolve("hidden.key"));
     }
 }
