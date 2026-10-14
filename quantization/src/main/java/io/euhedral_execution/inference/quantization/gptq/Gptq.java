@@ -10,7 +10,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.stream.IntStream;
 
-/// GPTQ for the artifact formats on the GPU (tools/gptq/gptq.py): each object's columns are rounded in order (or in
+/// GPTQ for the artifact formats on the GPU: each object's columns are rounded in order (or in
 /// act-order) and each column's error carried into the columns not yet rounded through the upper Cholesky factor of
 /// (H + damp * mean(diag H) I)^-1. Group scales are chosen by the converter's weighted searches on the error-updated
 /// weights when a group's first column comes up; runs of columns between two choices round in one kernel launch.

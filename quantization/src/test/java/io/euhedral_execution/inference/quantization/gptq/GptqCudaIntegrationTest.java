@@ -15,9 +15,10 @@ import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 
-/// The GPU GPTQ against tools/gptq on one object in every format, with and without act-order (fixture written by
-/// quantization/src/test/python/make_gptq_fixture.py). The tensor scales match exactly; the codes come from a factor
-/// cuSOLVER computes in its own order, so they are compared by agreement and by the output error under H.
+/// The GPU GPTQ against a PyTorch reference of the calibration (tools/gptq, last at commit 9ff02525) on one object in
+/// every format, with and without act-order (frozen fixture in the test resources). The tensor scales match exactly;
+/// the codes come from a factor cuSOLVER computes in its own order, so they are compared by agreement and by the output
+/// error under H.
 class GptqCudaIntegrationTest {
 
     private static final float[] E2M1 = {0f, 0.5f, 1f, 1.5f, 2f, 3f, 4f, 6f};

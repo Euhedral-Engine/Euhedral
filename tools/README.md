@@ -110,8 +110,9 @@ GGUF run by llama.cpp as the reference, the engine's teacher-forced KL over T2 (
 
 ## GPTQ
 
-`gptq/` rounds an artifact's decoder layers and heads by GPTQ and writes the codes for `--codes-from`
-(docs/QUALITY.md#gptq). It needs PyTorch with CUDA, `tokenizers` and `jinja2`, and the checkpoint's BF16 weights:
+`gptq/calibration.py` builds the GPTQ calibration set; the `quantization` module (quantization/README.md) rounds an
+artifact's decoder layers and heads by GPTQ on the engine's kernels and writes the codes for `--codes-from`
+(docs/QUALITY.md#gptq). The calibration set needs `tokenizers` and `jinja2`:
 
 ```bash
 cd tools
@@ -120,17 +121,15 @@ python -m gptq.calibration prompts $C/prompts.jsonl $HOLDOUT/t4_prompts.jsonl
 python -m gptq.calibration generate http://localhost:8080 $C/prompts.jsonl $C/generations.jsonl --parallel 2
 python -m gptq.calibration tokens $CHECKPOINT $C            # writes $C/tokens.npy
 # the codes, one layer at a time on the GPU; then the artifact
-python -m gptq.calibrate --model $CHECKPOINT --quantization nvfp4 --compressed --tokens $C/tokens.npy \
-    --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES
+(cd .. && ./gradlew :quantization:run --args="calibrate --model $CHECKPOINT --quantization nvfp4 --compressed \
+    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES --act-order")
 python3 convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --compressed \
     --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --imatrix imatrix-swift15-v1mix.gguf --codes-from $CODES \
     --out $OUT/qwen3_8_27b_nvfp4_compressed.edrl
 ```
 
-`calibrate` holds the hidden states of all sequences in pinned host memory (5.4 GiB for 218 sequences of 2048 tokens)
-and fits a 16 GB card with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; `--sequences N` and `--layers N` make a
-short run. `test_gptq.py` checks that with a diagonal Hessian it reproduces the converter's calibrated rounding byte for
-byte, in every format and layout.
+`calibrate` holds the hidden states of all sequences in pinned host memory (5.4 GiB for 218 sequences of 2048
+tokens); `--sequences N` and `--layers N` make a short run.
 
 ## DFlash2
 

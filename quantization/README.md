@@ -36,6 +36,21 @@ settings resumes there.
 Options: `--act-order` (columns by decreasing diag H), `--damp` (0.01), `--batch` (sequences per batch, 8),
 `--sequences N`, `--layers N` (a short run), `--skip-mtp`, `--library` (the engine's native library).
 
+## Scoring
+
+```bash
+./gradlew :quantization:run --args="score --artifact qwen3_8_27b_nvfp4_compressed.edrl --results results.txt \
+    --reference swift_1_5_bf16.kld --name t1 --reference swift_t2.kld --name t2"
+```
+
+Teacher-forces every chunk of each llama.cpp reference (`llama-perplexity --kl-divergence-base`, docs/QUALITY.md) on
+the artifact and appends a summary per reference to the results file: mean NLL, dNLL, KL(reference || artifact) over
+the reference entries above its 16-nat floor, top-1 agreement with standard errors (chunk-level over several chunks),
+the KL median, p95, p99 and maximum, and delta-p of the forced token. Each chunk of N tokens prefills N / 2 + 1 and
+verifies the rest `--rows` (8) forced tokens at a time; each logits row is scored where the engine left it, by
+`score.cu` reading the reference row a reader frame fetched into mapped host memory. `--concurrency` (3) chunks run at
+once on their own sequences; `--host-mib` (2304) keeps that much of the weights in host memory.
+
 ## Libraries
 
 `cudaMathLibraries` downloads cuBLAS 13.2, cuSOLVER 12.0 and nvJitLink 13.1 from NVIDIA's CUDA 13.1 redistributables
@@ -45,13 +60,16 @@ module binds them, the CUDA driver API and NVRTC with the FFM API, in the engine
 ## Tests
 
 - `SafetensorsTest`, `RecipeTest`: CPU.
-- `Qwen38ObjectsTest`: the fused objects of two layers and the MTP layer equal `tools/gptq`'s byte for byte
+The fixtures below are frozen outputs of a PyTorch reference of the calibration (`tools/gptq`, last at commit
+9ff02525).
+
+- `Qwen38ObjectsTest`: the fused objects of two layers and the MTP layer equal the reference's byte for byte
   (`-Peuhedral.quantization.checkpoint=DIR`).
-- `GptqCudaIntegrationTest`: one object in Q3, Q5, NVFP4 and NVFP4-SD4, with and without act-order, against
-  `tools/gptq` (fixture: `src/test/python/make_gptq_fixture.py`): tensor scales exactly, codes by agreement and output
-  error under H.
-- `LayerForwardCudaIntegrationTest`: layers 0 and 3 against `tools/gptq/qwen38.py` (fixture:
-  `src/test/python/make_forward_fixture.py`, written to `build/forward-fixture`).
+- `GptqCudaIntegrationTest`: one object in Q3, Q5, NVFP4 and NVFP4-SD4, with and without act-order, against the
+  reference (fixture in the test resources): tensor scales exactly, codes by agreement and output error under H.
+- `LayerForwardCudaIntegrationTest`: layers 0 and 3 against the reference's BF16 forward (fixture in
+  `/mnt/shared/qwen38-quant/quality/fixtures/forward-fixture`, or `-Peuhedral.quantization.forward-fixture=DIR`).
+- `ForwardPipelineCudaIntegrationTest`: the frame pipeline equals the sequential forward bit for bit.
 
 ```bash
 ./gradlew :quantization:cudaIntegrationTest --rerun -Peuhedral.quantization.checkpoint=/path/to/checkpoint \

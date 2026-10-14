@@ -97,7 +97,7 @@ GGUFs and `weight_only.sh`'s work directory).
 
 ## GPTQ
 
-Every artifact's decoder layers, LM head and draft head are rounded by GPTQ (`tools/gptq/`, Frantar et al., 2022):
+Every artifact's decoder layers, LM head and draft head are rounded by GPTQ (the `quantization` module, Frantar et al., 2022):
 each linear's columns are rounded in order, and each column's rounding error is carried into the columns not yet
 rounded through the Cholesky factor of the inverse Hessian H = XᵀX of the linear's inputs, so the rounding minimizes
 the output error on the calibration activations rather than the weight error. Scales are chosen as the converter
@@ -111,11 +111,11 @@ Swift-1.5's own answers (thinking, tool calls and chat-template tokens included)
 Hermes function-calling prompts that T4 does not use, generated greedily by the engine serving `nvfp4-compressed`;
 64 of wikitext-2 train; 64 of CPython, Go, serde_json and cJSON source files other than T3's.
 
-**Calibration** (`tools/gptq/calibrate.py`) runs the sequences through a PyTorch port of the model (`tools/gptq/qwen38.py`;
-its BF16 forward pass on T1 is within KL 0.0005 of llama.cpp's BF16 reference) one layer at a time: the Hessians
-accumulate on the GPU while the sequences pass through the layer, the layer's objects are rounded, and the sequences
-pass through the rounded layer to give the next layer its inputs. The hidden states stay in pinned host memory. It takes
-46 to 53 minutes per artifact on the 16 GB card (about 45 s per layer), with damping 0.01.
+**Calibration** (`quantization/README.md`) runs the sequences through the BF16 checkpoint on the engine's own kernels
+one layer at a time: the Hessians accumulate on the GPU while the sequences pass through the layer, the layer's
+objects are rounded (cuSOLVER for the Cholesky factor, the module's kernels for the column runs), and the sequences
+pass through the rounded layer to give the next layer its inputs. The hidden states stay in pinned host memory. It
+takes about 13 minutes per artifact on the 16 GB card, with damping 0.01.
 
 **Engine checks** of the GPTQ artifacts, `nvfp4-compressed` (`nvfp4`): 2.94 (2.99) tokens per verification at 4K and
 3.01 (3.17) at 32K over the benchmark's chat prompts, 118 (102) tok/s at 4K and 103 (105) at 32K. Acceptance varies by

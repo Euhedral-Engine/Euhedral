@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /// GPTQ calibration of an artifact recipe on the engine's kernels: writes each quantized object's rounding to OUT as
-/// the .npz files `convert_checkpoint.py --codes-from` takes (tools/gptq/calibrate.py, natively).
+/// the .npz files `convert_checkpoint.py --codes-from` takes.
 ///
 /// The calibration sequences run through the checkpoint one decoder layer at a time: the layer's quantized linears'
 /// input rows accumulate into their Hessians, every object is rounded by GPTQ in the format the recipe stores it, the

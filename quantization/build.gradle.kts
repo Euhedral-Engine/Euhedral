@@ -110,9 +110,12 @@ tasks.named<JavaExec>("run") {
             .joinToString(File.pathSeparator))
 }
 
-// The BF16 checkpoint for the tests that read it (they skip without one): -Peuhedral.quantization.checkpoint=DIR
+// The BF16 checkpoint for the tests that read it (they skip without one): -Peuhedral.quantization.checkpoint=DIR;
+// -Peuhedral.quantization.forward-fixture=DIR moves the forward tests' fixture.
 tasks.withType<Test>().configureEach {
-    providers.gradleProperty("euhedral.quantization.checkpoint").orNull?.let { systemProperty("euhedral.quantization.checkpoint", it) }
+    for (name in listOf("euhedral.quantization.checkpoint", "euhedral.quantization.forward-fixture")) {
+        providers.gradleProperty(name).orNull?.let { systemProperty(name, it) }
+    }
 }
 
 // The CUDA test tasks the root build registers also need this module's cuBLAS/cuSOLVER and the CUDA headers its
