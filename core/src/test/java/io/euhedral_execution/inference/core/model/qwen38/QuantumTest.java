@@ -135,18 +135,20 @@ class QuantumTest {
     @Test
     void outcomeReachedAtAdmissionIsPublishedWithTheStreamDeselected() {
         var plan = new ExecutionPlan(ExecutionFixtures.weights());
-        var selected = new AtomicInteger();
+        // Per thread: the property is that the thread running an outcome callback has no stream selected; another
+        // quantum's submission may be selecting one on another thread at the same time.
+        var selected = ThreadLocal.withInitial(AtomicInteger::new);
         var gpu = new ExecutionFixtures.RecordingGpu() {
             @Override
             public GpuStream openStream() {
                 return new InlineGpuStream() {
                     @Override
                     public void submit(Runnable launches, boolean overlapPredecessor) {
-                        selected.incrementAndGet();
+                        selected.get().incrementAndGet();
                         try {
                             launches.run();
                         } finally {
-                            selected.decrementAndGet();
+                            selected.get().decrementAndGet();
                         }
                     }
                 };
@@ -161,9 +163,11 @@ class QuantumTest {
         // The callbacks may run on two threads at once: the test thread and the worker that completed the outcome.
         List<Integer> selectedAtOutcome = new java.util.concurrent.CopyOnWriteArrayList<>();
         var cancelledOutcome = runtime.submit(cancelled);
-        var cancelledSeen = cancelledOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        var cancelledSeen = cancelledOutcome.whenComplete(
+                (outcome, failure) -> selectedAtOutcome.add(selected.get().get()));
         var invalidOutcome = runtime.submit(invalid);
-        var invalidSeen = invalidOutcome.whenComplete((outcome, failure) -> selectedAtOutcome.add(selected.get()));
+        var invalidSeen = invalidOutcome.whenComplete(
+                (outcome, failure) -> selectedAtOutcome.add(selected.get().get()));
 
         assertEquals(Quantum.Status.CANCELLED, cancelledOutcome.join().status());
         assertEquals(Quantum.Status.FAILED, invalidOutcome.join().status());
