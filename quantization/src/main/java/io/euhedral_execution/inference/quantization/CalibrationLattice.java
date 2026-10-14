@@ -13,13 +13,13 @@ import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import java.time.Duration;
 import java.util.BitSet;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 /// The Euhedral lattice the calibration runs its concurrent work on: reading the next layer from the checkpoint,
 /// rounding a layer's objects on their own streams, and writing their states. Workers take one CPU per performance
-/// core first, then efficiency cores, never the CPUs in `excluded`.
+/// core first, then efficiency cores, among the CPUs the process may run on (its affinity: `taskset`, or systemd's
+/// `AllowedCPUs`, keeps CPUs out).
 public final class CalibrationLattice implements AutoCloseable {
 
     private final ControlPlaneLattice lattice;
@@ -32,7 +32,8 @@ public final class CalibrationLattice implements AutoCloseable {
         this.tasks = tasks;
     }
 
-    public static CalibrationLattice start(int workers, Set<Integer> excluded) {
+    public static CalibrationLattice start(int workers) {
+        BitSet allowed = allowedCpus();
         BitSet cpus = new BitSet();
         BitSet cores = new BitSet();
         var performance = SystemInfo.getPCpuSet();
@@ -40,7 +41,7 @@ public final class CalibrationLattice implements AutoCloseable {
                 cpu >= 0 && cpus.cardinality() < workers;
                 cpu = performance.nextSetBit(cpu + 1)) {
             var info = SystemInfo.getCpuInfo(cpu);
-            if (excluded.contains(cpu) || info == null || cores.get(info.core())) continue;
+            if (!allowed.get(cpu) || info == null || cores.get(info.core())) continue;
             cores.set(info.core());
             cpus.set(cpu);
         }
@@ -48,7 +49,7 @@ public final class CalibrationLattice implements AutoCloseable {
         for (int cpu = efficiency.nextSetBit(0);
                 cpu >= 0 && cpus.cardinality() < workers;
                 cpu = efficiency.nextSetBit(cpu + 1)) {
-            if (!excluded.contains(cpu)) cpus.set(cpu);
+            if (allowed.get(cpu)) cpus.set(cpu);
         }
         FragmentConfig defaults = FragmentConfig.ofDefaults();
         FragmentConfig fixed = new FragmentConfig(
@@ -73,6 +74,27 @@ public final class CalibrationLattice implements AutoCloseable {
     /// The lattice itself, for an engine [io.euhedral_execution.inference.core.model.qwen38.Execution] of its own.
     public ControlPlaneLattice terminal() {
         return lattice;
+    }
+
+    /// The CPUs the process may run on (Linux: `Cpus_allowed_list` of /proc/self/status); every CPU elsewhere.
+    static BitSet allowedCpus() {
+        BitSet allowed = new BitSet();
+        try {
+            for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of("/proc/self/status"))) {
+                if (!line.startsWith("Cpus_allowed_list:")) continue;
+                for (String range : line.substring(line.indexOf(':') + 1).trim().split(",")) {
+                    String[] bounds = range.split("-");
+                    int first = Integer.parseInt(bounds[0].trim());
+                    int last = bounds.length > 1 ? Integer.parseInt(bounds[1].trim()) : first;
+                    allowed.set(first, last + 1);
+                }
+                return allowed;
+            }
+        } catch (java.io.IOException | RuntimeException unavailable) {
+            // Not Linux, or an unreadable status: no affinity to honour.
+        }
+        allowed.set(0, Runtime.getRuntime().availableProcessors() * 2);
+        return allowed;
     }
 
     /// The lake frames are published into.

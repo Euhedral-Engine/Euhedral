@@ -28,9 +28,9 @@ The LM head is then rounded under the final norm's output; the MTP layer on the 
 hidden at p with the embedding of token p + 1); the draft head under the MTP output it reads. The token embedding is
 left to the converter.
 
-Concurrent work runs as frames on a lattice of six workers (never CPUs 8-9): the next layer is read from the
-checkpoint while the GPU runs the current one, and a layer's objects round three at a time on their workers' own
-streams. The hidden states stay in pinned host memory and are checkpointed every 8 layers; a run with the same
+Concurrent work runs as frames on a lattice of six workers, placed on the CPUs the process may run on (`taskset` or
+systemd's `AllowedCPUs` keeps CPUs out): the next layer is read from the checkpoint while the GPU runs the current one,
+and a layer's objects round three at a time on their workers' own streams. The hidden states stay in pinned host memory and are checkpointed every 8 layers; a run with the same
 settings resumes there.
 
 Options: `--act-order` (columns by decreasing diag H), `--damp` (0.01), `--batch` (sequences per batch, 8),

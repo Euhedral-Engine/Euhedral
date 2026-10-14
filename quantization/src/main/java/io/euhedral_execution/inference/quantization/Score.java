@@ -83,7 +83,7 @@ public final class Score {
                         device.gpu,
                         ArtifactProfile.Speculation.NONE,
                         HostWeightSelection.select(data, settings.hostBytes()));
-                var lattice = CalibrationLattice.start(settings.workers(), java.util.Set.of(8, 9))) {
+                var lattice = CalibrationLattice.start(settings.workers())) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice.terminal(), plan, device.gpu);
             try {

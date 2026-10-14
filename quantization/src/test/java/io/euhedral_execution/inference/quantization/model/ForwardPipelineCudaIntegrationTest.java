@@ -13,7 +13,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -35,7 +34,7 @@ class ForwardPipelineCudaIntegrationTest {
         Path library = Path.of(System.getProperty("euhedral.cuda.library"));
         try (Safetensors store = Safetensors.open(Path.of(checkpoint));
                 Device device = new Device(library);
-                CalibrationLattice lattice = CalibrationLattice.start(4, Set.of(8, 9));
+                CalibrationLattice lattice = CalibrationLattice.start(4);
                 Arena arena = Arena.ofConfined()) {
             var objects = new Qwen38Objects(store, Path.of(checkpoint));
             GpuCompletions completions = new GpuCompletions(device.cuda);
