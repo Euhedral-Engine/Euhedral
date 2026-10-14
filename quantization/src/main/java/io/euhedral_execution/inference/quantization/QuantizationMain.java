@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.quantization;
 
+import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -11,7 +12,7 @@ import java.util.Map;
 /// ```
 /// calibrate --model CHECKPOINT --quantization nvfp4|q3 [--compressed] --tokens TOKENS.npy --draft-ids-from ARTIFACT
 ///           --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
-///           [--library LIBEUHEDRAL_CUDA]
+///           [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
 ///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
@@ -93,7 +94,10 @@ public final class QuantizationMain {
                 Integer.parseInt(options.getOrDefault("batch", "8")),
                 Integer.parseInt(options.getOrDefault("sequences", "0")),
                 Integer.parseInt(options.getOrDefault("layers", "64")),
-                options.containsKey("skip-mtp"));
+                options.containsKey("skip-mtp"),
+                new Gptq.Nvfp4Search(
+                        Integer.parseInt(options.getOrDefault("nvfp4-above", "2")),
+                        Float.parseFloat(options.getOrDefault("nvfp4-scale-max", "448"))));
         Calibrate.run(settings, Path.of(library));
     }
 
