@@ -14,6 +14,7 @@ public final class Ops {
     private static final List<String> KERNELS = List.of(
             "bf16_to_float",
             "float_to_bf16_rounded",
+            "copy_floats",
             "axpby",
             "fill",
             "swiglu_forward",
@@ -116,6 +117,12 @@ public final class Ops {
                 "float_to_bf16_rounded",
                 count,
                 new Cuda.Arguments().pointer(in).pointer(count).pointer(out));
+    }
+
+    /// y = x on the stream (the engine's device copies synchronize it).
+    public void copy(long x, long y, long count) {
+        elementwise(
+                "copy_floats", count, new Cuda.Arguments().pointer(x).pointer(y).pointer(count));
     }
 
     /// y = a x + b y.

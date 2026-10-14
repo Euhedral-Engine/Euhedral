@@ -18,7 +18,8 @@ import java.util.Map;
 ///              [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
 /// train-model --model CHECKPOINT --codes CODES_DIR [--norms NORMS_DIR] --tokens TOKENS.npy --out CODES_DIR
 ///             [--overlay CHECKPOINT_DIR] [--sequences 218] [--holdout 18] [--epochs 1] [--scale-lr 2e-6]
-///             [--norm-lr 2e-5] [--top-k 64] [--evaluate-every 50] [--probe 0] [--accumulate 8] [--batch 4] [--library
+///             [--norm-lr 2e-5] [--top-k 64] [--evaluate-every 50] [--probe 0] [--accumulate 8] [--fp32] [--batch 4]
+/// [--library
 /// LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
 ///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
@@ -49,7 +50,10 @@ public final class QuantizationMain {
         for (int i = 1; i < args.length; i++) {
             String key = args[i];
             if (!key.startsWith("--")) throw new IllegalArgumentException("unexpected " + key);
-            boolean flag = key.equals("--compressed") || key.equals("--act-order") || key.equals("--skip-mtp");
+            boolean flag = key.equals("--compressed")
+                    || key.equals("--act-order")
+                    || key.equals("--skip-mtp")
+                    || key.equals("--fp32");
             String value = flag ? "true" : args[++i];
             if (key.equals("--reference")) references.add(value);
             else if (key.equals("--name")) names.add(value);
@@ -77,6 +81,7 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("evaluate-every", "50")),
                             Integer.parseInt(options.getOrDefault("probe", "0")),
                             Integer.parseInt(options.getOrDefault("accumulate", "8")),
+                            !options.containsKey("fp32"),
                             Integer.parseInt(options.getOrDefault("batch", "4"))),
                     Path.of(library));
             return;

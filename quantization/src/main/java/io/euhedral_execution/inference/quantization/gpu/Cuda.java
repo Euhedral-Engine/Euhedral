@@ -35,7 +35,7 @@ public final class Cuda {
     private final MethodHandle cuEventCreate, cuEventRecord, cuEventQuery, cuStreamWaitEvent, cuEventDestroy;
     private final MethodHandle nvrtcCreateProgram, nvrtcCompileProgram, nvrtcGetProgramLogSize, nvrtcGetProgramLog;
     private final MethodHandle nvrtcGetCUBINSize, nvrtcGetCUBIN, nvrtcDestroyProgram;
-    private final MethodHandle cublasCreate, cublasSetStream, cublasGemmEx, cublasSgemm;
+    private final MethodHandle cublasCreate, cublasSetStream, cublasGemmEx, cublasSgemm, cublasSetMathMode;
     private final MethodHandle cusolverDnCreate, cusolverDnSetStream, potrfBufferSize, potrf, potriBufferSize, potri;
     private final long context;
     private final String architecture;
@@ -69,6 +69,7 @@ public final class Cuda {
         nvrtcGetCUBINSize = bind(nvrtc, "nvrtcGetCUBINSize", INT, PTR, PTR);
         nvrtcGetCUBIN = bind(nvrtc, "nvrtcGetCUBIN", INT, PTR, PTR);
         nvrtcDestroyProgram = bind(nvrtc, "nvrtcDestroyProgram", INT, PTR);
+        cublasSetMathMode = bind(cublas, "cublasSetMathMode", INT, PTR, INT);
         cublasCreate = bind(cublas, "cublasCreate_v2", INT, PTR);
         cublasSetStream = bind(cublas, "cublasSetStream_v2", INT, PTR, PTR);
         cublasGemmEx = bind(
@@ -269,6 +270,16 @@ public final class Cuda {
         try {
             check("cuFuncSetAttribute " + function.name(), (int)
                     cuFuncSetAttribute.invokeExact(function.handle(), 8, bytes));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Lets `handle`'s FP32 products run on TF32 tensor cores (CUBLAS_TF32_TENSOR_OP_MATH): inputs rounded to a
+    /// 10-bit mantissa, FP32 accumulation.
+    public void tensorCoreMath(long handle) {
+        try {
+            check("cublasSetMathMode", (int) cublasSetMathMode.invokeExact(handle, 3));
         } catch (Throwable failure) {
             throw rethrow(failure);
         }
