@@ -56,6 +56,11 @@ extern "C" __global__ void float_to_bf16_rounded(const float* in, long long coun
     out[i] = (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
+extern "C" __global__ void copy_floats(const float* x, float* y, long long count) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] = x[i];
+}
+
 // y = a * x + b * y.
 extern "C" __global__ void axpby(const float* x, float* y, long long count, float a, float b) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;

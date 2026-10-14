@@ -49,14 +49,24 @@ public final class TrainableLayer implements AutoCloseable {
         }
     }
 
-    /// A trainable parameter: master values, gradient and Adam moments (FP32, device).
+    /// A trainable parameter: master values, gradient and Adam moments (FP32, device). A described parameter's
+    /// addresses are bound from outside ([#bind]); only an allocated one is owned and freed with the layer.
     public static final class Parameter {
         public final String name;
-        public final long values, gradient, first, second, count;
+        public final long count;
+        public long values, gradient, first, second;
+        private final boolean allocated;
+
+        private Parameter(String name, long count) {
+            this.name = name;
+            this.count = count;
+            this.allocated = false;
+        }
 
         Parameter(CudaGpuMemory gpu, Ops ops, String name, long count) {
             this.name = name;
             this.count = count;
+            this.allocated = true;
             this.values = gpu.allocate(4 * count);
             this.gradient = gpu.allocate(4 * count);
             this.first = gpu.allocate(4 * count);
@@ -67,7 +77,7 @@ public final class TrainableLayer implements AutoCloseable {
         }
 
         void free(CudaGpuMemory gpu) {
-            for (long address : new long[] {values, gradient, first, second}) gpu.free(address);
+            if (allocated) for (long address : new long[] {values, gradient, first, second}) gpu.free(address);
         }
     }
 
@@ -75,7 +85,7 @@ public final class TrainableLayer implements AutoCloseable {
     public static final class QuantizedLinear {
         public final String role;
         public final int out, in, group;
-        public final long codes;
+        public long codes;
         public final Parameter scales;
 
         QuantizedLinear(String role, int out, int in, int group, long codes, Parameter scales) {
@@ -131,6 +141,51 @@ public final class TrainableLayer implements AutoCloseable {
         gpu.copyDeviceToDevice(copy, values, 4 * count);
         owned.add(copy);
         frozen.put(role, copy);
+    }
+
+    // ---------------------------------------------------------------- bound storage
+
+    /// Declares a linear, norm or frozen tensor whose device storage [#bind] supplies.
+    public void describeLinear(String role, int out, int in, int group) {
+        linears.put(
+                role,
+                new QuantizedLinear(
+                        role, out, in, group, 0, new Parameter(role + "/scales", (long) out * (in / group))));
+    }
+
+    public void describeNorm(String role, int width) {
+        norms.put(role, new Parameter(role, width));
+    }
+
+    public void describeFrozen(String role) {
+        frozen.put(role, 0L);
+    }
+
+    /// Where a layer's parameters are on the device: codes and scales of each linear, norms, frozen tensors, and the
+    /// gradients (a layer's slices of the accumulated gradients) by parameter name.
+    public record Binding(
+            Map<String, Long> codes, Map<String, Long> values, Map<String, Long> gradients, Map<String, Long> frozen) {}
+
+    /// Computes with the storage of `binding` from now on (its kernels read it when they run).
+    public void bind(Binding binding) {
+        for (QuantizedLinear linear : linears.values()) {
+            linear.codes = binding.codes().get(linear.role);
+            linear.scales.values = binding.values().get(linear.scales.name);
+            linear.scales.gradient = binding.gradients().get(linear.scales.name);
+        }
+        for (Parameter norm : norms.values()) {
+            norm.values = binding.values().get(norm.name);
+            norm.gradient = binding.gradients().get(norm.name);
+        }
+        for (String role : List.copyOf(frozen.keySet()))
+            frozen.put(role, binding.frozen().get(role));
+    }
+
+    /// Uses `weight` and `weightGradient` (FP32, each the largest linear) instead of allocating its own: layers that
+    /// never run at once can share them.
+    public void shareWeights(long weight, long weightGradient) {
+        this.weight = weight;
+        this.weightGradient = weightGradient;
     }
 
     // ---------------------------------------------------------------- reloadable storage
@@ -273,7 +328,7 @@ public final class TrainableLayer implements AutoCloseable {
         if (s.attention) attentionForward(n1, mixed, position0);
         else gdnForward(n1, mixed);
         long h1 = buffer("h1", (long) rows * h);
-        gpu.copyDeviceToDevice(h1, x, 4L * rows * h);
+        ops.copy(x, h1, (long) rows * h);
         ops.axpby(mixed, h1, (long) rows * h, 1, 1);
         long n2 = buffer("n2", (long) rows * h), inv2 = buffer("inv2", rows);
         ops.rmsNormForward(h1, norms.get("post_norm").values, n2, inv2, rows, h, s.eps, 1);
@@ -281,7 +336,7 @@ public final class TrainableLayer implements AutoCloseable {
         apply("mlp/gate_up", n2, gu, false);
         long act = buffer("swiglu", (long) rows * s.intermediate);
         ops.swigluForward(gu, act, rows, s.intermediate);
-        gpu.copyDeviceToDevice(y, h1, 4L * rows * h);
+        ops.copy(h1, y, (long) rows * h);
         apply("mlp/down", act, y, true);
     }
 
@@ -366,7 +421,7 @@ public final class TrainableLayer implements AutoCloseable {
         Shape s = shape;
         int h = s.hidden;
         long dh1 = buffer("d_h1", (long) rows * h);
-        gpu.copyDeviceToDevice(dh1, dy, 4L * rows * h);
+        ops.copy(dy, dh1, (long) rows * h);
         long dAct = buffer("d_swiglu", (long) rows * s.intermediate);
         ops.zero(dAct, (long) rows * s.intermediate);
         applyBackward("mlp/down", buffer("swiglu", 0), dy, dAct);
@@ -391,7 +446,7 @@ public final class TrainableLayer implements AutoCloseable {
         if (s.attention) attentionBackward(dh1, dn1, position0);
         else gdnBackward(dh1, dn1);
         long dxTarget = dx != 0 ? dx : buffer("d_x", (long) rows * h);
-        gpu.copyDeviceToDevice(dxTarget, dh1, 4L * rows * h);
+        ops.copy(dh1, dxTarget, (long) rows * h);
         ops.rmsNormBackward(
                 x,
                 norms.get("input_norm").values,

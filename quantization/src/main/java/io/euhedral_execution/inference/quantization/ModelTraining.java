@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.quantization;
 
+import io.euhedral_execution.inference.core.runtime.graph.FrameSeeds;
 import io.euhedral_execution.inference.quantization.checkpoint.Overlay;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
@@ -28,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /// End-to-end distillation of a quantized artifact's scales and norms: every decoder layer's quantized linears train
 /// their group scales (codes fixed) and the layers' norms their weights, against the BF16 checkpoint's own output
@@ -62,6 +64,7 @@ public final class ModelTraining {
             int evaluateEvery,
             int probe,
             int accumulate,
+            boolean tensorCores,
             int batch) {}
 
     /// Rows of the LM head's logits at a time.
@@ -76,9 +79,8 @@ public final class ModelTraining {
     private final Arena host = Arena.ofShared();
     private final List<Long> pinned = new ArrayList<>();
 
-    /// A trainable parameter in host memory: values and Adam moments.
-    private record HostParameter(
-            MemorySegment values, MemorySegment first, MemorySegment second, MemorySegment gradient) {}
+    /// A trainable parameter in pinned host memory: values and Adam moments.
+    private record HostParameter(MemorySegment values, MemorySegment first, MemorySegment second) {}
 
     /// One quantized object: its codes (pinned), its state as read (format, layout), its trainable scales.
     private record HostLinear(
@@ -127,10 +129,24 @@ public final class ModelTraining {
         host.close();
     }
 
+    /// The pinned chunk slices come from, and how much of it is used.
+    private MemorySegment chunk = MemorySegment.NULL;
+    private long chunkUsed;
+
+    /// Pinned host memory (asynchronous copies need it), sliced from 1 GiB chunks, 256-byte aligned, zeroed.
     private MemorySegment pinned(long bytes) {
-        long address = device.gpu.allocateHostWeights(bytes);
-        pinned.add(address);
-        return MemorySegment.ofAddress(address).reinterpret(bytes);
+        long size = (bytes + 255) & ~255L;
+        if (chunkUsed + size > chunk.byteSize()) {
+            long chunkBytes = Math.max(1L << 30, size);
+            long address = device.gpu.allocateHostWeights(chunkBytes);
+            pinned.add(address);
+            chunk = MemorySegment.ofAddress(address).reinterpret(chunkBytes);
+            chunkUsed = 0;
+        }
+        MemorySegment slice = chunk.asSlice(chunkUsed, bytes);
+        chunkUsed += size;
+        slice.fill((byte) 0);
+        return slice;
     }
 
     // ---- the run ----
@@ -140,118 +156,14 @@ public final class ModelTraining {
         int sequences = tokens.length, length = tokens[0].length, k = settings.topK();
         long positions = (long) sequences * length;
         MemorySegment embedded = pinned(positions * 2 * hidden);
-        MemorySegment teacherIds = host.allocate(4 * positions * k, 4);
-        MemorySegment teacherLogProbs = host.allocate(4 * positions * k, 4);
+        MemorySegment teacherIds = pinned(4 * positions * k);
+        MemorySegment teacherLogProbs = pinned(4 * positions * k);
         teacher(lattice, tokens, embedded, teacherIds, teacherLogProbs);
-        long rows = length;
-        // The device side of the student: one trainable layer of each kind, the LM head and final norm, the buffers.
-        var c = checkpoint.config;
-        try (TrainableLayer gdn = storage(false);
-                TrainableLayer attention = storage(true)) {
-            long head = uploadBf16("lm_head.weight");
-            long finalNorm = device.gpu.allocate(4L * hidden);
-            float[] finalNormValues = readNormFloats("model.language_model.norm.weight");
-            Upload.floats(device.gpu, finalNorm, finalNormValues);
-            long count = rows * hidden;
-            long x = device.gpu.allocate(4 * count),
-                    y = device.gpu.allocate(4 * count),
-                    dh = device.gpu.allocate(4 * count);
-            long dx = device.gpu.allocate(4 * count),
-                    normed = device.gpu.allocate(4 * count),
-                    dn = device.gpu.allocate(4 * count);
-            long inverse = device.gpu.allocate(4 * rows), embeddedBf16 = device.gpu.allocate(2 * count);
-            long logits = device.gpu.allocate(4L * HEAD_ROWS * vocabulary),
-                    dLogits = device.gpu.allocate(4L * HEAD_ROWS * vocabulary);
-            long chunkBf16 = device.gpu.allocate(2L * HEAD_ROWS * Math.max(hidden, vocabulary));
-            long ids = device.gpu.allocate(4L * rows * k), logProbs = device.gpu.allocate(4L * rows * k);
-            long loss = device.gpu.allocate(8);
-            MemorySegment saved = pinned((long) layers * 4 * count);
-            Student student = new Student(
-                    gdn,
-                    attention,
-                    head,
-                    finalNorm,
-                    x,
-                    y,
-                    dh,
-                    dx,
-                    normed,
-                    dn,
-                    inverse,
-                    embeddedBf16,
-                    logits,
-                    dLogits,
-                    chunkBf16,
-                    ids,
-                    logProbs,
-                    loss,
-                    saved,
-                    embedded,
-                    teacherIds,
-                    teacherLogProbs,
-                    length);
-            int training = sequences - settings.holdout();
-            double best = student.evaluate(training, sequences);
-            log(String.format(Locale.ROOT, "held-out KL %.6f before training", best));
-            // The output keeps the state of the best held-out KL measured so far, the starting state included.
-            save();
-            int step = 0;
-            for (int epoch = 1; epoch <= settings.epochs(); epoch++) {
-                double total = 0;
-                for (int s = 0; s < training; s++) {
-                    double kl = student.step(s, ++step);
-                    total += kl;
-                    if (step % settings.accumulate() == 0)
-                        student.apply(settings.accumulate(), step / settings.accumulate());
-                    if (step <= settings.probe()) {
-                        student.forward(s, false);
-                        log(String.format(
-                                Locale.ROOT,
-                                "probe step %d: sequence %d KL %.6f before its step, %.6f after",
-                                step,
-                                s,
-                                kl,
-                                student.headLoss(s, false)));
-                    }
-                    if (step % 10 == 0)
-                        log(String.format(Locale.ROOT, "step %d: training KL %.6f (last 10)", step, total / 10));
-                    if (step % 10 == 0) total = 0;
-                    if (settings.evaluateEvery() > 0 && step % settings.evaluateEvery() == 0) {
-                        double heldOut = student.evaluate(training, sequences);
-                        log(String.format(Locale.ROOT, "step %d: held-out KL %.6f", step, heldOut));
-                        if (heldOut < best) {
-                            best = heldOut;
-                            save();
-                        }
-                    }
-                }
-                if (step % settings.accumulate() != 0)
-                    student.apply(step % settings.accumulate(), step / settings.accumulate() + 1);
-                double heldOut = student.evaluate(training, sequences);
-                log(String.format(Locale.ROOT, "epoch %d: held-out KL %.6f", epoch, heldOut));
-                if (heldOut < best) {
-                    best = heldOut;
-                    save();
-                }
-            }
-            for (long address : new long[] {
-                head,
-                finalNorm,
-                x,
-                y,
-                dh,
-                dx,
-                normed,
-                dn,
-                inverse,
-                embeddedBf16,
-                logits,
-                dLogits,
-                chunkBf16,
-                ids,
-                logProbs,
-                loss
-            }) device.gpu.free(address);
+        var steps = new Steps(lattice, embedded, teacherIds, teacherLogProbs, sequences, length);
+        try {
+            steps.run();
+        } finally {
+            steps.close();
         }
         finish();
     }
@@ -415,21 +327,17 @@ public final class ModelTraining {
     }
 
     private HostParameter parameter(long count) {
-        return new HostParameter(
-                host.allocate(4 * count, 4),
-                host.allocate(4 * count, 4),
-                host.allocate(4 * count, 4),
-                host.allocate(4 * count, 4));
+        return new HostParameter(pinned(4 * count), pinned(4 * count), pinned(4 * count));
     }
 
     private MemorySegment floats(float[] values) {
-        MemorySegment segment = host.allocate(4L * values.length, 4);
+        MemorySegment segment = pinned(4L * values.length);
         MemorySegment.copy(values, 0, segment, ValueLayout.JAVA_FLOAT, 0, values.length);
         return segment;
     }
 
     private MemorySegment copy(MemorySegment source) {
-        MemorySegment segment = host.allocate(source.byteSize(), 16);
+        MemorySegment segment = pinned(source.byteSize());
         segment.copyFrom(source);
         return segment;
     }
@@ -508,112 +416,295 @@ public final class ModelTraining {
 
     // ---- the student ----
 
-    private final class Student {
-        final TrainableLayer gdn, attention;
-        final long head, finalNorm, x, y, dh, dx, normed, dn, inverse, embeddedBf16, logits, dLogits, chunkBf16, ids;
-        final long logProbs, loss;
-        final MemorySegment saved, embedded, teacherIds, teacherLogProbs;
-        final int length;
+    /// The student's training, asynchronous: a frame enqueues a whole step (or an evaluation) on two streams,
+    /// and the lattice's completion source emits the next frame once the device is through it; no thread waits on
+    /// the device.
+    ///
+    /// The compute stream runs the layers; the copy stream brings each layer's codes, scales, norms and frozen
+    /// tensors from pinned host memory into one of two storage slots of its kind while the layer before it runs,
+    /// saves each layer's input to host memory during the forward pass and brings it back during the backward pass.
+    /// Events order the two: a slot is filled once the layer that last read it has run, and a layer runs once its
+    /// slot is filled. Gradients add up on the device, in each layer's slice of one buffer, across the sequences of
+    /// an update; an update streams each parameter's values and Adam moments through the device and back.
+    private final class Steps implements AutoCloseable {
 
-        Student(
-                TrainableLayer gdn,
-                TrainableLayer attention,
-                long head,
-                long finalNorm,
-                long x,
-                long y,
-                long dh,
-                long dx,
-                long normed,
-                long dn,
-                long inverse,
-                long embeddedBf16,
-                long logits,
-                long dLogits,
-                long chunkBf16,
-                long ids,
-                long logProbs,
-                long loss,
-                MemorySegment saved,
+        /// One storage slot: a layer's parameters on the device, and the events that order its use.
+        private final class Slot {
+            final Map<String, Long> codes = new LinkedHashMap<>(), values = new LinkedHashMap<>();
+            final Map<String, Long> frozen = new LinkedHashMap<>();
+            final long loaded = device.cuda.createEvent(), released = device.cuda.createEvent();
+            int layer = -1;
+        }
+
+        final CalibrationLattice lattice;
+        final MemorySegment embedded, teacherIds, teacherLogProbs, saved;
+        final int sequences, length, training;
+        final long count, copyStream;
+        final Ops compute;
+        final TrainableLayer gdn, attention;
+        /// [kind][parity]: kind 0 GDN, 1 attention.
+        final Slot[][] slots = new Slot[2][2];
+        final int[] slotParity;
+        /// Each layer's accumulated gradients on the device, by parameter name.
+        final List<Map<String, Long>> gradients = new ArrayList<>();
+        final long gradientBuffer, head, finalNorm, inverse, normed, dn, embeddedBf16, logits, dLogits, chunkBf16;
+        final long ids, logProbs, loss, scratchOutput, weight, weightGradient;
+        final long[] activations = new long[2], inputs = new long[2], deltas = new long[2];
+        final long[] saveDone = {device.cuda.createEvent(), device.cuda.createEvent()};
+        final long[] inputLoaded = {device.cuda.createEvent(), device.cuda.createEvent()};
+        final long[] inputReleased = {device.cuda.createEvent(), device.cuda.createEvent()};
+        final long[] applyLoaded = {device.cuda.createEvent(), device.cuda.createEvent()};
+        final long[] applyDone = {device.cuda.createEvent(), device.cuda.createEvent()};
+        final long[] applyReleased = {device.cuda.createEvent(), device.cuda.createEvent()};
+        final long copyReady = device.cuda.createEvent(), computeReady = device.cuda.createEvent();
+        final long computeDone = device.cuda.createEvent(), finished = device.cuda.createEvent();
+        /// The head's teacher rows and the embedded input are overwritten only once the compute stream has read them.
+        final long headReleased = device.cuda.createEvent(), embeddedReleased = device.cuda.createEvent();
+        /// Adam's values and moments of one parameter at a time, two in flight.
+        final long[][] applyBuffers = new long[2][3];
+        final MemorySegment lossHost;
+        final GpuCompletions completions;
+        final CompletableFuture<Void> done = new CompletableFuture<>();
+        final FrameSeeds seeds = new FrameSeeds();
+        final List<Long> owned = new ArrayList<>();
+        int step, update, pendingSequences, applyParity;
+        double best = Double.POSITIVE_INFINITY, window;
+
+        Steps(
+                CalibrationLattice lattice,
                 MemorySegment embedded,
                 MemorySegment teacherIds,
                 MemorySegment teacherLogProbs,
-                int length) {
-            this.gdn = gdn;
-            this.attention = attention;
-            this.head = head;
-            this.finalNorm = finalNorm;
-            this.x = x;
-            this.y = y;
-            this.dh = dh;
-            this.dx = dx;
-            this.normed = normed;
-            this.dn = dn;
-            this.inverse = inverse;
-            this.embeddedBf16 = embeddedBf16;
-            this.logits = logits;
-            this.dLogits = dLogits;
-            this.chunkBf16 = chunkBf16;
-            this.ids = ids;
-            this.logProbs = logProbs;
-            this.loss = loss;
-            this.saved = saved;
+                int sequences,
+                int length)
+                throws IOException {
+            this.lattice = lattice;
             this.embedded = embedded;
             this.teacherIds = teacherIds;
             this.teacherLogProbs = teacherLogProbs;
+            this.sequences = sequences;
             this.length = length;
+            this.training = sequences - settings.holdout();
+            this.count = (long) length * hidden;
+            this.copyStream = device.newStream();
+            long handle = device.cuda.cublasHandle(device.stream);
+            if (settings.tensorCores()) device.cuda.tensorCoreMath(handle);
+            this.compute = new Ops(device.cuda, device.stream, handle);
+            long largest = 0, largestParameter = 0;
+            for (HostLayer layer : model)
+                for (HostLinear linear : layer.linears().values()) {
+                    largest = Math.max(largest, (long) linear.out() * linear.in());
+                    largestParameter =
+                            Math.max(largestParameter, linear.scales().values().byteSize() / 4);
+                }
+            this.weight = allocate(4 * largest);
+            this.weightGradient = allocate(4 * largest);
+            this.gdn = describe(false);
+            this.attention = describe(true);
+            for (int kind = 0; kind < 2; kind++)
+                for (int parity = 0; parity < 2; parity++) slots[kind][parity] = slot(kind == 1);
+            this.slotParity = new int[layers];
+            int[] ordinal = new int[2];
+            for (HostLayer layer : model) slotParity[layer.index()] = ordinal[layer.attention() ? 1 : 0]++ % 2;
+            long total = 0;
+            for (HostLayer layer : model) {
+                for (HostLinear linear : layer.linears().values())
+                    total += linear.scales().values().byteSize() / 4;
+                for (HostParameter norm : layer.norms().values())
+                    total += norm.values().byteSize() / 4;
+            }
+            this.gradientBuffer = allocate(4 * total);
+            compute.zero(gradientBuffer, total);
+            long at = gradientBuffer;
+            for (HostLayer layer : model) {
+                Map<String, Long> slices = new LinkedHashMap<>();
+                for (HostLinear linear : layer.linears().values()) {
+                    slices.put(linear.role() + "/scales", at);
+                    at += linear.scales().values().byteSize();
+                }
+                for (var norm : layer.norms().entrySet()) {
+                    slices.put(norm.getKey(), at);
+                    at += norm.getValue().values().byteSize();
+                }
+                gradients.add(slices);
+            }
+            for (int i = 0; i < 2; i++) {
+                activations[i] = allocate(4 * count);
+                inputs[i] = allocate(4 * count);
+                deltas[i] = allocate(4 * count);
+                for (int j = 0; j < 3; j++) applyBuffers[i][j] = allocate(4 * largestParameter);
+            }
+            this.scratchOutput = allocate(4 * count);
+            this.head = uploadBf16("lm_head.weight");
+            owned.add(head);
+            this.finalNorm = allocate(4L * hidden);
+            Upload.floats(device.gpu, finalNorm, readNormFloats("model.language_model.norm.weight"));
+            this.inverse = allocate(4L * length);
+            this.normed = allocate(4 * count);
+            this.dn = allocate(4 * count);
+            this.embeddedBf16 = allocate(2 * count);
+            this.logits = allocate(4L * HEAD_ROWS * vocabulary);
+            this.dLogits = allocate(4L * HEAD_ROWS * vocabulary);
+            this.chunkBf16 = allocate(2L * HEAD_ROWS * Math.max(hidden, vocabulary));
+            int k = settings.topK();
+            this.ids = allocate(4L * length * k);
+            this.logProbs = allocate(4L * length * k);
+            this.loss = allocate(8L * Math.max(sequences, 1));
+            this.saved = pinned((long) layers * 4 * count);
+            this.lossHost = pinned(8L * Math.max(sequences, 1));
+            this.completions = new GpuCompletions(device.cuda);
+            lattice.attach(completions);
         }
 
-        /// Fills the layer of `index`'s kind with its state.
-        TrainableLayer load(int index) {
-            HostLayer state = model.get(index);
-            TrainableLayer layer = state.attention() ? attention : gdn;
-            for (HostLinear linear : state.linears().values())
-                layer.loadLinear(
-                        linear.role(),
-                        linear.codes(),
-                        linear.scales().values(),
-                        linear.scales().first(),
-                        linear.scales().second());
-            for (var entry : state.norms().entrySet())
-                layer.loadNorm(
-                        entry.getKey(),
-                        entry.getValue().values(),
-                        entry.getValue().first(),
-                        entry.getValue().second());
-            for (var entry : state.frozen().entrySet()) layer.loadFrozen(entry.getKey(), entry.getValue());
+        private long allocate(long bytes) {
+            long address = device.gpu.allocate(bytes);
+            owned.add(address);
+            return address;
+        }
+
+        private TrainableLayer describe(boolean attention) {
+            HostLayer template = model.stream()
+                    .filter(l -> l.attention() == attention)
+                    .findFirst()
+                    .orElseThrow();
+            var c = checkpoint.config;
+            var shape = new TrainableLayer.Shape(
+                    attention,
+                    c.hidden(),
+                    c.intermediate(),
+                    c.keyHeads(),
+                    c.valueHeads(),
+                    c.keyDim(),
+                    c.valueDim(),
+                    c.convKernel(),
+                    c.heads(),
+                    c.kvHeads(),
+                    c.headDim(),
+                    c.rotaryDim(),
+                    c.theta(),
+                    (float) c.eps());
+            var layer = new TrainableLayer(device.gpu, compute, shape);
+            for (HostLinear linear : template.linears().values())
+                layer.describeLinear(linear.role(), linear.out(), linear.in(), 64);
+            for (var norm : template.norms().entrySet())
+                layer.describeNorm(
+                        norm.getKey(), (int) (norm.getValue().values().byteSize() / 4));
+            for (String role : template.frozen().keySet()) layer.describeFrozen(role);
+            layer.shareWeights(weight, weightGradient);
             return layer;
         }
 
-        /// The model over sequence `s`, keeping each layer's input; leaves the last layer's output in `x`.
-        void forward(int s, boolean keep) {
-            long count = (long) length * hidden;
-            device.gpu.copyHostToDevice(embeddedBf16, embedded.asSlice(s * 2 * count, 2 * count), 2 * count);
-            ops.bf16ToFloat(embeddedBf16, count, x);
-            for (int index = 0; index < layers; index++) {
-                TrainableLayer layer = load(index);
-                if (keep) device.gpu.copyDeviceToHost(saved.asSlice(index * 4 * count, 4 * count), x, 4 * count);
-                layer.forward(x, y, length, 0);
-                device.gpu.copyDeviceToDevice(x, y, 4 * count);
+        private Slot slot(boolean attention) {
+            HostLayer template = model.stream()
+                    .filter(l -> l.attention() == attention)
+                    .findFirst()
+                    .orElseThrow();
+            Slot slot = new Slot();
+            for (HostLinear linear : template.linears().values()) {
+                slot.codes.put(linear.role(), allocate((long) linear.out() * linear.in()));
+                slot.values.put(
+                        linear.role() + "/scales",
+                        allocate(linear.scales().values().byteSize()));
             }
+            for (var norm : template.norms().entrySet())
+                slot.values.put(norm.getKey(), allocate(norm.getValue().values().byteSize()));
+            for (var frozen : template.frozen().entrySet())
+                slot.frozen.put(frozen.getKey(), allocate(frozen.getValue().byteSize()));
+            return slot;
         }
 
-        /// The KL to the teacher at every position of sequence `s` from the last layer's output `x` (its mean, per
-        /// position); with `gradient` also its gradient on `x` into `dh`.
-        double headLoss(int s, boolean gradient) {
-            long count = (long) length * hidden;
+        private Slot slotOf(int index) {
+            return slots[model.get(index).attention() ? 1 : 0][slotParity[index]];
+        }
+
+        // ---- enqueueing; every method below runs on the frame that owns the run ----
+
+        /// Selects the copy stream for the engine's asynchronous copies on this thread.
+        private void onCopyStream() {
+            device.select(copyStream);
+        }
+
+        private void toDevice(long target, MemorySegment source) {
+            device.gpu.copyHostToDeviceAsync(target, source.address(), source.byteSize());
+        }
+
+        private void toHost(MemorySegment target, long source) {
+            device.gpu.copyDeviceToHostAsync(target.address(), source, target.byteSize());
+        }
+
+        /// Fills layer `index`'s slot on the copy stream, once the layer that last used the slot has run.
+        private void load(int index) {
+            Slot slot = slotOf(index);
+            HostLayer layer = model.get(index);
+            device.cuda.waitEvent(copyStream, slot.released);
+            for (HostLinear linear : layer.linears().values()) {
+                toDevice(slot.codes.get(linear.role()), linear.codes());
+                toDevice(
+                        slot.values.get(linear.role() + "/scales"),
+                        linear.scales().values());
+            }
+            for (var norm : layer.norms().entrySet())
+                toDevice(slot.values.get(norm.getKey()), norm.getValue().values());
+            for (var frozen : layer.frozen().entrySet()) toDevice(slot.frozen.get(frozen.getKey()), frozen.getValue());
+            slot.layer = index;
+            device.cuda.recordEvent(slot.loaded, copyStream);
+        }
+
+        /// The layer of `index`'s kind, computing from its slot (on the compute stream, behind the slot's load).
+        private TrainableLayer use(int index) {
+            Slot slot = slotOf(index);
+            device.cuda.waitEvent(device.stream, slot.loaded);
+            TrainableLayer layer = model.get(index).attention() ? attention : gdn;
+            layer.bind(new TrainableLayer.Binding(slot.codes, slot.values, gradients.get(index), slot.frozen));
+            return layer;
+        }
+
+        /// The forward pass of sequence `s`: the last layer's output in `activations[layers % 2]`; with `keep`, each
+        /// layer's input saved to host memory.
+        private long forward(int s, boolean keep) {
+            device.cuda.waitEvent(copyStream, embeddedReleased);
+            device.gpu.copyHostToDeviceAsync(embeddedBf16, embedded.address() + s * 2 * count, 2 * count);
+            device.cuda.recordEvent(copyReady, copyStream);
+            device.cuda.waitEvent(device.stream, copyReady);
+            compute.bf16ToFloat(embeddedBf16, count, activations[0]);
+            device.cuda.recordEvent(embeddedReleased, device.stream);
+            load(0);
+            for (int index = 0; index < layers; index++) {
+                if (index + 1 < layers) load(index + 1);
+                long input = activations[index % 2], output = activations[(index + 1) % 2];
+                if (keep) {
+                    // The copy stream saves the input once it is written; the layer writing `output` (the input of
+                    // the layer before, two back) waits for that layer's save.
+                    device.cuda.recordEvent(computeReady, device.stream);
+                    device.cuda.waitEvent(copyStream, computeReady);
+                    device.gpu.copyDeviceToHostAsync(saved.address() + index * 4 * count, input, 4 * count);
+                    device.cuda.recordEvent(saveDone[index % 2], copyStream);
+                    device.cuda.waitEvent(device.stream, saveDone[(index + 1) % 2]);
+                }
+                TrainableLayer layer = use(index);
+                layer.forward(input, output, length, 0);
+                device.cuda.recordEvent(slotOf(index).released, device.stream);
+            }
+            return activations[layers % 2];
+        }
+
+        /// The KL at the LM head for sequence `s` from the last layer's output `x` into `loss[slot]` (per position);
+        /// with `gradient`, its gradient on `x` into `dh`.
+        private void head(int s, long x, long dh, boolean gradient, int slot) {
             int k = settings.topK();
-            ops.rmsNormForward(x, finalNorm, normed, inverse, length, hidden, (float) checkpoint.config.eps(), 1);
-            ops.zero(dn, count);
-            ops.zero(loss, 2);
             long base = (long) s * length * k;
-            device.gpu.copyHostToDevice(ids, teacherIds.asSlice(4 * base, 4L * length * k), 4L * length * k);
-            device.gpu.copyHostToDevice(logProbs, teacherLogProbs.asSlice(4 * base, 4L * length * k), 4L * length * k);
+            device.cuda.waitEvent(copyStream, headReleased);
+            device.gpu.copyHostToDeviceAsync(ids, teacherIds.address() + 4 * base, 4L * length * k);
+            device.gpu.copyHostToDeviceAsync(logProbs, teacherLogProbs.address() + 4 * base, 4L * length * k);
+            device.cuda.recordEvent(copyReady, copyStream);
+            device.cuda.waitEvent(device.stream, copyReady);
+            compute.rmsNormForward(x, finalNorm, normed, inverse, length, hidden, (float) checkpoint.config.eps(), 1);
+            compute.zero(dn, count);
             for (int first = 0; first < length; first += HEAD_ROWS) {
                 int rows = Math.min(HEAD_ROWS, length - first);
-                ops.floatToBf16(normed + 4L * first * hidden, (long) rows * hidden, chunkBf16);
+                compute.floatToBf16(normed + 4L * first * hidden, (long) rows * hidden, chunkBf16);
                 device.cuda.gemmBf16(
-                        device.cublas,
+                        compute.cublas,
                         Cuda.CUBLAS_OP_T,
                         Cuda.CUBLAS_OP_N,
                         vocabulary,
@@ -628,7 +719,7 @@ public final class ModelTraining {
                         logits,
                         vocabulary,
                         false);
-                ops.topKDistillation(
+                compute.topKDistillation(
                         logits,
                         rows,
                         vocabulary,
@@ -637,11 +728,11 @@ public final class ModelTraining {
                         logProbs + 4L * first * k,
                         1.0f / length,
                         dLogits,
-                        loss);
+                        loss + 8L * slot);
                 if (!gradient) continue;
-                ops.floatToBf16(dLogits, (long) rows * vocabulary, chunkBf16);
+                compute.floatToBf16(dLogits, (long) rows * vocabulary, chunkBf16);
                 device.cuda.gemmBf16(
-                        device.cublas,
+                        compute.cublas,
                         Cuda.CUBLAS_OP_N,
                         Cuda.CUBLAS_OP_N,
                         hidden,
@@ -657,95 +748,223 @@ public final class ModelTraining {
                         hidden,
                         false);
             }
+            device.cuda.recordEvent(headReleased, device.stream);
             if (gradient) {
-                ops.zero(dh, count);
-                ops.rmsNormBackward(x, finalNorm, inverse, dn, dh, 0, length, hidden, 1);
-            }
-            return read(loss) / length;
-        }
-
-        /// Adds layer `index`'s gradients (left on the device by its backward pass) to its gradients in host memory.
-        void accumulate(int index, TrainableLayer layer) {
-            HostLayer state = model.get(index);
-            for (HostLinear linear : state.linears().values())
-                add(layer.linears.get(linear.role()).scales, linear.scales().gradient());
-            for (var entry : state.norms().entrySet())
-                add(layer.norms.get(entry.getKey()), entry.getValue().gradient());
-        }
-
-        private void add(TrainableLayer.Parameter parameter, MemorySegment sum) {
-            try (Arena arena = Arena.ofConfined()) {
-                MemorySegment gradient = arena.allocate(4 * parameter.count, 4);
-                device.gpu.copyDeviceToHost(gradient, parameter.gradient, gradient.byteSize());
-                for (long i = 0; i < parameter.count; i++)
-                    sum.setAtIndex(
-                            ValueLayout.JAVA_FLOAT,
-                            i,
-                            sum.getAtIndex(ValueLayout.JAVA_FLOAT, i) + gradient.getAtIndex(ValueLayout.JAVA_FLOAT, i));
+                compute.zero(dh, count);
+                compute.rmsNormBackward(x, finalNorm, inverse, dn, dh, 0, length, hidden, 1);
             }
         }
 
-        /// One Adam step of every layer on the gradients accumulated since the last one (their mean over `count`
-        /// sequences), which it then clears.
-        void apply(int count, int update) {
-            for (int index = 0; index < layers; index++) {
-                HostLayer state = model.get(index);
-                TrainableLayer layer = state.attention() ? attention : gdn;
-                for (HostLinear linear : state.linears().values())
-                    adam(layer.linears.get(linear.role()).scales, linear.scales(), count, settings.scaleRate(), update);
-                for (var entry : state.norms().entrySet())
-                    adam(layer.norms.get(entry.getKey()), entry.getValue(), count, settings.normRate(), update);
-            }
-        }
-
-        private void adam(TrainableLayer.Parameter device, HostParameter state, int count, float rate, int update) {
-            long bytes = 4 * device.count;
-            ModelTraining.this.device.gpu.copyHostToDevice(device.values, state.values(), bytes);
-            ModelTraining.this.device.gpu.copyHostToDevice(device.first, state.first(), bytes);
-            ModelTraining.this.device.gpu.copyHostToDevice(device.second, state.second(), bytes);
-            ModelTraining.this.device.gpu.copyHostToDevice(device.gradient, state.gradient(), bytes);
-            ops.axpby(device.gradient, device.gradient, device.count, 0, 1.0f / count);
-            ops.adam(
-                    device.values,
-                    device.gradient,
-                    device.first,
-                    device.second,
-                    device.count,
-                    rate,
-                    0.9f,
-                    0.999f,
-                    1e-12f,
-                    0,
-                    update);
-            ModelTraining.this.device.gpu.copyDeviceToHost(state.values(), device.values, bytes);
-            ModelTraining.this.device.gpu.copyDeviceToHost(state.first(), device.first, bytes);
-            ModelTraining.this.device.gpu.copyDeviceToHost(state.second(), device.second, bytes);
-            state.gradient().fill((byte) 0);
-        }
-
-        /// One training step on sequence `s`; returns its mean KL.
-        double step(int s, int step) {
-            long count = (long) length * hidden;
-            forward(s, true);
-            double kl = headLoss(s, true);
+        /// One training step on sequence `s`: forward, head, backward; the gradients add to the accumulated ones.
+        private void step(int s) {
+            long x = forward(s, true);
+            head(s, x, deltas[0], true, 0);
+            load(layers - 1);
+            loadInput(layers - 1);
             for (int index = layers - 1; index >= 0; index--) {
-                TrainableLayer layer = load(index);
-                device.gpu.copyHostToDevice(x, saved.asSlice(index * 4 * count, 4 * count), 4 * count);
-                layer.forward(x, y, length, 0);
-                layer.backward(x, dh, dx, 0);
-                accumulate(index, layer);
-                device.gpu.copyDeviceToDevice(dh, dx, 4 * count);
+                if (index > 0) {
+                    load(index - 1);
+                    loadInput(index - 1);
+                }
+                device.cuda.waitEvent(device.stream, inputLoaded[index % 2]);
+                TrainableLayer layer = use(index);
+                long input = inputs[index % 2];
+                layer.forward(input, scratchOutput, length, 0);
+                long dy = deltas[(layers - 1 - index) % 2], dx = deltas[(layers - index) % 2];
+                layer.backward(input, dy, index > 0 ? dx : 0, 0);
+                device.cuda.recordEvent(slotOf(index).released, device.stream);
+                device.cuda.recordEvent(inputReleased[index % 2], device.stream);
             }
-            return kl;
         }
 
-        double evaluate(int first, int sequences) {
-            double total = 0;
-            for (int s = first; s < sequences; s++) {
-                forward(s, false);
-                total += headLoss(s, false);
+        /// Brings layer `index`'s saved input back into `inputs[index % 2]` on the copy stream.
+        private void loadInput(int index) {
+            device.cuda.waitEvent(copyStream, inputReleased[index % 2]);
+            device.gpu.copyHostToDeviceAsync(inputs[index % 2], saved.address() + index * 4 * count, 4 * count);
+            device.cuda.recordEvent(inputLoaded[index % 2], copyStream);
+        }
+
+        /// One Adam step of every parameter on the mean of the gradients accumulated over `sequencesSince` sequences;
+        /// clears them.
+        private void apply(int sequencesSince) {
+            update++;
+            for (HostLayer layer : model) {
+                Map<String, Long> slices = gradients.get(layer.index());
+                for (HostLinear linear : layer.linears().values())
+                    adam(linear.scales(), slices.get(linear.role() + "/scales"), sequencesSince, settings.scaleRate());
+                for (var norm : layer.norms().entrySet())
+                    adam(norm.getValue(), slices.get(norm.getKey()), sequencesSince, settings.normRate());
             }
-            return total / (sequences - first);
+        }
+
+        private void adam(HostParameter state, long gradient, int sequencesSince, float rate) {
+            int parity = applyParity++ % 2;
+            long[] buffers = applyBuffers[parity];
+            long elements = state.values().byteSize() / 4;
+            device.cuda.waitEvent(copyStream, applyReleased[parity]);
+            toDevice(buffers[0], state.values());
+            toDevice(buffers[1], state.first());
+            toDevice(buffers[2], state.second());
+            device.cuda.recordEvent(applyLoaded[parity], copyStream);
+            device.cuda.waitEvent(device.stream, applyLoaded[parity]);
+            compute.axpby(gradient, gradient, elements, 0, 1.0f / sequencesSince);
+            compute.adam(buffers[0], gradient, buffers[1], buffers[2], elements, rate, 0.9f, 0.999f, 1e-12f, 0, update);
+            device.cuda.recordEvent(applyDone[parity], device.stream);
+            device.cuda.waitEvent(copyStream, applyDone[parity]);
+            toHost(state.values(), buffers[0]);
+            toHost(state.first(), buffers[1]);
+            toHost(state.second(), buffers[2]);
+            device.cuda.recordEvent(applyReleased[parity], copyStream);
+        }
+
+        /// Joins the compute stream into the copy stream, copies the losses out after it, and records `finished`
+        /// there: once it is done, every copy and kernel enqueued so far is.
+        private void finish(int slots) {
+            device.cuda.recordEvent(computeDone, device.stream);
+            device.cuda.waitEvent(copyStream, computeDone);
+            device.gpu.copyDeviceToHostAsync(lossHost.address(), loss, 8L * slots);
+            device.cuda.recordEvent(finished, copyStream);
+        }
+
+        // ---- the frames ----
+
+        void run() {
+            lattice.lake().admit(); // released when the run ends
+            lattice.lake().publish(new Evaluate(true));
+            try {
+                done.join();
+            } finally {
+                lattice.lake().terminated();
+            }
+        }
+
+        private double lossAt(int slot) {
+            return lossHost.getAtIndex(ValueLayout.JAVA_DOUBLE, slot);
+        }
+
+        /// A frame of the run: its work enqueues device work or does host work; a failure ends the run.
+        private abstract class Frame extends io.euhedral_execution.core.frames.AbstractFrame {
+            Frame() {
+                super(io.euhedral_execution.inference.core.runtime.graph.FrameSeeds.ID_HASH);
+                randomizeHash(seeds.next());
+            }
+
+            abstract void work() throws Exception;
+
+            @Override
+            public void execute() {
+                if (done.isDone()) return;
+                try {
+                    onCopyStream();
+                    work();
+                } catch (Throwable failure) {
+                    done.completeExceptionally(failure);
+                }
+            }
+
+            @Override
+            public void doFinallyWithError(Throwable failure) {
+                done.completeExceptionally(failure);
+            }
+        }
+
+        /// Enqueues the forward pass and KL of every held-out sequence; `Evaluated` reads them.
+        private final class Evaluate extends Frame {
+            final boolean initial;
+
+            Evaluate(boolean initial) {
+                this.initial = initial;
+            }
+
+            @Override
+            void work() {
+                compute.zero(loss, (long) (sequences - training) * 2);
+                for (int s = training; s < sequences; s++) head(s, forward(s, false), 0, false, s - training);
+                finish(sequences - training);
+                completions.await(finished, new Evaluated(initial));
+            }
+        }
+
+        private final class Evaluated extends Frame {
+            final boolean initial;
+
+            Evaluated(boolean initial) {
+                this.initial = initial;
+            }
+
+            @Override
+            void work() throws IOException {
+                double total = 0;
+                for (int i = 0; i < sequences - training; i++) total += lossAt(i);
+                double heldOut = total / (sequences - training) / length;
+                if (initial) log(String.format(Locale.ROOT, "held-out KL %.6f before training", heldOut));
+                else log(String.format(Locale.ROOT, "step %d: held-out KL %.6f", step, heldOut));
+                if (heldOut < best) {
+                    best = heldOut;
+                    save();
+                }
+                next();
+            }
+        }
+
+        /// The next frame after a step or an evaluation: another step, an evaluation, or the end.
+        private void next() {
+            int total = settings.epochs() * training;
+            if (step >= total) {
+                done.complete(null);
+                return;
+            }
+            lattice.lake().publish(new Step());
+        }
+
+        /// Enqueues one training step (and, when due, the update); `Stepped` follows it.
+        private final class Step extends Frame {
+            @Override
+            void work() {
+                int s = step % training;
+                step++;
+                pendingSequences++;
+                compute.zero(loss, 2);
+                step(s);
+                boolean last = step == settings.epochs() * training;
+                if (pendingSequences == settings.accumulate() || step % training == 0) {
+                    apply(pendingSequences);
+                    pendingSequences = 0;
+                }
+                finish(1);
+                completions.await(finished, new Stepped(last));
+            }
+        }
+
+        private final class Stepped extends Frame {
+            final boolean last;
+
+            Stepped(boolean last) {
+                this.last = last;
+            }
+
+            @Override
+            void work() {
+                window += lossAt(0) / length;
+                if (step % 10 == 0) {
+                    log(String.format(Locale.ROOT, "step %d: training KL %.6f (last 10)", step, window / 10));
+                    window = 0;
+                }
+                boolean evaluate = last
+                        || step % training == 0
+                        || (settings.evaluateEvery() > 0 && step % settings.evaluateEvery() == 0);
+                if (evaluate) lattice.lake().publish(new Evaluate(false));
+                else next();
+            }
+        }
+
+        @Override
+        public void close() {
+            device.select(device.stream);
+            device.synchronize();
+            for (long address : owned) device.gpu.free(address);
+            gdn.close();
+            attention.close();
         }
     }
 
