@@ -14,21 +14,27 @@ import io.euhedral_execution.inference.quantization.model.LayerForward;
 import io.euhedral_execution.inference.quantization.model.LayerWeights;
 import io.euhedral_execution.inference.quantization.training.Ops;
 import io.euhedral_execution.inference.quantization.training.TrainableLayer;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 
 /// End-to-end distillation of a quantized artifact's scales and norms: every decoder layer's quantized linears
@@ -45,6 +51,11 @@ import java.util.concurrent.CompletableFuture;
 /// kept in host memory with them). Held-out sequences measure the mean KL per position. The result is written
 /// as `train-blocks` writes it: a codes directory for `convert_checkpoint.py --codes-from` and an overlay
 /// checkpoint with the trained norms.
+///
+/// A run resumes: the teacher's top-k is kept in `out/resume/teacher.bin`, and every held-out evaluation that
+/// follows an update writes the whole training state (each parameter's values and Adam moments, the step, the
+/// update count, the best held-out KL) to `out/resume/state`. A run with the same settings and tokens starts
+/// from there; delete `out/resume` to start over.
 public final class ModelTraining {
 
     /// Command-line settings. `codes` holds the starting rounding (all objects); `norms`, when set, the
@@ -97,6 +108,9 @@ public final class ModelTraining {
             Map<String, MemorySegment> frozen) {}
 
     private final List<HostLayer> model = new ArrayList<>();
+
+    /// What a resumed run must share with the one it resumes: the data, the starting state and the optimizer.
+    private String identity;
 
     private ModelTraining(Settings settings, Device device, Qwen38Objects checkpoint) {
         this.settings = settings;
@@ -230,6 +244,28 @@ public final class ModelTraining {
                 long batchRows = (long) settings.batch() * length;
                 batchStates = device.gpu.allocate(batchRows * 2 * hidden);
                 embed(tokens, embedded, batchStates);
+                identity = String.join(
+                        " ",
+                        "tokens=" + java.util.Arrays.deepHashCode(tokens),
+                        "sequences=" + sequences,
+                        "length=" + length,
+                        "holdout=" + settings.holdout(),
+                        "topK=" + k,
+                        "accumulate=" + settings.accumulate(),
+                        "scaleRate=" + settings.scaleRate(),
+                        "normRate=" + settings.normRate(),
+                        "codes=" + settings.codes().toAbsolutePath(),
+                        "norms="
+                                + (settings.norms() == null
+                                        ? "-"
+                                        : settings.norms().toAbsolutePath()));
+                if (readTeacher(teacherIds, teacherLogProbs)) {
+                    device.gpu.free(batchStates);
+                    device.gpu.freeHostWeights(streamAddress);
+                    log("teacher: top-" + k + " of every position read from " + teacherFile());
+                    publish(new StudentLayer(0));
+                    return;
+                }
                 MemorySegment.copy(embedded, 0, stream, 0, sequenceBytes * sequences);
                 forward = new LayerForward(device, checkpoint.config, (int) batchRows);
                 pipeline = new ForwardPipeline(device, forward, lattice.lake(), completions, settings.batch());
@@ -262,6 +298,23 @@ public final class ModelTraining {
                                 publish(index + 1 < layers ? new TeacherLayer(index + 1) : new TeacherHead());
                             }
                         });
+            }
+        }
+
+        /// Reads the student's starting state of layer `index` (the teacher's top-k already read).
+        final class StudentLayer extends Frame {
+            final int index;
+
+            StudentLayer(int index) {
+                this.index = index;
+            }
+
+            @Override
+            void work() throws IOException {
+                try (LayerWeights.Staged staged = LayerWeights.stage(checkpoint, index)) {
+                    model.add(hostLayer(index, staged));
+                }
+                publish(index + 1 < layers ? new StudentLayer(index + 1) : new StudentStart(null, 0));
             }
         }
 
@@ -315,7 +368,8 @@ public final class ModelTraining {
             }
         }
 
-        /// Frees the teacher's buffers and starts the student's frames; `Finish` follows them.
+        /// Frees the teacher's buffers (none when its top-k was read) and starts the student's frames; `Finish`
+        /// follows them.
         final class StudentStart extends Frame {
             final TeacherHead teacher;
             final long event;
@@ -327,18 +381,21 @@ public final class ModelTraining {
 
             @Override
             void work() throws IOException {
-                device.cuda.destroyEvent(event);
-                for (long address : new long[] {
-                    teacher.head,
-                    teacher.finalNorm,
-                    teacher.normed,
-                    teacher.logits,
-                    teacher.ids,
-                    teacher.logProbs,
-                    batchStates
-                }) device.gpu.free(address);
-                device.gpu.freeHostWeights(streamAddress);
-                log("teacher: top-" + settings.topK() + " of every position kept");
+                if (teacher != null) {
+                    device.cuda.destroyEvent(event);
+                    for (long address : new long[] {
+                        teacher.head,
+                        teacher.finalNorm,
+                        teacher.normed,
+                        teacher.logits,
+                        teacher.ids,
+                        teacher.logProbs,
+                        batchStates
+                    }) device.gpu.free(address);
+                    device.gpu.freeHostWeights(streamAddress);
+                    writeTeacher(teacherIds, teacherLogProbs);
+                    log("teacher: top-" + settings.topK() + " of every position kept in " + teacherFile());
+                }
                 steps = new Steps(lattice, embedded, teacherIds, teacherLogProbs, sequences, length, completions);
                 steps.start().whenComplete((ignored, failure) -> {
                     if (failure != null) done.completeExceptionally(failure);
@@ -908,8 +965,17 @@ public final class ModelTraining {
         // ---- the frames ----
 
         /// Publishes the first evaluation; `done` completes when the last frame has run.
-        CompletableFuture<Void> start() {
-            lattice.lake().publish(new Evaluate(true));
+        CompletableFuture<Void> start() throws IOException {
+            Properties resumed = readState();
+            if (resumed == null) {
+                lattice.lake().publish(new Evaluate(true));
+                return done;
+            }
+            step = Integer.parseInt(resumed.getProperty("step"));
+            update = Integer.parseInt(resumed.getProperty("update"));
+            best = Double.parseDouble(resumed.getProperty("best"));
+            log(String.format(Locale.ROOT, "resumed at step %d (best held-out KL %.6f)", step, best));
+            next();
             return done;
         }
 
@@ -978,6 +1044,7 @@ public final class ModelTraining {
                     best = heldOut;
                     save();
                 }
+                if (!initial && pendingSequences == 0) writeState(step, update, best);
                 next();
             }
         }
@@ -1040,6 +1107,137 @@ public final class ModelTraining {
             for (long address : owned) device.gpu.free(address);
             gdn.close();
             attention.close();
+        }
+    }
+
+    // ---- resuming ----
+
+    private Path teacherFile() {
+        return settings.out().resolve("resume").resolve("teacher.bin");
+    }
+
+    /// The teacher's top-k ids and log-probabilities, after a line naming the run's identity.
+    private void writeTeacher(MemorySegment ids, MemorySegment logProbs) throws IOException {
+        Path file = teacherFile(), partial = file.resolveSibling("teacher.bin.partial");
+        Files.createDirectories(file.getParent());
+        try (FileChannel channel = FileChannel.open(
+                partial, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            write(channel, MemorySegment.ofArray((teacherIdentity() + "\n").getBytes(StandardCharsets.UTF_8)));
+            write(channel, ids);
+            write(channel, logProbs);
+        }
+        Files.move(partial, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /// Reads the kept top-k into `ids` and `logProbs` if it is this run's; false otherwise.
+    private boolean readTeacher(MemorySegment ids, MemorySegment logProbs) throws IOException {
+        Path file = teacherFile();
+        if (!Files.exists(file)) return false;
+        byte[] header = (teacherIdentity() + "\n").getBytes(StandardCharsets.UTF_8);
+        if (Files.size(file) != header.length + ids.byteSize() + logProbs.byteSize()) return false;
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            MemorySegment kept = MemorySegment.ofArray(new byte[header.length]);
+            read(channel, kept);
+            if (!java.util.Arrays.equals(kept.toArray(ValueLayout.JAVA_BYTE), header)) return false;
+            read(channel, ids);
+            read(channel, logProbs);
+        }
+        return true;
+    }
+
+    /// The teacher depends on the data and the k it keeps, not on the student's settings.
+    private String teacherIdentity() {
+        return identity.replaceAll(" (holdout|accumulate|scaleRate|normRate|codes|norms)=\\S+", "");
+    }
+
+    /// Every layer's trainable parameters, in the order the state files hold them.
+    private static List<HostParameter> parameters(HostLayer layer) {
+        List<HostParameter> parameters = new ArrayList<>();
+        for (HostLinear linear : layer.linears().values()) parameters.add(linear.scales());
+        parameters.addAll(layer.norms().values());
+        return parameters;
+    }
+
+    /// Writes the training state next to the last one and then replaces it, so a stop at any point leaves one
+    /// whole state.
+    private void writeState(int step, int update, double best) throws IOException {
+        Path resume = settings.out().resolve("resume"), partial = resume.resolve("state.partial");
+        Path state = resume.resolve("state"), old = resume.resolve("state.old");
+        deleteTree(partial);
+        Files.createDirectories(partial);
+        for (HostLayer layer : model) {
+            try (FileChannel channel = FileChannel.open(
+                    partial.resolve("layer-" + layer.index() + ".bin"),
+                    StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE)) {
+                for (HostParameter parameter : parameters(layer)) {
+                    write(channel, parameter.values());
+                    write(channel, parameter.first());
+                    write(channel, parameter.second());
+                }
+            }
+        }
+        Properties progress = new Properties();
+        progress.setProperty("identity", identity);
+        progress.setProperty("step", Integer.toString(step));
+        progress.setProperty("update", Integer.toString(update));
+        progress.setProperty("best", Double.toString(best));
+        try (Writer writer = Files.newBufferedWriter(partial.resolve("progress.properties"))) {
+            progress.store(writer, null);
+        }
+        deleteTree(old);
+        if (Files.exists(state)) Files.move(state, old, StandardCopyOption.ATOMIC_MOVE);
+        Files.move(partial, state, StandardCopyOption.ATOMIC_MOVE);
+        deleteTree(old);
+        log("training state at step " + step + " kept in " + state);
+    }
+
+    /// Reads the kept training state into the host parameters if it is this run's; null otherwise.
+    private Properties readState() throws IOException {
+        Path resume = settings.out().resolve("resume"), state = resume.resolve("state");
+        // A stop between the two moves leaves the last whole state as `state.old`.
+        if (!Files.exists(state) && Files.exists(resume.resolve("state.old")))
+            Files.move(resume.resolve("state.old"), state, StandardCopyOption.ATOMIC_MOVE);
+        Path file = state.resolve("progress.properties");
+        if (!Files.exists(file)) return null;
+        Properties progress = new Properties();
+        try (Reader reader = Files.newBufferedReader(file)) {
+            progress.load(reader);
+        }
+        if (!identity.equals(progress.getProperty("identity"))) {
+            log("the training state in " + state + " is another run's (" + progress.getProperty("identity")
+                    + "); starting over");
+            return null;
+        }
+        for (HostLayer layer : model) {
+            try (FileChannel channel =
+                    FileChannel.open(state.resolve("layer-" + layer.index() + ".bin"), StandardOpenOption.READ)) {
+                for (HostParameter parameter : parameters(layer)) {
+                    read(channel, parameter.values());
+                    read(channel, parameter.first());
+                    read(channel, parameter.second());
+                }
+                if (channel.position() != channel.size())
+                    throw new IOException("layer " + layer.index() + "'s training state has the wrong size");
+            }
+        }
+        return progress;
+    }
+
+    private static void write(FileChannel channel, MemorySegment segment) throws IOException {
+        ByteBuffer buffer = segment.asByteBuffer();
+        while (buffer.hasRemaining()) channel.write(buffer);
+    }
+
+    private static void read(FileChannel channel, MemorySegment segment) throws IOException {
+        ByteBuffer buffer = segment.asByteBuffer();
+        while (buffer.hasRemaining()) if (channel.read(buffer) < 0) throw new EOFException("training state ends early");
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (!Files.exists(root)) return;
+        try (var paths = Files.walk(root)) {
+            for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(path);
         }
     }
 
