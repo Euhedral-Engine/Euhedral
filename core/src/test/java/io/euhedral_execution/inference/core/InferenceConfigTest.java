@@ -1,8 +1,10 @@
 package io.euhedral_execution.inference.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
@@ -44,5 +46,13 @@ class InferenceConfigTest {
         assertThrows(IllegalArgumentException.class, () -> withCache(1 << 30, 0));
         assertThrows(IllegalArgumentException.class, () -> withCache(1 << 30, 1000));
         assertThrows(IllegalArgumentException.class, () -> withCache(1 << 30, -512));
+    }
+
+    @Test
+    void carriesTheSelectedCacheFormat() {
+        assertNull(withCache(0, 2048).kvCache(), "the artifact's format");
+        var selected = new InferenceConfig(
+                Path.of("a"), Path.of("t"), Path.of("l"), cpus(), 32768, Duration.ofSeconds(1), 0, 2048, KvFormat.BF16);
+        assertEquals(KvFormat.BF16, selected.kvCache());
     }
 }

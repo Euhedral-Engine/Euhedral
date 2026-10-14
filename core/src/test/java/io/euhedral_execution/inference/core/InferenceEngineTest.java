@@ -12,6 +12,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.EngineModelFixture;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -42,6 +43,41 @@ class InferenceEngineTest {
                 session.generate("!", 2, ignored -> {});
             }
             assertEquals(1, lattices.get());
+        }
+    }
+
+    @Test
+    void theConfiguredCacheFormatSizesTheModelAndReachesTheRuntime() throws Exception {
+        var base = config();
+        var bf16 = new InferenceConfig(
+                base.artifactPath(),
+                base.tokenizerDirectory(),
+                base.cudaLibraryPath(),
+                base.workerCpus(),
+                base.maxContextTokens(),
+                base.shutdownTimeout(),
+                base.prefixCacheBytes(),
+                base.prefixCacheCheckpointTokens(),
+                KvFormat.BF16);
+        var bootstrap = new FakeBootstrap();
+        try (var engine = InferenceEngine.load(bf16, bootstrap)) {
+            assertEquals(KvFormat.BF16, bootstrap.kvFormat);
+            assertEquals(KvFormat.BF16, runtime(engine).kvFormat());
+        }
+        var defaults = new FakeBootstrap();
+        try (var engine = InferenceEngine.load(base, defaults)) {
+            assertEquals(KvFormat.NVFP4, defaults.kvFormat, "without a profiled artifact the cache is NVFP4");
+            assertEquals(KvFormat.NVFP4, runtime(engine).kvFormat());
+        }
+    }
+
+    private static Qwen38Runtime runtime(InferenceEngine engine) {
+        try {
+            var field = InferenceEngine.class.getDeclaredField("model");
+            field.setAccessible(true);
+            return (Qwen38Runtime) field.get(engine);
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError(failure);
         }
     }
 
@@ -366,7 +402,12 @@ class InferenceEngineTest {
 
                 @Override
                 Qwen38Model loadModel(
-                        Path path, Artifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
+                        Path path,
+                        Artifact artifact,
+                        ArtifactProfile profile,
+                        ExecutionGpu gpu,
+                        int maxContext,
+                        KvFormat kvFormat)
                         throws java.io.IOException {
                     if (selected == 2) throw new IllegalStateException("model");
                     if (selected == 3)
@@ -374,7 +415,7 @@ class InferenceEngineTest {
                                 gpu,
                                 new io.euhedral_execution.inference.core.model.qwen38.loader.Weights(
                                         null, null, null, null, null, null));
-                    return super.loadModel(path, artifact, profile, gpu, maxContext);
+                    return super.loadModel(path, artifact, profile, gpu, maxContext, kvFormat);
                 }
 
                 @Override
@@ -406,7 +447,8 @@ class InferenceEngineTest {
                 new io.euhedral_execution.inference.core.artifact.TensorDescriptor[0]);
         var failure = assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceEngine.Bootstrap().loadModel(Path.of("model.edrl"), artifact, null, null, 262145));
+                () -> new InferenceEngine.Bootstrap()
+                        .loadModel(Path.of("model.edrl"), artifact, null, null, 262145, KvFormat.NVFP4));
         assertEquals(
                 "a context of 262145 tokens is longer than the 262144 positions the model supports; set a smaller max "
                         + "context",
@@ -694,6 +736,7 @@ class InferenceEngineTest {
         int gpuCloseCount;
         int modelLoads;
         int artifactReads;
+        KvFormat kvFormat;
 
         @Override
         Artifact readArtifact(Path path) {
@@ -707,9 +750,16 @@ class InferenceEngineTest {
         }
 
         @Override
-        Qwen38Model loadModel(Path path, Artifact artifact, ArtifactProfile profile, ExecutionGpu gpu, int maxContext)
+        Qwen38Model loadModel(
+                Path path,
+                Artifact artifact,
+                ArtifactProfile profile,
+                ExecutionGpu gpu,
+                int maxContext,
+                KvFormat kvFormat)
                 throws java.io.IOException {
             modelLoads++;
+            this.kvFormat = kvFormat;
             return EngineModelFixture.load(gpu, EngineExecutionFixture.weights());
         }
 

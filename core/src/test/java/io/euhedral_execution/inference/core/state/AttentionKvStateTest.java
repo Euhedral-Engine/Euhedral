@@ -33,6 +33,49 @@ class AttentionKvStateTest {
     }
 
     @Test
+    void aBf16CacheAllocatesPagesOfBf16Rows() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024, KvFormat.BF16)) {
+            assertEquals(KvFormat.BF16, state.format());
+            assertEquals(256L * 512 * 4, state.planePageBytes());
+            state.prepareAppend(0, 300);
+            long[] table = gpu.tableEntries.get(state.keyCacheAddress());
+            for (long page : state.pageAddresses()) assertEquals(2L * 256 * 512 * 4, gpu.allocations.get(page));
+            assertEquals(state.pageAddresses().get(1), table[1]);
+            assertEquals(state.pageAddresses().get(1) + 256L * 512 * 4, table[table.length / 2 + 1]);
+        }
+        assertTrue(gpu.allocations.isEmpty());
+    }
+
+    @Test
+    void longContextsSizeBf16Pages() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState state = new AttentionKvState(gpu, 1024, KvFormat.BF16)) {
+            state.prepareAppend(0, 131072);
+            assertEquals(131072, state.capacity());
+            assertEquals(512, state.pageAddresses().size());
+            long bytes = 0;
+            for (long page : state.pageAddresses()) bytes += gpu.allocations.get(page);
+            assertEquals(131072L * 2 * 512 * 4, bytes);
+        }
+        // The largest legal context of the widest KV geometry stays in range.
+        assertEquals(256L * 512 * 64, AttentionKvState.planePageBytes(16384, KvFormat.BF16));
+    }
+
+    @Test
+    void fingerprintIncludesTheCacheFormat() {
+        RecordingGpu gpu = new RecordingGpu();
+        try (AttentionKvState nvfp4 = new AttentionKvState(gpu, 1024, KvFormat.NVFP4);
+                AttentionKvState bf16 = new AttentionKvState(gpu, 1024, KvFormat.BF16)) {
+            var first = new io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint();
+            var second = new io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint();
+            nvfp4.fingerprint(first);
+            bf16.fingerprint(second);
+            assertNotEquals(first.value(), second.value());
+        }
+    }
+
+    @Test
     void aPromptsChunksAppendInOrderAfterOneReservation() {
         RecordingGpu gpu = new RecordingGpu();
         try (AttentionKvState state = new AttentionKvState(gpu, 1024)) {

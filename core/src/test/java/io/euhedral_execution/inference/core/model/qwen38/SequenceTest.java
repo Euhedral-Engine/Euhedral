@@ -383,4 +383,23 @@ class SequenceTest {
             this.closeCount++;
         }
     }
+
+    @Test
+    void theCacheFormatIsChosenBeforeTheCachesExist() {
+        var sequence = new Sequence(1);
+        assertEquals(io.euhedral_execution.inference.core.state.KvFormat.NVFP4, sequence.kvFormat());
+        sequence.useKvFormat(io.euhedral_execution.inference.core.state.KvFormat.BF16);
+        var held = HeldWork.admit(sequence);
+        Quantum.attachSequenceState(
+                new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8)), sequence, new MemoryGpu());
+        var attention = (AttentionStates) sequence.kvCacheState();
+        assertEquals(io.euhedral_execution.inference.core.state.KvFormat.BF16, attention.format());
+        assertEquals(
+                io.euhedral_execution.inference.core.state.KvFormat.BF16,
+                attention.forLayer(1).format());
+        assertThrows(
+                IllegalStateException.class,
+                () -> sequence.useKvFormat(io.euhedral_execution.inference.core.state.KvFormat.NVFP4));
+        held.commit(0);
+    }
 }

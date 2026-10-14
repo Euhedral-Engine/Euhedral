@@ -192,7 +192,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
         this.inShortlist = new boolean[plan.weights().config().vocabSize()];
         for (int token : this.draftTokens)
             if (token >= 0 && token < this.inShortlist.length) this.inShortlist[token] = true;
-        this.checkpoint = new MtpCheckpoint(plan.weights().config());
+        this.checkpoint = new MtpCheckpoint(plan.weights().config(), sequence.kvFormat());
     }
 
     /// MTP state in a checkpoint at `p`: the MTP cache's rows below `p - 1` and the base hidden row of `p - 1`.
