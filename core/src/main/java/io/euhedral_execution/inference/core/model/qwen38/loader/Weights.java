@@ -38,4 +38,11 @@ public record Weights(
     public Weights {
         runtimeObjects = runtimeObjects == null ? Map.of() : Map.copyOf(runtimeObjects);
     }
+
+    /// The disk-backed objects: those execution reads from the artifact file.
+    public java.util.List<TensorHandle> diskBacked() {
+        return this.runtimeObjects.values().stream()
+                .filter(TensorHandle::diskBacked)
+                .toList();
+    }
 }
