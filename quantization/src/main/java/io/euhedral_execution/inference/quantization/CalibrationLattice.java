@@ -70,6 +70,11 @@ public final class CalibrationLattice implements AutoCloseable {
         return new CalibrationLattice(lattice, lake, new HostTasks(lake));
     }
 
+    /// The lattice itself, for an engine [io.euhedral_execution.inference.core.model.qwen38.Execution] of its own.
+    public ControlPlaneLattice terminal() {
+        return lattice;
+    }
+
     /// The lake frames are published into.
     public InferenceLake lake() {
         return lake;
