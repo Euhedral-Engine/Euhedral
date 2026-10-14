@@ -156,16 +156,16 @@ public final class Calibrate {
                         });
             });
         }
-        return chain.thenRun(() -> {
+        return chain.thenCompose(ignored -> {
                     try {
                         device.select(device.stream);
                         dropCheckpoint();
-                        heads(tokens, forward, states, batchStates, sequences, length);
+                        return heads(tokens, forward, states, batchStates, sequences, length);
                     } catch (IOException failure) {
                         throw new UncheckedIOException(failure);
                     }
-                    log("done");
                 })
+                .thenRun(() -> log("done"))
                 .whenComplete((ignored, failure) -> {
                     device.select(device.stream);
                     pipeline.close();
@@ -428,52 +428,73 @@ public final class Calibrate {
         log(tokens.length + " sequences of " + tokens[0].length + " tokens embedded");
     }
 
-    private void heads(
+    /// The LM head and the draft head rounded, after the MTP layer (whose rounding lanes the chain waits for).
+    private CompletableFuture<Void> heads(
             int[][] tokens, LayerForward forward, MemorySegment states, long batchStates, int sequences, int length)
             throws IOException {
         var c = checkpoint.config;
         float eps = (float) c.eps();
         long finalNorm = uploadTensor("model.language_model.norm.weight");
         long headHessian = zeroed(4L * hidden * hidden);
-        long draftHessian = headHessian;
         long normed = device.gpu.allocate(2L * settings.batch() * length * hidden);
+        CompletableFuture<Long> draftHessian;
         try {
             if (settings.skipMtp()) {
                 batches(states, batchStates, sequences, length, false, count -> {
                     device.gpu.rmsNormUnitOffsetBf16(batchStates, finalNorm, normed, count * length, hidden, eps);
                     device.accumulateHessian(headHessian, normed, count * length, hidden);
                 });
+                draftHessian = CompletableFuture.completedFuture(headHessian);
             } else {
                 draftHessian =
                         mtp(tokens, forward, states, batchStates, normed, finalNorm, headHessian, sequences, length);
             }
-            var head = checkpoint.object("text/output_head");
-            long headWeights = uploadObject(head);
+        } catch (IOException | RuntimeException failure) {
+            for (long a : new long[] {normed, finalNorm, headHessian}) device.gpu.free(a);
+            throw failure;
+        }
+        var result = new java.util.concurrent.atomic.AtomicLong(headHessian);
+        return draftHessian
+                .thenAccept(draft -> {
+                    device.select(device.stream);
+                    result.set(draft);
+                    try {
+                        roundHeads(headHessian, draft);
+                    } catch (IOException failure) {
+                        throw new UncheckedIOException(failure);
+                    }
+                })
+                .whenComplete((ignored, failure) -> {
+                    device.select(device.stream);
+                    device.gpu.free(normed);
+                    device.gpu.free(finalNorm);
+                    device.gpu.free(headHessian);
+                    if (result.get() != headHessian) device.gpu.free(result.get());
+                });
+    }
+
+    private void roundHeads(long headHessian, long draftHessian) throws IOException {
+        var head = checkpoint.object("text/output_head");
+        long headWeights = uploadObject(head);
+        try {
+            device.gpu.free(
+                    roundObject("text/output_head", headWeights, head.rows(), (int) head.columns(), headHessian));
+            int[] ids = draftIds();
+            long draft = device.gpu.allocate(2L * ids.length * hidden);
             try {
-                device.gpu.free(
-                        roundObject("text/output_head", headWeights, head.rows(), (int) head.columns(), headHessian));
-                int[] ids = draftIds();
-                long draft = device.gpu.allocate(2L * ids.length * hidden);
-                try {
-                    gather(headWeights, ids, draft);
-                    device.gpu.free(roundObject("text/draft_head", draft, ids.length, hidden, draftHessian));
-                } finally {
-                    device.gpu.free(draft);
-                }
+                gather(headWeights, ids, draft);
+                device.gpu.free(roundObject("text/draft_head", draft, ids.length, hidden, draftHessian));
             } finally {
-                device.gpu.free(headWeights);
+                device.gpu.free(draft);
             }
         } finally {
-            device.gpu.free(normed);
-            device.gpu.free(finalNorm);
-            device.gpu.free(headHessian);
-            if (draftHessian != headHessian) device.gpu.free(draftHessian);
+            device.gpu.free(headWeights);
         }
     }
 
-    /// Accumulates the LM head's Hessian, rounds the MTP layer and returns the draft head's Hessian (the MTP
-    /// output's).
-    private long mtp(
+    /// Accumulates the LM head's Hessian, rounds the MTP layer and completes with the draft head's Hessian (the
+    /// MTP output's) once the layer's rounding lanes are done.
+    private CompletableFuture<Long> mtp(
             int[][] tokens,
             LayerForward forward,
             MemorySegment states,
@@ -497,7 +518,14 @@ public final class Calibrate {
         long scratchNormed = device.gpu.allocate(2L * batchRows * hidden);
         long stemHessian = zeroed(4L * 4 * hidden * hidden);
         long rowBytes = 2L * hidden;
-        try (LayerWeights layer = LayerWeights.mtp(device.gpu, checkpoint)) {
+        LayerWeights layer = LayerWeights.mtp(device.gpu, checkpoint);
+        Runnable free = () -> {
+            layer.close();
+            for (long a : new long[] {embeddingNorm, hiddenNorm, mtpNorm, stem, scratch, scratchNormed, stemHessian}) {
+                device.gpu.free(a);
+            }
+        };
+        try {
             var projection = checkpoint.object("mtp/input_projection");
             long projectionWeights = uploadObject(projection);
             // The stem of each batch: [RMSNorm(embedding of p + 1, embedding norm); RMSNorm(normed hidden p, hidden
@@ -545,24 +573,30 @@ public final class Calibrate {
             device.gpu.free(projectionDecoded);
             device.gpu.free(table);
             Map<String, Long> hessians = observeMtp(layer, forward, states, batchStates, sequences, rows);
-            roundAll(layer, hessians);
-            long draftHessian = zeroed(4L * hidden * hidden);
-            long packed = (long) rows * rowBytes;
-            for (int s = 0; s < sequences; s += settings.batch()) {
-                int count = Math.min(settings.batch(), sequences - s);
-                device.gpu.copyHostToDevice(
-                        batchStates, states.asSlice(s * sequenceBytes, count * packed), count * packed);
-                forward.forward(layer, batchStates, count, rows, null);
-                device.gpu.rmsNormUnitOffsetBf16(batchStates, mtpNorm, normed, count * rows, hidden, eps);
-                device.accumulateHessian(draftHessian, normed, count * rows, hidden);
-            }
-            device.synchronize();
-            log("MTP layer done");
-            return draftHessian;
-        } finally {
-            for (long a : new long[] {embeddingNorm, hiddenNorm, mtpNorm, stem, scratch, scratchNormed, stemHessian}) {
-                device.gpu.free(a);
-            }
+            return roundAll(layer, hessians)
+                    .thenApply(ignored -> {
+                        device.select(device.stream);
+                        long draftHessian = zeroed(4L * hidden * hidden);
+                        long packed = (long) rows * rowBytes;
+                        for (int s = 0; s < sequences; s += settings.batch()) {
+                            int count = Math.min(settings.batch(), sequences - s);
+                            device.gpu.copyHostToDevice(
+                                    batchStates, states.asSlice(s * sequenceBytes, count * packed), count * packed);
+                            forward.forward(layer, batchStates, count, rows, null);
+                            device.gpu.rmsNormUnitOffsetBf16(batchStates, mtpNorm, normed, count * rows, hidden, eps);
+                            device.accumulateHessian(draftHessian, normed, count * rows, hidden);
+                        }
+                        device.synchronize();
+                        log("MTP layer done");
+                        return draftHessian;
+                    })
+                    .whenComplete((ignored, failure) -> {
+                        device.select(device.stream);
+                        free.run();
+                    });
+        } catch (IOException | RuntimeException failure) {
+            free.run();
+            throw failure;
         }
     }
 

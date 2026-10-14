@@ -48,8 +48,9 @@ public final class Rotate {
 
     static final int HIDDEN = 5120;
     private static final int GROUP = 64;
-    /// Rows of a tensor transformed at once.
-    private static final int CHUNK_ROWS = 16384;
+    /// Rows of a tensor transformed at once: as many as the widest residual-writing tensor (the MLP down
+    /// projection, 5120 x 17408) has values, so that one buffer holds either.
+    private static final int CHUNK_ROWS = 17408;
     private static final String TEXT = "model.language_model.";
     private static final Pattern INPUT = Pattern.compile(
             "model\\.language_model\\.layers\\.(\\d+)\\.(linear_attn\\.in_proj_(qkv|z|a|b)|self_attn\\.[qkv]_proj"
@@ -86,8 +87,9 @@ public final class Rotate {
         return TEXT + "layers." + m.group(1) + "." + norm + ".weight";
     }
 
-    /// A Hadamard matrix of order 20 (Paley's first construction with q = 19): H = I + S with S skew, its first row
-    /// and column ±1 and the rest the Jacobsthal matrix of the quadratic residues; entries ±1, H H^T = 20 I.
+    /// A Hadamard matrix of order 20 (Paley's first construction with q = 19): H = I + S with S skew, its first
+    /// row and column ±1 and the rest the Jacobsthal matrix of the quadratic residues; entries ±1, H H^T = 20
+    /// I.
     static int[][] hadamard20() {
         int q = 19;
         boolean[] square = new boolean[q];
