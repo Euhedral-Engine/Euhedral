@@ -118,10 +118,54 @@ public final class Device implements AutoCloseable {
         cuda.gemmBf16(cublas, Cuda.CUBLAS_OP_T, Cuda.CUBLAS_OP_N, n, rows, k, 1.0f, w, k, x, k, 0.0f, y, n, true);
     }
 
-    /// hessian [k, k] (FP32) += x^T x for x [rows, k] (BF16), FP32 accumulation.
+    /// Column block of the symmetric Hessian accumulation.
+    private static final int HESSIAN_BLOCK = 1024;
+
+    /// The upper blocks of hessian [k, k] (FP32, column-major) += x^T x for x [rows, k] (BF16), FP32 accumulation:
+    /// the product is symmetric, so only blocks on or above the diagonal are computed (about half the work); call
+    /// [#symmetrize] once the accumulation is complete.
     public void accumulateHessian(long hessian, long x, int rows, int k) {
-        cuda.gemmBf16(cublas, Cuda.CUBLAS_OP_N, Cuda.CUBLAS_OP_T, k, k, rows, 1.0f, x, k, x, k, 1.0f, hessian, k);
+        for (int i = 0; i < k; i += HESSIAN_BLOCK) {
+            int height = Math.min(HESSIAN_BLOCK, k - i);
+            for (int j = i; j < k; j += HESSIAN_BLOCK) {
+                int width = Math.min(HESSIAN_BLOCK, k - j);
+                cuda.gemmBf16(
+                        cublas,
+                        Cuda.CUBLAS_OP_N,
+                        Cuda.CUBLAS_OP_T,
+                        height,
+                        width,
+                        rows,
+                        1.0f,
+                        x + 2L * i,
+                        k,
+                        x + 2L * j,
+                        k,
+                        1.0f,
+                        hessian + 4L * ((long) j * k + i),
+                        k);
+            }
+        }
     }
+
+    /// Completes a Hessian accumulated by [#accumulateHessian]: its lower triangle from its upper one.
+    public void symmetrize(long hessian, int k) {
+        if (mirrorUpper == null) {
+            mirrorUpper = cuda.compileResource("gptq.cu", java.util.List.of("mirror_upper"))
+                    .getFirst();
+        }
+        long count = (long) k * k;
+        cuda.launch(
+                mirrorUpper,
+                (int) ((count + 255) / 256),
+                1,
+                256,
+                0,
+                stream,
+                new Cuda.Arguments().pointer(hessian).integer(k));
+    }
+
+    private volatile Cuda.Function mirrorUpper;
 
     @Override
     public void close() {

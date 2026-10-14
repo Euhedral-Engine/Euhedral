@@ -319,3 +319,12 @@ extern "C" __global__ void fill_bytes(unsigned char* a, long long count, unsigne
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) a[i] = value;
 }
+
+// Copies the upper triangle of a column-major n x n matrix over its lower triangle (a Hessian accumulated by upper
+// blocks only).
+extern "C" __global__ void mirror_upper(float* a, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)n * n) return;
+    long long r = i % n, c = i / n;  // column-major (r, c)
+    if (r > c) a[c * n + r] = a[r * n + c];
+}
