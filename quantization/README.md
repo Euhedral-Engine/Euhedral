@@ -51,6 +51,23 @@ verifies the rest `--rows` (8) forced tokens at a time; each logits row is score
 `score.cu` reading the reference row a reader frame fetched into mapped host memory. `--batch` (4) chunks run together
 on their own sequences, each step group of all of them in one batched verification (at most 32 rows); `--host-mib` (2304) keeps that much of the weights in host memory.
 
+## MTP drafter corpus
+
+```bash
+./gradlew :quantization:run --args="generate --artifact qwen3_8_27b_nvfp4_compressed.edrl --tokenizer /path/to/checkpoint \
+    --out corpus/ --prompts prompts.jsonl --max-tokens 4096 --batch 8 --host-mib 4096"
+```
+
+Answers chat prompts (`{"id", "messages", "tools"?}` per line; `tools/gptq/calibration.py prompts ... --chat N`) with the
+artifact's own greedy decode and keeps what the MTP drafter learns from: every token, and the post-final-norm hidden
+of every row the base model ran, which is what seeds the drafter (docs/MTP_CONTRACT.md §2). Prompts are rendered by
+the checkpoint's chat template with thinking on and prefilled in the engine's 512-row chunks, as the server does; then
+up to `--batch` sequences (at most 32) decode together, one row each per batched verification, so every row is bit
+for bit the artifact's own one-row decode. The corpus (`Corpus`) is `tokens.bin`, `hidden.bin` (BF16) and
+`index.jsonl`; a stopped run resumes by prompt id. The run's bookkeeping is a lattice source that quanta post records
+to. Each sequence holds about 144 MB of GDN state, so `--batch` and `--host-mib` trade against each other on a 16 GB
+card (8 and 4096 for `nvfp4-compressed`).
+
 ## Libraries
 
 `cudaMathLibraries` downloads cuBLAS 13.2, cuSOLVER 12.0 and nvJitLink 13.1 from NVIDIA's CUDA 13.1 redistributables
