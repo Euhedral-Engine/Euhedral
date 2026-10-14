@@ -1,8 +1,9 @@
-// NVRTC module root: the attention leaves. NVFP4 cache layout and decode/prefill attention come
-// first; the QK norm/RoPE and KV append leaves follow.
+// NVRTC module root: the attention leaves. The NVFP4 and BF16 cache layouts and decode/prefill attention over
+// either come first; the QK norm/RoPE and KV append leaves follow.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include "nvfp4_kv.cuh"
+#include "bf16_kv.cuh"
 #include "nvfp4_attention.cuh"
 #include "nvfp4_prefill32.cuh"
 #include "nvfp4_prefill_fa2.cuh"

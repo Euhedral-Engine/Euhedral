@@ -305,6 +305,14 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
         uint32_t cache_length, uint64_t start, const void* position, void* scratch);
+// The same over BF16 pages: 512 bytes per D256 head row, the 256 BF16 values as computed.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_kv_append_bf16(
+        const void* query_key, const void* gate, void* keys, void* values,
+        uint32_t rows, uint32_t query_width, uint32_t key_width, uint64_t start, const void* position);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_causal_bf16(
+        const void* query_key, const void* gate, const void* keys, const void* values, void* output,
+        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
+        uint32_t cache_length, uint64_t start, const void* position, void* scratch);
 
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_attention_qk_norm_rope_bf16(
         const void* device_query_key,

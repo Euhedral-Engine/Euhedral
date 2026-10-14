@@ -50,9 +50,115 @@ static __device__ __forceinline__ void load_values(uint2 (&codes)[8], unsigned (
         scales[it] = valid ? row[nvfp4kv::kCodeBytes + (lane & 15u)] : 0u;
     }
 }
+// The cache-format pieces of the kernel: the raw K tile's shared-memory rows and their copy, the A fragments read
+// from them, and V's register prefetch and FP16 expansion.
+template <class Kv> struct Format;
+template <> struct Format<Nvfp4Kv> {
+    static constexpr unsigned kRow = ROW;
+    static __device__ __forceinline__ void issue(unsigned char* raw, const unsigned char* const* keyPages, unsigned base,
+            unsigned end, unsigned head, unsigned heads, unsigned lane) {
+        issue_keys(raw, keyPages, base, end, head, heads, lane);
+    }
+    // The A fragments of the tile rows of keys g and g + 8 (row0, row1), from the raw codes and scales.
+    struct Keys {
+        const unsigned char* row0;
+        const unsigned char* row1;
+        unsigned scaleWords0[4], scaleWords1[4];
+        __device__ __forceinline__ Keys(const unsigned char* first, const unsigned char* second) : row0(first), row1(second) {
+            const uint4 scaleBytes0 = *reinterpret_cast<const uint4*>(row0 + 128);
+            const uint4 scaleBytes1 = *reinterpret_cast<const uint4*>(row1 + 128);
+            scaleWords0[0] = scaleBytes0.x; scaleWords0[1] = scaleBytes0.y; scaleWords0[2] = scaleBytes0.z; scaleWords0[3] = scaleBytes0.w;
+            scaleWords1[0] = scaleBytes1.x; scaleWords1[1] = scaleBytes1.y; scaleWords1[2] = scaleBytes1.z; scaleWords1[3] = scaleBytes1.w;
+        }
+        __device__ __forceinline__ void fragment(int k, unsigned tig, const unsigned* pairs, unsigned (&a)[4]) const {
+            const uint2 codes0 = *reinterpret_cast<const uint2*>(row0 + k * 8);
+            const uint2 codes1 = *reinterpret_cast<const uint2*>(row1 + k * 8);
+            const unsigned scale0 = scale_pair((scaleWords0[k >> 2] >> (8 * (k & 3))) & 0xFFu);
+            const unsigned scale1 = scale_pair((scaleWords1[k >> 2] >> (8 * (k & 3))) & 0xFFu);
+            a[0] = half2_multiply(pairs[(codes0.x >> (8 * tig)) & 0xFFu], scale0);
+            a[1] = half2_multiply(pairs[(codes1.x >> (8 * tig)) & 0xFFu], scale1);
+            a[2] = half2_multiply(pairs[(codes0.y >> (8 * tig)) & 0xFFu], scale0);
+            a[3] = half2_multiply(pairs[(codes1.y >> (8 * tig)) & 0xFFu], scale1);
+        }
+    };
+    struct Values {
+        uint2 codes[8];
+        unsigned scales[8];
+        __device__ __forceinline__ void load(const unsigned char* const* valuePages, unsigned base, unsigned end,
+                unsigned head, unsigned heads, unsigned lane) {
+            load_values(codes, scales, valuePages, base, end, head, heads, lane);
+        }
+        // Writes the tile's FP16 rows: this lane's 16 values of token 2 it + (lane >> 4), for each it.
+        __device__ __forceinline__ void expand(__half* vbuf, const unsigned* pairs, unsigned lane) const {
+#pragma unroll
+            for (unsigned it = 0; it < 8; it++) {
+                const unsigned scale = scale_pair(scales[it]);
+                const unsigned words[2] = {codes[it].x, codes[it].y};
+                unsigned out[8];
+#pragma unroll
+                for (int h = 0; h < 2; h++)
+#pragma unroll
+                    for (int b = 0; b < 4; b++) out[h * 4 + b] = half2_multiply(pairs[(words[h] >> (8 * b)) & 0xFFu], scale);
+                uint4* dst = reinterpret_cast<uint4*>(vbuf + (2 * it + (lane >> 4)) * STRIDE + (lane & 15u) * 16);
+                dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
+                dst[1] = make_uint4(out[4], out[5], out[6], out[7]);
+            }
+        }
+    };
+};
+// BF16: 512-byte rows, 528 bytes apart in shared memory so the eight rows of a fragment fall in distinct banks.
+template <> struct Format<Bf16Kv> {
+    static constexpr unsigned kRow = bf16kv::kRowBytes + 16;
+    static __device__ __forceinline__ void issue(unsigned char* raw, const unsigned char* const* keyPages, unsigned base,
+            unsigned end, unsigned head, unsigned heads, unsigned lane) {
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            const unsigned chunk = lane + 32u * j, t = chunk / 32u, offset = chunk % 32u;
+            if (base + t < end) cp_async16(raw + t * kRow + offset * 16u, bf16kv::cache_row(keyPages, base + t, head, heads) + offset * 16u);
+        }
+    }
+    struct Keys {
+        const unsigned char* row0;
+        const unsigned char* row1;
+        __device__ __forceinline__ Keys(const unsigned char* first, const unsigned char* second) : row0(first), row1(second) {}
+        // Dimensions 16 k + 2 tig, + 1 and 16 k + 8 + 2 tig, + 1 of each row.
+        __device__ __forceinline__ void fragment(int k, unsigned tig, const unsigned*, unsigned (&a)[4]) const {
+            const unsigned* words0 = reinterpret_cast<const unsigned*>(row0) + k * 8 + tig;
+            const unsigned* words1 = reinterpret_cast<const unsigned*>(row1) + k * 8 + tig;
+            a[0] = bf16kv::widen2(words0[0]);
+            a[1] = bf16kv::widen2(words1[0]);
+            a[2] = bf16kv::widen2(words0[4]);
+            a[3] = bf16kv::widen2(words1[4]);
+        }
+    };
+    struct Values {
+        uint4 words[8][2];
+        __device__ __forceinline__ void load(const unsigned char* const* valuePages, unsigned base, unsigned end,
+                unsigned head, unsigned heads, unsigned lane) {
+#pragma unroll
+            for (unsigned it = 0; it < 8; it++) {
+                const unsigned token = base + 2 * it + (lane >> 4);
+                const bool valid = token < end;
+                const uint4* row = reinterpret_cast<const uint4*>(bf16kv::cache_row(valuePages, valid ? token : base, head, heads))
+                        + (lane & 15u) * 2;
+                words[it][0] = valid ? row[0] : make_uint4(0, 0, 0, 0);
+                words[it][1] = valid ? row[1] : make_uint4(0, 0, 0, 0);
+            }
+        }
+        __device__ __forceinline__ void expand(__half* vbuf, const unsigned*, unsigned lane) const {
+#pragma unroll
+            for (unsigned it = 0; it < 8; it++) {
+                uint4* dst = reinterpret_cast<uint4*>(vbuf + (2 * it + (lane >> 4)) * STRIDE + (lane & 15u) * 16);
+                dst[0] = bf16kv::widen8(words[it][0]);
+                dst[1] = bf16kv::widen8(words[it][1]);
+            }
+        }
+    };
+};
 }  // namespace gqa_decode
 namespace gqa_decode {
 // One (KV head, split) block of the decode attention below; `block` is its index in the one-row grid. 96 threads.
+template <class Kv>
 static __device__ __forceinline__ void decode_block(unsigned block,
         const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         unsigned int queryHeads, unsigned int keyHeads, unsigned int cacheLength, float* partial, unsigned int splits) {
@@ -63,7 +169,7 @@ static __device__ __forceinline__ void decode_block(unsigned block,
     const unsigned begin = split * span, end = min(cacheLength, begin + span);
     const unsigned tiles = begin < end ? (end - begin + KT - 1) / KT : 0;
     __shared__ __align__(16) __half vbuf[2][KT * STRIDE];            // expanded V tiles (warp 0 stages the queries here first)
-    __shared__ __align__(16) unsigned char kraw[kRing][TILE_BYTES];  // raw K tiles
+    __shared__ __align__(16) unsigned char kraw[kRing][KT * Format<Kv>::kRow];  // raw K tiles
     __shared__ __align__(16) unsigned pairs[256];                    // byte of two E2M1 codes -> FP16 pair
     __shared__ __align__(16) float4 scores[2][32];                   // one lane's four scores per tile
     __shared__ __align__(16) __half pbuf[2][8 * 24];                 // P^T source: [query][key], hi and lo, padded rows
@@ -73,12 +179,11 @@ static __device__ __forceinline__ void decode_block(unsigned block,
         for (int i = 0; i < 8; i++) mbarrier_init(&mbarriers[i], 32);
     // Rotated queries (rows >= group zero) as hi + lo FP16 B fragments: qb[k][part][2]. Warp 0 only.
     unsigned qh[16][2], ql[16][2];
-    uint2 valueCodes[8];
-    unsigned valueScales[8];
+    typename Format<Kv>::Values values;
     if (warp == 0) {
 #pragma unroll
         for (int s = 0; s < kRing - 1; s++) {
-            if ((unsigned)s < tiles) issue_keys(kraw[s], keyPages, begin + s * KT, end, kh, keyHeads, lane);
+            if ((unsigned)s < tiles) Format<Kv>::issue(kraw[s], keyPages, begin + s * KT, end, kh, keyHeads, lane);
             cp_async_commit();
         }
         __half* qhi = vbuf[0];  // 8 rows x STRIDE
@@ -87,7 +192,7 @@ static __device__ __forceinline__ void decode_block(unsigned block,
             float values[8];
             for (int d = 0; d < 8; d++)
                 values[d] = r < group ? __bfloat162float(queryKey[(kh * group + r) * D + lane + d * 32]) : 0.0f;
-            if (r < group) nvfp4kv::hadamard256(values, lane);
+            if (r < group) Kv::rotate(values, lane);
             for (int d = 0; d < 8; d++) {
                 const __half hi = __float2half_rn(values[d]);
                 qhi[r * STRIDE + lane + d * 32] = hi;
@@ -105,38 +210,27 @@ static __device__ __forceinline__ void decode_block(unsigned block,
         }
         __syncwarp();
     } else if (warp == 1 && tiles > 0) {
-        load_values(valueCodes, valueScales, valuePages, begin, end, kh, keyHeads, lane);
+        values.load(valuePages, begin, end, kh, keyHeads, lane);
     }
     __syncthreads();
     if (warp == 0) {
         for (unsigned tile = 0; tile < tiles; tile++) {
             const unsigned base = begin + tile * KT, slot = tile & 1u;
             if (tile + kRing - 1 < tiles)
-                issue_keys(kraw[(tile + kRing - 1) % kRing], keyPages, base + (kRing - 1) * KT, end, kh, keyHeads, lane);
+                Format<Kv>::issue(kraw[(tile + kRing - 1) % kRing], keyPages, base + (kRing - 1) * KT, end, kh, keyHeads, lane);
             cp_async_commit();
             cp_async_wait<kRing - 1>();
             __syncwarp();
             // A = K tile (rows = keys g and g + 8; columns 2 tig, 2 tig + 1 and 8 + 2 tig, 9 + 2 tig of dims 16 k ..): the
             // codes are bytes tig and tig + 4 of the k-th group's eight code bytes. Rows past `end` hold stale bytes;
             // their scores are masked below, and an mma row never mixes with another.
-            const unsigned char* row0 = kraw[tile % kRing] + g * ROW;
-            const unsigned char* row1 = row0 + 8 * ROW;
-            const uint4 scaleBytes0 = *reinterpret_cast<const uint4*>(row0 + 128);
-            const uint4 scaleBytes1 = *reinterpret_cast<const uint4*>(row1 + 128);
-            const unsigned scaleWords0[4] = {scaleBytes0.x, scaleBytes0.y, scaleBytes0.z, scaleBytes0.w};
-            const unsigned scaleWords1[4] = {scaleBytes1.x, scaleBytes1.y, scaleBytes1.z, scaleBytes1.w};
+            const unsigned char* row0 = kraw[tile % kRing] + g * Format<Kv>::kRow;
+            const typename Format<Kv>::Keys keys(row0, row0 + 8 * Format<Kv>::kRow);
             float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // (key g, q 2tig/+1), (key g + 8, q 2tig/+1)
 #pragma unroll
             for (int k = 0; k < 16; k++) {
-                const uint2 codes0 = *reinterpret_cast<const uint2*>(row0 + k * 8);
-                const uint2 codes1 = *reinterpret_cast<const uint2*>(row1 + k * 8);
-                const unsigned scale0 = scale_pair((scaleWords0[k >> 2] >> (8 * (k & 3))) & 0xFFu);
-                const unsigned scale1 = scale_pair((scaleWords1[k >> 2] >> (8 * (k & 3))) & 0xFFu);
                 unsigned a[4];
-                a[0] = half2_multiply(pairs[(codes0.x >> (8 * tig)) & 0xFFu], scale0);
-                a[1] = half2_multiply(pairs[(codes1.x >> (8 * tig)) & 0xFFu], scale1);
-                a[2] = half2_multiply(pairs[(codes0.y >> (8 * tig)) & 0xFFu], scale0);
-                a[3] = half2_multiply(pairs[(codes1.y >> (8 * tig)) & 0xFFu], scale1);
+                keys.fragment(k, tig, pairs, a);
                 fa2::mma16816(s, a, qh[k][0], qh[k][1]);
                 fa2::mma16816(s, a, ql[k][0], ql[k][1]);
             }
@@ -148,28 +242,12 @@ static __device__ __forceinline__ void decode_block(unsigned block,
     } else if (warp == 1) {
         for (unsigned tile = 0; tile < tiles; tile++) {
             const unsigned base = begin + tile * KT, slot = tile & 1u;
-            uint2 nextCodes[8];
-            unsigned nextScales[8];
-            if (tile + 1 < tiles) load_values(nextCodes, nextScales, valuePages, base + KT, end, kh, keyHeads, lane);
+            typename Format<Kv>::Values next;
+            if (tile + 1 < tiles) next.load(valuePages, base + KT, end, kh, keyHeads, lane);
             if (tile >= 2) mbarrier_wait(&mbarriers[kValuesEmpty + slot], ((tile >> 1) - 1) & 1u);
-#pragma unroll
-            for (unsigned it = 0; it < 8; it++) {
-                const unsigned scale = scale_pair(valueScales[it]);
-                const unsigned words[2] = {valueCodes[it].x, valueCodes[it].y};
-                unsigned out[8];
-#pragma unroll
-                for (int h = 0; h < 2; h++)
-#pragma unroll
-                    for (int b = 0; b < 4; b++) out[h * 4 + b] = half2_multiply(pairs[(words[h] >> (8 * b)) & 0xFFu], scale);
-                uint4* dst = reinterpret_cast<uint4*>(vbuf[slot] + (2 * it + (lane >> 4)) * STRIDE + (lane & 15u) * 16);
-                dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
-                dst[1] = make_uint4(out[4], out[5], out[6], out[7]);
-            }
+            values.expand(vbuf[slot], pairs, lane);
             mbarrier_arrive(&mbarriers[kValuesFull + slot]);
-            if (tile + 1 < tiles) {
-#pragma unroll
-                for (unsigned it = 0; it < 8; it++) { valueCodes[it] = nextCodes[it]; valueScales[it] = nextScales[it]; }
-            }
+            if (tile + 1 < tiles) values = next;
         }
     } else {
         float o[16][4];
@@ -238,32 +316,40 @@ static __device__ __forceinline__ void decode_block(unsigned block,
 }
 }  // namespace gqa_decode
 
-extern "C" __global__ __launch_bounds__(96) void euhedral_attention_decode_gqa_nvfp4(
-        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
-        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
-        unsigned int headDim, const unsigned long long* position, unsigned long long positionOffset,
-        float* partial, unsigned int splits) {
-    euhedral_pdl_begin();
-    const unsigned int cacheLength = (unsigned int)(*position + positionOffset) + 1u;
-    gqa_decode::decode_block(blockIdx.x, queryKey, keyPages, valuePages, queryHeads, keyHeads, cacheLength, partial, splits);
-}
+#define EUHEDRAL_ATTENTION_DECODE_GQA(name, Kv)                                                                \
+    extern "C" __global__ __launch_bounds__(96) void name(const __nv_bfloat16* queryKey,                           \
+            const __nv_bfloat16* gateValue, const unsigned char* const* keyPages,                                  \
+            const unsigned char* const* valuePages, __nv_bfloat16* output, unsigned int rows,                      \
+            unsigned int queryHeads, unsigned int keyHeads, unsigned int headDim,                                  \
+            const unsigned long long* position, unsigned long long positionOffset, float* partial,                 \
+            unsigned int splits) {                                                                                 \
+        euhedral_pdl_begin();                                                                                      \
+        const unsigned int cacheLength = (unsigned int)(*position + positionOffset) + 1u;                          \
+        gqa_decode::decode_block<Kv>(                                                                              \
+                blockIdx.x, queryKey, keyPages, valuePages, queryHeads, keyHeads, cacheLength, partial, splits);   \
+    }
+EUHEDRAL_ATTENTION_DECODE_GQA(euhedral_attention_decode_gqa_nvfp4, Nvfp4Kv)
+EUHEDRAL_ATTENTION_DECODE_GQA(euhedral_attention_decode_gqa_bf16, Bf16Kv)
 
 // Row-exact multi-row twin for speculative verification: blockIdx.y is the verified row, which attends
 // the keys up to start + row exactly as the one-row launch above at that position would (same split
 // count and block partition); rows below `from` keys are left to the per-head decode twin. Each row
 // writes its own partials (rowStride floats apart). Grid: keyHeads * (largest split count) x rows.
-extern "C" __global__ __launch_bounds__(96) void euhedral_attention_decode_gqa_nvfp4_rows(
-        const __nv_bfloat16* queryKey, const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        unsigned int queryHeads, unsigned int keyHeads, const unsigned long long* position, float* partial,
-        unsigned long long rowStride, unsigned int from) {
-    const unsigned row = blockIdx.y;
-    const unsigned length = (unsigned)*position + row + 1u;
-    if (length < from) return;
-    unsigned splits = (length + 31u) / 32u;
-    if (splits > 64u) splits = 64u;
-    if (blockIdx.x >= keyHeads * splits) return;
-    euhedral_pdl_begin();
-    gqa_decode::decode_block(blockIdx.x, queryKey + (unsigned long long)row * (queryHeads + keyHeads) * 256u, keyPages,
-            valuePages, queryHeads, keyHeads, length, partial + row * rowStride, splits);
-}
+#define EUHEDRAL_ATTENTION_DECODE_GQA_ROWS(name, Kv)                                                           \
+    extern "C" __global__ __launch_bounds__(96) void name(const __nv_bfloat16* queryKey,                           \
+            const unsigned char* const* keyPages, const unsigned char* const* valuePages, unsigned int queryHeads, \
+            unsigned int keyHeads, const unsigned long long* position, float* partial,                             \
+            unsigned long long rowStride, unsigned int from) {                                                     \
+        const unsigned row = blockIdx.y;                                                                           \
+        const unsigned length = (unsigned)*position + row + 1u;                                                    \
+        if (length < from) return;                                                                                 \
+        unsigned splits = (length + 31u) / 32u;                                                                    \
+        if (splits > 64u) splits = 64u;                                                                            \
+        if (blockIdx.x >= keyHeads * splits) return;                                                               \
+        euhedral_pdl_begin();                                                                                      \
+        gqa_decode::decode_block<Kv>(blockIdx.x,                                                                   \
+                queryKey + (unsigned long long)row * (queryHeads + keyHeads) * 256u, keyPages, valuePages,         \
+                queryHeads, keyHeads, length, partial + row * rowStride, splits);                                  \
+    }
+EUHEDRAL_ATTENTION_DECODE_GQA_ROWS(euhedral_attention_decode_gqa_nvfp4_rows, Nvfp4Kv)
+EUHEDRAL_ATTENTION_DECODE_GQA_ROWS(euhedral_attention_decode_gqa_bf16_rows, Bf16Kv)

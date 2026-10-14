@@ -45,12 +45,15 @@ static CUfunction residual_rms_norm, residual_rms_norm_row;
 static CUfunction swiglu;
 static CUfunction attention_qk_norm_rope;
 static CUfunction attention_qk_norm_rope_rows;
-static CUfunction attention_append_nvfp4, attention_prefill_nvfp4, attention_decode_nvfp4, attention_merge_nvfp4;
 /* fa2::kSharedBytes of native/src/attention/nvfp4_prefill_fa2.cuh: the K and V tiles, double buffered. */
 #define FA2_SHARED_BYTES 67584u
-static CUfunction attention_prefill_nvfp4_exact, attention_decode_nvfp4_exact, attention_prefill_fa2, attention_decode_gqa;
-/* Multi-row twins of decode attention and its merge: row j is one-row decode at its own position. */
-static CUfunction attention_decode_rows, attention_decode_gqa_rows, attention_merge_rows;
+/* The attention kernels over one cache format (NVFP4 or BF16 pages). The decode_rows, decode_gqa_rows and merge_rows
+ * twins are multi-row decode and its merge: row j is one-row decode at its own position. */
+struct attention_kernels {
+    CUfunction append, prefill, prefill_exact, prefill_fa2, decode, decode_exact, decode_gqa, merge;
+    CUfunction decode_rows, decode_gqa_rows, merge_rows;
+};
+static struct attention_kernels nvfp4_attention, bf16_attention;
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static int get_function(CUmodule module, CUfunction* function, const char* name) {
@@ -63,6 +66,27 @@ static int load_functions(CUmodule module, const char* const* names, CUfunction*
         int status = get_function(module, functions[index], names[index]);
         if (status != CUDA_SUCCESS) return status;
     }
+    return CUDA_SUCCESS;
+}
+
+/* The attention kernels over the cache format `format` (their names' format part). */
+static int load_attention_kernels(struct attention_kernels* kernels, const char* format) {
+    const char* const patterns[] = {"euhedral_attention_kv_append_%s", "euhedral_attention_prefill32_%s",
+            "euhedral_attention_prefill32_%s_exact", "euhedral_attention_prefill_fa2_%s", "euhedral_attention_decode_%s",
+            "euhedral_attention_decode_%s_exact", "euhedral_attention_decode_gqa_%s", "euhedral_attention_merge_%s",
+            "euhedral_attention_decode_%s_rows", "euhedral_attention_decode_gqa_%s_rows", "euhedral_attention_merge_%s_rows"};
+    CUfunction* const functions[] = {&kernels->append, &kernels->prefill, &kernels->prefill_exact, &kernels->prefill_fa2,
+            &kernels->decode, &kernels->decode_exact, &kernels->decode_gqa, &kernels->merge, &kernels->decode_rows,
+            &kernels->decode_gqa_rows, &kernels->merge_rows};
+    for (int index = 0; index < 11; index++) {
+        char name[64];
+        snprintf(name, sizeof name, patterns[index], format);
+        int status = get_function(attention_module, functions[index], name);
+        if (status != CUDA_SUCCESS) return status;
+    }
+    if (cuFuncSetAttribute(kernels->prefill_fa2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)FA2_SHARED_BYTES)
+            != CUDA_SUCCESS)
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
     return CUDA_SUCCESS;
 }
 
@@ -105,21 +129,14 @@ static void initialize_modules(void) {
             &attention_module, &attention_qk_norm_rope);
     if (init_status != EUHEDRAL_CUDA_SUCCESS) return;
     {
-        const char* const names[] = {"euhedral_attention_qk_norm_rope_rows_bf16", "euhedral_attention_kv_append_nvfp4",
-                "euhedral_attention_prefill32_nvfp4", "euhedral_attention_prefill32_nvfp4_exact",
-                "euhedral_attention_prefill_fa2_nvfp4", "euhedral_attention_decode_gqa_nvfp4",
-                "euhedral_attention_decode_nvfp4", "euhedral_attention_decode_nvfp4_exact",
-                "euhedral_attention_merge_nvfp4", "euhedral_attention_decode_nvfp4_rows",
-                "euhedral_attention_decode_gqa_nvfp4_rows", "euhedral_attention_merge_nvfp4_rows"};
-        CUfunction* const functions[] = {&attention_qk_norm_rope_rows, &attention_append_nvfp4, &attention_prefill_nvfp4,
-                &attention_prefill_nvfp4_exact, &attention_prefill_fa2, &attention_decode_gqa, &attention_decode_nvfp4,
-                &attention_decode_nvfp4_exact, &attention_merge_nvfp4, &attention_decode_rows,
-                &attention_decode_gqa_rows, &attention_merge_rows};
-        init_status = load_functions(attention_module, names, functions, 12);
+        const char* const names[] = {"euhedral_attention_qk_norm_rope_rows_bf16"};
+        CUfunction* const functions[] = {&attention_qk_norm_rope_rows};
+        init_status = load_functions(attention_module, names, functions, 1);
         if (init_status != CUDA_SUCCESS) return;
     }
-    if (cuFuncSetAttribute(attention_prefill_fa2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)FA2_SHARED_BYTES) != CUDA_SUCCESS)
-        init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    init_status = load_attention_kernels(&nvfp4_attention, "nvfp4");
+    if (init_status != CUDA_SUCCESS) return;
+    init_status = load_attention_kernels(&bf16_attention, "bf16");
 }
 
 // Every kernel registered here begins with euhedral_pdl_begin(), so stream-serialized
@@ -141,14 +158,17 @@ static void initialize(void) {
     euhedral_cuda_pdl_register(swiglu);
     euhedral_cuda_pdl_register(attention_qk_norm_rope);
     euhedral_cuda_pdl_register(attention_qk_norm_rope_rows);
-    euhedral_cuda_pdl_register(attention_append_nvfp4);
-    euhedral_cuda_pdl_register(attention_decode_nvfp4);
-    euhedral_cuda_pdl_register(attention_decode_nvfp4_exact);
-    euhedral_cuda_pdl_register(attention_decode_gqa);
-    euhedral_cuda_pdl_register(attention_merge_nvfp4);
-    euhedral_cuda_pdl_register(attention_decode_rows);
-    euhedral_cuda_pdl_register(attention_decode_gqa_rows);
-    euhedral_cuda_pdl_register(attention_merge_rows);
+    const struct attention_kernels* const formats[] = {&nvfp4_attention, &bf16_attention};
+    for (int index = 0; index < 2; index++) {
+        euhedral_cuda_pdl_register(formats[index]->append);
+        euhedral_cuda_pdl_register(formats[index]->decode);
+        euhedral_cuda_pdl_register(formats[index]->decode_exact);
+        euhedral_cuda_pdl_register(formats[index]->decode_gqa);
+        euhedral_cuda_pdl_register(formats[index]->merge);
+        euhedral_cuda_pdl_register(formats[index]->decode_rows);
+        euhedral_cuda_pdl_register(formats[index]->decode_gqa_rows);
+        euhedral_cuda_pdl_register(formats[index]->merge_rows);
+    }
 }
 
 #ifdef _WIN32
@@ -456,7 +476,40 @@ int euhedral_cuda_zero_device_memory(void* device_address, uint64_t byte_size) {
     return result == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)result;
 }
 
+static int kv_append(const struct attention_kernels* kernels, const void* device_query_key,
+        const void* device_gate_value, void* device_key_cache, void* device_value_cache, uint32_t rows,
+        uint32_t query_width, uint32_t key_value_width, uint64_t start_position, const void* device_position);
+
 int euhedral_cuda_attention_kv_append_nvfp4(
+        const void* device_query_key,
+        const void* device_gate_value,
+        void* device_key_cache,
+        void* device_value_cache,
+        uint32_t rows,
+        uint32_t query_width,
+        uint32_t key_value_width,
+        uint64_t start_position,
+        const void* device_position) {
+    return kv_append(&nvfp4_attention, device_query_key, device_gate_value, device_key_cache, device_value_cache, rows,
+            query_width, key_value_width, start_position, device_position);
+}
+
+int euhedral_cuda_attention_kv_append_bf16(
+        const void* device_query_key,
+        const void* device_gate_value,
+        void* device_key_cache,
+        void* device_value_cache,
+        uint32_t rows,
+        uint32_t query_width,
+        uint32_t key_value_width,
+        uint64_t start_position,
+        const void* device_position) {
+    return kv_append(&bf16_attention, device_query_key, device_gate_value, device_key_cache, device_value_cache, rows,
+            query_width, key_value_width, start_position, device_position);
+}
+
+/* Launches `kernels`' append, which it reads once the module is initialized. */
+static int kv_append(const struct attention_kernels* kernels,
         const void* device_query_key,
         const void* device_gate_value,
         void* device_key_cache,
@@ -485,7 +538,7 @@ int euhedral_cuda_attention_kv_append_nvfp4(
     uint32_t rows_arg = rows, query_width_arg = query_width, key_value_width_arg = key_value_width;
     void* parameters[] = {&query_key, &gate_value, &key_cache, &value_cache,
             &rows_arg, &query_width_arg, &key_value_width_arg, &position};
-    return launch_and_synchronize(attention_append_nvfp4, (uint32_t)((count / 256 + 3) / 4), 128, parameters);
+    return launch_and_synchronize(kernels->append, (uint32_t)((count / 256 + 3) / 4), 128, parameters);
 }
 
 static int qk_norm_rope(const void* device_query_key, const void* device_query_norm, const void* device_key_norm,
@@ -560,24 +613,35 @@ static int qk_norm_rope(const void* device_query_key, const void* device_query_n
     return launch_and_synchronize(attention_qk_norm_rope, (uint32_t)blocks, head_dim, parameters);
 }
 
-static int attention_causal(const void* query_key, const void* gate, const void* keys, const void* values, void* output,
-        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t cache_length, uint64_t start,
-        const void* device_position, uint64_t position_offset, void* scratch);
+static int attention_causal(const struct attention_kernels* kernels, const void* query_key, const void* gate,
+        const void* keys, const void* values, void* output, uint32_t rows, uint32_t query_heads, uint32_t key_heads,
+        uint32_t head_dim, uint32_t cache_length, uint64_t start, const void* device_position, uint64_t position_offset,
+        void* scratch);
 
 int euhedral_cuda_attention_causal_nvfp4(
         const void* query_key, const void* gate, const void* keys, const void* values, void* output,
         uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
         uint32_t cache_length, uint64_t start, const void* device_position, void* scratch) {
     if (device_position == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
-    return attention_causal(query_key, gate, keys, values, output, rows, query_heads, key_heads, head_dim, cache_length,
-            start, device_position, 0, scratch);
+    return attention_causal(&nvfp4_attention, query_key, gate, keys, values, output, rows, query_heads, key_heads,
+            head_dim, cache_length, start, device_position, 0, scratch);
+}
+
+int euhedral_cuda_attention_causal_bf16(
+        const void* query_key, const void* gate, const void* keys, const void* values, void* output,
+        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim,
+        uint32_t cache_length, uint64_t start, const void* device_position, void* scratch) {
+    if (device_position == NULL) return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    return attention_causal(&bf16_attention, query_key, gate, keys, values, output, rows, query_heads, key_heads,
+            head_dim, cache_length, start, device_position, 0, scratch);
 }
 
 /* Decode kernels read the quantum's position from `device_position` (plus `position_offset`, this call's first row
  * within the quantum); `start` is the host's copy, which sizes the grids. Prefill kernels take `start` by value. */
-static int attention_causal(const void* query_key, const void* gate, const void* keys, const void* values, void* output,
-        uint32_t rows, uint32_t query_heads, uint32_t key_heads, uint32_t head_dim, uint32_t cache_length, uint64_t start,
-        const void* device_position, uint64_t position_offset, void* scratch) {
+static int attention_causal(const struct attention_kernels* kernels, const void* query_key, const void* gate,
+        const void* keys, const void* values, void* output, uint32_t rows, uint32_t query_heads, uint32_t key_heads,
+        uint32_t head_dim, uint32_t cache_length, uint64_t start, const void* device_position, uint64_t position_offset,
+        void* scratch) {
     // The row twins also serve small non-row-exact quanta that bring decode scratch (speculative drafting):
     // a 32-row prefill tile over a long cache is one CTA per head, about 9.5 ms over 32K keys for 2-4 rows
     // against 0.45-0.75 ms for the twins.
@@ -604,25 +668,25 @@ static int attention_causal(const void* query_key, const void* gate, const void*
                 uint32_t below = last < from ? last : from - 1u, splits = (below + 47u) / 48u;
                 if (splits > 64u) splits = 64u;
                 void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &from_arg};
-                status = launch_and_synchronize_2d(attention_decode_rows, query_heads * splits, rows, 128, args);
+                status = launch_and_synchronize_2d(kernels->decode_rows, query_heads * splits, rows, 128, args);
                 if (status != 0) return status;
             }
             if (last >= from) {
                 uint32_t splits = (last + 31u) / 32u;
                 if (splits > 64u) splits = 64u;
                 void* args[] = {&query_key, &keys, &values, &qh, &kh, &position, &scratch, &row_stride, &from_arg};
-                status = launch_and_synchronize_2d(attention_decode_gqa_rows, key_heads * splits, rows, 96, args);
+                status = launch_and_synchronize_2d(kernels->decode_gqa_rows, key_heads * splits, rows, 96, args);
                 if (status != 0) return status;
             }
             void* merge_args[] = {&gate, &output, &scratch, &qh, &kh, &position, &row_stride, &from_arg};
-            return launch_and_synchronize_2d(attention_merge_rows, query_heads, rows, 128, merge_args);
+            return launch_and_synchronize_2d(kernels->merge_rows, query_heads, rows, 128, merge_args);
         }
     }
     if (rows > 1 && euhedral_cuda_row_exact() && query_key && gate && output) {
         /* Row-exact: row j is one-row decode at position start + j over the keys up to it. */
         const uint64_t width = ((uint64_t)query_heads + key_heads) * head_dim * 2u, out = (uint64_t)query_heads * head_dim * 2u;
         for (uint32_t row = 0; row < rows; ++row) {
-            int status = attention_causal((const char*)query_key + row * width, (const char*)gate + row * width, keys, values,
+            int status = attention_causal(kernels, (const char*)query_key + row * width, (const char*)gate + row * width, keys, values,
                     (char*)output + row * out, 1u, query_heads, key_heads, head_dim, cache_length, start + row, device_position,
                     position_offset + row, scratch);
             if (status != 0) return status;
@@ -653,9 +717,9 @@ static int attention_causal(const void* query_key, const void* gate, const void*
                 && (rows >= 512u || (rows >= 128u && (uint64_t)cache_length >= 2048u))) {
             uint64_t fa2_grid = ((uint64_t)rows + 15u) / 16u * key_heads;
             if (fa2_grid <= UINT32_MAX)
-                return launch_and_synchronize_shared(attention_prefill_fa2, (uint32_t)fa2_grid, 32u * (group + 2u), FA2_SHARED_BYTES, args);
+                return launch_and_synchronize_shared(kernels->prefill_fa2, (uint32_t)fa2_grid, 32u * (group + 2u), FA2_SHARED_BYTES, args);
         }
-        CUfunction prefill = exact ? attention_prefill_nvfp4_exact : attention_prefill_nvfp4;
+        CUfunction prefill = exact ? kernels->prefill_exact : kernels->prefill;
         return launch_and_synchronize(prefill, (uint32_t)grid, 128, args);
     }
     // Decode must only attend the prefix ending at its query, even when a caller
@@ -673,7 +737,7 @@ static int attention_causal(const void* query_key, const void* gate, const void*
     void* merge[] = {&gate, &output, &scratch, &query_heads, &key_heads, &splits};
     // Exact numerics keep the per-element (lane + 32 d) kernel.
     int exact = euhedral_cuda_exact_numerics();
-    CUfunction decode = exact ? attention_decode_nvfp4_exact : attention_decode_nvfp4;
+    CUfunction decode = exact ? kernels->decode_exact : kernels->decode;
     uint32_t decode_grid = query_heads * splits, decode_block = 128;
     // Relaxed numerics from 2048 keys: one three-warp tensor-core CTA (96 threads) per (KV head, 32-key split, at most 64)
     // serves the KV head's whole query-head group (docs/ATTENTION_DECODE.md). Shorter contexts keep the per-query-head
@@ -682,13 +746,13 @@ static int attention_causal(const void* query_key, const void* gate, const void*
     if (!exact && length >= 2048u && group <= 8u) {
         splits = (uint32_t)(((uint64_t)length + 31) / 32);
         if (splits > 64) splits = 64;
-        decode = attention_decode_gqa;
+        decode = kernels->decode_gqa;
         decode_grid = key_heads * splits;
         decode_block = 96;
     }
     status = (int)euhedral_launch_kernel(decode, decode_grid, 1, 1,
             decode_block, 1, 1, 0, stream, args, NULL);
-    if (status == 0) status = (int)euhedral_launch_kernel(attention_merge_nvfp4, query_heads, 1, 1,
+    if (status == 0) status = (int)euhedral_launch_kernel(kernels->merge, query_heads, 1, 1,
             128, 1, 1, 0, stream, merge, NULL);
     if (status != 0 || stream == NULL) {
         int drained = (int)cudaStreamSynchronize((cudaStream_t)stream);

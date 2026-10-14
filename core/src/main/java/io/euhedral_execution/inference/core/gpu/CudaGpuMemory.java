@@ -145,6 +145,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
     private final MethodHandle attentionCausalNvfp4;
+    private final MethodHandle attentionKvAppendBf16;
+    private final MethodHandle attentionCausalBf16;
     private final MethodHandle linearQ3P2e2DecodeBf16;
     private final MethodHandle q3P2e2Expand;
     private final MethodHandle embedQ3P2e2;
@@ -552,6 +554,10 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                     bind(linker, symbols, "euhedral_cuda_attention_kv_append_nvfp4", ATTENTION_KV_APPEND_NVFP4);
             this.attentionCausalNvfp4 =
                     bind(linker, symbols, "euhedral_cuda_attention_causal_nvfp4", ATTENTION_CAUSAL_NVFP4);
+            this.attentionKvAppendBf16 =
+                    bind(linker, symbols, "euhedral_cuda_attention_kv_append_bf16", ATTENTION_KV_APPEND_NVFP4);
+            this.attentionCausalBf16 =
+                    bind(linker, symbols, "euhedral_cuda_attention_causal_bf16", ATTENTION_CAUSAL_NVFP4);
             if (!q3MxAvailable() || !nvfp4NativeAvailable())
                 throw new GpuMemoryException("an NVIDIA Blackwell GPU (compute capability 12.x) is required");
         } catch (RuntimeException exception) {
@@ -2870,6 +2876,57 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             int keyValueWidth,
             long startPosition,
             long positionAddress) {
+        kvAppend(
+                attentionKvAppendNvfp4,
+                "Qwen attention KV append",
+                queryKeyAddress,
+                gateValueAddress,
+                keyCacheAddress,
+                valueCacheAddress,
+                rows,
+                queryWidth,
+                keyValueWidth,
+                startPosition,
+                positionAddress);
+    }
+
+    @Override
+    public void attentionKvAppendBf16(
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            int rows,
+            int queryWidth,
+            int keyValueWidth,
+            long startPosition,
+            long positionAddress) {
+        kvAppend(
+                attentionKvAppendBf16,
+                "BF16 attention KV append",
+                queryKeyAddress,
+                gateValueAddress,
+                keyCacheAddress,
+                valueCacheAddress,
+                rows,
+                queryWidth,
+                keyValueWidth,
+                startPosition,
+                positionAddress);
+    }
+
+    private void kvAppend(
+            MethodHandle append,
+            String operation,
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            int rows,
+            int queryWidth,
+            int keyValueWidth,
+            long startPosition,
+            long positionAddress) {
         ensureOpen();
         requireAddresses(queryKeyAddress, gateValueAddress, keyCacheAddress, valueCacheAddress, positionAddress);
         if (rows <= 0
@@ -2881,8 +2938,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         Math.addExact(startPosition, rows);
         invokeLayer(
-                "Qwen attention KV append",
-                attentionKvAppendNvfp4,
+                operation,
+                append,
                 MemorySegment.ofAddress(queryKeyAddress),
                 MemorySegment.ofAddress(gateValueAddress),
                 MemorySegment.ofAddress(keyCacheAddress),
@@ -2896,6 +2953,73 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     @Override
     public void attentionCausalNvfp4(
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            long outputAddress,
+            int rows,
+            int queryHeads,
+            int keyValueHeads,
+            int headDim,
+            int cacheLength,
+            long startPosition,
+            long positionAddress,
+            long scratchAddress) {
+        causal(
+                attentionCausalNvfp4,
+                "Qwen causal attention",
+                queryKeyAddress,
+                gateValueAddress,
+                keyCacheAddress,
+                valueCacheAddress,
+                outputAddress,
+                rows,
+                queryHeads,
+                keyValueHeads,
+                headDim,
+                cacheLength,
+                startPosition,
+                positionAddress,
+                scratchAddress);
+    }
+
+    @Override
+    public void attentionCausalBf16(
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            long outputAddress,
+            int rows,
+            int queryHeads,
+            int keyValueHeads,
+            int headDim,
+            int cacheLength,
+            long startPosition,
+            long positionAddress,
+            long scratchAddress) {
+        causal(
+                attentionCausalBf16,
+                "BF16 causal attention",
+                queryKeyAddress,
+                gateValueAddress,
+                keyCacheAddress,
+                valueCacheAddress,
+                outputAddress,
+                rows,
+                queryHeads,
+                keyValueHeads,
+                headDim,
+                cacheLength,
+                startPosition,
+                positionAddress,
+                scratchAddress);
+    }
+
+    private void causal(
+            MethodHandle causal,
+            String operation,
             long queryKeyAddress,
             long gateValueAddress,
             long keyCacheAddress,
@@ -2924,8 +3048,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
         if (rows == 1) requireAddresses(scratchAddress);
         invokeLayer(
-                "Qwen causal attention",
-                attentionCausalNvfp4,
+                operation,
+                causal,
                 MemorySegment.ofAddress(queryKeyAddress),
                 MemorySegment.ofAddress(gateValueAddress),
                 MemorySegment.ofAddress(keyCacheAddress),
