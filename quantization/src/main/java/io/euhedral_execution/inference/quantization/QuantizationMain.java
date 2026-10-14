@@ -27,6 +27,7 @@ import java.util.Map;
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
 /// 4096]
 /// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// rotate --model CHECKPOINT --out CHECKPOINT_DIR [--seed 1] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
 
@@ -34,7 +35,7 @@ public final class QuantizationMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0
-                || !List.of("calibrate", "score", "generate", "train-blocks", "train-model")
+                || !List.of("calibrate", "score", "generate", "train-blocks", "train-model", "rotate")
                         .contains(args[0])) {
             System.err.println(
                     "usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens T.npy "
@@ -45,6 +46,7 @@ public final class QuantizationMain {
             System.err.println(
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
                             + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library PATH]");
+            System.err.println("       rotate --model CHECKPOINT --out DIR [--seed 1] [--library PATH]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
@@ -124,6 +126,14 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("workers", "6")),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Path.of(library)));
+            return;
+        }
+        if (args[0].equals("rotate")) {
+            Rotate.run(new Rotate.Settings(
+                    Path.of(required(options, "model")),
+                    Path.of(required(options, "out")),
+                    Long.parseLong(options.getOrDefault("seed", "1")),
+                    Path.of(library)));
             return;
         }
         if (args[0].equals("score")) {
