@@ -35,6 +35,54 @@ public record QuantState(
         return directory.resolve(name.replace('/', '.') + ".npz");
     }
 
+    /// Reads a state `save` (or codes.py) wrote; its arrays land in `arena`.
+    public static QuantState load(Path path, java.lang.foreign.Arena arena) throws IOException {
+        try (var zip = new java.util.zip.ZipFile(path.toFile())) {
+            String format = textEntry(zip, "format_name"), layout = textEntry(zip, "layout");
+            ByteBuffer shape = arrayEntry(zip, "shape");
+            long rows = shape.getLong(0), columns = shape.getLong(8);
+            MemorySegment codes = arena.allocate(rows * columns);
+            codes.copyFrom(MemorySegment.ofBuffer(arrayEntry(zip, "codes")));
+            ByteBuffer scaleBytes = arrayEntry(zip, "scales");
+            MemorySegment scales = arena.allocate(scaleBytes.remaining());
+            scales.copyFrom(MemorySegment.ofBuffer(scaleBytes));
+            float global = arrayEntry(zip, "global_scale").getFloat(0);
+            byte[] table = null;
+            if (zip.getEntry("table.npy") != null) {
+                ByteBuffer t = arrayEntry(zip, "table");
+                table = new byte[t.remaining()];
+                t.get(table);
+            }
+            return new QuantState(format, layout, rows, columns, codes, scales, global, table);
+        }
+    }
+
+    /// The data of entry `name`.npy (little endian), after its header.
+    private static ByteBuffer arrayEntry(java.util.zip.ZipFile zip, String name) throws IOException {
+        var entry = zip.getEntry(name + ".npy");
+        if (entry == null) throw new IOException("no " + name + " in " + zip.getName());
+        byte[] bytes;
+        try (var in = zip.getInputStream(entry)) {
+            bytes = in.readAllBytes();
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        int major = bytes[6];
+        int headerLength = major == 1 ? (buffer.getShort(8) & 0xffff) : buffer.getInt(8);
+        int start = (major == 1 ? 10 : 12) + headerLength;
+        return buffer.slice(start, bytes.length - start).order(ByteOrder.LITTLE_ENDIAN);
+    }
+
+    /// A 0-d unicode string entry (numpy '<U').
+    private static String textEntry(java.util.zip.ZipFile zip, String name) throws IOException {
+        ByteBuffer data = arrayEntry(zip, name);
+        StringBuilder text = new StringBuilder();
+        while (data.remaining() >= 4) {
+            int code = data.getInt();
+            if (code != 0) text.appendCodePoint(code);
+        }
+        return text.toString();
+    }
+
     public void save(Path path) throws IOException {
         boolean nvfp4 = formatName.equals("NVFP4");
         long groups = columns / (nvfp4 ? 16 : 64);
