@@ -37,7 +37,13 @@ public final class Cuda {
     private final MethodHandle nvrtcCreateProgram, nvrtcCompileProgram, nvrtcGetProgramLogSize, nvrtcGetProgramLog;
     private final MethodHandle nvrtcGetCUBINSize, nvrtcGetCUBIN, nvrtcDestroyProgram;
     private final MethodHandle cublasCreate, cublasSetStream, cublasGemmEx, cublasSgemm, cublasSetMathMode;
-    private final MethodHandle cusolverDnCreate, cusolverDnSetStream, potrfBufferSize, potrf, potriBufferSize, potri;
+    private final MethodHandle cusolverDnCreate,
+            cusolverDnSetStream,
+            potrfBufferSize,
+            potrf,
+            potriBufferSize,
+            potri,
+            potrs;
     private final long context;
     private final String architecture;
 
@@ -105,6 +111,7 @@ public final class Cuda {
         potrf = bind(cusolver, "cusolverDnSpotrf", INT, PTR, INT, INT, PTR, INT, PTR, INT, PTR);
         potriBufferSize = bind(cusolver, "cusolverDnSpotri_bufferSize", INT, PTR, INT, INT, PTR, INT, PTR);
         potri = bind(cusolver, "cusolverDnSpotri", INT, PTR, INT, INT, PTR, INT, PTR, INT, PTR);
+        potrs = bind(cusolver, "cusolverDnSpotrs", INT, PTR, INT, INT, INT, PTR, INT, PTR, INT, PTR);
         try (Arena local = Arena.ofConfined()) {
             check("cuInit", (int) cuInit.invokeExact(0));
             MemorySegment device = local.allocate(INT);
@@ -514,6 +521,16 @@ public final class Cuda {
                     ? (int) potri.invokeExact(handle, fill, n, a, n, workspace, workspaceFloats, info)
                     : (int) potrf.invokeExact(handle, fill, n, a, n, workspace, workspaceFloats, info);
             check(inverse ? "cusolverDnSpotri" : "cusolverDnSpotrf", status);
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Solves `A X = B` in place in `b` (n x columns, column-major, leading dimension n) from the Cholesky factor of A
+    /// that `cholesky` left in `factor`; `info` is a device int.
+    public void solveCholesky(long handle, int fill, int n, int columns, long factor, long b, long info) {
+        try {
+            check("cusolverDnSpotrs", (int) potrs.invokeExact(handle, fill, n, columns, factor, n, b, n, info));
         } catch (Throwable failure) {
             throw rethrow(failure);
         }

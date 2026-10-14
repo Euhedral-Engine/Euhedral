@@ -710,3 +710,350 @@ extern "C" __global__ __launch_bounds__(256) void transpose_to_bf16(
         if (r < k && c < n) out[(size_t)c * k + r] = __float2bfloat16_rn(s[x][j]);
     }
 }
+
+// ---- Quantizer kernels: Hessian preparation, block LDL, regularization, scale search, LDLQ strips, refit ----
+
+namespace {
+
+/// Sum of `v` over the block (all threads must call); the result is valid in thread 0. `shared` holds 32 doubles.
+__device__ inline double block_sum(double v, double* shared) {
+    for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xffffffffu, v, offset);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __syncthreads();
+    if (lane == 0) shared[warp] = v;
+    __syncthreads();
+    const int warps = (blockDim.x + 31) >> 5;
+    v = threadIdx.x < warps ? shared[threadIdx.x] : 0.0;
+    if (warp == 0)
+        for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xffffffffu, v, offset);
+    return v;
+}
+
+}  // namespace
+
+extern "C" __global__ void fill_floats(float* x, long long count, float value) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        x[i] = value;
+}
+
+extern "C" __global__ void copy_floats(const float* src, float* dst, long long count) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+extern "C" __global__ void float_to_half(const float* x, long long count, __half* out) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        out[i] = __float2half_rn(x[i]);
+}
+
+/// y += alpha * x
+extern "C" __global__ void axpy_floats(float* y, const float* x, long long count, float alpha) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        y[i] += alpha * x[i];
+}
+
+extern "C" __global__ void subtract_floats(const float* a, const float* b, float* out, long long count) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        out[i] = a[i] - b[i];
+}
+
+/// out[0] += sum(a * b), in double.
+extern "C" __global__ __launch_bounds__(256) void sum_products(
+        const float* a, const float* b, long long count, double* out) {
+    __shared__ double shared[32];
+    double sum = 0.0;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        sum += (double)a[i] * (double)b[i];
+    sum = block_sum(sum, shared);
+    if (threadIdx.x == 0) atomicAdd(out, sum);
+}
+
+/// out[0] = mean of v[i * stride] for i < count (one block of 1024 threads).
+extern "C" __global__ __launch_bounds__(1024) void strided_mean(
+        const float* v, int count, long long stride, float* out) {
+    __shared__ double shared[32];
+    double sum = 0.0;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) sum += v[(long long)i * stride];
+    sum = block_sum(sum, shared);
+    if (threadIdx.x == 0) out[0] = (float)(sum / count);
+}
+
+/// h[i, i] += factor * mean[0] for the k x k matrix h.
+extern "C" __global__ void add_diagonal(float* h, int k, const float* mean, float factor) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < k) h[(long long)i * k + i] += factor * mean[0];
+}
+
+/// store != 0: d = diag(h); otherwise diag(h) = d.
+extern "C" __global__ void diagonal_io(float* h, int k, float* d, int store) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    if (store) d[i] = h[(long long)i * k + i];
+    else h[(long long)i * k + i] = d[i];
+}
+
+/// mode 0: upper = lower; 1: lower = upper; 2: strict upper = 0. Grid (ceil(k / 32), ceil(k / 8)), block 32 x 8.
+extern "C" __global__ __launch_bounds__(256) void triangle(float* h, int k, int mode) {
+    const int c = blockIdx.x * 32 + (threadIdx.x & 31), r = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (r >= k || c >= r) return;
+    if (mode == 0) h[(long long)c * k + r] = h[(long long)r * k + c];
+    else if (mode == 1) h[(long long)r * k + c] = h[(long long)c * k + r];
+    else h[(long long)c * k + r] = 0.f;
+}
+
+/// x[r, c] *= s[axis == 0 ? r : c], or /= with divide; grid (ceil(cols / 256), rows).
+extern "C" __global__ void scale_floats(float* x, int rows, int cols, const float* s, int axis, int divide) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const float v = s[axis == 0 ? blockIdx.y : c];
+    float* p = x + (long long)blockIdx.y * cols + c;
+    *p = divide ? *p / v : *p * v;
+}
+
+/// out[c, r] = float(w[r, c]) for the bf16 w `[n, k]`, out `[k, n]`. Block 32 x 8; grid (ceil(k / 32), ceil(n / 32)).
+extern "C" __global__ __launch_bounds__(256) void bf16_to_float_transposed(
+        const __nv_bfloat16* w, int n, int k, float* out) {
+    __shared__ float s[32][33];
+    const int x = threadIdx.x & 31, y = threadIdx.x >> 5;
+    for (int j = y; j < 32; j += 8) {
+        const int r = blockIdx.y * 32 + j, c = blockIdx.x * 32 + x;
+        if (r < n && c < k) s[j][x] = __bfloat162float(w[(long long)r * k + c]);
+    }
+    __syncthreads();
+    for (int j = y; j < 32; j += 8) {
+        const int c = blockIdx.x * 32 + j, r = blockIdx.y * 32 + x;
+        if (r < n && c < k) out[(long long)c * n + r] = s[x][j];
+    }
+}
+
+/// inv of each 16 x 16 lower-triangular diagonal block of the row-major lower factor l, by forward substitution
+/// (one thread per inverse column). Grid k / 16, block 16.
+extern "C" __global__ __launch_bounds__(16) void invert_diagonal_blocks(const float* l, int k, float* inv) {
+    __shared__ float d[16][16];
+    const int b = blockIdx.x, j = threadIdx.x;
+    for (int i = 0; i < 16; i++) d[i][j] = l[(long long)(16 * b + i) * k + 16 * b + j];
+    __syncthreads();
+    float x[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float acc = i == j ? 1.f : 0.f;
+#pragma unroll
+        for (int m = 0; m < i; m++) acc -= d[i][m] * x[m];
+        x[i] = acc / d[i][i];
+        inv[(long long)b * 256 + i * 16 + j] = x[i];
+    }
+}
+
+/// l[:, 16b : 16b + 16] <- l[:, 16b : 16b + 16] * inv[b] for the rows of and below block b; the diagonal block itself
+/// becomes 0 (identity with a zeroed diagonal). Rows above are zero already. Grid (ceil(k / 128), k / 16), block 128.
+extern "C" __global__ __launch_bounds__(128) void right_multiply_blocks(float* l, int k, const float* inv) {
+    __shared__ float s[256];
+    const int b = blockIdx.y;
+    for (int i = threadIdx.x; i < 256; i += 128) s[i] = inv[(long long)b * 256 + i];
+    __syncthreads();
+    const int r = blockIdx.x * 128 + threadIdx.x;
+    if (r < 16 * b || r >= k) return;
+    float* row = l + (long long)r * k + 16 * b;
+    if (r < 16 * b + 16) {
+#pragma unroll
+        for (int c = 0; c < 16; c++) row[c] = 0.f;
+        return;
+    }
+    float v[16];
+#pragma unroll
+    for (int m = 0; m < 16; m++) v[m] = row[m];
+#pragma unroll
+    for (int c = 0; c < 16; c++) {
+        float acc = 0.f;
+#pragma unroll
+        for (int m = 0; m < 16; m++) acc += v[m] * s[m * 16 + c];
+        row[c] = acc;
+    }
+}
+
+/// out[c] = sqrt(sum_r w[r, c]^2 / k) for the row-major w `[k, n]`. Block 32 x 8; grid ceil(n / 32).
+extern "C" __global__ __launch_bounds__(256) void column_rms(const float* w, int k, int n, float* out) {
+    __shared__ double s[8][33];
+    const int lane = threadIdx.x & 31, sub = threadIdx.x >> 5;
+    const int c = blockIdx.x * 32 + lane;
+    double sum = 0.0;
+    if (c < n)
+        for (int r = sub; r < k; r += 8) {
+            const double v = w[(long long)r * n + c];
+            sum += v * v;
+        }
+    s[sub][lane] = sum;
+    __syncthreads();
+    if (sub == 0 && c < n) {
+        double total = 0.0;
+        for (int i = 0; i < 8; i++) total += s[i][lane];
+        out[c] = (float)sqrt(total / k);
+    }
+}
+
+/// out[r] = sqrt(sum_c w[r, c]^2 / n). Grid k, block 256.
+extern "C" __global__ __launch_bounds__(256) void row_rms(const float* w, int k, int n, float* out) {
+    __shared__ double shared[32];
+    double sum = 0.0;
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        const double v = w[(long long)blockIdx.x * n + c];
+        sum += v * v;
+    }
+    sum = block_sum(sum, shared);
+    if (threadIdx.x == 0) out[blockIdx.x] = (float)sqrt(sum / n);
+}
+
+/// Output channel scales of exllamav3's regularize: from the column RMS and its mean, the divisor of the weight
+/// (sign, times the normalised scale when applied) and the stored sv (the divisor, 0 for channels without energy).
+extern "C" __global__ void output_scales(const float* rms, const float* mean, int n, const float* signs,
+        int apply, float* divisor, float* stored) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const bool normalised = mean[0] > 1e-30f;
+    float s = normalised ? rms[c] / mean[0] : rms[c];
+    const bool zero = fabsf(s) < 1e-30f;
+    float d = signs[c];
+    if (apply || !normalised) {
+        if (zero) s = 0.1f;
+        d = signs[c] * s + 1e-10f;
+    }
+    divisor[c] = d;
+    stored[c] = zero ? 0.f : d;
+}
+
+/// su = sign * rms / -codebook_scale + 1e-10, rms below 1e-30 read as 0.1.
+extern "C" __global__ void input_scales(const float* rms, const float* signs, int k, float* su) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= k) return;
+    float s = rms[r];
+    if (fabsf(s) < 1e-30f) s = 0.1f;
+    su[r] = signs[r] * s / (-1.24371088f) + 1e-10f;
+}
+
+/// out[tile] = mean of squares of tile (blockIdx.y, blockIdx.x) of the row-major w with row length n. Block 256.
+extern "C" __global__ __launch_bounds__(256) void tile_mean_square(const float* w, int n, float* out) {
+    __shared__ double shared[32];
+    const int row = threadIdx.x >> 4, col = threadIdx.x & 15;
+    const double v = w[(long long)(blockIdx.y * 16 + row) * n + blockIdx.x * 16 + col];
+    const double sum = block_sum(v * v, shared);
+    if (threadIdx.x == 0) out[blockIdx.y * gridDim.x + blockIdx.x] = (float)(sum / 256.0);
+}
+
+/// Sample tile s (grid, block 256): tile (tile_k[s], tile_n[s]) of w in tensor-core order, times scale.
+extern "C" __global__ __launch_bounds__(256) void gather_tiles(
+        const float* w, int n, const int* tile_k, const int* tile_n, float scale, float* out) {
+    const int e = tensor_core_element(threadIdx.x);
+    const float v = w[(long long)(tile_k[blockIdx.x] * 16 + (e >> 4)) * n + tile_n[blockIdx.x] * 16 + (e & 15)];
+    out[(long long)blockIdx.x * 256 + threadIdx.x] = v * scale;
+}
+
+/// Candidate c, sample j (every `stride`th of the samples) times scales[c]: out `[cands, per, 256]`.
+extern "C" __global__ void candidate_tiles(
+        const float* samples, int stride, int per, const float* scales, long long count, float* out) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x) {
+        const long long tile = i >> 8;
+        const long long cand = tile / per, j = tile % per;
+        out[i] = samples[(j * stride) * 256 + (i & 255)] * scales[cand];
+    }
+}
+
+/// out[c] = mean((q[c] / scales[c] - sample)^2) over candidate c's tiles. Grid cands, block 256.
+extern "C" __global__ __launch_bounds__(256) void candidate_mse(
+        const float* q, const float* samples, int stride, int per, const float* scales, float* out) {
+    __shared__ double shared[32];
+    const float s = scales[blockIdx.x];
+    double sum = 0.0;
+    const long long total = (long long)per * 256;
+    for (long long i = threadIdx.x; i < total; i += blockDim.x) {
+        const long long j = i >> 8;
+        const float d = q[(long long)blockIdx.x * total + i] / s - samples[(j * stride) * 256 + (i & 255)];
+        sum += (double)d * d;
+    }
+    sum = block_sum(sum, shared);
+    if (threadIdx.x == 0) out[blockIdx.x] = (float)(sum / (double)total);
+}
+
+/// The 16-row strip of w (plus p when given) at first_row as n / 16 tiles in tensor-core order. Grid n / 16, block 256.
+extern "C" __global__ __launch_bounds__(256) void strip_gather_sum(
+        const float* w, const float* p, int n, int first_row, float* tiles) {
+    const int e = tensor_core_element(threadIdx.x);
+    const long long at = (long long)(first_row + (e >> 4)) * n + blockIdx.x * 16 + (e & 15);
+    tiles[(long long)blockIdx.x * 256 + threadIdx.x] = p ? w[at] + p[at] : w[at];
+}
+
+/// e[(e_row + r) * n + c] = w[(first_row + r) * n + c] - q[(first_row + r) * n + c] for the 16 rows of a strip.
+extern "C" __global__ void strip_error(
+        const float* w, const float* q, int n, int first_row, float* e, int e_row) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 16 * n) return;
+    e[(long long)e_row * n + i] = w[(long long)first_row * n + i] - q[(long long)first_row * n + i];
+}
+
+/// out[c] = sum_r a[r, c] * b[r, c] + extra * sum_r a[r, c]^2. Block 32 x 8; grid ceil(n / 32).
+extern "C" __global__ __launch_bounds__(256) void column_dots(
+        const float* a, const float* b, float extra, int k, int n, float* out) {
+    __shared__ double s[8][33];
+    const int lane = threadIdx.x & 31, sub = threadIdx.x >> 5;
+    const int c = blockIdx.x * 32 + lane;
+    double sum = 0.0;
+    if (c < n)
+        for (int r = sub; r < k; r += 8) {
+            const double x = a[(long long)r * n + c];
+            sum += x * b[(long long)r * n + c] + (double)extra * x * x;
+        }
+    s[sub][lane] = sum;
+    __syncthreads();
+    if (sub == 0 && c < n) {
+        double total = 0.0;
+        for (int i = 0; i < 8; i++) total += s[i][lane];
+        out[c] = (float)total;
+    }
+}
+
+/// out[r] = sum_c a[r, c] * b[r, c]. Grid k, block 256.
+extern "C" __global__ __launch_bounds__(256) void row_dots(
+        const float* a, const float* b, int k, int n, float* out) {
+    __shared__ double shared[32];
+    double sum = 0.0;
+    for (int c = threadIdx.x; c < n; c += blockDim.x)
+        sum += (double)a[(long long)blockIdx.x * n + c] * b[(long long)blockIdx.x * n + c];
+    sum = block_sum(sum, shared);
+    if (threadIdx.x == 0) out[blockIdx.x] = (float)sum;
+}
+
+/// num[c] <- dn[c] > 1e-30 ? num[c] / dn[c] : 1
+extern "C" __global__ void column_ratio(float* num, const float* dn, int n) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < n) num[c] = dn[c] > 1e-30f ? num[c] / fmaxf(dn[c], 1e-30f) : 1.f;
+}
+
+/// a[r, c] *= h[r, c] (+ damping on the diagonal of h); grid (ceil(k / 256), k).
+extern "C" __global__ void hessian_product(float* a, const float* h, int k, float damping) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= k) return;
+    const long long at = (long long)blockIdx.y * k + c;
+    a[at] *= h[at] + (c == blockIdx.y ? damping : 0.f);
+}
+
+/// Solution of the input-side system, kept where finite and positive and 1 elsewhere (all 1 when the factorization
+/// failed).
+extern "C" __global__ void clean_row_scales(float* r, const int* info, int k) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    const float v = r[i];
+    r[i] = info[0] == 0 && isfinite(v) && v > 0.f ? v : 1.f;
+}
+
+/// x *= s, or /= s with divide.
+extern "C" __global__ void scale_scalar(float* x, long long count, float s, int divide) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+            i += (long long)gridDim.x * blockDim.x)
+        x[i] = divide ? x[i] / s : x[i] * s;
+}
