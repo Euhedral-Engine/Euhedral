@@ -87,6 +87,9 @@ subprojects {
             providers.gradleProperty("euhedral.qwen.bf16-artifact").orNull?.let {
                 systemProperty("euhedral.qwen.bf16-artifact", it)
             }
+            providers.gradleProperty("euhedral.qwen.tokenizer-dir").orNull?.let {
+                systemProperty("euhedral.qwen.tokenizer-dir", it)
+            }
             // Optional Qwen3.8-Flash-Next artifact (qwen4_exp).
             systemProperty(
                     "euhedral.qwen4.artifact",
