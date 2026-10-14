@@ -30,15 +30,16 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// Teacher-forced scoring of an artifact against llama.cpp BF16 references (`llama-perplexity
 /// --kl-divergence-base`, docs/QUALITY.md). Each chunk of N reference tokens is forced on a fresh sequence: a prefill
 /// of N / 2 + 1 tokens, then verifications of `rows` forced tokens, so that step k's logits row predicts the token the
 /// reference's record k does. Every row is scored on the device where the engine left it (`score.cu`), against the
-/// reference row a reader frame has already fetched into mapped host memory; nothing is copied. Several chunks run
-/// at once on their own sequences. The summary line per reference: name, mean NLL, perplexity, dNLL and its standard
+/// reference row a reader frame has already fetched into mapped host memory; nothing is copied. `batch` chunks run
+/// together, one sequence each, their verifications batched into one quantum (at most 32 rows), so each weight is
+/// read once per step group of all of them. The summary line per reference: name, mean NLL, perplexity, dNLL and its
+/// standard
 /// error, KL and its standard error, top-1 agreement, then KL median, p95, p99, maximum, the top-1 standard error and
 /// delta-p mean, RMS, p1 and p99.
 public final class Score {
@@ -51,7 +52,7 @@ public final class Score {
             Path results,
             int rows,
             long hostBytes,
-            int concurrency,
+            int batch,
             int workers,
             Path library) {}
 
@@ -64,17 +65,24 @@ public final class Score {
     private final ExecutionPlan plan;
     private final Cuda.Function kernel;
     private final AtomicLong sequenceIds = new AtomicLong(1);
+    private final long scoreStream;
 
     private Score(Settings settings, Device device, Execution runtime, ExecutionPlan plan) {
         this.settings = settings;
         this.device = device;
         this.runtime = runtime;
         this.plan = plan;
+        this.scoreStream = device.newStream();
         this.kernel =
                 device.cuda.compileResource("score.cu", List.of("score_rows")).getFirst();
     }
 
     public static void run(Settings settings) throws Exception {
+        if (settings.batch() < 1
+                || settings.rows() < 1
+                || settings.rows() > 8
+                || settings.batch() * settings.rows() > 32)
+            throw new IllegalArgumentException("--rows (at most 8) times --batch must be at most 32");
         var data = ArtifactReader.read(settings.artifact());
         try (Device device = new Device(settings.library());
                 Qwen38Model model = Qwen38Model.load(
@@ -107,15 +115,19 @@ public final class Score {
                 throw new IllegalArgumentException(
                         path + " has a vocabulary of " + reference.vocabulary + ", the artifact " + vocabulary);
             }
-            var queue = new ConcurrentLinkedQueue<Integer>();
-            for (int chunk = 0; chunk < reference.chunks; chunk++) queue.add(chunk);
             double[][] scored = new double[reference.chunks][];
-            List<CompletableFuture<Void>> lanes = new ArrayList<>();
-            for (int lane = 0; lane < Math.min(settings.concurrency(), reference.chunks); lane++) {
-                var chain = new Chain(reference);
-                lanes.add(chain.drain(queue, scored).whenComplete((ignored, failure) -> chain.close()));
+            int batch = Math.min(settings.batch(), reference.chunks);
+            Lane[] lanes = new Lane[batch];
+            for (int k = 0; k < batch; k++) lanes[k] = new Lane(reference);
+            try {
+                for (int first = 0; first < reference.chunks; first += batch) {
+                    int[] chunks = new int[Math.min(batch, reference.chunks - first)];
+                    for (int k = 0; k < chunks.length; k++) chunks[k] = first + k;
+                    new Group(reference, chunks, lanes).run(scored).get();
+                }
+            } finally {
+                for (Lane lane : lanes) lane.close();
             }
-            CompletableFuture.allOf(lanes.toArray(CompletableFuture[]::new)).get();
             String summary = Summary.lines(name, path, settings.artifact(), reference, scored);
             System.out.print(summary);
             Files.writeString(
@@ -133,140 +145,17 @@ public final class Score {
         }
     }
 
-    /// One sequence at a time, chunk after chunk: its mapped buffers (two reference row blocks, the targets and the
-    /// results of the current chunk) and the stream its rows are scored on.
-    private final class Chain implements AutoCloseable {
-        final Reference reference;
-        final long rowBytes;
+    /// One slot of a group: the mapped buffers of the chunk it scores (two reference row blocks, the targets and the
+    /// results).
+    private final class Lane implements AutoCloseable {
         final long[] blocks = new long[2];
-        final long targets, results, stream;
+        final long targets, results;
 
-        Chain(Reference reference) {
-            this.reference = reference;
-            this.rowBytes = 2L * reference.width;
-            for (int b = 0; b < 2; b++) blocks[b] = device.gpu.allocateHostWeights(settings.rows() * rowBytes);
+        Lane(Reference reference) {
+            for (int b = 0; b < 2; b++)
+                blocks[b] = device.gpu.allocateHostWeights(settings.rows() * 2L * reference.width);
             targets = device.gpu.allocateHostWeights(4L * reference.records);
             results = device.gpu.allocateHostWeights(8L * RESULTS * reference.records);
-            stream = device.newStream();
-        }
-
-        CompletableFuture<Void> drain(ConcurrentLinkedQueue<Integer> queue, double[][] scored) {
-            Integer chunk = queue.poll();
-            if (chunk == null) return CompletableFuture.completedFuture(null);
-            return chunk(chunk).thenCompose(values -> {
-                scored[chunk] = values;
-                return drain(queue, scored);
-            });
-        }
-
-        /// The chunk's per-step results [records, RESULTS].
-        CompletableFuture<double[]> chunk(int chunk) {
-            int[] tokens = reference.tokens[chunk];
-            int prefix = reference.context / 2 + 1, steps = reference.records;
-            MemorySegment.ofAddress(targets)
-                    .reinterpret(4L * steps)
-                    .copyFrom(MemorySegment.ofArray(Arrays.copyOfRange(tokens, prefix, prefix + steps)));
-            var sequence = new Sequence(sequenceIds.getAndIncrement());
-            // Group 0 is step 0, from the prefill's last row; group g > 0 covers steps 1 + rows (g - 1) onwards.
-            int groups = 1 + (steps - 1 + settings.rows() - 1) / settings.rows();
-            // A group's reference rows are read while the quantum before it runs: block g % 2 was last scored by
-            // group g - 2, finished by then.
-            @SuppressWarnings("unchecked")
-            CompletableFuture<Void>[] reads = new CompletableFuture[groups];
-            reads[0] = read(chunk, 0, 0);
-            if (groups > 1) reads[1] = read(chunk, 1, 1);
-            CompletableFuture<Void> done = reads[0];
-            for (int begin = 0; begin < prefix; begin += InferenceConfig.PREFILL_CHUNK_TOKENS) {
-                int[] part = Arrays.copyOfRange(
-                        tokens, begin, Math.min(prefix, begin + InferenceConfig.PREFILL_CHUNK_TOKENS));
-                boolean last = begin + InferenceConfig.PREFILL_CHUNK_TOKENS >= prefix;
-                done = done.thenCompose(ignored -> submit(
-                        sequence, Quantum.ExecutionKind.PREFILL, part, LogitsRequirement.LAST_TOKEN, last ? 0 : -1, 0));
-            }
-            for (int g = 1; g < groups; g++) {
-                int group = g, first = 1 + settings.rows() * (g - 1), count = Math.min(settings.rows(), steps - first);
-                int[] forced = Arrays.copyOfRange(tokens, prefix + first - 1, prefix + first - 1 + count);
-                done = done.thenCompose(ignored -> {
-                    if (group + 1 < groups) reads[group + 1] = read(chunk, group + 1, first + settings.rows());
-                    return reads[group].thenCompose(alsoIgnored -> submit(
-                            sequence,
-                            Quantum.ExecutionKind.VERIFY,
-                            forced,
-                            LogitsRequirement.ALL_TOKENS,
-                            group,
-                            first));
-                });
-            }
-            return done.handle((ignored, failure) -> {
-                sequence.complete();
-                if (failure != null) throw new IllegalStateException("chunk " + chunk + " failed", failure);
-                double[] values = new double[RESULTS * steps];
-                MemorySegment.copy(
-                        MemorySegment.ofAddress(results).reinterpret(8L * RESULTS * steps),
-                        ValueLayout.JAVA_DOUBLE,
-                        0,
-                        values,
-                        0,
-                        values.length);
-                return values;
-            });
-        }
-
-        /// Reads the reference rows of `group` (its first step `first`) into its block, on a worker.
-        CompletableFuture<Void> read(int chunk, int group, int first) {
-            int count = group == 0 ? 1 : Math.min(settings.rows(), reference.records - first);
-            long block = blocks[group % 2];
-            return runtime.onWorker(() -> {
-                reference.read(chunk, first, count, block);
-                return null;
-            });
-        }
-
-        /// Runs one quantum; with `group` >= 0 its logits rows (all of them, or the last one) are scored as the
-        /// steps of `group` starting at `first`.
-        CompletableFuture<Void> submit(
-                Sequence sequence,
-                Quantum.ExecutionKind kind,
-                int[] tokens,
-                LogitsRequirement requirement,
-                int group,
-                int first) {
-            var quantum = new Quantum(plan, sequence, kind, sequence.currentTokenPosition(), tokens, requirement);
-            return runtime.submit(quantum, done -> {
-                        try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
-                            if (group < 0) return;
-                            int count = requirement == LogitsRequirement.ALL_TOKENS ? logits.tokenCount() : 1;
-                            long row = logits.deviceAddress()
-                                    + (long) (logits.tokenCount() - count) * logits.vocabularySize() * Short.BYTES;
-                            score(row, group, first, count);
-                        }
-                    })
-                    .thenAccept(outcome -> {
-                        if (outcome.status() != Quantum.Status.SUCCESS) {
-                            throw new IllegalStateException("quantum failed", outcome.failure());
-                        }
-                    });
-        }
-
-        /// Scores `count` logits rows from `row` against the block of `group`. The kernel reads the reference
-        /// rows and writes its results in mapped host memory; it is waited for before the logits are released.
-        void score(long row, int group, int first, int count) {
-            device.cuda.bindThread();
-            device.cuda.launch(
-                    kernel,
-                    count,
-                    1,
-                    THREADS,
-                    0,
-                    stream,
-                    new Cuda.Arguments()
-                            .pointer(row)
-                            .pointer(device.gpu.hostWeightsDeviceAddress(blocks[group % 2]))
-                            .integer(reference.width)
-                            .integer(reference.vocabulary)
-                            .pointer(device.gpu.hostWeightsDeviceAddress(targets) + 4L * first)
-                            .pointer(device.gpu.hostWeightsDeviceAddress(results) + 8L * RESULTS * first));
-            device.cuda.synchronize(stream);
         }
 
         @Override
@@ -275,6 +164,164 @@ public final class Score {
             device.gpu.freeHostWeights(targets);
             device.gpu.freeHostWeights(results);
         }
+    }
+
+    /// Chunks scored together, one sequence each, in lockstep (every chunk of a reference has the same prefix and
+    /// steps): each prefill on its own, then each step group of every chunk in one batched verification.
+    private final class Group {
+        final Reference reference;
+        final int[] chunks;
+        final Lane[] lanes;
+        final Sequence[] sequences;
+        final int prefix, steps, groups;
+
+        Group(Reference reference, int[] chunks, Lane[] lanes) {
+            this.reference = reference;
+            this.chunks = chunks;
+            this.lanes = lanes;
+            this.sequences = new Sequence[chunks.length];
+            this.prefix = reference.context / 2 + 1;
+            this.steps = reference.records;
+            // Group 0 is step 0, from the prefill's last row; group g > 0 covers steps 1 + rows (g - 1) onwards.
+            this.groups = 1 + (steps - 1 + settings.rows() - 1) / settings.rows();
+        }
+
+        CompletableFuture<Void> run(double[][] scored) {
+            for (int k = 0; k < chunks.length; k++) {
+                int[] tokens = reference.tokens[chunks[k]];
+                MemorySegment.ofAddress(lanes[k].targets)
+                        .reinterpret(4L * steps)
+                        .copyFrom(MemorySegment.ofArray(Arrays.copyOfRange(tokens, prefix, prefix + steps)));
+                sequences[k] = new Sequence(sequenceIds.getAndIncrement());
+            }
+            // A group's reference rows are read while the quantum before it runs: block g % 2 was last scored by
+            // group g - 2, finished by then.
+            @SuppressWarnings("unchecked")
+            CompletableFuture<Void>[] reads = new CompletableFuture[groups];
+            reads[0] = read(0, 0);
+            if (groups > 1) reads[1] = read(1, 1);
+            List<CompletableFuture<Void>> prefills = new ArrayList<>();
+            for (int k = 0; k < chunks.length; k++) {
+                int lane = k;
+                int[] tokens = reference.tokens[chunks[k]];
+                CompletableFuture<Void> chain = reads[0];
+                for (int begin = 0; begin < prefix; begin += InferenceConfig.PREFILL_CHUNK_TOKENS) {
+                    int[] part = Arrays.copyOfRange(
+                            tokens, begin, Math.min(prefix, begin + InferenceConfig.PREFILL_CHUNK_TOKENS));
+                    boolean last = begin + InferenceConfig.PREFILL_CHUNK_TOKENS >= prefix;
+                    chain = chain.thenCompose(ignored -> prefill(lane, part, last));
+                }
+                prefills.add(chain);
+            }
+            CompletableFuture<Void> done = CompletableFuture.allOf(prefills.toArray(CompletableFuture[]::new));
+            for (int g = 1; g < groups; g++) {
+                int group = g, first = 1 + settings.rows() * (g - 1), count = Math.min(settings.rows(), steps - first);
+                done = done.thenCompose(ignored -> {
+                    if (group + 1 < groups) reads[group + 1] = read(group + 1, first + settings.rows());
+                    return reads[group].thenCompose(alsoIgnored -> verify(group, first, count));
+                });
+            }
+            return done.handle((ignored, failure) -> {
+                for (Sequence sequence : sequences) sequence.complete();
+                if (failure != null)
+                    throw new IllegalStateException("chunks " + Arrays.toString(chunks) + " failed", failure);
+                for (int k = 0; k < chunks.length; k++) {
+                    double[] values = new double[RESULTS * steps];
+                    MemorySegment.copy(
+                            MemorySegment.ofAddress(lanes[k].results).reinterpret(8L * RESULTS * steps),
+                            ValueLayout.JAVA_DOUBLE,
+                            0,
+                            values,
+                            0,
+                            values.length);
+                    scored[chunks[k]] = values;
+                }
+                return null;
+            });
+        }
+
+        /// Reads every chunk's reference rows of `group` (its first step `first`) into the lanes' blocks, on workers.
+        CompletableFuture<Void> read(int group, int first) {
+            int count = group == 0 ? 1 : Math.min(settings.rows(), reference.records - first);
+            CompletableFuture<?>[] reads = new CompletableFuture<?>[chunks.length];
+            for (int k = 0; k < chunks.length; k++) {
+                int chunk = chunks[k];
+                long block = lanes[k].blocks[group % 2];
+                reads[k] = runtime.onWorker(() -> {
+                    reference.read(chunk, first, count, block);
+                    return null;
+                });
+            }
+            return CompletableFuture.allOf(reads);
+        }
+
+        /// One prefill quantum of lane `lane`'s sequence; the last one's logits row is step 0.
+        CompletableFuture<Void> prefill(int lane, int[] tokens, boolean last) {
+            Sequence sequence = sequences[lane];
+            var quantum = new Quantum(
+                    plan,
+                    sequence,
+                    Quantum.ExecutionKind.PREFILL,
+                    sequence.currentTokenPosition(),
+                    tokens,
+                    last ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE);
+            return succeeded(runtime.submit(quantum, done -> {
+                if (!last) return;
+                try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
+                    long row = logits.deviceAddress()
+                            + (long) (logits.tokenCount() - 1) * logits.vocabularySize() * Short.BYTES;
+                    score(row, lane, 0, 0, 1);
+                    device.cuda.synchronize(scoreStream);
+                }
+            }));
+        }
+
+        /// One batched verification of `count` forced tokens per chunk from step `first`, scored as `group`.
+        CompletableFuture<Void> verify(int group, int first, int count) {
+            List<Quantum.Part> parts = new ArrayList<>();
+            for (int k = 0; k < chunks.length; k++) {
+                int[] tokens = reference.tokens[chunks[k]];
+                int[] forced = Arrays.copyOfRange(tokens, prefix + first - 1, prefix + first - 1 + count);
+                parts.add(new Quantum.Part(sequences[k], sequences[k].currentTokenPosition(), forced));
+            }
+            var quantum = Quantum.batch(plan, Quantum.ExecutionKind.VERIFY, parts, LogitsRequirement.ALL_TOKENS);
+            return succeeded(runtime.submit(quantum, done -> {
+                try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
+                    long rowBytes = (long) logits.vocabularySize() * Short.BYTES;
+                    for (int k = 0; k < chunks.length; k++)
+                        score(logits.deviceAddress() + (long) k * count * rowBytes, k, group, first, count);
+                    device.cuda.synchronize(scoreStream);
+                }
+            }));
+        }
+
+        /// Scores `count` logits rows from `row` against lane `lane`'s block of `group`. The kernel reads
+        /// the reference rows and writes its results in mapped host memory; the caller waits for it
+        /// before the logits are released.
+        void score(long row, int lane, int group, int first, int count) {
+            device.cuda.bindThread();
+            device.cuda.launch(
+                    kernel,
+                    count,
+                    1,
+                    THREADS,
+                    0,
+                    scoreStream,
+                    new Cuda.Arguments()
+                            .pointer(row)
+                            .pointer(device.gpu.hostWeightsDeviceAddress(lanes[lane].blocks[group % 2]))
+                            .integer(reference.width)
+                            .integer(reference.vocabulary)
+                            .pointer(device.gpu.hostWeightsDeviceAddress(lanes[lane].targets) + 4L * first)
+                            .pointer(device.gpu.hostWeightsDeviceAddress(lanes[lane].results) + 8L * RESULTS * first));
+        }
+    }
+
+    private static CompletableFuture<Void> succeeded(CompletableFuture<Quantum.Outcome> outcome) {
+        return outcome.thenAccept(done -> {
+            if (done.status() != Quantum.Status.SUCCESS)
+                throw new IllegalStateException("quantum failed", done.failure());
+        });
     }
 
     /// A llama.cpp logits file: "_logits_", int32 context, vocabulary and chunk count, the chunks' tokens, then per

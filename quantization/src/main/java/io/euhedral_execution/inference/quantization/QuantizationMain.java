@@ -13,7 +13,7 @@ import java.util.Map;
 ///           --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
 ///           [--library LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
-///       [--host-mib 2304] [--concurrency 3] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
 
@@ -25,7 +25,7 @@ public final class QuantizationMain {
                     + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                     + "[--layers N] [--skip-mtp] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
-                    + "[--rows 8] [--host-mib 2304] [--concurrency 3] [--workers 6] [--library PATH]");
+                    + "[--rows 8] [--host-mib 2304] [--batch 4] [--workers 6] [--library PATH]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
@@ -53,7 +53,7 @@ public final class QuantizationMain {
                     Path.of(required(options, "results")),
                     Integer.parseInt(options.getOrDefault("rows", "8")),
                     Long.parseLong(options.getOrDefault("host-mib", "2304")) << 20,
-                    Integer.parseInt(options.getOrDefault("concurrency", "3")),
+                    Integer.parseInt(options.getOrDefault("batch", "4")),
                     Integer.parseInt(options.getOrDefault("workers", "6")),
                     Path.of(library)));
             return;
