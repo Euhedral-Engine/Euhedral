@@ -2,6 +2,11 @@ package io.euhedral_execution.inference.quantization.mtp;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.euhedral_execution.core.frames.AbstractFrame;
+import io.euhedral_execution.core.generics.LatticeReceiver;
+import io.euhedral_execution.core.generics.LatticeSource;
+import io.euhedral_execution.core.ingest.AbstractIngestSink;
+import io.euhedral_execution.data_structures.queues.MpscQueue;
 import io.euhedral_execution.inference.api.chat.QwenChatTemplate;
 import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
@@ -25,6 +30,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -32,8 +38,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /// The MTP drafter's training corpus ([Corpus]): the artifact's own greedy answers to chat prompts, with the
 /// post-final-norm hidden of every row the base model ran, which is what seeds the drafter (docs/MTP_CONTRACT.md §2).
@@ -42,7 +49,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /// the engine's 512-row chunks, as the server prefills it. Up to `batch` sequences then decode together, one row each
 /// per batched verification quantum: every row is bit for bit what the artifact's own greedy decode computes, and the
 /// weights are read once per step for all of them. A sequence ends at a stop token or after `maxTokens`.
+///
+/// The run's bookkeeping belongs to a lattice source ([Generation]); quanta report to it through posted records.
 public final class Generate {
+
+    /// CUDA's per-thread default stream: the argmax launches of concurrent quanta never share a stream.
+    private static final long PER_THREAD_STREAM = 2;
 
     /// Command-line settings.
     public record Settings(
@@ -62,12 +74,11 @@ public final class Generate {
     private final Execution runtime;
     private final ExecutionPlan plan;
     private final Cuda.Function argmax;
-    private final long argmaxStream;
     private final int hidden, vocabulary;
     private final Set<Integer> stops;
     private final AtomicLong sequenceIds = new AtomicLong(1);
-    /// Mapped host memory the argmax kernel writes, one int per row of a step.
-    private final long choices;
+    /// Mapped host memory the argmax kernel writes: one int per lane for prefills, one per row for the step.
+    private final long prefillChoices, stepChoices;
 
     private Generate(Settings settings, Device device, Execution runtime, ExecutionPlan plan, Set<Integer> stops) {
         this.settings = settings;
@@ -79,8 +90,8 @@ public final class Generate {
         this.vocabulary = plan.weights().config().vocabSize();
         this.argmax =
                 device.cuda.compileResource("mtp.cu", List.of("argmax_rows")).getFirst();
-        this.argmaxStream = device.newStream();
-        this.choices = device.gpu.allocateHostWeights(4L * Math.max(settings.batch(), 1));
+        this.prefillChoices = device.gpu.allocateHostWeights(4L * settings.batch());
+        this.stepChoices = device.gpu.allocateHostWeights(4L * settings.batch());
     }
 
     public static void run(Settings settings) throws Exception {
@@ -114,8 +125,14 @@ public final class Generate {
             var runtime = new Execution(lattice.terminal(), plan, device.gpu);
             try (Corpus.Writer writer =
                     Corpus.Writer.open(settings.out(), plan.weights().config().hiddenSize())) {
-                new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds())
-                        .answer(prompts, writer);
+                var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds());
+                var generation = generate.new Generation(prompts, writer);
+                lattice.attach(generation);
+                try {
+                    generation.finished.get();
+                } finally {
+                    generation.complete();
+                }
             } finally {
                 runtime.close();
             }
@@ -150,6 +167,8 @@ public final class Generate {
     /// host memory sized for the longest answer.
     private final class Slot implements AutoCloseable {
         final Prompt prompt;
+        /// Its place in the prefill choices.
+        final int lane;
         final Sequence sequence = new Sequence(sequenceIds.getAndIncrement());
         final Arena arena = Arena.ofShared();
         final MemorySegment rows;
@@ -158,8 +177,9 @@ public final class Generate {
         /// The token the next step feeds: the base model's greedy choice after the last row it ran.
         int next;
 
-        Slot(Prompt prompt) {
+        Slot(Prompt prompt, int lane) {
             this.prompt = prompt;
+            this.lane = lane;
             int capacity = prompt.tokens().length + settings.maxTokens();
             this.tokens = Arrays.copyOf(prompt.tokens(), capacity + 1);
             this.length = prompt.tokens().length;
@@ -185,27 +205,75 @@ public final class Generate {
         }
     }
 
-    private void answer(List<Prompt> prompts, Corpus.Writer writer) throws Exception {
-        var ready = new LinkedBlockingQueue<Object>();
-        List<Slot> active = new ArrayList<>();
-        int started = 0, prefilling = 0, finished = 0;
-        long generated = 0, begun = System.nanoTime();
-        while (true) {
-            while (started < prompts.size() && active.size() + prefilling < settings.batch()) {
-                Slot slot = new Slot(prompts.get(started++));
-                prefilling++;
-                prefill(slot).whenComplete((done, failure) -> ready.add(failure != null ? failure : slot));
+    /// The owner of a run: which prompts are answered, which sequences decode, whether a step is in flight, and the
+    /// corpus. Its fields change only while a worker polls it, which the lattice does one thread at a time; quanta
+    /// report what they did by posting records, which the poll applies in order before it starts prefills and the
+    /// next step.
+    final class Generation extends AbstractIngestSink {
+        final CompletableFuture<Void> finished = new CompletableFuture<>();
+        private final MpscQueue<Runnable> records = new MpscQueue<>(256, 4);
+        private final List<Prompt> prompts;
+        private final Corpus.Writer writer;
+        private final List<Slot> active = new ArrayList<>();
+        private final ArrayDeque<Integer> lanes = new ArrayDeque<>();
+        private final Delegate delegate = new Delegate();
+        private int started, prefilling, answered;
+        private boolean stepping;
+        private long generated;
+        private final long begun = System.nanoTime();
+
+        Generation(List<Prompt> prompts, Corpus.Writer writer) {
+            this.prompts = prompts;
+            this.writer = writer;
+            for (int lane = 0; lane < settings.batch(); lane++) lanes.add(lane);
+        }
+
+        /// Posts `record` for the poll to apply. Any thread; never blocks.
+        void post(Runnable record) {
+            if (!records.offer(record)) throw new IllegalStateException("the generation refused a record");
+        }
+
+        private void poll() {
+            if (finished.isDone()) return;
+            try {
+                for (Runnable record; (record = records.poll()) != null; ) record.run();
+                retire();
+                while (started < prompts.size() && !lanes.isEmpty()) {
+                    Slot slot = new Slot(prompts.get(started++), lanes.poll());
+                    prefilling++;
+                    prefill(slot)
+                            .whenComplete((done, failure) -> post(() -> {
+                                prefilling--;
+                                if (failure != null) throw new IllegalStateException("a prefill failed", failure);
+                                active.add(slot);
+                            }));
+                }
+                if (!stepping && !active.isEmpty()) {
+                    List<Slot> stepped = List.copyOf(active);
+                    stepping = true;
+                    step(stepped)
+                            .whenComplete((choices, failure) -> post(() -> {
+                                stepping = false;
+                                if (failure != null) throw new IllegalStateException("a step failed", failure);
+                                for (int k = 0; k < stepped.size(); k++) {
+                                    Slot slot = stepped.get(k);
+                                    slot.tokens[slot.length++] = slot.next;
+                                    slot.next = choices[k];
+                                }
+                            }));
+                }
+                if (started == prompts.size() && active.isEmpty() && prefilling == 0 && !stepping) {
+                    System.out.printf(Locale.ROOT, "%d answers, %d tokens%n", answered, generated);
+                    finished.complete(null);
+                }
+            } catch (RuntimeException | Error failure) {
+                finished.completeExceptionally(failure);
             }
-            if (active.isEmpty() && prefilling == 0) break;
-            // Wait for a prefill only when nothing can step.
-            Object arrived = active.isEmpty() ? ready.take() : ready.poll();
-            while (arrived != null) {
-                prefilling--;
-                if (arrived instanceof Throwable failure) throw new IllegalStateException("a prefill failed", failure);
-                active.add((Slot) arrived);
-                arrived = ready.poll();
-            }
-            // A prompt whose first choice already ends it has no answer to keep.
+        }
+
+        /// Writes the sequences whose last choice ends them, and frees their lanes.
+        private void retire() {
+            if (stepping) return;
             for (var iterator = active.iterator(); iterator.hasNext(); ) {
                 Slot slot = iterator.next();
                 if (!slot.finished()) continue;
@@ -214,22 +282,50 @@ public final class Generate {
                 writer.write(
                         slot.prompt.id(), slot.tokens, slot.length, slot.prompt.tokens().length, slot.rows, slot.ran);
                 generated += slot.length - slot.prompt.tokens().length;
-                finished++;
+                lanes.add(slot.lane);
                 slot.close();
-                if (finished % 16 == 0) {
-                    double seconds = (System.nanoTime() - begun) / 1e9;
+                if (++answered % 16 == 0) {
                     System.out.printf(
                             Locale.ROOT,
                             "%d/%d answered, %d tokens generated, %.0f tok/s%n",
-                            finished,
+                            answered,
                             prompts.size(),
                             generated,
-                            generated / seconds);
+                            generated / ((System.nanoTime() - begun) / 1e9));
                 }
             }
-            if (!active.isEmpty()) step(active);
         }
-        System.out.printf(Locale.ROOT, "%d answers, %d tokens%n", finished, generated);
+
+        @Override
+        public LatticeSource getDelegate() {
+            return delegate;
+        }
+
+        @Override
+        public void complete() {
+            delegate.complete();
+        }
+
+        @Override
+        public boolean isComplete() {
+            return delegate.isComplete();
+        }
+
+        /// The lattice calls `request` and `pull` of a source one thread at a time: the generation's state needs no
+        /// other protection.
+        private final class Delegate extends AbstractIngestSink.Delegate {
+            @Override
+            public long hookOnPull(
+                    Consumer<AbstractFrame> consumer, Function<AbstractFrame, Boolean> stopCondition, long demand) {
+                poll();
+                return 0;
+            }
+
+            @Override
+            public void hookOnRequest(LatticeReceiver terminal, long demand) {
+                poll();
+            }
+        }
     }
 
     /// Prefills a slot's prompt in the engine's chunks, keeping every row's hidden; the last chunk's logits give the
@@ -255,7 +351,7 @@ public final class Generate {
                     if (!last) return;
                     try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
                         long row = logits.deviceAddress() + (long) (logits.tokenCount() - 1) * vocabulary * Short.BYTES;
-                        slot.next = choose(row, 1)[0];
+                        slot.next = choose(row, 1, prefillChoices + 4L * slot.lane)[0];
                     }
                 }));
             });
@@ -263,30 +359,26 @@ public final class Generate {
         return chain;
     }
 
-    /// One batched verification of each active slot's next token: keeps each row's hidden and the next choices.
-    private void step(List<Slot> active) throws Exception {
-        List<Quantum.Part> parts = new ArrayList<>(active.size());
-        for (Slot slot : active)
+    /// One batched verification of each slot's next token: keeps each row's hidden; completes with the next choices.
+    private CompletableFuture<int[]> step(List<Slot> slots) {
+        List<Quantum.Part> parts = new ArrayList<>(slots.size());
+        for (Slot slot : slots)
             parts.add(new Quantum.Part(slot.sequence, slot.sequence.currentTokenPosition(), new int[] {slot.next}));
         var quantum = Quantum.batch(plan, Quantum.ExecutionKind.VERIFY, parts, LogitsRequirement.ALL_TOKENS)
                 .seedingDraft();
         int[][] chosen = new int[1][];
-        succeeded(runtime.submit(quantum, done -> {
+        return succeeded(runtime.submit(quantum, done -> {
                     try (DeviceLogits logits = done.logitsOutput().orElseThrow()) {
-                        chosen[0] = choose(logits.deviceAddress(), active.size());
+                        chosen[0] = choose(logits.deviceAddress(), slots.size(), stepChoices);
                     }
-                    for (Slot slot : active) slot.keep(1);
+                    for (Slot slot : slots) slot.keep(1);
                 }))
-                .get();
-        for (int k = 0; k < active.size(); k++) {
-            Slot slot = active.get(k);
-            slot.tokens[slot.length++] = slot.next;
-            slot.next = chosen[0][k];
-        }
+                .thenApply(ignored -> chosen[0]);
     }
 
-    /// The greedy token of each of `rows` BF16 logits rows from `logits`.
-    private synchronized int[] choose(long logits, int rows) {
+    /// The greedy token of each of `rows` BF16 logits rows from `logits`, through the mapped ints at `out`, on the
+    /// calling thread's own default stream.
+    private int[] choose(long logits, int rows, long out) {
         device.cuda.bindThread();
         device.cuda.launch(
                 argmax,
@@ -294,16 +386,16 @@ public final class Generate {
                 1,
                 256,
                 0,
-                argmaxStream,
+                PER_THREAD_STREAM,
                 new Cuda.Arguments()
                         .pointer(logits)
                         .integer(vocabulary)
-                        .pointer(device.gpu.hostWeightsDeviceAddress(choices)));
-        device.cuda.synchronize(argmaxStream);
-        int[] out = new int[rows];
+                        .pointer(device.gpu.hostWeightsDeviceAddress(out)));
+        device.cuda.synchronize(PER_THREAD_STREAM);
+        int[] chosen = new int[rows];
         MemorySegment.copy(
-                MemorySegment.ofAddress(choices).reinterpret(4L * rows), ValueLayout.JAVA_INT, 0, out, 0, rows);
-        return out;
+                MemorySegment.ofAddress(out).reinterpret(4L * rows), ValueLayout.JAVA_INT, 0, chosen, 0, rows);
+        return chosen;
     }
 
     private static CompletableFuture<Void> succeeded(CompletableFuture<Quantum.Outcome> outcome) {
