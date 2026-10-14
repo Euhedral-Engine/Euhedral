@@ -1,12 +1,13 @@
 """Build the GPTQ calibration set: token sequences of the model's own answers, prose and code, disjoint from the holdout.
 
 Usage (in tools/, with `tokenizers` and `jinja2` importable):
-  python -m gptq.calibration prompts OUT/prompts.jsonl T4_PROMPTS.jsonl [--count N]
+  python -m gptq.calibration prompts OUT/prompts.jsonl T4_PROMPTS.jsonl [--count N] [--chat N]
   python -m gptq.calibration generate SERVER_URL OUT/prompts.jsonl OUT/generations.jsonl [--parallel N] [--max-tokens N]
   python -m gptq.calibration tokens CHECKPOINT OUT [--length 2048] [--generated N] [--prose N] [--code N]
 
 `prompts` samples training-split prompts (GSM8K, MBPP, Hermes function calling; tools/holdout/t4_prompts.py) with a
-seed of its own, leaving out every T4 prompt. `generate` asks an OpenAI-compatible server (the engine serving
+seed of its own, leaving out every T4 prompt; `--chat N` adds N first turns of UltraChat 200k's SFT split (general
+chat, for the MTP drafter's corpus) after them, leaving the others as they are. `generate` asks an OpenAI-compatible server (the engine serving
 Swift-1.5) for greedy answers with thinking, several requests at a time, resuming a stopped run. `tokens` renders each
 answered prompt with the checkpoint's chat template (prompt, thinking, answer), tokenizes it with the checkpoint's
 tokenizer (the same ids llama.cpp produces), adds wikitext-2 train and source files other than T3's, and writes
@@ -56,7 +57,7 @@ def held_out_prompts(path: Path) -> set[str]:
     return {json.loads(line)["messages"][0]["content"] for line in path.open()}
 
 
-def prompts(out: Path, count: int, t4: Path) -> None:
+def prompts(out: Path, count: int, t4: Path, chat: int = 0) -> None:
     rng = random.Random(SEED)
     held_out = held_out_prompts(t4)
     per = count // 3 + 1
@@ -72,6 +73,10 @@ def prompts(out: Path, count: int, t4: Path) -> None:
         tools.append({"id": f"hermes-fc-{row['id']}", "messages": [{"role": "user", "content": human}], "tools": declared})
     chosen = [p for group in zip(math, code, tools) for p in group
               if p["messages"][0]["content"] not in held_out][:count]
+    if chat:
+        chosen += [{"id": f"ultrachat-{row['prompt_id'][:12]}", "messages": [{"role": "user", "content": row["prompt"]}]}
+                   for row in t4_prompts.rows("HuggingFaceH4/ultrachat_200k", "default", "train_sft", 207865, chat, rng)
+                   if row["prompt"] not in held_out]
     with out.open("w", encoding="utf-8") as handle:
         for prompt in chosen:
             handle.write(json.dumps(prompt, ensure_ascii=False) + "\n")
@@ -173,7 +178,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("prompts"); p.add_argument("out", type=Path); p.add_argument("t4", type=Path)
-    p.add_argument("--count", type=int, default=240)
+    p.add_argument("--count", type=int, default=240); p.add_argument("--chat", type=int, default=0)
     g = sub.add_parser("generate"); g.add_argument("server"); g.add_argument("prompts", type=Path); g.add_argument("out", type=Path)
     g.add_argument("--parallel", type=int, default=4); g.add_argument("--max-tokens", type=int, default=1800)
     t = sub.add_parser("tokens"); t.add_argument("checkpoint", type=Path); t.add_argument("out", type=Path)
@@ -181,7 +186,7 @@ def main(argv: list[str]) -> int:
     t.add_argument("--prose", type=int, default=64); t.add_argument("--code", type=int, default=64)
     args = parser.parse_args(argv)
     if args.command == "prompts":
-        prompts(args.out, args.count, args.t4)
+        prompts(args.out, args.count, args.t4, args.chat)
     elif args.command == "generate":
         generate(args.server, args.prompts, args.out, args.parallel, args.max_tokens)
     else:
