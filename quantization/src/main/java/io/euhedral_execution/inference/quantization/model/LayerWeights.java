@@ -40,6 +40,11 @@ public final class LayerWeights implements AutoCloseable {
             this.attention = attention;
         }
 
+        /// The layer's tensors in host memory by role (norms, GDN tensors) or object name, as they are uploaded.
+        public Map<String, MemorySegment> parts() {
+            return java.util.Collections.unmodifiableMap(parts);
+        }
+
         @Override
         public void close() {
             arena.close();

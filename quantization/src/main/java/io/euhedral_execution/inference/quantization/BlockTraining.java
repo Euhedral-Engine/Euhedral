@@ -406,7 +406,7 @@ public final class BlockTraining {
     }
 
     /// The checkpoint tensor of each norm role of `layer` (`index`).
-    private static java.util.Map<String, String> normTensors(int index, boolean attention) {
+    static java.util.Map<String, String> normTensors(int index, boolean attention) {
         String p = "model.language_model.layers." + index + ".";
         var tensors = new java.util.LinkedHashMap<String, String>();
         tensors.put("input_norm", p + "input_layernorm.weight");

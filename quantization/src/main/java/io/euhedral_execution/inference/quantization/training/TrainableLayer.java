@@ -133,6 +133,81 @@ public final class TrainableLayer implements AutoCloseable {
         frozen.put(role, copy);
     }
 
+    // ---------------------------------------------------------------- reloadable storage
+
+    /// Adds a quantized linear's device storage (codes and scales) to be filled by [#loadLinear]; the layer owns it.
+    public void addLinearStorage(String role, int out, int in, int group) {
+        long codes = gpu.allocate((long) out * in);
+        owned.add(codes);
+        linears.put(
+                role,
+                new QuantizedLinear(
+                        role,
+                        out,
+                        in,
+                        group,
+                        codes,
+                        new Parameter(gpu, ops, role + "/scales", (long) out * (in / group))));
+    }
+
+    public void addNormStorage(String role, int width) {
+        norms.put(role, new Parameter(gpu, ops, role, width));
+    }
+
+    public void addFrozenStorage(String role, long count) {
+        long address = gpu.allocate(4 * count);
+        owned.add(address);
+        frozen.put(role, address);
+    }
+
+    /// Fills a linear from host memory: int8 codes, and FP32 scales with their Adam moments; zeroes its gradient.
+    public void loadLinear(
+            String role,
+            java.lang.foreign.MemorySegment codes,
+            java.lang.foreign.MemorySegment scales,
+            java.lang.foreign.MemorySegment first,
+            java.lang.foreign.MemorySegment second) {
+        QuantizedLinear linear = linears.get(role);
+        gpu.copyHostToDevice(linear.codes, codes, (long) linear.out * linear.in);
+        load(linear.scales, scales, first, second);
+    }
+
+    public void loadNorm(
+            String role,
+            java.lang.foreign.MemorySegment values,
+            java.lang.foreign.MemorySegment first,
+            java.lang.foreign.MemorySegment second) {
+        load(norms.get(role), values, first, second);
+    }
+
+    public void loadFrozen(String role, java.lang.foreign.MemorySegment values) {
+        gpu.copyHostToDevice(frozen.get(role), values, values.byteSize());
+    }
+
+    private void load(
+            Parameter parameter,
+            java.lang.foreign.MemorySegment values,
+            java.lang.foreign.MemorySegment first,
+            java.lang.foreign.MemorySegment second) {
+        long bytes = 4 * parameter.count;
+        gpu.copyHostToDevice(parameter.values, values, bytes);
+        gpu.copyHostToDevice(parameter.first, first, bytes);
+        gpu.copyHostToDevice(parameter.second, second, bytes);
+        ops.zero(parameter.gradient, parameter.count);
+    }
+
+    /// Copies a parameter's values and Adam moments back to host memory.
+    public void store(
+            Parameter parameter,
+            java.lang.foreign.MemorySegment values,
+            java.lang.foreign.MemorySegment first,
+            java.lang.foreign.MemorySegment second) {
+        long bytes = 4 * parameter.count;
+        gpu.copyDeviceToHost(values, parameter.values, bytes);
+        gpu.copyDeviceToHost(first, parameter.first, bytes);
+        gpu.copyDeviceToHost(second, parameter.second, bytes);
+    }
+
     public List<Parameter> parameters() {
         List<Parameter> all = new ArrayList<>();
         for (QuantizedLinear linear : linears.values()) all.add(linear.scales);
