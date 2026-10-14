@@ -120,7 +120,9 @@ and 11) and gave KL 0.088 / 0.080 / 0.202 / 0.225 on T1-T4: the model's own gene
 trained through all 64 layers at once against the BF16 model's top-64 log-probabilities plus one bucket for the rest of
 the vocabulary; 200 sequences, Adam over 8 sequences per update, 1 epoch) lowered the held-out calibration KL from 0.173
 to 0.165 and gave KL 0.087 / 0.081 / 0.194 / 0.310 on T1-T4: the model's own generations get much worse, so it is not
-adopted either.
+adopted either. The LM head stays NVFP4: rounded by GPTQ in Q5G64 instead (`calibrate --output-head Q5G64_F16S`,
+the converter's `--output-head`; 0.12 GiB more), it gave KL 0.084 / 0.079 / 0.183 / 0.264 for `q3` and 0.027 / 0.031 /
+0.061 / 0.159 for `nvfp4` on T1-T4.
 
 **Calibration set** (`tools/gptq/calibration.py`): 218 sequences of 2048 tokens, none from the holdout: 90 of
 Swift-1.5's own answers (thinking, tool calls and chat-template tokens included) to 187 training-split GSM8K, MBPP and
