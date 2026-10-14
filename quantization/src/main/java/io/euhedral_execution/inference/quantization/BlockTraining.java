@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.quantization;
 
+import io.euhedral_execution.inference.quantization.checkpoint.Overlay;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gptq.QuantState;
@@ -16,6 +17,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
@@ -27,6 +29,12 @@ import java.util.Set;
 /// scales and its norms their weights ([TrainableLayer]) so that the layer on the quantized stream's input matches the
 /// BF16 layer's output on the target stream's input, by squared error; held-out sequences measure the error before
 /// and after. The codes stay as GPTQ chose them.
+///
+/// Each trained layer's scales (rounded to float16) and norms then run the quantized stream for the layers after it.
+/// They go to `out`, a codes directory for `convert_checkpoint.py --codes-from` (the objects of untrained layers, the
+/// heads and the MTP layer copied as they were), and the norms to `out/norms`; `overlay` is then a checkpoint
+/// directory that reads as the source checkpoint with the trained norms in place. A layer with `out/layer-N.done` is
+/// not trained again: a stopped run resumes.
 public final class BlockTraining {
 
     /// Command-line settings: which layers train, on how many sequences (the last `holdout` held out), how long and
@@ -41,7 +49,9 @@ public final class BlockTraining {
             int epochs,
             float scaleRate,
             float normRate,
-            int batch) {}
+            int batch,
+            Path out,
+            Path overlay) {}
 
     private final Settings settings;
     private final Device device;
@@ -98,9 +108,12 @@ public final class BlockTraining {
                     pipeline.run(layer, targetAddress, batchStates, sequences, length, settings.batch(), null, true)
                             .join();
                     boolean trains = settings.layers().contains(index);
-                    if (trains) trainLayer(index, layer, target, quantized, sequences, length);
-                    // The quantized stream: the layer decoded from its codes (untrained).
-                    for (String name : List.copyOf(layer.objects.keySet())) layer.replace(name, decode(name));
+                    boolean trained = trains && Files.exists(done(index));
+                    if (trains && !trained) trainLayer(index, layer, target, quantized, sequences, length);
+                    // The quantized stream: the layer decoded from its codes, trained when it was.
+                    Path codes = trains ? settings.out() : settings.codes();
+                    for (String name : List.copyOf(layer.objects.keySet())) layer.replace(name, decode(codes, name));
+                    if (trains) applyNorms(index, layer);
                     pipeline.run(layer, quantizedAddress, batchStates, sequences, length, settings.batch(), null, true)
                             .join();
                     if (trains) {
@@ -113,6 +126,7 @@ public final class BlockTraining {
                 }
                 log("layer " + index + " done");
             }
+            finish();
         } finally {
             device.gpu.free(batchStates);
             device.gpu.freeHostWeights(targetAddress);
@@ -145,8 +159,10 @@ public final class BlockTraining {
         try (TrainableLayer trainable = new TrainableLayer(device.gpu, ops, shape);
                 Arena arena = Arena.ofShared()) {
             List<Long> temporaries = new java.util.ArrayList<>(), codesOwned = new java.util.ArrayList<>();
+            java.util.Map<String, QuantState> states = new java.util.LinkedHashMap<>();
             for (String name : layer.objects.keySet()) {
                 QuantState state = QuantState.load(QuantState.stateFile(settings.codes(), name), arena);
+                states.put(name, state);
                 if (state.formatName().equals("NVFP4"))
                     throw new IllegalArgumentException(name + " is NVFP4: block training takes grouped formats");
                 long codes = device.gpu.allocate(state.rows() * state.columns());
@@ -180,6 +196,7 @@ public final class BlockTraining {
             for (long address : temporaries) device.gpu.free(address);
             try {
                 fit(index, trainable, target, quantized, sequences, length);
+                save(index, layer, trainable, states, attention);
             } finally {
                 for (long address : codesOwned) device.gpu.free(address);
             }
@@ -268,7 +285,7 @@ public final class BlockTraining {
                                 0,
                                 step);
                     }
-                    total += read(loss);
+                    total += read(loss) / count;
                 }
                 double after = evaluate(
                         trainable,
@@ -360,9 +377,9 @@ public final class BlockTraining {
     // ---- the quantized stream's weights ----
 
     /// Object `name` decoded from its codes to BF16 on the device.
-    private long decode(String name) throws IOException {
+    private long decode(Path directory, String name) throws IOException {
         try (Arena arena = Arena.ofConfined()) {
-            QuantState state = QuantState.load(QuantState.stateFile(settings.codes(), name), arena);
+            QuantState state = QuantState.load(QuantState.stateFile(directory, name), arena);
             long n = state.rows(), k = state.columns();
             long codes = device.gpu.allocate(n * k), scales = 0, floats = device.gpu.allocate(4 * n * k);
             try {
@@ -380,6 +397,126 @@ public final class BlockTraining {
                 if (scales != 0) device.gpu.free(scales);
             }
         }
+    }
+
+    // ---- trained layers ----
+
+    private Path done(int index) {
+        return settings.out().resolve("layer-" + index + ".done");
+    }
+
+    /// The checkpoint tensor of each norm role of `layer` (`index`).
+    private static java.util.Map<String, String> normTensors(int index, boolean attention) {
+        String p = "model.language_model.layers." + index + ".";
+        var tensors = new java.util.LinkedHashMap<String, String>();
+        tensors.put("input_norm", p + "input_layernorm.weight");
+        tensors.put("post_norm", p + "post_attention_layernorm.weight");
+        if (attention) {
+            tensors.put("query_norm", p + "self_attn.q_norm.weight");
+            tensors.put("key_norm", p + "self_attn.k_norm.weight");
+        } else tensors.put("gdn_norm", p + "linear_attn.norm.weight");
+        return tensors;
+    }
+
+    /// Writes a trained layer: its objects' states with the trained scales in float16, its norms (FP32 files in
+    /// `out/norms`), then the layer's done marker.
+    private void save(
+            int index,
+            LayerWeights layer,
+            TrainableLayer trainable,
+            java.util.Map<String, QuantState> states,
+            boolean attention)
+            throws IOException {
+        Files.createDirectories(settings.out().resolve("norms"));
+        for (var entry : states.entrySet()) {
+            QuantState state = entry.getValue();
+            var parameter = trainable.linears.get(entry.getKey().substring(layer.prefix.length())).scales;
+            float[] scales = download(parameter.values, parameter.count);
+            MemorySegment half = MemorySegment.ofArray(new short[scales.length]);
+            for (int i = 0; i < scales.length; i++)
+                half.setAtIndex(ValueLayout.JAVA_SHORT, i, Float.floatToFloat16(scales[i]));
+            new QuantState(
+                            state.formatName(),
+                            state.layout(),
+                            state.rows(),
+                            state.columns(),
+                            state.codes(),
+                            half,
+                            state.globalScale(),
+                            state.table())
+                    .save(QuantState.stateFile(settings.out(), entry.getKey()));
+        }
+        for (var entry : normTensors(index, attention).entrySet()) {
+            var parameter = trainable.norms.get(entry.getKey());
+            float[] values = download(parameter.values, parameter.count);
+            java.nio.ByteBuffer bytes =
+                    java.nio.ByteBuffer.allocate(4 * values.length).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            for (float value : values) bytes.putFloat(value);
+            Files.write(settings.out().resolve("norms").resolve(entry.getValue() + ".f32"), bytes.array());
+        }
+        Files.writeString(done(index), "trained\n");
+    }
+
+    /// Puts a trained layer's norms (rounded to BF16) into `layer`'s norm tensors on the device.
+    private void applyNorms(int index, LayerWeights layer) throws IOException {
+        var roles = java.util.Map.of(
+                "input_norm", layer.inputNorm,
+                "post_norm", layer.postNorm,
+                "query_norm", layer.queryNorm,
+                "key_norm", layer.keyNorm,
+                "gdn_norm", layer.gdnNorm);
+        for (var entry : normTensors(index, layer.attention).entrySet()) {
+            float[] values = readNorm(entry.getValue());
+            short[] bf16 = new short[values.length];
+            for (int i = 0; i < values.length; i++) bf16[i] = bf16(values[i]);
+            Upload.segment(device.gpu, roles.get(entry.getKey()), MemorySegment.ofArray(bf16), 2L * bf16.length);
+        }
+    }
+
+    private float[] readNorm(String tensor) throws IOException {
+        java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(
+                        Files.readAllBytes(settings.out().resolve("norms").resolve(tensor + ".f32")))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        float[] values = new float[bytes.remaining() / 4];
+        bytes.asFloatBuffer().get(values);
+        return values;
+    }
+
+    private static short bf16(float value) {
+        int bits = Float.floatToRawIntBits(value);
+        return (short) ((bits + 0x7fff + ((bits >>> 16) & 1)) >>> 16);
+    }
+
+    private float[] download(long address, long count) {
+        device.synchronize();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment host = arena.allocate(4 * count, 4);
+            device.gpu.copyDeviceToHost(host, address, host.byteSize());
+            return host.toArray(ValueLayout.JAVA_FLOAT);
+        }
+    }
+
+    /// Completes `out` with the objects it lacks (copied from the source codes) and writes the overlay checkpoint.
+    private void finish() throws IOException {
+        try (var files = Files.list(settings.codes())) {
+            for (Path file : (Iterable<Path>) files::iterator) {
+                Path copy = settings.out().resolve(file.getFileName());
+                if (file.getFileName().toString().endsWith(".npz") && !Files.exists(copy)) Files.copy(file, copy);
+            }
+        }
+        if (settings.overlay() == null) return;
+        java.util.Map<String, float[]> norms = new java.util.TreeMap<>();
+        Path normDirectory = settings.out().resolve("norms");
+        if (Files.isDirectory(normDirectory)) {
+            try (var files = Files.list(normDirectory)) {
+                for (Path file : (Iterable<Path>) files::iterator) {
+                    String tensor = file.getFileName().toString().replaceAll("\\.f32$", "");
+                    norms.put(tensor, readNorm(tensor));
+                }
+            }
+        }
+        Overlay.write(settings.model(), settings.overlay(), norms);
+        log("overlay checkpoint with " + norms.size() + " trained norms in " + settings.overlay());
     }
 
     // ---- embedding ----

@@ -13,7 +13,8 @@ import java.util.Map;
 /// calibrate --model CHECKPOINT --quantization nvfp4|q3 [--compressed] --tokens TOKENS.npy --draft-ids-from ARTIFACT
 ///           --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
 ///           [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
-/// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --train-layers 10,11 [--sequences 96]
+/// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
+///              [--overlay CHECKPOINT_DIR] [--sequences 96]
 ///              [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
 ///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
@@ -68,7 +69,9 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("epochs", "2")),
                             Float.parseFloat(options.getOrDefault("scale-lr", "1e-5")),
                             Float.parseFloat(options.getOrDefault("norm-lr", "1e-4")),
-                            Integer.parseInt(options.getOrDefault("batch", "4"))),
+                            Integer.parseInt(options.getOrDefault("batch", "4")),
+                            Path.of(required(options, "out")),
+                            options.containsKey("overlay") ? Path.of(options.get("overlay")) : null),
                     Path.of(library));
             return;
         }
