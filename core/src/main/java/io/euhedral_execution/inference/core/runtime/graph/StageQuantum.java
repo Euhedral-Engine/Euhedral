@@ -19,6 +19,15 @@ public interface StageQuantum {
         return null;
     }
 
+    /// Every sequence whose carried state this quantum's graph shares: [#sequenceOwner]'s, or none; a quantum that
+    /// runs several sequences' rows names each.
+    default SequenceOwner[] sequenceOwners() {
+        SequenceOwner owner = sequenceOwner();
+        return owner == null ? NO_OWNERS : new SequenceOwner[] {owner};
+    }
+
+    SequenceOwner[] NO_OWNERS = new SequenceOwner[0];
+
     default boolean overlapLaunches() {
         return false;
     }
