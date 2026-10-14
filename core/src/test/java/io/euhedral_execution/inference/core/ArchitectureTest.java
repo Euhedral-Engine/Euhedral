@@ -164,6 +164,7 @@ class ArchitectureTest {
             "model/qwen38/Emission.java#drain",
             "model/qwen38/SequenceCleanup.java#close",
             "model/qwen38/Qwen38Model.java#close",
+            "model/qwen38/offload/DiskReader.java#close",
             "model/qwen38/prefix/PrefixCache.java#close",
             "model/qwen38/speculative/MtpDecoder.java#generate",
             "model/qwen38/speculative/DFlash2Decoder.java#generate",

@@ -98,6 +98,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private final Chunk[] chunks;
     /// A batched quantum's sequences and their rows ([#batch]); null for a quantum of one sequence.
     private final Segment[] segments;
+    /// The reader of this quantum's disk-backed weights and its number there; null and -1 without disk uses.
+    private io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader diskReader;
+    private long diskTicket = -1;
     /// A batched quantum's place in each segment's sequence order.
     private SegmentWork[] segmentWorks;
     /// A prompt's prefix checkpoints, and for each chunk the checkpoint copied after it (-1: none).
@@ -325,6 +328,19 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// The plan whose weights this quantum runs.
     public ExecutionPlan plan() {
         return this.plan;
+    }
+
+    /// Names the reader of this quantum's disk uses and its number there; set at admission, before it starts.
+    void readsFromDisk(io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader reader, long ticket) {
+        this.diskReader = reader;
+        this.diskTicket = ticket;
+    }
+
+    /// The quantum's device work does not consume all its disk uses: those not yet read are raised unread. Any
+    /// thread; a no-op without disk uses.
+    void abandonDiskReads() {
+        var reader = this.diskReader;
+        if (reader != null) reader.abandon(this.diskTicket);
     }
 
     /// The view of [#plan] this quantum runs.

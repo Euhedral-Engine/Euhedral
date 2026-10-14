@@ -106,6 +106,8 @@ public final class StageGraph implements AutoCloseable {
     private final Replay replay;
     private Capture recording;
     private Capture replaying;
+    /// Whether the replaying quantum's captured graph was launched: it ran every stage's device work.
+    private boolean launched;
     private final AtomicBoolean recordingBroken = new AtomicBoolean();
     /// Lanes whose shadow joined the current recording.
     private final AtomicLong shadowLanes = new AtomicLong();
@@ -370,6 +372,7 @@ public final class StageGraph implements AutoCloseable {
         this.usedLanes.set(1L << this.home);
         this.recording = null;
         this.replaying = null;
+        this.launched = false;
         Capture capture = this.shadowStreams == null ? null : capture(quantum.captureKey());
         if (capture != null) {
             if (capture.graph != 0) this.replaying = capture;
@@ -541,6 +544,7 @@ public final class StageGraph implements AutoCloseable {
             // A stage that never ran never awaited what it waited for: the join takes those waits over, so a later
             // graph released onto this join still follows the graphs before this one.
             awaitExternals(home);
+            abandonUnsubmitted(home);
             if (this.joined != 0) home.mark(this.joined);
             sweepExternals();
             if (this.recording != null) finishRecording();
@@ -552,6 +556,7 @@ public final class StageGraph implements AutoCloseable {
             // The join may not be recorded: later graphs are released onto it as well as they can be.
             try {
                 awaitExternals(home);
+                abandonUnsubmitted(home);
                 if (this.joined != 0) home.mark(this.joined);
             } catch (RuntimeException | Error markFailure) {
                 failure.addSuppressed(markFailure);
@@ -565,6 +570,20 @@ public final class StageGraph implements AutoCloseable {
     /// Orders the home lane behind every external predecessor this binding waited on.
     private void awaitExternals(GpuStream home) {
         for (int slot = 0; slot < this.externalCount; slot++) if (this.awaits[slot] != 0) home.await(this.awaits[slot]);
+    }
+
+    /// Hands every stage whose device work this quantum does not include its [StageFrame#abandoned] turn, in stage
+    /// order: none when a captured graph ran the whole quantum.
+    private void abandonUnsubmitted(GpuStream home) {
+        if (this.replaying != null && this.launched) return;
+        for (StageFrame stage : this.stages) {
+            if (stage.submitted) continue;
+            try {
+                stage.abandoned(home);
+            } catch (RuntimeException | Error failure) {
+                this.quantum.fail(failure);
+            }
+        }
     }
 
     /// Every last accessor that never submitted (a stopped, failed or replayed quantum) releases the later graphs
@@ -809,6 +828,7 @@ public final class StageGraph implements AutoCloseable {
                 runStages();
                 return;
             }
+            this.launched = true;
         } catch (RuntimeException | Error failure) {
             capture.diverged = true;
             fail(failure);

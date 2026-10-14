@@ -14,6 +14,8 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.GdnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.MtpWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -50,6 +52,10 @@ public final class ExecutionPlan {
         /// Copies a host-backed weight into its staging slot. Its weight's `hostAddress` is the source
         /// and its `deviceAddress` the slot.
         WEIGHT_TRANSFER,
+        /// Copies a disk-backed weight from its window slot (`outputBufferIndex`) into its staging slot once
+        /// the slot's read raised its flag, then lowers the flag. Its weight's `hostAddress` is the payload in
+        /// the window slot and its `deviceAddress` the staging slot.
+        DISK_TRANSFER,
         /// Copies the target's hidden rows after one tapped layer into the sequence's DFlash2 tap rows (slot
         /// `outputBufferIndex`), in quanta that seed drafting; a no-op otherwise.
         DFLASH_TAP,
@@ -240,12 +246,27 @@ public final class ExecutionPlan {
         }
     }
 
+    /// A view's instructions and buffers; `diskUses` are its disk transfers' reads, in the order of its transfers.
     record PlanData(
             List<Instruction> instructions,
             List<Integer> projectionWidths,
             List<BufferSpec> bufferSpecs,
             boolean firstLayer,
-            boolean fullModel) {
+            boolean fullModel,
+            List<DiskUse> diskUses) {
+        PlanData {
+            diskUses = List.copyOf(diskUses);
+        }
+
+        PlanData(
+                List<Instruction> instructions,
+                List<Integer> projectionWidths,
+                List<BufferSpec> bufferSpecs,
+                boolean firstLayer,
+                boolean fullModel) {
+            this(instructions, projectionWidths, bufferSpecs, firstLayer, fullModel, List.of());
+        }
+
         PlanData(
                 List<Instruction> instructions,
                 List<Integer> projectionWidths,
@@ -269,6 +290,8 @@ public final class ExecutionPlan {
     /// The plan's own topology.
     private final Shape shape;
     private final WeightStaging staging;
+    /// The disk window of this plan family, or null when no weight is disk-backed.
+    private final DiskWindow window;
     // The views of a full model; null otherwise.
     private final Shape smallPrefill;
     private final Shape decode;
@@ -372,7 +395,14 @@ public final class ExecutionPlan {
     /// Builds the production plan for weights that may be host-backed: every executed view stages
     /// them through `staging`, which must be present when any weight is host-backed.
     public ExecutionPlan(Weights weights, WeightStaging staging) {
-        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), staging);
+        this(weights, staging, null);
+    }
+
+    /// Builds the production plan for weights that may be host-backed or disk-backed: every executed view stages
+    /// them through `staging`, and reads the disk-backed ones through `window`, which must be present when any
+    /// weight is disk-backed.
+    public ExecutionPlan(Weights weights, WeightStaging staging, DiskWindow window) {
+        this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), staging, window);
     }
 
     /// Unfused reference topology for every execution kind. This is a correctness oracle for tests
@@ -383,12 +413,18 @@ public final class ExecutionPlan {
         return new ExecutionPlan(
                 weights,
                 new PlanData(data.instructions(), data.projectionWidths(), data.bufferSpecs(), data.firstLayer()),
+                null,
                 null);
     }
 
     /// The staging ring of this plan family, or null when no weight is host-backed.
     public WeightStaging staging() {
         return this.staging;
+    }
+
+    /// The disk window of this plan family, or null when no weight is disk-backed.
+    public DiskWindow window() {
+        return this.window;
     }
 
     /// Selects the view a quantum of `kind` over `rows` rows runs. A plan without views runs its own topology.
@@ -586,13 +622,15 @@ public final class ExecutionPlan {
     }
 
     private ExecutionPlan(Weights weights, PlanData data) {
-        this(weights, data, null);
+        this(weights, data, null, null);
     }
 
-    /// The plan of `data`; a full model also builds its views, which stage host-backed weights through `staging`.
-    private ExecutionPlan(Weights weights, PlanData data, WeightStaging staging) {
+    /// The plan of `data`; a full model also builds its views, which stage host-backed weights through `staging`
+    /// and read disk-backed ones through `window`.
+    private ExecutionPlan(Weights weights, PlanData data, WeightStaging staging, DiskWindow window) {
         this.weights = weights;
         this.staging = staging;
+        this.window = window;
         this.shape = new Shape(Shape.View.OWN, this, data, false, false);
         if (!data.fullModel()) {
             this.smallPrefill = null;
@@ -613,11 +651,11 @@ public final class ExecutionPlan {
                         && weights.mtp().layer().mixer()
                                 instanceof io.euhedral_execution.inference.core.model.qwen38.loader.AttentionWeights
                         && weights.runtimeObjects().containsKey(DRAFT_HEAD)
-                ? new Shape(Shape.View.MTP_DRAFT, this, staged(mtpDraft(weights), staging), false, false)
+                ? new Shape(Shape.View.MTP_DRAFT, this, staged(mtpDraft(weights), staging, window), false, false)
                 : null;
         this.mtpCatchUp = this.mtpDraft == null
                 ? null
-                : new Shape(Shape.View.MTP_CATCHUP, this, staged(mtpDraft(weights), staging), false, false);
+                : new Shape(Shape.View.MTP_CATCHUP, this, staged(mtpDraft(weights), staging, window), false, false);
         DFlash2Weights drafter = weights.dflash2();
         // A DFlash2 block leaves the host-backed transfer lane idle for milliseconds before every verification, so it
         // copies the decode view's first ring slots, and a verification that finds them loaded skips their transfers.
@@ -630,18 +668,23 @@ public final class ExecutionPlan {
                         ? new Shape(
                                 Shape.View.DFLASH_BLOCK,
                                 this,
-                                staged(dflash2Block(weights, drafter), staging),
+                                staged(dflash2Block(weights, drafter), staging, window),
                                 false,
                                 false)
                         : new Shape(
                                 Shape.View.DFLASH_BLOCK,
                                 this,
-                                withPrefetch(staged(dflash2Block(weights, drafter), staging), firstUses),
+                                withPrefetch(staged(dflash2Block(weights, drafter), staging, window), firstUses),
                                 false,
                                 true);
         this.dflashContext = drafter == null
                 ? null
-                : new Shape(Shape.View.DFLASH_CONTEXT, this, staged(dflash2Context(drafter), staging), false, false);
+                : new Shape(
+                        Shape.View.DFLASH_CONTEXT,
+                        this,
+                        staged(dflash2Context(drafter), staging, window),
+                        false,
+                        false);
         this.smallPrefill = prefillShape(Shape.View.SMALL_PREFILL, data, PrefillView.SMALL);
         this.decode = prefillShape(Shape.View.DECODE, data, PrefillView.SMALL);
         this.prefetchedSlots = this.dflashBlock != null && this.dflashBlock.prefetchesRing() ? firstUses.size() : 0;
@@ -649,7 +692,7 @@ public final class ExecutionPlan {
                 ? new Shape(
                         Shape.View.DECODE_PRELOADED,
                         this,
-                        staged(prefillView(data, PrefillView.SMALL), staging, true),
+                        staged(prefillView(data, PrefillView.SMALL), staging, window, true),
                         false,
                         false)
                 : null;
@@ -659,7 +702,7 @@ public final class ExecutionPlan {
                 : new Shape(
                         Shape.View.VERIFY_PRELOADED,
                         this,
-                        staged(prefillView(data, PrefillView.SMALL), staging, true),
+                        staged(prefillView(data, PrefillView.SMALL), staging, window, true),
                         false,
                         false);
         this.regionPrefill = prefillShape(Shape.View.REGION_PREFILL, data, PrefillView.REGIONS);
@@ -671,7 +714,7 @@ public final class ExecutionPlan {
         // a shape that falls back to ordinary FFN.
         boolean regions = prefill == PrefillView.REGIONS;
         boolean hasFusedFfn = selected.instructions().stream().anyMatch(i -> i.kind() == Kind.Q3_GATE_UP_SWIGLU);
-        return new Shape(view, this, staged(selected, this.staging), regions && hasFusedFfn, false);
+        return new Shape(view, this, staged(selected, this.staging, this.window), regions && hasFusedFfn, false);
     }
 
     /// The view to run when the ring holds what [Shape#prefetchesRing] loads: the decode view without the transfers of
@@ -703,7 +746,10 @@ public final class ExecutionPlan {
         List<TensorHandle> uses = new ArrayList<>();
         for (Instruction instruction : data.instructions()) {
             for (TensorHandle weight : instruction.weights) {
-                if (weight.hostBacked() && uses.size() < slots) uses.add(weight);
+                if (!stagedUse(weight) || uses.size() == slots) continue;
+                // A disk-backed weight is read for the quantum that uses it, never ahead of it.
+                if (weight.diskBacked()) return List.of();
+                uses.add(weight);
             }
         }
         return List.copyOf(uses);
@@ -736,7 +782,17 @@ public final class ExecutionPlan {
                     -1));
         }
         return new PlanData(
-                List.copyOf(result), data.projectionWidths(), data.bufferSpecs(), data.firstLayer(), data.fullModel());
+                List.copyOf(result),
+                data.projectionWidths(),
+                data.bufferSpecs(),
+                data.firstLayer(),
+                data.fullModel(),
+                data.diskUses());
+    }
+
+    /// Whether a use of `weight` reads a staging slot: it is host-backed or disk-backed.
+    private static boolean stagedUse(TensorHandle weight) {
+        return weight.hostBacked() || weight.diskBacked();
     }
 
     /// Rewrites a view so that each use of a host-backed weight reads a staging slot. Use `u` takes slot
@@ -744,25 +800,44 @@ public final class ExecutionPlan {
     /// the quantum, and precedes the consumer. Transfers are leaves apart from those two edges, so each
     /// copy starts as soon as its slot is free.
     static PlanData staged(PlanData data, WeightStaging staging) {
-        return staged(data, staging, false);
+        return staged(data, staging, null, false);
+    }
+
+    /// [#staged(PlanData, WeightStaging)] for weights that may also be disk-backed, read through `window`.
+    static PlanData staged(PlanData data, WeightStaging staging, DiskWindow window) {
+        return staged(data, staging, window, false);
     }
 
     /// [#staged(PlanData, WeightStaging)], with `preloaded` leaving out the transfers of the first `slots` uses: the
     /// quantum runs only after a prefetch loaded them into slots 0 .. slots - 1 ([#prefetchesRing]).
     static PlanData staged(PlanData data, WeightStaging staging, boolean preloaded) {
+        return staged(data, staging, null, preloaded);
+    }
+
+    /// The staged view of `data`. A disk-backed use's transfer is a [Kind#DISK_TRANSFER] from window slot
+    /// `slot + slots * (k mod 2)`, where `slot` is its staging slot and `k` counts the view's earlier disk
+    /// uses of that staging slot: the copies into one staging slot run one after another on the device, so
+    /// each window slot's uses are consumed in the order the view lists them ([PlanData#diskUses]).
+    static PlanData staged(PlanData data, WeightStaging staging, DiskWindow window, boolean preloaded) {
         List<Instruction> source = data.instructions();
-        boolean hostBacked = source.stream().flatMap(i -> i.weights.stream()).anyMatch(TensorHandle::hostBacked);
-        if (!hostBacked) return data;
+        boolean stages = source.stream().flatMap(i -> i.weights.stream()).anyMatch(ExecutionPlan::stagedUse);
+        if (!stages) return data;
         if (staging == null) throw new IllegalArgumentException("host-backed weights need a staging ring");
+        boolean disk = source.stream().flatMap(i -> i.weights.stream()).anyMatch(TensorHandle::diskBacked);
+        if (disk && window == null) throw new IllegalArgumentException("disk-backed weights need a disk window");
         int slots = staging.slots();
+        if (disk && DiskWindow.SLOTS != 2 * slots)
+            throw new IllegalArgumentException("a disk window has two slots per staging slot");
         for (Instruction instruction : source) {
             long uses = instruction.weights.stream()
-                    .filter(TensorHandle::hostBacked)
+                    .filter(ExecutionPlan::stagedUse)
                     .count();
             if (uses > slots) throw new IllegalArgumentException("an instruction stages more weights than slots");
             for (TensorHandle weight : instruction.weights) {
-                if (weight.hostBacked() && weight.byteSize() > staging.slotBytes())
+                if (stagedUse(weight) && weight.byteSize() > staging.slotBytes())
                     throw new IllegalArgumentException("host-backed weight exceeds a staging slot: " + weight.name());
+                if (weight.diskBacked() && DiskWindow.slotBytesFor(weight.byteSize()) > window.slotBytes())
+                    throw new IllegalArgumentException("disk-backed weight exceeds a window slot: " + weight.name());
             }
         }
         // Each use's weight, in order, and the transfers still to emit once a slot frees.
@@ -770,28 +845,57 @@ public final class ExecutionPlan {
         List<Integer> useLayers = new ArrayList<>();
         for (Instruction instruction : source) {
             for (TensorHandle weight : instruction.weights) {
-                if (weight.hostBacked()) {
+                if (stagedUse(weight)) {
                     useWeights.add(weight);
                     useLayers.add(instruction.layerIndex());
                 }
             }
         }
         List<Instruction> result = new ArrayList<>();
+        List<DiskUse> diskUses = new ArrayList<>();
+        int[] diskUsesOfSlot = new int[slots];
         int[] remapped = new int[source.size()];
         int[] transferIds = new int[useWeights.size()];
         java.util.function.IntConsumer emitTransfer = use -> {
             TensorHandle weight = useWeights.get(use);
+            int slot = use % slots;
+            List<Integer> dependencies = use < slots ? List.of() : List.of(consumerOf(use - slots, source, remapped));
+            transferIds[use] = result.size();
+            if (weight.diskBacked()) {
+                int windowSlot = slot + slots * (diskUsesOfSlot[slot]++ % 2);
+                DiskUse read = new DiskUse(weight.name(), weight.fileOffset(), weight.byteSize(), windowSlot);
+                diskUses.add(read);
+                TensorHandle transfer = new TensorHandle(
+                        weight.name(),
+                        weight.shape(),
+                        weight.dataType(),
+                        weight.format(),
+                        weight.layout(),
+                        staging.slotAddress(slot),
+                        weight.byteSize(),
+                        window.slotHost(windowSlot) + read.lead());
+                result.add(new Instruction(
+                        result.size(),
+                        Kind.DISK_TRANSFER,
+                        dependencies,
+                        List.of(transfer),
+                        List.of(),
+                        List.of(),
+                        0,
+                        0,
+                        windowSlot,
+                        useLayers.get(use)));
+                return;
+            }
             TensorHandle transfer = new TensorHandle(
                     weight.name(),
                     weight.shape(),
                     weight.dataType(),
                     weight.format(),
                     weight.layout(),
-                    staging.slotAddress(use % slots),
+                    staging.slotAddress(slot),
                     weight.byteSize(),
                     weight.hostAddress());
-            List<Integer> dependencies = use < slots ? List.of() : List.of(consumerOf(use - slots, source, remapped));
-            transferIds[use] = result.size();
             result.add(new Instruction(
                     result.size(),
                     Kind.WEIGHT_TRANSFER,
@@ -811,7 +915,7 @@ public final class ExecutionPlan {
             List<TensorHandle> weights = new ArrayList<>();
             int first = use;
             for (TensorHandle weight : instruction.weights) {
-                if (!weight.hostBacked()) {
+                if (!stagedUse(weight)) {
                     weights.add(weight);
                     continue;
                 }
@@ -843,7 +947,12 @@ public final class ExecutionPlan {
             }
         }
         return new PlanData(
-                List.copyOf(result), data.projectionWidths(), data.bufferSpecs(), data.firstLayer(), data.fullModel());
+                List.copyOf(result),
+                data.projectionWidths(),
+                data.bufferSpecs(),
+                data.firstLayer(),
+                data.fullModel(),
+                diskUses);
     }
 
     /// The remapped id of the instruction that reads use `use`; it is always already emitted.
@@ -851,7 +960,7 @@ public final class ExecutionPlan {
         int seen = 0;
         for (Instruction instruction : source) {
             for (TensorHandle weight : instruction.weights) {
-                if (weight.hostBacked() && seen++ == use) return remapped[instruction.id()];
+                if (stagedUse(weight) && seen++ == use) return remapped[instruction.id()];
             }
         }
         throw new IllegalStateException("no consumer for staged use " + use);
@@ -2270,7 +2379,7 @@ public final class ExecutionPlan {
                 || shape[0] != rows
                 || shape[1] != width
                 || width % 64 != 0
-                || (handle.deviceAddress() == 0 && !handle.hostBacked())
+                || (handle.deviceAddress() == 0 && !handle.hostBacked() && !handle.diskBacked())
                 || handle.dataType() != TensorDataType.BF16
                 || !(handle.format() == format
                         || handle.format() == WeightFormat.NVFP4
@@ -2297,6 +2406,7 @@ public final class ExecutionPlan {
                 handle.deviceAddress(),
                 handle.byteSize(),
                 handle.hostAddress(),
-                handle.hostMapped());
+                handle.hostMapped(),
+                handle.fileOffset());
     }
 }

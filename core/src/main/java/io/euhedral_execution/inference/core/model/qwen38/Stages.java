@@ -35,6 +35,7 @@ public final class Stages {
         return switch (instruction.kind()) {
             case EMBEDDING -> new Embed(graph, stage, instruction, gpu);
             case WEIGHT_TRANSFER -> new WeightTransfer(graph, stage, instruction, gpu);
+            case DISK_TRANSFER -> new DiskTransfer(graph, stage, instruction, gpu);
             case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNorm(graph, stage, instruction, gpu);
             case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new Linear(graph, stage, instruction, gpu);
             case Q3_GATE_UP_SWIGLU -> new GateUpSwiGlu(graph, stage, instruction, gpu);
@@ -296,6 +297,62 @@ public final class Stages {
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             gpu().copyHostWeightsToDevice(this.destination, this.source, this.byteSize);
+        }
+    }
+
+    /// Copies a disk-backed weight from its window slot into its staging slot on the transfer lane: a wait
+    /// until the slot's read raised its flag, the copy, and the write that lowers the flag, all in stream
+    /// order, so a captured graph repeats them. A quantum whose device work leaves it out still waits for and
+    /// lowers the flag on its home lane ([#abandoned]), so every later use of the slot finds its own bytes.
+    public static final class DiskTransfer extends Stage {
+        private final long source;
+        private final long destination;
+        private final long byteSize;
+        private final int windowSlot;
+        /// The quantum whose wait, and whose write, this stage last queued.
+        private Object waited;
+        private Object written;
+
+        DiskTransfer(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
+            super(graph, stage, instruction, gpu);
+            TensorHandle weight = instruction.weight();
+            this.source = weight.hostAddress();
+            this.destination = weight.deviceAddress();
+            this.byteSize = weight.byteSize();
+            this.windowSlot = instruction.outputBufferIndex();
+        }
+
+        @Override
+        protected boolean transfers() {
+            return true;
+        }
+
+        @Override
+        protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
+            long flag = context.plan().window().flagDevice(this.windowSlot);
+            gpu().waitHostFlag(flag, 1);
+            this.waited = context;
+            gpu().copyHostWeightsToDevice(this.destination, this.source, this.byteSize);
+            gpu().writeHostFlag(flag, 0);
+            this.written = context;
+        }
+
+        @Override
+        protected void abandoned(io.euhedral_execution.inference.core.gpu.GpuStream home) {
+            Quantum context = context();
+            context.abandonDiskReads();
+            long flag = context.plan().window().flagDevice(this.windowSlot);
+            boolean wait = this.waited != context;
+            boolean write = this.written != context;
+            if (!wait && !write) return;
+            home.submit(
+                    () -> {
+                        if (wait) gpu().waitHostFlag(flag, 1);
+                        if (write) gpu().writeHostFlag(flag, 0);
+                    },
+                    false);
+            this.waited = context;
+            this.written = context;
         }
     }
 

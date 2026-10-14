@@ -195,6 +195,7 @@ class StageGraphCaptureTest {
         home.retireNext(false);
         drain(this.source);
         assertEquals("SUCCESS", replayed.outcome.join());
+        assertTrue(replayed.abandoned.isEmpty(), "the captured graph ran every stage's device work");
         assertEquals(List.of("commit:0", "commit:1", "commit:2", "retire", "outcome"), replayed.events);
         graph.close();
         assertEquals(List.of(1001L), home.destroyed);
