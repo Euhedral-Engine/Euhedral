@@ -9,6 +9,7 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr double kFloor = -16.0;
+constexpr double kLowest = -1.7976931348623157e308;  // below every finite value
 
 __device__ __forceinline__ float logit(const unsigned short* row, int i) {
     return __uint_as_float(static_cast<unsigned int>(row[i]) << 16);
@@ -25,7 +26,7 @@ __device__ void reduce_max(double& value, int& index, double* shared_value, int*
     if (lane == 0) { shared_value[warp] = value; shared_index[warp] = index; }
     __syncthreads();
     if (warp == 0) {
-        value = lane < kThreads / 32 ? shared_value[lane] : -INFINITY;
+        value = lane < kThreads / 32 ? shared_value[lane] : kLowest;
         index = lane < kThreads / 32 ? shared_index[lane] : 0x7fffffff;
         for (int offset = 16; offset > 0; offset >>= 1) {
             double other = __shfl_down_sync(0xffffffffu, value, offset);
@@ -70,7 +71,7 @@ extern "C" __global__ void score_rows(const unsigned short* logits, const unsign
     const float minimum = __uint_as_float(row[2] | (static_cast<unsigned int>(row[3]) << 16));
     const unsigned short* codes = row + 4;
 
-    double q_max = -INFINITY, p_max = -INFINITY;
+    double q_max = kLowest, p_max = kLowest;
     int q_arg = 0x7fffffff, p_arg = 0x7fffffff;
     for (int i = threadIdx.x; i < vocabulary; i += kThreads) {
         double value = logit(q, i);
