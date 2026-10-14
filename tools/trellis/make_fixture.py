@@ -19,7 +19,7 @@ def tiles(out: Path) -> None:
     g = torch.Generator(device="cpu").manual_seed(0)
     x = torch.randn(64, 256, generator=g).cuda()
     np.save(out / "tiles-in.npy", x.cpu().numpy().astype(np.float32))
-    for k in (2, 3, 4, 2.5, 3.5):
+    for k in (2, 3, 4, 5, 6, 2.5, 3.5):
         quant_args = {"K": k, "mul1": True}
         rec, idx = q.quantize_tiles(x, quant_args)
         np.save(out / f"tiles-{k}-idx.npy", idx.cpu().numpy().astype(np.uint16))

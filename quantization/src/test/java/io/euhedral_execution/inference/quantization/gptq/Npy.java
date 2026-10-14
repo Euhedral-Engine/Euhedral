@@ -8,12 +8,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.regex.Pattern;
 
 /// A minimal .npy reader for test fixtures (little-endian, C order).
-record Npy(String descr, long[] shape, ByteBuffer data) {
+public record Npy(String descr, long[] shape, ByteBuffer data) {
 
     private static final Pattern DESCR = Pattern.compile("'descr': '([^']+)'");
     private static final Pattern SHAPE = Pattern.compile("'shape': \\(([^)]*)\\)");
 
-    static Npy read(InputStream input) throws IOException {
+    public static Npy read(InputStream input) throws IOException {
         byte[] bytes = input.readAllBytes();
         ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
         int major = bytes[6];

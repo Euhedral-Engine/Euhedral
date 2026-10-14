@@ -1,0 +1,577 @@
+// Trellis (EXL3) quantization kernels. Portions ported from exllamav3 1.6.1 (MIT License, Copyright (c) 2025
+// Turboderp): codebook.cuh (mul1 decode), quantize_tiles_optimized.cuh (the dense Viterbi that runs on sm_120 for
+// K = 2..6), quantize_tiles_frac_kernel.cuh (alternating K and K + 1 bit steps), pack.cu / frac.cu (MSB-first
+// packing) and exl3_dq.cuh (the circular bit window of the decoder).
+//
+// A 256-weight tile is a tail-biting ring of 16 * K bits. Weight i is quantized to a 16-bit state whose low K bits are
+// new; the codebook value of a state is the mul1 product, summed bytewise, scaled in fp16. Costs are fp16; ties go to
+// the lowest predecessor, so the result is exactly the reference's.
+#include <cuda_fp16.h>
+
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef long long int64_t;
+
+#define H_INF __ushort_as_half(0x7c00)
+
+namespace {
+
+constexpr int kTile = 256;
+
+/// Two mul1 codebook entries from the precomputed products x0 = state0 * 0x83DCD12D, x1 = state1 * 0x83DCD12D.
+__device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1) {
+    const uint32_t acc = 0x6400u;
+    uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
+    uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+    half h0 = __ushort_as_half((uint16_t)sum0);
+    half h1 = __ushort_as_half((uint16_t)sum1);
+    return __hfma2(__halves2half2(h0, h1), k_inv_h2, k_bias_h2);
+}
+
+__device__ inline half2 decode_mul1_2(uint32_t x0, uint32_t x1) {
+    return decode_mul1_product_2(x0 * 0x83DCD12Du, x1 * 0x83DCD12Du);
+}
+
+__device__ inline half decode_mul1(uint32_t x) {
+    x *= 0x83DCD12Du;
+    uint32_t sum = __dp4a(x, 0x01010101u, 0x6400u);
+    return __hfma(__ushort_as_half((uint16_t)sum), __ushort_as_half(0x1eee), __ushort_as_half(0xc931));
+}
+
+__device__ __forceinline__ uint32_t warp_min(uint32_t value) {
+    return __reduce_min_sync(0xffffffff, value);
+}
+
+__host__ __device__ constexpr int viterbi_threads(int K) { return K == 5 || K == 6 ? 512 : 1024; }
+
+/// Dense tail-biting Viterbi of one tile for K = 2..6 (one block per tile). Costs live in shared memory, the history
+/// is one byte per (position, state) in `temp_edges`, [256, 65536 >> K] per tile.
+template <int K>
+__device__ __forceinline__ void viterbi_body(
+        const float* __restrict__ input_tiles_ptr, float* __restrict__ output_tiles_ptr,
+        uint16_t* __restrict__ output_indices_ptr, uint16_t* __restrict__ temp_edges_ptr) {
+    constexpr int L = kTile;
+    constexpr int NT = viterbi_threads(K);
+    constexpr int NW = NT / 32;
+    constexpr int Kr = 16 - K;
+    constexpr int max_q = 1 << K;
+    constexpr int edges = 65536 >> K;
+    constexpr int history_bytes = L * edges;
+    const int tile_idx = blockIdx.x;
+    const int thread = threadIdx.x;
+    const float* input_tile = input_tiles_ptr + L * tile_idx;
+    float* output_tile = output_tiles_ptr + L * tile_idx;
+    uint16_t* output_indices = output_indices_ptr + L * tile_idx;
+    uint8_t* temp_edges = reinterpret_cast<uint8_t*>(temp_edges_ptr) + (int64_t)history_bytes * tile_idx;
+
+    extern __shared__ uint8_t shbuf[];
+    half* sh_input_tile = reinterpret_cast<half*>(shbuf);
+    int* sh_idx = reinterpret_cast<int*>(shbuf + L * sizeof(half) + 64);
+    half* temp_costs = reinterpret_cast<half*>(shbuf + L * sizeof(half) + 64 + 128);
+    half* temp_costs_inc = temp_costs + edges;
+    for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
+    __syncthreads();
+    auto ring = [&](int i, int roll) {
+        int ri = i + roll;
+        if (ri >= L) ri -= L;
+        return ri;
+    };
+
+    // Best final cost; ties resolve by the bit-reversed rank of the state, as in the reference.
+    auto argmin_cost = [&]() {
+        uint32_t best = 0x7c00ffffu;
+        for (int e = thread; e < edges; e += NT) {
+            unsigned v = e & 1023;
+            unsigned rank = ((__brev(v >> 5) >> 27) << 10) | ((__brev(v & 31) >> 27) << 5) | (e >> 10);
+            unsigned key = ((uint32_t)__half_as_ushort(temp_costs[e]) << 16) | rank;
+            best = min(best, key);
+        }
+        best = warp_min(best);
+        if ((thread & 31) == 0) ((uint32_t*)sh_idx)[thread >> 5] = best;
+        __syncthreads();
+        if (thread < 32) {
+            best = thread < NW ? ((uint32_t*)sh_idx)[thread] : 0x7c00ffffu;
+            best = warp_min(best);
+        }
+        unsigned rank = best & 65535;
+        unsigned v = ((__brev(rank >> 10) >> 27) << 5) | (__brev((rank >> 5) & 31) >> 27);
+        return best >= 0x7c000000u ? 0 : (int)(((rank & 31) << 10) | v);
+    };
+
+    auto backward = [&](int roll, bool write, int edge) {
+        if (thread == 0) {
+            for (int i = L - 1; i >= 0; --i) {
+                const int ri = ring(i, roll);
+                const int branch = temp_edges[edges * ri + edge];
+                const int prev_edge = ((branch & (max_q - 1)) << (16 - 2 * K)) | (edge >> K);
+                const int encoded = (prev_edge << K) | edge;
+                edge = prev_edge;
+                if (write) {
+                    output_indices[ri] = (uint16_t)encoded;
+                    output_tile[ri] = __half2float(decode_mul1(encoded));
+                } else if (ri == 0)
+                    break;
+            }
+        }
+        if (thread == 0) sh_idx[0] = edge;
+        __syncthreads();
+        return sh_idx[0];
+    };
+
+    // Two passes: the first from an open start, whose best end state then pins the second.
+#define SOLVE()                                           \
+    forward(L / 2, -1);                                   \
+    int end_state = backward(L / 2, false, argmin_cost()); \
+    forward(0, end_state);                                \
+    backward(0, true, end_state)
+
+    if constexpr (K <= 5) {
+        constexpr int NP = edges / (2 * NT);
+        constexpr int NC = max_q;
+        // Decoded values persist in registers across both passes.
+        half2 values[NP][NC];
+#pragma unroll
+        for (int j = 0; j < NP; ++j) {
+            int out = 2 * (thread + j * NT);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                int state = (c << Kr) | out;
+                values[j][c] = decode_mul1_2(state, state + 1);
+            }
+        }
+        auto forward = [&](int roll, int pre_state) {
+            for (int i = 0; i < L; ++i) {
+                int ri = ring(i, roll);
+                half* t = temp_costs;
+                temp_costs = temp_costs_inc;
+                temp_costs_inc = t;
+                half2 w = __half2half2(sh_input_tile[ri]);
+#pragma unroll
+                for (int j = 0; j < NP; ++j) {
+                    int out = 2 * (thread + j * NT);
+                    half2 best;
+                    int b0 = 0x7fffffff, b1 = 0x7fffffff;
+                    uint32_t best0 = 0x7c00ffffu, best1 = 0x7c00ffffu;
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        int state = (c << Kr) | out;
+                        int pred = state >> K;
+                        half2 d = __hsub2(values[j][c], w);
+                        half2 err;
+                        if (i == 0) {
+                            err = __hmul2(d, d);
+                            if (pre_state >= 0 && pred != pre_state) err = __half2half2(H_INF);
+                        } else
+                            err = __hfma2(d, d, __half2half2(temp_costs_inc[pred]));
+                        if constexpr (K <= 3) {
+                            // Strict less-than in candidate order: the lowest predecessor wins a tie.
+                            if (c == 0) best = __half2half2(H_INF);
+                            if (c == 0 || __hlt(__low2half(err), __low2half(best))) {
+                                best = __halves2half2(__low2half(err), __high2half(best));
+                                b0 = pred;
+                            }
+                            if (c == 0 || __hlt(__high2half(err), __high2half(best))) {
+                                best = __halves2half2(__low2half(best), __high2half(err));
+                                b1 = pred;
+                            }
+                        } else {
+                            // Packed (cost, predecessor) minimum, K = 4 and 5.
+                            best0 = min(best0, ((uint32_t)__half_as_ushort(__low2half(err)) << 16) | pred);
+                            best1 = min(best1, ((uint32_t)__half_as_ushort(__high2half(err)) << 16) | pred);
+                        }
+                    }
+                    if constexpr (K > 3) {
+                        best = __halves2half2(__ushort_as_half(best0 >> 16), __ushort_as_half(best1 >> 16));
+                        b0 = best0 & 65535;
+                        b1 = best1 & 65535;
+                    }
+                    reinterpret_cast<half2*>(temp_costs)[out / 2] = best;
+                    if (pre_state >= 0 || ri < L / 2) {
+                        ((uint16_t*)temp_edges)[(edges * ri + out) / 2] =
+                                ((b0 >> (16 - 2 * K)) & 255) | (((b1 >> (16 - 2 * K)) & 255) << 8);
+                    }
+                }
+                __syncthreads();
+            }
+        };
+        SOLVE();
+    } else {
+        // K = 6: no register cache; the codebook values are recomputed (the reference reads an equal fp16 table).
+        auto step = [&](int i, int ri, int pre_state, bool write) {
+            for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * NT) {
+                const half2 w2 = __half2half2(sh_input_tile[ri]);
+                int in_edge_idx = out_edge_idx >> K;
+                half2 decoded2 = decode_mul1_2(out_edge_idx, out_edge_idx + 1);
+                half2 dh2 = __hsub2(decoded2, w2);
+                half2 min_err2;
+                if (i == 0) {
+                    min_err2 = __hmul2(dh2, dh2);
+                    if (pre_state >= 0 && in_edge_idx != pre_state) min_err2 = __half2half2(H_INF);
+                } else
+                    min_err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+                uint32_t best0 = ((uint32_t)__half_as_ushort(__low2half(min_err2)) << 16) | in_edge_idx;
+                uint32_t best1 = ((uint32_t)__half_as_ushort(__high2half(min_err2)) << 16) | in_edge_idx;
+#pragma unroll
+                for (int k = 1; k < max_q; ++k) {
+                    const int state0 = (k << Kr) | out_edge_idx;
+                    in_edge_idx = state0 >> K;
+                    decoded2 = decode_mul1_2(state0, state0 + 1);
+                    dh2 = __hsub2(decoded2, w2);
+                    half2 err2;
+                    if (i == 0) {
+                        err2 = __hmul2(dh2, dh2);
+                        if (pre_state >= 0 && in_edge_idx != pre_state) err2 = __half2half2(H_INF);
+                    } else
+                        err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+                    best0 = min(best0, ((uint32_t)__half_as_ushort(__low2half(err2)) << 16) | in_edge_idx);
+                    best1 = min(best1, ((uint32_t)__half_as_ushort(__high2half(err2)) << 16) | in_edge_idx);
+                }
+                min_err2 = __halves2half2(__ushort_as_half(best0 >> 16), __ushort_as_half(best1 >> 16));
+                int min_in_edge0 = best0 & 65535;
+                int min_in_edge1 = best1 & 65535;
+                reinterpret_cast<half2*>(temp_costs)[out_edge_idx >> 1] = min_err2;
+                if (write) {
+                    ((uint16_t*)temp_edges)[(edges * ri + out_edge_idx) / 2] =
+                            ((min_in_edge0 >> (16 - 2 * K)) & 255) | (((min_in_edge1 >> (16 - 2 * K)) & 255) << 8);
+                }
+            }
+            __syncthreads();
+        };
+        auto forward = [&](int roll, int pre_state) {
+            for (int i = 0; i < L; ++i) {
+                int ri = ring(i, roll);
+                half* t = temp_costs;
+                temp_costs = temp_costs_inc;
+                temp_costs_inc = t;
+                step(i, ri, pre_state, pre_state >= 0 || ri < L / 2);
+            }
+        };
+        SOLVE();
+    }
+}
+
+constexpr int kFracThreads = 512;
+
+/// One step of the fractional Viterbi: in-nodes are the top 16 - KIN bits of the window, out-nodes the top
+/// 16 - KOUT bits of the next. History is two bytes per (position, node).
+template <int KIN, int KOUT>
+__device__ __forceinline__ void frac_step(
+        const half w, const half* __restrict__ costs_in, half* __restrict__ costs_out,
+        uint16_t* __restrict__ hist_row, const bool first, const int pre_state, const bool write_hist,
+        const int thread) {
+    constexpr int Kr = 16 - KOUT;
+    constexpr int max_q = 1 << KOUT;
+    constexpr int edges_out = 65536 >> KOUT;
+    const half2 w2 = __half2half2(w);
+    const half2 inf2 = __half2half2(H_INF);
+    for (int out_edge_idx = 2 * thread; out_edge_idx < edges_out; out_edge_idx += 2 * kFracThreads) {
+        int in_edge_idx = out_edge_idx >> KIN;
+        uint32_t product0 = out_edge_idx * 0x83DCD12Du;
+        uint32_t product1 = product0 + 0x83DCD12Du;
+        half2 decoded2 = decode_mul1_product_2(product0, product1);
+        half2 dh2 = __hsub2(decoded2, w2);
+        half2 min_err2;
+        if (first) {
+            min_err2 = __hmul2(dh2, dh2);
+            if (pre_state >= 0 && in_edge_idx != pre_state) min_err2 = inf2;
+        } else
+            min_err2 = __hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
+        int min_in_edge0 = in_edge_idx;
+        int min_in_edge1 = in_edge_idx;
+#pragma unroll
+        for (int k = 1; k < max_q; ++k) {
+            const int state0 = (k << Kr) | out_edge_idx;
+            in_edge_idx = state0 >> KIN;
+            constexpr uint32_t product_step = 0x83DCD12Du << Kr;
+            product0 += product_step;
+            product1 += product_step;
+            decoded2 = decode_mul1_product_2(product0, product1);
+            dh2 = __hsub2(decoded2, w2);
+            half2 err2;
+            if (first) {
+                err2 = __hmul2(dh2, dh2);
+                if (pre_state >= 0 && in_edge_idx != pre_state) err2 = inf2;
+            } else
+                err2 = __hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
+            if (__hlt(__low2half(err2), __low2half(min_err2))) {
+                min_err2 = __halves2half2(__low2half(err2), __high2half(min_err2));
+                min_in_edge0 = in_edge_idx;
+            }
+            if (__hlt(__high2half(err2), __high2half(min_err2))) {
+                min_err2 = __halves2half2(__low2half(min_err2), __high2half(err2));
+                min_in_edge1 = in_edge_idx;
+            }
+        }
+        reinterpret_cast<half2*>(costs_out)[out_edge_idx >> 1] = min_err2;
+        if (write_hist) {
+            hist_row[out_edge_idx] = (uint16_t)min_in_edge0;
+            hist_row[out_edge_idx + 1] = (uint16_t)min_in_edge1;
+        }
+    }
+}
+
+/// Fractional-rate Viterbi, KA bits per position plus one where bit (position mod 16) of MASK is set. Costs
+/// (2 * edges_max halves per tile) and history (256 * edges_max uint16 per tile) are in global scratch.
+template <int KA, uint32_t MASK>
+__device__ __forceinline__ void frac_body(
+        const float* __restrict__ input_tiles_ptr, float* __restrict__ output_tiles_ptr,
+        uint16_t* __restrict__ output_indices_ptr, half* __restrict__ temp_costs_ptr,
+        uint16_t* __restrict__ temp_edges_ptr) {
+    constexpr int L = kTile;
+    constexpr int NT = kFracThreads;
+    constexpr int NW = NT / 32;
+    constexpr int KB = KA + 1;
+    constexpr int edges_max = 65536 >> KA;
+    constexpr int edges_last = 65536 >> (KA + (MASK & 1));
+
+    extern __shared__ uint8_t shbuf[];
+    uint8_t* sh = shbuf;
+    const int tile_idx = blockIdx.x;
+    const int thread = threadIdx.x;
+    const float* input_tile = input_tiles_ptr + L * tile_idx;
+    float* output_tile = output_tiles_ptr + L * tile_idx;
+    uint16_t* output_indices = output_indices_ptr + L * tile_idx;
+    uint16_t* temp_edges = temp_edges_ptr + (size_t)L * edges_max * tile_idx;
+
+    half* sh_input_tile = (half*)sh;
+    sh += L * sizeof(half);
+    int* sh_idx = (int*)sh;
+
+    half* temp_costs = temp_costs_ptr + (size_t)2 * edges_max * tile_idx;
+    half* temp_costs_inc = temp_costs + edges_max;
+
+    for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
+    __syncthreads();
+
+    auto ring = [&](int i, int roll) {
+        int ri = i + roll;
+        if (ri >= L) ri -= L;
+        return ri;
+    };
+
+    auto forward = [&](int roll, int pre_state) {
+        for (int i = 0; i < L; ++i) {
+            const int ri = ring(i, roll);
+            half* t = temp_costs;
+            temp_costs = temp_costs_inc;
+            temp_costs_inc = t;
+            const bool first = i == 0;
+            const bool write_hist = pre_state >= 0 || ri < L / 2;
+            uint16_t* hist_row = temp_edges + (size_t)edges_max * ri;
+            const half w = sh_input_tile[ri];
+            const int din = (MASK >> (ri & 15)) & 1, dout = (MASK >> ((ri + 1) & 15)) & 1;
+            switch (din * 2 + dout) {
+                case 0: frac_step<KA, KA>(w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, thread); break;
+                case 1: frac_step<KA, KB>(w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, thread); break;
+                case 2: frac_step<KB, KA>(w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, thread); break;
+                default: frac_step<KB, KB>(w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, thread); break;
+            }
+            __syncthreads();
+        }
+    };
+
+    auto argmin_cost = [&]() {
+        uint32_t best = 0x7c00ffffu;
+        for (int e = thread; e < edges_last; e += NT) {
+            unsigned v = e & 1023;
+            unsigned rank = ((__brev(v >> 5) >> 27) << 10) | ((__brev(v & 31) >> 27) << 5) | (e >> 10);
+            unsigned key = ((uint32_t)__half_as_ushort(temp_costs[e]) << 16) | rank;
+            best = min(best, key);
+        }
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1) best = min(best, __shfl_xor_sync(0xffffffff, best, offset));
+        if ((thread & 31) == 0) ((uint32_t*)sh_idx)[thread >> 5] = best;
+        __syncthreads();
+        if (thread < 32) {
+            best = thread < NW ? ((uint32_t*)sh_idx)[thread] : 0x7c00ffffu;
+#pragma unroll
+            for (int offset = 16; offset; offset >>= 1) best = min(best, __shfl_xor_sync(0xffffffff, best, offset));
+        }
+        unsigned rank = best & 65535;
+        unsigned v = ((__brev(rank >> 10) >> 27) << 5) | (__brev((rank >> 5) & 31) >> 27);
+        return best >= 0x7c000000u ? 0 : (int)(((rank & 31) << 10) | v);
+    };
+
+    auto backward = [&](int roll, bool write, int edge) {
+        if (thread == 0) {
+            for (int i = L - 1; i >= 0; --i) {
+                const int ri = ring(i, roll);
+                const int prev_edge = (int)temp_edges[(size_t)edges_max * ri + edge];
+                const int kin = KA + ((MASK >> (ri & 15)) & 1);
+                const int encoded = ((prev_edge << kin) | edge) & 0xFFFF;
+                edge = prev_edge;
+                if (write) {
+                    output_indices[ri] = (uint16_t)encoded;
+                    output_tile[ri] = __half2float(decode_mul1(encoded));
+                } else if (ri == 0)
+                    break;
+            }
+        }
+        if (thread == 0) sh_idx[0] = edge;
+        __syncthreads();
+        return sh_idx[0];
+    };
+
+    forward(L / 2, -1);
+    int end_state = backward(L / 2, false, argmin_cost());
+    forward(0, end_state);
+    backward(0, true, end_state);
+}
+
+/// Integer-rate packing of one tile: K low bits of each state, MSB first, 16 spans of 16 weights, 16-bit halves of
+/// each 32-bit word swapped (pack.cu).
+template <int K>
+__device__ __forceinline__ void pack_body(uint16_t* __restrict__ g_packed, const uint16_t* __restrict__ g_unpacked) {
+    constexpr int packed_size = 256 * K / 16;
+    __shared__ uint16_t s_unpacked[256];
+    __shared__ uint16_t s_packed[packed_size];
+    int t = threadIdx.x;
+    g_packed += blockIdx.x * packed_size;
+    g_unpacked += blockIdx.x * 256;
+    ((uint32_t*)s_unpacked)[t] = ((const uint32_t*)g_unpacked)[t];
+    __syncthreads();
+    const int spans = 16;
+    const int len = 256 / spans;
+    if (t < spans) {
+        int i = len * t;
+        int j = K * t;
+        int k = 32;
+        uint32_t buf = 0;
+        for (int n = 0; n < len; ++n) {
+            uint32_t v = (uint32_t)s_unpacked[i];
+            v &= ((1 << K) - 1);
+            k -= K;
+            buf |= (v << k);
+            if (k <= 16) {
+                s_packed[j] = (uint16_t)(buf >> 16);
+                buf <<= 16;
+                k += 16;
+                j++;
+            }
+            i++;
+        }
+    }
+    __syncthreads();
+    if (t < packed_size / 2) ((uint32_t*)g_packed)[t] = __byte_perm(((uint32_t*)s_packed)[t], 0, 0x1032);
+}
+
+constexpr int kFracMaxWords = 64;
+
+__device__ __forceinline__ int frac_d(int i, int ka, uint32_t mask) { return ka + ((mask >> (i & 15)) & 1); }
+
+/// Ring position where window i ends.
+__device__ __forceinline__ int frac_s(int i, int ka, uint32_t mask, int bpb) {
+    int s = (i >> 4) * bpb;
+    for (int j = 0; j <= (i & 15); ++j) s += frac_d(j, ka, mask);
+    return s;
+}
+
+/// 16-bit window starting at ring bit `start`, from MSB-first 32-bit words.
+__device__ __forceinline__ uint32_t frac_window(const uint32_t* words, int nw, int start) {
+    const int R = nw * 32;
+    start %= R;
+    if (start < 0) start += R;
+    const int wi = start >> 5, o = start & 31;
+    const uint64_t v = ((uint64_t)words[wi] << 32) | (uint64_t)words[(wi + 1) % nw];
+    return (uint32_t)((v >> (48 - o)) & 0xFFFFu);
+}
+
+/// Fractional packing, one thread per tile (frac.cu); `bpb` is the uint16 words per tile.
+__device__ __forceinline__ void pack_frac_tile(
+        uint16_t* __restrict__ g_packed, const uint16_t* __restrict__ g_unpacked, int tile, int ka, uint32_t mask,
+        int bpb) {
+    const int nw = bpb / 2;
+    uint32_t words[kFracMaxWords];
+    for (int w = 0; w < nw; ++w) words[w] = 0;
+    const uint16_t* idx = g_unpacked + (size_t)tile * 256;
+    int pos = 0;
+    for (int i = 0; i < 256; ++i) {
+        const int d = frac_d(i, ka, mask);
+        const uint32_t v = (uint32_t)idx[i] & ((1u << d) - 1);
+        for (int b = d - 1; b >= 0; --b, ++pos)
+            if ((v >> b) & 1) words[pos >> 5] |= 1u << (31 - (pos & 31));
+    }
+    uint32_t* out = (uint32_t*)(g_packed + (size_t)tile * bpb);
+    for (int w = 0; w < nw; ++w) out[w] = words[w];
+}
+
+/// Decodes one tile (one block of 256 threads) of packed words, integer or fractional: weight i is the codebook
+/// value of the 16-bit window ending at ring position S(i) (frac.cu unpack, exl3_dq.cuh window).
+__device__ __forceinline__ void decode_tile(
+        const uint16_t* __restrict__ g_packed, float* __restrict__ g_decoded, int ka, uint32_t mask, int bpb) {
+    __shared__ uint32_t words[kFracMaxWords];
+    const int tile = blockIdx.x;
+    const int t = threadIdx.x;
+    const int nw = bpb / 2;
+    for (int w = t; w < nw; w += blockDim.x) words[w] = ((const uint32_t*)(g_packed + (size_t)tile * bpb))[w];
+    __syncthreads();
+    g_decoded[(size_t)tile * 256 + t] =
+            __half2float(decode_mul1(frac_window(words, nw, frac_s(t, ka, mask, bpb) - 16)));
+}
+
+}  // namespace
+
+#define VITERBI(K)                                                                                          \
+    extern "C" __global__ __launch_bounds__(viterbi_threads(K), 1) void viterbi_k##K(                        \
+            const float* tiles, int count, uint16_t* indices, float* decoded, uint16_t* scratch) {           \
+        viterbi_body<K>(tiles, decoded, indices, scratch);                                                   \
+    }
+VITERBI(2)
+VITERBI(3)
+VITERBI(4)
+VITERBI(5)
+VITERBI(6)
+
+#define VITERBI_FRAC(KA)                                                                                     \
+    extern "C" __global__ __launch_bounds__(kFracThreads, 2) void viterbi_frac_k##KA(                        \
+            const float* tiles, int count, uint16_t* indices, float* decoded, uint16_t* scratch) {           \
+        constexpr size_t edges_max = 65536 >> KA;                                                            \
+        half* costs = reinterpret_cast<half*>(scratch);                                                      \
+        uint16_t* history = scratch + (size_t)count * 2 * edges_max;                                         \
+        frac_body<KA, 0xaaaau>(tiles, decoded, indices, costs, history);                                     \
+    }
+VITERBI_FRAC(2)
+VITERBI_FRAC(3)
+
+#define PACK(K)                                                                                              \
+    extern "C" __global__ __launch_bounds__(128) void pack_k##K(                                             \
+            const uint16_t* indices, int count, uint16_t* words) {                                           \
+        pack_body<K>(words, indices);                                                                        \
+    }
+PACK(2)
+PACK(3)
+PACK(4)
+PACK(5)
+PACK(6)
+
+#define PACK_FRAC(KA)                                                                                        \
+    extern "C" __global__ __launch_bounds__(128) void pack_frac_k##KA(                                       \
+            const uint16_t* indices, int count, uint16_t* words) {                                           \
+        const int tile = blockIdx.x * 128 + threadIdx.x;                                                     \
+        if (tile < count) pack_frac_tile(words, indices, tile, KA, 0xaaaau, 16 * KA + 8);                   \
+    }
+PACK_FRAC(2)
+PACK_FRAC(3)
+
+#define DECODE(K)                                                                                            \
+    extern "C" __global__ __launch_bounds__(256) void decode_k##K(                                           \
+            const uint16_t* words, int count, float* decoded) {                                              \
+        decode_tile(words, decoded, K, 0u, 16 * K);                                                          \
+    }
+DECODE(2)
+DECODE(3)
+DECODE(4)
+DECODE(5)
+DECODE(6)
+
+#define DECODE_FRAC(KA)                                                                                      \
+    extern "C" __global__ __launch_bounds__(256) void decode_frac_k##KA(                                     \
+            const uint16_t* words, int count, float* decoded) {                                              \
+        decode_tile(words, decoded, KA, 0xaaaau, 16 * KA + 8);                                               \
+    }
+DECODE_FRAC(2)
+DECODE_FRAC(3)
