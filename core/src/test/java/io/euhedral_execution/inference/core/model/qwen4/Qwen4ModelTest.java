@@ -6,12 +6,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertLease;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertTestSupport;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Artifact;
-import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
 import io.euhedral_execution.inference.core.model.qwen4.loader.HostMemoryGpu;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlan;

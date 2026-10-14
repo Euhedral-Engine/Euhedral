@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4.loader;
 
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import java.util.Locale;
 import java.util.Map;
 

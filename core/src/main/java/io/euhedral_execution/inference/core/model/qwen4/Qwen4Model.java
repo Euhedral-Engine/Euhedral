@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
@@ -15,7 +16,6 @@ import io.euhedral_execution.inference.core.model.qwen4.loader.Artifact;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ArtifactReader;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ExpertHierarchyStats;
 import io.euhedral_execution.inference.core.model.qwen4.loader.FixedLoader;
-import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.model.qwen4.loader.NgramStore;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlan;

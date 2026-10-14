@@ -8,10 +8,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-/// Sequence-owned NVFP4 pages for one full-attention layer. Existing KV payloads
+/// Sequence-owned pages for one full-attention layer, in the sequence's [KvFormat]. Existing KV payloads
 /// never move. The sequence takes one state-sharing quantum at a time, and a prompt quantum's chunks append in
 /// order (their carried-state edges), which orders reservation with attention; close runs after GPU completion.
-/// Each D256 row holds 128 code and 16 scale bytes.
+/// Each D256 row holds the format's [KvFormat#headRowBytes] (NVFP4: 128 code and 16 scale bytes).
 ///
 /// Reservation runs inside the owning quantum with its stream selected, and allocates in stream order on
 /// it. A grown page table is uploaded from pinned staging by a copy queued on that stream, ahead of the
@@ -32,8 +32,10 @@ import java.util.Objects;
 /// except, between quanta, the submitted frontier.
 public final class AttentionKvState implements AutoCloseable {
     public static final int PAGE_TOKENS = 256;
+    /// Bytes of an NVFP4 head row ([KvFormat#NVFP4]).
     public static final int HEAD_ROW_BYTES = 144;
     private final ExecutionGpu gpu;
+    private final KvFormat format;
     private final long planePageBytes;
     private final List<Long> pages = new ArrayList<>();
     /// Table uploads' staging, each with the frontier its append reaches. The appends release what a committed
@@ -53,10 +55,25 @@ public final class AttentionKvState implements AutoCloseable {
     private boolean closed;
 
     public AttentionKvState(ExecutionGpu gpu, int keyValueWidth) {
+        this(gpu, keyValueWidth, KvFormat.NVFP4);
+    }
+
+    public AttentionKvState(ExecutionGpu gpu, int keyValueWidth, KvFormat format) {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
+        this.format = Objects.requireNonNull(format, "format");
         if (keyValueWidth <= 0 || keyValueWidth % 256 != 0)
-            throw new IllegalArgumentException("NVFP4 KV requires complete D256 heads");
-        this.planePageBytes = Math.multiplyExact((long) PAGE_TOKENS * HEAD_ROW_BYTES, keyValueWidth / 256);
+            throw new IllegalArgumentException("the KV cache requires complete D256 heads");
+        this.planePageBytes = planePageBytes(keyValueWidth, format);
+    }
+
+    /// Bytes of one plane (K or V) of one page of `keyValueWidth`-wide rows in `format`.
+    public static long planePageBytes(int keyValueWidth, KvFormat format) {
+        return Math.multiplyExact((long) PAGE_TOKENS * format.headRowBytes, keyValueWidth / 256);
+    }
+
+    /// The format the cache stores its rows in.
+    public KvFormat format() {
+        return this.format;
     }
 
     /// Reserves contiguous append rows without publishing them to consumers. The rows continue the submitted
@@ -112,7 +129,11 @@ public final class AttentionKvState implements AutoCloseable {
     }
 
     public void fingerprint(CaptureFingerprint fingerprint) {
-        fingerprint.add(this.gpu, this.table).add(this.tableSlots).add(this.gpu, this.decodeScratch);
+        fingerprint
+                .add(this.gpu, this.table)
+                .add(this.tableSlots)
+                .add(this.gpu, this.decodeScratch)
+                .add(this.format.ordinal());
     }
 
     /// Records that the writes for `tokenCount` reserved rows after the submitted frontier were submitted to the

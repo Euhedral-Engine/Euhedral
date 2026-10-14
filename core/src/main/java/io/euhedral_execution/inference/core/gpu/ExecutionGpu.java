@@ -698,6 +698,56 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("Qwen attention KV append is not implemented");
     }
 
+    /// [#attentionKvAppendNvfp4] into a BF16 cache ([io.euhedral_execution.inference.core.state.KvFormat#BF16]): the
+    /// key and value rows stored as computed, 512 bytes per head row.
+    public void attentionKvAppendBf16(
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            int rows,
+            int queryWidth,
+            int keyValueWidth,
+            long startPosition,
+            long positionAddress) {
+        throw new UnsupportedOperationException("BF16 attention KV append is not implemented");
+    }
+
+    /// [#attentionCausalNvfp4] over a BF16 cache.
+    public void attentionCausalBf16(
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            long outputAddress,
+            int rows,
+            int queryHeads,
+            int keyValueHeads,
+            int headDim,
+            int cacheLength,
+            long startPosition,
+            long positionAddress,
+            long scratchAddress) {
+        throw new UnsupportedOperationException("BF16 causal attention is not implemented");
+    }
+
+    /// Whether the device runs stream memory operations ([#waitHostFlag], [#writeHostFlag]).
+    public boolean streamMemoryOps() {
+        return false;
+    }
+
+    /// Queues on the selected stream a wait until the 32-bit host-mapped word at `flagDeviceAddress` equals
+    /// `value`; captures into graphs.
+    public void waitHostFlag(long flagDeviceAddress, int value) {
+        throw new UnsupportedOperationException("host flag waits are not implemented");
+    }
+
+    /// Queues on the selected stream a write of `value` to the 32-bit host-mapped word at `flagDeviceAddress`,
+    /// after the work queued before it; captures into graphs.
+    public void writeHostFlag(long flagDeviceAddress, int value) {
+        throw new UnsupportedOperationException("host flag writes are not implemented");
+    }
+
     /// Evaluates causal GQA against the already-appended cache and applies the Q gate.
     public void attentionCausalNvfp4(
             long queryKeyAddress,

@@ -1,4 +1,4 @@
-package io.euhedral_execution.inference.core.model.qwen4.loader;
+package io.euhedral_execution.inference.core.artifact;
 
 import java.io.IOException;
 import java.nio.file.Files;
