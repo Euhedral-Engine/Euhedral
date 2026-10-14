@@ -263,6 +263,17 @@ public final class Stages {
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
+            if (instruction.weightFormat() == WeightFormat.BF16) {
+                gpu().embedBf16(
+                                tokenIds(context),
+                                instruction.weightAddress(),
+                                instruction.weightByteSize(),
+                                context.workspace().hiddenStateAddress(),
+                                rows(context),
+                                context.plan().weights().config().vocabSize(),
+                                instruction.outputWidth());
+                return;
+            }
             gpu().embedQ3(
                             tokenIds(context),
                             instruction.weightAddress(),
