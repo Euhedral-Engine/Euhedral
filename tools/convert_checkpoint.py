@@ -40,7 +40,7 @@ if str(TOOLS) not in sys.path:
 from euhedral_artifacts import device  # noqa: E402
 from euhedral_artifacts.dflash2 import PROJECTIONS  # noqa: E402
 from euhedral_artifacts.pipeline import convert, extend  # noqa: E402
-from euhedral_artifacts.recipes import QUANTIZATIONS, Recipe  # noqa: E402
+from euhedral_artifacts.recipes import HEAD_FORMATS, QUANTIZATIONS, Recipe  # noqa: E402
 
 CUDA_JOBS = 4
 
@@ -76,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "column importance instead of from its largest value (needs PyTorch)")
     parser.add_argument("--codes-from", type=Path, metavar="DIR",
                         help="take the codes and scales of the objects DIR holds files for (see above)")
+    parser.add_argument("--output-head", choices=HEAD_FORMATS, metavar="FORMAT",
+                        help="the LM head's format in place of the recipe's (" + ", ".join(HEAD_FORMATS) + ")")
     parser.add_argument("--force", action="store_true", help="replace an existing artifact")
     return parser
 
@@ -112,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--imatrix needs PyTorch")
     device.set_device(name)
     try:
-        manifest = convert(args.model, args.out, Recipe(args.quantization, args.compressed), args.ranking,
+        manifest = convert(args.model, args.out, Recipe(args.quantization, args.compressed, args.output_head), args.ranking,
                            args.draft_ids_from, jobs, args.force, args.dflash2, args.dflash2_projections,
                            args.imatrix, args.codes_from)
     except (OSError, ValueError) as error:

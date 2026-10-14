@@ -4,9 +4,10 @@ import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/// How each quantized object is stored in an artifact (tools/euhedral_artifacts/recipes.py and inventory.py): the
-/// q3 artifact's format per object, mapped to the recipe being built, and compressed q3's code limit.
-public record Recipe(String quantization, boolean compressed) {
+/// How each quantized object is stored in an artifact (tools/euhedral_artifacts/recipes.py and inventory.py):
+/// the q3 artifact's format per object, mapped to the recipe being built, and compressed q3's code limit.
+/// `outputHead`, when set, is the LM head's format (row-split) in place of the recipe's.
+public record Recipe(String quantization, boolean compressed, String outputHead) {
 
     public static final String ROW_SPLIT = "row-split-k128-v1";
     public static final String SD4 = "row-split-k128-sd4-v1";
@@ -16,9 +17,18 @@ public record Recipe(String quantization, boolean compressed) {
         if (!quantization.equals("q3") && !quantization.equals("nvfp4")) {
             throw new IllegalArgumentException("quantization is q3 or nvfp4, not " + quantization);
         }
+        if (outputHead != null
+                && !java.util.List.of("NVFP4", "Q3G64_F16S", "Q4G64_F16S", "Q5G64_F16S")
+                        .contains(outputHead))
+            throw new IllegalArgumentException("unknown LM head format " + outputHead);
+    }
+
+    public Recipe(String quantization, boolean compressed) {
+        this(quantization, compressed, null);
     }
 
     public Gptq.Format format(String name) {
+        if (name.equals("text/output_head") && outputHead != null) return Gptq.Format.of(outputHead, ROW_SPLIT, null);
         String q3 = q3Format(name);
         String format, layout;
         if (quantization.equals("q3")) {
