@@ -20,7 +20,9 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
 
     public enum Quantization {
         Q3,
-        NVFP4
+        NVFP4,
+        /// The unquantized model: every object in BF16.
+        BF16
     }
 
     /// The speculative decoding strategy an artifact's drafter selects.
@@ -57,10 +59,10 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         return DraftLength.fixed(this.quantization == Quantization.Q3 ? 2 : 4);
     }
 
-    /// The attention cache format the artifact's sequences take unless the engine selects one: NVFP4, which every
-    /// quantized artifact's attention runs on.
+    /// The attention cache format the artifact's sequences take unless the engine selects one: BF16 for the
+    /// unquantized model, NVFP4 for every quantized one.
     public KvFormat kvFormat() {
-        return KvFormat.NVFP4;
+        return this.quantization == Quantization.BF16 ? KvFormat.BF16 : KvFormat.NVFP4;
     }
 
     /// `selected`, or when it is null the cache format of an artifact with `profile` (null: an unprofiled artifact,
@@ -90,13 +92,15 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
                 switch (probe.format()) {
                     case Q3_G64_FP16 -> Quantization.Q3;
                     case NVFP4 -> Quantization.NVFP4;
+                    case BF16 -> Quantization.BF16;
                     default ->
                         throw new IllegalArgumentException(
-                                "unsupported projection format " + probe.format() + "; expected Q3 or NVFP4");
+                                "unsupported projection format " + probe.format() + "; expected Q3, NVFP4 or BF16");
                 };
         WeightLayout layout = probe.layout();
         if (quantization == Quantization.Q3 && layout == WeightLayout.ROW_SPLIT_K128_SD4_V1
-                || quantization == Quantization.NVFP4 && layout == WeightLayout.ROW_SPLIT_P2E2_V1)
+                || quantization == Quantization.NVFP4 && layout == WeightLayout.ROW_SPLIT_P2E2_V1
+                || quantization == Quantization.BF16 && layout != WeightLayout.CONTIGUOUS_LE_V1)
             throw new IllegalArgumentException("layout " + layout + " does not belong to " + quantization);
         boolean compressed = layout == WeightLayout.ROW_SPLIT_P2E2_V1 || layout == WeightLayout.ROW_SPLIT_K128_SD4_V1;
         Speculation speculation = dflash2 ? Speculation.DFLASH2 : mtp && draftHead ? Speculation.MTP : Speculation.NONE;
