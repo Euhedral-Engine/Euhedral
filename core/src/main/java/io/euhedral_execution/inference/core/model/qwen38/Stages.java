@@ -847,7 +847,8 @@ public final class Stages {
                 this.pendingAppendStates[index] = state;
                 this.pendingAppendRows[index] = part.rows();
                 state.prepareAppend(part.position(), part.rows());
-                gpu().attentionKvAppendNvfp4(
+                gpu().attentionKvAppend(
+                                state.format(),
                                 input(context, instruction, 0) + part.rowOffset() * rowBytes,
                                 input(context, instruction, 1) + part.rowOffset() * rowBytes,
                                 state.keyCacheAddress(),
@@ -908,7 +909,8 @@ public final class Stages {
             long inputRowBytes = (long) (queryWidth + keyValueWidth) * Short.BYTES;
             for (Part part : parts(context)) {
                 AttentionKvState state = attentionState(part.sequence(), instruction);
-                gpu().attentionCausalNvfp4(
+                gpu().attentionCausal(
+                                state.format(),
                                 input(context, instruction, 0) + part.rowOffset() * inputRowBytes,
                                 input(context, instruction, 1) + part.rowOffset() * inputRowBytes,
                                 state.keyCacheAddress(),

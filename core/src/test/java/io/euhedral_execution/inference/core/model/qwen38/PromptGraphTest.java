@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.lang.foreign.ValueLayout;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -133,6 +134,92 @@ class PromptGraphTest {
                     Quantum.Status.SUCCESS,
                     runtime.submit(prompt).get(5, TimeUnit.SECONDS).status());
             assertEquals(List.of(2, 4, 5), cacheLengths);
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void aBf16CacheAppendsAndAttendsThroughTheBf16EntryPoints() throws Exception {
+        var plan = new ExecutionPlan(EngineExecutionFixture.weights());
+        List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
+        var gpu = new EngineExecutionFixture.SamplingGpu(VOCABULARY) {
+            @Override
+            public void attentionKvAppendNvfp4(
+                    long queryKeyAddress,
+                    long gateValueAddress,
+                    long keyCacheAddress,
+                    long valueCacheAddress,
+                    int rows,
+                    int queryWidth,
+                    int keyValueWidth,
+                    long startPosition,
+                    long positionAddress) {
+                calls.add("append nvfp4");
+            }
+
+            @Override
+            public void attentionKvAppendBf16(
+                    long queryKeyAddress,
+                    long gateValueAddress,
+                    long keyCacheAddress,
+                    long valueCacheAddress,
+                    int rows,
+                    int queryWidth,
+                    int keyValueWidth,
+                    long startPosition,
+                    long positionAddress) {
+                calls.add("append bf16 " + rows);
+            }
+
+            @Override
+            public void attentionCausalNvfp4(
+                    long queryKeyAddress,
+                    long gateValueAddress,
+                    long keyCacheAddress,
+                    long valueCacheAddress,
+                    long outputAddress,
+                    int rows,
+                    int queryHeads,
+                    int keyValueHeads,
+                    int headDim,
+                    int cacheLength,
+                    long startPosition,
+                    long positionAddress,
+                    long scratchAddress) {
+                calls.add("attend nvfp4");
+            }
+
+            @Override
+            public void attentionCausalBf16(
+                    long queryKeyAddress,
+                    long gateValueAddress,
+                    long keyCacheAddress,
+                    long valueCacheAddress,
+                    long outputAddress,
+                    int rows,
+                    int queryHeads,
+                    int keyValueHeads,
+                    int headDim,
+                    int cacheLength,
+                    long startPosition,
+                    long positionAddress,
+                    long scratchAddress) {
+                calls.add("attend bf16 " + cacheLength);
+            }
+        };
+        var runtime = ExecutionFixtures.runtime(plan, gpu);
+        try {
+            var sequence = new Sequence(7);
+            sequence.useKvFormat(KvFormat.BF16);
+            var prompt = Quantum.prompt(plan, sequence, 0, new int[] {1, 2, 3}, 3, LogitsRequirement.NONE, null);
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    runtime.submit(prompt).get(5, TimeUnit.SECONDS).status());
+            assertFalse(calls.isEmpty());
+            for (String call : calls) assertTrue(call.equals("append bf16 3") || call.equals("attend bf16 3"), call);
+            var attention = (AttentionStates) sequence.kvCacheState();
+            assertEquals(KvFormat.BF16, attention.format());
         } finally {
             runtime.close();
         }

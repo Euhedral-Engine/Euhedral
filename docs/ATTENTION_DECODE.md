@@ -5,6 +5,27 @@ The GQA decode attention kernel serves one query-head group (6 heads) per KV hea
 decode kernel runs; a group of more than 8 query heads also keeps the per-head kernel). Sources: `native/src/attention/nvfp4_decode_gqa.cuh` (decode, row twin), `nvfp4_attention.cuh` (merge), `nvfp4_pipe.cuh` (shared
 pipeline helpers). Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running.
 
+## Cache formats
+
+A sequence keeps its attention caches in one of two formats, chosen per engine (`InferenceConfig.kvCache`,
+`euhedral.inference.kv-cache`; unset, the artifact's, NVFP4):
+
+- **NVFP4** (`nvfp4_kv.cuh`): 144-byte head rows of the H256-rotated keys and values. Queries are rotated into the same basis
+  and outputs back out of it.
+- **BF16** (`bf16_kv.cuh`): 512-byte head rows, the keys and values as computed, unrotated.
+
+Both use the same 256-token pages and page tables. Every attention kernel (append, 32-row and FlashAttention-2 prefill, per-head and
+GQA decode, merge, the verifier's row twins, the `_exact` twins) is one body templated on a cache-format policy (`Nvfp4Kv`,
+`Bf16Kv` in `nvfp4_attention.cuh`), instantiated as `euhedral_attention_*_nvfp4` and `euhedral_attention_*_bf16`; the host picks
+the set by the cache's format (`euhedral_cuda_attention_causal_bf16`, `euhedral_cuda_attention_kv_append_bf16`) and the routes and
+split counts are the same for both, so every verification row is one-row decode bit for bit in either format. The per-head
+kernels read BF16 rows as FP32. The tensor-core kernels widen them to FP16 tiles: exact from 2^-14 to 65504, saturated to
++-65504 beyond, so the tiles stay finite. A batched quantum's sequences share one format, and a sequence's capture key carries it.
+
+Against a float64 oracle of gated causal GQA attention over the cached BF16 values, every route adds at most 1.3e-5 relative RMS
+error beyond the BF16 rounding of its output (`native/tests/test_attention_bf16.py`: prefill up to 512 rows and 4096 keys, decode up
+to 32768 keys).
+
 ## Design
 
 One CTA per (KV head, key split): 4 KV heads times at most 64 splits of 32 or more keys, so 256 CTAs. The CTA is three warps with

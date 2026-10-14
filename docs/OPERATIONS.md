@@ -17,6 +17,7 @@ and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHE
 | `euhedral.inference.max-context-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
 | `euhedral.inference.prefix-cache-bytes` | 4294967296 | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |
 | `euhedral.inference.prefix-cache-checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
+| `euhedral.inference.kv-cache` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](ATTENTION_DECODE.md#cache-formats)). |
 | `euhedral.inference.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
 | `euhedral.api.default-max-tokens` | 4096 | Completion length when a request sets none. |
 | `euhedral.api.max-queued-generations` | 16 | Requests waiting behind the running generation; more are refused with 503. |
