@@ -48,8 +48,8 @@ the artifact and appends a summary per reference to the results file: mean NLL, 
 the reference entries above its 16-nat floor, top-1 agreement with standard errors (chunk-level over several chunks),
 the KL median, p95, p99 and maximum, and delta-p of the forced token. Each chunk of N tokens prefills N / 2 + 1 and
 verifies the rest `--rows` (8) forced tokens at a time; each logits row is scored where the engine left it, by
-`score.cu` reading the reference row a reader frame fetched into mapped host memory. `--concurrency` (3) chunks run at
-once on their own sequences; `--host-mib` (2304) keeps that much of the weights in host memory.
+`score.cu` reading the reference row a reader frame fetched into mapped host memory. `--batch` (4) chunks run together
+on their own sequences, each step group of all of them in one batched verification (at most 32 rows); `--host-mib` (2304) keeps that much of the weights in host memory.
 
 ## Libraries
 
