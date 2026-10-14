@@ -13,6 +13,7 @@ public final class Ops {
     private static final int THREADS = 256;
     private static final List<String> KERNELS = List.of(
             "bf16_to_float",
+            "float_to_bf16_rounded",
             "axpby",
             "fill",
             "swiglu_forward",
@@ -103,6 +104,14 @@ public final class Ops {
     public void bf16ToFloat(long in, long count, long out) {
         elementwise(
                 "bf16_to_float",
+                count,
+                new Cuda.Arguments().pointer(in).pointer(count).pointer(out));
+    }
+
+    /// BF16 (round to nearest even) of FP32 values.
+    public void floatToBf16(long in, long count, long out) {
+        elementwise(
+                "float_to_bf16_rounded",
                 count,
                 new Cuda.Arguments().pointer(in).pointer(count).pointer(out));
     }

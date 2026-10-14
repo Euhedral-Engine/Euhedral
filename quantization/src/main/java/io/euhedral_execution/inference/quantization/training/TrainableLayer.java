@@ -32,19 +32,19 @@ public final class TrainableLayer implements AutoCloseable {
             double theta,
             float eps) {
 
-        int qkWidth() {
+        public int qkWidth() {
             return attention ? (heads + kvHeads) * headDim : 2 * keyHeads * keyDim;
         }
 
-        int valueWidth() {
+        public int valueWidth() {
             return valueHeads * valueDim;
         }
 
-        int convWidth() {
+        public int convWidth() {
             return qkWidth() + valueWidth();
         }
 
-        int mixerWidth() {
+        public int mixerWidth() {
             return attention ? heads * headDim : valueWidth();
         }
     }
