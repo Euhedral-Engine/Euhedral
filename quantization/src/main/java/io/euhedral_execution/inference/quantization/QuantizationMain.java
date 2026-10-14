@@ -11,21 +11,21 @@ import java.util.Map;
 ///
 /// ```
 /// calibrate --model CHECKPOINT --quantization nvfp4|q3 [--compressed] --tokens TOKENS.npy --draft-ids-from ARTIFACT
-///           --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
-///           [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
+/// --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
+/// [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
 /// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
-///              [--overlay CHECKPOINT_DIR] [--sequences 96]
-///              [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
+/// [--overlay CHECKPOINT_DIR] [--sequences 96]
+/// [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
 /// train-model --model CHECKPOINT --codes CODES_DIR [--norms NORMS_DIR] --tokens TOKENS.npy --out CODES_DIR
-///             [--overlay CHECKPOINT_DIR] [--sequences 218] [--holdout 18] [--epochs 1] [--scale-lr 2e-6]
-///             [--norm-lr 2e-5] [--top-k 64] [--evaluate-every 50] [--probe 0] [--accumulate 8] [--fp32] [--batch 4]
+/// [--overlay CHECKPOINT_DIR] [--sequences 218] [--holdout 18] [--epochs 1] [--scale-lr 2e-6]
+/// [--norm-lr 2e-5] [--top-k 64] [--evaluate-every 50] [--probe 0] [--accumulate 8] [--fp32] [--batch 4]
 /// [--library
 /// LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
-///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// [--host-mib N] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
 /// 4096]
-///          [--batch 12] [--host-mib 3072] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
 
@@ -39,10 +39,10 @@ public final class QuantizationMain {
                     + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                     + "[--layers N] [--skip-mtp] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
-                    + "[--rows 8] [--host-mib 2304] [--batch 4] [--workers 6] [--library PATH]");
+                    + "[--rows 8] [--host-mib N] [--batch 4] [--workers 6] [--library PATH]");
             System.err.println(
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
-                            + "[--max-tokens 4096] [--batch 12] [--host-mib 3072] [--limit N] [--workers 6] [--library PATH]");
+                            + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library PATH]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
@@ -118,7 +118,7 @@ public final class QuantizationMain {
                             Path.of(required(options, "out")),
                             Integer.parseInt(options.getOrDefault("max-tokens", "4096")),
                             Integer.parseInt(options.getOrDefault("batch", "12")),
-                            Long.parseLong(options.getOrDefault("host-mib", "3072")) << 20,
+                            hostBytes(options),
                             Integer.parseInt(options.getOrDefault("workers", "6")),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Path.of(library)));
@@ -134,7 +134,7 @@ public final class QuantizationMain {
                     names,
                     Path.of(required(options, "results")),
                     Integer.parseInt(options.getOrDefault("rows", "8")),
-                    Long.parseLong(options.getOrDefault("host-mib", "2304")) << 20,
+                    hostBytes(options),
                     Integer.parseInt(options.getOrDefault("batch", "4")),
                     Integer.parseInt(options.getOrDefault("workers", "6")),
                     Path.of(library)));
@@ -156,6 +156,11 @@ public final class QuantizationMain {
                         Integer.parseInt(options.getOrDefault("nvfp4-above", "2")),
                         Float.parseFloat(options.getOrDefault("nvfp4-scale-max", "448"))));
         Calibrate.run(settings, Path.of(library));
+    }
+
+    /// `--host-mib` in bytes, or [Residency#PLANNED] when it is not given.
+    private static long hostBytes(Map<String, String> options) {
+        return options.containsKey("host-mib") ? Long.parseLong(options.get("host-mib")) << 20 : Residency.PLANNED;
     }
 
     private static String required(Map<String, String> options, String key) {

@@ -19,9 +19,9 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.quantization.CalibrationLattice;
+import io.euhedral_execution.inference.quantization.Residency;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
@@ -97,6 +97,9 @@ public final class Generate {
         this.stepChoices = device.gpu.allocateHostWeights(4L * settings.batch());
     }
 
+    /// Longest rendered prompt the residency plan makes room for, ahead of `maxTokens` of generation.
+    private static final int PROMPT_TOKENS = 4096;
+
     public static void run(Settings settings) throws Exception {
         if (settings.batch() < 1 || settings.batch() > 32)
             throw new IllegalArgumentException("--batch is 1 to 32 sequences (one row each per step)");
@@ -107,7 +110,14 @@ public final class Generate {
                         data,
                         device.gpu,
                         ArtifactProfile.Speculation.MTP,
-                        HostWeightSelection.select(data, settings.hostBytes()));
+                        // A rendered prompt is at most PROMPT_TOKENS long ahead of its generation.
+                        Residency.hostBacked(
+                                data,
+                                ArtifactProfile.Speculation.MTP,
+                                device.gpu,
+                                settings.hostBytes(),
+                                settings.batch(),
+                                PROMPT_TOKENS + settings.maxTokens()));
                 var lattice = CalibrationLattice.start(settings.workers())) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             if (!plan.drafts()) throw new IllegalArgumentException(settings.artifact() + " has no MTP drafter");
@@ -135,6 +145,9 @@ public final class Generate {
     private static Generation start(
             Settings settings, Device device, Execution runtime, ExecutionPlan plan, CalibrationLattice lattice) {
         try {
+            // The worker's thread compiles the generator's kernels; no stream stays selected on it, since the engine's
+            // quanta select their own on the same workers.
+            device.cuda.bindThread();
             QwenTokenizer tokenizer = QwenTokenizer.load(settings.tokenizer());
             QwenChatTemplate template = QwenChatTemplate.load(settings.tokenizer());
             Files.createDirectories(settings.out());

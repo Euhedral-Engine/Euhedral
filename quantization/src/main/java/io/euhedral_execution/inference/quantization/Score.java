@@ -10,7 +10,6 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
-import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
@@ -71,6 +70,7 @@ public final class Score {
         this.device = device;
         this.runtime = runtime;
         this.plan = plan;
+        device.cuda.bindThread(); // the worker's thread compiles the scorer's kernel; the engine selects streams here
         this.scoreStream = device.newStream();
         this.kernel =
                 device.cuda.compileResource("score.cu", List.of("score_rows")).getFirst();
@@ -83,13 +83,24 @@ public final class Score {
                 || settings.batch() * settings.rows() > 32)
             throw new IllegalArgumentException("--rows (at most 8) times --batch must be at most 32");
         var data = ArtifactReader.read(settings.artifact());
+        int context = 0;
+        for (Path path : settings.references())
+            try (Reference reference = Reference.open(path)) {
+                context = Math.max(context, reference.context);
+            }
         try (Device device = new Device(settings.library());
                 Qwen38Model model = Qwen38Model.load(
                         settings.artifact(),
                         data,
                         device.gpu,
                         ArtifactProfile.Speculation.NONE,
-                        HostWeightSelection.select(data, settings.hostBytes()));
+                        Residency.hostBacked(
+                                data,
+                                ArtifactProfile.Speculation.NONE,
+                                device.gpu,
+                                settings.hostBytes(),
+                                settings.batch(),
+                                context));
                 var lattice = CalibrationLattice.start(settings.workers())) {
             var plan = new ExecutionPlan(model.weights(), model.staging());
             var runtime = new Execution(lattice.terminal(), plan, device.gpu);
