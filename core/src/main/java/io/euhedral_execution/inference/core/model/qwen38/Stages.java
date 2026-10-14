@@ -311,15 +311,19 @@ public final class Stages {
             boolean finalNorm = instruction.outputBuffers().contains(ExecutionPlan.Buffer.FINAL_NORMALIZED);
             int rows = finalNorm ? logitsRows(context) : rows(context);
             if (finalNorm && context.seedsDraft() && context.plan().drafts()) {
-                // Speculative drafting reads every row's post-final-norm hidden (docs/MTP_CONTRACT.md §2).
-                var states = (AttentionStates) context.sequenceState().kvCacheState();
-                int all = rows(context);
-                normalize(
-                        instruction,
-                        context.workspace().address(instruction.inputBuffers().getFirst()),
-                        states.draftSeedRows(all, instruction.outputWidth()),
-                        all,
-                        (float) context.plan().weights().config().rmsNormEpsilon());
+                // Speculative drafting reads every row's post-final-norm hidden (docs/MTP_CONTRACT.md §2): each
+                // sequence's rows into its own seed rows.
+                long source =
+                        context.workspace().address(instruction.inputBuffers().getFirst());
+                for (Part part : parts(context)) {
+                    var states = (AttentionStates) part.sequence().kvCacheState();
+                    normalize(
+                            instruction,
+                            source + (long) part.rowOffset() * instruction.inputWidth() * Short.BYTES,
+                            states.draftSeedRows(part.rows(), instruction.outputWidth()),
+                            part.rows(),
+                            (float) context.plan().weights().config().rmsNormEpsilon());
+                }
             }
             if (rows == 0) return;
             long input = context.shape().hasFirstLayer()

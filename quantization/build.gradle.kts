@@ -26,6 +26,8 @@ application {
 
 dependencies {
     implementation(project(":core"))
+    // The checkpoint's chat template (QwenChatTemplate), rendered as the server renders prompts.
+    implementation(project(":api"))
     implementation(libs.euhedral.core)
     implementation(libs.jackson.databind)
     testImplementation(libs.junit.jupiter)
