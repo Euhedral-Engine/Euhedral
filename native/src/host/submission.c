@@ -173,6 +173,33 @@ cudaError_t euhedral_submit_memset(void* destination, int value, size_t bytes, c
     return status;
 }
 
+CUresult euhedral_submit_wait_value(CUdeviceptr address, uint32_t value, cudaStream_t stream) {
+    if (mode != SUBMIT_ORDINARY) {
+        mix(0x3a17ull);
+        mix((uint64_t)address);
+        mix((uint64_t)value);
+        if (mode == SUBMIT_CHECKING) return CUDA_SUCCESS;
+    }
+    CUresult status = cuStreamWaitValue32((CUstream)stream, address, value, CU_STREAM_WAIT_VALUE_EQ);
+    if (mode == SUBMIT_RECORDING && status == CUDA_SUCCESS && !shadow_failed)
+        record_failure(cuStreamWaitValue32((CUstream)shadow, address, value, CU_STREAM_WAIT_VALUE_EQ) != CUDA_SUCCESS);
+    return status;
+}
+
+CUresult euhedral_submit_write_value(CUdeviceptr address, uint32_t value, cudaStream_t stream) {
+    if (mode != SUBMIT_ORDINARY) {
+        mix(0x3a18ull);
+        mix((uint64_t)address);
+        mix((uint64_t)value);
+        if (mode == SUBMIT_CHECKING) return CUDA_SUCCESS;
+    }
+    CUresult status = cuStreamWriteValue32((CUstream)stream, address, value, CU_STREAM_WRITE_VALUE_DEFAULT);
+    if (mode == SUBMIT_RECORDING && status == CUDA_SUCCESS && !shadow_failed)
+        record_failure(
+                cuStreamWriteValue32((CUstream)shadow, address, value, CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS);
+    return status;
+}
+
 void euhedral_cuda_submission_record(uint64_t shadow_stream, int overlap) {
     mode = SUBMIT_RECORDING;
     shadow = (cudaStream_t)(uintptr_t)shadow_stream;

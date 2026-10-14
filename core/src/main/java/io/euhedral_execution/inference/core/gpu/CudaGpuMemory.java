@@ -66,6 +66,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle streamSynchronize;
     private final MethodHandle streamSelect;
     private final MethodHandle streamClear;
+    private final MethodHandle waitHostFlag;
+    private final MethodHandle writeHostFlag;
     private final MethodHandle pdlSelect;
     private final MethodHandle submissionRecord;
     private final MethodHandle submissionCheck;
@@ -348,6 +350,16 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.pdlSelect =
                     bind(linker, symbols, "euhedral_cuda_pdl_select", FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
             this.streamClear = bind(linker, symbols, "euhedral_cuda_stream_clear", FunctionDescriptor.ofVoid());
+            this.waitHostFlag = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_wait_host_flag",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
+            this.writeHostFlag = bind(
+                    linker,
+                    symbols,
+                    "euhedral_cuda_write_host_flag",
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT));
             this.submissionRecord = bind(
                     linker,
                     symbols,
@@ -1165,6 +1177,38 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 byteSize,
                 "host weight copy");
         if (status != 0) throw new GpuMemoryException("host weight copy", status);
+    }
+
+    /// 32-bit stream memory operations run on every device of the CUDA driver this library requires.
+    @Override
+    public boolean streamMemoryOps() {
+        return true;
+    }
+
+    @Override
+    public void waitHostFlag(long flagDeviceAddress, int value) {
+        ensureOpen();
+        if (flagDeviceAddress == 0) throw new IllegalArgumentException("invalid host flag");
+        int status;
+        try {
+            status = (int) waitHostFlag.invokeExact(flagDeviceAddress, value);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA host flag wait invocation failed", failure);
+        }
+        if (status != 0) throw new GpuMemoryException("CUDA host flag wait", status);
+    }
+
+    @Override
+    public void writeHostFlag(long flagDeviceAddress, int value) {
+        ensureOpen();
+        if (flagDeviceAddress == 0) throw new IllegalArgumentException("invalid host flag");
+        int status;
+        try {
+            status = (int) writeHostFlag.invokeExact(flagDeviceAddress, value);
+        } catch (Throwable failure) {
+            throw new GpuMemoryException("CUDA host flag write invocation failed", failure);
+        }
+        if (status != 0) throw new GpuMemoryException("CUDA host flag write", status);
     }
 
     @Override
