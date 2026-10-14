@@ -37,7 +37,8 @@ public final class Stages {
             case WEIGHT_TRANSFER -> new WeightTransfer(graph, stage, instruction, gpu);
             case DISK_TRANSFER -> new DiskTransfer(graph, stage, instruction, gpu);
             case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNorm(graph, stage, instruction, gpu);
-            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR -> new Linear(graph, stage, instruction, gpu);
+            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR, BF16_PROJECTION ->
+                new Linear(graph, stage, instruction, gpu);
             case Q3_GATE_UP_SWIGLU -> new GateUpSwiGlu(graph, stage, instruction, gpu);
             case RESIDUAL_RMS_NORM -> new ResidualNorm(graph, stage, instruction, gpu);
             case GDN_PROJECT_CONTROL -> new GdnProjectControl(graph, stage, instruction, gpu);
@@ -452,9 +453,10 @@ public final class Stages {
             boolean quantized = instruction.kind() == ExecutionPlan.Kind.Q3_LINEAR
                     || instruction.kind() == ExecutionPlan.Kind.Q4_LINEAR
                     || instruction.kind() == ExecutionPlan.Kind.Q5_LINEAR;
-            if (context.kind() == Quantum.ExecutionKind.VERIFY
-                    && rows > 1
-                    && !(quantized && gpu().rowExactQuantizedLinears())) {
+            // BF16 projections run on kernels whose rows do not depend on how many run together.
+            boolean rowExact = (quantized && gpu().rowExactQuantizedLinears())
+                    || instruction.kind() == ExecutionPlan.Kind.BF16_PROJECTION;
+            if (context.kind() == Quantum.ExecutionKind.VERIFY && rows > 1 && !rowExact) {
                 // Row-exact verification: each row takes exactly the route and kernel one-row decode does.
                 int outputBytes = instruction.kind() == ExecutionPlan.Kind.BF16_LINEAR ? Float.BYTES : Short.BYTES;
                 for (int row = 0; row < rows; row++) {
@@ -498,6 +500,15 @@ public final class Stages {
                                     instruction.inputWidth(),
                                     instruction.outputWidth(),
                                     instruction.weightByteSize());
+                case BF16_PROJECTION ->
+                    io.euhedral_execution.inference.core.model.qwen4.Ops.linearBf16RowExact(
+                            gpu(),
+                            input,
+                            instruction.weightAddress(),
+                            output,
+                            rows,
+                            instruction.inputWidth(),
+                            instruction.outputWidth());
                 case BF16_LINEAR ->
                     gpu().linearBf16ToFloat(
                                     input,

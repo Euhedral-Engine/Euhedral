@@ -6,8 +6,8 @@ import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 
 /// Typed launches of the Flash-Next kernels (native/src/qwen4): the geometry each kernel is written for and the
-/// argument checks the native launcher cannot make (alignment, extents). Every method queues on the GPU's selected
-/// stream; none allocates on the hot path.
+/// argument checks the native launcher cannot make (alignment, extents). Every method queues on the GPU's
+/// selected stream; none allocates on the hot path.
 ///
 /// The kernels reproduce upstream's BF16 arithmetic, rounding after every tensor operation the way PyTorch does
 /// (docs/FLASH_NEXT_EXECUTION.md).
@@ -33,8 +33,8 @@ public final class Ops {
     /// (`EUHEDRAL_QWEN4_LINEAR_SPLIT=0`: one warp per column, the exact route's kernel).
     static final boolean LINEAR_SPLIT = !"0".equals(System.getenv("EUHEDRAL_QWEN4_LINEAR_SPLIT"));
 
-    /// The K slices of a decode linear of `k` inputs and `n` outputs, by its shape alone: 8 for outputs too few to
-    /// fill the device or reductions of 8192 and more, 4 for reductions of 2048 and more, else 1.
+    /// The K slices of a decode linear of `k` inputs and `n` outputs, by its shape alone: 8 for outputs too few
+    /// to fill the device or reductions of 8192 and more, 4 for reductions of 2048 and more, else 1.
     static int slices(int k, int n) {
         if (n < 64 || k >= 8192) return 8;
         if (k >= 2048 && n < 4096) return 4;
@@ -42,6 +42,40 @@ public final class Ops {
     }
 
     /// `output[r][j] = bf16(sum_k input[r][k] * weights[j][k])` for BF16 `weights` of `n` rows by `k` columns.
+
+    /// [#linearBf16] on the tensor-core kernels for every row count: K split by the shape alone and four row
+    /// tiles per weight load above 16 rows, so each row's bits are those of its one-row launch. Needs K
+    /// divisible by 32 and N by 8.
+    public static void linearBf16RowExact(
+            ExecutionGpu gpu, long input, long weights, long output, int rows, int k, int n) {
+        requirePositive(rows, k, n);
+        if (k % 32 != 0 || n % 8 != 0)
+            throw new IllegalArgumentException(
+                    "a row-exact BF16 linear needs K divisible by 32 and N by 8, got " + k + " x " + n);
+        requireAligned(16, input, weights);
+        if ((output & 3) != 0) throw new IllegalArgumentException("the output must be 4-byte aligned");
+        boolean split = n <= 1536 || n % 32 != 0;
+        boolean tiles = rows > 16;
+        Kernel kernel = split
+                ? (tiles ? Kernel.LINEAR_TC_ROWS_SPLIT_BF16 : Kernel.LINEAR_TC_SPLIT_BF16)
+                : (tiles ? Kernel.LINEAR_TC_ROWS_BF16 : Kernel.LINEAR_TC_BF16);
+        gpu.launchTableKernel(
+                kernel,
+                split ? n / 8 : n / 32,
+                ceilDiv(rows, tiles ? 64 : 16),
+                1,
+                128,
+                1,
+                1,
+                0,
+                arguments()
+                        .pointer(input)
+                        .pointer(weights)
+                        .pointer(output)
+                        .int32(rows)
+                        .int32(k)
+                        .int32(n));
+    }
 
     public static void linearBf16(ExecutionGpu gpu, long input, long weights, long output, int rows, int k, int n) {
         requirePositive(rows, k, n);
@@ -228,8 +262,8 @@ public final class Ops {
                         .int32(width));
     }
 
-    /// Expands staged n-gram records (see [io.euhedral_execution.inference.core.model.qwen4.loader.NgramStore]) into
-    /// BF16 rows of `width` values, one after another.
+    /// Expands staged n-gram records (see [io.euhedral_execution.inference.core.model.qwen4.loader.NgramStore])
+    /// into BF16 rows of `width` values, one after another.
     public static void ngramExpand(ExecutionGpu gpu, long records, long output, int count, int width, int recordBytes) {
         requirePositive(count, width, recordBytes);
         if (recordBytes % 4 != 0) throw new IllegalArgumentException("records are multiples of four bytes");
@@ -250,8 +284,8 @@ public final class Ops {
                         .int32(recordBytes));
     }
 
-    /// The PLE gate: every stream's share of the shared value, `sigmoid(signed sqrt(key . query / sqrt(width))) *
-    /// value`.
+    /// The PLE gate: every stream's share of the shared value, `sigmoid(signed sqrt(key . query / sqrt(width)))
+    /// * value`.
     public static void pleGate(
             ExecutionGpu gpu, long key, long query, long value, long output, int rows, int streams, int width) {
         requirePositive(rows, streams, width);
@@ -274,8 +308,8 @@ public final class Ops {
                         .int32(width));
     }
 
-    /// The PLE short convolution with `(taps - 1) * dilation` rows of history: `gated + silu(conv(normed))`. The
-    /// history is read, not written; call [#convHistory] afterwards.
+    /// The PLE short convolution with `(taps - 1) * dilation` rows of history: `gated + silu(conv(normed))`.
+    /// The history is read, not written; call [#convHistory] afterwards.
     public static void pleConv(
             ExecutionGpu gpu,
             long normed,
@@ -330,8 +364,8 @@ public final class Ops {
                         .int32(history));
     }
 
-    /// `output[r] = table[ids[r]]`: embedding rows of `width` BF16 values from a table of `vocabulary` rows that is in
-    /// device memory or mapped host memory; `ids` are int32 token ids on the device.
+    /// `output[r] = table[ids[r]]`: embedding rows of `width` BF16 values from a table of `vocabulary` rows
+    /// that is in device memory or mapped host memory; `ids` are int32 token ids on the device.
     public static void embedding(
             ExecutionGpu gpu, long table, long ids, long output, int rows, int width, int vocabulary) {
         requirePositive(rows, width, vocabulary);
