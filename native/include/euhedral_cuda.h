@@ -75,6 +75,16 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_copy_device_to_device_2d(
         uint64_t row_bytes,
         uint64_t rows);
 
+/// BF16 rows of a BF16 [vocabulary, hidden] table; hidden divisible by 8, table and output 16-byte aligned.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_embed_bf16(
+        const int32_t* device_token_ids,
+        const void* device_embedding_weights,
+        void* device_hidden_state,
+        uint32_t token_count,
+        uint32_t vocabulary_size,
+        uint32_t hidden_size,
+        uint64_t embedding_byte_size);
+
 EUHEDRAL_CUDA_EXPORT int euhedral_cuda_embed_q3(
         const int32_t* device_token_ids,
         const void* device_embedding_weights,

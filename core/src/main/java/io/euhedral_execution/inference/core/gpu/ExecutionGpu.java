@@ -278,6 +278,19 @@ public abstract class ExecutionGpu implements GpuMemory {
             int vocabularySize,
             int hiddenSize);
 
+    /// Rows of a BF16 [vocabulary, hidden] embedding table for `tokenCount` token ids; an id outside the vocabulary
+    /// leaves its row as it was.
+    public void embedBf16(
+            long tokenIdsAddress,
+            long embeddingAddress,
+            long embeddingByteSize,
+            long hiddenStateAddress,
+            int tokenCount,
+            int vocabularySize,
+            int hiddenSize) {
+        throw new UnsupportedOperationException("BF16 embedding is not implemented by this GPU");
+    }
+
     public abstract void synchronize();
 
     /// [#embedQ3] for an embedding table in either Q3 layout. Backends without P2E2 support accept

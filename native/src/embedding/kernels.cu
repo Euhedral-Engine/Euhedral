@@ -33,6 +33,30 @@ static __device__ __forceinline__ unsigned short euhedral_float_to_bfloat16(floa
     return (unsigned short)(bits >> 16);
 }
 
+// BF16 rows of a BF16 table (the unquantized model's), one block per token, 16 bytes per thread and step; an id
+// outside the vocabulary leaves its row as it was, as the Q3 kernels do.
+extern "C" __global__ __launch_bounds__(128) void euhedral_bf16_embedding(
+        const int* token_ids,
+        const unsigned short* table,
+        unsigned short* output,
+        unsigned int token_count,
+        unsigned int vocabulary_size,
+        unsigned int hidden_size) {
+    unsigned int token = (unsigned int)blockIdx.x;
+    if (token >= token_count) {
+        return;
+    }
+    int row = token_ids[token];
+    if (row < 0 || (unsigned int)row >= vocabulary_size) {
+        return;
+    }
+    const uint4* source = reinterpret_cast<const uint4*>(table + (unsigned long long)(unsigned int)row * hidden_size);
+    uint4* target = reinterpret_cast<uint4*>(output + (unsigned long long)token * hidden_size);
+    for (unsigned int i = threadIdx.x; i < hidden_size / 8u; i += blockDim.x) {
+        target[i] = source[i];
+    }
+}
+
 extern "C" __global__ __launch_bounds__(128) void euhedral_q3_embedding(
         const int* token_ids,
         const unsigned char* weights,

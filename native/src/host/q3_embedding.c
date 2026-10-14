@@ -28,6 +28,7 @@ static pthread_once_t q3_embedding_once = PTHREAD_ONCE_INIT;
 static CUmodule q3_embedding_module;
 static CUfunction q3_embedding_function;
 static CUfunction q3_p2e2_embedding_function;
+static CUfunction bf16_embedding_function;
 static int q3_embedding_init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static void initialize_q3_embedding_kernel(void) {
@@ -37,6 +38,9 @@ static void initialize_q3_embedding_kernel(void) {
     if (cuModuleGetFunction(&q3_p2e2_embedding_function, q3_embedding_module, "euhedral_q3_p2e2_embedding")
             != CUDA_SUCCESS)
         q3_p2e2_embedding_function = NULL;
+    if (cuModuleGetFunction(&bf16_embedding_function, q3_embedding_module, "euhedral_bf16_embedding")
+            != CUDA_SUCCESS)
+        bf16_embedding_function = NULL;
     q3_embedding_init_status = EUHEDRAL_CUDA_SUCCESS;
 }
 
@@ -151,6 +155,63 @@ int euhedral_cuda_embed_q3(
     CUresult status = euhedral_launch_kernel(
             q3_embedding_function,
             (unsigned int) grid_size,
+            1,
+            1,
+            128,
+            1,
+            1,
+            0,
+            euhedral_cuda_submission_stream(),
+            kernel_parameters,
+            NULL);
+    return status == CUDA_SUCCESS ? EUHEDRAL_CUDA_SUCCESS : (int) status;
+}
+
+int euhedral_cuda_embed_bf16(
+        const int32_t* device_token_ids,
+        const void* device_embedding_weights,
+        void* device_hidden_state,
+        uint32_t token_count,
+        uint32_t vocabulary_size,
+        uint32_t hidden_size,
+        uint64_t embedding_byte_size) {
+    if (device_token_ids == NULL || device_embedding_weights == NULL || device_hidden_state == NULL
+            || token_count == 0 || vocabulary_size == 0 || hidden_size == 0 || hidden_size % 8u != 0
+            || ((uintptr_t) device_embedding_weights & 15u) != 0 || ((uintptr_t) device_hidden_state & 15u) != 0) {
+        return EUHEDRAL_CUDA_INVALID_ARGUMENT;
+    }
+    uint64_t expected_byte_size = 0;
+    if (!checked_multiply_u64((uint64_t) vocabulary_size * 2u, hidden_size, &expected_byte_size)) {
+        return EUHEDRAL_CUDA_SIZE_OVERFLOW;
+    }
+    if (embedding_byte_size != expected_byte_size) {
+        return EUHEDRAL_CUDA_FORMAT_MISMATCH;
+    }
+    int kernel_status = euhedral_cuda_bind_thread_context();
+    if (kernel_status == EUHEDRAL_CUDA_SUCCESS) kernel_status = ensure_q3_embedding_kernel();
+    if (kernel_status != EUHEDRAL_CUDA_SUCCESS) {
+        return kernel_status;
+    }
+    if (bf16_embedding_function == NULL) {
+        return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+    }
+    CUdeviceptr token_ids = (CUdeviceptr) (uintptr_t) device_token_ids;
+    CUdeviceptr weights = (CUdeviceptr) (uintptr_t) device_embedding_weights;
+    CUdeviceptr output = (CUdeviceptr) (uintptr_t) device_hidden_state;
+    unsigned int token_count_argument = token_count;
+    unsigned int vocabulary_size_argument = vocabulary_size;
+    unsigned int hidden_size_argument = hidden_size;
+    void* kernel_parameters[] = {
+        &token_ids,
+        &weights,
+        &output,
+        &token_count_argument,
+        &vocabulary_size_argument,
+        &hidden_size_argument,
+    };
+    CUresult status = euhedral_launch_kernel(
+            bf16_embedding_function,
+            token_count,
             1,
             1,
             128,

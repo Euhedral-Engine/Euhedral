@@ -121,7 +121,7 @@ class FullModelExecutionPlanTest {
 
     @Test
     void everyBf16ObjectRunsAsARowExactBf16Projection() {
-        formatOverride = name -> name.equals("text/token_embedding") ? null : WeightFormat.BF16;
+        formatOverride = name -> WeightFormat.BF16;
         Weights weights;
         try {
             weights = fullModelWeights();

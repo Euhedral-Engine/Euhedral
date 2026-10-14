@@ -60,6 +60,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle copyDeviceToReadback;
     private final MethodHandle copyDeviceToDevice;
     private final MethodHandle embedQ3;
+    private final MethodHandle embedBf16;
     private final MethodHandle synchronize;
     private final MethodHandle streamCreate;
     private final MethodHandle streamDestroy;
@@ -213,6 +214,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.copyDeviceToReadback = bind(linker, symbols, "euhedral_cuda_copy_device_to_readback", COPY);
             this.copyDeviceToDevice = bind(linker, symbols, "euhedral_cuda_copy_device_to_device", COPY);
             this.embedQ3 = bind(linker, symbols, "euhedral_cuda_embed_q3", EMBED_Q3);
+            this.embedBf16 = bind(linker, symbols, "euhedral_cuda_embed_bf16", EMBED_Q3);
             this.embedQ3P2e2 = bind(linker, symbols, "euhedral_cuda_embed_q3_p2e2", EMBED_Q3);
             this.linearQ3P2e2DecodeBf16 =
                     bind(linker, symbols, "euhedral_cuda_linear_q3_p2e2_decode_bf16", LINEAR_Q3_BF16);
@@ -1330,6 +1332,37 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
                 byteSize,
                 "device-to-device copy");
         if (status != 0) throw new GpuMemoryException("device-to-device copy", status);
+    }
+
+    @Override
+    public void embedBf16(
+            long tokenIdsAddress,
+            long embeddingAddress,
+            long embeddingByteSize,
+            long hiddenStateAddress,
+            int tokenCount,
+            int vocabularySize,
+            int hiddenSize) {
+        ensureOpen();
+        requireDeviceAddress(tokenIdsAddress);
+        requireDeviceAddress(embeddingAddress);
+        requireDeviceAddress(hiddenStateAddress);
+        if (tokenCount <= 0 || vocabularySize <= 0 || hiddenSize <= 0 || hiddenSize % 8 != 0)
+            throw new IllegalArgumentException("BF16 embedding sizes must be positive, the hidden size divisible by 8");
+        int status;
+        try {
+            status = (int) embedBf16.invokeExact(
+                    MemorySegment.ofAddress(tokenIdsAddress),
+                    MemorySegment.ofAddress(embeddingAddress),
+                    MemorySegment.ofAddress(hiddenStateAddress),
+                    tokenCount,
+                    vocabularySize,
+                    hiddenSize,
+                    embeddingByteSize);
+        } catch (Throwable throwable) {
+            throw new GpuMemoryException("BF16 embedding invocation failed", throwable);
+        }
+        if (status != 0) throw new GpuMemoryException("CUDA BF16 embedding", status);
     }
 
     @Override
