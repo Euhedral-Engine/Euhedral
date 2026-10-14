@@ -191,7 +191,10 @@ public final class ModelTraining {
                     teacherLogProbs,
                     length);
             int training = sequences - settings.holdout();
-            log(String.format(Locale.ROOT, "held-out KL %.6f before training", student.evaluate(training, sequences)));
+            double best = student.evaluate(training, sequences);
+            log(String.format(Locale.ROOT, "held-out KL %.6f before training", best));
+            // The output keeps the state of the best held-out KL measured so far, the starting state included.
+            save();
             int step = 0;
             for (int epoch = 1; epoch <= settings.epochs(); epoch++) {
                 double total = 0;
@@ -213,15 +216,23 @@ public final class ModelTraining {
                     if (step % 10 == 0)
                         log(String.format(Locale.ROOT, "step %d: training KL %.6f (last 10)", step, total / 10));
                     if (step % 10 == 0) total = 0;
-                    if (settings.evaluateEvery() > 0 && step % settings.evaluateEvery() == 0)
-                        log(String.format(
-                                Locale.ROOT, "step %d: held-out KL %.6f", step, student.evaluate(training, sequences)));
+                    if (settings.evaluateEvery() > 0 && step % settings.evaluateEvery() == 0) {
+                        double kl = student.evaluate(training, sequences);
+                        log(String.format(Locale.ROOT, "step %d: held-out KL %.6f", step, kl));
+                        if (kl < best) {
+                            best = kl;
+                            save();
+                        }
+                    }
                 }
                 if (step % settings.accumulate() != 0)
                     student.apply(step % settings.accumulate(), step / settings.accumulate() + 1);
-                log(String.format(
-                        Locale.ROOT, "epoch %d: held-out KL %.6f", epoch, student.evaluate(training, sequences)));
-                save();
+                double kl = student.evaluate(training, sequences);
+                log(String.format(Locale.ROOT, "epoch %d: held-out KL %.6f", epoch, kl));
+                if (kl < best) {
+                    best = kl;
+                    save();
+                }
             }
             for (long address : new long[] {
                 head,
@@ -749,7 +760,8 @@ public final class ModelTraining {
 
     // ---- output ----
 
-    /// Writes every layer's objects with their trained scales (float16) and its norms, as `train-blocks` does.
+    /// Writes every layer's objects with their trained scales (float16) and its norms, as `train-blocks` does: the
+    /// state of the best held-out KL so far.
     private void save() throws IOException {
         Files.createDirectories(settings.out().resolve("norms"));
         for (HostLayer layer : model) {
@@ -786,7 +798,7 @@ public final class ModelTraining {
                 }
             }
         }
-        log("saved the trained scales and norms in " + settings.out());
+        log("saved the scales and norms of the best held-out KL so far in " + settings.out());
     }
 
     /// Completes `out` with the objects it lacks (the heads, the MTP layer) and writes the overlay checkpoint.
