@@ -8,6 +8,7 @@ import io.euhedral_execution.core.control_plane.ControlPlaneShard;
 import io.euhedral_execution.core.generics.AbstractExecutor;
 import io.euhedral_execution.core.impl.BaseCloneableObject;
 import io.euhedral_execution.core.impl.DefaultExecutor;
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
@@ -516,8 +517,10 @@ public final class InferenceEngine implements AutoCloseable {
             return new CudaGpuMemory(path);
         }
 
-        /// Loads the artifact's executed objects, keeping in host memory only as many weights as a context
-        /// of `maxContextTokens`, its attention caches in `kvFormat`, needs to fit in the free device memory.
+        /// Loads the artifact's executed objects, its attention caches in `kvFormat`, moving off the
+        /// device only as many weights as a context of `maxContextTokens` needs to fit in its free
+        /// memory: into pinned host memory up to the host budget ([HostBudget],
+        /// `euhedral.residency.host-budget-bytes` in tests), the rest read from the artifact on use.
         Qwen38Model loadModel(
                 Path path,
                 Artifact artifact,
@@ -535,21 +538,34 @@ public final class InferenceEngine implements AutoCloseable {
             long free = Math.min(
                     memoryInfo(gpu).freeBytes(),
                     Long.getLong("euhedral.residency.device-budget-bytes", Long.MAX_VALUE));
-            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, Long.MAX_VALUE, kvFormat);
+            // Pinned memory for host-backed weights and the disk window: the host budget, which tests state.
+            HostBudget budget = HostBudget.system();
+            long host = Long.getLong(
+                    "euhedral.residency.host-budget-bytes", Math.min(budget.pinnableBytes(), budget.residentBytes()));
+            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat);
+            if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
+                throw new IOException("the weights the GPU cannot hold need "
+                        + ((plan.hostArenaBytes() + plan.windowBytes()) >> 20) + " MiB of host memory (the token "
+                        + "embedding, the host-backed weights and the disk window), more than the " + (host >> 20)
+                        + " MiB host budget; set " + HostBudget.ENVIRONMENT + " higher or a smaller max context");
             if (!plan.fits())
                 throw new IOException("a context of " + maxContextTokens + " tokens does not fit in the "
                         + (free >> 20) + " MiB free on this GPU, even with the weights in host memory; set a "
                         + "smaller max context");
-            long hostBytes = 0;
+            long diskBytes = 0;
             for (var tensor : artifact.tensors())
-                if (plan.hostBacked().contains(tensor.name())) hostBytes += tensor.byteSize();
+                if (plan.diskBacked().contains(tensor.name())) diskBytes += tensor.byteSize();
             LOG.info(
-                    "Context {} tokens: {} MiB of the {} MiB free on the GPU, {} MiB of weights in host memory",
+                    "Context {} tokens: {} MiB of the {} MiB free on the GPU, {} MiB of weights in host memory, {} MiB"
+                            + " read from the artifact through a {} MiB window (host budget {} MiB)",
                     maxContextTokens,
                     plan.deviceBytes() >> 20,
                     free >> 20,
-                    hostBytes >> 20);
-            return Qwen38Model.load(path, artifact, gpu, profile.speculation(), plan.hostBacked());
+                    plan.hostArenaBytes() >> 20,
+                    diskBytes >> 20,
+                    plan.windowBytes() >> 20,
+                    host >> 20);
+            return Qwen38Model.load(path, artifact, gpu, profile.speculation(), plan.hostBacked(), plan.diskBacked());
         }
 
         /// Fragment defaults with fixed idle timing: an idle worker parks for the default 15 us. The adaptive
