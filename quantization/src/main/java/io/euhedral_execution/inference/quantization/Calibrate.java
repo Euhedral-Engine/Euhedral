@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
+import io.euhedral_execution.inference.quantization.checkpoint.ResumeFile;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import io.euhedral_execution.inference.quantization.gptq.QuantState;
@@ -29,6 +30,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -63,7 +65,6 @@ public final class Calibrate {
 
     private static final int HEAD_ROWS = 16384;
     private static final int CHECKPOINT_EVERY = 8;
-    private static final long CHECKPOINT_SLICE = 1L << 30;
     /// Objects of a layer rounded at once, each on its own stream (largest first): three fit a 16 GB card
     /// beside the layer and its Hessians.
     private static final int ROUNDING_FRAMES = 3;
@@ -678,47 +679,33 @@ public final class Calibrate {
                 + settings.actOrder() + "|" + settings.damp();
     }
 
+    /// Overwrites the checkpoint file in place: the header names the run and the layers done once the states
+    /// are written.
     private void saveCheckpoint(MemorySegment states, int layersDone, int sequences, int length) throws IOException {
-        Path partial = settings.out().resolve("hidden.bin.partial");
-        try (FileChannel channel = FileChannel.open(
-                partial, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-            // A ByteBuffer covers at most 2 GiB: write the states a slice at a time.
-            for (long at = 0; at < states.byteSize(); at += CHECKPOINT_SLICE) {
-                ByteBuffer buffer = states.asSlice(at, Math.min(CHECKPOINT_SLICE, states.byteSize() - at))
-                        .asByteBuffer();
-                while (buffer.hasRemaining()) channel.write(buffer);
-            }
+        try (ResumeFile file = new ResumeFile(checkpointFile())) {
+            file.header(new Properties());
+            file.write(ResumeFile.HEADER, states);
+            Properties header = new Properties();
+            header.setProperty("key", checkpointKey(sequences, length));
+            header.setProperty("layers", Integer.toString(layersDone));
+            file.header(header);
         }
-        Files.move(partial, checkpointFile(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        Files.writeString(settings.out().resolve("hidden.key"), checkpointKey(sequences, length) + "|" + layersDone);
         log("checkpoint after layer " + (layersDone - 1));
     }
 
     private int resume(MemorySegment states, int sequences, int length) throws IOException {
-        Path key = settings.out().resolve("hidden.key");
-        if (!Files.isRegularFile(key) || !Files.isRegularFile(checkpointFile())) return 0;
-        String saved = Files.readString(key);
-        String prefix = checkpointKey(sequences, length) + "|";
-        if (!saved.startsWith(prefix)) return 0;
-        int layersDone = Integer.parseInt(saved.substring(prefix.length()).trim());
-        try (FileChannel channel = FileChannel.open(checkpointFile(), StandardOpenOption.READ)) {
-            long position = 0;
-            for (long at = 0; at < states.byteSize(); at += CHECKPOINT_SLICE) {
-                ByteBuffer buffer = states.asSlice(at, Math.min(CHECKPOINT_SLICE, states.byteSize() - at))
-                        .asByteBuffer();
-                while (buffer.hasRemaining()) {
-                    int read = channel.read(buffer, position);
-                    if (read < 0) return 0;
-                    position += read;
-                }
-            }
+        if (!Files.isRegularFile(checkpointFile())) return 0;
+        try (ResumeFile file = new ResumeFile(checkpointFile())) {
+            Properties header = file.header();
+            if (!checkpointKey(sequences, length).equals(header.getProperty("key"))) return 0;
+            int layersDone = Integer.parseInt(header.getProperty("layers"));
+            file.read(ResumeFile.HEADER, states);
+            log("resumed after layer " + (layersDone - 1));
+            return layersDone;
         }
-        log("resumed after layer " + (layersDone - 1));
-        return layersDone;
     }
 
     private void dropCheckpoint() throws IOException {
         Files.deleteIfExists(checkpointFile());
-        Files.deleteIfExists(settings.out().resolve("hidden.key"));
     }
 }
