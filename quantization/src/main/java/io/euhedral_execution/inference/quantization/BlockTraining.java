@@ -432,9 +432,10 @@ public final class BlockTraining {
             QuantState state = entry.getValue();
             var parameter = trainable.linears.get(entry.getKey().substring(layer.prefix.length())).scales;
             float[] scales = download(parameter.values, parameter.count);
-            MemorySegment half = MemorySegment.ofArray(new short[scales.length]);
+            // A byte array: the state's writer takes no other heap segment.
+            MemorySegment half = MemorySegment.ofArray(new byte[2 * scales.length]);
             for (int i = 0; i < scales.length; i++)
-                half.setAtIndex(ValueLayout.JAVA_SHORT, i, Float.floatToFloat16(scales[i]));
+                half.setAtIndex(ValueLayout.JAVA_SHORT_UNALIGNED, i, Float.floatToFloat16(scales[i]));
             new QuantState(
                             state.formatName(),
                             state.layout(),
