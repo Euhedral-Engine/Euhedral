@@ -13,6 +13,8 @@ import java.util.Map;
 /// calibrate --model CHECKPOINT --quantization nvfp4|q3 [--compressed] --tokens TOKENS.npy --draft-ids-from ARTIFACT
 ///           --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
 ///           [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
+/// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --train-layers 10,11 [--sequences 96]
+///              [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
 ///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
@@ -25,7 +27,7 @@ public final class QuantizationMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0
-                || !(args[0].equals("calibrate") || args[0].equals("score") || args[0].equals("generate"))) {
+                || !List.of("calibrate", "score", "generate", "train-blocks").contains(args[0])) {
             System.err.println("usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] --tokens T.npy "
                     + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                     + "[--layers N] [--skip-mtp] [--library PATH]");
@@ -51,6 +53,25 @@ public final class QuantizationMain {
         String library = options.getOrDefault(
                 "library",
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
+        if (args[0].equals("train-blocks")) {
+            java.util.Set<Integer> layers = new java.util.TreeSet<>();
+            for (String layer : required(options, "train-layers").split(","))
+                layers.add(Integer.parseInt(layer.trim()));
+            BlockTraining.run(
+                    new BlockTraining.Settings(
+                            Path.of(required(options, "model")),
+                            Path.of(required(options, "codes")),
+                            Path.of(required(options, "tokens")),
+                            layers,
+                            Integer.parseInt(options.getOrDefault("sequences", "96")),
+                            Integer.parseInt(options.getOrDefault("holdout", "16")),
+                            Integer.parseInt(options.getOrDefault("epochs", "2")),
+                            Float.parseFloat(options.getOrDefault("scale-lr", "1e-5")),
+                            Float.parseFloat(options.getOrDefault("norm-lr", "1e-4")),
+                            Integer.parseInt(options.getOrDefault("batch", "4"))),
+                    Path.of(library));
+            return;
+        }
         if (args[0].equals("generate")) {
             if (prompts.isEmpty()) throw new IllegalArgumentException("--prompts is required");
             io.euhedral_execution.inference.quantization.mtp.Generate.run(

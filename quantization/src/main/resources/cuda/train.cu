@@ -49,6 +49,13 @@ extern "C" __global__ void bf16_to_float(const unsigned short* in, long long cou
     if (i < count) out[i] = __uint_as_float((unsigned int)in[i] << 16);
 }
 
+extern "C" __global__ void float_to_bf16_rounded(const float* in, long long count, unsigned short* out) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    unsigned int bits = __float_as_uint(in[i]);
+    out[i] = (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
 // y = a * x + b * y.
 extern "C" __global__ void axpby(const float* x, float* y, long long count, float a, float b) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
