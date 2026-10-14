@@ -1044,9 +1044,10 @@ extern "C" __global__ void hessian_product(float* a, const float* h, int k, floa
 
 /// Solution of the input-side system, kept where finite and positive and 1 elsewhere (all 1 when the factorization
 /// failed).
-extern "C" __global__ void clean_row_scales(float* r, const int* info, int k) {
+extern "C" __global__ void clean_row_scales(float* r, const int* info, int k, int* failures) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= k) return;
+    if (i == 0 && info[0] != 0) atomicAdd(failures, 1);
     const float v = r[i];
     r[i] = info[0] == 0 && isfinite(v) && v > 0.f ? v : 1.f;
 }
