@@ -20,7 +20,6 @@ import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -29,10 +28,9 @@ import org.junit.jupiter.api.Timeout;
 
 /// Measurement tool, not a regression test (skipped unless `euhedral.quality.report` names an output
 /// file): teacher-forced decode of the benchmark corpus document, recording every step's BF16 logits
-/// row. With `euhedral.quality.tokens` naming a llama.cpp reference logits file, every chunk of that file
-/// is forced instead, each on a fresh sequence, into `REPORT-chunkNNN.bin` (docs/QUALITY.md). Artifacts compare by
-/// their per-token negative log-likelihood of the document (paired, on the
-/// same tokens) and by the KL divergence between their logits rows (tools in docs/NVFP4_COMPRESSED.md).
+/// row. Artifacts compare by their per-token negative log-likelihood of the document (paired, on the
+/// same tokens) and by the KL divergence between their logits rows (tools/compare_teacher_forced.py,
+/// docs/NVFP4_COMPRESSED.md). Scoring against a BF16 reference is the quantization module's `score` command.
 ///
 /// Report format, little endian: int32 steps, int32 vocabulary, then per step the int32 forced next
 /// token and the logits row as `vocabulary` BF16 values.
@@ -49,28 +47,14 @@ class TeacherForcedQualityCudaIntegrationTest {
         long hostBytes = Long.getLong("euhedral.quality.host-mib", 0L) << 20;
         // Forced tokens per verification (1: one-row decode); the row-exact multi-row kernels take up to 8.
         int rows = Integer.getInteger("euhedral.quality.rows", 8);
-        String tokenFile = System.getProperty("euhedral.quality.tokens", "");
-        List<int[]> chunks;
-        int prefix;
-        int steps;
-        if (tokenFile.isBlank()) {
-            prefix = Integer.getInteger("euhedral.quality.prefix", 512);
-            steps = Integer.getInteger("euhedral.quality.steps", 2048);
-            QwenTokenizer tokenizer = QwenTokenizer.load(
-                    Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
-            int[] document = tokenizer.encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
-                    .resolve("benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/"
-                            + "chat-corpus-v1-document.md")));
-            if (document.length < prefix + steps + 1) throw new IllegalStateException("document too short");
-            chunks = List.of(document);
-        } else {
-            // A llama.cpp reference (`llama-perplexity --kl-divergence-base`) scores the second half of each
-            // chunk; each chunk here forces the same tokens: prefix N / 2 + 1, then N / 2 - 1 steps.
-            ReferenceChunks reference = ReferenceChunks.read(Path.of(tokenFile));
-            prefix = reference.context() / 2 + 1;
-            steps = reference.context() - prefix;
-            chunks = reference.chunks();
-        }
+        int prefix = Integer.getInteger("euhedral.quality.prefix", 512);
+        int steps = Integer.getInteger("euhedral.quality.steps", 2048);
+        QwenTokenizer tokenizer = QwenTokenizer.load(
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
+        int[] document = tokenizer.encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
+                .resolve("benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/"
+                        + "chat-corpus-v1-document.md")));
+        if (document.length < prefix + steps + 1) throw new IllegalStateException("document too short");
         var data = ArtifactReader.read(artifact);
         try (CudaGpuMemory gpu = new CudaGpuMemory(library);
                 Qwen38Model model = Qwen38Model.load(
@@ -84,31 +68,24 @@ class TeacherForcedQualityCudaIntegrationTest {
             var runtime = new Execution(lattice, plan, gpu);
             int vocabulary = model.weights().config().vocabSize();
             try {
-                for (int chunk = 0; chunk < chunks.size(); chunk++) {
-                    Path out = tokenFile.isBlank()
-                            ? Path.of(report)
-                            : Path.of(String.format(Locale.ROOT, "%s-chunk%03d.bin", report, chunk));
-                    double nll = record(
-                            runtime,
-                            gpu,
-                            plan,
-                            new Sequence(chunk + 1),
-                            chunks.get(chunk),
-                            prefix,
-                            steps,
-                            vocabulary,
-                            rows,
-                            out);
-                    System.out.printf(
-                            Locale.ROOT,
-                            "quality %s chunk %d/%d: %d forced tokens after %d, mean NLL %.5f nats%n",
-                            artifact.getFileName(),
-                            chunk + 1,
-                            chunks.size(),
-                            steps,
-                            prefix,
-                            nll);
-                }
+                double nll = record(
+                        runtime,
+                        gpu,
+                        plan,
+                        new Sequence(1),
+                        document,
+                        prefix,
+                        steps,
+                        vocabulary,
+                        rows,
+                        Path.of(report));
+                System.out.printf(
+                        Locale.ROOT,
+                        "quality %s: %d forced tokens after %d, mean NLL %.5f nats%n",
+                        artifact.getFileName(),
+                        steps,
+                        prefix,
+                        nll);
             } finally {
                 runtime.close();
             }
@@ -180,31 +157,6 @@ class TeacherForcedQualityCudaIntegrationTest {
             return nll / steps;
         } finally {
             sequence.complete();
-        }
-    }
-
-    /// The chunks of a llama.cpp logits file: "_logits_", int32 context, vocabulary and chunk count, then
-    /// context * chunks int32 tokens (little endian).
-    private record ReferenceChunks(int context, List<int[]> chunks) {
-        static ReferenceChunks read(Path path) throws java.io.IOException {
-            try (var channel = java.nio.channels.FileChannel.open(path)) {
-                var header = java.nio.ByteBuffer.allocate(20).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                channel.read(header, 0);
-                if (!new String(header.array(), 0, 8, java.nio.charset.StandardCharsets.US_ASCII).equals("_logits_"))
-                    throw new IllegalArgumentException(path + " is not a llama.cpp logits file");
-                int context = header.getInt(8);
-                int count = header.getInt(16);
-                var tokens = java.nio.ByteBuffer.allocate(4 * context * count).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                channel.read(tokens, 20);
-                tokens.flip();
-                List<int[]> chunks = new java.util.ArrayList<>();
-                for (int chunk = 0; chunk < count; chunk++) {
-                    int[] values = new int[context];
-                    tokens.asIntBuffer().position(chunk * context).get(values);
-                    chunks.add(values);
-                }
-                return new ReferenceChunks(context, chunks);
-            }
         }
     }
 
