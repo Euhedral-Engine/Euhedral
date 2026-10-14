@@ -1,6 +1,7 @@
 #pragma once
-// KV cache append: BF16 K/V rows into NVFP4 cache pages.
+// KV cache append: BF16 K/V rows into NVFP4 or BF16 cache pages.
 #include "nvfp4_kv.cuh"
+#include "bf16_kv.cuh"
 #include "reductions.cuh"
 #include "common/pdl.cuh"
 
@@ -26,4 +27,24 @@ extern "C" __global__ __launch_bounds__(128) void euhedral_attention_kv_append_n
     __shared__ float scratch[4][256];
     nvfp4kv::quantize_row(queryKey + source, key, key + 128, scratch[warp], lane);
     nvfp4kv::quantize_row(gateValue + source, value, value + 128, scratch[warp], lane);
+}
+
+// KV cache append into BF16 pages: each warp copies one head row of K and of V as computed, 16 bytes per lane.
+extern "C" __global__ __launch_bounds__(128) void euhedral_attention_kv_append_bf16(
+        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
+        unsigned char* const* keyPages, unsigned char* const* valuePages,
+        unsigned int rows, unsigned int queryWidth, unsigned int keyValueWidth,
+        const unsigned long long* startPosition) {
+    euhedral_pdl_begin();
+    const unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const unsigned int heads = keyValueWidth / 256;
+    const unsigned int rowHead = blockIdx.x * 4 + warp;
+    if (rowHead >= rows * heads) return;
+    const unsigned int row = rowHead / heads, head = rowHead % heads;
+    const unsigned long long position = *startPosition + row;
+    const unsigned long long source = (unsigned long long)row * (queryWidth + keyValueWidth)
+            + queryWidth + head * 256;
+    const unsigned int offset = ((position % 256) * heads + head) * bf16kv::kRowBytes;
+    reinterpret_cast<uint4*>(keyPages[position / 256] + offset)[lane] = reinterpret_cast<const uint4*>(queryKey + source)[lane];
+    reinterpret_cast<uint4*>(valuePages[position / 256] + offset)[lane] = reinterpret_cast<const uint4*>(gateValue + source)[lane];
 }

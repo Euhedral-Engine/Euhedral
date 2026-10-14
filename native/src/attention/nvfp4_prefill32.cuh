@@ -1,5 +1,6 @@
 #pragma once
 #include "nvfp4_kv.cuh"
+#include "nvfp4_attention.cuh"
 #include <mma.h>
 
 namespace nvfp4kv {
@@ -29,13 +30,23 @@ __device__ __forceinline__ void stage_tokens32(__half* kv, const unsigned char* 
 }
 }  // namespace nvfp4kv
 
+// The 32-token tile of either cache format as FP16 rows of 256.
+static __device__ __forceinline__ void stage_tokens32(Nvfp4Kv, __half* kv, const unsigned char* const* pages,
+        unsigned int base, unsigned int last, unsigned int head, unsigned int heads) {
+    nvfp4kv::stage_tokens32(kv, pages, base, last, head, heads);
+}
+static __device__ __forceinline__ void stage_tokens32(Bf16Kv, __half* kv, const unsigned char* const* pages,
+        unsigned int base, unsigned int last, unsigned int head, unsigned int heads) {
+    bf16kv::stage_tokens32(kv, 256, pages, base, last, head, heads);
+}
+
 // 32 query rows x 32 keys; K and V share the same staging storage. Accumulation
 // and online softmax are FP32; rotated Q and probabilities are FP16 MMA operands.
 // KV expansion into FP16 is exact. No quadratic score buffer is materialized.
 // EXACT keeps one thread per query row for the softmax statistics, summing each row's 32
 // probabilities in key order; otherwise four threads share a row and combine partial sums.
-template<bool EXACT>
-static __device__ __forceinline__ void attention_prefill32_nvfp4(
+template<class Kv, bool EXACT>
+static __device__ __forceinline__ void attention_prefill32(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
         const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
@@ -54,7 +65,7 @@ static __device__ __forceinline__ void attention_prefill32_nvfp4(
 #pragma unroll
         for (int d = 0; d < 8; d++) values[d] = first + r < rows
                 ? __bfloat162float(queryKey[(unsigned long long)(first + r) * width + head * 256 + lane + d * 32]) : 0;
-        nvfp4kv::hadamard256(values, lane);
+        Kv::rotate(values, lane);
 #pragma unroll
         for (int d = 0; d < 8; d++) q[r * 256 + lane + d * 32] = __float2half_rn(values[d]);
         if (lane == 0) { maximum[r] = -__int_as_float(0x7f800000); denominator[r] = 0; }
@@ -65,7 +76,7 @@ static __device__ __forceinline__ void attention_prefill32_nvfp4(
     __syncthreads();
     const unsigned int last = min(cacheLength, (unsigned int)(start + min(first + 32, rows)));
     for (unsigned int base = 0; base < last; base += 32) {
-        nvfp4kv::stage_tokens32(kv, keyPages, base, last, kh, keyHeads);
+        stage_tokens32(Kv{}, kv, keyPages, base, last, kh, keyHeads);
         __syncthreads();
         {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> score;
@@ -140,7 +151,7 @@ static __device__ __forceinline__ void attention_prefill32_nvfp4(
             wmma::load_matrix_sync(out[f], tile, 16, wmma::mem_row_major);
             __syncwarp();
         }
-        nvfp4kv::stage_tokens32(kv, valuePages, base, last, kh, keyHeads);
+        stage_tokens32(Kv{}, kv, valuePages, base, last, kh, keyHeads);
         __syncthreads();
 #pragma unroll
         for (int f = 0; f < 8; f++) {
@@ -170,7 +181,7 @@ static __device__ __forceinline__ void attention_prefill32_nvfp4(
             float values[8];
 #pragma unroll
             for (int d = 0; d < 8; d++) values[d] = accum[r * 256 + lane + d * 32] / denominator[group * 16 + r];
-            nvfp4kv::hadamard256(values, lane);
+            Kv::rotate(values, lane);
 #pragma unroll
             for (int d = 0; d < 8; d++) {
                 const unsigned int col = head * 256 + lane + d * 32;
@@ -183,19 +194,16 @@ static __device__ __forceinline__ void attention_prefill32_nvfp4(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128) void euhedral_attention_prefill32_nvfp4(
-        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
-        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
-        unsigned int headDim, unsigned int cacheLength, unsigned long long start) {
-    attention_prefill32_nvfp4<false>(queryKey, gateValue, keyPages, valuePages, output, rows, queryHeads,
-            keyHeads, cacheLength, start);
-}
-extern "C" __global__ __launch_bounds__(128) void euhedral_attention_prefill32_nvfp4_exact(
-        const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
-        const unsigned char* const* keyPages, const unsigned char* const* valuePages,
-        __nv_bfloat16* output, unsigned int rows, unsigned int queryHeads, unsigned int keyHeads,
-        unsigned int headDim, unsigned int cacheLength, unsigned long long start) {
-    attention_prefill32_nvfp4<true>(queryKey, gateValue, keyPages, valuePages, output, rows, queryHeads,
-            keyHeads, cacheLength, start);
-}
+#define EUHEDRAL_ATTENTION_PREFILL32(name, Kv, EXACT)                                                         \
+    extern "C" __global__ __launch_bounds__(128) void name(const __nv_bfloat16* queryKey,                          \
+            const __nv_bfloat16* gateValue, const unsigned char* const* keyPages,                                  \
+            const unsigned char* const* valuePages, __nv_bfloat16* output, unsigned int rows,                      \
+            unsigned int queryHeads, unsigned int keyHeads, unsigned int headDim, unsigned int cacheLength,        \
+            unsigned long long start) {                                                                            \
+        attention_prefill32<Kv, EXACT>(queryKey, gateValue, keyPages, valuePages, output, rows, queryHeads,        \
+                keyHeads, cacheLength, start);                                                                     \
+    }
+EUHEDRAL_ATTENTION_PREFILL32(euhedral_attention_prefill32_nvfp4, Nvfp4Kv, false)
+EUHEDRAL_ATTENTION_PREFILL32(euhedral_attention_prefill32_nvfp4_exact, Nvfp4Kv, true)
+EUHEDRAL_ATTENTION_PREFILL32(euhedral_attention_prefill32_bf16, Bf16Kv, false)
+EUHEDRAL_ATTENTION_PREFILL32(euhedral_attention_prefill32_bf16_exact, Bf16Kv, true)

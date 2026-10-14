@@ -53,16 +53,129 @@ static __device__ __forceinline__ void stage(__half* kv, const unsigned char* co
 }
 }  // namespace fa2
 
+namespace fa2 {
+// The producer warps of the kernel below (thread `pt` of 32 kProducerWarps): K and V tiles of 32 tokens expanded to
+// FP16 rows in the slot each tile's full barrier hands over, after the consumers released it.
+static __device__ __forceinline__ void produce(Nvfp4Kv, __half* kv, const unsigned* pairs, unsigned long long* mbarriers,
+        const unsigned char* const* keyPages, const unsigned char* const* valuePages, unsigned kh, unsigned keyHeads,
+        unsigned last, unsigned tiles, unsigned pt) {
+    using namespace nvfp4pipe;
+    constexpr unsigned kThreads = kProducerWarps * 32, kPerThread = KT * nvfp4kv::kGroups / kThreads;
+    uint2 codes[2][kPerThread];
+    unsigned scales[2][kPerThread];
+    auto load = [&](unsigned base) {
+#pragma unroll
+        for (unsigned i = 0; i < kPerThread; i++) {
+            const unsigned group_index = pt + kThreads * i, token = base + group_index / nvfp4kv::kGroups;
+            const unsigned slot = group_index % nvfp4kv::kGroups;
+            const bool valid = token < last;
+            const unsigned char* row = nvfp4kv::cache_row(keyPages, valid ? token : base, kh, keyHeads);
+            const unsigned char* value = nvfp4kv::cache_row(valuePages, valid ? token : base, kh, keyHeads);
+            const uint2 kc = *reinterpret_cast<const uint2*>(row + slot * 8), vc = *reinterpret_cast<const uint2*>(value + slot * 8);
+            codes[0][i] = valid ? kc : make_uint2(0, 0);
+            codes[1][i] = valid ? vc : make_uint2(0, 0);
+            scales[0][i] = valid ? row[nvfp4kv::kCodeBytes + slot] : 0u;
+            scales[1][i] = valid ? value[nvfp4kv::kCodeBytes + slot] : 0u;
+        }
+    };
+    if (tiles > 0) load(0);
+    for (unsigned tile = 0; tile < tiles; tile++) {
+        const unsigned base = tile * KT, slot = tile & 1u;
+        uint2 next_codes[2][kPerThread];
+        unsigned next_scales[2][kPerThread];
+        if (tile + 1 < tiles) {
+            // Fetch the next tile while this one is expanded.
+#pragma unroll
+            for (unsigned i = 0; i < kPerThread; i++) {
+                const unsigned group_index = pt + kThreads * i, token = base + KT + group_index / nvfp4kv::kGroups;
+                const unsigned slot_index = group_index % nvfp4kv::kGroups;
+                const bool valid = token < last;
+                const unsigned char* row = nvfp4kv::cache_row(keyPages, valid ? token : base, kh, keyHeads);
+                const unsigned char* value = nvfp4kv::cache_row(valuePages, valid ? token : base, kh, keyHeads);
+                const uint2 kc = *reinterpret_cast<const uint2*>(row + slot_index * 8), vc = *reinterpret_cast<const uint2*>(value + slot_index * 8);
+                next_codes[0][i] = valid ? kc : make_uint2(0, 0);
+                next_codes[1][i] = valid ? vc : make_uint2(0, 0);
+                next_scales[0][i] = valid ? row[nvfp4kv::kCodeBytes + slot_index] : 0u;
+                next_scales[1][i] = valid ? value[nvfp4kv::kCodeBytes + slot_index] : 0u;
+            }
+        }
+        if (tile >= 2) mbarrier_wait(&mbarriers[2 + slot], ((tile >> 1) - 1) & 1u);
+#pragma unroll
+        for (unsigned plane = 0; plane < 2; plane++) {
+            __half* destination_plane = kv + (slot * 2 + plane) * KT * STRIDE;
+#pragma unroll
+            for (unsigned i = 0; i < kPerThread; i++) {
+                const unsigned group_index = pt + kThreads * i, token = group_index / nvfp4kv::kGroups, slot_index = group_index % nvfp4kv::kGroups;
+                const unsigned scale = scale_pair(scales[plane][i]);
+                const unsigned words[2] = {codes[plane][i].x, codes[plane][i].y};
+                unsigned out[8];
+#pragma unroll
+                for (int h = 0; h < 2; h++)
+#pragma unroll
+                    for (int b = 0; b < 4; b++) out[h * 4 + b] = half2_multiply(pairs[(words[h] >> (8 * b)) & 0xFFu], scale);
+                uint4* destination = reinterpret_cast<uint4*>(destination_plane + token * STRIDE + slot_index * 16);
+                destination[0] = make_uint4(out[0], out[1], out[2], out[3]);
+                destination[1] = make_uint4(out[4], out[5], out[6], out[7]);
+            }
+        }
+        mbarrier_arrive(&mbarriers[slot]);
+        if (tile + 1 < tiles) {
+#pragma unroll
+            for (unsigned plane = 0; plane < 2; plane++)
+#pragma unroll
+                for (unsigned i = 0; i < kPerThread; i++) { codes[plane][i] = next_codes[plane][i]; scales[plane][i] = next_scales[plane][i]; }
+        }
+    }
+}
+
+// BF16 rows: each thread widens eight 16-value groups per plane, loaded once the slot is free (the rows of both planes
+// of a tile do not fit beside the consumers' registers twice).
+static __device__ __forceinline__ void produce(Bf16Kv, __half* kv, const unsigned*, unsigned long long* mbarriers,
+        const unsigned char* const* keyPages, const unsigned char* const* valuePages, unsigned kh, unsigned keyHeads,
+        unsigned last, unsigned tiles, unsigned pt) {
+    using namespace nvfp4pipe;
+    constexpr unsigned kThreads = kProducerWarps * 32, kPerThread = KT * 16 / kThreads;
+    for (unsigned tile = 0; tile < tiles; tile++) {
+        const unsigned base = tile * KT, slot = tile & 1u;
+        if (tile >= 2) mbarrier_wait(&mbarriers[2 + slot], ((tile >> 1) - 1) & 1u);
+#pragma unroll
+        for (unsigned plane = 0; plane < 2; plane++) {
+            const unsigned char* const* pages = plane == 0 ? keyPages : valuePages;
+            uint4 words[kPerThread][2];
+#pragma unroll
+            for (unsigned i = 0; i < kPerThread; i++) {
+                const unsigned group_index = pt + kThreads * i, token = base + group_index / 16u;
+                const bool valid = token < last;
+                const uint4* row = reinterpret_cast<const uint4*>(bf16kv::cache_row(pages, valid ? token : base, kh, keyHeads))
+                        + (group_index % 16u) * 2;
+                words[i][0] = valid ? row[0] : make_uint4(0, 0, 0, 0);
+                words[i][1] = valid ? row[1] : make_uint4(0, 0, 0, 0);
+            }
+            __half* destination_plane = kv + (slot * 2 + plane) * KT * STRIDE;
+#pragma unroll
+            for (unsigned i = 0; i < kPerThread; i++) {
+                const unsigned group_index = pt + kThreads * i;
+                uint4* destination = reinterpret_cast<uint4*>(destination_plane + (group_index / 16u) * STRIDE + (group_index % 16u) * 16);
+                destination[0] = bf16kv::widen8(words[i][0]);
+                destination[1] = bf16kv::widen8(words[i][1]);
+            }
+        }
+        mbarrier_arrive(&mbarriers[slot]);
+    }
+}
+}  // namespace fa2
+
 // The rewrite: query-head warps compute, two more warps (the producers) expand the K and V tiles ahead of them into a
 // double buffer, handed over by mbarriers, so the tile expansion no longer stalls the MMAs and the per-tile CTA
 // barriers are gone. Every value is computed by the same operations in the same order as in the single-role kernel
 // (reference_prefill_fa2.cuh), so the output is bit for bit identical. Query-head groups up to 6 (8 warps); the
 // double buffer is dynamic shared memory (fa2::kSharedBytes).
-extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_fa2_nvfp4(
+template <class Kv>
+static __device__ __forceinline__ void attention_prefill_fa2(
         const __nv_bfloat16* queryKey, const __nv_bfloat16* gateValue,
         const unsigned char* const* keyPages, const unsigned char* const* valuePages,
         __nv_bfloat16* output, unsigned rows, unsigned queryHeads, unsigned keyHeads,
-        unsigned headDim, unsigned cacheLength, unsigned long long start) {
+        unsigned cacheLength, unsigned long long start) {
     using namespace fa2;
     using namespace nvfp4pipe;
     extern __shared__ __align__(16) __half kv[];  // [slot][K, V][KT][STRIDE]
@@ -90,7 +203,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
                 float values[8];
                 for (int d = 0; d < 8; d++) values[d] = first + r < rows
                         ? __bfloat162float(queryKey[(unsigned long long)(first + r) * width + head * D + lane + d * 32]) : 0.0f;
-                nvfp4kv::hadamard256(values, lane);
+                Kv::rotate(values, lane);
                 for (int d = 0; d < 8; d++) q[r * STRIDE + lane + d * 32] = __float2half_rn(values[d]);
             }
             __syncwarp();
@@ -102,73 +215,8 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
     const unsigned last = min(cacheLength, (unsigned)(start + min(first + 16, rows)));
     const unsigned tiles = (last + KT - 1) / KT;
     if (producer) {
-        const unsigned pt = threadIdx.x - group * 32;  // 0 .. 32 kProducerWarps - 1
-        constexpr unsigned kThreads = kProducerWarps * 32, kPerThread = KT * nvfp4kv::kGroups / kThreads;
-        uint2 codes[2][kPerThread];
-        unsigned scales[2][kPerThread];
-        auto load = [&](unsigned base) {
-#pragma unroll
-            for (unsigned i = 0; i < kPerThread; i++) {
-                const unsigned group_index = pt + kThreads * i, token = base + group_index / nvfp4kv::kGroups;
-                const unsigned slot = group_index % nvfp4kv::kGroups;
-                const bool valid = token < last;
-                const unsigned char* row = nvfp4kv::cache_row(keyPages, valid ? token : base, kh, keyHeads);
-                const unsigned char* value = nvfp4kv::cache_row(valuePages, valid ? token : base, kh, keyHeads);
-                const uint2 kc = *reinterpret_cast<const uint2*>(row + slot * 8), vc = *reinterpret_cast<const uint2*>(value + slot * 8);
-                codes[0][i] = valid ? kc : make_uint2(0, 0);
-                codes[1][i] = valid ? vc : make_uint2(0, 0);
-                scales[0][i] = valid ? row[nvfp4kv::kCodeBytes + slot] : 0u;
-                scales[1][i] = valid ? value[nvfp4kv::kCodeBytes + slot] : 0u;
-            }
-        };
-        if (tiles > 0) load(0);
-        for (unsigned tile = 0; tile < tiles; tile++) {
-            const unsigned base = tile * KT, slot = tile & 1u;
-            uint2 next_codes[2][kPerThread];
-            unsigned next_scales[2][kPerThread];
-            if (tile + 1 < tiles) {
-                // Fetch the next tile while this one is expanded.
-#pragma unroll
-                for (unsigned i = 0; i < kPerThread; i++) {
-                    const unsigned group_index = pt + kThreads * i, token = base + KT + group_index / nvfp4kv::kGroups;
-                    const unsigned slot_index = group_index % nvfp4kv::kGroups;
-                    const bool valid = token < last;
-                    const unsigned char* row = nvfp4kv::cache_row(keyPages, valid ? token : base, kh, keyHeads);
-                    const unsigned char* value = nvfp4kv::cache_row(valuePages, valid ? token : base, kh, keyHeads);
-                    const uint2 kc = *reinterpret_cast<const uint2*>(row + slot_index * 8), vc = *reinterpret_cast<const uint2*>(value + slot_index * 8);
-                    next_codes[0][i] = valid ? kc : make_uint2(0, 0);
-                    next_codes[1][i] = valid ? vc : make_uint2(0, 0);
-                    next_scales[0][i] = valid ? row[nvfp4kv::kCodeBytes + slot_index] : 0u;
-                    next_scales[1][i] = valid ? value[nvfp4kv::kCodeBytes + slot_index] : 0u;
-                }
-            }
-            if (tile >= 2) mbarrier_wait(&mbarriers[2 + slot], ((tile >> 1) - 1) & 1u);
-#pragma unroll
-            for (unsigned plane = 0; plane < 2; plane++) {
-                __half* destination_plane = kv + (slot * 2 + plane) * KT * STRIDE;
-#pragma unroll
-                for (unsigned i = 0; i < kPerThread; i++) {
-                    const unsigned group_index = pt + kThreads * i, token = group_index / nvfp4kv::kGroups, slot_index = group_index % nvfp4kv::kGroups;
-                    const unsigned scale = scale_pair(scales[plane][i]);
-                    const unsigned words[2] = {codes[plane][i].x, codes[plane][i].y};
-                    unsigned out[8];
-#pragma unroll
-                    for (int h = 0; h < 2; h++)
-#pragma unroll
-                        for (int b = 0; b < 4; b++) out[h * 4 + b] = half2_multiply(pairs[(words[h] >> (8 * b)) & 0xFFu], scale);
-                    uint4* destination = reinterpret_cast<uint4*>(destination_plane + token * STRIDE + slot_index * 16);
-                    destination[0] = make_uint4(out[0], out[1], out[2], out[3]);
-                    destination[1] = make_uint4(out[4], out[5], out[6], out[7]);
-                }
-            }
-            mbarrier_arrive(&mbarriers[slot]);
-            if (tile + 1 < tiles) {
-#pragma unroll
-                for (unsigned plane = 0; plane < 2; plane++)
-#pragma unroll
-                    for (unsigned i = 0; i < kPerThread; i++) { codes[plane][i] = next_codes[plane][i]; scales[plane][i] = next_scales[plane][i]; }
-            }
-        }
+        fa2::produce(Kv{}, kv, pairs, mbarriers, keyPages, valuePages, kh, keyHeads, last, tiles,
+                threadIdx.x - group * 32);
         return;
     }
     float o[32][4];
@@ -251,7 +299,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
                 const unsigned row = first + r;
                 float values[8];
                 for (int d = 0; d < 8; d++) values[d] = buf[r * D + lane + d * 32];
-                nvfp4kv::hadamard256(values, lane);
+                Kv::rotate(values, lane);
                 if (row < rows) {
                     for (int d = 0; d < 8; d++) {
                         const unsigned col = head * D + lane + d * 32;
@@ -264,3 +312,13 @@ extern "C" __global__ __launch_bounds__(256, 1) void euhedral_attention_prefill_
         asm volatile("bar.sync 1, %0;" ::"r"(compute_threads) : "memory");
     }
 }
+#define EUHEDRAL_ATTENTION_PREFILL_FA2(name, Kv)                                                               \
+    extern "C" __global__ __launch_bounds__(256, 1) void name(const __nv_bfloat16* queryKey,                       \
+            const __nv_bfloat16* gateValue, const unsigned char* const* keyPages,                                  \
+            const unsigned char* const* valuePages, __nv_bfloat16* output, unsigned rows, unsigned queryHeads,     \
+            unsigned keyHeads, unsigned headDim, unsigned cacheLength, unsigned long long start) {                 \
+        attention_prefill_fa2<Kv>(queryKey, gateValue, keyPages, valuePages, output, rows, queryHeads, keyHeads,   \
+                cacheLength, start);                                                                               \
+    }
+EUHEDRAL_ATTENTION_PREFILL_FA2(euhedral_attention_prefill_fa2_nvfp4, Nvfp4Kv)
+EUHEDRAL_ATTENTION_PREFILL_FA2(euhedral_attention_prefill_fa2_bf16, Bf16Kv)

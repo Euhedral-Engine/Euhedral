@@ -71,7 +71,8 @@ The exported C API (`include/euhedral_cuda.h`) falls into these groups:
   (`nvfp4_native_available`, `linear_nvfp4_native_bf16`, `nvfp4_native_gate_up_swiglu_bf16`, `nvfp4_native_scratch_bytes`) and
   `linear_q3_reference_bf16`;
 - GDN: `gdn_control_fp32`, `gdn_project_control_fp32`, `gdn_convolution_bf16`, `gdn_recurrence_bf16`, `gdn_gated_rms_norm_bf16`;
-- attention: `attention_kv_append_nvfp4`, `attention_qk_norm_rope_bf16`, `attention_causal_nvfp4`;
+- attention: `attention_kv_append_nvfp4`, `attention_kv_append_bf16`, `attention_qk_norm_rope_bf16`,
+  `attention_causal_nvfp4`, `attention_causal_bf16`;
 - sampling: `argmax_bf16`;
 - Flash-Next: `qwen4_kernel_count`, `qwen4_kernel_name`, `qwen4_launch`.
 
