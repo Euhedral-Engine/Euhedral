@@ -186,6 +186,31 @@ public final class Stages {
             return context.workspace().positionAddress(chunk(context));
         }
 
+        /// One sequence's rows of this stage: its sequence, first position and its device address, row count and
+        /// first row in the quantum's rows.
+        protected record Part(Sequence sequence, long position, long positionAddress, int rows, int rowOffset) {}
+
+        /// This stage's rows by sequence: the stage's chunk of the quantum's sequence, or each segment of a batched
+        /// quantum.
+        protected final Part[] parts(Quantum context) {
+            if (!context.batched())
+                return new Part[] {
+                    new Part(context.sequenceState(), position(context), positionAddress(context), rows(context), 0)
+                };
+            Quantum.Segment[] segments = context.segments();
+            Part[] parts = new Part[segments.length];
+            for (int index = 0; index < parts.length; index++) {
+                Quantum.Segment segment = segments[index];
+                parts[index] = new Part(
+                        segment.sequence(),
+                        segment.startPosition(),
+                        context.workspace().positionAddress(index),
+                        segment.rows(),
+                        segment.rowOffset());
+            }
+            return parts;
+        }
+
         /// The logits rows this stage produces: its chunk's, only in the last chunk.
         protected final int logitsRows(Quantum context) {
             return chunk(context).logitsRows(context.logitsRequirement());
@@ -200,7 +225,11 @@ public final class Stages {
         }
 
         protected static GdnState sequenceState(Quantum context, ExecutionPlan.Instruction instruction) {
-            Object state = context.sequenceState().recurrentState();
+            return sequenceState(context.sequenceState(), instruction);
+        }
+
+        protected static GdnState sequenceState(Sequence sequence, ExecutionPlan.Instruction instruction) {
+            Object state = sequence.recurrentState();
             if (state instanceof GdnStates states) {
                 return states.forLayer(instruction.layerIndex());
             }
@@ -211,7 +240,11 @@ public final class Stages {
         }
 
         protected static AttentionKvState attentionState(Quantum context, ExecutionPlan.Instruction instruction) {
-            Object state = context.sequenceState().kvCacheState();
+            return attentionState(context.sequenceState(), instruction);
+        }
+
+        protected static AttentionKvState attentionState(Sequence sequence, ExecutionPlan.Instruction instruction) {
+            Object state = sequence.kvCacheState();
             if (!(state instanceof AttentionStates states)) {
                 throw new IllegalStateException("sequence is missing its persistent attention KV state");
             }
@@ -548,11 +581,12 @@ public final class Stages {
 
     /// The GDN convolution over the sequence's persistent convolution state. A verification checkpoints the state
     /// and its input rows first; a previous verification that committed only part of its rows leaves a replay this
-    /// stage runs before its own rows.
+    /// stage runs before its own rows. A batched quantum runs each sequence's rows over its own state.
     public static final class GdnConvolution extends Stage {
 
-        /// The GDN state a verification checkpointed in this stage; its commit sets the replay.
-        private GdnState pendingSpeculativeState;
+        /// The GDN states a verification checkpointed in this stage (one per sequence); its commit sets the replay.
+        private GdnState[] pendingSpeculativeStates;
+        private int[] pendingSpeculativeRows;
 
         GdnConvolution(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, stage, instruction, gpu);
@@ -560,14 +594,27 @@ public final class Stages {
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
+            Part[] parts = parts(context);
+            if (context.kind() == Quantum.ExecutionKind.VERIFY) {
+                this.pendingSpeculativeStates = new GdnState[parts.length];
+                this.pendingSpeculativeRows = new int[parts.length];
+            }
+            for (int index = 0; index < parts.length; index++) perform(context, instruction, parts[index], index);
+        }
+
+        private void perform(Quantum context, ExecutionPlan.Instruction instruction, Part part, int index) {
             Qwen38Config config = context.plan().weights().config();
             int queryKeyWidth = 2 * config.linearNumKeyHeads() * config.linearKeyHeadDim();
             int valueWidth = config.linearNumValueHeads() * config.linearValueHeadDim();
-            GdnState state = sequenceState(context, instruction);
+            long queryKey = input(context, instruction, 0) + (long) part.rowOffset() * queryKeyWidth * Short.BYTES;
+            long valueZ = input(context, instruction, 1) + (long) part.rowOffset() * 2 * valueWidth * Short.BYTES;
+            long output =
+                    output(context, instruction, 0) + (long) part.rowOffset() * instruction.outputWidth() * Short.BYTES;
+            GdnState state = sequenceState(part.sequence(), instruction);
             // A previous verification committed only part of its rows: rebuild this layer's state first.
             if (state.pendingReplayRows() > 0) replay(context, instruction, state);
             if (context.kind() == Quantum.ExecutionKind.VERIFY) {
-                int rows = rows(context);
+                int rows = part.rows();
                 var speculative = state.speculative(
                         rows,
                         queryKeyWidth,
@@ -580,22 +627,18 @@ public final class Stages {
                                 state.convolutionStateAddress(),
                                 state.convolutionBytes());
                 gpu().copyDeviceToDevice(
-                                speculative.queryKeyRows(),
-                                input(context, instruction, 0),
-                                (long) rows * queryKeyWidth * Short.BYTES);
-                gpu().copyDeviceToDevice(
-                                speculative.valueZRows(),
-                                input(context, instruction, 1),
-                                (long) rows * 2 * valueWidth * Short.BYTES);
-                this.pendingSpeculativeState = state;
+                                speculative.queryKeyRows(), queryKey, (long) rows * queryKeyWidth * Short.BYTES);
+                gpu().copyDeviceToDevice(speculative.valueZRows(), valueZ, (long) rows * 2 * valueWidth * Short.BYTES);
+                this.pendingSpeculativeStates[index] = state;
+                this.pendingSpeculativeRows[index] = rows;
             }
             gpu().gdnConvolutionBf16(
-                            input(context, instruction, 0),
-                            input(context, instruction, 1),
+                            queryKey,
+                            valueZ,
                             instruction.weightAddress(0),
-                            sequenceState(context, instruction).convolutionStateAddress(),
-                            output(context, instruction, 0),
-                            rows(context),
+                            state.convolutionStateAddress(),
+                            output,
+                            part.rows(),
                             queryKeyWidth,
                             valueWidth,
                             instruction.outputWidth(),
@@ -650,23 +693,29 @@ public final class Stages {
             state.setPendingReplayRows(0);
         }
 
-        /// A verification whose GDN state ran past its committed rows leaves a replay for the next quantum.
+        /// A verification whose GDN state ran past its committed rows leaves a replay for the next quantum. A batched
+        /// quantum commits every row.
         @Override
         protected void commit() {
-            GdnState speculative = this.pendingSpeculativeState;
-            if (speculative != null) {
-                int committed = context().committedRowCount();
-                speculative.setPendingReplayRows(committed < rows(context()) ? committed : 0);
+            GdnState[] speculative = this.pendingSpeculativeStates;
+            if (speculative == null) return;
+            int committed = context().committedRowCount();
+            for (int index = 0; index < speculative.length; index++) {
+                int rows = this.pendingSpeculativeRows[index];
+                if (speculative[index] != null)
+                    speculative[index].setPendingReplayRows(context().batched() || committed >= rows ? 0 : committed);
             }
         }
 
         @Override
         protected void releaseTemporary(Quantum context) {
-            this.pendingSpeculativeState = null;
+            this.pendingSpeculativeStates = null;
+            this.pendingSpeculativeRows = null;
         }
     }
 
-    /// The GDN recurrence over the sequence's persistent recurrent state; a verification checkpoints it first.
+    /// The GDN recurrence over the sequence's persistent recurrent state; a verification checkpoints it first. A
+    /// batched quantum runs each sequence's rows over its own state.
     public static final class GdnRecurrence extends Stage {
 
         GdnRecurrence(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
@@ -675,26 +724,38 @@ public final class Stages {
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
+            for (Part part : parts(context)) perform(context, instruction, part);
+        }
+
+        private void perform(Quantum context, ExecutionPlan.Instruction instruction, Part part) {
             Qwen38Config config = context.plan().weights().config();
             float outputScale = (float) (1.0 / Math.sqrt(config.linearKeyHeadDim()));
+            int queryKeyWidth = 2 * config.linearNumKeyHeads() * config.linearKeyHeadDim();
+            int valueWidth = config.linearNumValueHeads() * config.linearValueHeadDim();
+            long convolved = input(context, instruction, 0)
+                    + (long) part.rowOffset() * (queryKeyWidth + valueWidth) * Short.BYTES;
+            long controlOffset = (long) part.rowOffset() * config.linearNumValueHeads() * Float.BYTES;
+            long alpha = input(context, instruction, 1) + controlOffset;
+            long beta = input(context, instruction, 2) + controlOffset;
+            long output = output(context, instruction, 0) + (long) part.rowOffset() * valueWidth * Short.BYTES;
+            GdnState state = sequenceState(part.sequence(), instruction);
             if (context.kind() == Quantum.ExecutionKind.VERIFY) {
-                GdnState state = sequenceState(context, instruction);
                 var speculative = state.speculative();
-                long rowBytes = (long) rows(context) * config.linearNumValueHeads() * Float.BYTES;
+                long rowBytes = (long) part.rows() * config.linearNumValueHeads() * Float.BYTES;
                 gpu().copyDeviceToDevice(
                                 speculative.recurrentCheckpoint(),
                                 state.recurrentStateAddress(),
                                 state.recurrentBytes());
-                gpu().copyDeviceToDevice(speculative.alphaRows(), input(context, instruction, 1), rowBytes);
-                gpu().copyDeviceToDevice(speculative.betaRows(), input(context, instruction, 2), rowBytes);
+                gpu().copyDeviceToDevice(speculative.alphaRows(), alpha, rowBytes);
+                gpu().copyDeviceToDevice(speculative.betaRows(), beta, rowBytes);
             }
             gpu().gdnRecurrenceBf16(
-                            input(context, instruction, 0),
-                            input(context, instruction, 1),
-                            input(context, instruction, 2),
-                            sequenceState(context, instruction).recurrentStateAddress(),
-                            output(context, instruction, 0),
-                            rows(context),
+                            convolved,
+                            alpha,
+                            beta,
+                            state.recurrentStateAddress(),
+                            output,
+                            part.rows(),
                             config.linearNumKeyHeads(),
                             config.linearNumValueHeads(),
                             config.linearKeyHeadDim(),
@@ -725,7 +786,7 @@ public final class Stages {
         }
     }
 
-    /// The attention Q/K RMSNorm and RoPE.
+    /// The attention Q/K RMSNorm and RoPE, at each sequence's positions.
     public static final class QkNormRope extends Stage {
 
         QkNormRope(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
@@ -736,29 +797,35 @@ public final class Stages {
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             Qwen38Config config = context.plan().weights().config();
             int rotaryDim = (int) Math.round(config.attentionHeadDim() * config.partialRotaryFactor());
-            gpu().attentionQkNormRopeBf16(
-                            input(context, instruction, 0),
-                            instruction.weightAddress(0),
-                            instruction.weightAddress(1),
-                            output(context, instruction, 0),
-                            rows(context),
-                            config.numAttentionHeads(),
-                            config.numKeyValueHeads(),
-                            config.attentionHeadDim(),
-                            rotaryDim,
-                            position(context),
-                            positionAddress(context),
-                            (float) config.rmsNormEpsilon(),
-                            config.ropeTheta());
+            long rowBytes = (long) (config.numAttentionHeads() + config.numKeyValueHeads())
+                    * config.attentionHeadDim()
+                    * Short.BYTES;
+            for (Part part : parts(context)) {
+                gpu().attentionQkNormRopeBf16(
+                                input(context, instruction, 0) + part.rowOffset() * rowBytes,
+                                instruction.weightAddress(0),
+                                instruction.weightAddress(1),
+                                output(context, instruction, 0) + part.rowOffset() * rowBytes,
+                                part.rows(),
+                                config.numAttentionHeads(),
+                                config.numKeyValueHeads(),
+                                config.attentionHeadDim(),
+                                rotaryDim,
+                                part.position(),
+                                part.positionAddress(),
+                                (float) config.rmsNormEpsilon(),
+                                config.ropeTheta());
+            }
         }
     }
 
-    /// Appends the quantum's keys and values to the sequence's KV cache. The rows are submitted at once and
-    /// published (committed) only when the quantum's device work retired; an uncommitted append never
-    /// becomes visible.
+    /// Appends the quantum's keys and values to the sequence's KV cache (each sequence's rows to its own). The rows
+    /// are submitted at once and published (committed) only when the quantum's device work retired; an uncommitted
+    /// append never becomes visible.
     public static final class KvAppend extends Stage {
 
-        private AttentionKvState pendingAppendState;
+        private AttentionKvState[] pendingAppendStates;
+        private int[] pendingAppendRows;
 
         KvAppend(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, stage, instruction, gpu);
@@ -769,21 +836,29 @@ public final class Stages {
             Qwen38Config config = context.plan().weights().config();
             int queryWidth = config.numAttentionHeads() * config.attentionHeadDim();
             int keyValueWidth = config.numKeyValueHeads() * config.attentionHeadDim();
-            AttentionKvState state = attentionState(context, instruction);
-            // Retirement settles the reservation, including staging a failed launch leaves queued.
-            this.pendingAppendState = state;
-            state.prepareAppend(position(context), rows(context));
-            gpu().attentionKvAppendNvfp4(
-                            input(context, instruction, 0),
-                            input(context, instruction, 1),
-                            state.keyCacheAddress(),
-                            state.valueCacheAddress(),
-                            rows(context),
-                            queryWidth,
-                            keyValueWidth,
-                            position(context),
-                            positionAddress(context));
-            state.appendSubmitted(rows(context));
+            long rowBytes = (long) (queryWidth + keyValueWidth) * Short.BYTES;
+            Part[] parts = parts(context);
+            this.pendingAppendStates = new AttentionKvState[parts.length];
+            this.pendingAppendRows = new int[parts.length];
+            for (int index = 0; index < parts.length; index++) {
+                Part part = parts[index];
+                AttentionKvState state = attentionState(part.sequence(), instruction);
+                // Retirement settles the reservation, including staging a failed launch leaves queued.
+                this.pendingAppendStates[index] = state;
+                this.pendingAppendRows[index] = part.rows();
+                state.prepareAppend(part.position(), part.rows());
+                gpu().attentionKvAppendNvfp4(
+                                input(context, instruction, 0) + part.rowOffset() * rowBytes,
+                                input(context, instruction, 1) + part.rowOffset() * rowBytes,
+                                state.keyCacheAddress(),
+                                state.valueCacheAddress(),
+                                part.rows(),
+                                queryWidth,
+                                keyValueWidth,
+                                part.position(),
+                                part.positionAddress());
+                state.appendSubmitted(part.rows());
+            }
         }
 
         /// Publishes the appended rows once the quantum's device work has retired: a prompt's rows all at once, by
@@ -791,25 +866,34 @@ public final class Stages {
         @Override
         protected void commit() {
             Quantum context = context();
-            if (this.pendingAppendState == null || !chunk(context).last()) return;
+            if (this.pendingAppendStates == null || !chunk(context).last()) return;
+            if (context.batched()) {
+                for (int index = 0; index < this.pendingAppendStates.length; index++)
+                    this.pendingAppendStates[index].commitAppended(this.pendingAppendRows[index]);
+                return;
+            }
+            AttentionKvState state = this.pendingAppendStates[0];
             int committed = context.committedRowCount();
             // Every row the quantum appended: a later quantum's rows stay submitted. Fewer (a verification's
             // accepted prefix): the rest are dropped, and no later quantum is in flight behind a verification.
-            if (committed == context.inputTokenCount()) this.pendingAppendState.commitAppended(committed);
-            else this.pendingAppendState.commitSubmitted(committed);
+            if (committed == context.inputTokenCount()) state.commitAppended(committed);
+            else state.commitSubmitted(committed);
         }
 
         @Override
         protected void releaseTemporary(Quantum context) {
-            AttentionKvState state = this.pendingAppendState;
-            this.pendingAppendState = null;
+            AttentionKvState[] states = this.pendingAppendStates;
+            this.pendingAppendStates = null;
+            this.pendingAppendRows = null;
             // An uncommitted append never becomes visible; a committed one was published by the commit, and a later
             // quantum's submitted rows must stay.
-            if (state != null && !this.retirementCommitted) state.discardSubmitted();
+            if (states != null && !this.retirementCommitted)
+                for (AttentionKvState state : states) if (state != null) state.discardSubmitted();
         }
     }
 
-    /// Causal attention over the sequence's KV cache, including the rows this quantum appended.
+    /// Causal attention over the sequence's KV cache, including the rows this quantum appended; each sequence's rows
+    /// over its own cache.
     public static final class CausalAttention extends Stage {
 
         CausalAttention(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
@@ -819,28 +903,33 @@ public final class Stages {
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             Qwen38Config config = context.plan().weights().config();
-            AttentionKvState state = attentionState(context, instruction);
-            gpu().attentionCausalNvfp4(
-                            input(context, instruction, 0),
-                            input(context, instruction, 1),
-                            state.keyCacheAddress(),
-                            state.valueCacheAddress(),
-                            output(context, instruction, 0),
-                            rows(context),
-                            config.numAttentionHeads(),
-                            config.numKeyValueHeads(),
-                            config.attentionHeadDim(),
-                            // The append stage submitted these rows earlier on this quantum's stream; they are
-                            // readable here but not committed until the quantum retires.
-                            Math.toIntExact(position(context) + rows(context)),
-                            position(context),
-                            positionAddress(context),
-                            rows(context) == 1
-                                            || context.kind() == Quantum.ExecutionKind.VERIFY
-                                            || draftRowTwins(context)
-                                    ? ((AttentionStates) context.sequenceState().kvCacheState())
-                                            .decodeScratch(config.numAttentionHeads(), rows(context))
-                                    : 0);
+            int queryWidth = config.numAttentionHeads() * config.attentionHeadDim();
+            int keyValueWidth = config.numKeyValueHeads() * config.attentionHeadDim();
+            long inputRowBytes = (long) (queryWidth + keyValueWidth) * Short.BYTES;
+            for (Part part : parts(context)) {
+                AttentionKvState state = attentionState(part.sequence(), instruction);
+                gpu().attentionCausalNvfp4(
+                                input(context, instruction, 0) + part.rowOffset() * inputRowBytes,
+                                input(context, instruction, 1) + part.rowOffset() * inputRowBytes,
+                                state.keyCacheAddress(),
+                                state.valueCacheAddress(),
+                                output(context, instruction, 0) + (long) part.rowOffset() * queryWidth * Short.BYTES,
+                                part.rows(),
+                                config.numAttentionHeads(),
+                                config.numKeyValueHeads(),
+                                config.attentionHeadDim(),
+                                // The append stage submitted these rows earlier on this quantum's stream; they are
+                                // readable here but not committed until the quantum retires.
+                                Math.toIntExact(part.position() + part.rows()),
+                                part.position(),
+                                part.positionAddress(),
+                                part.rows() == 1
+                                                || context.kind() == Quantum.ExecutionKind.VERIFY
+                                                || draftRowTwins(context)
+                                        ? ((AttentionStates) part.sequence().kvCacheState())
+                                                .decodeScratch(config.numAttentionHeads(), part.rows())
+                                        : 0);
+            }
         }
 
         /// Small draft quanta (MTP catch-up, at most 8 rows) bring decode scratch, so their attention runs on

@@ -339,6 +339,11 @@ public final class Workspace implements AutoCloseable {
         return positionAddress() + (long) chunk.index() * Long.BYTES;
     }
 
+    /// The device address of a batched quantum's segment `index`'s start position in the input record.
+    public long positionAddress(int index) {
+        return positionAddress() + (long) index * Long.BYTES;
+    }
+
     /// Fills `record` (at least [#inputByteSize] bytes) with the input record for `tokenIds` at `startPosition`.
     public void writeInput(MemorySegment record, int[] tokenIds, long startPosition) {
         writeInput(record, tokenIds, new long[] {startPosition});

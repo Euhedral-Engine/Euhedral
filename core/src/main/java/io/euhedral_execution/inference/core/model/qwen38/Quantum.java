@@ -96,6 +96,10 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private DFlash2Proposal proposal;
     /// The quantum's rows in chunks: a prompt's chunks, or one chunk of all its rows.
     private final Chunk[] chunks;
+    /// A batched quantum's sequences and their rows ([#batch]); null for a quantum of one sequence.
+    private final Segment[] segments;
+    /// A batched quantum's place in each segment's sequence order.
+    private SegmentWork[] segmentWorks;
     /// A prompt's prefix checkpoints, and for each chunk the checkpoint copied after it (-1: none).
     private PromptCheckpoints checkpoints;
     private int[] checkpointOf;
@@ -108,6 +112,19 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             return this.last ? requirement.outputRows(this.rows) : 0;
         }
     }
+
+    /// One sequence's rows in a batched quantum: `tokenIds` from `startPosition`.
+    public record Part(Sequence sequence, long startPosition, int[] tokenIds) {
+        public Part {
+            Objects.requireNonNull(sequence, "sequence");
+            Objects.requireNonNull(tokenIds, "tokenIds");
+            if (startPosition < 0 || tokenIds.length == 0) throw new IllegalArgumentException("invalid token range");
+        }
+    }
+
+    /// Segment `index` of a batched quantum: `rows` rows of `sequence` from `startPosition`, at row `rowOffset` of
+    /// the quantum's rows and position slot `index` of its input record.
+    public record Segment(int index, Sequence sequence, long startPosition, int rows, int rowOffset) {}
 
     public Quantum(ExecutionPlan plan, Sequence sequence, ExecutionKind kind, long startPosition, int[] tokenIds) {
         this(plan, sequence, kind, startPosition, tokenIds, LogitsRequirement.ALL_TOKENS);
@@ -156,6 +173,51 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         this.startPosition = startPosition;
         this.tokenIds = tokenIds.clone();
         this.chunks = new Chunk[] {new Chunk(0, startPosition, tokenIds.length, 0, true)};
+        this.segments = null;
+    }
+
+    /// A quantum of several sequences' rows (decode or verification), run as one graph: every linear reads its
+    /// weights once for all of them, and each row is computed as in a quantum of its own sequence (bit for bit, for
+    /// verification). Each sequence must have nothing else in flight when the quantum is admitted; it commits all
+    /// its rows. Logits are every row's ([LogitsRequirement#ALL_TOKENS], in part order) or none; it is never
+    /// captured.
+    public static Quantum batch(
+            ExecutionPlan plan, ExecutionKind kind, java.util.List<Part> parts, LogitsRequirement logits) {
+        return new Quantum(plan, kind, parts, logits);
+    }
+
+    private Quantum(ExecutionPlan plan, ExecutionKind kind, java.util.List<Part> parts, LogitsRequirement logits) {
+        this.plan = Objects.requireNonNull(plan, "plan");
+        this.kind = Objects.requireNonNull(kind, "kind");
+        if (kind != ExecutionKind.DECODE && kind != ExecutionKind.VERIFY)
+            throw new IllegalArgumentException("only decode and verification quanta are batched");
+        if (parts.isEmpty()) throw new IllegalArgumentException("a batched quantum needs a part");
+        if (plan.draftsWithDFlash2())
+            throw new IllegalArgumentException("a plan with a DFlash2 drafter taps each sequence's rows; not batched");
+        this.logitsRequirement = Objects.requireNonNull(logits, "logits");
+        if (logits == LogitsRequirement.LAST_TOKEN)
+            throw new IllegalArgumentException("a batched quantum produces every row's logits or none");
+        this.hostLogits = null;
+        this.segments = new Segment[parts.size()];
+        int rows = 0;
+        for (int index = 0; index < parts.size(); index++) {
+            Part part = parts.get(index);
+            for (int other = 0; other < index; other++)
+                if (parts.get(other).sequence() == part.sequence())
+                    throw new IllegalArgumentException("a batched quantum takes each sequence once");
+            this.segments[index] =
+                    new Segment(index, part.sequence(), part.startPosition(), part.tokenIds().length, rows);
+            rows += part.tokenIds().length;
+        }
+        this.tokenIds = new int[rows];
+        for (Part part : parts) {
+            Segment segment = this.segments[parts.indexOf(part)];
+            System.arraycopy(part.tokenIds(), 0, this.tokenIds, segment.rowOffset(), segment.rows());
+        }
+        this.shape = plan.forExecution(kind, rows);
+        this.sequence = this.segments[0].sequence();
+        this.startPosition = this.segments[0].startPosition();
+        this.chunks = new Chunk[] {new Chunk(0, this.startPosition, rows, 0, true)};
     }
 
     /// A prompt quantum: `tokens` from `startPosition` in chunks of `chunkRows` rows (the remainder last), run as one
@@ -210,6 +272,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             int rows = Math.min(chunkRows, tokens.length - offset);
             this.chunks[index] = new Chunk(index, startPosition + offset, rows, offset, index == count - 1);
         }
+        this.segments = null;
     }
 
     /// Takes `checkpoints` inside the prompt graph: after each chunk that ends at a checkpoint the cache reserved,
@@ -267,8 +330,20 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return this.shape;
     }
 
+    /// The sequence of the quantum; a batched quantum's first.
     public Sequence sequenceState() {
         return this.sequence;
+    }
+
+    /// Whether the quantum runs several sequences' rows ([#batch]).
+    public boolean batched() {
+        return this.segments != null;
+    }
+
+    /// A batched quantum's segments, in row order.
+    public Segment[] segments() {
+        if (this.segments == null) throw new IllegalStateException("the quantum is not batched");
+        return this.segments;
     }
 
     public int inputTokenCount() {
@@ -407,12 +482,13 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
 
     @Override
     public void cancel() {
-        this.sequence.cancel();
+        if (this.segments == null) this.sequence.cancel();
+        else for (Segment segment : this.segments) segment.sequence().cancel();
     }
 
     /// Reports whether this quantum must stop admitting dependent instructions.
     public boolean hasFailureOrCancellation() {
-        return failure() != null || this.sequence.cancellationRequested();
+        return failure() != null || cancelRequested();
     }
 
     @Override
@@ -437,6 +513,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     @Override
     public Object captureKey() {
         if (this.kind == ExecutionKind.PREFILL || this.tokenIds.length > MAX_CAPTURED_ROWS) return null;
+        if (this.segments != null) return null;
         if (this.workspace == null || this.gpu == null || this.gpu.exactNumerics()) return null;
         // Its seed rows are found only when its stage runs.
         if (this.draftSeedRow >= 0) return null;
@@ -546,6 +623,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         Objects.requireNonNull(storage, "storage");
         this.terminalConsumer = terminalConsumer;
+        if (this.segments != null) return beginBatch(gpu, stream, storage, shared);
         if (this.sequence.cancellationRequested()) {
             // Cancelled before it began: it concludes without a stage.
             return false;
@@ -613,12 +691,98 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
     }
 
+    /// [#begin] of a batched quantum: admits each segment into its sequence's order, which must hold nothing else, and
+    /// binds a workspace for all its rows whose input record holds each segment's start position.
+    private boolean beginBatch(ExecutionGpu gpu, GpuStream stream, WorkspaceStorage storage, SharedWorkspace shared) {
+        if (cancelRequested()) return false;
+        this.segmentWorks = new SegmentWork[this.segments.length];
+        try {
+            if (shared != null && this.tokenIds.length > shared.maxRows())
+                throw new IllegalArgumentException("a quantum of " + this.tokenIds.length
+                        + " rows exceeds the workspace sized at load for " + shared.maxRows());
+            int vocabulary = this.plan.weights().config().vocabSize();
+            for (int index = 0; index < this.tokenIds.length; index++)
+                if (this.tokenIds[index] < 0 || this.tokenIds[index] >= vocabulary)
+                    throw new IllegalArgumentException("token ID outside vocabulary at index " + index);
+            for (Segment segment : this.segments)
+                if (segment.sequence().inFlight())
+                    throw new IllegalStateException("a batched quantum's sequences must have nothing else in flight");
+            for (Segment segment : this.segments) {
+                SegmentWork work = new SegmentWork(segment);
+                segment.sequence()
+                        .admit(work, segment.startPosition(), Math.addExact(segment.startPosition(), segment.rows()));
+                this.segmentWorks[segment.index()] = work;
+            }
+            this.admitted = true;
+            for (Segment segment : this.segments) attachSequenceState(this.shape, segment.sequence(), gpu);
+            this.workspace = shared == null
+                    ? new Workspace(storage, this.tokenIds.length, this.shape, this.logitsRequirement)
+                            .withInput(this.tokenIds.length, this.segments.length)
+                    : Workspace.bound(shared, storage, this.tokenIds.length, this.shape, this.logitsRequirement)
+                            .withInput(this.tokenIds.length, this.segments.length);
+            this.workspace.allocateBuffers();
+            uploadInput(gpu);
+            return true;
+        } catch (RuntimeException | Error error) {
+            if (stream != null) stream.recover(error);
+            fail(error);
+            return false;
+        }
+    }
+
+    /// A batched quantum's place in one segment's sequence order: ready once the quantum retired, it then commits the
+    /// segment's rows or abandons them, as the quantum's outcome says.
+    private final class SegmentWork implements Sequence.Work {
+        private final Segment segment;
+        private volatile boolean ready;
+        private Throwable failed;
+        private boolean commits;
+
+        SegmentWork(Segment segment) {
+            this.segment = segment;
+        }
+
+        @Override
+        public boolean ready() {
+            return this.ready;
+        }
+
+        @Override
+        public long admittedAt() {
+            return this.segment.startPosition();
+        }
+
+        @Override
+        public void concluded(Throwable blocked) {
+            Sequence sequence = this.segment.sequence();
+            if (this.failed != null) {
+                sequence.fail(this.failed);
+                sequence.abandon();
+            } else if (this.commits && blocked == null) {
+                sequence.commit(this.segment.startPosition() + this.segment.rows());
+            } else {
+                if (blocked != null) sequence.fail(blocked);
+                sequence.abandon();
+            }
+        }
+
+        /// Settles the segment's sequence with the quantum's outcome; its order holds nothing before it.
+        void settle(Throwable failed, boolean commits) {
+            this.failed = failed;
+            this.commits = commits;
+            this.ready = true;
+            this.segment.sequence().drain();
+        }
+    }
+
     /// Queues the input record (token IDs and start position) ahead of every stage of the quantum.
     private void uploadInput(ExecutionGpu gpu) {
         ExecutionGpu.UploadBuffer upload = gpu.allocateUploadBuffer(this.workspace.inputByteSize());
         this.inputUpload = upload;
-        long[] positions = new long[this.chunks.length];
-        for (int index = 0; index < positions.length; index++) positions[index] = this.chunks[index].startPosition();
+        long[] positions = new long[this.segments != null ? this.segments.length : this.chunks.length];
+        for (int index = 0; index < positions.length; index++)
+            positions[index] =
+                    this.segments != null ? this.segments[index].startPosition() : this.chunks[index].startPosition();
         this.workspace.writeInput(upload.segment(), this.tokenIds, positions);
         gpu.copyUploadToDevice(this.workspace.tokenIdsAddress(), upload);
     }
@@ -727,10 +891,21 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return this.sequence.owner();
     }
 
-    /// A quantum is cancelled through its sequence.
+    @Override
+    public SequenceOwner[] sequenceOwners() {
+        if (this.segments == null) return new SequenceOwner[] {this.sequence.owner()};
+        SequenceOwner[] owners = new SequenceOwner[this.segments.length];
+        for (int index = 0; index < owners.length; index++)
+            owners[index] = this.segments[index].sequence().owner();
+        return owners;
+    }
+
+    /// A quantum is cancelled through its sequence (any of a batched quantum's).
     @Override
     protected boolean cancelRequested() {
-        return this.sequence.cancellationRequested();
+        if (this.segments == null) return this.sequence.cancellationRequested();
+        for (Segment segment : this.segments) if (segment.sequence().cancellationRequested()) return true;
+        return false;
     }
 
     /// A quantum the sequence admitted concludes in the sequence's admission order: it marks itself ready and
@@ -738,7 +913,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// thread finds it ready at the head. Any other quantum concludes now.
     @Override
     public void concludeInOrder(Runnable conclusion) {
-        if (!this.admitted) {
+        // A batched quantum heads each of its sequences' orders: it concludes now and settles them in [#settle].
+        if (!this.admitted || this.segments != null) {
             conclusion.run();
             return;
         }
@@ -804,6 +980,10 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// row and the proposal become readable for a success, and the outcome is recorded for the continuation.
     @Override
     protected void settle() {
+        if (this.segments != null) {
+            settleBatch();
+            return;
+        }
         Throwable error = failure();
         Throwable failed = error;
         boolean cancelled = false;
@@ -853,6 +1033,42 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         if (this.hostLogits != null) this.hostLogits.retired(completed.status() == Status.SUCCESS);
         if (this.proposal != null) this.proposal.retired(completed.status() == Status.SUCCESS);
         if (completed.failure() != null) fail(completed.failure());
+        this.conclusion = completed;
+    }
+
+    /// [#settle] of a batched quantum: each segment's sequence commits its rows, or follows the failure or the
+    /// cancellation, in its own order (which the quantum heads).
+    private void settleBatch() {
+        Throwable error = failure();
+        Throwable failed = error;
+        boolean cancelled = false;
+        if (error instanceof CancellationException cancellation && cancelRequested()) {
+            Throwable[] suppressed = cancellation.getSuppressed();
+            if (suppressed.length == 0) {
+                cancelled = true;
+                failed = null;
+            } else failed = suppressed[0];
+        }
+        if (error != null) failed = releaseLogits(failed);
+        if (this.segmentWorks != null) {
+            for (SegmentWork work : this.segmentWorks) {
+                if (work == null) continue;
+                try {
+                    work.settle(failed, failed == null && !cancelled);
+                } catch (RuntimeException | Error settleFailure) {
+                    if (failed == null) failed = settleFailure;
+                    else if (failed != settleFailure) failed.addSuppressed(settleFailure);
+                }
+            }
+        }
+        this.admitted = false;
+        Outcome completed = failed != null
+                ? new Outcome(Status.FAILED, failed)
+                : cancelled ? new Outcome(Status.CANCELLED, null) : new Outcome(Status.SUCCESS, null);
+        if (completed.failure() != null) {
+            failed = releaseLogits(failed);
+            fail(completed.failure());
+        }
         this.conclusion = completed;
     }
 
