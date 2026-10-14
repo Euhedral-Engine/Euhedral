@@ -120,6 +120,43 @@ class FullModelExecutionPlanTest {
     }
 
     @Test
+    void everyBf16ObjectRunsAsARowExactBf16Projection() {
+        formatOverride = name -> name.equals("text/token_embedding") ? null : WeightFormat.BF16;
+        Weights weights;
+        try {
+            weights = fullModelWeights();
+        } finally {
+            formatOverride = name -> null;
+        }
+        ExecutionPlan plan = new ExecutionPlan(weights);
+        java.util.Map<ExecutionPlan.Kind, Long> kinds = plan.instructions().stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        ExecutionPlan.Instruction::kind, java.util.stream.Collectors.counting()));
+        assertEquals(null, kinds.get(ExecutionPlan.Kind.Q3_LINEAR));
+        assertEquals(null, kinds.get(ExecutionPlan.Kind.Q4_LINEAR));
+        assertEquals(null, kinds.get(ExecutionPlan.Kind.Q5_LINEAR));
+        assertEquals(ExecutionPlan.Kind.BF16_PROJECTION, kindOf(plan, "text/layers/0/mlp/gate_up"));
+        assertEquals(ExecutionPlan.Kind.BF16_PROJECTION, kindOf(plan, "text/output_head"));
+        // Prefill keeps the BF16 gate/up projection apart from its SwiGLU: the fused stage is grouped Q3's.
+        var prefill = plan.forExecution(ExecutionKind.PREFILL, 256);
+        assertTrue(prefill.instructions().stream().noneMatch(i -> i.kind() == ExecutionPlan.Kind.Q3_GATE_UP_SWIGLU));
+    }
+
+    @Test
+    void aBf16HeadOnAGroupedModelRunsInItsOwnFormat() {
+        formatOverride = name -> name.equals("text/output_head") ? WeightFormat.BF16 : null;
+        Weights weights;
+        try {
+            weights = fullModelWeights();
+        } finally {
+            formatOverride = name -> null;
+        }
+        ExecutionPlan plan = new ExecutionPlan(weights);
+        assertEquals(ExecutionPlan.Kind.BF16_PROJECTION, kindOf(plan, "text/output_head"));
+        assertEquals(ExecutionPlan.Kind.Q3_LINEAR, kindOf(plan, "text/layers/8/mlp/down"));
+    }
+
+    @Test
     void eachGroupedProjectionRunsTheKernelOfItsOwnFormat() {
         // Q4 value_z, Q4 mixer outputs, and Q4 down projections in the first and last eight layers.
         java.util.function.Function<String, WeightFormat> override = name -> name.endsWith("/gdn/value_z")
@@ -327,6 +364,15 @@ class FullModelExecutionPlanTest {
     private static TensorHandle quantized(String name, int rows, int columns, WeightFormat requested) {
         WeightFormat format = formatOverride.apply(name) != null ? formatOverride.apply(name) : requested;
         long[] shape = {rows, columns};
+        if (format == WeightFormat.BF16)
+            return new TensorHandle(
+                    name,
+                    shape,
+                    TensorDataType.BF16,
+                    format,
+                    WeightLayout.CONTIGUOUS_LE_V1,
+                    nextAddress++,
+                    2L * rows * columns);
         long bytes = CompactTensorLayout.expectedByteSize(
                 shape, TensorDataType.BF16, format, WeightLayout.ROW_SPLIT_K128_V1);
         if (diskBacked.test(name))

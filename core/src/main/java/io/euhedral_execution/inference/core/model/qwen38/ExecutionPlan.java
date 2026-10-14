@@ -34,6 +34,8 @@ public final class ExecutionPlan {
         Q3_LINEAR,
         Q4_LINEAR,
         Q5_LINEAR,
+        /// A BF16 projection (BF16 in and out) on the row-exact tensor-core kernels.
+        BF16_PROJECTION,
         BF16_LINEAR,
         GDN_CONTROL,
         GDN_CONVOLUTION,
@@ -59,7 +61,8 @@ public final class ExecutionPlan {
         /// Copies the target's hidden rows after one tapped layer into the sequence's DFlash2 tap rows (slot
         /// `outputBufferIndex`), in quanta that seed drafting; a no-op otherwise.
         DFLASH_TAP,
-        /// DFlash2 drafter operators (docs/DFLASH2.md). A linear with no input buffer reads the sequence's tap rows.
+        /// DFlash2 drafter operators (docs/DFLASH2.md). A linear with no input buffer reads the sequence's tap
+        /// rows.
         DFLASH_LINEAR,
         DFLASH_RMS_NORM,
         /// The dynamic convolution's prepare (`outputBufferIndex` 0) or finish (1) kernel.
@@ -246,7 +249,8 @@ public final class ExecutionPlan {
         }
     }
 
-    /// A view's instructions and buffers; `diskUses` are its disk transfers' reads, in the order of its transfers.
+    /// A view's instructions and buffers; `diskUses` are its disk transfers' reads, in the order of its
+    /// transfers.
     record PlanData(
             List<Instruction> instructions,
             List<Integer> projectionWidths,
@@ -276,8 +280,8 @@ public final class ExecutionPlan {
         }
     }
 
-    /// Prefill specializations derived from the full-model reference topology. `SMALL` covers decode and
-    /// quanta below the 64-row region tile; `REGIONS` fuses the FFN gate/up projection with SwiGLU.
+    /// Prefill specializations derived from the full-model reference topology. `SMALL` covers decode and quanta
+    /// below the 64-row region tile; `REGIONS` fuses the FFN gate/up projection with SwiGLU.
     private enum PrefillView {
         SMALL,
         REGIONS
@@ -295,11 +299,11 @@ public final class ExecutionPlan {
     // The views of a full model; null otherwise.
     private final Shape smallPrefill;
     private final Shape decode;
-    /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded by the
-    /// prefetch of a DFlash2 block (null when no weight is host-backed).
+    /// The decode view without the transfers of its first ring slots, for a quantum that finds them loaded by
+    /// the prefetch of a DFlash2 block (null when no weight is host-backed).
     private final Shape decodePreloaded;
-    /// The decode view's work for verifications of more than [#DECODE_MAX_ROWS] rows, and its preloaded variant: their
-    /// quantized linears take the expansion scratch, which a decode token's do not.
+    /// The decode view's work for verifications of more than [#DECODE_MAX_ROWS] rows, and its preloaded
+    /// variant: their quantized linears take the expansion scratch, which a decode token's do not.
     private final Shape verify;
     private final Shape verifyPreloaded;
     /// The staging slots a DFlash2 block's prefetch fills (0 without one).
@@ -309,7 +313,8 @@ public final class ExecutionPlan {
     private final Shape mtpDraft;
     /// The MTP draft's work for catch-ups of more than [#DECODE_MAX_ROWS] rows; null without the draft view.
     private final Shape mtpCatchUp;
-    /// The DFlash2 views, null without the loaded drafter: its block (DRAFT) and its context rows (DRAFT_CONTEXT).
+    /// The DFlash2 views, null without the loaded drafter: its block (DRAFT) and its context rows
+    /// (DRAFT_CONTEXT).
     private final Shape dflashBlock;
     private final Shape dflashContext;
 
@@ -320,16 +325,16 @@ public final class ExecutionPlan {
             Map.entry(Buffer.FFN_DELTA, Buffer.MIXER_DELTA),
             Map.entry(Buffer.SWIGLU, Buffer.VALUE_Z_PROJECTED));
 
-    /// Adds the ordering edges that a single device stream used to provide implicitly. For every
-    /// storage (aliased buffers count as one when `reuseStorage`), each reader is ordered after the
-    /// last writer, and each writer after the last writer and every reader since it. Edges the
-    /// dependencies already imply transitively are not added.
+    /// Adds the ordering edges that a single device stream used to provide implicitly. For every storage
+    /// (aliased buffers count as one when `reuseStorage`), each reader is ordered after the last writer, and
+    /// each writer after the last writer and every reader since it. Edges the dependencies already imply
+    /// transitively are not added.
     static int[][] withStorageHazards(List<Instruction> instructions, int[][] dependencies, boolean reuseStorage) {
         return withStorageHazards(instructions, dependencies, reuseStorage, new boolean[instructions.size()]);
     }
 
-    /// As above, with the expansion scratch as one more storage, which each of the `scratch` stages writes: they
-    /// take it one after another.
+    /// As above, with the expansion scratch as one more storage, which each of the `scratch` stages writes:
+    /// they take it one after another.
     static int[][] withStorageHazards(
             List<Instruction> instructions, int[][] dependencies, boolean reuseStorage, boolean[] scratch) {
         int count = instructions.size();
@@ -385,28 +390,28 @@ public final class ExecutionPlan {
         return ordered;
     }
 
-    /// Builds the production plan. For a complete model, prefill quanta automatically select the
-    /// retained region architecture by row count and geometry; decode runs the small topology.
-    /// Staged plans for partial weights (embedding-only, layer zero) remain reference-only.
+    /// Builds the production plan. For a complete model, prefill quanta automatically select the retained
+    /// region architecture by row count and geometry; decode runs the small topology. Staged plans for partial
+    /// weights (embedding-only, layer zero) remain reference-only.
     public ExecutionPlan(Weights weights) {
         this(weights, (WeightStaging) null);
     }
 
-    /// Builds the production plan for weights that may be host-backed: every executed view stages
-    /// them through `staging`, which must be present when any weight is host-backed.
+    /// Builds the production plan for weights that may be host-backed: every executed view stages them through
+    /// `staging`, which must be present when any weight is host-backed.
     public ExecutionPlan(Weights weights, WeightStaging staging) {
         this(weights, staging, null);
     }
 
-    /// Builds the production plan for weights that may be host-backed or disk-backed: every executed view stages
-    /// them through `staging`, and reads the disk-backed ones through `window`, which must be present when any
-    /// weight is disk-backed.
+    /// Builds the production plan for weights that may be host-backed or disk-backed: every executed view
+    /// stages them through `staging`, and reads the disk-backed ones through `window`, which must be present
+    /// when any weight is disk-backed.
     public ExecutionPlan(Weights weights, WeightStaging staging, DiskWindow window) {
         this(Objects.requireNonNull(weights, "weights"), planFromLoadedWeights(weights), staging, window);
     }
 
-    /// Unfused reference topology for every execution kind. This is a correctness oracle for tests
-    /// and is never selected by the runtime.
+    /// Unfused reference topology for every execution kind. This is a correctness oracle for tests and is never
+    /// selected by the runtime.
     public static ExecutionPlan reference(Weights weights) {
         Objects.requireNonNull(weights, "weights");
         PlanData data = planFromLoadedWeights(weights);
@@ -453,8 +458,8 @@ public final class ExecutionPlan {
 
     static final String DRAFT_HEAD = "text/draft_head";
 
-    /// The MTP draft's stem (stage 1, after the embedding): reads the seed hidden rows and the embedding, normalizes
-    /// each into the normalized rows, and packs them.
+    /// The MTP draft's stem (stage 1, after the embedding): reads the seed hidden rows and the embedding,
+    /// normalizes each into the normalized rows, and packs them.
     static Instruction mtpStem(List<TensorHandle> norms, int hidden, int mtpLayer) {
         return new Instruction(
                 1,
@@ -491,8 +496,8 @@ public final class ExecutionPlan {
 
     /// The MTP draft view (docs/MTP_CONTRACT.md §2): embedding of each row's token, the MTP stem with the
     /// context's seed hidden rows, the input projection, then the MTP layer, built by [#fullModel] as a
-    /// one-layer model with `mtp/final_norm` and the draft head, at the layer index after the base
-    /// layers (its own attention cache).
+    /// one-layer model with `mtp/final_norm` and the draft head, at the layer index after the base layers (its
+    /// own attention cache).
     private static PlanData mtpDraft(Weights weights) {
         Qwen38Config c = weights.config();
         MtpWeights mtp = weights.mtp();
@@ -550,7 +555,7 @@ public final class ExecutionPlan {
         nodes.add(mtpStem(List.of(embeddingNorm, hiddenNorm), hidden, mtpLayer));
         nodes.add(new Instruction(
                 2,
-                Kind.Q3_LINEAR,
+                linearKind(projection, Kind.Q3_LINEAR),
                 List.of(1),
                 List.of(projection),
                 List.of(Buffer.MTP_PACKED),
@@ -625,8 +630,8 @@ public final class ExecutionPlan {
         this(weights, data, null, null);
     }
 
-    /// The plan of `data`; a full model also builds its views, which stage host-backed weights through `staging`
-    /// and read disk-backed ones through `window`.
+    /// The plan of `data`; a full model also builds its views, which stage host-backed weights through
+    /// `staging` and read disk-backed ones through `window`.
     private ExecutionPlan(Weights weights, PlanData data, WeightStaging staging, DiskWindow window) {
         this.weights = weights;
         this.staging = staging;
@@ -717,8 +722,8 @@ public final class ExecutionPlan {
         return new Shape(view, this, staged(selected, this.staging, this.window), regions && hasFusedFfn, false);
     }
 
-    /// The view to run when the ring holds what [Shape#prefetchesRing] loads: the decode view without the transfers of
-    /// its first slots, or `view` when it has no such variant.
+    /// The view to run when the ring holds what [Shape#prefetchesRing] loads: the decode view without the
+    /// transfers of its first slots, or `view` when it has no such variant.
     Shape preloadedVariant(Shape view) {
         if (view == this.decode && this.decodePreloaded != null) return this.decodePreloaded;
         if (view == this.verify && this.verifyPreloaded != null) return this.verifyPreloaded;
@@ -740,8 +745,8 @@ public final class ExecutionPlan {
         return this.shape;
     }
 
-    /// The host-backed weights of `data`'s first `slots` staging uses, in use order: the weights its staged view
-    /// copies into slots 0 .. slots - 1 before any slot is reused.
+    /// The host-backed weights of `data`'s first `slots` staging uses, in use order: the weights its staged
+    /// view copies into slots 0 .. slots - 1 before any slot is reused.
     private static List<TensorHandle> firstHostBackedUses(PlanData data, int slots) {
         List<TensorHandle> uses = new ArrayList<>();
         for (Instruction instruction : data.instructions()) {
@@ -755,7 +760,8 @@ public final class ExecutionPlan {
         return List.copyOf(uses);
     }
 
-    /// `data` with leaf transfers that copy `uses` into staging slots 0, 1, ... (the decode view's first slots).
+    /// `data` with leaf transfers that copy `uses` into staging slots 0, 1, ... (the decode view's first
+    /// slots).
     private PlanData withPrefetch(PlanData data, List<TensorHandle> uses) {
         List<Instruction> result = new ArrayList<>(data.instructions());
         for (int use = 0; use < uses.size(); use++) {
@@ -795,10 +801,10 @@ public final class ExecutionPlan {
         return weight.hostBacked() || weight.diskBacked();
     }
 
-    /// Rewrites a view so that each use of a host-backed weight reads a staging slot. Use `u` takes slot
-    /// `u mod slots`; its transfer follows the use that last read the slot (use `u - slots`), or starts
-    /// the quantum, and precedes the consumer. Transfers are leaves apart from those two edges, so each
-    /// copy starts as soon as its slot is free.
+    /// Rewrites a view so that each use of a host-backed weight reads a staging slot. Use `u` takes slot `u mod
+    /// slots`; its transfer follows the use that last read the slot (use `u - slots`), or starts the quantum,
+    /// and precedes the consumer. Transfers are leaves apart from those two edges, so each copy starts as soon
+    /// as its slot is free.
     static PlanData staged(PlanData data, WeightStaging staging) {
         return staged(data, staging, null, false);
     }
@@ -808,16 +814,16 @@ public final class ExecutionPlan {
         return staged(data, staging, window, false);
     }
 
-    /// [#staged(PlanData, WeightStaging)], with `preloaded` leaving out the transfers of the first `slots` uses: the
-    /// quantum runs only after a prefetch loaded them into slots 0 .. slots - 1 ([#prefetchesRing]).
+    /// [#staged(PlanData, WeightStaging)], with `preloaded` leaving out the transfers of the first `slots`
+    /// uses: the quantum runs only after a prefetch loaded them into slots 0 .. slots - 1 ([#prefetchesRing]).
     static PlanData staged(PlanData data, WeightStaging staging, boolean preloaded) {
         return staged(data, staging, null, preloaded);
     }
 
-    /// The staged view of `data`. A disk-backed use's transfer is a [Kind#DISK_TRANSFER] from window slot
-    /// `slot + slots * (k mod 2)`, where `slot` is its staging slot and `k` counts the view's earlier disk
-    /// uses of that staging slot: the copies into one staging slot run one after another on the device, so
-    /// each window slot's uses are consumed in the order the view lists them ([PlanData#diskUses]).
+    /// The staged view of `data`. A disk-backed use's transfer is a [Kind#DISK_TRANSFER] from window slot `slot
+    /// + slots * (k mod 2)`, where `slot` is its staging slot and `k` counts the view's earlier disk uses of
+    /// that staging slot: the copies into one staging slot run one after another on the device, so each window
+    /// slot's uses are consumed in the order the view lists them ([PlanData#diskUses]).
     static PlanData staged(PlanData data, WeightStaging staging, DiskWindow window, boolean preloaded) {
         List<Instruction> source = data.instructions();
         boolean stages = source.stream().flatMap(i -> i.weights.stream()).anyMatch(ExecutionPlan::stagedUse);
@@ -966,10 +972,10 @@ public final class ExecutionPlan {
         throw new IllegalStateException("no consumer for staged use " + use);
     }
 
-    /// Rewrites the reference layer DAG into the retained prefill regions:
-    /// A residual+RMSNorm, D early joint GDN projection/control, and, from 64 rows, B gate/up+SwiGLU.
-    /// The attention producers stay four leaf frames (Q projection, QK norm and
-    /// RoPE, KV projection, cache append), so the KV branch runs on its own lane beside the Q branch.
+    /// Rewrites the reference layer DAG into the retained prefill regions: A residual+RMSNorm, D early joint
+    /// GDN projection/control, and, from 64 rows, B gate/up+SwiGLU. The attention producers stay four leaf
+    /// frames (Q projection, QK norm and RoPE, KV projection, cache append), so the KV branch runs on its own
+    /// lane beside the Q branch.
     private static PlanData prefillView(PlanData data, PrefillView view) {
         boolean regions = view == PrefillView.REGIONS;
         List<Instruction> source = earlyControlOrder(data.instructions());
@@ -1293,7 +1299,7 @@ public final class ExecutionPlan {
                 hidden));
         nodes.add(node(
                 2,
-                Kind.Q4_LINEAR,
+                linearKind(queryKey, Kind.Q4_LINEAR),
                 List.of(1),
                 List.of(queryKey),
                 List.of(Buffer.INPUT_NORMALIZED),
@@ -1392,7 +1398,7 @@ public final class ExecutionPlan {
                 hidden));
         nodes.add(node(
                 13,
-                Kind.Q3_LINEAR,
+                linearKind(gateUp, Kind.Q3_LINEAR),
                 List.of(12),
                 List.of(gateUp),
                 List.of(Buffer.POST_MIXER_NORMALIZED),
@@ -1457,8 +1463,9 @@ public final class ExecutionPlan {
         return -1;
     }
 
-    /// The DFlash2 context view (DRAFT_CONTEXT, docs/DFLASH2.md): the feature fusion of the sequence's tap rows, the
-    /// hidden norm, then each draft layer's key/value projection, key norm and RoPE into the drafter's ring.
+    /// The DFlash2 context view (DRAFT_CONTEXT, docs/DFLASH2.md): the feature fusion of the sequence's tap
+    /// rows, the hidden norm, then each draft layer's key/value projection, key norm and RoPE into the
+    /// drafter's ring.
     private static PlanData dflash2Context(DFlash2Weights drafter) {
         DFlash2Config c = drafter.config();
         int hidden = c.hiddenSize();
@@ -1514,9 +1521,9 @@ public final class ExecutionPlan {
         return new PlanData(List.copyOf(nodes), List.of(), buffers, true, false);
     }
 
-    /// The DFlash2 block view (DRAFT, docs/DFLASH2.md): the anchor and mask tokens' embedding, the draft layers over
-    /// all rows of the block at once, the final norm, the target's output head over the proposal rows, their top
-    /// candidates, and the selector's path.
+    /// The DFlash2 block view (DRAFT, docs/DFLASH2.md): the anchor and mask tokens' embedding, the draft layers
+    /// over all rows of the block at once, the final norm, the target's output head over the proposal rows,
+    /// their top candidates, and the selector's path.
     private static PlanData dflash2Block(Weights weights, DFlash2Weights drafter) {
         DFlash2Config c = drafter.config();
         Qwen38Config target = weights.config();
@@ -1750,9 +1757,9 @@ public final class ExecutionPlan {
         return new PlanData(List.copyOf(nodes), List.of(), buffers, true, false);
     }
 
-    /// A dynamic convolution around `body`: the kernel projection of the normalized rows, the prepare convolution
-    /// into DRAFT_CONVOLVED, `body` (reading it, writing MIXER_DELTA), then the finish convolution into FFN_DELTA.
-    /// Returns the finish stage.
+    /// A dynamic convolution around `body`: the kernel projection of the normalized rows, the prepare
+    /// convolution into DRAFT_CONVOLVED, `body` (reading it, writing MIXER_DELTA), then the finish convolution
+    /// into FFN_DELTA. Returns the finish stage.
     private static int convolved(
             List<Instruction> nodes,
             int layer,
@@ -1918,7 +1925,7 @@ public final class ExecutionPlan {
 
                 int queryKeyId = addNode(
                         nodes,
-                        Kind.Q4_LINEAR,
+                        linearKind(queryKey, Kind.Q4_LINEAR),
                         layerIndex,
                         List.of(normId),
                         List.of(queryKey),
@@ -2022,7 +2029,7 @@ public final class ExecutionPlan {
 
                 int queryKeyId = addNode(
                         nodes,
-                        Kind.Q4_LINEAR,
+                        linearKind(queryKey, Kind.Q4_LINEAR),
                         layerIndex,
                         List.of(normId),
                         List.of(queryKey),
@@ -2032,7 +2039,7 @@ public final class ExecutionPlan {
                         attentionQkWidth);
                 int gateValueId = addNode(
                         nodes,
-                        Kind.Q5_LINEAR,
+                        linearKind(gateValue, Kind.Q5_LINEAR),
                         layerIndex,
                         List.of(normId),
                         List.of(gateValue),
@@ -2109,7 +2116,7 @@ public final class ExecutionPlan {
             TensorHandle down = validateQuantized(ffn.down(), hidden, intermediate, WeightFormat.Q3_G64_FP16);
             int gateUpId = addNode(
                     nodes,
-                    Kind.Q3_LINEAR,
+                    linearKind(gateUp, Kind.Q3_LINEAR),
                     layerIndex,
                     List.of(postNormId),
                     List.of(gateUp),
@@ -2161,7 +2168,7 @@ public final class ExecutionPlan {
                 hidden);
         addNode(
                 nodes,
-                Kind.Q3_LINEAR,
+                linearKind(outputHead, Kind.Q3_LINEAR),
                 -1,
                 List.of(finalNormId),
                 List.of(outputHead),
@@ -2265,7 +2272,7 @@ public final class ExecutionPlan {
                 }
                 nodes.add(new Instruction(
                         nodes.size(),
-                        Kind.Q3_LINEAR,
+                        linearKind(projection, Kind.Q3_LINEAR),
                         List.of(1),
                         List.of(validateQuantized(projection, shape[0], hiddenSize, WeightFormat.Q3_G64_FP16)),
                         List.of(Buffer.INPUT_NORMALIZED),
@@ -2343,8 +2350,8 @@ public final class ExecutionPlan {
         return copyHandle(handle);
     }
 
-    /// Projections may be NVFP4 wherever a row-split format is registered; the token embedding, a
-    /// gather, has Q3 kernels only.
+    /// Projections may be NVFP4 wherever a row-split format is registered; the token embedding, a gather, has
+    /// Q3 kernels only.
     private static final WeightFormat EMBEDDING_FORMAT = WeightFormat.Q3_G64_FP16;
 
     private static TensorHandle validateEmbedding(TensorHandle handle, long rows, int width) {
@@ -2360,13 +2367,14 @@ public final class ExecutionPlan {
                 || format == WeightFormat.Q5_G64_FP16;
     }
 
-    /// The linear kind that runs `weight`: the artifact chooses each grouped projection's width (Q3, Q4 or Q5); NVFP4
-    /// weights keep the role's kind, which the stage dispatches by format.
+    /// The linear kind that runs `weight`: the artifact chooses each grouped projection's width (Q3, Q4 or Q5);
+    /// NVFP4 weights keep the role's kind, which the stage dispatches by format.
     private static Kind linearKind(TensorHandle weight, Kind role) {
         return switch (weight.format()) {
             case Q3_G64_FP16 -> Kind.Q3_LINEAR;
             case Q4_G64_FP16 -> Kind.Q4_LINEAR;
             case Q5_G64_FP16 -> Kind.Q5_LINEAR;
+            case BF16 -> Kind.BF16_PROJECTION;
             default -> role;
         };
     }
@@ -2374,6 +2382,22 @@ public final class ExecutionPlan {
     private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat format) {
         Objects.requireNonNull(handle, "weight");
         long[] shape = handle.shape();
+        // The unquantized model's projections: BF16 values the tensor-core kernels take whole.
+        if (handle.format() == WeightFormat.BF16) {
+            if (shape == null
+                    || shape.length != 2
+                    || shape[0] != rows
+                    || shape[1] != width
+                    || width % 32 != 0
+                    || rows % 8 != 0
+                    || (handle.deviceAddress() == 0 && !handle.hostBacked() && !handle.diskBacked())
+                    || handle.dataType() != TensorDataType.BF16
+                    || handle.layout() != WeightLayout.CONTIGUOUS_LE_V1
+                    || handle.byteSize() != rows * width * Short.BYTES)
+                throw new IllegalArgumentException(
+                        "unsupported BF16 projection layout or dimensions: " + handle.name());
+            return copyHandle(handle);
+        }
         if (shape == null
                 || shape.length != 2
                 || shape[0] != rows

@@ -195,6 +195,7 @@ public final class Shape implements GraphShape {
         return switch (instruction.kind()) {
             case Q3_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.Q3_LINEAR;
             case Q4_LINEAR, Q5_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.MX_LINEAR;
+            case BF16_PROJECTION -> null;
             case DFLASH_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : null;
             case DFLASH_LM_HEAD -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.Q3_LINEAR;
             default -> null;
