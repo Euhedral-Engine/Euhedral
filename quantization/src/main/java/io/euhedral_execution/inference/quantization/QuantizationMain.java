@@ -14,22 +14,29 @@ import java.util.Map;
 ///           [--library LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
 ///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
+/// 4096]
+///          [--batch 12] [--host-mib 3072] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
 
     private QuantizationMain() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length == 0 || !(args[0].equals("calibrate") || args[0].equals("score"))) {
+        if (args.length == 0
+                || !(args[0].equals("calibrate") || args[0].equals("score") || args[0].equals("generate"))) {
             System.err.println("usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] --tokens T.npy "
                     + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                     + "[--layers N] [--skip-mtp] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
                     + "[--rows 8] [--host-mib 2304] [--batch 4] [--workers 6] [--library PATH]");
+            System.err.println(
+                    "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
+                            + "[--max-tokens 4096] [--batch 12] [--host-mib 3072] [--limit N] [--workers 6] [--library PATH]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
-        List<String> references = new ArrayList<>(), names = new ArrayList<>();
+        List<String> references = new ArrayList<>(), names = new ArrayList<>(), prompts = new ArrayList<>();
         for (int i = 1; i < args.length; i++) {
             String key = args[i];
             if (!key.startsWith("--")) throw new IllegalArgumentException("unexpected " + key);
@@ -37,11 +44,28 @@ public final class QuantizationMain {
             String value = flag ? "true" : args[++i];
             if (key.equals("--reference")) references.add(value);
             else if (key.equals("--name")) names.add(value);
+            else if (key.equals("--prompts")) prompts.add(value);
             else options.put(key.substring(2), value);
         }
         String library = options.getOrDefault(
                 "library",
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
+        if (args[0].equals("generate")) {
+            if (prompts.isEmpty()) throw new IllegalArgumentException("--prompts is required");
+            io.euhedral_execution.inference.quantization.mtp.Generate.run(
+                    new io.euhedral_execution.inference.quantization.mtp.Generate.Settings(
+                            Path.of(required(options, "artifact")),
+                            prompts.stream().map(Path::of).toList(),
+                            Path.of(required(options, "tokenizer")),
+                            Path.of(required(options, "out")),
+                            Integer.parseInt(options.getOrDefault("max-tokens", "4096")),
+                            Integer.parseInt(options.getOrDefault("batch", "12")),
+                            Long.parseLong(options.getOrDefault("host-mib", "3072")) << 20,
+                            Integer.parseInt(options.getOrDefault("workers", "6")),
+                            Integer.parseInt(options.getOrDefault("limit", "0")),
+                            Path.of(library)));
+            return;
+        }
         if (args[0].equals("score")) {
             if (references.isEmpty() || references.size() != names.size()) {
                 throw new IllegalArgumentException("give each --reference a --name");
