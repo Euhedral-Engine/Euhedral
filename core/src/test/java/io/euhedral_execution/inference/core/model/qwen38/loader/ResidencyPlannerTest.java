@@ -13,6 +13,8 @@ import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Quantiz
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -132,5 +134,133 @@ class ResidencyPlannerTest {
         long bf16 = ResidencyPlanner.kvBytes(config, 131072, io.euhedral_execution.inference.core.state.KvFormat.BF16);
         org.junit.jupiter.api.Assertions.assertEquals(nvfp4, ResidencyPlanner.kvBytes(config, 131072));
         org.junit.jupiter.api.Assertions.assertEquals(nvfp4 / 144 * 512, bf16);
+    }
+
+    private static final List<String> FAMILIES = List.of(
+            "gdn/query_key",
+            "gdn/output",
+            "attention/output",
+            "attention/query_key",
+            "attention/gate_value",
+            "gdn/value_z",
+            "mlp/down",
+            "mlp/gate_up");
+
+    /// The embedding, the output head and every family of each of `config`'s layers, each `familyBytes`.
+    private static Artifact artifact(Qwen38Config config, long familyBytes) {
+        List<TensorDescriptor> tensors = new ArrayList<>();
+        tensors.add(tensor("text/token_embedding", familyBytes));
+        tensors.add(tensor("text/output_head", familyBytes));
+        for (int layer = 0; layer < config.numHiddenLayers(); layer++)
+            for (String family : FAMILIES) tensors.add(tensor("text/layers/" + layer + "/" + family, familyBytes));
+        return new Artifact(null, config, tensors.toArray(TensorDescriptor[]::new));
+    }
+
+    /// Free device memory that holds the KV and the reserve and `weights` bytes more.
+    private static long free(Qwen38Config config, long weights) {
+        return ResidencyPlanner.kvBytes(config, 4096) + ResidencyPlanner.RESERVE_BYTES + weights;
+    }
+
+    @Test
+    void weightsBeyondTheHostBudgetGoToDiskInSelectionOrder() {
+        Artifact artifact = artifact(config(1), 16 * MIB);
+        var plan =
+                ResidencyPlanner.plan(artifact, PROFILE, free(config(1), 200 * MIB), 4096, 256 * MIB, KvFormat.NVFP4);
+        assertTrue(plan.fits());
+        assertFalse(plan.diskBacked().isEmpty());
+        assertTrue(plan.hostBacked().contains(HostWeightSelection.EMBEDDING));
+        assertTrue(plan.hostArenaBytes() + plan.windowBytes() <= 256 * MIB);
+        assertEquals(DiskWindow.SLOTS * DiskWindow.slotBytesFor(16 * MIB), plan.windowBytes());
+        long host = 0;
+        for (TensorDescriptor tensor : artifact.tensors())
+            if (plan.hostBacked().contains(tensor.name())) host += tensor.byteSize();
+        assertEquals(host, plan.hostArenaBytes());
+        List<String> order = List.copyOf(HostWeightSelection.select(artifact, Long.MAX_VALUE));
+        int lastHost = plan.hostBacked().stream().mapToInt(order::indexOf).max().orElse(-1);
+        int firstDisk =
+                plan.diskBacked().stream().mapToInt(order::indexOf).min().orElseThrow();
+        assertTrue(lastHost < firstDisk);
+        for (String name : plan.diskBacked()) assertFalse(plan.hostBacked().contains(name));
+        assertTrue(plan.deviceBytes() <= free(config(1), 200 * MIB));
+    }
+
+    @Test
+    void theDeviceRingHoldsTheLargestHostOrDiskTensor() {
+        Artifact artifact = artifact(config(1), 16 * MIB);
+        var disk =
+                ResidencyPlanner.plan(artifact, PROFILE, free(config(1), 200 * MIB), 4096, 256 * MIB, KvFormat.NVFP4);
+        var host = ResidencyPlanner.plan(
+                artifact, PROFILE, free(config(1), 200 * MIB), 4096, Long.MAX_VALUE, KvFormat.NVFP4);
+        // The same device need: every offloaded tensor is staged through the same ring, whichever tier holds it.
+        assertEquals(host.deviceBytes(), disk.deviceBytes());
+        java.util.Set<String> offloaded = new java.util.HashSet<>(disk.hostBacked());
+        offloaded.addAll(disk.diskBacked());
+        assertEquals(host.hostBacked(), offloaded);
+    }
+
+    @Test
+    void aWindowThatDoesNotFitTheHostBudgetIsRefused() {
+        var plan = ResidencyPlanner.plan(
+                artifact(config(1), 16 * MIB), PROFILE, free(config(1), 200 * MIB), 4096, 32 * MIB, KvFormat.NVFP4);
+        assertFalse(plan.fits());
+        assertTrue(plan.hostArenaBytes() + plan.windowBytes() > 32 * MIB);
+    }
+
+    @Test
+    void anEmbeddingBeyondTheHostBudgetIsRefused() {
+        var plan = ResidencyPlanner.plan(
+                artifact(config(1), 16 * MIB), PROFILE, free(config(1), 200 * MIB), 4096, 8 * MIB, KvFormat.NVFP4);
+        assertFalse(plan.fits());
+        assertFalse(plan.diskBacked().contains(HostWeightSelection.EMBEDDING));
+    }
+
+    @Test
+    void unlimitedHostMemoryNeedsNoDisk() {
+        var plan = ResidencyPlanner.plan(
+                artifact(config(1), 16 * MIB),
+                PROFILE,
+                free(config(1), 200 * MIB),
+                4096,
+                Long.MAX_VALUE,
+                KvFormat.NVFP4);
+        assertTrue(plan.fits());
+        assertFalse(plan.hostBacked().isEmpty());
+        assertTrue(plan.diskBacked().isEmpty());
+        assertEquals(0, plan.windowBytes());
+    }
+
+    @Test
+    void aHostBudgetThatHoldsTheSelectionNeedsNoWindow() {
+        Artifact artifact = artifact(config(1), 16 * MIB);
+        var unlimited = ResidencyPlanner.plan(
+                artifact, PROFILE, free(config(1), 200 * MIB), 4096, Long.MAX_VALUE, KvFormat.NVFP4);
+        var exact = ResidencyPlanner.plan(
+                artifact, PROFILE, free(config(1), 200 * MIB), 4096, unlimited.hostArenaBytes(), KvFormat.NVFP4);
+        assertTrue(exact.fits());
+        assertEquals(unlimited.hostBacked(), exact.hostBacked());
+        assertTrue(exact.diskBacked().isEmpty());
+        assertEquals(0, exact.windowBytes());
+    }
+
+    @Test
+    void onlyRowSplitAndBf16ProjectionsAreStageable() {
+        assertTrue(HostWeightSelection.stageable(tensor("text/layers/0/mlp/down", MIB)));
+        assertFalse(HostWeightSelection.stageable(tensor("text/output_head", MIB)));
+        assertFalse(HostWeightSelection.stageable(new TensorDescriptor(
+                "text/layers/0/mlp/down",
+                new long[] {1, 1},
+                TensorDataType.BF16,
+                WeightFormat.Q3_G64_FP16,
+                WeightLayout.ROW_SPLIT_P2E2_V1,
+                0,
+                MIB)));
+        assertTrue(HostWeightSelection.stageable(new TensorDescriptor(
+                "text/layers/0/mlp/down",
+                new long[] {1, 1},
+                TensorDataType.BF16,
+                WeightFormat.BF16,
+                WeightLayout.CONTIGUOUS_LE_V1,
+                0,
+                MIB)));
     }
 }
