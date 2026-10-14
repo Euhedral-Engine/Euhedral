@@ -41,8 +41,6 @@ public final class Ops {
         return 1;
     }
 
-    /// `output[r][j] = bf16(sum_k input[r][k] * weights[j][k])` for BF16 `weights` of `n` rows by `k` columns.
-
     /// [#linearBf16] on the tensor-core kernels for every row count: K split by the shape alone and four row
     /// tiles per weight load above 16 rows, so each row's bits are those of its one-row launch. Needs K
     /// divisible by 32 and N by 8.
@@ -77,6 +75,7 @@ public final class Ops {
                         .int32(n));
     }
 
+    /// `output[r][j] = bf16(sum_k input[r][k] * weights[j][k])` for BF16 `weights` of `n` rows by `k` columns.
     public static void linearBf16(ExecutionGpu gpu, long input, long weights, long output, int rows, int k, int n) {
         requirePositive(rows, k, n);
         if (k % 8 != 0) throw new IllegalArgumentException("a BF16 linear needs K divisible by 8, got " + k);

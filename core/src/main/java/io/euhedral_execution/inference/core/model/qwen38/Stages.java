@@ -1310,6 +1310,15 @@ public final class Stages {
                                     instruction.inputWidth(),
                                     instruction.outputWidth(),
                                     instruction.weightByteSize());
+                else if (instruction.weightFormat() == WeightFormat.BF16)
+                    io.euhedral_execution.inference.core.model.qwen4.Ops.linearBf16RowExact(
+                            gpu(),
+                            in,
+                            instruction.weightAddress(),
+                            out,
+                            rows - 1,
+                            instruction.inputWidth(),
+                            instruction.outputWidth());
                 else
                     gpu().linearQ3Bf16(
                                     in,
