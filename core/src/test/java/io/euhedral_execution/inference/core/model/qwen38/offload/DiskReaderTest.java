@@ -233,4 +233,32 @@ class DiskReaderTest {
         this.reader.enqueue(2, next);
         for (DiskUse use : next) consume(use);
     }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aClosedReaderReleasesTheWaitsTheDeviceStillHolds(boolean async) throws Exception {
+        open(async);
+        // The device holds four flag waits; only the first two belong to registered uses.
+        int[] waits = {0, 1, 0, 2};
+        this.reader.enqueue(1, List.of(new DiskUse("a", 0, 4096, 0), new DiskUse("b", 8192, 4096, 1)));
+        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+        Thread device = Thread.ofPlatform().daemon().start(() -> {
+            for (int slot : waits) {
+                while (this.window.flag(slot) != 1) Thread.onSpinWait();
+                this.window.lower(slot);
+                done.incrementAndGet();
+            }
+        });
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (done.get() < 2) {
+            assertTrue(System.nanoTime() < deadline, "the registered uses were never read");
+            pump();
+        }
+        this.reader.close();
+        int released = this.reader.releaseDevice(100_000_000L, 5_000_000_000L);
+        device.join(5_000);
+        assertEquals(4, done.get(), "the device drained every wait it held");
+        assertEquals(2, released);
+        assertEquals(0, this.reader.releaseDevice(20_000_000L, 1_000_000_000L), "nothing waits any more");
+    }
 }

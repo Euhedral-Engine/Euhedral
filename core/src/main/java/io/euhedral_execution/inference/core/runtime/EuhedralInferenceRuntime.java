@@ -374,10 +374,21 @@ public final class EuhedralInferenceRuntime implements AutoCloseable {
             EuhedralInferenceRuntime.this.lake.publishFromCallback(frame);
         }
 
+        /// Counts a quantum, or refuses it once [#awaitIdle] closed the count: a quantum admitted after that would
+        /// run on graphs and lanes the closing runtime releases, with nothing waiting for it.
         @Override
         public void admit() {
-            EuhedralInferenceRuntime.this.lake.admit();
-            this.count.incrementAndGet();
+            while (true) {
+                int count = this.count.get();
+                if (count < 0) throw new IllegalStateException("inference runtime is closed");
+                if (this.count.compareAndSet(count, count + 1)) break;
+            }
+            try {
+                EuhedralInferenceRuntime.this.lake.admit();
+            } catch (RuntimeException | Error refused) {
+                if (this.count.decrementAndGet() == CLOSED) this.idle.complete(null);
+                throw refused;
+            }
         }
 
         @Override
