@@ -290,11 +290,12 @@ public final class Execution implements AutoCloseable {
                             context.begin(this.gpu, stream, terminalConsumer, (WorkspaceStorage) storage, this.shared));
         } catch (RuntimeException | Error refused) {
             LOG.debug("a quantum was refused; its continuation carries the failure", refused);
-            // Prepared and then refused at binding: its graph may have started, and drains what it leaves.
-            if (ticket >= 0 && began[0]) this.diskReader.enqueue(ticket, uses, context::fail);
+            // Refused after its graph started publishing: the failure drains what its stages leave, so the
+            // reader must read its uses. Refused before: no stage of it runs, and nothing may be read for it.
+            if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
             return refused;
         }
-        if (ticket >= 0 && began[0]) this.diskReader.enqueue(ticket, uses, context::fail);
+        if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
         return null;
     }
 

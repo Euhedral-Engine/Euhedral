@@ -385,6 +385,7 @@ public final class StageGraph implements AutoCloseable {
             // The replay frame waits for every external edge; its stages wait for none of their own.
             for (int index = 0; index < count; index++) edges[index].slot = index;
             this.replayGate.set(count);
+            quantum.stagesPublishing();
             // The replay frame, admission's hold, and one count per external edge.
             this.live.set(2 + count);
             if (count == 0) this.source.publish(this.replay);
@@ -411,6 +412,7 @@ public final class StageGraph implements AutoCloseable {
         }
         int ready = 0;
         for (StageFrame root : this.roots) if (root.externalIn == 0) ready++;
+        quantum.stagesPublishing();
         // Admission holds one count so that fast roots cannot retire the quantum before all publish.
         this.live.set(ready + 1 + count);
         for (StageFrame root : this.roots) if (root.externalIn == 0) this.source.publish(root);

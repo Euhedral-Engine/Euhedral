@@ -11,6 +11,10 @@ public interface StageQuantum {
     /// Failure or cancellation: no further stage may submit work or make a successor ready.
     boolean stopRequested();
 
+    /// The quantum's graph starts publishing its stages: from here a failure drains them, and before it none
+    /// ran. Called once per start, on the admitting frame.
+    default void stagesPublishing() {}
+
     void fail(Throwable failure);
 
     /// Whether registered kernels of this quantum may overlap their predecessor's tail.

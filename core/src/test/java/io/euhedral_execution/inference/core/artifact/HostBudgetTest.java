@@ -84,4 +84,13 @@ class HostBudgetTest {
         assertThrows(IllegalArgumentException.class, () -> HostBudget.of("-5", null, GIB));
         assertThrows(IllegalArgumentException.class, () -> new HostBudget(-1, 0));
     }
+
+    @org.junit.jupiter.api.Test
+    void aStatedBudgetPinsAsStatedAndAnAutomaticOneWhatTheMachineSpares() {
+        HostBudget stated = HostBudget.of("40960", null, 8L << 30);
+        org.junit.jupiter.api.Assertions.assertEquals(40960L << 20, stated.pinnedBytes());
+        HostBudget automatic = HostBudget.of(null, null, 64L << 30);
+        org.junit.jupiter.api.Assertions.assertEquals(
+                Math.min(automatic.pinnableBytes(), automatic.residentBytes()), automatic.pinnedBytes());
+    }
 }

@@ -539,9 +539,8 @@ public final class InferenceEngine implements AutoCloseable {
                     memoryInfo(gpu).freeBytes(),
                     Long.getLong("euhedral.residency.device-budget-bytes", Long.MAX_VALUE));
             // Pinned memory for host-backed weights and the disk window: the host budget, which tests state.
-            HostBudget budget = HostBudget.system();
-            long host = Long.getLong(
-                    "euhedral.residency.host-budget-bytes", Math.min(budget.pinnableBytes(), budget.residentBytes()));
+            HostBudget budget = HostBudget.system(false);
+            long host = Long.getLong("euhedral.residency.host-budget-bytes", budget.pinnedBytes());
             var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat);
             if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
                 throw new IOException("the weights the GPU cannot hold need "

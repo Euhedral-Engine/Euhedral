@@ -330,6 +330,18 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return this.plan;
     }
 
+    private volatile boolean stagesPublishing;
+
+    @Override
+    public void stagesPublishing() {
+        this.stagesPublishing = true;
+    }
+
+    /// Whether the quantum's graph started publishing its stages ([#stagesPublishing()]).
+    boolean stagesPublished() {
+        return this.stagesPublishing;
+    }
+
     /// Names the reader of this quantum's disk uses and its number there; set at admission, before it starts.
     void readsFromDisk(io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader reader, long ticket) {
         this.diskReader = reader;
