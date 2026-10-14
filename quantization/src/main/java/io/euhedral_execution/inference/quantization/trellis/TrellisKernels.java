@@ -8,12 +8,16 @@ import java.util.Map;
 
 /// The trellis kernels (resources/cuda/trellis.cu) on one stream: Viterbi over 256-weight tiles (mul1 codebook,
 /// 16-bit state, K bits per weight, 2.5 and 3.5 alternating K and K + 1), packing into exllamav3's int16 words, and
-/// decoding words back to values. Tiles are in tensor-core element order; every pointer is a device address.
+/// decoding words back to values, and the reconstruction of a quantized linear (decode, signed 128-point Hadamards,
+/// BF16 `nn.Linear` weight). Tiles are in tensor-core element order; every pointer is a device address.
 public final class TrellisKernels {
 
     private static final int[] INTEGER = {2, 3, 4, 5, 6};
     private static final int[] HALF_STEP = {2, 3};
     private static final int FRAC_THREADS = 512;
+
+    /// Position in a tensor-core ordered tile to its row-major element (`row * 16 + column`) of the 16x16 tile.
+    public static final int[] TENSOR_CORE_ORDER = tensorCoreOrder();
 
     private final Cuda cuda;
     private final long stream;
@@ -26,6 +30,15 @@ public final class TrellisKernels {
         for (int k : INTEGER) for (String kind : List.of("viterbi_k", "pack_k", "decode_k")) names.add(kind + k);
         for (int k : HALF_STEP)
             for (String kind : List.of("viterbi_frac_k", "pack_frac_k", "decode_frac_k")) names.add(kind + k);
+        for (int k : INTEGER) names.add("reconstruct_k" + k);
+        for (int k : HALF_STEP) names.add("reconstruct_frac_k" + k);
+        names.addAll(List.of(
+                "hadamard128_rows",
+                "hadamard128_columns",
+                "strip_tiles",
+                "scale_rows_fp16",
+                "scale_columns_fp16",
+                "transpose_to_bf16"));
         for (Cuda.Function f : cuda.compileResource("trellis.cu", names)) functions.put(f.name(), f);
         for (int k : INTEGER) {
             Cuda.Function f = functions.get("viterbi_k" + k);
@@ -149,5 +162,116 @@ public final class TrellisKernels {
                 0,
                 stream,
                 new Cuda.Arguments().pointer(words).integer(count).pointer(decoded));
+    }
+
+    private static int[] tensorCoreOrder() {
+        int[] order = new int[256];
+        for (int t = 0; t < 32; t++) {
+            int r0 = (t % 4) * 2, c0 = t / 4;
+            int[] rows = {r0, r0 + 1, r0 + 8, r0 + 9};
+            for (int j = 0; j < 8; j++) order[8 * t + j] = rows[j % 4] * 16 + c0 + (j / 4) * 8;
+        }
+        return order;
+    }
+
+    /// In place, every 128-row block of every column of the float32 row-major `x` `[rows, cols]` becomes
+    /// `H128 * block / sqrt(128)` (Sylvester order).
+    public void hadamardRows(long x, int rows, int cols) {
+        validateBlocks(rows, "rows");
+        if (cols < 0) throw new IllegalArgumentException("negative cols " + cols);
+        if (rows == 0 || cols == 0) return;
+        cuda.launch(
+                functions.get("hadamard128_rows"),
+                (cols + 31) / 32,
+                rows / 128,
+                256,
+                0,
+                stream,
+                new Cuda.Arguments().pointer(x).integer(rows).integer(cols));
+    }
+
+    /// In place, every 128-column block of every row of the float32 row-major `x` `[rows, cols]` becomes
+    /// `H128 * block / sqrt(128)`.
+    public void hadamardColumns(long x, int rows, int cols) {
+        validateBlocks(cols, "cols");
+        if (rows < 0) throw new IllegalArgumentException("negative rows " + rows);
+        if (rows == 0 || cols == 0) return;
+        cuda.launch(
+                functions.get("hadamard128_columns"),
+                cols / 128,
+                rows,
+                128,
+                0,
+                stream,
+                new Cuda.Arguments().pointer(x).integer(rows).integer(cols));
+    }
+
+    private static void validateBlocks(int extent, String name) {
+        if (extent < 0 || extent % 128 != 0)
+            throw new IllegalArgumentException(name + " " + extent + " not a multiple of 128");
+    }
+
+    /// Gathers rows `[firstRow, firstRow + stripRows)` of the float32 `w` `[k, n]` (`stripRows` is 16) into `n / 16`
+    /// tiles `[n / 16, 256]` in tensor-core order.
+    public void toTiles(long w, int k, int n, int firstRow, int stripRows, long tiles) {
+        strip(w, k, n, firstRow, stripRows, tiles, 0);
+    }
+
+    /// The inverse of [#toTiles]: scatters the tiles back into the strip of `w`.
+    public void fromTiles(long tiles, int k, int n, int firstRow, long w) {
+        strip(w, k, n, firstRow, 16, tiles, 1);
+    }
+
+    private void strip(long w, int k, int n, int firstRow, int stripRows, long tiles, int inverse) {
+        if (stripRows != 16) throw new IllegalArgumentException("strip of " + stripRows + " rows, not 16");
+        if (n <= 0 || n % 16 != 0) throw new IllegalArgumentException("n " + n + " not a multiple of 16");
+        if (firstRow < 0 || firstRow + 16 > k) throw new IllegalArgumentException("strip outside " + k + " rows");
+        cuda.launch(
+                functions.get("strip_tiles"),
+                n / 16,
+                1,
+                256,
+                0,
+                stream,
+                new Cuda.Arguments()
+                        .pointer(w)
+                        .integer(n)
+                        .integer(firstRow)
+                        .pointer(tiles)
+                        .integer(inverse));
+    }
+
+    /// Rebuilds the BF16 `nn.Linear` weight `[n, k]` (`out`) of an exllamav3 linear from its packed trellis
+    /// `[k / 16, n / 16, 16 * bits]` int16 words and fp16 `suh` `[k]`, `svh` `[n]`:
+    /// `W = had_r(had_l(Q) * suh[:, None]) * svh[None, :]` with `Q` the decoded `[k, n]` matrix. `scratch` holds
+    /// `4 * k * n` bytes (float32).
+    public void reconstruct(long words, long suh, long svh, int k, int n, double bits, long out, long scratch) {
+        validate(bits);
+        validateBlocks(k, "k");
+        validateBlocks(n, "n");
+        cuda.launch(
+                function("reconstruct", bits),
+                (k / 16) * (n / 16),
+                1,
+                256,
+                0,
+                stream,
+                new Cuda.Arguments().pointer(words).integer(n).pointer(scratch));
+        hadamardRows(scratch, k, n);
+        Cuda.Arguments rows =
+                new Cuda.Arguments().pointer(scratch).pointer(suh).integer(k).integer(n);
+        cuda.launch(functions.get("scale_rows_fp16"), (n + 255) / 256, k, 256, 0, stream, rows);
+        hadamardColumns(scratch, k, n);
+        Cuda.Arguments columns =
+                new Cuda.Arguments().pointer(scratch).pointer(svh).integer(k).integer(n);
+        cuda.launch(functions.get("scale_columns_fp16"), (n + 255) / 256, k, 256, 0, stream, columns);
+        cuda.launch(
+                functions.get("transpose_to_bf16"),
+                (n + 31) / 32,
+                (k + 31) / 32,
+                256,
+                0,
+                stream,
+                new Cuda.Arguments().pointer(scratch).integer(k).integer(n).pointer(out));
     }
 }
