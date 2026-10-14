@@ -38,8 +38,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// of N / 2 + 1 tokens, then verifications of `rows` forced tokens, so that step k's logits row predicts the token the
 /// reference's record k does. Every row is scored on the device where the engine left it (`score.cu`), against the
 /// reference row a reader frame has already fetched into mapped host memory; nothing is copied. Several chunks run
-/// at once on their own sequences. The summary line per reference has the columns of `tools/compare_reference.py
-/// --detail`.
+/// at once on their own sequences. The summary line per reference: name, mean NLL, perplexity, dNLL and its standard
+/// error, KL and its standard error, top-1 agreement, then KL median, p95, p99, maximum, the top-1 standard error and
+/// delta-p mean, RMS, p1 and p99.
 public final class Score {
 
     /// Command-line settings.
@@ -346,7 +347,7 @@ public final class Score {
         }
     }
 
-    /// The summary of a reference's per-step results, as `tools/compare_reference.py --detail` prints it.
+    /// The summary of a reference's per-step results.
     static final class Summary {
         static String lines(String name, Path path, Path artifact, Reference reference, double[][] scored) {
             int chunks = scored.length, steps = reference.records, n = chunks * steps;

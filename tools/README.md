@@ -163,7 +163,6 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
   (`qwen4_exp`) NVFP4 checkpoint to an EDRL version 3 artifact, restartable and byte-verified, and its tensor inventory
   (`docs/FLASH_NEXT_ARTIFACT.md`). `test_flash_next_converter.py` converts a miniature checkpoint and needs NumPy only.
 - `compare_teacher_forced.py`: compares teacher-forced logits reports with one another (NumPy).
-- `compare_reference.py`: compares teacher-forced logits reports with a BF16 reference written by llama.cpp (NumPy).
 - `dflash2_reference.py`: runs the upstream DFlash2 draft model (z-lab/dflash, unmodified; needs PyTorch, transformers 5.15 and the
   upstream source tree) over fixed inputs and writes every intermediate as fixtures (docs/DFLASH2.md).
 - `dflash2_compare.py`: per-tensor relative error between two DFlash2 fixture directories (NumPy).

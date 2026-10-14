@@ -1,4 +1,4 @@
-// Teacher-forced scoring against a llama.cpp BF16 reference (tools/compare_reference.py, on the device): for each row,
+// Teacher-forced scoring against a llama.cpp BF16 reference (`llama-perplexity --kl-divergence-base`): for each row,
 // the engine's logits (BF16 [vocabulary]) against the reference's 16-bit log-probabilities. The reference row holds
 // two FP32 values (scale, minimum) then a uint16 code per token: log p = scale * code + minimum (in float64). Writes,
 // per row: the candidate's NLL of the forced token, the reference's, KL(reference || candidate) over the reference

@@ -13,7 +13,7 @@ import java.util.List;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
 
-/// `score.cu` against the arithmetic of tools/compare_reference.py in float64 on the host: random BF16 logits rows
+/// `score.cu` against the same arithmetic in float64 on the host: random BF16 logits rows
 /// against random 16-bit reference rows, a vocabulary that does not fill the last block of threads, and a tie for the
 /// maximum on both sides.
 class ScoreCudaIntegrationTest {

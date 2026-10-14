@@ -26,17 +26,15 @@ llama-perplexity -m Qwen3.8-27B-BF16.gguf -f chat-corpus-v1-document.md -c 2560 
 An artifact converted from another checkpoint is measured against that checkpoint's BF16 reference: for Swift-1.5, convert it
 with llama.cpp's `convert_hf_to_gguf.py --outtype bf16` and run the same command on the result.
 
-Each artifact is run over the same positions (prefix 1281, 1279 steps; the NVFP4 artifacts need
-`-Peuhedral.quality.host-mib=1280` on a 16 GB card):
+Each artifact is teacher-forced over the same positions (prefix 1281, 1279 steps) by the quantization module's `score`
+command (quantization/README.md):
 
 ```bash
-./gradlew :core:cudaIntegrationTest --tests '*TeacherForcedQualityCudaIntegrationTest' \
-    -Peuhedral.quality.artifact=/models/qwen3_8_27b_q3.edrl -Peuhedral.quality.report=q3.bin \
-    -Peuhedral.quality.prefix=1281 -Peuhedral.quality.steps=1279
-python3 tools/compare_reference.py bf16.kld q3.bin nvfp4.bin
+./gradlew :quantization:run --args="score --artifact /models/qwen3_8_27b_q3.edrl --results results.txt \
+    --reference bf16.kld --name q3-t1"
 ```
 
-`compare_reference.py` prints the mean NLL of the forced tokens, the paired NLL difference to the reference with its standard
+`score` prints the mean NLL of the forced tokens, the paired NLL difference to the reference with its standard
 error, the mean KL(reference || artifact) and the top-1 agreement. The reference's log-probabilities are stored in 16 bits over
 the 16 nats below each position's maximum, which bounds the KL resolution at about 1e-4. Entries further down are clamped to
 one floor value, about 2% of the probability mass over a 248K vocabulary, so the KL sums only the entries above
@@ -65,15 +63,15 @@ with `--jinja`; its documents are scored with `--parse-special`, so template tok
 
 ```bash
 llama-perplexity -m Swift-1.5-BF16.gguf -f t2.txt -c 2560 -b 2560 -ub 2560 --chunks 25 -ngl 0 --kl-divergence-base swift_t2.kld
-tools/holdout/score.sh nvfp4c-t2 qwen3_8_27b_nvfp4_compressed.edrl swift_t2.kld results.txt
+./gradlew :quantization:run --args="score --artifact qwen3_8_27b_nvfp4_compressed.edrl --results results.txt \
+    --reference swift_t2.kld --name nvfp4c-t2"
 ```
 
-`score.sh` runs `TeacherForcedQualityCudaIntegrationTest` with `-Peuhedral.quality.tokens=REFERENCE.kld`, which forces
-every chunk of the reference on a fresh sequence, then `compare_reference.py --detail`, which reports chunk-level standard
-errors (tokens within a document are correlated), KL percentiles and delta-p, on the GPU when PyTorch with CUDA is
-installed (about 2 seconds per chunk). The test forces 8 tokens per speculative
-verification (`-Peuhedral.quality.rows`, 1 for one-row decode): verification is row-exact, so its reports are byte for byte
-those of one-row decode (checked on T1), and a 2560-token chunk takes about 21 seconds instead of about 170.
+`score` forces every chunk of the reference on a fresh sequence, three chunks at a time, scores each logits row on the
+GPU where the engine left it, and reports chunk-level standard errors (tokens within a document are correlated), KL
+percentiles and delta-p. It forces 8 tokens per speculative verification (`--rows`, 1 for one-row decode):
+verification is row-exact, so its rows are bit for bit those of one-row decode. A 25-chunk text takes about 200
+seconds on the 16 GB card; T1 about 9.
 
 The BF16 references stream the weights from the page cache, so they need the 54 GB GGUF to stay cached: with nothing else
 holding memory a chunk takes about 10 seconds; beside a 29 GB process it took about 40.
@@ -91,7 +89,7 @@ On T4 the chunk-level NLL errors are large (0.03 to 0.11 nats): its chunks mix n
 open-ended thinking, so mean KL and top-1 agreement resolve it better than dNLL.
 
 **Large files on a shared exFAT drive are read, never memory-mapped.** Page faults on big mappings of such a drive hung the
-kernel of the development machine (Linux 7.0) three times. The converter, `compare_reference.py` and
+kernel of the development machine (Linux 7.0) three times. The converter, `score` and
 `dequantize_gguf.py` use positioned reads; llama.cpp, which maps its models, reads them from a local ext4 disk (the BF16
 GGUFs and `weight_only.sh`'s work directory).
 
@@ -228,11 +226,12 @@ The cache stores each key and value row after the H256 rotation as 4-bit codes w
 same rows: `EUHEDRAL_CUDA_KV_CODEC=1`, `2` or `3` in the environment of the process that compiles the kernels stores
 midrise integer grids, magnitudes m + 0.5 for m below 8, 4 and 2 (INT4, INT3 and INT2), with the scale chosen from the
 group's largest value as for E2M1; every kernel, the exact twins included, decodes the chosen grid. A fresh Gradle
-daemon carries the variable into the test JVM:
+daemon carries the variable into the scoring JVM:
 
 ```bash
 ./gradlew --stop
-EUHEDRAL_CUDA_KV_CODEC=2 tools/holdout/score.sh int3-t2 qwen3_8_27b_nvfp4_compressed.edrl swift_t2.kld results.txt
+EUHEDRAL_CUDA_KV_CODEC=2 ./gradlew :quantization:run --args="score --artifact qwen3_8_27b_nvfp4_compressed.edrl \
+    --results results.txt --reference swift_t2.kld --name int3-t2"
 ```
 
 T2 is also scored at a 32K context: four 32768-token chunks of the wikitext test text, the second half of each scored
