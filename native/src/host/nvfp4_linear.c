@@ -25,6 +25,9 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static CUmodule module;
 /* [layout][tile][M]: layout 0 plain NVFP4, 1 SD4; tile 0 _w8, 1 _w4 (decode_tile); 1 to 8 token rows. */
 static CUfunction decode_rows[2][2][EUHEDRAL_DECODE_MAX_ROWS + 1];
+/* [layout][tile][G]: 2 to 4 groups of 8 token rows (9 to 32 rows, batched verification). */
+#define DECODE_GROUPS_MAX 4u
+static CUfunction decode_groups[2][2][DECODE_GROUPS_MAX + 1];
 static int init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
 
 static void initialize(void) {
@@ -39,6 +42,13 @@ static void initialize(void) {
                 if (cuModuleGetFunction(&decode_rows[layout][tile][m], module, name) != CUDA_SUCCESS)
                     init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
                 euhedral_cuda_pdl_register(decode_rows[layout][tile][m]);
+            }
+            for (unsigned int g = 2; g <= DECODE_GROUPS_MAX; ++g) {
+                char name[64];
+                snprintf(name, sizeof(name), "euhedral_nvfp4_decode_groups%u_%s%s", g, tile ? "w4" : "w8", layout ? "_sd4" : "");
+                if (cuModuleGetFunction(&decode_groups[layout][tile][g], module, name) != CUDA_SUCCESS)
+                    init_status = EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
+                euhedral_cuda_pdl_register(decode_groups[layout][tile][g]);
             }
         }
     }
@@ -108,21 +118,29 @@ static int decode_tile(uint32_t in_features, uint32_t out_features) {
 }
 
 /* Production dispatch for BF16 activations: 1 to 8 rows (decode, speculative verification and drafting) on the
- * tensor-core decode kernels, each row bit for bit as a one-row call. Other row counts run on the native route
+ * tensor-core decode kernels, and 9 to 32 (batched verification of several sequences) on their grouped twins, each
+ * row bit for bit as a one-row call. Other row counts run on the native route
  * (euhedral_cuda_linear_nvfp4_native_bf16) or, when it declines, the scalar reference. */
 int euhedral_cuda_linear_nvfp4_bf16(const void* input, const void* weights, void* output,
         uint32_t rows, uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
     int layout;
     int status = prepare(input, weights, output, rows, in_features, out_features, weights_byte_size, &layout);
     if (status != EUHEDRAL_CUDA_SUCCESS) return status;
-    const int qualified = rows <= EUHEDRAL_DECODE_MAX_ROWS && in_features % 128u == 0 && out_features % 16u == 0;
+    const int qualified = rows <= 8u * DECODE_GROUPS_MAX && in_features % 128u == 0 && out_features % 16u == 0;
     if (euhedral_cuda_exact_numerics() || !qualified)
         return euhedral_reference_nvfp4(input, weights, output, rows, in_features, out_features, layout);
     CUdeviceptr input_ptr = (CUdeviceptr)(uintptr_t)input, weights_ptr = (CUdeviceptr)(uintptr_t)weights;
     CUdeviceptr output_ptr = (CUdeviceptr)(uintptr_t)output;
     unsigned int in_arg = in_features, out_arg = out_features;
-    void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
     const int tile = decode_tile(in_features, out_features);
+    if (rows > EUHEDRAL_DECODE_MAX_ROWS) {
+        unsigned int rows_arg = rows;
+        void* grouped[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg, &rows_arg};
+        return finish(euhedral_launch_kernel(decode_groups[layout][tile][(rows + 7u) / 8u],
+                out_features / (tile ? 32u : 16u), 1, 1, tile ? 128u : 256u, 1, 1, 0, euhedral_cuda_submission_stream(),
+                grouped, NULL));
+    }
+    void* params[] = {&input_ptr, &weights_ptr, &output_ptr, &in_arg, &out_arg};
     return finish(euhedral_launch_kernel(decode_rows[layout][tile][rows], out_features / (tile ? 32u : 16u), 1, 1,
             tile ? 128u : 256u, 1, 1, 0, euhedral_cuda_submission_stream(), params, NULL));
 }
