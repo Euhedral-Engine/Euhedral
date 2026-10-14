@@ -11,6 +11,7 @@ import torch
 
 from exllamav3 import Config, Model
 from exllamav3.conversion.allocation import create_q_strategy
+from exllamav3.modules.quant.exl3 import LinearEXL3
 from exllamav3.modules.quant.exl3_lib import quantize as q
 
 
@@ -46,8 +47,14 @@ def linear(out: Path) -> None:
     for name in ("trellis", "suh", "svh"):
         np.save(out / f"linear-{name}.npy", out_tensors[name].cpu().numpy())
     np.save(out / "linear-reconstructed.npy", weight_q.T.contiguous().half().cpu().numpy())
+    # what the loader rebuilds from the stored fp16 trellis/suh/svh (differs slightly from weight_q's fp32 refit scales)
+    loaded = LinearEXL3(
+        None, k, n, suh=out_tensors["suh"], svh=out_tensors["svh"], trellis=out_tensors["trellis"],
+        mul1=out_tensors["mul1"],
+    ).get_weight_tensor()
+    np.save(out / "linear-loaded.npy", loaded.T.contiguous().half().cpu().numpy())
     (out / "linear.json").write_text(json.dumps({
-        "k": k, "n": n, "bits": 3, "sigma_reg": 0.025, "proxy_err": float(proxy_err),
+        "k": k, "n": n, "bits": 3, "sigma_reg": 0.025, "apply_out_scales": True, "codebook": "mul1", "proxy_err": float(proxy_err),
         "g_scale": float(quant_args["g_scale"]),
     }, indent=1))
 
@@ -56,7 +63,7 @@ def allocations(out: Path, checkpoint: Path) -> None:
     config = Config.from_directory(str(checkpoint))
     model = Model.from_config(config)
     result = {}
-    for bpw in (2.5, 3.0, 3.5):
+    for bpw in (2.5, 2.75, 3.0, 3.25, 3.5):
         # as convert_model.py calls it: mul1 codebook (half steps), no --hq, default 6-bit head
         strategy, _ = create_q_strategy(model, None, config, bpw, 6, 4, False, half_steps=True)
         result[str(bpw)] = {key: float(bits) for key, bits in sorted(strategy.items()) if key != "lm_head"}

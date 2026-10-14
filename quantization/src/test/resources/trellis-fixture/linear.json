@@ -3,6 +3,8 @@
  "n": 512,
  "bits": 3,
  "sigma_reg": 0.025,
+ "apply_out_scales": true,
+ "codebook": "mul1",
  "proxy_err": 0.010226351145248048,
  "g_scale": 0.7470000742661929
 }
