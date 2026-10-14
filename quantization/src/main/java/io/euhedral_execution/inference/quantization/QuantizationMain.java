@@ -16,6 +16,10 @@ import java.util.Map;
 /// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
 ///              [--overlay CHECKPOINT_DIR] [--sequences 96]
 ///              [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
+/// train-model --model CHECKPOINT --codes CODES_DIR [--norms NORMS_DIR] --tokens TOKENS.npy --out CODES_DIR
+///             [--overlay CHECKPOINT_DIR] [--sequences 218] [--holdout 18] [--epochs 1] [--scale-lr 2e-6]
+///             [--norm-lr 2e-5] [--top-k 64] [--evaluate-every 50] [--probe 0] [--accumulate 8] [--batch 4] [--library
+/// LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
 ///       [--host-mib 2304] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
@@ -28,7 +32,8 @@ public final class QuantizationMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0
-                || !List.of("calibrate", "score", "generate", "train-blocks").contains(args[0])) {
+                || !List.of("calibrate", "score", "generate", "train-blocks", "train-model")
+                        .contains(args[0])) {
             System.err.println("usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] --tokens T.npy "
                     + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                     + "[--layers N] [--skip-mtp] [--library PATH]");
@@ -54,6 +59,28 @@ public final class QuantizationMain {
         String library = options.getOrDefault(
                 "library",
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
+        if (args[0].equals("train-model")) {
+            ModelTraining.run(
+                    new ModelTraining.Settings(
+                            Path.of(required(options, "model")),
+                            Path.of(required(options, "codes")),
+                            options.containsKey("norms") ? Path.of(options.get("norms")) : null,
+                            Path.of(required(options, "tokens")),
+                            Path.of(required(options, "out")),
+                            options.containsKey("overlay") ? Path.of(options.get("overlay")) : null,
+                            Integer.parseInt(options.getOrDefault("sequences", "218")),
+                            Integer.parseInt(options.getOrDefault("holdout", "18")),
+                            Integer.parseInt(options.getOrDefault("epochs", "1")),
+                            Float.parseFloat(options.getOrDefault("scale-lr", "2e-6")),
+                            Float.parseFloat(options.getOrDefault("norm-lr", "2e-5")),
+                            Integer.parseInt(options.getOrDefault("top-k", "64")),
+                            Integer.parseInt(options.getOrDefault("evaluate-every", "50")),
+                            Integer.parseInt(options.getOrDefault("probe", "0")),
+                            Integer.parseInt(options.getOrDefault("accumulate", "8")),
+                            Integer.parseInt(options.getOrDefault("batch", "4"))),
+                    Path.of(library));
+            return;
+        }
         if (args[0].equals("train-blocks")) {
             java.util.Set<Integer> layers = new java.util.TreeSet<>();
             String chosen = required(options, "train-layers");
