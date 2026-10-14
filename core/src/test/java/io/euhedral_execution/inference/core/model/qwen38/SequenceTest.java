@@ -402,4 +402,19 @@ class SequenceTest {
                 () -> sequence.useKvFormat(io.euhedral_execution.inference.core.state.KvFormat.NVFP4));
         held.commit(0);
     }
+
+    @Test
+    void aSequencesCaptureFingerprintCarriesItsCacheFormat() {
+        long[] values = new long[2];
+        var formats = io.euhedral_execution.inference.core.state.KvFormat.values();
+        for (int index = 0; index < 2; index++) {
+            var states = AttentionStates.allocate(
+                    new MemoryGpu(), new LayerType[] {LayerType.FULL_ATTENTION}, 256, false, formats[index]);
+            var fingerprint = new io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint();
+            states.fingerprint(fingerprint);
+            values[index] = fingerprint.value();
+            states.close();
+        }
+        assertFalse(values[0] == values[1], "graphs captured over one cache format never replay over the other");
+    }
 }

@@ -693,4 +693,20 @@ class QuantumTest {
         assertEquals(Sequence.TerminalState.FAILED, context.sequenceState().terminalState());
         runtime.close();
     }
+
+    @Test
+    void aQuantumRefusesMixedCacheFormats() {
+        var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
+        var nvfp4 = new Sequence(1);
+        var bf16 = new Sequence(2);
+        bf16.useKvFormat(io.euhedral_execution.inference.core.state.KvFormat.BF16);
+        var failure = assertThrows(
+                IllegalArgumentException.class,
+                () -> Quantum.batch(
+                        plan,
+                        Quantum.ExecutionKind.DECODE,
+                        List.of(new Quantum.Part(nvfp4, 0, new int[] {1}), new Quantum.Part(bf16, 0, new int[] {2})),
+                        LogitsRequirement.NONE));
+        assertEquals("a batched quantum's sequences keep their caches in one format", failure.getMessage());
+    }
 }

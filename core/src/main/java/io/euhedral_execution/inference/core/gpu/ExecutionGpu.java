@@ -731,6 +731,94 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("BF16 causal attention is not implemented");
     }
 
+    /// [#attentionKvAppendNvfp4] or [#attentionKvAppendBf16], by the cache's `format`.
+    public final void attentionKvAppend(
+            io.euhedral_execution.inference.core.state.KvFormat format,
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            int rows,
+            int queryWidth,
+            int keyValueWidth,
+            long startPosition,
+            long positionAddress) {
+        switch (format) {
+            case NVFP4 ->
+                attentionKvAppendNvfp4(
+                        queryKeyAddress,
+                        gateValueAddress,
+                        keyCacheAddress,
+                        valueCacheAddress,
+                        rows,
+                        queryWidth,
+                        keyValueWidth,
+                        startPosition,
+                        positionAddress);
+            case BF16 ->
+                attentionKvAppendBf16(
+                        queryKeyAddress,
+                        gateValueAddress,
+                        keyCacheAddress,
+                        valueCacheAddress,
+                        rows,
+                        queryWidth,
+                        keyValueWidth,
+                        startPosition,
+                        positionAddress);
+        }
+    }
+
+    /// [#attentionCausalNvfp4] or [#attentionCausalBf16], by the cache's `format`.
+    public final void attentionCausal(
+            io.euhedral_execution.inference.core.state.KvFormat format,
+            long queryKeyAddress,
+            long gateValueAddress,
+            long keyCacheAddress,
+            long valueCacheAddress,
+            long outputAddress,
+            int rows,
+            int queryHeads,
+            int keyValueHeads,
+            int headDim,
+            int cacheLength,
+            long startPosition,
+            long positionAddress,
+            long scratchAddress) {
+        switch (format) {
+            case NVFP4 ->
+                attentionCausalNvfp4(
+                        queryKeyAddress,
+                        gateValueAddress,
+                        keyCacheAddress,
+                        valueCacheAddress,
+                        outputAddress,
+                        rows,
+                        queryHeads,
+                        keyValueHeads,
+                        headDim,
+                        cacheLength,
+                        startPosition,
+                        positionAddress,
+                        scratchAddress);
+            case BF16 ->
+                attentionCausalBf16(
+                        queryKeyAddress,
+                        gateValueAddress,
+                        keyCacheAddress,
+                        valueCacheAddress,
+                        outputAddress,
+                        rows,
+                        queryHeads,
+                        keyValueHeads,
+                        headDim,
+                        cacheLength,
+                        startPosition,
+                        positionAddress,
+                        scratchAddress);
+        }
+    }
+
     /// Whether the device runs stream memory operations ([#waitHostFlag], [#writeHostFlag]).
     public boolean streamMemoryOps() {
         return false;

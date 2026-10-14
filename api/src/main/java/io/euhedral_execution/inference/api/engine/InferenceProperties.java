@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
@@ -15,7 +16,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /// engine keeps device memory for that much context and holds back weights in pinned host memory when
 /// the GPU cannot fit both. `prefixCacheBytes` is the pinned host memory that keeps the state of earlier prompts,
 /// so a request sharing a prefix with one of them prefills only what follows (default 4 GiB, 0 turns it off);
-/// `prefixCacheCheckpointTokens` is the prompt tokens between stored checkpoints, a multiple of 512.
+/// `prefixCacheCheckpointTokens` is the prompt tokens between stored checkpoints, a multiple of 512. `kvCache` is the
+/// format of the attention cache, `nvfp4` or `bf16`; unset, the artifact's (NVFP4).
 @ConfigurationProperties("euhedral.inference")
 public record InferenceProperties(
         Path artifactPath,
@@ -26,7 +28,8 @@ public record InferenceProperties(
         @DefaultValue("10s") Duration shutdownTimeout,
         String modelId,
         @DefaultValue("4294967296") long prefixCacheBytes,
-        @DefaultValue("2048") int prefixCacheCheckpointTokens) {
+        @DefaultValue("2048") int prefixCacheCheckpointTokens,
+        KvFormat kvCache) {
 
     public InferenceProperties {
         require(artifactPath, "artifact-path");
@@ -56,7 +59,8 @@ public record InferenceProperties(
                 this.maxContextTokens,
                 this.shutdownTimeout,
                 this.prefixCacheBytes,
-                this.prefixCacheCheckpointTokens);
+                this.prefixCacheCheckpointTokens,
+                this.kvCache);
     }
 
     static BitSet parseCpus(String specification) {

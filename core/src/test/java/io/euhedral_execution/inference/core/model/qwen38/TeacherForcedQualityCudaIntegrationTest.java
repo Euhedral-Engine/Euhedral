@@ -69,16 +69,7 @@ class TeacherForcedQualityCudaIntegrationTest {
             int vocabulary = model.weights().config().vocabSize();
             try {
                 double nll = record(
-                        runtime,
-                        gpu,
-                        plan,
-                        new Sequence(1),
-                        document,
-                        prefix,
-                        steps,
-                        vocabulary,
-                        rows,
-                        Path.of(report));
+                        runtime, gpu, plan, sequence(), document, prefix, steps, vocabulary, rows, Path.of(report));
                 System.out.printf(
                         Locale.ROOT,
                         "quality %s: %d forced tokens after %d, mean NLL %.5f nats%n",
@@ -219,5 +210,13 @@ class TeacherForcedQualityCudaIntegrationTest {
                 .get(600, TimeUnit.SECONDS);
         if (outcome.status() != Quantum.Status.SUCCESS) throw new AssertionError(outcome.failure());
         return captured.get();
+    }
+
+    /// A sequence whose attention caches are in `euhedral.quality.kv-cache` (`nvfp4`, the default, or `bf16`).
+    private static Sequence sequence() {
+        var sequence = new Sequence(1);
+        sequence.useKvFormat(io.euhedral_execution.inference.core.state.KvFormat.valueOf(
+                System.getProperty("euhedral.quality.kv-cache", "nvfp4").toUpperCase(Locale.ROOT)));
+        return sequence;
     }
 }

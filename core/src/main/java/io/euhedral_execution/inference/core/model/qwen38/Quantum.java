@@ -178,9 +178,9 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
 
     /// A quantum of several sequences' rows (decode or verification), run as one graph: every linear reads its
     /// weights once for all of them, and each row is computed as in a quantum of its own sequence (bit for bit, for
-    /// verification). Each sequence must have nothing else in flight when the quantum is admitted; it commits all
-    /// its rows. Logits are every row's ([LogitsRequirement#ALL_TOKENS], in part order) or none; it is never
-    /// captured.
+    /// verification). The sequences keep their attention caches in one format. Each sequence must have nothing else
+    /// in flight when the quantum is admitted; it commits all its rows. Logits are every row's
+    /// ([LogitsRequirement#ALL_TOKENS], in part order) or none; it is never captured.
     public static Quantum batch(
             ExecutionPlan plan, ExecutionKind kind, java.util.List<Part> parts, LogitsRequirement logits) {
         return new Quantum(plan, kind, parts, logits);
@@ -205,6 +205,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             for (int other = 0; other < index; other++)
                 if (parts.get(other).sequence() == part.sequence())
                     throw new IllegalArgumentException("a batched quantum takes each sequence once");
+            if (part.sequence().kvFormat() != parts.get(0).sequence().kvFormat())
+                throw new IllegalArgumentException("a batched quantum's sequences keep their caches in one format");
             this.segments[index] =
                     new Segment(index, part.sequence(), part.startPosition(), part.tokenIds().length, rows);
             rows += part.tokenIds().length;

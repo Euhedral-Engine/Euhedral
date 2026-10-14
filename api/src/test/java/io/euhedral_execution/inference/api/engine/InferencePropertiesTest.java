@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.BitSet;
@@ -23,7 +24,7 @@ class InferencePropertiesTest {
         expected.set(2, 6);
         expected.set(8);
         assertEquals(expected, InferenceProperties.parseCpus(" 2-5, 8 ,"));
-        var config = new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048)
+        var config = new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048, null)
                 .toInferenceConfig();
         assertEquals(BitSet.valueOf(new long[] {1L << 3}), config.workerCpus());
         assertEquals(Duration.ofSeconds(4), config.shutdownTimeout());
@@ -37,10 +38,10 @@ class InferencePropertiesTest {
         assertThrows(IllegalArgumentException.class, () -> InferenceProperties.parseCpus(" , "));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceProperties(null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048));
+                () -> new InferenceProperties(null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048, null));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceProperties(PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048));
+                () -> new InferenceProperties(PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048, null));
     }
 
     private static InferenceProperties bind(Map<String, String> overrides) {
@@ -82,6 +83,22 @@ class InferencePropertiesTest {
                 bind(Map.of("euhedral.inference.prefix-cache-checkpoint-tokens", "4096"))
                         .toInferenceConfig()
                         .prefixCacheCheckpointTokens());
+    }
+
+    @Test
+    void theCacheFormatIsTheArtifactsUnlessBound() {
+        assertEquals(null, bind(Map.of()).toInferenceConfig().kvCache());
+        assertEquals(
+                KvFormat.BF16,
+                bind(Map.of("euhedral.inference.kv-cache", "bf16"))
+                        .toInferenceConfig()
+                        .kvCache());
+        assertEquals(
+                KvFormat.NVFP4,
+                bind(Map.of("euhedral.inference.kv-cache", "nvfp4"))
+                        .toInferenceConfig()
+                        .kvCache());
+        assertThrows(BindException.class, () -> bind(Map.of("euhedral.inference.kv-cache", "fp8")));
     }
 
     @Test
