@@ -12,7 +12,6 @@ namespace {
 constexpr int kE4m3Codes = 127;
 constexpr int kNvfp4Block = 16;
 constexpr int kSearchBelow = 6;
-constexpr int kSearchAbove = 2;
 constexpr int kSd4Above = 40;
 
 __device__ __forceinline__ float e2m1_value(int index) {
@@ -124,10 +123,11 @@ extern "C" __global__ void grouped_choose(const float* values, int ld, const flo
 
 // The NVFP4 block scale of one 16-column block per row: values [rows, ld], weights [16]. With `table` (16 E4M3
 // codes, SD4) the least-error entry at most `below` codes under the nearest scale, the first on ties; without it the
-// least-error code from SEARCH_BELOW under to SEARCH_ABOVE over the nearest (search_nvfp4_rows_torch). Writes the
-// stored code (table index for SD4) and the absolute decode e4m3 * global scale.
+// least-error code from SEARCH_BELOW under to `above` over the nearest (search_nvfp4_rows_torch). Writes the stored
+// code (table index for SD4) and the absolute decode e4m3 * global scale.
 extern "C" __global__ void nvfp4_choose(const float* values, int ld, const float* weights, int rows, float global_scale,
-                                        const unsigned char* table, int below, unsigned char* code_out, float* decode_out,
+                                        const unsigned char* table, int below, int above, unsigned char* code_out,
+                                        float* decode_out,
                                         int out_stride) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
@@ -147,7 +147,7 @@ extern "C" __global__ void nvfp4_choose(const float* values, int ld, const float
     } else {
         code = nearest;
         float best_error = block_error(x, weights, __fmul_rn(e4m3_value(nearest), global_scale));
-        for (int offset = -kSearchBelow; offset <= kSearchAbove; offset++) {
+        for (int offset = -kSearchBelow; offset <= above; offset++) {
             if (offset == 0) continue;
             int candidate = min(max(nearest + offset, 0), kE4m3Codes - 1);
             float error = block_error(x, weights, __fmul_rn(e4m3_value(candidate), global_scale));

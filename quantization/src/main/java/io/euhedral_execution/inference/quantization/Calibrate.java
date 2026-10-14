@@ -58,7 +58,8 @@ public final class Calibrate {
             int batch,
             int sequences,
             int layers,
-            boolean skipMtp) {}
+            boolean skipMtp,
+            Gptq.Nvfp4Search nvfp4) {}
 
     private static final int HEAD_ROWS = 16384;
     private static final int CHECKPOINT_EVERY = 8;
@@ -85,7 +86,7 @@ public final class Calibrate {
         this.device = device;
         this.lattice = lattice;
         this.checkpoint = checkpoint;
-        this.gptq = new Gptq(device.cuda, device.gpu, device.stream);
+        this.gptq = new Gptq(device.cuda, device.gpu, device.stream, settings.nvfp4());
         this.gatherRows =
                 device.cuda.compileResource("rows.cu", List.of("gather_rows")).getFirst();
         this.hidden = checkpoint.config.hidden();
@@ -246,7 +247,8 @@ public final class Calibrate {
         String name = names.get(index);
         return lattice.<Void>submit(() -> {
                     long stream = device.bindOwnStream();
-                    Gptq own = streamGptq.computeIfAbsent(stream, s -> new Gptq(device.cuda, device.gpu, s));
+                    Gptq own = streamGptq.computeIfAbsent(
+                            stream, s -> new Gptq(device.cuda, device.gpu, s, settings.nvfp4()));
                     long[] shape = layer.shapes.get(name);
                     try {
                         decoded.put(

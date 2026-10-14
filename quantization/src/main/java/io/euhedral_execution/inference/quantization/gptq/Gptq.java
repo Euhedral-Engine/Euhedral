@@ -19,7 +19,20 @@ public final class Gptq implements AutoCloseable {
 
     public static final int BLOCK = 128;
     private static final int SEARCH_BELOW = 6;
-    private static final float E2M1_MAX_TIMES_E4M3_MAX = 2688.0f;
+    private static final float E2M1_MAX = 6.0f;
+
+    /// The NVFP4 block-scale search: a block may take a scale up to `above` E4M3 codes over the nearest one (always
+    /// down to SEARCH_BELOW under it), and the tensor's global scale maps its largest magnitude to E2M1's 6 times
+    /// `scaleMax` (E4M3's 448 by default; a smaller one leaves the blocks with the largest values codes to search
+    /// above).
+    public record Nvfp4Search(int above, float scaleMax) {
+        public static final Nvfp4Search DEFAULT = new Nvfp4Search(2, 448.0f);
+
+        public Nvfp4Search {
+            if (above < 0 || scaleMax <= 0 || scaleMax > 448.0f)
+                throw new IllegalArgumentException("invalid NVFP4 search");
+        }
+    }
 
     /// A storage format: grouped (Q3/Q4/Q5 G64, codes qmin..qmax) or NVFP4 (block 16, optionally SD4).
     public record Format(String name, String layout, int group, int qmin, int qmax, boolean nvfp4, boolean sd4) {
@@ -51,6 +64,7 @@ public final class Gptq implements AutoCloseable {
     private final Cuda cuda;
     private final CudaGpuMemory gpu;
     private final long stream;
+    private final Nvfp4Search search;
     private final long cublas, cusolver;
     private final Cuda.Function groupedChoose,
             nvfp4Choose,
@@ -69,6 +83,11 @@ public final class Gptq implements AutoCloseable {
             fillBytes;
 
     public Gptq(Cuda cuda, CudaGpuMemory gpu, long stream) {
+        this(cuda, gpu, stream, Nvfp4Search.DEFAULT);
+    }
+
+    public Gptq(Cuda cuda, CudaGpuMemory gpu, long stream, Nvfp4Search search) {
+        this.search = search;
         this.cuda = cuda;
         this.gpu = gpu;
         this.stream = stream;
@@ -254,7 +273,7 @@ public final class Gptq implements AutoCloseable {
         } finally {
             gpu.free(amax);
         }
-        float global = largest / E2M1_MAX_TIMES_E4M3_MAX;
+        float global = largest / (E2M1_MAX * search.scaleMax());
         if (!format.sd4()) return new TensorScales(global, null);
         if (global <= 0) {
             byte[] identity = new byte[Sd4Table.ENTRIES];
@@ -633,6 +652,7 @@ public final class Gptq implements AutoCloseable {
                             .real(tensor.globalScale())
                             .pointer(tableDevice)
                             .integer(SEARCH_BELOW)
+                            .integer(search.above())
                             .pointer(scales + g)
                             .pointer(decodes + 4L * g)
                             .integer(groups));
