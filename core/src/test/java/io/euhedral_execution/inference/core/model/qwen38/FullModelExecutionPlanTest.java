@@ -122,18 +122,13 @@ class FullModelExecutionPlanTest {
     @Test
     void eachGroupedProjectionRunsTheKernelOfItsOwnFormat() {
         // Q4 value_z, Q4 mixer outputs, and Q4 down projections in the first and last eight layers.
-        formatOverride = name -> name.endsWith("/gdn/value_z")
+        java.util.function.Function<String, WeightFormat> override = name -> name.endsWith("/gdn/value_z")
                         || name.endsWith("/gdn/output")
                         || name.endsWith("/attention/output")
                         || name.matches("text/layers/([0-7]|5[6-9]|6[0-3])/mlp/down")
                 ? WeightFormat.Q4_G64_FP16
                 : null;
-        Weights weights;
-        try {
-            weights = fullModelWeights();
-        } finally {
-            formatOverride = name -> null;
-        }
+        Weights weights = fullModelWeights(name -> false, name -> false, override);
         ExecutionPlan plan = new ExecutionPlan(weights);
 
         java.util.Map<ExecutionPlan.Kind, Long> kinds = plan.instructions().stream()
@@ -216,13 +211,24 @@ class FullModelExecutionPlanTest {
     /// Weights whose `host` objects are host-backed and `disk` objects disk-backed, each at an unaligned offset.
     static Weights fullModelWeights(
             java.util.function.Predicate<String> host, java.util.function.Predicate<String> disk) {
+        return fullModelWeights(host, disk, name -> null);
+    }
+
+    /// As above, with `override` choosing grouped formats. Test classes run concurrently and the builder reads
+    /// static choices, so builds take turns.
+    private static synchronized Weights fullModelWeights(
+            java.util.function.Predicate<String> host,
+            java.util.function.Predicate<String> disk,
+            java.util.function.Function<String, WeightFormat> override) {
         hostBacked = host;
         diskBacked = disk;
+        formatOverride = override;
         try {
             return buildFullModelWeights();
         } finally {
             hostBacked = name -> false;
             diskBacked = name -> false;
+            formatOverride = name -> null;
         }
     }
 

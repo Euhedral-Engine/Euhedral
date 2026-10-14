@@ -42,6 +42,10 @@ public final class Execution implements AutoCloseable {
 
     private static final Consumer<Quantum> NO_TERMINAL_CONSUMER = ignored -> {};
 
+    /// How long the device must leave the window's flags alone at shutdown, and the longest the release runs.
+    private static final long RELEASE_QUIET_NANOS = 100_000_000L;
+    private static final long RELEASE_BOUND_NANOS = 10_000_000_000L;
+
     private final ExecutionPlan plan;
     private final ExecutionGpu gpu;
     private final InferenceLake lake;
@@ -407,6 +411,16 @@ public final class Execution implements AutoCloseable {
             } catch (RuntimeException closeFailure) {
                 if (failure == null) failure = closeFailure;
                 else failure.addSuppressed(closeFailure);
+            }
+        }
+        // Every quantum retired, so the device holds no flag wait; should one remain, the window's flags are raised
+        // until the device leaves them alone, so freeing the workspace never waits on a read that will not come.
+        if (this.diskReader != null && this.gpu.completionProven()) {
+            try {
+                this.diskReader.releaseDevice(RELEASE_QUIET_NANOS, RELEASE_BOUND_NANOS);
+            } catch (RuntimeException releaseFailure) {
+                if (failure == null) failure = releaseFailure;
+                else failure.addSuppressed(releaseFailure);
             }
         }
         // Every quantum retired: the workspace is idle. A poisoned GPU keeps it, as it keeps the graphs' storage.

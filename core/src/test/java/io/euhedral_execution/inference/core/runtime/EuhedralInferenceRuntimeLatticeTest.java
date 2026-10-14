@@ -266,6 +266,26 @@ class EuhedralInferenceRuntimeLatticeTest {
     }
 
     @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aQuantumAdmittedAfterTheRuntimeClosedIsRefusedAndNeverRuns() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.weights());
+        var gpu = new ConcurrentGpu();
+        var runtime = new Execution(new PullingLattice(), plan, gpu);
+        var sequence = new Sequence(705);
+        var first =
+                runtime.execute(List.of(new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1})));
+        assertEquals(Quantum.Status.SUCCESS, first.getFirst().status());
+        // The runtime closed while the lake still takes frames: an admission that runs now finds the decode graph
+        // idle, and must not start it, since nothing waits for it any more.
+        runtime.runtime().close();
+        var late = runtime.submit(new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 1, new int[] {1}));
+        var outcome = late.get(10, TimeUnit.SECONDS);
+        assertEquals(Quantum.Status.FAILED, outcome.status());
+        assertEquals(0, runtime.activeQuanta());
+        runtime.close();
+    }
+
+    @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void euhedralWorkersRunIndependentSequencesAndProjectionsInParallel() throws Exception {
         BitSet cpus = twoWorkerCpus();

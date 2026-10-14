@@ -332,6 +332,35 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         }
     }
 
+    /// Shutdown only, on the closing thread, after [#close] and once no quantum can be admitted: raises every
+    /// free window slot unread until the device leaves the flags alone for `quietNanos` (or `boundNanos`
+    /// passed), so no flag wait the device still holds outlives the window. A raised slot the device lowers is
+    /// raised again. Returns the slots it raised that the device then consumed: 0 when every wait was already
+    /// satisfied.
+    public int releaseDevice(long quietNanos, long boundNanos) {
+        if (!this.closed) throw new IllegalStateException("the disk reader releases the device only once closed");
+        long start = System.nanoTime();
+        long quietSince = start;
+        int consumed = 0;
+        boolean[] raised = new boolean[DiskWindow.SLOTS];
+        while (true) {
+            long now = System.nanoTime();
+            for (int slot = 0; slot < DiskWindow.SLOTS; slot++) {
+                if (this.window.flag(slot) != 0) continue;
+                if (raised[slot]) {
+                    consumed++;
+                    quietSince = now;
+                }
+                this.window.raise(slot);
+                raised[slot] = true;
+            }
+            if (now - quietSince >= quietNanos || now - start >= boundNanos) break;
+            LockSupport.parkNanos(50_000L);
+        }
+        if (consumed > 0) LOG.warn("the device still waited on {} disk-backed weights at shutdown", consumed);
+        return consumed;
+    }
+
     private final class Delegate extends AbstractIngestSink.Delegate {
         @Override
         public long hookOnPull(
