@@ -1,10 +1,10 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.ModelArchitecture;
-import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.model.qwen4.loader.ResidencyPlan;
 import java.io.IOException;

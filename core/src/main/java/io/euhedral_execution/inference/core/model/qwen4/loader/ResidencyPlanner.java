@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4.loader;
 
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Config;
 import io.euhedral_execution.inference.core.model.qwen4.expert.ExpertBank;

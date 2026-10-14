@@ -2,8 +2,8 @@ package io.euhedral_execution.inference.core.model.qwen4;
 
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import io.euhedral_execution.inference.core.artifact.HostBudget;
 import io.euhedral_execution.inference.core.gpu.CudaGpuMemory;
-import io.euhedral_execution.inference.core.model.qwen4.loader.HostBudget;
 import io.euhedral_execution.inference.core.model.qwen4.loader.Mode;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;

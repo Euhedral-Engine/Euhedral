@@ -123,4 +123,14 @@ class ResidencyPlannerTest {
         var without = ResidencyPlanner.plan(artifact(), plain, 64L << 30, 4096);
         assertEquals(120 * MIB, speculative.deviceBytes() - without.deviceBytes());
     }
+
+    @Test
+    void aBf16CacheTakesItsRowsBytesPerToken() {
+        Qwen38Config config = config(2);
+        long nvfp4 =
+                ResidencyPlanner.kvBytes(config, 131072, io.euhedral_execution.inference.core.state.KvFormat.NVFP4);
+        long bf16 = ResidencyPlanner.kvBytes(config, 131072, io.euhedral_execution.inference.core.state.KvFormat.BF16);
+        org.junit.jupiter.api.Assertions.assertEquals(nvfp4, ResidencyPlanner.kvBytes(config, 131072));
+        org.junit.jupiter.api.Assertions.assertEquals(nvfp4 / 144 * 512, bf16);
+    }
 }

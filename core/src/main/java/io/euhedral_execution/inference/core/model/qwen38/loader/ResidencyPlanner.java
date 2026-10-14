@@ -6,6 +6,8 @@ import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.state.AttentionKvState;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.Set;
 
 /// Decides which weights stay on the device so that a context of `maxContextTokens` fits in the memory
@@ -17,45 +19,81 @@ import java.util.Set;
 /// execution workspaces, the shared scratch and the kernel modules loaded after the model.
 public final class ResidencyPlanner {
 
-    /// Bytes of KV cache per token of one NVFP4 attention layer: K and V rows of 144 bytes per 256 values.
-    private static final long KV_BYTES_PER_LAYER_TOKEN = 2L * 144;
-
     /// Everything outside weights and KV that a running sequence needs on the device.
     static final long RESERVE_BYTES = 1280L << 20;
 
     private ResidencyPlanner() {}
 
-    /// The outcome: the objects to keep in host memory, the device bytes the plan needs, and whether it fits.
-    public record Plan(Set<String> hostBacked, long deviceBytes, boolean fits) {}
+    /// The outcome: the objects to keep in host memory and those left in the artifact file, the device bytes the
+    /// plan needs, the pinned host bytes of the host-backed objects (`hostArenaBytes`) and of the disk window
+    /// (`windowBytes`, 0 without disk-backed objects), and whether it fits.
+    public record Plan(
+            Set<String> hostBacked,
+            Set<String> diskBacked,
+            long deviceBytes,
+            long hostArenaBytes,
+            long windowBytes,
+            boolean fits) {
 
-    /// KV bytes of one sequence of `tokens` positions, in whole pages.
+        public Plan(Set<String> hostBacked, long deviceBytes, boolean fits) {
+            this(hostBacked, Set.of(), deviceBytes, 0L, 0L, fits);
+        }
+    }
+
+    /// NVFP4 KV bytes of one sequence of `tokens` positions, in whole pages.
     public static long kvBytes(Qwen38Config config, int tokens) {
+        return kvBytes(config, tokens, KvFormat.NVFP4);
+    }
+
+    /// KV bytes of one sequence of `tokens` positions in `format`, in whole pages.
+    public static long kvBytes(Qwen38Config config, int tokens, KvFormat format) {
         long layers = 0;
         for (LayerType type : config.layerTypes()) if (type == LayerType.FULL_ATTENTION) layers++;
         long pages = (tokens + 255L) / 256L;
-        long widthUnits = (long) config.numKeyValueHeads() * config.attentionHeadDim() / 256L;
-        return layers * pages * 256L * KV_BYTES_PER_LAYER_TOKEN * widthUnits;
+        int width = config.numKeyValueHeads() * config.attentionHeadDim();
+        return Math.multiplyExact(layers * pages, 2 * AttentionKvState.planePageBytes(width, format));
+    }
+
+    /// Plans residency with at most `hostBytes` of pinned host memory and a KV cache in `kvFormat`: objects
+    /// beyond what the device and that host memory hold are left in the artifact file. The disk tier is planned
+    /// by the offload work; until then, nothing is disk-backed and the host budget is not enforced.
+    public static Plan plan(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat) {
+        return plan(artifact, profile, freeBytes, maxContextTokens, kvFormat);
     }
 
     /// Plans residency for `artifact` on a device with `freeBytes` free, or returns the plan that comes
     /// closest (`fits` false) when even the largest host-backed selection does not make room.
     public static Plan plan(Artifact artifact, ArtifactProfile profile, long freeBytes, int maxContextTokens) {
-        long fixed = kvBytes(artifact.config(), maxContextTokens) + RESERVE_BYTES;
+        return plan(artifact, profile, freeBytes, maxContextTokens, KvFormat.NVFP4);
+    }
+
+    private static Plan plan(
+            Artifact artifact, ArtifactProfile profile, long freeBytes, int maxContextTokens, KvFormat kvFormat) {
+        long fixed = kvBytes(artifact.config(), maxContextTokens, kvFormat) + RESERVE_BYTES;
         Plan resident = deviceNeed(artifact, profile, Set.of());
-        if (resident.deviceBytes() + fixed <= freeBytes) return withFixed(resident, fixed, true);
+        if (resident.deviceBytes() + fixed <= freeBytes) return withFixed(artifact, resident, fixed, true);
         long all = artifactBytes(artifact, profile);
         // Grow the host-backed bytes until the device need fits. The ring grows with the largest selected
         // tensor, so each step re-evaluates the whole selection.
         long step = 64L << 20;
         for (long bytes = step; ; bytes += step) {
             Plan candidate = deviceNeed(artifact, profile, HostWeightSelection.select(artifact, bytes));
-            if (candidate.deviceBytes() + fixed <= freeBytes) return withFixed(candidate, fixed, true);
-            if (bytes > all) return withFixed(candidate, fixed, false);
+            if (candidate.deviceBytes() + fixed <= freeBytes) return withFixed(artifact, candidate, fixed, true);
+            if (bytes > all) return withFixed(artifact, candidate, fixed, false);
         }
     }
 
-    private static Plan withFixed(Plan plan, long fixed, boolean fits) {
-        return new Plan(plan.hostBacked(), plan.deviceBytes() + fixed, fits);
+    private static Plan withFixed(Artifact artifact, Plan plan, long fixed, boolean fits) {
+        long host = 0;
+        for (TensorDescriptor tensor : artifact.tensors())
+            if (plan.hostBacked().contains(tensor.name())) host += tensor.byteSize();
+        return new Plan(plan.hostBacked(), Set.of(), plan.deviceBytes() + fixed, host, 0L, fits);
     }
 
     private static long artifactBytes(Artifact artifact, ArtifactProfile profile) {
