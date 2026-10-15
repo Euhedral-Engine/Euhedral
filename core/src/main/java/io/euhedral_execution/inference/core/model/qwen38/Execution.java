@@ -171,18 +171,18 @@ public final class Execution implements AutoCloseable {
         return uses;
     }
 
-    /// The bytes the quantum that runs `shape` copies into the staging ring.
-    static long transferBytes(GraphShape shape) {
-        if (shape instanceof Shape view) return view.transferBytes();
-        if (shape instanceof CheckpointView checkpointed)
-            return checkpointed.view().transferBytes();
+    /// The bytes the quantum that runs `shape` copies into the staging ring, or reads from disk when `disk`.
+    static long weightBytes(GraphShape shape, boolean disk) {
+        if (shape instanceof Shape view) return disk ? view.diskReadBytes() : view.transferBytes();
+        if (shape instanceof CheckpointView checkpointed) return weightBytes(checkpointed.view(), disk);
         if (!(shape instanceof ChunkedShape chunked)) return 0;
         long bytes = 0;
-        for (int chunk = 0; chunk < chunked.chunks(); chunk++) bytes += transferBytes(chunked.template(chunk));
+        for (int chunk = 0; chunk < chunked.chunks(); chunk++) bytes += weightBytes(chunked.template(chunk), disk);
         return bytes;
     }
 
-    /// The counts of the quanta of `kind` admitted so far.
+    /// The counts of the quanta of `kind` admitted so far; each counter is read independently, so they are not a
+    /// consistent snapshot.
     public PassStatistics statistics(Quantum.ExecutionKind kind) {
         int base = kind.ordinal() * COUNTERS;
         return new PassStatistics(
@@ -208,14 +208,13 @@ public final class Execution implements AutoCloseable {
         }
     }
 
-    private void count(Quantum context, GraphShape admitted, List<DiskUse> uses) {
+    private void count(Quantum context, GraphShape admitted) {
         int base = context.kind().ordinal() * COUNTERS;
         boolean batched = context.batched();
         long segments = batched ? context.segments().length : 1;
         long rows = context.inputTokenCount();
-        long disk = 0;
-        for (DiskUse use : uses) disk += use.readBytes();
-        long transfer = transferBytes(admitted);
+        long disk = this.diskReader == null ? 0 : weightBytes(admitted, true);
+        long transfer = weightBytes(admitted, false);
         this.counters.incrementAndGet(base + QUANTA);
         if (batched) this.counters.incrementAndGet(base + BATCHED);
         this.counters.addAndGet(base + SEGMENTS, segments);
@@ -357,7 +356,6 @@ public final class Execution implements AutoCloseable {
                 context.chunkCount() > 1 || !context.checkpointChunks().isEmpty() ? this.prompts.shape(context) : view;
         // Its disk uses are registered once it started, in admission order: the order of each window slot's copies.
         List<DiskUse> uses = this.diskReader == null ? List.of() : diskUses(admitted);
-        count(context, admitted, uses);
         long ticket = uses.isEmpty() ? -1 : this.nextDiskTicket++;
         if (ticket >= 0) context.readsFromDisk(this.diskReader, ticket);
         boolean[] began = new boolean[1];
@@ -372,9 +370,11 @@ public final class Execution implements AutoCloseable {
             // Refused after its graph started publishing: the failure drains what its stages leave, so the
             // reader must read its uses. Refused before: no stage of it runs, and nothing may be read for it.
             if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
+            if (context.stagesPublished()) count(context, admitted);
             return refused;
         }
         if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
+        count(context, admitted);
         return null;
     }
 
