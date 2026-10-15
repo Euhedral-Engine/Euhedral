@@ -76,7 +76,8 @@ class LinearFormatsTest {
 
     @Test
     void theRegistryHoldsExactlyTheSevenKeys() {
-        assertEquals(ROWS.size(), LinearFormats.all().size());
+        // The seven rows below and the trellis format, whose row is checked on its own.
+        assertEquals(ROWS.size() + 1, LinearFormats.all().size());
         for (Row row : ROWS) {
             LinearFormat format = format(row);
             assertEquals(row.format(), format.format(), row.label());
@@ -97,6 +98,42 @@ class LinearFormatsTest {
         assertTrue(LinearFormats.quantized(NVFP4));
         assertFalse(LinearFormats.quantized(BF16));
         assertFalse(LinearFormats.quantized(WeightFormat.FP16));
+    }
+
+    @Test
+    void theTrellisRowAnswersItsStorageQuestions() {
+        LinearFormat trellis = LinearFormats.find(WeightFormat.TRELLIS, WeightLayout.TRELLIS_TILE16_V1)
+                .orElseThrow();
+        assertTrue(trellis.stageable());
+        assertEquals(Quantization.TRELLIS, trellis.quantization());
+        assertFalse(trellis.compressed());
+        assertFalse(trellis.gateUpRegion());
+        assertTrue(trellis.splitsRows());
+        assertEquals(List.of("o.suh", "o.svh", "o.segments"), trellis.companions("o"));
+        long[] gateUp = {320, 2176, 56};
+        assertEquals(
+                320L * 2176 * 56 * 2,
+                CompactTensorLayout.expectedByteSize(
+                        gateUp, TensorDataType.BF16, WeightFormat.TRELLIS, WeightLayout.TRELLIS_TILE16_V1));
+        assertTrue(CompactTensorLayout.acceptsByteSize(
+                gateUp,
+                TensorDataType.BF16,
+                WeightFormat.TRELLIS,
+                WeightLayout.TRELLIS_TILE16_V1,
+                320L * 2176 * 56 * 2));
+        TensorDescriptor payload = new TensorDescriptor(
+                "text/layers/3/mlp/gate_up",
+                gateUp,
+                TensorDataType.BF16,
+                WeightFormat.TRELLIS,
+                WeightLayout.TRELLIS_TILE16_V1,
+                0,
+                320L * 2176 * 56 * 2);
+        assertTrue(HostWeightSelection.stageable(payload));
+        assertEquals(
+                Quantization.TRELLIS,
+                ArtifactProfile.of(new Artifact(null, null, new TensorDescriptor[] {payload}))
+                        .quantization());
     }
 
     @Test

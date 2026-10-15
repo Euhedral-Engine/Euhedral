@@ -1,8 +1,10 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
@@ -19,7 +21,8 @@ import java.util.Set;
 ///
 /// The device budget is the resident weights, the staging ring for host-backed projections, the KV pages
 /// of every sequence of `maxContextTokens`, a fixed reserve for the first sequence's GDN state, the
-/// execution workspaces, the shared scratch and the kernel modules loaded after the model.
+/// execution workspaces, the shared scratch, the prefill scratch of the largest trellis object (zero for other
+/// artifacts) and the kernel modules loaded after the model.
 ///
 /// The LM head (the one object too large for the staging slots) leaves the device last: it is mapped into host
 /// memory and read in place over the bus, once per pass whatever the sequence count, when everything else
@@ -131,6 +134,7 @@ public final class ResidencyPlanner {
                         Math.multiplyExact(sequences, kvBytes(artifact.config(), maxContextTokens, kvFormat)),
                         RESERVE_BYTES),
                 Math.multiplyExact(sequences - 1L, extra));
+        fixed = Math.addExact(fixed, trellisScratchBytes(artifact, profile));
         TensorDescriptor head = headOf(artifact);
         // A mapped NVFP4 head is swept over the bus once per row when a verification outgrows the decode kernels.
         boolean mappable = head != null
@@ -182,6 +186,19 @@ public final class ResidencyPlanner {
             else high = middle - 1;
         }
         return low;
+    }
+
+    /// The scratch the prefill route of the largest trellis object needs at a prefill chunk of rows (decoded weight,
+    /// rotated activations and outputs); 0 for an artifact with no trellis object.
+    static long trellisScratchBytes(Artifact artifact, ArtifactProfile profile) {
+        long largest = 0;
+        for (TensorDescriptor tensor : artifact.tensors()) {
+            if (tensor.format() != WeightFormat.TRELLIS
+                    || !CompactWeightLoader.uploads(tensor.name(), profile.speculation())) continue;
+            largest = Math.max(
+                    largest, LinearFormats.of(tensor).planScratchBytes(tensor, InferenceConfig.PREFILL_CHUNK_TOKENS));
+        }
+        return largest;
     }
 
     /// The LM head's descriptor, or null when the artifact has none.

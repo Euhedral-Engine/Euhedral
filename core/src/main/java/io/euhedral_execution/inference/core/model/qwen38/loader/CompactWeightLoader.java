@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
+import io.euhedral_execution.inference.core.artifact.TensorDataReader;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
@@ -10,6 +11,8 @@ import io.euhedral_execution.inference.core.artifact.WeightLoadException;
 import io.euhedral_execution.inference.core.artifact.format.ExpectedTensor;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
+import io.euhedral_execution.inference.core.artifact.format.TrellisFormat;
+import io.euhedral_execution.inference.core.artifact.format.TrellisLayout;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
@@ -17,6 +20,8 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -47,6 +52,7 @@ final class CompactWeightLoader {
         validateConfig(config);
         DFlash2Config dflash2 = DFlash2Inventory.read(artifactPath, descriptors);
         validateInventory(config, descriptors, dflash2);
+        validateTrellisSegments(artifactPath, descriptors);
         Map<String, TensorHandle> handles =
                 loadObjects(artifactPath, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked);
         try {
@@ -87,6 +93,10 @@ final class CompactWeightLoader {
         if (speculation == ArtifactProfile.Speculation.DFLASH2) mapped.addAll(DFlash2Inventory.MAPPED);
         Set<String> host = new java.util.HashSet<>(hostBacked);
         host.addAll(mapped);
+        // A trellis companion is a few KB that every launch of its object reads: it never leaves the device.
+        Set<String> companions = trellisCompanions(descriptors);
+        for (String name : host)
+            if (companions.contains(name)) throw new IllegalArgumentException(name + " cannot be host-backed");
         for (TensorDescriptor descriptor : descriptors) {
             if (!diskBacked.contains(descriptor.name())) continue;
             if (host.contains(descriptor.name()) || !HostWeightSelection.stageable(descriptor))
@@ -279,17 +289,37 @@ final class CompactWeightLoader {
         LinearFormat format =
                 LinearFormats.find(packed.format(), packed.layout()).orElse(null);
         if (format == null || !format.splitsRows()) return;
-        long half = packed.shape()[0] / 2;
-        handles.put(
-                "mtp/layer/attention/query_key",
-                format.rows(List.of(packed), 0, half, "mtp/layer/attention/query_key", gpu)
-                        .getFirst());
-        handles.put(
-                "mtp/layer/attention/gate_value",
-                format.rows(List.of(packed), half, half, "mtp/layer/attention/gate_value", gpu)
-                        .getFirst());
-        handles.remove(MTP_ATTENTION);
-        gpu.free(packed.deviceAddress());
+        List<TensorHandle> object = group(handles, MTP_ATTENTION);
+        // Rows are the first dimension of the grouped formats; a trellis payload is [k/16, n/16, w].
+        long half = (packed.format() == WeightFormat.TRELLIS ? packed.shape()[1] * 16 : packed.shape()[0]) / 2;
+        List<TensorHandle> first = format.rows(object, 0, half, "mtp/layer/attention/query_key", gpu);
+        List<TensorHandle> second;
+        try {
+            second = format.rows(object, half, half, "mtp/layer/attention/gate_value", gpu);
+        } catch (RuntimeException | Error failure) {
+            for (TensorHandle handle : first) gpu.free(handle.deviceAddress());
+            throw failure;
+        }
+        for (TensorHandle handle : first) handles.put(handle.name(), handle);
+        for (TensorHandle handle : second) handles.put(handle.name(), handle);
+        for (TensorHandle handle : object) {
+            handles.remove(handle.name());
+            gpu.free(handle.deviceAddress());
+        }
+    }
+
+    /// `name`'s tensor and its companions, in the order its format lists them.
+    static List<TensorHandle> group(Map<String, TensorHandle> handles, String name) {
+        TensorHandle object = handles.get(name);
+        if (object == null) throw new IllegalArgumentException("no loaded runtime object '" + name + "'");
+        List<TensorHandle> group = new ArrayList<>(List.of(object));
+        for (String companion : LinearFormats.of(object).companions(name)) {
+            TensorHandle handle = handles.get(companion);
+            if (handle == null)
+                throw new IllegalArgumentException("no loaded companion '" + companion + "' of '" + name + "'");
+            group.add(handle);
+        }
+        return group;
     }
 
     private static MtpWeights buildMtp(Map<String, TensorHandle> handles) throws WeightLoadException {
@@ -331,6 +361,98 @@ final class CompactWeightLoader {
                 take(handles, "mtp/final_norm"));
     }
 
+    private static boolean trellis(TensorDescriptor descriptor) {
+        return descriptor.format() == WeightFormat.TRELLIS && descriptor.layout() == WeightLayout.TRELLIS_TILE16_V1;
+    }
+
+    /// The names of the companion tensors of every trellis object in `descriptors`.
+    static Set<String> trellisCompanions(Map<String, TensorDescriptor> descriptors) {
+        return trellisCompanions(descriptors.values());
+    }
+
+    static Set<String> trellisCompanions(java.util.Collection<TensorDescriptor> descriptors) {
+        Set<String> names = new LinkedHashSet<>();
+        for (TensorDescriptor descriptor : descriptors)
+            if (trellis(descriptor)) names.addAll(LinearFormats.of(descriptor).companions(descriptor.name()));
+        return names;
+    }
+
+    private static final List<String> COMPANION_SUFFIXES =
+            List.of(TrellisFormat.SUH, TrellisFormat.SVH, TrellisFormat.SEGMENTS);
+
+    /// Every trellis object has exactly its three companions, with the dtype, format, layout and shape the
+    /// format names, and no companion stands without its object. Checked on descriptors alone, so a malformed
+    /// artifact is refused before any payload is read or allocated.
+    private static void validateTrellisCompanions(Map<String, TensorDescriptor> descriptors)
+            throws WeightLoadException {
+        for (TensorDescriptor descriptor : descriptors.values()) {
+            if (!trellis(descriptor)) continue;
+            String name = descriptor.name();
+            long n = descriptor.shape()[1] * 16, k = descriptor.shape()[0] * 16;
+            TensorDescriptor suh = companion(descriptors, name, TrellisFormat.SUH, WeightFormat.FP16);
+            TensorDescriptor svh = companion(descriptors, name, TrellisFormat.SVH, WeightFormat.FP16);
+            TensorDescriptor segments = companion(descriptors, name, TrellisFormat.SEGMENTS, WeightFormat.I32);
+            if (suh.shape().length != 2 || suh.shape()[1] != k || suh.shape()[0] < 1)
+                throw new WeightLoadException(
+                        "trellis companion '" + suh.name() + "' must have shape [segments, " + k + "]");
+            if (svh.shape().length != 1 || svh.shape()[0] != n)
+                throw new WeightLoadException("trellis companion '" + svh.name() + "' must have shape [" + n + "]");
+            if (segments.shape().length != 1 || segments.shape()[0] != suh.shape()[0])
+                throw new WeightLoadException("trellis companion '" + segments.name()
+                        + "' must have one end per suh row (" + suh.shape()[0] + ")");
+        }
+        for (TensorDescriptor descriptor : descriptors.values())
+            for (String suffix : COMPANION_SUFFIXES) {
+                String name = descriptor.name();
+                if (!name.endsWith(suffix)) continue;
+                TensorDescriptor owner = descriptors.get(name.substring(0, name.length() - suffix.length()));
+                if (owner == null || !trellis(owner))
+                    throw new WeightLoadException("trellis companion '" + name + "' has no trellis object");
+            }
+    }
+
+    private static TensorDescriptor companion(
+            Map<String, TensorDescriptor> descriptors, String object, String suffix, WeightFormat format)
+            throws WeightLoadException {
+        String name = object + suffix;
+        TensorDescriptor companion = descriptors.get(name);
+        if (companion == null)
+            throw new WeightLoadException("trellis object '" + object + "' is missing its companion '" + name + "'");
+        TensorDataType dataType = format == WeightFormat.I32 ? TensorDataType.INT32 : TensorDataType.FP16;
+        if (companion.format() != format
+                || companion.dataType() != dataType
+                || companion.layout() != WeightLayout.CONTIGUOUS_LE_V1)
+            throw new WeightLoadException(
+                    "trellis companion '" + name + "' must be " + dataType + "/" + format + "/CONTIGUOUS_LE_V1");
+        return companion;
+    }
+
+    /// Reads each trellis object's `.segments` on the host and checks them against the object: strictly
+    /// increasing multiples of 128, the last equal to n, one per `suh` row, at most 8; the packed MTP
+    /// attention projection must also have n/2 as a boundary. Before any device allocation.
+    static void validateTrellisSegments(Path artifactPath, Map<String, TensorDescriptor> descriptors)
+            throws IOException {
+        try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+            for (TensorDescriptor descriptor : descriptors.values()) {
+                if (!trellis(descriptor)) continue;
+                String name = descriptor.name();
+                TensorDescriptor suh = descriptors.get(name + TrellisFormat.SUH);
+                TensorDescriptor segments = descriptors.get(name + TrellisFormat.SEGMENTS);
+                if (suh == null || segments == null) continue;
+                long n = descriptor.shape()[1] * 16;
+                try {
+                    int[] ends = TrellisLayout.readEnds(TensorDataReader.read(artifactPath, segments, arena));
+                    TrellisLayout.validateSegments(ends, n, suh.shape()[0]);
+                    if (name.equals(MTP_ATTENTION) && Arrays.stream(ends).noneMatch(end -> end == n / 2))
+                        throw new IllegalArgumentException("n/2=" + n / 2 + " is not a segment boundary");
+                } catch (IllegalArgumentException invalid) {
+                    throw new WeightLoadException(
+                            "invalid trellis segments '" + segments.name() + "': " + invalid.getMessage());
+                }
+            }
+        }
+    }
+
     /// The text inventory: every object, and no other.
     static void validateInventory(Qwen38Config config, Map<String, TensorDescriptor> descriptors)
             throws WeightLoadException {
@@ -340,7 +462,10 @@ final class CompactWeightLoader {
     /// The text inventory and, with `dflash2`, the DFlash2 drafter's objects: every object, and no other.
     static void validateInventory(Qwen38Config config, Map<String, TensorDescriptor> descriptors, DFlash2Config dflash2)
             throws WeightLoadException {
-        int count = EXPECTED_OBJECT_COUNT + (dflash2 == null ? 0 : DFlash2Inventory.objectCount(dflash2));
+        validateTrellisCompanions(descriptors);
+        int count = EXPECTED_OBJECT_COUNT
+                + (dflash2 == null ? 0 : DFlash2Inventory.objectCount(dflash2))
+                + trellisCompanions(descriptors).size();
         if (descriptors.size() != count) {
             throw new WeightLoadException(
                     "compact Qwen artifact must contain " + count + " runtime objects, found " + descriptors.size());
@@ -390,6 +515,7 @@ final class CompactWeightLoader {
             expected.add("mtp/layer/mlp/gate_up");
             expected.add("mtp/layer/mlp/down");
         }
+        expected.addAll(trellisCompanions(descriptors));
         for (String name : expected) {
             TensorDescriptor descriptor = descriptors.get(name);
             if (descriptor == null) {

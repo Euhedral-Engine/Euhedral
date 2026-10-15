@@ -13,21 +13,25 @@ VERSION = 2
 HEADER_SIZE = 48
 HEADER_FORMAT = ">iiqqqiiq"
 
-DTYPE_ORDINAL = {"BF16": 0, "INT32": 6}
+DTYPE_ORDINAL = {"BF16": 0, "FP16": 1, "INT32": 6}
 FORMAT_ORDINAL = {
     "BF16": 0,
+    "FP16": 1,
     "FP32": 2,
     "I32": 3,
     "Q3G64_F16S": 4,
     "Q4G64_F16S": 5,
     "Q5G64_F16S": 6,
     "NVFP4": 7,
+    "TRELLIS": 8,
 }
 LAYOUT_ORDINAL = {
     "contiguous-le-v1": 0,
     "row-split-k128-v1": 1,
     "row-split-p2e2-v1": 2,
     "row-split-k128-sd4-v1": 3,
+    "row-interleaved-nvfp4-v1": 4,
+    "trellis-tile16-v1": 5,
 }
 FORMAT_Q3 = FORMAT_ORDINAL["Q3G64_F16S"]
 LAYOUT_ROW_SPLIT = LAYOUT_ORDINAL["row-split-k128-v1"]
