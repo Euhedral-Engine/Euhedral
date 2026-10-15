@@ -2,6 +2,8 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Inventory;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
@@ -90,7 +92,7 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
             if (name.startsWith(DFlash2Inventory.PREFIX)) dflash2 = true;
         }
         if (probe == null) throw new IllegalArgumentException("artifact has no text layer FFN projection");
-        Quantization quantization =
+        Quantization family =
                 switch (probe.format()) {
                     case Q3_G64_FP16 -> Quantization.Q3;
                     case NVFP4 -> Quantization.NVFP4;
@@ -100,11 +102,10 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
                                 "unsupported projection format " + probe.format() + "; expected Q3, NVFP4 or BF16");
                 };
         WeightLayout layout = probe.layout();
-        if (quantization == Quantization.Q3 && layout == WeightLayout.ROW_SPLIT_K128_SD4_V1
-                || quantization == Quantization.NVFP4 && layout == WeightLayout.ROW_SPLIT_P2E2_V1
-                || quantization == Quantization.BF16 && layout != WeightLayout.CONTIGUOUS_LE_V1)
-            throw new IllegalArgumentException("layout " + layout + " does not belong to " + quantization);
-        boolean compressed = layout == WeightLayout.ROW_SPLIT_P2E2_V1 || layout == WeightLayout.ROW_SPLIT_K128_SD4_V1;
+        LinearFormat format = LinearFormats.find(probe.format(), layout)
+                .orElseThrow(() -> new IllegalArgumentException("layout " + layout + " does not belong to " + family));
+        Quantization quantization = format.quantization();
+        boolean compressed = format.compressed();
         Speculation speculation = dflash2 ? Speculation.DFLASH2 : mtp && draftHead ? Speculation.MTP : Speculation.NONE;
         return new ArtifactProfile(quantization, compressed, speculation);
     }

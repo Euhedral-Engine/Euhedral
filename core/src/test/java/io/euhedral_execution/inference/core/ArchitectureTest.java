@@ -366,14 +366,19 @@ class ArchitectureTest {
         }
     }
 
+    /// The weight-format seam: the one place in the shared artifact layer that names the dense model's kinds and
+    /// quantizations, because it decides how each format executes ([LinearFormat]).
+    private static final String FORMAT_SEAM = "artifact/format/";
+
     /// The shared artifact layer reads containers and tensors for every model; it knows no model.
     @Test
     void theSharedArtifactLayerKnowsNoModel() throws IOException {
         List<String> violations = new ArrayList<>();
         for (Path file : javaFiles("artifact", true))
-            for (String line : Files.readAllLines(file))
-                if (line.startsWith("import io.euhedral_execution.inference.core.model."))
-                    violations.add(relative(file) + ": " + line);
+            if (!relative(file).startsWith(FORMAT_SEAM))
+                for (String line : Files.readAllLines(file))
+                    if (line.startsWith("import io.euhedral_execution.inference.core.model."))
+                        violations.add(relative(file) + ": " + line);
         assertTrue(violations.isEmpty(), "shared artifact code imports a model:\n" + String.join("\n", violations));
     }
 
@@ -398,7 +403,8 @@ class ArchitectureTest {
                 for (Path file :
                         walk.filter(p -> p.toString().endsWith(".java")).toList()) {
                     String path = tree.getKey().relativize(file).toString().replace('\\', '/');
-                    if (tree.getValue().isEmpty() && path.startsWith("model/")) continue;
+                    if (tree.getValue().isEmpty() && (path.startsWith("model/") || path.startsWith(FORMAT_SEAM)))
+                        continue;
                     String name = tree.getValue() + path;
                     if (importsAModel(file) && !MODEL_IMPORTS_OUTSIDE_MODEL.contains(name)) violations.add(name);
                 }

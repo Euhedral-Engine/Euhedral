@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.runtime.graph.CaptureFingerprint;
@@ -44,12 +46,14 @@ public final class SharedWorkspace implements AutoCloseable {
                 ExecutionPlan.Instruction instruction = shape.instructions().get(stage);
                 scratch = Math.max(
                         scratch,
-                        gpu.scratchBytes(
-                                use,
-                                maxRows,
-                                instruction.inputWidth(),
-                                instruction.outputWidth(),
-                                instruction.weightLayout()));
+                        scratchFormat(instruction)
+                                .scratchBytes(
+                                        gpu,
+                                        use,
+                                        maxRows,
+                                        instruction.inputWidth(),
+                                        instruction.outputWidth(),
+                                        instruction.weights()));
             }
         }
         this.scratchBytes = scratch;
@@ -65,6 +69,13 @@ public final class SharedWorkspace implements AutoCloseable {
             close();
             throw failure;
         }
+    }
+
+    /// The format that sizes `instruction`'s scratch: the one its weights are in ([LinearFormats#routing]).
+    private static LinearFormat scratchFormat(ExecutionPlan.Instruction instruction) {
+        return instruction.weights().isEmpty()
+                ? LinearFormats.routing(null, null)
+                : LinearFormats.routing(instruction.weightFormat(), instruction.weightLayout());
     }
 
     /// The [Workspace] slots of `plan`: every named buffer, the input record, the hidden and normalized state, and

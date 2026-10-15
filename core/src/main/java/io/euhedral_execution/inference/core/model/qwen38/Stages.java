@@ -2,6 +2,10 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
+import io.euhedral_execution.inference.core.artifact.format.LinearLaunch;
+import io.euhedral_execution.inference.core.artifact.format.Nvfp4Format;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
@@ -9,6 +13,7 @@ import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Stat
 import io.euhedral_execution.inference.core.runtime.graph.StageFrame;
 import io.euhedral_execution.inference.core.runtime.graph.StageGraph;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
+import java.util.List;
 import java.util.Objects;
 
 /// The stage frames of 3.8 views: one class per instruction kind, each running its instruction (the stage's spec) on
@@ -19,23 +24,23 @@ public final class Stages {
     /// Rows per call of an NVFP4 linear: all of them, or at most [ExecutionGpu#NVFP4_PLAIN_LOAD_MAX_ROWS] when the
     /// weights are host-mapped, so that no call reaches the tile kernels (TMA over mapped host memory) or the
     /// scalar reference (a sweep of the weights over the bus per row).
-    static int nvfp4RowsPerCall(boolean hostMapped, int rows) {
+    public static int nvfp4RowsPerCall(boolean hostMapped, int rows) {
         return hostMapped ? Math.min(rows, ExecutionGpu.NVFP4_PLAIN_LOAD_MAX_ROWS) : rows;
     }
 
     /// Runs `instruction`'s NVFP4 linear over `rows` rows in the calls [#nvfp4RowsPerCall] allows.
     static void linearNvfp4(
             ExecutionGpu gpu, ExecutionPlan.Instruction instruction, long input, long output, int rows) {
-        int perCall = nvfp4RowsPerCall(instruction.weightHostMapped(), rows);
-        for (int first = 0; first < rows; first += perCall)
-            gpu.linearNvfp4Bf16(
-                    input + (long) first * instruction.inputWidth() * Short.BYTES,
-                    instruction.weightAddress(),
-                    output + (long) first * instruction.outputWidth() * Short.BYTES,
-                    Math.min(perCall, rows - first),
-                    instruction.inputWidth(),
-                    instruction.outputWidth(),
-                    instruction.weightByteSize());
+        Nvfp4Format.linear(
+                gpu,
+                instruction.weightHostMapped(),
+                input,
+                instruction.weightAddress(),
+                output,
+                rows,
+                instruction.inputWidth(),
+                instruction.outputWidth(),
+                instruction.weightByteSize());
     }
 
     private Stages() {}
@@ -470,11 +475,15 @@ public final class Stages {
         }
     }
 
-    /// Runs one independent quantized or BF16 projection instruction.
+    /// Runs one independent quantized or BF16 projection instruction through its weights' [LinearFormat].
     public static final class Linear extends Stage {
+
+        private final List<TensorHandle> weights;
+        private LinearFormat format;
 
         Linear(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, stage, instruction, gpu);
+            this.weights = instruction.weights();
         }
 
         @Override
@@ -488,22 +497,9 @@ public final class Stages {
             long output = context.shape().hasFirstLayer()
                     ? context.workspace().address(instruction.outputBuffers().getFirst())
                     : context.workspace().projectionAddress(instruction.outputBufferIndex());
-            if (instruction.weights().size() == 1
-                    && instruction.weightFormat() == WeightFormat.NVFP4
-                    && (instruction.kind() == ExecutionPlan.Kind.Q3_LINEAR
-                            || instruction.kind() == ExecutionPlan.Kind.Q4_LINEAR
-                            || instruction.kind() == ExecutionPlan.Kind.Q5_LINEAR)) {
-                linearNvfp4(gpu(), instruction, input, output, rows);
-                if (logits) context.logitsProduced(output);
-                return;
-            }
-            boolean quantized = instruction.kind() == ExecutionPlan.Kind.Q3_LINEAR
-                    || instruction.kind() == ExecutionPlan.Kind.Q4_LINEAR
-                    || instruction.kind() == ExecutionPlan.Kind.Q5_LINEAR;
-            // BF16 projections run on kernels whose rows do not depend on how many run together.
-            boolean rowExact = (quantized && gpu().rowExactQuantizedLinears())
-                    || instruction.kind() == ExecutionPlan.Kind.BF16_PROJECTION;
-            if (context.kind() == Quantum.ExecutionKind.VERIFY && rows > 1 && !rowExact) {
+            if (this.format == null) this.format = LinearFormats.of(this.weights.getFirst());
+            boolean verify = context.kind() == Quantum.ExecutionKind.VERIFY;
+            if (verify && rows > 1 && !this.format.rowExact(gpu(), instruction.kind())) {
                 // Row-exact verification: each row takes exactly the route and kernel one-row decode does.
                 int outputBytes = instruction.kind() == ExecutionPlan.Kind.BF16_LINEAR ? Float.BYTES : Short.BYTES;
                 for (int row = 0; row < rows; row++) {
@@ -511,63 +507,30 @@ public final class Stages {
                             instruction,
                             input + (long) row * instruction.inputWidth() * Short.BYTES,
                             output + (long) row * instruction.outputWidth() * outputBytes,
-                            1);
+                            1,
+                            verify);
                 }
-            } else launch(instruction, input, output, rows);
+            } else launch(instruction, input, output, rows, verify);
             if (logits) context.logitsProduced(output);
         }
 
-        private void launch(ExecutionPlan.Instruction instruction, long input, long output, int rows) {
-            switch (instruction.kind()) {
-                case Q3_LINEAR ->
-                    gpu().linearQ3Bf16(
-                                    input,
-                                    instruction.weightAddress(),
-                                    output,
-                                    rows,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth(),
-                                    instruction.weightByteSize(),
-                                    instruction.weightLayout());
-                case Q4_LINEAR ->
-                    gpu().linearQ4Bf16(
-                                    input,
-                                    instruction.weightAddress(),
-                                    output,
-                                    rows,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth(),
-                                    instruction.weightByteSize());
-                case Q5_LINEAR ->
-                    gpu().linearQ5Bf16(
-                                    input,
-                                    instruction.weightAddress(),
-                                    output,
-                                    rows,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth(),
-                                    instruction.weightByteSize());
-                case BF16_PROJECTION ->
-                    io.euhedral_execution.inference.core.model.qwen4.Ops.linearBf16RowExact(
-                            gpu(),
+        private void launch(ExecutionPlan.Instruction instruction, long input, long output, int rows, boolean verify) {
+            boolean scratch = this.scratchUse != null;
+            Quantum context = context();
+            this.format.linear(
+                    gpu(),
+                    new LinearLaunch(
+                            instruction.kind(),
+                            this.weights,
                             input,
-                            instruction.weightAddress(),
                             output,
                             rows,
                             instruction.inputWidth(),
-                            instruction.outputWidth());
-                case BF16_LINEAR ->
-                    gpu().linearBf16ToFloat(
-                                    input,
-                                    instruction.weightAddress(),
-                                    output,
-                                    rows,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth());
-                default ->
-                    throw new IllegalArgumentException(
-                            "linear stage received non-linear instruction: " + instruction.kind());
-            }
+                            instruction.outputWidth(),
+                            scratch ? context.workspace().scratchAddress() : 0,
+                            scratch ? context.workspace().scratchBytes() : 0,
+                            verify,
+                            instruction.weightHostMapped()));
         }
     }
 
@@ -580,25 +543,22 @@ public final class Stages {
 
         @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
-            if (instruction.weightFormat() == WeightFormat.NVFP4)
-                gpu().nvfp4GateUpSwiGluBf16(
-                                input(context, instruction, 0),
-                                instruction.weightAddress(),
-                                output(context, instruction, 0),
-                                rows(context),
-                                instruction.inputWidth(),
-                                instruction.outputWidth(),
-                                instruction.weightByteSize());
-            else
-                gpu().q3GateUpSwiGluBf16(
-                                input(context, instruction, 0),
-                                instruction.weightAddress(),
-                                output(context, instruction, 0),
-                                rows(context),
-                                instruction.inputWidth(),
-                                instruction.outputWidth(),
-                                instruction.weightByteSize(),
-                                instruction.weightLayout());
+            boolean scratch = this.scratchUse != null;
+            LinearFormats.routing(instruction.weightFormat(), instruction.weightLayout())
+                    .gateUpSwiGlu(
+                            gpu(),
+                            new LinearLaunch(
+                                    instruction.kind(),
+                                    instruction.weights(),
+                                    input(context, instruction, 0),
+                                    output(context, instruction, 0),
+                                    rows(context),
+                                    instruction.inputWidth(),
+                                    instruction.outputWidth(),
+                                    scratch ? context.workspace().scratchAddress() : 0,
+                                    scratch ? context.workspace().scratchBytes() : 0,
+                                    context.kind() == Quantum.ExecutionKind.VERIFY,
+                                    instruction.weightHostMapped()));
         }
     }
 
