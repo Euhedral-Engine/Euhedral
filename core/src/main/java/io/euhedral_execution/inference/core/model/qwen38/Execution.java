@@ -21,6 +21,7 @@ import io.euhedral_execution.inference.core.runtime.graph.WorkspaceOwner;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -76,6 +77,19 @@ public final class Execution implements AutoCloseable {
     private final AsyncReads asyncReads;
     /// The number of the next admitted quantum with disk uses; confined to the workspace's owner.
     private long nextDiskTicket;
+    /// Whether an admitted quantum with disk uses has not concluded; confined to the workspace's owner.
+    private boolean diskQuantumActive;
+    /// Quanta held back in admission order while a quantum with disk uses runs: the next one with disk uses and
+    /// every quantum after it. Confined to the workspace's owner.
+    private final ArrayDeque<Held> held = new ArrayDeque<>();
+    /// The size of [#held], for [#close] to know whether to wait.
+    private final AtomicInteger heldCount = new AtomicInteger();
+
+    /// A claimed quantum waiting for its admission.
+    private record Held(Quantum quantum, Consumer<? super Quantum> terminalConsumer) {}
+
+    /// Returned by [#admitNow] for a quantum that must wait for the running quantum with disk uses.
+    private static final Throwable HELD = new Throwable("held", null, false, false) {};
     /// Per execution kind, [#COUNTERS] counts of the admitted quanta; read from other threads.
     private final AtomicLongArray counters = new AtomicLongArray(Quantum.ExecutionKind.values().length * COUNTERS);
     private boolean closed;
@@ -549,7 +563,50 @@ public final class Execution implements AutoCloseable {
     }
 
     /// Admits a claimed quantum, and returns why the runtime refused it, or null. Runs on the workspace's owner.
+    ///
+    /// At most one quantum with disk uses is admitted at a time, and a quantum is never admitted ahead of one that
+    /// waits (the order of admission is the order of the workspace's buffers and of each sequence's state). Each
+    /// quantum with disk uses has its graph's stages block workers in submissions to a device stream that is full
+    /// while the device waits for reads that only a free worker reaps; with every worker so blocked, no read is
+    /// reaped and no flag rises. A waiting quantum is admitted when the one before it concluded.
     private Throwable accept(Quantum context, Consumer<? super Quantum> terminalConsumer) {
+        if (!this.held.isEmpty()) {
+            hold(context, terminalConsumer);
+            return null;
+        }
+        Throwable result = admitNow(context, terminalConsumer);
+        if (result != HELD) return result;
+        hold(context, terminalConsumer);
+        return null;
+    }
+
+    private void hold(Quantum context, Consumer<? super Quantum> terminalConsumer) {
+        this.held.add(new Held(context, terminalConsumer));
+        this.heldCount.incrementAndGet();
+    }
+
+    /// Admits the quanta that waited, in order, until one with disk uses is admitted. Owner frames only.
+    private void admitHeld() {
+        while (!this.held.isEmpty()) {
+            Held next = this.held.peek();
+            Throwable result;
+            try {
+                result = admitNow(next.quantum(), next.terminalConsumer());
+            } catch (RuntimeException | Error unexpected) {
+                // Not refused by the runtime, so nothing concluded the quantum: its continuation still must run.
+                next.quantum().fail(unexpected);
+                next.quantum().concludeUnstarted();
+                result = null;
+            }
+            if (result == HELD) return;
+            this.held.poll();
+            this.heldCount.decrementAndGet();
+        }
+    }
+
+    /// Admits `context` unless it has disk uses and another quantum with disk uses has not concluded: then returns
+    /// [#HELD] and changes nothing.
+    private Throwable admitNow(Quantum context, Consumer<? super Quantum> terminalConsumer) {
         Shape view = context.shape();
         // A decode view whose first staging slots this sequence's DFlash2 block just filled runs without their
         // transfers; its first readers of those slots then follow the block's prefetch transfers (their last writer).
@@ -567,8 +624,13 @@ public final class Execution implements AutoCloseable {
                 context.chunkCount() > 1 || !context.checkpointChunks().isEmpty() ? this.prompts.shape(context) : view;
         // Its disk uses are registered once it started, in admission order: the order of each window slot's copies.
         List<DiskUse> uses = this.diskReader == null ? List.of() : diskUses(admitted);
+        if (!uses.isEmpty() && this.diskQuantumActive) return HELD;
         long ticket = uses.isEmpty() ? -1 : this.nextDiskTicket++;
-        if (ticket >= 0) context.readsFromDisk(this.diskReader, ticket);
+        if (ticket >= 0) {
+            context.readsFromDisk(this.diskReader, ticket);
+            this.diskQuantumActive = true;
+            context.onConcluded(() -> this.runtime.publishOnOwner(this::diskQuantumConcluded));
+        }
         // Counted when its graph starts publishing, so before any outcome of the quantum can be observed.
         context.onPublishing(() -> count(context, admitted));
         boolean[] began = new boolean[1];
@@ -587,6 +649,12 @@ public final class Execution implements AutoCloseable {
         }
         if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
         return null;
+    }
+
+    /// The quantum with disk uses concluded: the quanta that waited for it are admitted. Owner frames only.
+    private void diskQuantumConcluded() {
+        this.diskQuantumActive = false;
+        admitHeld();
     }
 
     /// Whether the first `slots` staging slots hold what `block` (a DFlash2 block view that prefetches) loads for
@@ -660,11 +728,16 @@ public final class Execution implements AutoCloseable {
     /// ([EuhedralInferenceRuntime#publishOnOwner]); the selects of passes still in flight may then offer
     /// concurrently, which the assembler's owner confinement does not cover.
     private void concludePending() {
-        if (this.pendingOffers.get() == 0) return;
+        if (this.pendingOffers.get() == 0 && this.heldCount.get() == 0) return;
         CompletableFuture<Void> done = new CompletableFuture<>();
         try {
             this.runtime.publishOnOwner(() -> {
                 try {
+                    for (Held held = this.held.poll(); held != null; held = this.held.poll()) {
+                        this.heldCount.decrementAndGet();
+                        held.quantum().fail(new IllegalStateException("the execution is closing"));
+                        held.quantum().concludeUnstarted();
+                    }
                     List<Offer> waiting = this.assembler.withdraw(o -> true);
                     this.pendingOffers.addAndGet(-waiting.size());
                     refuse(waiting, new IllegalStateException("the execution is closing"), true);
