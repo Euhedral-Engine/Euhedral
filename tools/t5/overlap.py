@@ -62,7 +62,7 @@ def overlap(candidate: str, reference: set[int], n: int = 13) -> float:
     return len(found & reference) / len(found) if found else 0.0
 
 
-_NOTICE = re.compile(r"(?im)^[\s/#*;-]*(?:copyright|\(c\)).*$")
+_NOTICE = re.compile(r"(?im)^[\s/#*;-]*(?:copyright\s*(?:\(c\)|©|\d{4})|\(c\)\s*\d{4}).*$")
 BOILERPLATE_DIR = Path(__file__).with_name("boilerplate")
 
 

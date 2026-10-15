@@ -89,6 +89,20 @@ class OverlapTest(unittest.TestCase):
         self.assertGreaterEqual(copied["shared"], 18)
         self.assertEqual(copied["containment"], 1.0)
 
+    def test_wrapped_bsd_text_is_not_flagged_against_itself(self):
+        import textwrap
+        bsd = (overlap.BOILERPLATE_DIR / "bsd.txt").read_text()
+        wrapped = "\n".join(textwrap.fill(line, 60) for line in bsd.splitlines())
+        self.assertTrue(any(line.lower().startswith("copyright") for line in wrapped.splitlines()))
+        reference = overlap.Reference()
+        reference.add(wrapped)
+        measured = reference.measure(wrapped)
+        self.assertEqual(measured["shared"], 0)
+
+    def test_notice_lines_need_a_year_or_mark(self):
+        self.assertEqual(overlap._strip("Copyright holder nor the\nCopyright 2020 X\n(c) 2019 Y\n© Z"),
+                         "Copyright holder nor the\n\n\n© Z")
+
     def test_main_writes_report_and_fails_over_limit(self):
         with tempfile.TemporaryDirectory() as d:
             store = Path(d)

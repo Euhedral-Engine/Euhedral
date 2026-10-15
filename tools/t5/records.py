@@ -89,9 +89,14 @@ def _lines(path: Path):
                 yield json.loads(line)
 
 
+def _tools(value):
+    """A list becomes a tuple; any other value is kept so that validation can report it."""
+    return tuple(value) if isinstance(value, list) else value
+
+
 def load_conversations(path: Path) -> list[Conversation]:
     return [Conversation(r["id"], r["domain"], r["order"], r["language"], r.get("system"),
-                         tuple(r.get("turns", ())), tuple(r.get("tools", ())), r.get("fixture"),
+                         tuple(r.get("turns", ())), _tools(r.get("tools", ())), r.get("fixture"),
                          Source.from_json(r.get("source")))
             for r in _lines(path)]
 
@@ -195,6 +200,9 @@ def validate_conversations(conversations: list[Conversation], store: Path, exclu
             errors.append(f"{c.id}: order must be an integer")
         if not c.turns or not all(isinstance(t, str) and t.strip() for t in c.turns):
             errors.append(f"{c.id}: turns must be non-empty strings")
+        if not isinstance(c.tools, (tuple, list)):
+            errors.append(f"{c.id}: tools must be a list")
+            c = dataclasses.replace(c, tools=())
         if c.domain == "tool_use" and not c.tools:
             errors.append(f"{c.id}: tool_use needs tools")
         if c.tools or c.domain == "tool_use":

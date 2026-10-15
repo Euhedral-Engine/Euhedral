@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -53,6 +54,15 @@ class RecordsTest(unittest.TestCase):
     def test_duplicate_id(self):
         items = self.valid() + [conv("c0", order=5)]
         self.assertTrue(any("c0" in e and "duplicate" in e for e in self.check(items)))
+
+    def test_non_list_tools_is_a_validation_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            (store / "c.jsonl").write_text(json.dumps({"id": "x", "domain": "conversation", "order": 0,
+                                                       "language": "en", "turns": ["hi"], "tools": 5}))
+            loaded = records.load_conversations(store / "c.jsonl")
+            errors = records.validate_conversations(loaded, store, {}, chunks={"conversation": 1}, languages=set())
+            self.assertTrue(any("x" in e and "tools must be a list" in e for e in errors))
 
     def test_missing_fixture_and_tools(self):
         items = [dataclasses.replace(c, fixture="gone.json", tools=()) if c.id == "t1" else c for c in self.valid()]
