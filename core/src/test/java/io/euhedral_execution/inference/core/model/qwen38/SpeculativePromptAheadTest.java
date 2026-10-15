@@ -88,6 +88,8 @@ class SpeculativePromptAheadTest {
                     first.admit(select);
                     drive(first, select, lattice);
                     assertEquals(1, ended.size(), "generation " + generation);
+                    // As a session's end does: the next generation's pass must not wait for this sequence.
+                    runtime.leave(sequence);
                 } finally {
                     lattice.drive();
                     if (!sequence.inFlight()) sequence.complete();

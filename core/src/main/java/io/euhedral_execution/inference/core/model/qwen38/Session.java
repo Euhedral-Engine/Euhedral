@@ -414,6 +414,8 @@ public final class Session implements GenerationSession {
         private int generated;
         private int decodeToken;
         private boolean anotherTokenAllowed;
+        /// The position the decode step in flight samples its token for.
+        private long samplePosition;
         private boolean endedNormally;
         /// Where this prompt's next checkpoint attaches: the deepest stored node of its prefix. Null unless the
         /// prompt started a fresh sequence through the cache: the offsets of a continuation prompt are not
@@ -626,16 +628,10 @@ public final class Session implements GenerationSession {
             @Override
             public void admit(AbstractFrame select) {
                 started = timing == null ? 0L : System.nanoTime();
-                runtime.admit(
-                        new Quantum(
-                                plan,
-                                sequence,
-                                Quantum.ExecutionKind.DECODE,
-                                sequence.currentTokenPosition(),
-                                new int[] {decodeToken},
-                                anotherTokenAllowed ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE,
-                                anotherTokenAllowed ? hostLogits : null),
-                        select);
+                long at = sequence.currentTokenPosition();
+                samplePosition = at + 1;
+                var part = new Quantum.Part(sequence, at, new int[] {decodeToken});
+                runtime.offer(anotherTokenAllowed ? part.sampling(hostLogits) : part, select);
             }
 
             @Override
@@ -743,7 +739,7 @@ public final class Session implements GenerationSession {
 
         /// Reads a retired quantum's published outcome and selects its next token when `selectToken`.
         private OptionalInt select(Quantum context, boolean selectToken, boolean prefill) throws ExecutionException {
-            Quantum.Outcome outcome = context.conclusion();
+            Quantum.Outcome outcome = context.conclusionFor(sequence);
             DeviceLogits logits = null;
             Throwable executionFailure = null;
             try {
@@ -917,6 +913,7 @@ public final class Session implements GenerationSession {
         /// result completes, or, for the blocking form, once its caller drained the text.
         @Override
         protected void ended(List<Integer> tokens, Throwable failure) {
+            runtime.leave(sequence);
             if (failure != null && sequence.terminalState() == Sequence.TerminalState.ACTIVE) requestCancellation();
             if (this.heldBy == null) settle();
             else this.heldBy.end(tokens, failure);
@@ -982,6 +979,9 @@ public final class Session implements GenerationSession {
     }
 
     private void requestCancellation() {
-        if (this.cancelled.compareAndSet(false, true)) this.sequence.cancel();
+        if (this.cancelled.compareAndSet(false, true)) {
+            this.sequence.cancel();
+            this.runtime.withdrawCancelled();
+        }
     }
 }
