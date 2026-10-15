@@ -17,6 +17,7 @@ import java.util.Locale;
 /// - Q3: Q3G64_F16S projections. Compressed: P2E2 (lossless).
 /// - NVFP4: block-scaled NVFP4 projections. Compressed: SD4 scale tables.
 /// - BF16: the unquantized model, every object in BF16; its attention caches are BF16 too.
+/// - TRELLIS: trellis-coded projections at 1 to 8 bits per weight; its attention caches are NVFP4.
 /// - Speculation: DFlash2 when the artifact holds the DFlash2 drafter (`dflash2/`), else MTP when it holds the MTP
 ///   layer and draft head, else none.
 public record ArtifactProfile(Quantization quantization, boolean compressed, Speculation speculation) {
@@ -25,7 +26,9 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
         Q3,
         NVFP4,
         /// The unquantized model: every object in BF16.
-        BF16
+        BF16,
+        /// Trellis-coded (EXL3) projections with their scale vectors.
+        TRELLIS
     }
 
     /// The speculative decoding strategy an artifact's drafter selects.
@@ -97,6 +100,7 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
                     case Q3_G64_FP16 -> Quantization.Q3;
                     case NVFP4 -> Quantization.NVFP4;
                     case BF16 -> Quantization.BF16;
+                    case TRELLIS -> Quantization.TRELLIS;
                     default ->
                         throw new IllegalArgumentException(
                                 "unsupported projection format " + probe.format() + "; expected Q3, NVFP4 or BF16");
@@ -111,7 +115,7 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
     }
 
     /// The artifact's name in logs and run records: `q3`, `q3-compressed`, `nvfp4`, `nvfp4-compressed`, `bf16`,
-    /// with `-dflash2` when it drafts with DFlash2.
+    /// `trellis`, with `-dflash2` when it drafts with DFlash2.
     public String artifactName() {
         return this.quantization.name().toLowerCase(Locale.ROOT)
                 + (this.compressed ? "-compressed" : "")

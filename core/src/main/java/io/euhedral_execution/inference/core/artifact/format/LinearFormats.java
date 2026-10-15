@@ -21,7 +21,8 @@ public final class LinearFormats {
             new P2e2Format(),
             new Nvfp4Format(WeightLayout.ROW_SPLIT_K128_V1),
             new Nvfp4Format(WeightLayout.ROW_SPLIT_K128_SD4_V1),
-            new Bf16Format());
+            new Bf16Format(),
+            new TrellisFormat());
 
     private LinearFormats() {}
 

@@ -17,5 +17,9 @@ public enum WeightLayout {
     /// its E4M3 block scales (K/16 bytes), with no padding between rows, and the FP32 global scale follows
     /// the last row at the next 256-byte boundary
     /// ([io.euhedral_execution.inference.core.model.qwen4.loader.NgramLayout]).
-    ROW_INTERLEAVED_NVFP4_V1
+    ROW_INTERLEAVED_NVFP4_V1,
+    /// Trellis tiles: `[k/16, n/16, w]` int16 words, one 16x16 tile of `w` words per (k tile, n tile), the tile
+    /// at index `ti * (n/16) + tj` starting at word `that * w`
+    /// ([io.euhedral_execution.inference.core.artifact.format.TrellisLayout]).
+    TRELLIS_TILE16_V1
 }
