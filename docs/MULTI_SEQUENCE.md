@@ -53,3 +53,52 @@ Per conversation (a 1.5K-token prompt; 200 generated tokens per assistant turn; 
 Prefill would take about 8% of wall time at N = 4 when it is not batched. The share reaches 20% when a
 conversation generates fewer than about 340 tokens in total (about 70 per turn), or at N of about 12, which the
 card's memory does not allow.
+
+## BF16 passes
+
+Measured 2026-10-15 on the BF16 Swift-1.5 artifact (54 GB) with the server (context 6144 tokens, 28 GiB of pinned host
+memory for weights, `euhedral.residency.host-budget-bytes`, four worker processors), a 16 GB RTX 5070 Ti and an NVMe
+artifact file. Scripted conversations (chat prompts of 100 to 700 tokens, at most 256 new tokens per request, greedy
+with MTP speculation) were run through the Python client with `--parallel` equal to the server's sequence count. Rates
+come from the server's pass log (`Execution.passes` at DEBUG) and the speculative counters: tokens per sequence per
+verification is 1 plus the mean accepted drafts (2.6 here).
+
+`max-sequences=0` resolves to 1 on this machine (more sequences move weights to the disk tier), so the count is set
+explicitly.
+
+| Sequences | LM head | Prefix cache | Disk per pass | Verify pass period | Segments per verify pass | Decode tok/s | Whole-run tok/s | Outcome |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | device | off | 17850 MiB | 2.87 s | 3.93 | 3.7 | 3.4 | ran 9 min |
+| 8 | device | off | 20570 MiB | 3.11 s | 7.84 | 6.7 | 5.2 | ran 10 min |
+| 8 | host-mapped | off | 20570 MiB | 3.40 s | 7.65 | 5.9 | 4.7 | ran 10 min |
+| 8 | device | 2 GiB | 20570 MiB | 3.12 s | 7.92 | 6.5 | 5.4 | ran 10 min |
+| 12 | host-mapped | off | 23630 MiB | 3.88 s | 9.25 | 6.4 (not sustained) | | stalled after 1.5 min |
+
+Decode tok/s is segments per verify pass times tokens per verification over the pass period; whole-run tok/s divides the
+tokens of all verification passes by the run's wall time, so it includes the prefill passes at the start and the
+ramp-down. Every pass reads the same bytes whatever its row count, so the pass period grows only with the disk bytes
+(20570 MiB at 6.6 GB/s is 3.1 s). The period between two quanta that read the disk is the same for a prefill chunk
+(3.19 s), a lone decode (3.09 s) and a verification (3.11 s): drafting and sampling between passes add at most 0.04 s
+(about 1%) to a pass. The prefill share of wall time was 17% to 22% with these short conversations (one prefill chunk
+costs a whole pass); mapping the LM head into host memory adds about 0.3 s to a pass and frees device memory only for
+more than eight sequences.
+
+Serving settings: 8 sequences, device LM head, 2 GiB prefix cache (`generation/server.env` in the store holds the
+command line). Rejected: 12 sequences (host-mapped head), which stalled; no run longer than 10 minutes was made.
+
+### Stalls found and fixed
+
+A server with several sequences stalled (all GPU work idle, workers spinning in a CUDA call) within minutes. The device
+waits on a window flag that a read raises, and only a worker that polls the read source reaps the read. The lattice
+keeps one worker polling when it is quiet, so when that worker blocks inside a CUDA call (a launch into a full stream,
+or a free of pinned memory, which synchronizes the device) nothing reaps the read the device waits for. Two mechanisms
+were removed:
+
+- Prompts admitted together each registered their own reads and their graphs submitted at once, filling the streams
+  and blocking every worker. Quanta that read the artifact are now admitted one at a time, in admission order.
+- Pinned upload and readback buffers (a closing session's logits buffer, KV page-table staging) were freed on a
+  worker. Released buffers are kept by capacity for reuse until the memory closes.
+
+With both in place eight sequences ran for 10 minutes three times; twelve sequences stalled with a worker blocked in a
+launch. The cause that remains is the same: a worker blocked in a launch while the only polling worker is the one that
+blocked.
