@@ -40,6 +40,8 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     volatile Script script = tokens(List.of("Hello", ", ", "world"), true);
     volatile int contextLength = 4096;
     volatile boolean emptyReasoning;
+    /// Generations the service may run at once.
+    volatile int maxActive = 1;
 
     /// Behavior of the next generations. Implementations must honor `generation.isCancelled()`.
     @FunctionalInterface
@@ -120,6 +122,11 @@ final class ScriptedInferenceBackend implements InferenceBackend {
             Thread.sleep(1);
         }
         return this.generations.getFirst();
+    }
+
+    @Override
+    public int maxActiveGenerations() {
+        return this.maxActive;
     }
 
     @Override

@@ -40,7 +40,7 @@ class SetupCheckTest {
 
     private static InferenceProperties properties(Path artifact, Path tokenizer, Path library) {
         return new InferenceProperties(
-                artifact, tokenizer, library, "0", 32768, Duration.ofSeconds(10), "qwen", 0, 2048, null);
+                artifact, tokenizer, library, "0", 32768, Duration.ofSeconds(10), "qwen", 0, 2048, null, 1);
     }
 
     private Map<String, String> headers() {

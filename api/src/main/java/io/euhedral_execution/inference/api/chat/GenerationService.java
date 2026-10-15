@@ -25,15 +25,16 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 ///
 /// A request becomes a `DeferredResult` at once. On the workers it is planned (mapped, rendered, encoded,
 /// validated), admitted, and generated; its result is a JSON body or, for a stream, an `SseEmitter` whose events
-/// the workers write, both in the format of the surface's [Responder]. One generation runs at a time and at most
-/// `maxQueuedGenerations` wait; a finished generation starts the next on a worker. Validation and capacity
+/// the workers write, both in the format of the surface's [Responder]. As many generations run at once as the
+/// backend holds sequences ([InferenceBackend#maxActiveGenerations]) and at most `maxQueuedGenerations` wait; a
+/// finished generation starts the next on a worker. Validation and capacity
 /// failures reach the client as HTTP errors, because a stream's emitter becomes the result only once its request
 /// was planned and admitted.
 ///
 /// At shutdown the web server first stops accepting connections and waits for the requests in flight, queued ones
 /// included, up to `spring.lifecycle.timeout-per-shutdown-phase`. This service stops next, in a lifecycle phase
 /// between that wait and the web server's stop, while responses can still be written: requests still waiting are
-/// refused with 503 and the running generation is stopped and answered with an error. Spring destroys the engine
+/// refused with 503 and the running generations are stopped and answered with an error. Spring destroys the engine
 /// after that, because this service depends on it.
 @Service
 public class GenerationService implements SmartLifecycle, DisposableBean {
@@ -46,7 +47,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
     private final long requestTimeoutMillis;
     private final int maxQueued;
     private final ArrayDeque<Admission> waiting = new ArrayDeque<>();
-    private Admission running;
+    private final ArrayDeque<Admission> running = new ArrayDeque<>();
     private boolean closed;
     private boolean started;
 
@@ -61,7 +62,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
     }
 
     private synchronized int activeCount() {
-        return this.running == null ? 0 : 1;
+        return this.running.size();
     }
 
     private synchronized int queuedCount() {
@@ -75,7 +76,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
         CompletionSink stream(GenerationPlan plan, SseEmitter emitter);
     }
 
-    /// One planned request waiting for, or holding, the generation slot.
+    /// One planned request waiting for, or holding, a generation slot.
     private final class Admission {
         final ConversationPlanner.Planned planned;
         final DeferredResult<Object> result;
@@ -169,7 +170,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
                 admission.result.setErrorResult(ApiException.unavailable("The server is shutting down."));
                 return;
             }
-            if (this.running != null) {
+            if (this.running.size() >= this.backend.maxActiveGenerations()) {
                 if (this.waiting.size() < this.maxQueued) this.waiting.add(admission);
                 else {
                     this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
@@ -178,7 +179,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
                 }
                 return;
             }
-            this.running = admission;
+            this.running.add(admission);
         }
         start(admission);
     }
@@ -260,13 +261,18 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
     }
 
     private void release(Admission admission) {
-        Admission next;
+        List<Admission> next = new java.util.ArrayList<>();
         synchronized (this) {
-            if (this.running != admission) return;
-            next = this.waiting.poll();
-            this.running = next;
+            if (!this.running.remove(admission)) return;
+            int capacity = this.backend.maxActiveGenerations();
+            while (this.running.size() < capacity) {
+                Admission queued = this.waiting.poll();
+                if (queued == null) break;
+                this.running.add(queued);
+                next.add(queued);
+            }
         }
-        if (next != null) this.backend.workers().execute(() -> start(next));
+        for (Admission queued : next) this.backend.workers().execute(() -> start(queued));
     }
 
     private static ApiException apiException(Throwable failure) {
@@ -300,13 +306,13 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
     @Override
     public void stop() {
         List<Admission> refused;
-        Admission active;
+        List<Admission> active;
         synchronized (this) {
             if (this.closed) return;
             this.closed = true;
             refused = List.copyOf(this.waiting);
             this.waiting.clear();
-            active = this.running;
+            active = List.copyOf(this.running);
         }
         for (Admission admission : refused) {
             this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
@@ -329,19 +335,24 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
             Thread.currentThread().interrupt();
             return;
         }
-        ChatGeneration job = active == null ? null : active.generation;
+        List<ChatGeneration> jobs = new java.util.ArrayList<>();
+        for (Admission admission : active) if (admission.generation != null) jobs.add(admission.generation);
         LOG.info(
                 "Shutting down: {} waiting requests refused, {}",
                 refused.size(),
-                job == null ? "no generation running" : "stopping the running generation");
-        if (job == null) return;
-        job.shutDown();
-        try {
-            job.responded().get(30, TimeUnit.SECONDS);
-        } catch (TimeoutException | ExecutionException late) {
-            LOG.warn("The running generation did not stop within 30s; engine shutdown will cancel its session");
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
+                jobs.isEmpty() ? "no generation running" : "stopping " + jobs.size() + " running generations");
+        for (ChatGeneration job : jobs) job.shutDown();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        for (ChatGeneration job : jobs) {
+            try {
+                job.responded().get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            } catch (TimeoutException | ExecutionException late) {
+                LOG.warn("A running generation did not stop within 30s; engine shutdown will cancel its session");
+                break;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
     }
 
