@@ -6,6 +6,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/// Portions ported from exllamav3 (MIT License, Copyright (c) 2025 Turboderp).
+///
 /// The trellis kernels (resources/cuda/trellis.cu) on one stream: Viterbi over 256-weight tiles (mul1 codebook,
 /// 16-bit state, K bits per weight, 2.5 and 3.5 alternating K and K + 1), packing into exllamav3's int16 words, and
 /// decoding words back to values, and the reconstruction of a quantized linear (decode, signed 128-point Hadamards,
@@ -113,9 +115,13 @@ public final class TrellisKernels {
         if (count < 0) throw new IllegalArgumentException("negative tile count " + count);
     }
 
-    /// Tiles whose Viterbi scratch fits in `bytes` (at least one).
+    /// Tiles whose Viterbi scratch fits in `bytes`; throws when `bytes` holds less than one tile at `bits`.
     public static int scratchTiles(long bytes, double bits) {
-        return (int) Math.max(1, Math.min(Integer.MAX_VALUE, bytes / scratchBytes(1, bits)));
+        long tile = scratchBytes(1, bits);
+        if (bytes < tile)
+            throw new IllegalArgumentException("Viterbi scratch of " + bytes + " bytes holds no tile at " + bits
+                    + " bits (one needs " + tile + ")");
+        return (int) Math.min(Integer.MAX_VALUE, bytes / tile);
     }
 
     private Cuda.Function function(String kind, double bits) {

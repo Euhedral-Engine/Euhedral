@@ -14,8 +14,10 @@ import java.util.SplittableRandom;
 import java.util.stream.IntStream;
 
 /// One linear quantized in exllamav3's trellis format (EXL3: QTIP's tail-biting trellis, mul1 codebook), entirely on
-/// the device. Ported from exllamav3 1.6.1 (MIT License, Copyright (c) 2025 Turboderp), `quantize_exl3` and the
-/// functions it calls; the random signs come from a seeded `SplittableRandom` instead of torch's generator.
+/// the device. Ported from exllamav3 1.6.1, `quantize_exl3` and the functions it calls; the random signs come from a
+/// seeded `SplittableRandom` instead of torch's generator.
+///
+/// Portions ported from exllamav3 (MIT License, Copyright (c) 2025 Turboderp).
 ///
 /// Weights are handled as `W [k = in, n = out]` in FP32. Steps, each a private method named after its exllamav3
 /// counterpart: `finalizeHessian` (damp, rotate with the signs and the 128-point Hadamards), `blockLdl` (Cholesky
@@ -29,7 +31,8 @@ import java.util.stream.IntStream;
 /// Peak device memory for `k` inputs and `n` outputs, on top of the caller's weight and Hessian: the regularized
 /// weight, the decoded matrix and the feedback cache (`4 * k * n` bytes each) and the factor `L` (`4 * k * k`) while
 /// rounding; afterwards the original weight (rebuilt from the BF16 input), the decoded matrix, `H W` and one product
-/// (`4 * k * n` each) and the refit's system (`4 * k * k`); plus the 256 MiB Viterbi scratch. Measured whole-device
+/// (`4 * k * n` each) and the refit's system (`4 * k * k`); plus the Viterbi scratch ([#DEFAULT_VITERBI_SCRATCH_BYTES]
+/// by default). Measured whole-device
 /// peaks: 2.1 GB for `k = 5120`, `n = 17408` and 4.3 GB for `k = 17408`, `n = 5120` (1.4 GB of it the caller's).
 public final class TrellisQuantizer implements AutoCloseable {
 
@@ -81,7 +84,8 @@ public final class TrellisQuantizer implements AutoCloseable {
         this.cublas = cuda.cublasHandle(stream);
         this.cusolver = cuda.cusolverHandle(stream);
         this.scratch = gpu.allocate(viterbiScratchBytes);
-        // 0: float mean, 1: float spare, 2-3: ints (Cholesky status, solve status), 4-11: four doubles
+        // 0: float mean, 1: float spare, 2-3: ints (Cholesky status, solve status), 4-11: four doubles (bytes 16-47),
+        // 12: int refit failures (byte 48)
         this.small = gpu.allocate(64);
     }
 

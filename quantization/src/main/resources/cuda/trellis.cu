@@ -1,5 +1,5 @@
-// Trellis (EXL3) quantization kernels. Portions ported from exllamav3 1.6.1 (MIT License, Copyright (c) 2025
-// Turboderp): codebook.cuh (mul1 decode), quantize_tiles_optimized.cuh (the dense Viterbi that runs on sm_120 for
+// Trellis (EXL3) quantization kernels. Portions ported from exllamav3 (MIT License, Copyright (c) 2025 Turboderp).
+// Sources in exllamav3 1.6.1: codebook.cuh (mul1 decode), quantize_tiles_optimized.cuh (the dense Viterbi that runs on sm_120 for
 // K = 2..6), quantize_tiles_frac_kernel.cuh (alternating K and K + 1 bit steps), pack.cu / frac.cu (MSB-first
 // packing) and exl3_dq.cuh (the circular bit window of the decoder).
 //
