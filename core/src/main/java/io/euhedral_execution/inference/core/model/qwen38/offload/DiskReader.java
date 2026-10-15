@@ -27,14 +27,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /// Reads the disk-backed weights of admitted quanta into the [DiskWindow]: a source of the lattice, polled one
-/// worker at a time, whose bookkeeping is plain fields changed only by its poll.
+/// worker at a time, whose bookkeeping is plain fields changed only by its poll (the reads' ends, which the workers
+/// that reap them mark, aside).
 ///
 /// Each quantum registers its disk uses at admission ([#enqueue]), in the order the device consumes them. Every
 /// window slot keeps its own queue of uses, in admission order and, within a quantum, in use order: the order its
 /// copies run on the device, which the staging ring's edges fix. A poll gives each slot whose flag the device lowered
-/// the next use of its queue: it submits the read ([AsyncReads], io_uring), the worker that reaps the read raises the
-/// flag, and the read's completion frame then hands the slot back to the poll. Without asynchronous reads the poll
-/// reads positionally itself, one slot at a time.
+/// the next use of its queue: it submits the read ([AsyncReads], io_uring). The worker that reaps the read fails the
+/// use's quantum if the read failed, raises the flag and marks the read ended, and the next poll takes the slot back;
+/// neither the device nor the poll waits for the read's completion frame. Without asynchronous reads the poll reads
+/// positionally itself, one slot at a time.
 ///
 /// A quantum that stops before its device work consumed every use is abandoned ([#abandon]): its uses not yet read
 /// raise their flags unread, so the device, which drains them in order, never waits on them and the next quantum's
@@ -72,7 +74,13 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
     // Touched by the poll only.
     private final ArrayDeque<Pending>[] queues;
     private final int[] state = new int[DiskWindow.SLOTS];
-    private final SlotRead[] completions = new SlotRead[DiskWindow.SLOTS];
+    /// Each slot's routing seed for its reads' completion frames.
+    private final long[] seeds = new long[DiskWindow.SLOTS];
+    /// Set by the worker that reaps a slot's read, after it raised the slot's flag; the poll takes it as the end of
+    /// the read. The completion frame plays no part in the slot's turn, so a frame stranded behind a busy worker
+    /// never holds the slot.
+    private final java.util.concurrent.atomic.AtomicIntegerArray reaped =
+            new java.util.concurrent.atomic.AtomicIntegerArray(DiskWindow.SLOTS);
     /// Uses of each registered quantum not yet given a slot.
     private final Map<Long, int[]> remaining = new HashMap<>();
     /// Quanta abandoned while uses of theirs may still be registered or queued.
@@ -110,14 +118,15 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         long seed = HasherApi.mix(0xd15c_0000L);
         for (int slot = 0; slot < DiskWindow.SLOTS; slot++) {
             this.queues[slot] = new ArrayDeque<>();
-            this.completions[slot] = new SlotRead(slot, seed + 64L * slot);
+            this.seeds[slot] = seed + 64L * slot;
         }
     }
 
     // ---------------------------------------------------------------- any thread
 
     /// Registers `quantum`'s disk uses, in the order its device work consumes them. Called at admission, in
-    /// admission order, with quantum numbers that grow with it; `onFailure` fails the quantum when a read fails.
+    /// admission order, with quantum numbers that grow with it; `onFailure` fails the quantum when a read fails. It
+    /// runs on the worker that reaps the read, before the slot's flag rises, and must not block.
     public void enqueue(long quantum, List<DiskUse> uses, Consumer<Throwable> onFailure) {
         Objects.requireNonNull(onFailure, "onFailure");
         if (uses.isEmpty()) return;
@@ -159,6 +168,7 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         for (Record record = this.records.poll(); record != null; record = this.records.poll()) record.apply();
         if (this.closed) return;
         for (int slot = 0; slot < DiskWindow.SLOTS; slot++) {
+            if (this.state[slot] == READING && this.reaped.getAndSet(slot, 0) == 1) this.state[slot] = FILLED;
             if (this.state[slot] == FILLED && this.window.flag(slot) == 0) this.state[slot] = IDLE;
             if (this.state[slot] == IDLE && !this.queues[slot].isEmpty()) dispatch(slot);
         }
@@ -191,8 +201,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         boolean direct = this.directFd >= 0 && use.alignedOffset() + use.readBytes() <= this.fileSize;
         int fd = direct ? this.directFd : this.bufferedFd;
         long length = direct ? use.readBytes() : use.lead() + use.byteSize();
-        SlotRead read = this.completions[slot];
-        read.pending = next;
+        // A read of its own: the frame of the slot's last read may still wait in a queue.
+        SlotRead read = new SlotRead(slot, this.seeds[slot], next);
         this.state[slot] = READING;
         this.inFlight.incrementAndGet();
         boolean submitted;
@@ -211,7 +221,6 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         // This thread cannot submit (no ring of its own, or the submission failed): the use is read here, or
         // fails its quantum; either way the flag rises, so the device never waits for a read that will not come.
         this.inFlight.decrementAndGet();
-        read.pending = null;
         this.queues[slot].poll();
         given(next.quantum());
         try {
@@ -250,6 +259,11 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
 
     private static void failed(Pending pending, Throwable failure) {
         LOG.error("reading {} from the artifact failed", pending.use().name(), failure);
+        failQuantum(pending, failure);
+    }
+
+    /// Fails the quantum of `pending`'s use. Runs where the read ended, a worker's poll of the reads included.
+    private static void failQuantum(Pending pending, Throwable failure) {
         try {
             pending.onFailure().accept(failure);
         } catch (RuntimeException callbackFailure) {
@@ -257,41 +271,40 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         }
     }
 
-    /// The completion of slot `slot`'s read. The flag rises when the read is reaped ([#reaped]); the frame then fails
-    /// the quantum when the read failed and hands the slot back to the poll.
+    /// Slot `slot`'s read of one use. The worker that reaps it ([#reaped]) fails the use's quantum when the read
+    /// failed, raises the flag and marks the read ended for the poll; the completion frame only logs a failure. The
+    /// device and the poll so never wait for the frame, which can queue behind a worker blocked in a CUDA call that
+    /// itself waits for the device to pass this slot.
     private final class SlotRead extends AsyncReads.Read {
         private final int slot;
-        private Pending pending;
+        private final Pending pending;
 
-        SlotRead(int slot, long seed) {
+        SlotRead(int slot, long seed, Pending pending) {
             super(seed);
             this.slot = slot;
+            this.pending = pending;
         }
 
-        /// The device's copy waits on the flag alone: raised here, it never waits for this frame, which can queue
-        /// behind a worker blocked in a CUDA call that itself waits for the device to pass this slot. A failed
-        /// read's bytes are copied all the same; its quantum fails when the frame runs.
+        /// A failed read fails its quantum before the flag rises, so the device's copy of the slot's stale
+        /// bytes belongs to a quantum that cannot commit. Failing a quantum is a compare-and-set: `onFailure`
+        /// must not block.
         @Override
         protected void reaped() {
+            IOException failure = failure();
+            if (failure != null) failQuantum(this.pending, failure);
             DiskReader.this.window.raise(this.slot);
+            DiskReader.this.reaped.set(this.slot, 1);
+            DiskReader.this.inFlight.decrementAndGet();
         }
 
         @Override
         public void execute() {
-            Pending done = this.pending;
-            // A completion the lattice runs twice (rejected after running) ends its read once.
-            if (done == null) return;
-            this.pending = null;
             IOException failure = failure();
-            if (failure != null) failed(done, failure);
-            int slot = this.slot;
-            try {
-                if (!DiskReader.this.closed) post(() -> DiskReader.this.state[slot] = FILLED);
-            } catch (RuntimeException closing) {
-                // The reader closed between the check and the post: no later use needs the slot.
-            } finally {
-                DiskReader.this.inFlight.decrementAndGet();
-            }
+            if (failure != null)
+                LOG.error(
+                        "reading {} from the artifact failed",
+                        this.pending.use().name(),
+                        failure);
         }
 
         /// The lattice rejected the completion without running it: the read ended all the same.

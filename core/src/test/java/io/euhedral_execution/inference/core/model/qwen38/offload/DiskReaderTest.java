@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.runtime.graph.AsyncReads;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -15,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -60,7 +62,7 @@ class DiskReaderTest {
                 public void addUpstream(io.euhedral_execution.core.generics.LatticeSource upstream) {}
 
                 @Override
-                public void push(io.euhedral_execution.core.frames.AbstractFrame frame) {
+                public void push(AbstractFrame frame) {
                     frame.execute();
                     frame.doFinally();
                 }
@@ -262,29 +264,61 @@ class DiskReaderTest {
         assertEquals(0, this.reader.releaseDevice(20_000_000L, 1_000_000_000L), "nothing waits any more");
     }
 
+    /// Holds the completion frames the reads emit instead of running them: a frame stranded behind a busy worker.
+    private void pumpHolding(List<AbstractFrame> held) {
+        this.reader.poll();
+        this.reads.getDelegate().pull(held::add, frame -> false, Long.MAX_VALUE);
+    }
+
+    private void awaitRaisedHolding(int slot, List<AbstractFrame> held) {
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (this.window.flag(slot) != 1) {
+            assertTrue(System.nanoTime() < deadline, "slot " + slot + " was never raised");
+            pumpHolding(held);
+        }
+    }
+
     /// A read's completion frame can wait behind a worker blocked in a CUDA call, and that call can wait for the
-    /// device, which waits for this very slot: the slot is raised when its read is reaped, before the frame runs.
-    @org.junit.jupiter.api.Test
-    void aReapedReadRaisesItsSlotBeforeItsCompletionFrameRuns() throws Exception {
+    /// device, which waits for this slot: the slot is raised, and handed to its next use, while the frames wait.
+    @Test
+    void aSlotServesItsUsesWhileTheirCompletionFramesWait() throws Exception {
         open(true);
         DiskUse first = new DiskUse("q1/0", 0, 9_000, 0);
         DiskUse second = new DiskUse("q1/1", 40_960, 9_100, 0);
         this.reader.enqueue(1, List.of(first, second));
-        List<io.euhedral_execution.core.frames.AbstractFrame> held = new ArrayList<>();
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        while (this.window.flag(0) != 1) {
-            assertTrue(System.nanoTime() < deadline, "the reaped read never raised its slot");
-            this.reader.poll();
-            this.reads.getDelegate().pull(held::add, frame -> false, Long.MAX_VALUE);
-        }
-        assertEquals(1, held.size(), "the completion frame has not run");
+        List<AbstractFrame> held = new ArrayList<>();
+        awaitRaisedHolding(0, held);
+        assertEquals(1, held.size(), "the first completion frame has not run");
         assertPayload(first);
         this.window.lower(0);
-        // The stranded frame runs once its worker is free; the slot's next use follows.
-        for (var frame : held) {
+        awaitRaisedHolding(0, held);
+        assertEquals(2, held.size(), "neither completion frame has run");
+        assertPayload(second);
+        this.window.lower(0);
+        assertEquals(0, this.reader.readsInFlight());
+        for (AbstractFrame frame : held) {
             frame.execute();
             frame.doFinally();
         }
-        consume(second);
+    }
+
+    /// A failed read fails its quantum before its slot rises, without its completion frame: the device's copy of the
+    /// slot then belongs to a quantum that cannot commit.
+    @Test
+    void aFailedReadFailsItsQuantumBeforeItsSlotRises() throws Exception {
+        open(true);
+        // Past the end of the file: the read ends with no bytes.
+        DiskUse past = new DiskUse("q1/past", FILE_BYTES + 65_536L, 9_000, 2);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        int[] flagWhenFailed = {-1};
+        this.reader.enqueue(1, List.of(past), cause -> {
+            flagWhenFailed[0] = this.window.flag(2);
+            failure.set(cause);
+        });
+        List<AbstractFrame> held = new ArrayList<>();
+        awaitRaisedHolding(2, held);
+        assertTrue(failure.get() != null, "the quantum failed");
+        assertEquals(0, flagWhenFailed[0], "the quantum failed before the slot rose");
+        assertEquals(1, held.size(), "the completion frame has not run");
     }
 }

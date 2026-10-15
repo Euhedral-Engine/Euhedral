@@ -57,7 +57,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         /// The read ended (all its bytes arrived, or it failed: [#failure()]). Runs on the worker that
         /// reaped it, before its frame is emitted. The frame may then queue behind a worker busy with
         /// another frame, so what is awaited without the lattice (a flag the device polls) is released
-        /// here. It must not block.
+        /// here. It must neither block nor throw.
         protected void reaped() {}
     }
 
