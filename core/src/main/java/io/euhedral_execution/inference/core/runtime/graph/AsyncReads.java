@@ -53,6 +53,12 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         public final long readNanos() {
             return this.completedAt - this.submittedAt;
         }
+
+        /// The read ended (all its bytes arrived, or it failed: [#failure()]). Runs on the worker that
+        /// reaped it, before its frame is emitted. The frame may then queue behind a worker busy with
+        /// another frame, so what is awaited without the lattice (a flag the device polls) is released
+        /// here. It must not block.
+        protected void reaped() {}
     }
 
     private static final int ENTRIES = 1024;
@@ -340,6 +346,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                 if (this.inFlight.decrementAndGet() == 0) this.busyNanos.add(read.completedAt - this.busySince);
                 if (result < 0) read.failure = -result;
                 else if (result == 0) read.failure = 5;
+                read.reaped();
                 emit.accept(read);
                 emitted++;
             }

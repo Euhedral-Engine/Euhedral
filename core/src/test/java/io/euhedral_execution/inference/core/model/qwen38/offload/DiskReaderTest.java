@@ -261,4 +261,30 @@ class DiskReaderTest {
         assertEquals(2, released);
         assertEquals(0, this.reader.releaseDevice(20_000_000L, 1_000_000_000L), "nothing waits any more");
     }
+
+    /// A read's completion frame can wait behind a worker blocked in a CUDA call, and that call can wait for the
+    /// device, which waits for this very slot: the slot is raised when its read is reaped, before the frame runs.
+    @org.junit.jupiter.api.Test
+    void aReapedReadRaisesItsSlotBeforeItsCompletionFrameRuns() throws Exception {
+        open(true);
+        DiskUse first = new DiskUse("q1/0", 0, 9_000, 0);
+        DiskUse second = new DiskUse("q1/1", 40_960, 9_100, 0);
+        this.reader.enqueue(1, List.of(first, second));
+        List<io.euhedral_execution.core.frames.AbstractFrame> held = new ArrayList<>();
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (this.window.flag(0) != 1) {
+            assertTrue(System.nanoTime() < deadline, "the reaped read never raised its slot");
+            this.reader.poll();
+            this.reads.getDelegate().pull(held::add, frame -> false, Long.MAX_VALUE);
+        }
+        assertEquals(1, held.size(), "the completion frame has not run");
+        assertPayload(first);
+        this.window.lower(0);
+        // The stranded frame runs once its worker is free; the slot's next use follows.
+        for (var frame : held) {
+            frame.execute();
+            frame.doFinally();
+        }
+        consume(second);
+    }
 }
