@@ -159,9 +159,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final MethodHandle argmaxBf16;
     private final MethodHandle argmaxLogProbabilityBf16;
     private final MethodHandle zeroDeviceMemory;
-    private final MethodHandle tableLaunch;
-    private final MethodHandle tableKernelCount;
-    private final MethodHandle tableKernelName;
+    /// The launcher, kernel count and kernel name of each table, by [KernelTable] ordinal.
+    private final MethodHandle[] tableLaunch = new MethodHandle[KernelTable.values().length];
+
+    private final MethodHandle[] tableKernelCount = new MethodHandle[KernelTable.values().length];
+    private final MethodHandle[] tableKernelName = new MethodHandle[KernelTable.values().length];
     private final MethodHandle attentionQkNormRopeBf16;
     private final MethodHandle attentionKvAppendNvfp4;
     private final MethodHandle attentionCausalNvfp4;
@@ -556,30 +558,33 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             this.argmaxBf16 = bind(linker, symbols, "euhedral_cuda_argmax_bf16", ARGMAX_BF16);
             this.argmaxLogProbabilityBf16 = bind(linker, symbols, "euhedral_cuda_argmax_logprob_bf16", ARGMAX_BF16);
             this.zeroDeviceMemory = bind(linker, symbols, "euhedral_cuda_zero_device_memory", ZERO_DEVICE_MEMORY);
-            this.tableLaunch = bind(
-                    linker,
-                    symbols,
-                    "euhedral_cuda_qwen4_launch",
-                    FunctionDescriptor.of(
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.JAVA_INT,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.ADDRESS,
-                            ValueLayout.JAVA_INT));
-            this.tableKernelCount = bind(
-                    linker, symbols, "euhedral_cuda_qwen4_kernel_count", FunctionDescriptor.of(ValueLayout.JAVA_INT));
-            this.tableKernelName = bind(
-                    linker,
-                    symbols,
-                    "euhedral_cuda_qwen4_kernel_name",
-                    FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+            for (KernelTable table : KernelTable.values()) {
+                String prefix = "euhedral_cuda_" + table.name().toLowerCase(java.util.Locale.ROOT);
+                this.tableLaunch[table.ordinal()] = bind(
+                        linker,
+                        symbols,
+                        prefix + "_launch",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT));
+                this.tableKernelCount[table.ordinal()] =
+                        bind(linker, symbols, prefix + "_kernel_count", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+                this.tableKernelName[table.ordinal()] = bind(
+                        linker,
+                        symbols,
+                        prefix + "_kernel_name",
+                        FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+            }
             this.attentionQkNormRopeBf16 =
                     bind(linker, symbols, "euhedral_cuda_attention_qk_norm_rope_bf16", ATTENTION_QK_NORM_ROPE_BF16);
             this.attentionKvAppendNvfp4 =
@@ -2990,7 +2995,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         MemorySegment.copy(arguments.sizes(), 0, staging[1], ValueLayout.JAVA_BYTE, 0, arguments.count());
         int status;
         try {
-            status = (int) this.tableLaunch.invokeExact(
+            status = (int) this.tableLaunch[kernel.table().ordinal()].invokeExact(
                     kernel.index(),
                     gridX,
                     gridY,
@@ -3008,14 +3013,19 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (status != 0) throw new GpuMemoryException("table kernel " + kernel, status);
     }
 
-    /// The native kernel table's names, in table order (a test compares them with the model's [TableKernel] enum).
+    /// The Flash-Next kernel table's names, in table order (a test compares them with the model's [TableKernel] enum).
     public java.util.List<String> tableKernelNames() {
+        return tableKernelNames(KernelTable.QWEN4);
+    }
+
+    /// `table`'s kernel names, in table order (a test compares them with the table's [TableKernel] enum).
+    public java.util.List<String> tableKernelNames(KernelTable table) {
         ensureOpen();
         try {
-            int count = (int) this.tableKernelCount.invokeExact();
+            int count = (int) this.tableKernelCount[table.ordinal()].invokeExact();
             java.util.List<String> names = new java.util.ArrayList<>();
             for (int i = 0; i < count; i++) {
-                MemorySegment name = (MemorySegment) this.tableKernelName.invokeExact(i);
+                MemorySegment name = (MemorySegment) this.tableKernelName[table.ordinal()].invokeExact(i);
                 names.add(name.reinterpret(256).getString(0));
             }
             return names;

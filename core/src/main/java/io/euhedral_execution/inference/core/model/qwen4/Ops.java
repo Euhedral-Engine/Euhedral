@@ -46,33 +46,8 @@ public final class Ops {
     /// divisible by 32 and N by 8.
     public static void linearBf16RowExact(
             ExecutionGpu gpu, long input, long weights, long output, int rows, int k, int n) {
-        requirePositive(rows, k, n);
-        if (k % 32 != 0 || n % 8 != 0)
-            throw new IllegalArgumentException(
-                    "a row-exact BF16 linear needs K divisible by 32 and N by 8, got " + k + " x " + n);
-        requireAligned(16, input, weights);
-        if ((output & 3) != 0) throw new IllegalArgumentException("the output must be 4-byte aligned");
-        boolean split = n <= 1536 || n % 32 != 0;
-        boolean tiles = rows > 16;
-        Kernel kernel = split
-                ? (tiles ? Kernel.LINEAR_TC_ROWS_SPLIT_BF16 : Kernel.LINEAR_TC_SPLIT_BF16)
-                : (tiles ? Kernel.LINEAR_TC_ROWS_BF16 : Kernel.LINEAR_TC_BF16);
-        gpu.launchTableKernel(
-                kernel,
-                split ? n / 8 : n / 32,
-                ceilDiv(rows, tiles ? 64 : 16),
-                1,
-                128,
-                1,
-                1,
-                0,
-                arguments()
-                        .pointer(input)
-                        .pointer(weights)
-                        .pointer(output)
-                        .int32(rows)
-                        .int32(k)
-                        .int32(n));
+        io.euhedral_execution.inference.core.artifact.format.RowExactBf16.linear(
+                gpu, input, weights, output, rows, k, n);
     }
 
     /// `output[r][j] = bf16(sum_k input[r][k] * weights[j][k])` for BF16 `weights` of `n` rows by `k` columns.

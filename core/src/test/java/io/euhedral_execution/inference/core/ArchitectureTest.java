@@ -367,14 +367,13 @@ class ArchitectureTest {
     }
 
     /// The weight-format seam: the one place in the shared artifact layer that names the dense model's kinds and
-    /// quantizations, because it decides how each format executes ([LinearFormat]). It may name exactly these types
-    /// (`Ops` only until the shared linear kernel table replaces its row-exact BF16 launch).
+    /// quantizations, because it decides how each format executes ([LinearFormat]). It may name exactly these
+    /// types.
     private static final String FORMAT_SEAM = "artifact/format/";
 
     private static final Set<String> FORMAT_SEAM_MODEL_TYPES = Set.of(
             "io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan",
-            "io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile",
-            "io.euhedral_execution.inference.core.model.qwen4.Ops");
+            "io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile");
 
     private static final Pattern MODEL_REFERENCE =
             Pattern.compile("io\\.euhedral_execution\\.inference\\.core\\.model\\.[\\w.]*\\w");

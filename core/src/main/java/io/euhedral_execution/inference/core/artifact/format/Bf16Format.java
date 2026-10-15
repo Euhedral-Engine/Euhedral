@@ -127,7 +127,7 @@ final class Bf16Format implements LinearFormat {
         long weights = launch.weights().getFirst().deviceAddress();
         switch (launch.kind()) {
             case BF16_PROJECTION ->
-                io.euhedral_execution.inference.core.model.qwen4.Ops.linearBf16RowExact(
+                RowExactBf16.linear(
                         gpu,
                         launch.input(),
                         weights,
