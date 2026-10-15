@@ -90,6 +90,10 @@ subprojects {
             providers.gradleProperty("euhedral.qwen.tokenizer-dir").orNull?.let {
                 systemProperty("euhedral.qwen.tokenizer-dir", it)
             }
+            // Optional worker CPUs for the tests that pin their engine (core testing.WorkerCpus), e.g. 2-5.
+            providers.gradleProperty("euhedral.test.worker-cpus").orNull?.let {
+                systemProperty("euhedral.test.worker-cpus", it)
+            }
             // Optional Qwen3.8-Flash-Next artifact (qwen4_exp).
             systemProperty(
                     "euhedral.qwen4.artifact",

@@ -8,6 +8,7 @@ import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.WorkerCpus;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -22,10 +23,14 @@ import org.junit.jupiter.api.Timeout;
 
 /// The `bf16` artifact serving twelve speculative sequences at once on four workers, its weights read from disk every
 /// pass and its LM head mapped from host memory: the configuration that stalled with the GPU idle and a worker
-/// spinning in a CUDA call. Every session keeps generating for the run's duration (`euhedral.stress.minutes`,
-/// default 8), and some token must arrive at least every `euhedral.stress.stall-seconds` (default 90; a pass takes
-/// about 4 s). A stalled run cannot close its engine, so it ends the JVM. Skipped unless
-/// -Peuhedral.qwen.bf16-artifact names the artifact and -Peuhedral.qwen.tokenizer-dir its tokenizer.
+/// spinning in a CUDA call. It stalled after 179 s while disk copies waited for their reads on the device, on CPUs
+/// 2-5. Every session keeps generating for the run's duration (`euhedral.stress.minutes`, default 8), and some
+/// token must arrive at least every `euhedral.stress.stall-seconds` (default 90; a pass takes about 4 s).
+///
+/// A stalled run cannot close its engine, whose device work never ends, so the test ends the JVM with
+/// `Runtime.halt(97)`, which Gradle reports as a failed run. The workers are `-Peuhedral.test.worker-cpus`, or else
+/// the first four performance CPUs ([WorkerCpus]). Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact
+/// and -Peuhedral.qwen.tokenizer-dir its tokenizer.
 // Own JVM: sets the global residency properties.
 @ModelGroup.OwnJvm
 class DiskTierManySequencesCudaIntegrationTest {
@@ -50,8 +55,7 @@ class DiskTierManySequencesCudaIntegrationTest {
         assumeTrue(tokenizer != null, "no tokenizer directory");
         long minutes = Long.getLong("euhedral.stress.minutes", 8L);
         long stallNanos = TimeUnit.SECONDS.toNanos(Long.getLong("euhedral.stress.stall-seconds", 90L));
-        BitSet workers = new BitSet();
-        workers.set(2, 6);
+        BitSet workers = WorkerCpus.of(4);
         var config = new InferenceConfig(
                 Path.of(artifact),
                 Path.of(tokenizer),
