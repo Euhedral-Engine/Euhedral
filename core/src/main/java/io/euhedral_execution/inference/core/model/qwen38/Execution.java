@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.core.generics.LatticeTerminal;
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader;
 import io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse;
@@ -75,6 +76,11 @@ public final class Execution implements AutoCloseable {
     /// Per execution kind, [#COUNTERS] counts of the admitted quanta; read from other threads.
     private final AtomicLongArray counters = new AtomicLongArray(Quantum.ExecutionKind.values().length * COUNTERS);
     private boolean closed;
+    /// Forms passes from the ready steps of concurrent generations; confined to the workspace's owner.
+    private final PassAssembler<Sequence, Offer> assembler;
+
+    /// A ready step and the continuation that takes its outcome.
+    private record Offer(Quantum.Part part, AbstractFrame select) {}
 
     /// An execution whose lane pool has one lane per available processor.
     public Execution(LatticeTerminal lattice, ExecutionPlan plan, ExecutionGpu gpu) {
@@ -129,6 +135,11 @@ public final class Execution implements AutoCloseable {
                 new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs),
                 SharedWorkspace.bufferCount(this.plan));
         this.prompts = new PromptShapes(this.runtime);
+        int passRows = Math.min(maxRows, Integer.getInteger("euhedral.batch.max-rows", maxRows));
+        int passParts =
+                this.plan.draftsWithDFlash2() ? 1 : Integer.getInteger("euhedral.batch.max-parts", Integer.MAX_VALUE);
+        this.assembler =
+                new PassAssembler<>(o -> o.part().sequence(), o -> o.part().rows(), passRows, passParts, this::runPass);
         if (this.plan.window() == null) {
             this.asyncReads = null;
             this.diskReader = null;
@@ -318,6 +329,153 @@ public final class Execution implements AutoCloseable {
         claim(context);
         context.continueWith(this.lake, continuation);
         accept(context, NO_TERMINAL_CONSUMER);
+    }
+
+    /// Offers a generation's next base-model step (a decode or verification) for the next pass; its quantum's
+    /// continuation is `select`. Owner frames only (a port's admit). DFlash2 plans run every step alone at once.
+    public void offer(Quantum.Part part, AbstractFrame select) {
+        Objects.requireNonNull(part, "part");
+        Objects.requireNonNull(select, "select");
+        Offer offer = new Offer(part, select);
+        if (this.plan.draftsWithDFlash2()) admitAlone(offer, false);
+        else this.assembler.offer(offer);
+    }
+
+    /// The generation of `sequence` ended: it no longer holds back a pass. Any thread.
+    public void leave(Sequence sequence) {
+        Objects.requireNonNull(sequence, "sequence");
+        this.runtime.publishOnOwner(() -> this.assembler.leave(sequence));
+    }
+
+    /// Runs the pending steps of cancelled sequences alone now (they conclude CANCELLED without device work). Any
+    /// thread.
+    public void withdrawCancelled() {
+        this.runtime.publishOnOwner(() -> {
+            for (Offer offer : this.assembler.withdraw(o -> o.part().sequence().cancellationRequested()))
+                admitAlone(offer, false);
+        });
+    }
+
+    /// Applies a pass quantum's retirement on the owner: its members now owe a report. Called by [PassRetirement].
+    void passRetired(List<Sequence> members) {
+        this.runtime.publishOnOwner(() -> this.assembler.retired(members));
+    }
+
+    /// Runs one formed pass on the owner and returns how many quanta it admitted (each owes one retirement). Total:
+    /// an offer that cannot be admitted concludes through its own select, failed.
+    private int runPass(List<Offer> pass) {
+        List<Offer> unconcluded = new ArrayList<>(pass);
+        try {
+            if (pass.size() == 1) {
+                unconcluded.clear();
+                return admitAlone(pass.get(0), true);
+            }
+            Quantum batch;
+            try {
+                batch = batchOf(pass);
+            } catch (RuntimeException unbatched) {
+                LOG.warn("a pass of {} steps cannot run as one quantum; its steps run alone", pass.size(), unbatched);
+                int admitted = 0;
+                for (Offer offer : pass) {
+                    unconcluded.remove(offer);
+                    admitted += admitAlone(offer, true);
+                }
+                return admitted;
+            }
+            unconcluded.clear();
+            try {
+                admitPass(batch, pass, true);
+                return 1;
+            } catch (RuntimeException refused) {
+                refuse(pass, refused);
+                return 0;
+            }
+        } catch (RuntimeException failure) {
+            refuse(unconcluded, failure);
+            return 0;
+        }
+    }
+
+    /// The batched quantum that runs `pass`: a verification of every part, with every row's logits when any part
+    /// has host logits.
+    private Quantum batchOf(List<Offer> pass) {
+        List<Quantum.Part> parts = new ArrayList<>(pass.size());
+        boolean hostLogits = false;
+        boolean seeds = false;
+        for (Offer offer : pass) {
+            parts.add(offer.part());
+            hostLogits |= offer.part().hostLogits() != null;
+            seeds |= offer.part().seedsDraft();
+        }
+        Quantum batch = Quantum.batch(
+                this.plan,
+                Quantum.ExecutionKind.VERIFY,
+                parts,
+                hostLogits ? LogitsRequirement.ALL_TOKENS : LogitsRequirement.NONE);
+        if (seeds) batch.seedingDraft();
+        return batch;
+    }
+
+    /// Admits `offer` as a quantum of its own and returns the retirements it owes: 1, or 0 when it could not be
+    /// admitted (its select then saw the failure).
+    private int admitAlone(Offer offer, boolean counted) {
+        try {
+            admitPass(Quantum.alone(this.plan, offer.part()), List.of(offer), counted);
+            return counted ? 1 : 0;
+        } catch (RuntimeException refused) {
+            refuse(List.of(offer), refused);
+            return 0;
+        }
+    }
+
+    /// Admits `quantum`, which runs the `offers`' steps, with a [PassRetirement] as its continuation. Throws only
+    /// when the quantum was not admitted and its continuation never attached; the runtime's refusal is carried by
+    /// the continuation, as in [#admit].
+    private void admitPass(Quantum quantum, List<Offer> offers, boolean counted) {
+        claim(quantum);
+        quantum.continueWith(
+                this.lake,
+                new PassRetirement(
+                        this,
+                        this.lake,
+                        offers.stream().map(o -> o.part().sequence()).toList(),
+                        offers.stream().map(Offer::select).toList(),
+                        counted));
+        try {
+            accept(quantum, NO_TERMINAL_CONSUMER);
+        } catch (RuntimeException | Error unexpected) {
+            // Not refused by the runtime, so nothing concluded the quantum: its continuation still must run.
+            quantum.fail(unexpected);
+            quantum.concludeUnstarted();
+        }
+    }
+
+    /// Concludes each of `offers` through its own select, failed with `cause`, as a refusal of [#admit] is: a
+    /// stand-in quantum that never started carries the failure. Owes no retirement.
+    private void refuse(List<Offer> offers, Throwable cause) {
+        for (Offer offer : offers) {
+            try {
+                Quantum standIn;
+                try {
+                    standIn = Quantum.alone(this.plan, offer.part());
+                } catch (RuntimeException invalid) {
+                    standIn = new Quantum(
+                            this.plan,
+                            offer.part().sequence(),
+                            Quantum.ExecutionKind.DECODE,
+                            offer.part().startPosition(),
+                            offer.part().tokenIds());
+                }
+                standIn.continueWith(
+                        this.lake,
+                        new PassRetirement(
+                                this, this.lake, List.of(offer.part().sequence()), List.of(offer.select()), false));
+                standIn.fail(cause);
+                standIn.concludeUnstarted();
+            } catch (RuntimeException | Error lost) {
+                LOG.error("a refused step could not be concluded", lost);
+            }
+        }
     }
 
     /// Admits `context` ahead of a later quantum of its sequence whose continuation reads both: no frame follows
