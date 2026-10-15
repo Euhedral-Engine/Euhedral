@@ -189,7 +189,10 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                     this.plan.reasoning() ? result.reasoningTokens() : null);
             Finish.Reason reason = finishReason(result);
             var finish = new Finish(
-                    reason, reason == Finish.Reason.STOP_SEQUENCE ? this.stopFilter.matchedStop() : null, usage);
+                    reason,
+                    reason == Finish.Reason.STOP_SEQUENCE ? this.stopFilter.matchedStop() : null,
+                    usage,
+                    this.plan.returnTokenIds() ? result.tokenIds() : null);
             this.delivered = true;
             startSink();
             write(() -> this.sink.finish(finish));

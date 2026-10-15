@@ -1,7 +1,11 @@
 package io.euhedral_execution.inference.api.chat;
 
-/// How a generation ended. `stopSequence` is the request's stop string that ended it, for `STOP_SEQUENCE`.
-public record Finish(Reason reason, String stopSequence, TokenUsage usage) {
+import java.util.List;
+
+/// How a generation ended. `stopSequence` is the request's stop string that ended it, for `STOP_SEQUENCE`. `tokenIds`
+/// are the
+/// tokens the model generated, terminator included, or null when the request did not ask for them.
+public record Finish(Reason reason, String stopSequence, TokenUsage usage, List<Integer> tokenIds) {
 
     public enum Reason {
         /// The model ended its turn.

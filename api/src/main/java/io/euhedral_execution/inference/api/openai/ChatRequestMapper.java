@@ -89,6 +89,10 @@ public class ChatRequestMapper {
         checkOtherFields(request.otherFields(), NEUTRAL_VALUES, "");
         boolean stream = Boolean.TRUE.equals(request.stream());
         boolean includeUsage = streamOptionsIncludeUsage(request, stream);
+        boolean returnTokenIds = Boolean.TRUE.equals(request.returnTokenIds());
+        if (returnTokenIds && stream)
+            throw ApiException.invalidRequest(
+                    "'return_token_ids' is available only without streaming.", "return_token_ids");
         requireServedModel(request.model());
         ToolCalling tools = ToolCalling.fromRequest(request.tools(), request.toolChoice(), request.parallelToolCalls());
         QwenChatTemplate.Thinking thinking =
@@ -110,7 +114,8 @@ public class ChatRequestMapper {
                 sampling(request),
                 maxTokens(request),
                 request.maxTokens() != null ? "max_tokens" : "max_completion_tokens",
-                stream);
+                stream,
+                returnTokenIds);
         return new ConversationPlanner.Mapped(
                 conversation,
                 new OpenAiResponder(Instant.now().getEpochSecond(), this.backend.modelId(), includeUsage));

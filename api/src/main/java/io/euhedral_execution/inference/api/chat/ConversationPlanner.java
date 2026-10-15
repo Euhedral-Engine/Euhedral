@@ -71,7 +71,8 @@ public class ConversationPlanner {
                 conversation.thinking().enabled(),
                 conversation.reasoningBudget(),
                 conversation.format(),
-                prepared.grammar());
+                prepared.grammar(),
+                conversation.returnTokenIds());
     }
 
     /// The conversation rendered by the checkpoint template, ending in the assistant's generation prompt.

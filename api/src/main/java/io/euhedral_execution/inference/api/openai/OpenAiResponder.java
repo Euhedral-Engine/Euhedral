@@ -22,7 +22,7 @@ record OpenAiResponder(long created, String model, boolean includeUsage) impleme
 
     @Override
     public CompletionSink json(GenerationPlan plan, DeferredResult<Object> result) {
-        return new JsonSink("chatcmpl-" + plan.id(), result);
+        return new JsonSink("chatcmpl-" + plan.id(), plan, result);
     }
 
     @Override
@@ -43,6 +43,10 @@ record OpenAiResponder(long created, String model, boolean includeUsage) impleme
                 usage.promptTokens(), usage.cachedPromptTokens(), usage.completionTokens(), usage.reasoningTokens());
     }
 
+    private static List<Integer> ids(int[] tokenIds) {
+        return java.util.Arrays.stream(tokenIds).boxed().toList();
+    }
+
     private static ToolCall toolCall(GeneratedCall call) {
         return ToolCall.function(
                 "call_" + UUID.randomUUID().toString().replace("-", ""), call.name(), call.arguments());
@@ -50,13 +54,15 @@ record OpenAiResponder(long created, String model, boolean includeUsage) impleme
 
     private final class JsonSink implements CompletionSink {
         private final String id;
+        private final GenerationPlan plan;
         private final DeferredResult<Object> result;
         private final StringBuilder reasoning = new StringBuilder();
         private final StringBuilder content = new StringBuilder();
         private final List<ToolCall> toolCalls = new ArrayList<>();
 
-        private JsonSink(String id, DeferredResult<Object> result) {
+        private JsonSink(String id, GenerationPlan plan, DeferredResult<Object> result) {
             this.id = id;
+            this.plan = plan;
             this.result = result;
         }
 
@@ -88,7 +94,9 @@ record OpenAiResponder(long created, String model, boolean includeUsage) impleme
                     this.content.toString(),
                     this.toolCalls,
                     finishReason(finish.reason()),
-                    usage(finish.usage()));
+                    usage(finish.usage()),
+                    this.plan.returnTokenIds() ? ids(this.plan.prompt().tokenIds()) : null,
+                    finish.tokenIds());
             this.result.setResult(ResponseEntity.ok().contentType(JSON).body(response));
         }
 

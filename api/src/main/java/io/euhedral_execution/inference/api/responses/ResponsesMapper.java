@@ -92,7 +92,8 @@ public class ResponsesMapper {
                 sampling(request),
                 request.maxOutputTokens(),
                 "max_output_tokens",
-                Boolean.TRUE.equals(request.stream()));
+                Boolean.TRUE.equals(request.stream()),
+                false);
         return new ConversationPlanner.Mapped(
                 conversation,
                 new ResponsesResponder(

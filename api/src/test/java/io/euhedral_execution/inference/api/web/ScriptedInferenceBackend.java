@@ -27,6 +27,10 @@ import java.util.function.Consumer;
 /// thinking on.
 final class ScriptedInferenceBackend implements InferenceBackend {
     static final String MODEL_ID = "euhedral-test-model";
+    /// Scripted prompt tokens are `PROMPT_ID_BASE + position`, completion tokens `COMPLETION_ID_BASE + position`.
+    static final int PROMPT_ID_BASE = 100;
+
+    static final int COMPLETION_ID_BASE = 5000;
 
     final List<ScriptedGeneration> generations = new CopyOnWriteArrayList<>();
     private final AtomicInteger workerIds = new AtomicInteger();
@@ -188,7 +192,11 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         return CompletableFuture.supplyAsync(
                 () -> {
                     this.encoded.incrementAndGet();
-                    return new EncodedPrompt(prompt, new int[countPromptTokens(prompt)]);
+                    return new EncodedPrompt(
+                            prompt,
+                            java.util.stream.IntStream.range(0, countPromptTokens(prompt))
+                                    .map(position -> PROMPT_ID_BASE + position)
+                                    .toArray());
                 },
                 this.workers);
     }
@@ -267,18 +275,37 @@ final class ScriptedInferenceBackend implements InferenceBackend {
                         this.prefilled = prefilled;
                         this.started.countDown();
                         try {
-                            Result result = this.script.run(this, maxNewTokens, text);
+                            Result result = withTokenIds(this.script.run(this, maxNewTokens, text));
                             if (this.output == null || !this.output.reasoning()) return result;
                             // One token per chunk: the reasoning is what came before `</think>`.
                             int reasoning = this.reasoningChunks >= 0
                                     ? this.reasoningChunks
                                     : result.completionTokens() - (result.stopTokenReached() ? 1 : 0);
-                            return new Result(result.completionTokens(), result.stopTokenReached(), reasoning);
+                            return new Result(
+                                    result.completionTokens(),
+                                    result.stopTokenReached(),
+                                    reasoning,
+                                    result.cachedPromptTokens(),
+                                    result.tokenIds());
                         } catch (InterruptedException | ExecutionException failure) {
                             throw new java.util.concurrent.CompletionException(failure);
                         }
                     },
                     this.workers);
+        }
+
+        /// The scripted tokens carry the IDs `COMPLETION_ID_BASE + position`, the terminator last.
+        private static Result withTokenIds(Result result) {
+            if (!result.tokenIds().isEmpty()) return result;
+            List<Integer> ids = java.util.stream.IntStream.range(0, result.completionTokens())
+                    .mapToObj(position -> COMPLETION_ID_BASE + position)
+                    .toList();
+            return new Result(
+                    result.completionTokens(),
+                    result.stopTokenReached(),
+                    result.reasoningTokens(),
+                    result.cachedPromptTokens(),
+                    ids);
         }
 
         /// One retired prefill quantum, as the engine reports it.

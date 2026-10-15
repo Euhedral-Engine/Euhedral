@@ -175,7 +175,8 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
                                 tokenIds.size(),
                                 stopped,
                                 reasoningTokens(tokenIds, stopped),
-                                this.session.restoredPromptTokens());
+                                this.session.restoredPromptTokens(),
+                                tokenIds);
                     });
         }
 

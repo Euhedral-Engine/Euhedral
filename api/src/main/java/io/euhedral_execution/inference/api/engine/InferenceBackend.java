@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
@@ -111,8 +112,22 @@ public interface InferenceBackend {
 
     /// `completionTokens` counts every sampled token, including a terminating stop token; `reasoningTokens` counts
     /// those of the reasoning, before `</think>`; `cachedPromptTokens` of the prompt were restored from the prefix
-    /// cache instead of prefilled.
-    record Result(int completionTokens, boolean stopTokenReached, int reasoningTokens, int cachedPromptTokens) {
+    /// cache instead of prefilled. `tokenIds` are the sampled tokens themselves, terminator included (empty when a
+    /// backend does not report them).
+    record Result(
+            int completionTokens,
+            boolean stopTokenReached,
+            int reasoningTokens,
+            int cachedPromptTokens,
+            List<Integer> tokenIds) {
+        public Result {
+            tokenIds = List.copyOf(tokenIds);
+        }
+
+        public Result(int completionTokens, boolean stopTokenReached, int reasoningTokens, int cachedPromptTokens) {
+            this(completionTokens, stopTokenReached, reasoningTokens, cachedPromptTokens, List.of());
+        }
+
         public Result(int completionTokens, boolean stopTokenReached) {
             this(completionTokens, stopTokenReached, 0, 0);
         }
