@@ -72,6 +72,47 @@ class CudaGpuMemoryIntegrationTest {
         }
     }
 
+    /// Pinned buffers come in power-of-two size classes: a released one serves any request of its class;
+    /// releasing twice pools it once; a pooled buffer is no valid copy range; the pool keeps at most its cap
+    /// and frees the rest.
+    @Test
+    void thePinnedPoolKeepsSizeClassesUpToItsCap() throws Exception {
+        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
+        assertEquals(1L << 20, CudaGpuMemory.pinnedCapacity((1L << 20) - 7));
+        assertEquals(2L << 20, CudaGpuMemory.pinnedCapacity((1L << 20) + 1));
+        assertEquals(64L << 10, CudaGpuMemory.pinnedCapacity(100));
+
+        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
+            ExecutionGpu.UploadBuffer upload = gpu.allocateUploadBuffer(900_000);
+            long address = upload.segment().address();
+            upload.close();
+            upload.close();
+            assertEquals(1L << 20, gpu.pinnedPoolBytes(), "a buffer released twice is pooled once");
+            long device = gpu.allocate(4096);
+            try {
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> gpu.copyHostToDeviceAsync(device, address, 4096),
+                        "a pooled buffer is no longer a copy range");
+            } finally {
+                gpu.free(device);
+            }
+            ExecutionGpu.UploadBuffer first = gpu.allocateUploadBuffer(1_000_000);
+            ExecutionGpu.UploadBuffer second = gpu.allocateUploadBuffer(1_000_000);
+            assertEquals(address, first.segment().address(), "a request of the same class reuses the buffer");
+            assertEquals(0, gpu.pinnedPoolBytes());
+            first.close();
+            second.close();
+            assertEquals(2L << 20, gpu.pinnedPoolBytes());
+
+            ExecutionGpu.ReadbackBuffer large = gpu.allocateReadbackBuffer(CudaGpuMemory.PINNED_POOL_BYTES);
+            assertEquals(CudaGpuMemory.PINNED_POOL_BYTES, large.segment().byteSize());
+            large.close();
+            assertEquals(1, gpu.pinnedPoolOverflows(), "a buffer the pool has no room for is freed");
+            assertEquals(2L << 20, gpu.pinnedPoolBytes());
+        }
+    }
+
     @Test
     void validatesJavaArguments() throws Exception {
         Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
