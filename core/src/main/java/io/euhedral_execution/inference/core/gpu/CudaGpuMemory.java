@@ -112,8 +112,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final ConcurrentHashMap<Long, ConcurrentLinkedQueue<MemorySegment>> pinnedPool = new ConcurrentHashMap<>();
     /// Bytes held in [#pinnedPool].
     private final AtomicLong pinnedPoolBytes = new AtomicLong();
-    /// Released buffers freed because the pool was full.
+    /// Released buffers the pool had no room for.
     private final AtomicLong pinnedPoolOverflows = new AtomicLong();
+    /// Released buffers the pool had no room for, waiting for [#trimPinnedPool]: freeing one synchronizes the device,
+    /// which a worker must never wait for.
+    private final ConcurrentLinkedQueue<MemorySegment> pinnedExcess = new ConcurrentLinkedQueue<>();
     /// Set when the memory starts closing: a buffer released from then on is freed, not pooled.
     private volatile boolean closingPinned;
     /// The size of every live device allocation, by address; [#allocate] is the only native allocator.
@@ -1096,11 +1099,13 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     }
 
     /// Bytes of released pinned buffers kept for reuse.
+    @Override
     public long pinnedPoolBytes() {
         return this.pinnedPoolBytes.get();
     }
 
-    /// Released pinned buffers freed because the pool was full, since this binding opened.
+    /// Released pinned buffers the pool had no room for, since this binding opened.
+    @Override
     public long pinnedPoolOverflows() {
         return this.pinnedPoolOverflows.get();
     }
@@ -1166,20 +1171,37 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// the pool holds the buffers in use at once). A buffer released while the memory closes is freed.
     private void releasePinned(MemorySegment allocation) {
         long capacity = allocation.byteSize();
-        if (closingPinned) {
-            if (!closed) freePinned(allocation);
-            return;
-        }
+        pageLocked.remove(allocation.address());
         if (pinnedPoolBytes.addAndGet(capacity) > PINNED_POOL_BYTES) {
             pinnedPoolBytes.addAndGet(-capacity);
             pinnedPoolOverflows.incrementAndGet();
-            freePinned(allocation);
-            return;
+            pinnedExcess.offer(allocation);
+        } else {
+            pinnedPool
+                    .computeIfAbsent(capacity, size -> new ConcurrentLinkedQueue<>())
+                    .offer(allocation);
         }
-        pageLocked.remove(allocation.address());
-        pinnedPool
-                .computeIfAbsent(capacity, size -> new ConcurrentLinkedQueue<>())
-                .offer(allocation);
+        // A buffer released while the memory closes may have missed the close's drain: it is freed here.
+        if (closingPinned) drainPinned();
+    }
+
+    /// Frees the released buffers the pool had no room for. A free synchronizes the device, so this runs on a thread
+    /// that may wait for it (an API thread creating a session), never on a lattice worker.
+    @Override
+    public void trimPinnedPool() {
+        if (closed) return;
+        for (MemorySegment excess; (excess = pinnedExcess.poll()) != null; ) freePinned(excess);
+    }
+
+    /// Frees every released pinned buffer; the memory is closing.
+    private void drainPinned() {
+        if (closed) return;
+        for (var released : pinnedPool.values())
+            for (MemorySegment pinned; (pinned = released.poll()) != null; ) {
+                pinnedPoolBytes.addAndGet(-pinned.byteSize());
+                freePinned(pinned);
+            }
+        for (MemorySegment excess; (excess = pinnedExcess.poll()) != null; ) freePinned(excess);
     }
 
     @Override
@@ -3332,11 +3354,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         synchronize();
         for (Long event; (event = availableEvents.poll()) != null; ) destroyEvent(event);
         closingPinned = true;
-        for (var released : pinnedPool.values())
-            for (MemorySegment pinned; (pinned = released.poll()) != null; ) {
-                pinnedPoolBytes.addAndGet(-pinned.byteSize());
-                freePinned(pinned);
-            }
+        drainPinned();
         closed = true;
         arena.close();
     }

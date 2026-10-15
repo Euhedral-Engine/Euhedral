@@ -74,7 +74,7 @@ class CudaGpuMemoryIntegrationTest {
 
     /// Pinned buffers come in power-of-two size classes: a released one serves any request of its class;
     /// releasing twice pools it once; a pooled buffer is no valid copy range; the pool keeps at most its cap
-    /// and frees the rest.
+    /// and sets the rest aside for a caller's thread to free.
     @Test
     void thePinnedPoolKeepsSizeClassesUpToItsCap() throws Exception {
         Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
@@ -108,8 +108,10 @@ class CudaGpuMemoryIntegrationTest {
             ExecutionGpu.ReadbackBuffer large = gpu.allocateReadbackBuffer(CudaGpuMemory.PINNED_POOL_BYTES);
             assertEquals(CudaGpuMemory.PINNED_POOL_BYTES, large.segment().byteSize());
             large.close();
-            assertEquals(1, gpu.pinnedPoolOverflows(), "a buffer the pool has no room for is freed");
+            assertEquals(1, gpu.pinnedPoolOverflows(), "a buffer the pool has no room for is set aside");
             assertEquals(2L << 20, gpu.pinnedPoolBytes());
+            // Freed on a caller's thread, which may wait for the device.
+            gpu.trimPinnedPool();
         }
     }
 

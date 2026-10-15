@@ -27,6 +27,20 @@ public abstract class ExecutionGpu implements GpuMemory {
         }
     }
 
+    /// Bytes of released pinned host buffers kept for reuse; 0 for a GPU that keeps none.
+    public long pinnedPoolBytes() {
+        return 0;
+    }
+
+    /// Released pinned host buffers the pool had no room for; 0 for a GPU that keeps none.
+    public long pinnedPoolOverflows() {
+        return 0;
+    }
+
+    /// Frees released pinned host buffers the pool had no room for. Synchronizes the device: only on a thread that
+    /// may wait for it, never on a lattice worker.
+    public void trimPinnedPool() {}
+
     /// Whether exact numerics (the scalar oracles) are selected.
     public boolean exactNumerics() {
         return false;
