@@ -172,3 +172,16 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
 - `dflash2_compare.py`: per-tensor relative error between two DFlash2 fixture directories (NumPy).
 - `dflash2_quality.py`: compares two drafters' quality records (DFlash2QualityCudaIntegrationTest).
 - `render_qwen_chat_template_golden.py`: renders chat-template golden prompts (jinja2).
+
+## Conversation generation
+
+`python3 -m t5.generate SERVER_URL STORE --model ID --base-seed N [--parallel N] [--domains D ...] [--limit N]
+[--max-tokens N] [--target-tokens N] [--artifact-manifest PATH]` (run from `tools/`) drives the scripted
+conversations in `STORE/conversations.jsonl` through the server's chat API, executing tool calls against each
+conversation's fixture. Greedy or sampled decoding comes from `t5.records.plan_decoding`. Token ids are taken from
+the server (`return_token_ids`), not re-tokenized. `--parallel` should match the server's maximum number of
+sequences; a full queue (503) is retried with backoff.
+
+All output is one file, `STORE/generation/progress.json`, rewritten atomically after every finished conversation.
+Rerunning the same command resumes: finished conversations are skipped, an interrupted one restarts from its
+beginning, and a changed server, model, seed, limit, artifact or input file is refused.
