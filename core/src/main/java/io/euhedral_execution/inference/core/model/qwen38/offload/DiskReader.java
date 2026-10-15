@@ -188,13 +188,7 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         if (this.reads == null) {
             this.queues[slot].poll();
             given(next.quantum());
-            try {
-                readPositionally(slot, use);
-            } catch (IOException | RuntimeException failure) {
-                failed(next, failure);
-            }
-            this.state[slot] = FILLED;
-            this.window.raise(slot);
+            readHere(slot, next, null);
             return;
         }
         // Whole blocks past the page cache, unless they would run past the end of the file.
@@ -209,7 +203,7 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         Throwable refusal = null;
         try {
             submitted = this.reads.submit(fd, this.window.slotHost(slot), length, use.alignedOffset(), read);
-        } catch (RuntimeException failure) {
+        } catch (Throwable failure) {
             submitted = false;
             refusal = failure;
         }
@@ -223,14 +217,22 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         this.inFlight.decrementAndGet();
         this.queues[slot].poll();
         given(next.quantum());
+        readHere(slot, next, refusal);
+    }
+
+    /// Reads `next` into slot `slot` on this thread, or fails its quantum with `refusal` (the submission's failure)
+    /// when there is one. The slot rises whatever the read or the quantum's failure throws: a slot left down would
+    /// hold the device for good.
+    private void readHere(int slot, Pending next, Throwable refusal) {
         try {
             if (refusal != null) throw refusal;
-            readPositionally(slot, use);
+            readPositionally(slot, next.use());
         } catch (Throwable failure) {
             failed(next, failure);
+        } finally {
+            this.state[slot] = FILLED;
+            this.window.raise(slot);
         }
-        this.state[slot] = FILLED;
-        this.window.raise(slot);
     }
 
     /// One more use of `quantum` has its slot.
