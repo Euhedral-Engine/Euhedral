@@ -16,13 +16,18 @@ import sys
 from pathlib import Path
 
 try:
-    from t5 import records
+    from t5 import fixtures, records
 except ImportError:  # run as a script
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from t5 import records
+    from t5 import fixtures, records
 
-# Ideographs and kana are words of their own: those scripts do not separate words with spaces.
-_WORD = re.compile(r"[぀-ヿ㐀-鿿]|[^\W぀-ヿ㐀-鿿]+")
+# Ideographs and kana are words of their own: those scripts do not separate words with spaces. Other scripts'
+# words are runs of letters, digits and combining marks (Indic vowel signs and viragas, Arabic diacritics).
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f"
+_MARKS = "\u0300-\u036f\u064b-\u065f\u0900-\u0963\u0966-\u0dff\u200c\u200d"
+_WORD = re.compile(f"[{_CJK}]|(?:(?![{_CJK}])[\\w{_MARKS}])+")
+# Reference items shorter than this many windows do not count towards containment (one shared window is no copy).
+MIN_ITEM_SHINGLES = 3
 
 
 def shingles(text: str, n: int = 13) -> set[int]:
@@ -32,8 +37,42 @@ def shingles(text: str, n: int = 13) -> set[int]:
 
 
 def overlap(candidate: str, reference: set[int], n: int = 13) -> float:
+    """Fraction of the candidate's windows found in the reference."""
     found = shingles(candidate, n)
     return len(found & reference) / len(found) if found else 0.0
+
+
+class Reference:
+    """The union of the reference files' windows, with each reference item (a JSONL string value or a whole text
+    file) indexed so a candidate can be tested for containing most of one item."""
+
+    def __init__(self, n: int = 13) -> None:
+        self.n = n
+        self.union: set[int] = set()
+        self._sizes: list[int] = []
+        self._index: dict[int, list[int]] = {}
+
+    def add(self, text: str) -> None:
+        found = shingles(text, self.n)
+        self.union |= found
+        if len(found) >= MIN_ITEM_SHINGLES:
+            item = len(self._sizes)
+            self._sizes.append(len(found))
+            for h in found:
+                self._index.setdefault(h, []).append(item)
+
+    def measure(self, text: str) -> dict:
+        """fraction: share of the text's windows in the references (diluted by long text); shared: number of such
+        windows; containment: the largest share of one reference item's windows found in the text."""
+        found = shingles(text, self.n)
+        shared = found & self.union
+        counts: dict[int, int] = {}
+        for h in shared:
+            for item in self._index.get(h, ()):
+                counts[item] = counts.get(item, 0) + 1
+        containment = max((c / self._sizes[i] for i, c in counts.items()), default=0.0)
+        return {"fraction": len(shared) / len(found) if found else 0.0, "shared": len(shared),
+                "containment": containment}
 
 
 def _strings(value):
@@ -57,38 +96,54 @@ def reference_texts(path: Path):
         yield path.read_text(encoding="utf-8", errors="replace")
 
 
+def _worst(measures: list[dict]) -> dict:
+    return {key: max((m[key] for m in measures), default=0) for key in ("fraction", "shared", "containment")}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="t5.overlap")
     parser.add_argument("store", type=Path)
     parser.add_argument("--against", type=Path, nargs="+", required=True)
     parser.add_argument("--n", type=int, default=13)
-    parser.add_argument("--limit", type=float, default=0.05)
+    parser.add_argument("--limit", type=float, default=0.05, help="flag when the shared fraction exceeds this")
+    parser.add_argument("--min-shared", type=int, default=5, help="flag when this many windows are shared")
+    parser.add_argument("--containment", type=float, default=0.5,
+                        help="flag when this share of one reference item is contained")
     args = parser.parse_args(argv)
-    reference: set[int] = set()
+    reference = Reference(args.n)
     hashes = []
     for path in args.against:
-        reference |= {h for text in reference_texts(path) for h in shingles(text, args.n)}
+        for text in reference_texts(path):
+            reference.add(text)
         hashes.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-    result: dict = {}
+    items: dict = {}
     conversations = args.store / "conversations.jsonl"
     if conversations.exists():
         for c in records.load_conversations(conversations):
             texts = list(c.turns) + ([c.system] if c.system else [])
-            result[c.id] = max((overlap(t, reference, args.n) for t in texts), default=0.0)
+            if c.tools:
+                texts.append(fixtures.canonical(c.tools))
+            if c.fixture and (args.store / c.fixture).is_file():
+                texts.append((args.store / c.fixture).read_text(encoding="utf-8"))
+            items[c.id] = _worst([reference.measure(t) for t in texts])
     documents = args.store / "documents.jsonl"
     if documents.exists():
         for d in records.load_documents(documents):
             text = (args.store / d.path).read_text(encoding="utf-8", errors="replace")
-            result[d.id] = overlap(text, reference, args.n)
-    over = sorted(k for k, v in result.items() if v > args.limit)
+            items[d.id] = reference.measure(text)
+    flagged = sorted(k for k, v in items.items()
+                     if v["fraction"] > args.limit or v["shared"] >= args.min_shared
+                     or v["containment"] >= args.containment)
     out = args.store / "checks"
     out.mkdir(exist_ok=True)
-    (out / "overlap.json").write_text(
-        json.dumps({**result, "references": hashes, "n": args.n}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
-    for item in over:
-        print(f"{item}: overlap {result[item]:.3f} exceeds {args.limit}")
-    print(f"{len(result)} items, {len(over)} over the limit")
-    return 1 if over else 0
+    report = {"items": items, "references": hashes, "n": args.n,
+              "limits": {"fraction": args.limit, "min_shared": args.min_shared, "containment": args.containment}}
+    (out / "overlap.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    for item in flagged:
+        v = items[item]
+        print(f"{item}: fraction {v['fraction']:.3f}, shared {v['shared']}, containment {v['containment']:.3f}")
+    print(f"{len(items)} items, {len(flagged)} flagged")
+    return 1 if flagged else 0
 
 
 if __name__ == "__main__":

@@ -34,17 +34,45 @@ class SourcesTest(unittest.TestCase):
                 {"link": '<https://api.github.com/p?page=2>; rel="next", <https://api.github.com/p?page=2>; rel="last"'}),
             "https://api.github.com/p?page=2": ([commit("2026-10-03T00:00:00Z"), commit("2026-10-01T12:00:00Z")], {}),
         }
-        self.assertEqual(sources.github_path_first_commit("o", "r", "a/b.py", lambda url: pages[url]),
+        self.assertEqual(sources.github_path_first_commit("o", "r", "a/b.py", fetch=lambda url: pages[url]),
                          datetime.date(2026, 10, 1))
 
     def test_first_commit_single_page(self):
         fetch = lambda url: ([commit("2026-10-09T00:00:00Z"), commit("2026-10-04T00:00:00Z")], {})  # noqa: E731
-        self.assertEqual(sources.github_path_first_commit("o", "r", "x", fetch), datetime.date(2026, 10, 4))
+        self.assertEqual(sources.github_path_first_commit("o", "r", "x", fetch=fetch), datetime.date(2026, 10, 4))
 
     def test_published_date_dispatch(self):
         fetch = lambda url: ({"created_at": "2026-10-02T00:00:00Z"}, {})  # noqa: E731
-        self.assertEqual(sources.published_date("https://github.com/o/r/pull/3", fetch), datetime.date(2026, 10, 2))
+        self.assertEqual(sources.published_date("https://github.com/o/r/pull/3", fetch),
+                         (datetime.date(2026, 10, 2), None))
         self.assertIsNone(sources.published_date("https://example.com/x/y/z/w", fetch))
+
+    def test_blob_with_slash_ref_and_repository_date(self):
+        seen = []
+
+        def fetch(url):
+            seen.append(url)
+            if url.endswith("/repos/o/r"):
+                return {"created_at": "2026-09-30T00:00:00Z"}, {}
+            if "sha=feature%2Fx&path=src/m.py" in url:
+                return [commit("2026-10-05T00:00:00Z")], {}
+            raise OSError("404")
+
+        got = sources.published_date("https://github.com/o/r/blob/feature/x/src/m.py", fetch)
+        self.assertEqual(got, (datetime.date(2026, 10, 5), datetime.date(2026, 9, 30)))
+        self.assertTrue(any("sha=feature&path=x/src/m.py" in u for u in seen))
+
+    def test_old_repository_fails_check(self):
+        row = {"id": "c", "domain": "coding", "order": 0, "language": "en", "turns": ["x"],
+               "source": {"kind": "human", "url": "https://github.com/o/r/blob/main/a.py",
+                          "published": "2026-10-05", "license": "MIT", "checked": "t"}}
+        fetch = lambda url: ({"created_at": "2026-01-01T00:00:00Z"}, {}) if url.endswith("/repos/o/r") \
+            else ([commit("2026-10-05T00:00:00Z")], {})  # noqa: E731
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "conversations.jsonl").write_text(json.dumps(row))
+            result, failed = sources.check(Path(d), fetch)
+        self.assertTrue(failed)
+        self.assertEqual(result["c"]["error"], "repository created on or before the cutoff")
 
     def test_check_flags_mismatch_and_old_dates(self):
         rows = []

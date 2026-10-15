@@ -1,13 +1,17 @@
 {
-  "note": "Sources the evaluation set must not reuse. repositories: tools/holdout/texts.py (T3 code: CPython, Go, serde_json, cJSON), tools/gptq/calibration.py (calibration code: the same four projects). datasets: tools/holdout/texts.py (T2 wikitext-2 via ggml-org/ci), tools/holdout/t4_prompts.py (T4: gsm8k, mbpp, hermes function calling), tools/gptq/calibration.py (calibration prompts: the same three plus UltraChat 200k).",
+  "note": "Sources the evaluation set must not reuse. repositories: tools/holdout/texts.py (T3 code: CPython, Go, serde_json, cJSON), tools/gptq/calibration.py (calibration code: the same four projects). datasets: tools/holdout/texts.py , tools/holdout/t4_prompts.py (T4: gsm8k, mbpp, hermes function calling), tools/gptq/calibration.py (calibration prompts: the same three plus UltraChat 200k).",
   "repositories": [
     "python/cpython",
     "golang/go",
     "serde-rs/json",
     "DaveGamble/cJSON"
   ],
+  "sites": [
+    "wikipedia.org"
+  ],
   "datasets": [
     "ggml-org/ci",
+    "Salesforce/wikitext",
     "openai/gsm8k",
     "google-research-datasets/mbpp",
     "NousResearch/hermes-function-calling-v1",

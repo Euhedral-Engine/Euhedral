@@ -15,6 +15,12 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
+try:
+    from t5 import fixtures
+except ImportError:  # run as a script
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from t5 import fixtures
+
 CUTOFF = datetime.date(2026, 9, 21)
 CHUNKS = {"conversation": 24, "coding": 24, "tool_use": 16, "multilingual": 16}
 DOCUMENT_CHUNKS = {"prose": 16, "code": 16}
@@ -100,7 +106,9 @@ def load_excluded(path: Path = EXCLUDED_PATH) -> dict:
 
 
 def plan_decoding(conversations: list[Conversation], base_seed: int) -> dict[str, Decoding]:
-    """Within each sampled domain, in (order, id) order, even positions decode greedily and odd ones sampled."""
+    """Selection takes a prefix by `order` (spares last), so the greedy/sampled alternation is fixed by `order`.
+
+    Within each sampled domain, in (order, id) order, even positions decode greedily and odd ones sampled."""
     plan: dict[str, Decoding] = {}
     for domain in sorted({c.domain for c in conversations}):
         members = sorted((c for c in conversations if c.domain == domain), key=lambda c: (c.order, c.id))
@@ -127,6 +135,9 @@ def excluded_reason(url: str | None, excluded: dict) -> str | None:
         for repo in excluded.get("repositories", []):
             if repo.lower() == name:
                 return f"excluded repository {repo}"
+    for site in excluded.get("sites", []):
+        if host == site or host.endswith("." + site):
+            return f"excluded site {site}"
     if host.endswith("huggingface.co"):
         if parts[:1] == ["datasets"]:
             parts = parts[1:]
@@ -159,6 +170,15 @@ def _check_human(label: str, source: Source, excluded: dict, errors: list[str]) 
         errors.append(f"{label}: {reason}")
 
 
+def _inside(store: Path, relative: str) -> bool:
+    """Whether `relative` stays within the store (no absolute paths, no `..`)."""
+    try:
+        (store / relative).resolve().relative_to(store.resolve())
+    except ValueError:
+        return False
+    return not Path(relative).is_absolute()
+
+
 def validate_conversations(conversations: list[Conversation], store: Path, excluded: dict,
                            chunks: dict | None = None, languages=LANGUAGES,
                            base_seed: int = 0) -> list[str]:
@@ -171,13 +191,26 @@ def validate_conversations(conversations: list[Conversation], store: Path, exclu
         seen.add(c.id)
         if c.domain not in chunks:
             errors.append(f"{c.id}: unknown domain {c.domain!r}")
+        if not isinstance(c.order, int) or isinstance(c.order, bool):
+            errors.append(f"{c.id}: order must be an integer")
         if not c.turns or not all(isinstance(t, str) and t.strip() for t in c.turns):
             errors.append(f"{c.id}: turns must be non-empty strings")
         if c.domain == "tool_use":
             if not c.tools:
                 errors.append(f"{c.id}: tool_use needs tools")
-            if not c.fixture or not (store / c.fixture).is_file():
+            if not c.fixture or not _inside(store, c.fixture) or not (store / c.fixture).is_file():
                 errors.append(f"{c.id}: missing fixture {c.fixture}")
+        if c.tools and c.fixture and _inside(store, c.fixture) and (store / c.fixture).is_file():
+            names = [t.get("function", {}).get("name") for t in c.tools]
+            try:
+                spec = json.loads((store / c.fixture).read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                errors.append(f"{c.id}: fixture is not valid JSON")
+            else:
+                for error in fixtures.validate_spec(spec, [n for n in names if n]):
+                    errors.append(f"{c.id}: fixture: {error}")
+            if not all(names):
+                errors.append(f"{c.id}: every tool needs a function name")
         _check_human(c.id, c.source, excluded, errors)
     for domain, count in chunks.items():
         members = [c for c in conversations if c.domain == domain]
@@ -186,9 +219,11 @@ def validate_conversations(conversations: list[Conversation], store: Path, exclu
         orders = [c.order for c in members]
         if len(set(orders)) != len(orders):
             errors.append(f"domain {domain}: order values are not unique")
-    spoken = {c.language for c in conversations if c.domain == "multilingual"}
+    spoken = {c.language.split("-")[0].lower() for c in conversations if c.domain == "multilingual"}
     if "multilingual" in chunks and languages - spoken:
         errors.append(f"multilingual: missing languages {sorted(languages - spoken)}")
+    if not all(isinstance(c.order, int) for c in conversations):
+        return errors
     for conversation_id, decoding in plan_decoding(conversations, base_seed).items():
         domain = next(c.domain for c in conversations if c.id == conversation_id)
         if domain == "tool_use" and decoding.mode != "greedy":
@@ -208,7 +243,9 @@ def validate_documents(documents: list[Document], store: Path, excluded: dict,
         if d.kind not in chunks:
             errors.append(f"{d.id}: unknown kind {d.kind!r}")
         file = store / d.path
-        if not file.is_file():
+        if not _inside(store, d.path):
+            errors.append(f"{d.id}: path {d.path} leaves the store")
+        elif not file.is_file():
             errors.append(f"{d.id}: missing file {d.path}")
         elif hashlib.sha256(file.read_bytes()).hexdigest() != d.sha256:
             errors.append(f"{d.id}: sha256 mismatch for {d.path}")

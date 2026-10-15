@@ -6,6 +6,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,14 +31,15 @@ class RecordsTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self.store = Path(self._dir.name)
-        (self.store / "fx.json").write_text("{}")
+        (self.store / "fx.json").write_text(
+            '{"tools": {"lookup": {"rules": [{"match": {"q": 1}, "result": 2}]}}}')
         self.excluded = records.load_excluded()
 
     def tearDown(self):
         self._dir.cleanup()
 
     def valid(self):
-        tool = dict(tools=({"type": "function"},), fixture="fx.json")
+        tool = dict(tools=({"type": "function", "function": {"name": "lookup"}},), fixture="fx.json")
         return [conv("c0", order=0), conv("c1", order=1), conv("k0", "coding", 0), conv("k1", "coding", 1),
                 conv("t0", "tool_use", 0, **tool), conv("t1", "tool_use", 1, **tool),
                 conv("m0", "multilingual", 0, "es"), conv("m1", "multilingual", 1, "zh")]
@@ -129,6 +131,39 @@ class RecordsTest(unittest.TestCase):
         self.assertTrue(any("not after" in e for e in self.check_docs([self.document(source=old)])))
         bad = dataclasses.replace(HUMAN, url="https://raw.githubusercontent.com/golang/go/master/x.go")
         self.assertTrue(any("golang/go" in e for e in self.check_docs([self.document(source=bad)])))
+
+    def test_excluded_site_by_host_suffix(self):
+        for url in ("https://en.wikipedia.org/wiki/Oslo", "https://wikipedia.org/x"):
+            self.assertIn("wikipedia.org", records.excluded_reason(url, self.excluded))
+        self.assertIsNone(records.excluded_reason("https://notwikipedia.org/x", self.excluded))
+        self.assertIn("Salesforce/wikitext",
+                      records.excluded_reason("https://huggingface.co/datasets/Salesforce/wikitext", self.excluded))
+        bad = dataclasses.replace(HUMAN, url="https://en.wikipedia.org/wiki/Oslo")
+        items = [dataclasses.replace(c, source=bad) if c.id == "k0" else c for c in self.valid()]
+        self.assertTrue(any("k0" in e and "wikipedia.org" in e for e in self.check(items)))
+
+    def test_sampled_tool_use_fails(self):
+        with mock.patch.object(records, "SAMPLED_DOMAINS", records.SAMPLED_DOMAINS | {"tool_use"}):
+            errors = self.check(self.valid())
+        self.assertTrue(any("t1" in e and "sampled tool_use" in e for e in errors))
+
+    def test_fixture_must_cover_declared_tools(self):
+        (self.store / "fx.json").write_text('{"tools": {"other": {"default": 1}}}')
+        errors = self.check(self.valid())
+        self.assertTrue(any("t0" in e and "tool lookup has no fixture entry" in e for e in errors))
+        (self.store / "fx.json").write_text('{"tools": {"lookup": {"rules": [{"match": []}]}}}')
+        self.assertTrue(any("t0" in e and "rule 0" in e for e in self.check(self.valid())))
+
+    def test_order_type_and_regional_tags(self):
+        items = [dataclasses.replace(c, order="1") if c.id == "c0" else c for c in self.valid()]
+        self.assertTrue(any("c0" in e and "order" in e for e in self.check(items)))
+        items = [dataclasses.replace(c, language="es-MX") if c.id == "m0" else c for c in self.valid()]
+        self.assertEqual(self.check(items), [])
+
+    def test_paths_stay_in_the_store(self):
+        self.assertTrue(any("leaves the store" in e for e in self.check_docs([self.document(path="../x.py")])))
+        items = [dataclasses.replace(c, fixture="../fx.json") if c.id == "t0" else c for c in self.valid()]
+        self.assertTrue(any("t0" in e and "fixture" in e for e in self.check(items)))
 
     def test_json_round_trip(self):
         path = self.store / "c.jsonl"

@@ -78,6 +78,30 @@ class FixtureTest(unittest.TestCase):
             runs.append([f.call(name, args) for name, args in calls])
         self.assertEqual(runs[0], runs[1])
 
+    def test_validate_spec(self):
+        self.assertEqual(fixtures.validate_spec({"tools": {k: v for k, v in SPEC["tools"].items() if k != "bare"}}, ["weather", "calc"]), [])
+        bad = {"tools": {"a": {"builtin": "shell"}, "b": {"rules": [{"match": {}}]}, "c": {"rules": []}, "d": 3}}
+        errors = fixtures.validate_spec(bad, ["missing"])
+        for needle in ("missing has no fixture", "unknown builtin", "rule 0", "no rules and no default", "not an object"):
+            self.assertTrue(any(needle in e for e in errors), needle)
+        self.assertTrue(fixtures.validate_spec([]))
+
+    def test_paths_are_normalized(self):
+        f = fixtures.Fixture({"tools": SPEC["tools"], "files": {"/src/a.txt": "alpha"}})
+        for path in ("src/a.txt", "./src/a.txt", "/src/a.txt"):
+            self.assertEqual(json.loads(f.call("read", {"path": path}))["content"], "alpha")
+        self.assertEqual(json.loads(f.call("ls", {"path": "./src/"}))["entries"], ["a.txt"])
+
+    def test_integral_floats_match_ints(self):
+        f = fixtures.Fixture({"tools": {"t": {"rules": [{"match": {"n": 3}, "result": "three"}]}}})
+        self.assertEqual(f.call("t", '{"n": 3.0}'), '"three"')
+
+    def test_calculator_bounds(self):
+        for expression in ("9**999", "(10**900)*(10**900)*(10**900)*(10**900)", "2**-100000", "10**10**3"):
+            result = json.loads(fixtures.calculate(expression))
+            self.assertTrue("error" in result or len(str(result["result"])) < 5000, expression)
+        self.assertIn("error", json.loads(fixtures.calculate("7**7777")))
+
     def test_load_fixture(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "f.json"

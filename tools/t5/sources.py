@@ -3,7 +3,8 @@
 Usage (from tools/): python3 -m t5.sources check STORE
 
 Re-derives the publication date of every human source with a github.com URL (an issue or pull request: its
-`created_at`; a file: the date of the oldest commit touching it) and writes STORE/checks/dates.json. GITHUB_TOKEN,
+`created_at`; a file: the date of the oldest commit touching it on the linked ref, renames not followed, and the
+repository must itself have been created after the cutoff) and writes STORE/checks/dates.json. GITHUB_TOKEN,
 when set, is sent as a bearer token and never printed.
 """
 from __future__ import annotations
@@ -47,10 +48,18 @@ def github_issue_created(owner: str, repo: str, number: int, fetch=urlopen_json)
     return _date(data["created_at"])
 
 
-def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_json) -> datetime.date:
-    """Date of the oldest commit touching `path`: commits come newest first, so the last page holds it."""
-    url = f"{API}/repos/{owner}/{repo}/commits?path={quote(path)}&per_page=100"
-    data, headers = fetch(url)
+def github_repo_created(owner: str, repo: str, fetch=urlopen_json) -> datetime.date:
+    data, _ = fetch(f"{API}/repos/{owner}/{repo}")
+    return _date(data["created_at"])
+
+
+def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_json,
+                             ref: str | None = None) -> datetime.date:
+    """Date of the oldest commit touching `path` (on `ref`, a branch, tag or commit, when given). Commits come
+    newest first, so the last page holds it. Renames are not followed: a file moved from an older path shows only
+    its commits under the new one."""
+    sha = f"sha={quote(ref, safe='')}&" if ref else ""
+    data, headers = fetch(f"{API}/repos/{owner}/{repo}/commits?{sha}path={quote(path)}&per_page=100")
     last = re.search(r'<([^>]+)>;\s*rel="last"', headers.get("link", ""))
     if last:
         data, _ = fetch(last.group(1))
@@ -59,17 +68,26 @@ def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_jso
     return min(_date(c["commit"][who]["date"]) for c in data for who in ("author", "committer"))
 
 
-def published_date(url: str, fetch=urlopen_json) -> datetime.date | None:
-    """The publication date of a github.com URL, or None when its form is not recognised."""
+def published_date(url: str, fetch=urlopen_json) -> tuple[datetime.date, datetime.date | None] | None:
+    """(publication date, repository creation date for file sources else None) of a github.com URL, or None when
+    its form is not recognised. A file URL `/owner/repo/blob/REF/PATH` is ambiguous when REF holds `/`: the
+    longest-first split that yields commits wins."""
     parsed = urlparse(url)
     parts = [p for p in parsed.path.split("/") if p]
     if parsed.hostname != "github.com" or len(parts) < 4:
         return None
     owner, repo, kind = parts[:3]
     if kind in ("issues", "pull") and parts[3].isdigit():
-        return github_issue_created(owner, repo, int(parts[3]), fetch)
+        return github_issue_created(owner, repo, int(parts[3]), fetch), None
     if kind in ("blob", "tree") and len(parts) >= 5:
-        return github_path_first_commit(owner, repo, "/".join(parts[4:]), fetch)
+        rest = parts[3:]
+        for split in range(1, len(rest)):
+            try:
+                found = github_path_first_commit(owner, repo, "/".join(rest[split:]), fetch, "/".join(rest[:split]))
+            except (ValueError, OSError):
+                continue
+            return found, github_repo_created(owner, repo, fetch)
+        raise ValueError("no ref and path split of the url has commits")
     return None
 
 
@@ -88,7 +106,8 @@ def check(store: Path, fetch=urlopen_json) -> tuple[dict, bool]:
             continue
         entry = {"url": source.url, "recorded": str(source.published)}
         try:
-            found = published_date(source.url, fetch)
+            dated = published_date(source.url, fetch)
+            found, created = dated if dated else (None, None)
         except Exception as e:  # network or API failure counts as unverified
             entry["error"] = f"{type(e).__name__}: {e}"
             failed = True
@@ -98,7 +117,13 @@ def check(store: Path, fetch=urlopen_json) -> tuple[dict, bool]:
                 failed = True
             else:
                 entry["verified"] = str(found)
-                if found <= records.CUTOFF or found != source.published:
+                if created is not None:
+                    entry["repository_created"] = str(created)
+                    entry["note"] = "oldest commit at the path; renames are not followed"
+                if created is not None and created <= records.CUTOFF:
+                    entry["error"] = "repository created on or before the cutoff"
+                    failed = True
+                elif found <= records.CUTOFF or found != source.published:
                     entry["error"] = "date is not after the cutoff" if found <= records.CUTOFF \
                         else "date differs from the record"
                     failed = True
