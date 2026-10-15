@@ -33,6 +33,32 @@ class InferenceConfigTest {
     }
 
     @Test
+    void sizesForOneSequenceUnlessToldOtherwise() {
+        assertEquals(1, withCache(0, 2048).maxSequences());
+        assertEquals(
+                1,
+                new InferenceConfig(Path.of("a"), Path.of("t"), Path.of("l"), cpus(), Duration.ofSeconds(1))
+                        .maxSequences());
+        assertEquals(0, withSequences(0).maxSequences());
+        assertEquals(6, withSequences(6).maxSequences());
+        assertThrows(IllegalArgumentException.class, () -> withSequences(-1));
+    }
+
+    private static InferenceConfig withSequences(int sequences) {
+        return new InferenceConfig(
+                Path.of("a"),
+                Path.of("t"),
+                Path.of("l"),
+                cpus(),
+                32768,
+                Duration.ofSeconds(1),
+                0,
+                2048,
+                null,
+                sequences);
+    }
+
+    @Test
     void carriesTheCacheSettings() {
         var config = withCache(4L << 30, 4096);
         assertEquals(4L << 30, config.prefixCacheBytes());

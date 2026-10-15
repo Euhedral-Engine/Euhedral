@@ -166,7 +166,7 @@ public final class Execution implements AutoCloseable {
 
     /// The integer property `name` when it is at least 1; otherwise (unset, malformed or smaller) `fallback`, with a
     /// warning for a value that was set.
-    private static int positiveProperty(String name, int fallback) {
+    public static int positiveProperty(String name, int fallback) {
         Integer value = Integer.getInteger(name);
         if (value == null) return fallback;
         if (value < 1) {

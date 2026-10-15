@@ -113,6 +113,30 @@ class ResidencyPlannerTest {
     }
 
     @Test
+    void moreSequencesKeepFewerWeightsOnTheDevice() {
+        long free = 3000L * MIB;
+        var one = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
+        var four = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 4);
+        assertTrue(one.fits());
+        assertTrue(four.fits());
+        assertTrue(four.hostBacked().size() >= one.hostBacked().size());
+        long kv = ResidencyPlanner.kvBytes(config(2), 4096);
+        assertTrue(four.deviceBytes() >= one.deviceBytes() + 3 * kv);
+        var explicit = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
+        assertEquals(one.deviceBytes(), explicit.deviceBytes());
+        assertEquals(
+                one.deviceBytes(),
+                ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4)
+                        .deviceBytes());
+    }
+
+    @Test
+    void sequencesBeyondWhatFitAreReported() {
+        assertFalse(ResidencyPlanner.plan(artifact(), PROFILE, 3000L * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 4096)
+                .fits());
+    }
+
+    @Test
     void aContextThatCannotFitIsReported() {
         var plan = ResidencyPlanner.plan(artifact(), PROFILE, 1L << 30, 4096);
         assertFalse(plan.fits());
