@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.gpu;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -40,6 +41,34 @@ class CudaGpuMemoryIntegrationTest {
             } finally {
                 gpu.free(device);
             }
+        }
+    }
+
+    @Test
+    void releasedPinnedBuffersAreReusedInsteadOfFreed() throws Exception {
+        Path libraryPath = Path.of(System.getProperty("euhedral.cuda.library"));
+
+        try (CudaGpuMemory gpu = new CudaGpuMemory(libraryPath)) {
+            long readbackBytes = 3L << 20;
+            ExecutionGpu.ReadbackBuffer readback = gpu.allocateReadbackBuffer(readbackBytes);
+            long readbackAddress = readback.segment().address();
+            readback.close();
+            ExecutionGpu.ReadbackBuffer again = gpu.allocateReadbackBuffer(readbackBytes);
+            assertEquals(readbackAddress, again.segment().address(), "a released readback buffer serves the next one");
+            again.close();
+
+            long uploadBytes = 1L << 20;
+            ExecutionGpu.UploadBuffer upload = gpu.allocateUploadBuffer(uploadBytes);
+            long uploadAddress = upload.segment().address();
+            upload.close();
+            ExecutionGpu.UploadBuffer next = gpu.allocateUploadBuffer(uploadBytes);
+            assertEquals(uploadAddress, next.segment().address(), "a released upload buffer serves the next one");
+            ExecutionGpu.UploadBuffer concurrent = gpu.allocateUploadBuffer(uploadBytes);
+            assertTrue(
+                    concurrent.segment().address() != next.segment().address(),
+                    "a buffer in use is not handed out twice");
+            next.close();
+            concurrent.close();
         }
     }
 
