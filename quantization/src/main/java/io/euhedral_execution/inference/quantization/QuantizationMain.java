@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
+import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -16,7 +17,7 @@ import java.util.Map;
 /// [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
 /// calibrate --model CHECKPOINT --format trellis --bits 2.5|3.0|3.5 --tokens TOKENS.npy --out CHECKPOINT_DIR
 /// [--batch 8] [--sequences N] [--layers N] [--rounding-lanes N] [--viterbi-scratch-mib 256]
-/// [--memory-reserve-mib 1024] [--library LIBEUHEDRAL_CUDA]
+/// [--memory-reserve-mib 1024] [--write-buffer-mib 16] [--library LIBEUHEDRAL_CUDA]
 /// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
 /// [--overlay CHECKPOINT_DIR] [--sequences 96]
 /// [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
@@ -36,6 +37,18 @@ public final class QuantizationMain {
 
     private QuantizationMain() {}
 
+    /// Calibrate flags that only the GPTQ path reads; a trellis run rejects them.
+    private static final List<String> GPTQ_ONLY_FLAGS = List.of(
+            "skip-mtp",
+            "act-order",
+            "damp",
+            "quantization",
+            "compressed",
+            "output-head",
+            "draft-ids-from",
+            "nvfp4-above",
+            "nvfp4-scale-max");
+
     public static void main(String[] args) throws Exception {
         if (args.length == 0
                 || !List.of("calibrate", "score", "generate", "train-blocks", "train-model", "rotate")
@@ -46,7 +59,7 @@ public final class QuantizationMain {
                             + "[--layers N] [--skip-mtp] [--library PATH]");
             System.err.println("       calibrate --model DIR --format trellis --bits 2.5|3.0|3.5 --tokens T.npy "
                     + "--out DIR [--batch B] [--sequences N] [--layers N] [--rounding-lanes N] [--viterbi-scratch-mib 256] "
-                    + "[--memory-reserve-mib 1024] [--library PATH]");
+                    + "[--memory-reserve-mib 1024] [--write-buffer-mib 16] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
                     + "[--rows 8] [--host-mib N] [--batch 4] [--workers 6] [--library PATH]");
             System.err.println(
@@ -161,6 +174,11 @@ public final class QuantizationMain {
         String format = options.getOrDefault("format", "gptq");
         boolean trellis = format.equals("trellis");
         if (!trellis && !format.equals("gptq")) throw new IllegalArgumentException("--format is gptq or trellis");
+        if (trellis) {
+            for (String flag : GPTQ_ONLY_FLAGS)
+                if (options.containsKey(flag))
+                    throw new IllegalArgumentException("--" + flag + " applies to --format gptq, not trellis");
+        }
         Double bits = trellis ? Double.valueOf(required(options, "bits")) : null;
         var settings = new Calibrate.Settings(
                 Path.of(required(options, "model")),
@@ -184,8 +202,10 @@ public final class QuantizationMain {
                         Float.parseFloat(options.getOrDefault("nvfp4-scale-max", "448"))),
                 bits,
                 options.containsKey("rounding-lanes") ? Integer.valueOf(options.get("rounding-lanes")) : null,
-                Long.parseLong(options.getOrDefault("viterbi-scratch-mib", "256")),
-                Long.parseLong(options.getOrDefault("memory-reserve-mib", "1024")));
+                Long.parseLong(options.getOrDefault(
+                        "viterbi-scratch-mib", Long.toString(TrellisQuantizer.DEFAULT_VITERBI_SCRATCH_BYTES >> 20))),
+                Long.parseLong(options.getOrDefault("memory-reserve-mib", "1024")),
+                Long.parseLong(options.getOrDefault("write-buffer-mib", "16")));
         Calibrate.run(settings, Path.of(library));
     }
 

@@ -106,7 +106,8 @@ class TrellisCalibrateCudaIntegrationTest {
                 3.0,
                 null,
                 256,
-                1024);
+                1024,
+                16);
     }
 
     static Path library() {

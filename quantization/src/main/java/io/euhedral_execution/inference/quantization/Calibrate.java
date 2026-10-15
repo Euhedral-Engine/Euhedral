@@ -16,6 +16,7 @@ import io.euhedral_execution.inference.quantization.model.LayerWeights;
 import io.euhedral_execution.inference.quantization.trellis.Allocation;
 import io.euhedral_execution.inference.quantization.trellis.Exl3Writer;
 import io.euhedral_execution.inference.quantization.trellis.Linears;
+import io.euhedral_execution.inference.quantization.trellis.TrellisKernels;
 import io.euhedral_execution.inference.quantization.trellis.TrellisRounding;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -35,6 +36,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -56,7 +58,8 @@ public final class Calibrate {
     /// exllamav3 checkpoint, and then `recipe` and `draftIdsFrom` are unused and may be null; on the GPTQ path
     /// (`trellisBits` null) both are required. `roundingLanes` fixes the number of concurrent trellis rounding
     /// frames (null: sized from the free device memory per layer), `viterbiScratchMib` is each quantizer's Viterbi
-    /// scratch and `memoryReserveMib` the device memory the lane sizing leaves free.
+    /// scratch, `memoryReserveMib` the device memory the lane sizing leaves free and `writeBufferMib` the buffer
+    /// each output file is copied through.
     public record Settings(
             Path model,
             Recipe recipe,
@@ -73,7 +76,8 @@ public final class Calibrate {
             Double trellisBits,
             Integer roundingLanes,
             long viterbiScratchMib,
-            long memoryReserveMib) {}
+            long memoryReserveMib,
+            long writeBufferMib) {}
 
     private static final int HEAD_ROWS = 16384;
     private static final int DEFAULT_CHECKPOINT_EVERY = 8;
@@ -111,6 +115,7 @@ public final class Calibrate {
     private ForwardPipeline pipeline;
     private final Map<Long, Gptq> streamGptq = new ConcurrentHashMap<>();
     private final Qwen38Objects checkpoint;
+    /// The GPTQ rounding on the main stream; null in a trellis run.
     private final Gptq gptq;
     private final Cuda.Function gatherRows;
     private final int hidden;
@@ -125,7 +130,9 @@ public final class Calibrate {
         this.device = device;
         this.lattice = lattice;
         this.checkpoint = checkpoint;
-        this.gptq = new Gptq(device.cuda, device.gpu, device.stream, settings.nvfp4());
+        this.gptq = settings.trellisBits() == null
+                ? new Gptq(device.cuda, device.gpu, device.stream, settings.nvfp4())
+                : null;
         this.gatherRows =
                 device.cuda.compileResource("rows.cu", List.of("gather_rows")).getFirst();
         this.hidden = checkpoint.config.hidden();
@@ -136,6 +143,8 @@ public final class Calibrate {
     public static void run(Settings settings, Path library) throws IOException {
         if (settings.trellisBits() == null && (settings.recipe() == null || settings.draftIdsFrom() == null))
             throw new IllegalArgumentException("the GPTQ path needs a recipe and draft ids");
+        if (settings.trellisBits() != null && (settings.writeBufferMib() < 1 || settings.writeBufferMib() > 1023))
+            throw new IllegalArgumentException("--write-buffer-mib must be 1..1023: " + settings.writeBufferMib());
         try (Safetensors store = Safetensors.open(settings.model());
                 Device device = new Device(library);
                 CalibrationLattice lattice = CalibrationLattice.start(WORKERS)) {
@@ -163,6 +172,8 @@ public final class Calibrate {
     /// Sets the calibration up and returns its chain: each layer once its read is done (the next one read while
     /// it runs), checkpoints, then the heads.
     private CompletableFuture<Void> calibrate() throws IOException {
+        if (settings.trellisBits() != null)
+            allocation = allocateTrellis(); // rejects unsupported rates before any GPU work
         int[][] tokens = readTokens(settings.tokens(), settings.sequences());
         int sequences = tokens.length, length = tokens[0].length, batch = settings.batch();
         long rowBytes = 2L * hidden;
@@ -343,14 +354,23 @@ public final class Calibrate {
 
     // ---- trellis format ----
 
-    /// Allocates the bits per linear over the whole model, opens the writer and the rounding for a trellis run.
+    /// The bits per linear over the whole model for `--bits`; every allocated rate must be one the kernels support.
+    private Map<String, Double> allocateTrellis() {
+        double target = settings.trellisBits();
+        if (!Double.isFinite(target)) throw new IllegalArgumentException("--bits must be a number: " + target);
+        Map<String, Double> rates = Allocation.allocate(Linears.qwen38(checkpoint), checkpoint.config.layers(), target);
+        for (double rate : rates.values()) TrellisKernels.wordsPerTile(rate);
+        return rates;
+    }
+
+    /// Opens the writer and the rounding for a trellis run over the allocation.
     private void startTrellis(int sequences, int length) throws IOException {
         double target = settings.trellisBits();
-        allocation = Allocation.allocate(Linears.qwen38(checkpoint), checkpoint.config.layers(), target);
-        var histogram = new java.util.TreeMap<Double, Integer>();
+        var histogram = new TreeMap<Double, Integer>();
         for (double bits : allocation.values()) histogram.merge(bits, 1, Integer::sum);
         log("bit allocation for " + target + " bits per weight: " + allocation.size() + " linears " + histogram);
-        writer = new Exl3Writer(settings.model(), settings.out(), target, sequences, length);
+        writer = new Exl3Writer(
+                settings.model(), settings.out(), target, sequences, length, (int) (settings.writeBufferMib() << 20));
         trellis = new TrellisRounding(
                 device,
                 lattice,
@@ -842,9 +862,9 @@ public final class Calibrate {
     }
 
     private String checkpointKey(int sequences, int length) {
-        return settings.tokens().toAbsolutePath() + "|" + sequences + "|" + length + "|"
-                + (settings.trellisBits() != null ? "trellis " + settings.trellisBits() : settings.recipe()) + "|"
-                + settings.actOrder() + "|" + settings.damp();
+        String base = settings.tokens().toAbsolutePath() + "|" + sequences + "|" + length + "|";
+        if (settings.trellisBits() != null) return base + "trellis " + settings.trellisBits();
+        return base + settings.recipe() + "|" + settings.actOrder() + "|" + settings.damp();
     }
 
     /// Overwrites the checkpoint file in place: the header names the run and the layers done once the states
