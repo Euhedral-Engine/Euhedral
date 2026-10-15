@@ -34,7 +34,7 @@ class PassStatisticsTest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void everyAdmittedQuantumIsCountedByKind() throws Exception {
         var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
-        var execution = new Execution(new PullingLattice(), plan, new ExecutionFixtures.RecordingGpu());
+        var execution = new Execution(new PullingLattice(), plan, new ZeroingGpu());
         try {
             var sequence = new Sequence(7);
             execution
@@ -55,7 +55,7 @@ class PassStatisticsTest {
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void anAdmittedStagedQuantumCountsItsViewsTransfers() throws Exception {
         ExecutionPlan plan = StagingEdgesTest.stagedPlan();
-        var execution = new Execution(new PullingLattice(), plan, new ExecutionFixtures.RecordingGpu());
+        var execution = new Execution(new PullingLattice(), plan, new ZeroingGpu());
         try {
             var sequence = new Sequence(7);
             var quantum = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
@@ -68,5 +68,11 @@ class PassStatisticsTest {
         } finally {
             execution.close();
         }
+    }
+
+    /// A recording GPU that accepts the zeroing of sequence state.
+    private static final class ZeroingGpu extends ExecutionFixtures.RecordingGpu {
+        @Override
+        public void zeroDeviceMemory(long address, long byteSize) {}
     }
 }
