@@ -175,12 +175,17 @@ public final class TrellisRounding implements AutoCloseable {
         long held = 0;
         for (Linears.Linear linear : linears) held += 2L * linear.rows() * linear.columns();
         long budget = free - held - reserveBytes;
+        int idle = streamQuantizers.size(); // their scratch is already allocated and reused by the first lanes
         int width = 0;
         long used = 0;
         if (fixedLanes != null) width = Math.min(fixedLanes, linears.size());
         else
-            while (width < linears.size() && used + peakBytes(linears.get(width)) <= budget)
-                used += peakBytes(linears.get(width++));
+            while (width < linears.size()) {
+                long need = peakBytes(linears.get(width)) - (width < idle ? viterbiScratchBytes : 0);
+                if (used + need > budget) break;
+                used += need;
+                width++;
+            }
         width = Math.max(1, width);
         log.accept(String.format(
                 "layer %d: %d MiB free, %d MiB held for decoded weights, %d MiB reserve, %d rounding lanes%s",
@@ -201,8 +206,8 @@ public final class TrellisRounding implements AutoCloseable {
         if (at >= linears.size() || failure.get() != null) return CompletableFuture.completedFuture(null);
         Linears.Linear linear = linears.get(at);
         return lattice.<Void>submit(() -> {
-                    long stream = device.bindOwnStream();
                     try {
+                        long stream = device.bindOwnStream();
                         results.put(
                                 linear.tensor(),
                                 roundLinear(index, linear, layer, hessians, count, quantizer(stream), stream));

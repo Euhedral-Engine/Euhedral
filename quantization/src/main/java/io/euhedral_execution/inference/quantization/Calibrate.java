@@ -88,12 +88,14 @@ public final class Calibrate {
 
     /// Test hook: the number of layers between checkpoints (default 8).
     public static void checkpointEvery(int layers) {
+        if (layers < 1) throw new IllegalArgumentException("checkpointEvery must be at least 1: " + layers);
         checkpointEvery = layers;
     }
 
     /// Test hook: when positive, a run ends once this many layers are done and their checkpoint is written, without
     /// the MTP layer, the heads or the final files; 0 (default) runs to the end.
     public static void stopAfterLayers(int layers) {
+        if (layers < 0) throw new IllegalArgumentException("stopAfterLayers must not be negative: " + layers);
         stopAfterLayers = layers;
     }
 
@@ -215,19 +217,37 @@ public final class Calibrate {
                 .thenRun(() -> log("done"))
                 .whenComplete((ignored, failure) -> {
                     device.select(device.stream);
-                    if (trellis != null) trellis.close();
-                    if (writer != null) {
-                        try {
-                            writer.close();
-                        } catch (IOException closing) {
-                            if (failure == null) throw new UncheckedIOException(closing);
-                        }
+                    var errors = new ArrayList<Throwable>();
+                    closing(errors, () -> {
+                        if (trellis != null) trellis.close();
+                    });
+                    closing(errors, () -> {
+                        if (writer != null) writer.close();
+                    });
+                    closing(errors, pipeline::close);
+                    closing(errors, forward::close);
+                    closing(errors, () -> device.gpu.free(batchStates));
+                    closing(errors, () -> device.gpu.freeHostWeights(statesAddress));
+                    if (!errors.isEmpty()) {
+                        var primary = errors.getFirst();
+                        errors.stream().skip(1).forEach(primary::addSuppressed);
+                        if (failure != null) failure.addSuppressed(primary);
+                        else throw new IllegalStateException("closing the calibration failed", primary);
                     }
-                    pipeline.close();
-                    forward.close();
-                    device.gpu.free(batchStates);
-                    device.gpu.freeHostWeights(statesAddress);
                 });
+    }
+
+    /// An action that may throw; every failure is collected so the remaining resources are still released.
+    private interface Closing {
+        void run() throws Exception;
+    }
+
+    private static void closing(List<Throwable> errors, Closing action) {
+        try {
+            action.run();
+        } catch (Throwable error) {
+            errors.add(error);
+        }
     }
 
     // ---- decoder layers ----
@@ -350,10 +370,11 @@ public final class Calibrate {
                     + " layers: no MTP layer and no final files");
             return CompletableFuture.completedFuture(null);
         }
-        dropCheckpoint();
+        // the resume point stays until the final files are written
         return trellis.mtp().thenRun(() -> {
             try {
                 writer.finish(allocation);
+                dropCheckpoint();
             } catch (IOException failure) {
                 throw new UncheckedIOException(failure);
             }
