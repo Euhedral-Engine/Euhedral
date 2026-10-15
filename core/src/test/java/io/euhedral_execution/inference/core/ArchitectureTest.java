@@ -367,18 +367,43 @@ class ArchitectureTest {
     }
 
     /// The weight-format seam: the one place in the shared artifact layer that names the dense model's kinds and
-    /// quantizations, because it decides how each format executes ([LinearFormat]).
+    /// quantizations, because it decides how each format executes ([LinearFormat]). It may name exactly these types
+    /// (`Ops` only until the shared linear kernel table replaces its row-exact BF16 launch).
     private static final String FORMAT_SEAM = "artifact/format/";
+
+    private static final Set<String> FORMAT_SEAM_MODEL_TYPES = Set.of(
+            "io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan",
+            "io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile",
+            "io.euhedral_execution.inference.core.model.qwen4.Ops");
+
+    private static final Pattern MODEL_REFERENCE =
+            Pattern.compile("io\\.euhedral_execution\\.inference\\.core\\.model\\.[\\w.]*\\w");
+
+    /// The model types `file` names, in imports and fully qualified uses, outside comments.
+    private static List<String> modelReferences(Path file) throws IOException {
+        List<String> references = new ArrayList<>();
+        for (String line : Files.readAllLines(file)) {
+            String code = line.strip();
+            if (code.startsWith("//") || code.startsWith("*")) continue;
+            var matcher = MODEL_REFERENCE.matcher(code);
+            while (matcher.find()) references.add(matcher.group());
+        }
+        return references;
+    }
+
+    /// Whether a reference to `type` is allowed in `file`: the seam may name its allowlist, nothing else may.
+    private static boolean allowed(Path file, String type) {
+        return relative(file).startsWith(FORMAT_SEAM)
+                && FORMAT_SEAM_MODEL_TYPES.stream().anyMatch(t -> type.equals(t) || type.startsWith(t + "."));
+    }
 
     /// The shared artifact layer reads containers and tensors for every model; it knows no model.
     @Test
     void theSharedArtifactLayerKnowsNoModel() throws IOException {
         List<String> violations = new ArrayList<>();
         for (Path file : javaFiles("artifact", true))
-            if (!relative(file).startsWith(FORMAT_SEAM))
-                for (String line : Files.readAllLines(file))
-                    if (line.startsWith("import io.euhedral_execution.inference.core.model."))
-                        violations.add(relative(file) + ": " + line);
+            for (String type : modelReferences(file))
+                if (!allowed(file, type)) violations.add(relative(file) + ": " + type);
         assertTrue(violations.isEmpty(), "shared artifact code imports a model:\n" + String.join("\n", violations));
     }
 
@@ -403,10 +428,13 @@ class ArchitectureTest {
                 for (Path file :
                         walk.filter(p -> p.toString().endsWith(".java")).toList()) {
                     String path = tree.getKey().relativize(file).toString().replace('\\', '/');
-                    if (tree.getValue().isEmpty() && (path.startsWith("model/") || path.startsWith(FORMAT_SEAM)))
-                        continue;
+                    if (tree.getValue().isEmpty() && path.startsWith("model/")) continue;
                     String name = tree.getValue() + path;
-                    if (importsAModel(file) && !MODEL_IMPORTS_OUTSIDE_MODEL.contains(name)) violations.add(name);
+                    boolean seam = tree.getValue().isEmpty() && path.startsWith(FORMAT_SEAM);
+                    boolean refers = seam
+                            ? modelReferences(file).stream().anyMatch(type -> !allowed(file, type))
+                            : importsAModel(file);
+                    if (refers && !MODEL_IMPORTS_OUTSIDE_MODEL.contains(name)) violations.add(name);
                 }
             }
         }

@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.artifact.format;
 
-import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
@@ -49,18 +48,17 @@ final class GroupedFormat extends GroupedLinearFormat {
                     default -> 5;
                 };
         long n = shape[0];
-        long kPad = CompactTensorLayout.alignUp(shape[1], K_ALIGNMENT);
+        long kPad = PayloadSizes.alignUp(shape[1], K_ALIGNMENT);
         long groups = kPad / GROUP_SIZE;
         long basePerGroup = bits == 3 ? 24 : 32;
         long highPerGroup = bits <= 4 ? 0 : 8;
-        long baseRow = CompactTensorLayout.multiply(groups, basePerGroup);
-        long highRow = CompactTensorLayout.multiply(groups, highPerGroup);
-        long baseBytes = CompactTensorLayout.multiply(n, baseRow);
-        long highBytes = CompactTensorLayout.multiply(n, highRow);
-        long highOffset = CompactTensorLayout.alignUp(baseBytes, PLANE_ALIGNMENT);
-        long scaleOffset = CompactTensorLayout.add(highOffset, CompactTensorLayout.alignUp(highBytes, PLANE_ALIGNMENT));
-        return CompactTensorLayout.add(
-                scaleOffset, CompactTensorLayout.multiply(CompactTensorLayout.multiply(n, groups), 2));
+        long baseRow = PayloadSizes.multiply(groups, basePerGroup);
+        long highRow = PayloadSizes.multiply(groups, highPerGroup);
+        long baseBytes = PayloadSizes.multiply(n, baseRow);
+        long highBytes = PayloadSizes.multiply(n, highRow);
+        long highOffset = PayloadSizes.alignUp(baseBytes, PLANE_ALIGNMENT);
+        long scaleOffset = PayloadSizes.add(highOffset, PayloadSizes.alignUp(highBytes, PLANE_ALIGNMENT));
+        return PayloadSizes.add(scaleOffset, PayloadSizes.multiply(PayloadSizes.multiply(n, groups), 2));
     }
 
     @Override

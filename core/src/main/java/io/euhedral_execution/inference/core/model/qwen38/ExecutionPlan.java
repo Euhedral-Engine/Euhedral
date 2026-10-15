@@ -1016,6 +1016,7 @@ public final class ExecutionPlan {
                 continue;
             }
             if (regions
+                    // The kind stays: a format that fuses gate/up also serves other roles (NVFP4 in a Q4 role).
                     && first.kind() == Kind.Q3_LINEAR
                     && LinearFormats.find(first.weightFormat(), first.weightLayout())
                             .map(LinearFormat::gateUpRegion)
