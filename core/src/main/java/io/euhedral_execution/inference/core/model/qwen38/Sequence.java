@@ -59,6 +59,8 @@ public final class Sequence {
     private volatile long committed;
     private volatile long settled;
     private volatile boolean cancellationRequested;
+    /// Set by [#complete()]: the sequence's persistent state is closed.
+    private volatile boolean closed;
     private final AtomicReference<Terminal> terminal = new AtomicReference<>(ACTIVE);
     private volatile Object kvCacheState;
     private volatile KvFormat kvFormat = KvFormat.NVFP4;
@@ -158,8 +160,10 @@ public final class Sequence {
     }
 
     /// As [#admit(Work, long, long)] for one segment of a batched pass: a sequence whose cancellation was requested
-    /// after the pass formed is admitted anyway. Its rows run and commit like a cancellation during execution, and
-    /// its settlement then ends it CANCELLED, so the other segments of the pass are unaffected.
+    /// after the pass formed is admitted anyway; a closed or failed one is refused. Its rows run and commit like a
+    /// cancellation during execution, and its settlement then ends it CANCELLED, so the other segments of the pass
+    /// are unaffected. The caller admits a sequence cancelled before the pass formed through
+    /// [#admit(Work, long, long)], which refuses it.
     public void admitSegment(Work work, long start, long end) {
         admit(work, start, end, true);
     }
@@ -167,9 +171,7 @@ public final class Sequence {
     private void admit(Work work, long start, long end, boolean tolerateCancellation) {
         Objects.requireNonNull(work, "work");
         if (!tolerateCancellation) requireAdmissible();
-        else if (!this.cancellationRequested
-                ? terminalState() != TerminalState.ACTIVE
-                : terminalState() != TerminalState.ACTIVE && terminalState() != TerminalState.CANCELLED)
+        else if (!admissibleForSegment(terminalState()))
             throw new IllegalStateException("Sequence is terminal: " + terminalState());
         long frontier = submittedFrontier();
         if (start != frontier) {
@@ -179,6 +181,13 @@ public final class Sequence {
             throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
         }
         enter(work, end, tolerateCancellation);
+    }
+
+    /// Whether a segment is admitted in `state`: never once the sequence is closed or failed; active, or cancelled
+    /// with the cancellation requested.
+    private boolean admissibleForSegment(TerminalState state) {
+        if (this.closed) return false;
+        return state == TerminalState.ACTIVE || (this.cancellationRequested && state == TerminalState.CANCELLED);
     }
 
     /// Admits `work` that leaves the frontiers where they are (a draft) at the submitted frontier, and returns
@@ -212,7 +221,7 @@ public final class Sequence {
         VarHandle.fullFence();
         TerminalState state = terminalState();
         boolean denied = tolerateCancellation
-                ? !this.cancellationRequested && state != TerminalState.ACTIVE
+                ? !admissibleForSegment(state)
                 : this.cancellationRequested || state != TerminalState.ACTIVE;
         if (denied) {
             this.submitted = previous;
@@ -281,6 +290,7 @@ public final class Sequence {
         if (inFlight()) {
             throw new IllegalStateException("Cannot complete a sequence during execution");
         }
+        this.closed = true;
         this.terminal.compareAndSet(ACTIVE, COMPLETED);
         this.cleanup.close(this.recurrentState, this.kvCacheState, terminalFailure());
     }
