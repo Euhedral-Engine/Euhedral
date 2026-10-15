@@ -31,7 +31,7 @@ public final class Cuda {
     private final Arena arena = Arena.ofShared();
     private final MethodHandle cuInit, cuDeviceGet, cuDeviceGetAttribute, cuDevicePrimaryCtxRetain, cuCtxSetCurrent;
     private final MethodHandle cuModuleLoadData, cuModuleGetFunction, cuLaunchKernel, cuStreamSynchronize;
-    private final MethodHandle cuFuncSetAttribute, cuOccupancy;
+    private final MethodHandle cuFuncSetAttribute, cuOccupancy, cuMemGetInfo;
     private final int multiprocessors;
     private final MethodHandle cuEventCreate, cuEventRecord, cuEventQuery, cuStreamWaitEvent, cuEventDestroy;
     private final MethodHandle nvrtcCreateProgram, nvrtcCompileProgram, nvrtcGetProgramLogSize, nvrtcGetProgramLog;
@@ -63,6 +63,7 @@ public final class Cuda {
         cuModuleGetFunction = bind(driver, "cuModuleGetFunction", INT, PTR, PTR, PTR);
         cuLaunchKernel = bind(driver, "cuLaunchKernel", INT, PTR, INT, INT, INT, INT, INT, INT, INT, PTR, PTR, PTR);
         cuStreamSynchronize = bind(driver, "cuStreamSynchronize", INT, PTR);
+        cuMemGetInfo = bind(driver, "cuMemGetInfo_v2", INT, PTR, PTR);
         cuFuncSetAttribute = bind(driver, "cuFuncSetAttribute", INT, PTR, INT, INT);
         cuOccupancy = bind(driver, "cuOccupancyMaxActiveBlocksPerMultiprocessor", INT, PTR, PTR, INT, PTR);
         cuEventCreate = bind(driver, "cuEventCreate", INT, PTR, INT);
@@ -357,6 +358,17 @@ public final class Cuda {
     public void destroyEvent(long event) {
         try {
             check("cuEventDestroy", (int) cuEventDestroy.invokeExact(event));
+        } catch (Throwable failure) {
+            throw rethrow(failure);
+        }
+    }
+
+    /// Device memory not allocated by any process, in bytes (the thread must be bound to the context).
+    public long freeMemory() {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment free = local.allocate(8), total = local.allocate(8);
+            check("cuMemGetInfo", (int) cuMemGetInfo.invokeExact(free.address(), total.address()));
+            return free.get(ValueLayout.JAVA_LONG, 0);
         } catch (Throwable failure) {
             throw rethrow(failure);
         }

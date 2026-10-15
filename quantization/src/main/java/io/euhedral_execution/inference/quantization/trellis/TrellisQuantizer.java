@@ -36,8 +36,8 @@ public final class TrellisQuantizer implements AutoCloseable {
     /// Share of the mean Hessian diagonal added as damping, and (twice) per Cholesky retry.
     public static final double SIGMA_REG = 0.025;
 
-    /// Device memory for the Viterbi history, fixed per instance; tiles run in chunks that fit.
-    static final long VITERBI_SCRATCH_BYTES = 256L << 20;
+    /// Default device memory for the Viterbi history; tiles run in chunks that fit.
+    public static final long DEFAULT_VITERBI_SCRATCH_BYTES = 256L << 20;
 
     private static final int CHOLESKY_RETRIES = 10;
     private static final int STRIP_SPAN = 128;
@@ -65,14 +65,22 @@ public final class TrellisQuantizer implements AutoCloseable {
     private final long scratch, small;
     private final List<Long> live = new ArrayList<>();
 
+    private final long viterbiScratchBytes;
+
     public TrellisQuantizer(Cuda cuda, CudaGpuMemory gpu, long stream) {
+        this(cuda, gpu, stream, DEFAULT_VITERBI_SCRATCH_BYTES);
+    }
+
+    /// `viterbiScratchBytes` is the device memory for the Viterbi history, fixed per instance.
+    public TrellisQuantizer(Cuda cuda, CudaGpuMemory gpu, long stream, long viterbiScratchBytes) {
+        this.viterbiScratchBytes = viterbiScratchBytes;
         this.cuda = cuda;
         this.gpu = gpu;
         this.stream = stream;
         this.kernels = new TrellisKernels(cuda, stream);
         this.cublas = cuda.cublasHandle(stream);
         this.cusolver = cuda.cusolverHandle(stream);
-        this.scratch = gpu.allocate(VITERBI_SCRATCH_BYTES);
+        this.scratch = gpu.allocate(viterbiScratchBytes);
         // 0: float mean, 1: float spare, 2-3: ints (Cholesky status, solve status), 4-11: four doubles
         this.small = gpu.allocate(64);
     }
@@ -92,7 +100,7 @@ public final class TrellisQuantizer implements AutoCloseable {
         if (n <= 0 || k <= 0 || n % 128 != 0 || k % 128 != 0)
             throw new IllegalArgumentException("shape [" + n + ", " + k + "] not a multiple of 128");
         int wordsPerTile = TrellisKernels.wordsPerTile(bits);
-        int scratchTiles = TrellisKernels.scratchTiles(VITERBI_SCRATCH_BYTES, bits);
+        int scratchTiles = TrellisKernels.scratchTiles(viterbiScratchBytes, bits);
         long kn = (long) k * n;
         int tiles = (k / 16) * (n / 16);
         try {
@@ -315,7 +323,7 @@ public final class TrellisQuantizer implements AutoCloseable {
                 indices,
                 quantized,
                 scratch,
-                TrellisKernels.scratchTiles(VITERBI_SCRATCH_BYTES, bits));
+                TrellisKernels.scratchTiles(viterbiScratchBytes, bits));
         long error = allocate(4L * candidates);
         launch("candidate_mse", candidates, 1, 256, quantized, sampled, stride, per, scalesDevice, error);
         cuda.synchronize(stream);

@@ -6,10 +6,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/// Bit allocation over the budgeted linears, ported from exllamav3 1.6.1 (MIT License, Copyright (c) 2025
-/// Turboderp), `conversion/allocation.py` `create_q_strategy` without `--hq`, with half-integer steps (mul1
+/// Bit allocation over the budgeted linears, ported from exllamav3 1.6.1, `conversion/allocation.py`
+/// `create_q_strategy` without `--hq`, with half-integer steps (mul1
 /// codebook): every linear starts at the largest supported rate not above the target, then groups of linears are
 /// promoted one step at a time while the parameter-weighted budget allows.
+///
+/// Portions ported from exllamav3 (MIT License, Copyright (c) 2025 Turboderp).
 public final class Allocation {
 
     private Allocation() {}
