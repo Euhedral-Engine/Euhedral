@@ -14,6 +14,9 @@ import java.util.Map;
 /// --draft-ids-from ARTIFACT
 /// --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
 /// [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
+/// calibrate --model CHECKPOINT --format trellis --bits 2.5|3.0|3.5 --tokens TOKENS.npy --out CHECKPOINT_DIR
+/// [--batch 8] [--sequences N] [--layers N] [--rounding-lanes N] [--viterbi-scratch-mib 256]
+/// [--memory-reserve-mib 1024] [--library LIBEUHEDRAL_CUDA]
 /// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
 /// [--overlay CHECKPOINT_DIR] [--sequences 96]
 /// [--holdout 16] [--epochs 2] [--scale-lr 1e-5] [--norm-lr 1e-4] [--batch 4] [--library LIBEUHEDRAL_CUDA]
@@ -41,6 +44,9 @@ public final class QuantizationMain {
                     "usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens T.npy "
                             + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                             + "[--layers N] [--skip-mtp] [--library PATH]");
+            System.err.println("       calibrate --model DIR --format trellis --bits 2.5|3.0|3.5 --tokens T.npy "
+                    + "--out DIR [--batch B] [--sequences N] [--layers N] [--rounding-lanes N] [--viterbi-scratch-mib 256] "
+                    + "[--memory-reserve-mib 1024] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
                     + "[--rows 8] [--host-mib N] [--batch 4] [--workers 6] [--library PATH]");
             System.err.println(
@@ -152,14 +158,20 @@ public final class QuantizationMain {
                     Path.of(library)));
             return;
         }
+        String format = options.getOrDefault("format", "gptq");
+        boolean trellis = format.equals("trellis");
+        if (!trellis && !format.equals("gptq")) throw new IllegalArgumentException("--format is gptq or trellis");
+        Double bits = trellis ? Double.valueOf(required(options, "bits")) : null;
         var settings = new Calibrate.Settings(
                 Path.of(required(options, "model")),
-                new Recipe(
-                        required(options, "quantization"),
-                        options.containsKey("compressed"),
-                        options.get("output-head")),
+                trellis
+                        ? null
+                        : new Recipe(
+                                required(options, "quantization"),
+                                options.containsKey("compressed"),
+                                options.get("output-head")),
                 Path.of(required(options, "tokens")),
-                Path.of(required(options, "draft-ids-from")),
+                trellis ? null : Path.of(required(options, "draft-ids-from")),
                 Path.of(required(options, "out")),
                 options.containsKey("act-order"),
                 Float.parseFloat(options.getOrDefault("damp", "0.01")),
@@ -169,7 +181,11 @@ public final class QuantizationMain {
                 options.containsKey("skip-mtp"),
                 new Gptq.Nvfp4Search(
                         Integer.parseInt(options.getOrDefault("nvfp4-above", "2")),
-                        Float.parseFloat(options.getOrDefault("nvfp4-scale-max", "448"))));
+                        Float.parseFloat(options.getOrDefault("nvfp4-scale-max", "448"))),
+                bits,
+                options.containsKey("rounding-lanes") ? Integer.valueOf(options.get("rounding-lanes")) : null,
+                Long.parseLong(options.getOrDefault("viterbi-scratch-mib", "256")),
+                Long.parseLong(options.getOrDefault("memory-reserve-mib", "1024")));
         Calibrate.run(settings, Path.of(library));
     }
 

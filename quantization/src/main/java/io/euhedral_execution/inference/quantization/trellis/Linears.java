@@ -4,9 +4,13 @@ import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
+import java.util.function.IntPredicate;
 
 /// Qwen3.8's text linears: which object's Hessian each one shares, where its rows sit in the layer's fused
 /// artifact objects, and the allocation inputs (priority and promotion group) of the budgeted ones.
+///
+/// Portions ported from exllamav3 (MIT License, Copyright (c) 2025 Turboderp).
 public final class Linears {
 
     private Linears() {}
@@ -85,26 +89,39 @@ public final class Linears {
     /// (`.o`); the gated MLP has priority 0 and promotes up and gate together (`.gu`) and down alone (`.d`). The
     /// GDN a/b projections are not quantized and are not listed.
     public static List<Allocation.Linear> qwen38(int layers, Map<String, long[]> shapes) {
+        return budget(
+                layers, i -> i % 4 == 3, (i, tensor) -> shapes.get(tensor.substring(tensor.lastIndexOf('.') + 1)));
+    }
+
+    /// The budgeted linears of the checkpoint's own text model: the layer count and which layers are full
+    /// attention come from its config, the shapes from its tensor headers.
+    public static List<Allocation.Linear> qwen38(Qwen38Objects checkpoint) {
+        boolean[] full = checkpoint.config.fullAttention();
+        return budget(
+                checkpoint.config.layers(),
+                i -> full[i],
+                (i, tensor) -> checkpoint.store().tensor(tensor + ".weight").shape());
+    }
+
+    private static List<Allocation.Linear> budget(
+            int layers, IntPredicate fullAttention, BiFunction<Integer, String, long[]> shapes) {
         List<Allocation.Linear> all = new ArrayList<>();
         for (int i = 0; i < layers; i++) {
             String p = TEXT + i + ".";
-            boolean full = i % 4 == 3;
+            boolean full = fullAttention.test(i);
             String attention = p + (full ? "self_attn" : "linear_attn");
             int priority = full ? 2 : 1;
             String[][] projections = full
                     ? new String[][] {{"q_proj", ".qkv"}, {"k_proj", ".qkv"}, {"v_proj", ".qkv"}, {"o_proj", ".o"}}
                     : new String[][] {{"in_proj_qkv", ".qkvz"}, {"in_proj_z", ".qkvz"}, {"out_proj", ".o"}};
-            for (String[] projection : projections)
-                all.add(budgeted(
-                        attention + "." + projection[0],
-                        i,
-                        shapes.get(projection[0]),
-                        priority,
-                        attention + projection[1]));
+            for (String[] projection : projections) {
+                String name = attention + "." + projection[0];
+                all.add(budgeted(name, i, shapes.apply(i, name), priority, attention + projection[1]));
+            }
             String mlp = p + "mlp";
-            all.add(budgeted(mlp + ".up_proj", i, shapes.get("up_proj"), 0, mlp + ".gu"));
-            all.add(budgeted(mlp + ".gate_proj", i, shapes.get("gate_proj"), 0, mlp + ".gu"));
-            all.add(budgeted(mlp + ".down_proj", i, shapes.get("down_proj"), 0, mlp + ".d"));
+            all.add(budgeted(mlp + ".up_proj", i, shapes.apply(i, mlp + ".up_proj"), 0, mlp + ".gu"));
+            all.add(budgeted(mlp + ".gate_proj", i, shapes.apply(i, mlp + ".gate_proj"), 0, mlp + ".gu"));
+            all.add(budgeted(mlp + ".down_proj", i, shapes.apply(i, mlp + ".down_proj"), 0, mlp + ".d"));
         }
         return all;
     }

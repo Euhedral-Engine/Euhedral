@@ -13,6 +13,10 @@ import io.euhedral_execution.inference.quantization.lattice.GpuCompletions;
 import io.euhedral_execution.inference.quantization.model.ForwardPipeline;
 import io.euhedral_execution.inference.quantization.model.LayerForward;
 import io.euhedral_execution.inference.quantization.model.LayerWeights;
+import io.euhedral_execution.inference.quantization.trellis.Allocation;
+import io.euhedral_execution.inference.quantization.trellis.Exl3Writer;
+import io.euhedral_execution.inference.quantization.trellis.Linears;
+import io.euhedral_execution.inference.quantization.trellis.TrellisRounding;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
@@ -48,7 +52,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /// run with the same settings resumes there.
 public final class Calibrate {
 
-    /// Command-line settings.
+    /// Command-line settings. `trellisBits` (average bits per weight) selects the trellis format, written as an
+    /// exllamav3 checkpoint, and then `recipe` and `draftIdsFrom` are unused and may be null; on the GPTQ path
+    /// (`trellisBits` null) both are required. `roundingLanes` fixes the number of concurrent trellis rounding
+    /// frames (null: sized from the free device memory per layer), `viterbiScratchMib` is each quantizer's Viterbi
+    /// scratch and `memoryReserveMib` the device memory the lane sizing leaves free.
     public record Settings(
             Path model,
             Recipe recipe,
@@ -61,14 +69,38 @@ public final class Calibrate {
             int sequences,
             int layers,
             boolean skipMtp,
-            Gptq.Nvfp4Search nvfp4) {}
+            Gptq.Nvfp4Search nvfp4,
+            Double trellisBits,
+            Integer roundingLanes,
+            long viterbiScratchMib,
+            long memoryReserveMib) {}
 
     private static final int HEAD_ROWS = 16384;
-    private static final int CHECKPOINT_EVERY = 8;
+    private static final int DEFAULT_CHECKPOINT_EVERY = 8;
     /// Objects of a layer rounded at once, each on its own stream (largest first): three fit a 16 GB card
     /// beside the layer and its Hessians.
     private static final int ROUNDING_FRAMES = 3;
     private static final int WORKERS = 6;
+
+    private static volatile int checkpointEvery = DEFAULT_CHECKPOINT_EVERY;
+    private static volatile int stopAfterLayers;
+    private static volatile int lastResumeLayer;
+
+    /// Test hook: the number of layers between checkpoints (default 8).
+    public static void checkpointEvery(int layers) {
+        checkpointEvery = layers;
+    }
+
+    /// Test hook: when positive, a run ends once this many layers are done and their checkpoint is written, without
+    /// the MTP layer, the heads or the final files; 0 (default) runs to the end.
+    public static void stopAfterLayers(int layers) {
+        stopAfterLayers = layers;
+    }
+
+    /// Test hook: the layer the last run started at (0 for a fresh run, otherwise the layer after the checkpoint).
+    public static int lastResumeLayer() {
+        return lastResumeLayer;
+    }
 
     private final Settings settings;
     private final Device device;
@@ -81,6 +113,10 @@ public final class Calibrate {
     private final Cuda.Function gatherRows;
     private final int hidden;
     private final long start = System.nanoTime();
+    /// Set while a trellis calibration runs.
+    private TrellisRounding trellis;
+    private Exl3Writer writer;
+    private Map<String, Double> allocation;
 
     private Calibrate(Settings settings, Device device, Qwen38Objects checkpoint, CalibrationLattice lattice) {
         this.settings = settings;
@@ -96,6 +132,8 @@ public final class Calibrate {
     /// Starts the calibration on the lattice and waits for it: the setup, then each layer continuing the next,
     /// then the heads, all on the lattice's workers.
     public static void run(Settings settings, Path library) throws IOException {
+        if (settings.trellisBits() == null && (settings.recipe() == null || settings.draftIdsFrom() == null))
+            throw new IllegalArgumentException("the GPTQ path needs a recipe and draft ids");
         try (Safetensors store = Safetensors.open(settings.model());
                 Device device = new Device(library);
                 CalibrationLattice lattice = CalibrationLattice.start(WORKERS)) {
@@ -137,16 +175,19 @@ public final class Calibrate {
         ForwardPipeline pipeline = new ForwardPipeline(device, forward, lattice.lake(), completions, batch);
         this.pipeline = pipeline;
         int first = resume(states, sequences, length);
+        lastResumeLayer = first;
         if (first == 0) embed(tokens, states, batchStates);
+        if (settings.trellisBits() != null) startTrellis(sequences, length);
+        int stop = stopAfterLayers > 0 ? Math.min(settings.layers(), stopAfterLayers) : settings.layers();
         var reading = new AtomicReference<CompletableFuture<LayerWeights.Staged>>(stageLayer(first));
         CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (int i = first; i < settings.layers(); i++) {
+        for (int i = first; i < stop; i++) {
             int index = i;
             chain = chain.thenCompose(ignored -> reading.get()).thenCompose(staged -> {
-                if (index + 1 < settings.layers()) reading.set(stageLayer(index + 1)); // read while this one runs
+                if (index + 1 < stop) reading.set(stageLayer(index + 1)); // read while this one runs
                 return calibrateLayer(index, staged, forward, states, batchStates, sequences, length)
                         .thenRun(() -> {
-                            if ((index + 1) % CHECKPOINT_EVERY == 0 && index + 1 < settings.layers()) {
+                            if ((index + 1) % checkpointEvery == 0 && index + 1 < settings.layers()) {
                                 try {
                                     saveCheckpoint(states, index + 1, sequences, length);
                                 } catch (IOException failure) {
@@ -156,9 +197,15 @@ public final class Calibrate {
                         });
             });
         }
+        boolean stopped = stop < settings.layers();
         return chain.thenCompose(ignored -> {
                     try {
                         device.select(device.stream);
+                        if (stopped) {
+                            log("stopped after " + stop + " layers");
+                            return CompletableFuture.<Void>completedFuture(null);
+                        }
+                        if (trellis != null) return finishTrellis();
                         dropCheckpoint();
                         return heads(tokens, forward, states, batchStates, sequences, length);
                     } catch (IOException failure) {
@@ -168,6 +215,14 @@ public final class Calibrate {
                 .thenRun(() -> log("done"))
                 .whenComplete((ignored, failure) -> {
                     device.select(device.stream);
+                    if (trellis != null) trellis.close();
+                    if (writer != null) {
+                        try {
+                            writer.close();
+                        } catch (IOException closing) {
+                            if (failure == null) throw new UncheckedIOException(closing);
+                        }
+                    }
                     pipeline.close();
                     forward.close();
                     device.gpu.free(batchStates);
@@ -202,13 +257,31 @@ public final class Calibrate {
         try (staged) {
             layer = LayerWeights.upload(device.gpu, staged);
         }
+        long[] marks = {System.nanoTime(), 0, 0};
         return observeAll(layer, forward, states, batchStates, sequences, length)
-                .thenCompose(hessians -> roundAll(layer, hessians))
-                .thenCompose(ignored -> pipeline.run(
-                        layer, states.address(), batchStates, sequences, length, settings.batch(), null, true))
+                .thenCompose(hessians -> {
+                    marks[1] = System.nanoTime();
+                    if (trellis == null) return roundAll(layer, hessians);
+                    return trellis.round(index, layer, hessians, (long) sequences * length);
+                })
+                .thenCompose(ignored -> {
+                    marks[2] = System.nanoTime();
+                    return pipeline.run(
+                            layer, states.address(), batchStates, sequences, length, settings.batch(), null, true);
+                })
                 .whenComplete((ignored, failure) -> {
                     layer.close();
-                    if (failure == null) log("layer " + index + " done");
+                    if (failure != null) return;
+                    if (trellis != null) {
+                        long end = System.nanoTime();
+                        log(String.format(
+                                "layer %d: capture %.1f s, rounding %.1f s, propagation %.1f s",
+                                index,
+                                (marks[1] - marks[0]) / 1e9,
+                                (marks[2] - marks[1]) / 1e9,
+                                (end - marks[2]) / 1e9));
+                    }
+                    log("layer " + index + " done");
                 });
     }
 
@@ -246,6 +319,45 @@ public final class Calibrate {
                     for (var share : shares.entrySet()) hessians.put(share.getKey(), hessians.get(share.getValue()));
                     return hessians;
                 });
+    }
+
+    // ---- trellis format ----
+
+    /// Allocates the bits per linear over the whole model, opens the writer and the rounding for a trellis run.
+    private void startTrellis(int sequences, int length) throws IOException {
+        double target = settings.trellisBits();
+        allocation = Allocation.allocate(Linears.qwen38(checkpoint), checkpoint.config.layers(), target);
+        var histogram = new java.util.TreeMap<Double, Integer>();
+        for (double bits : allocation.values()) histogram.merge(bits, 1, Integer::sum);
+        log("bit allocation for " + target + " bits per weight: " + allocation.size() + " linears " + histogram);
+        writer = new Exl3Writer(settings.model(), settings.out(), target, sequences, length);
+        trellis = new TrellisRounding(
+                device,
+                lattice,
+                checkpoint,
+                writer,
+                allocation,
+                this::log,
+                settings.roundingLanes(),
+                settings.viterbiScratchMib(),
+                settings.memoryReserveMib());
+    }
+
+    /// After the last layer: the MTP linears (when the run covers the whole model), then the remaining files.
+    private CompletableFuture<Void> finishTrellis() throws IOException {
+        if (settings.layers() < checkpoint.config.layers()) {
+            log("partial run of " + settings.layers() + " of " + checkpoint.config.layers()
+                    + " layers: no MTP layer and no final files");
+            return CompletableFuture.completedFuture(null);
+        }
+        dropCheckpoint();
+        return trellis.mtp().thenRun(() -> {
+            try {
+                writer.finish(allocation);
+            } catch (IOException failure) {
+                throw new UncheckedIOException(failure);
+            }
+        });
     }
 
     /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded
@@ -709,7 +821,8 @@ public final class Calibrate {
     }
 
     private String checkpointKey(int sequences, int length) {
-        return settings.tokens().toAbsolutePath() + "|" + sequences + "|" + length + "|" + settings.recipe() + "|"
+        return settings.tokens().toAbsolutePath() + "|" + sequences + "|" + length + "|"
+                + (settings.trellisBits() != null ? "trellis " + settings.trellisBits() : settings.recipe()) + "|"
                 + settings.actOrder() + "|" + settings.damp();
     }
 
