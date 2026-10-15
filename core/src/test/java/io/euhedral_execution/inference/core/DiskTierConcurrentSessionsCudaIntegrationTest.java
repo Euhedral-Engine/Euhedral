@@ -1,0 +1,107 @@
+package io.euhedral_execution.inference.core;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import io.euhedral_execution.inference.core.generation.GenerationSession;
+import io.euhedral_execution.inference.core.generation.SessionOptions;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
+import io.euhedral_execution.inference.core.sampling.GenerationConfig;
+import io.euhedral_execution.inference.core.testing.ModelGroup;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+/// Sessions that start together while weights are read from disk finish, and each produces the tokens it produces
+/// alone. Their prompts are admitted at once; the quanta that read the artifact run one after the other, because
+/// graphs submitting at once block every worker in full device streams while the device waits for reads that only a
+/// free worker reaps.
+// Own JVM: sets the global residency budget properties.
+@ModelGroup.OwnJvm
+class DiskTierConcurrentSessionsCudaIntegrationTest {
+
+    private static final int CONTEXT_TOKENS = 2048;
+    private static final int NEW_TOKENS = 16;
+    private static final int SEQUENCES = 4;
+    private static final String[] PROMPTS = {
+        "The capital of France is",
+        "Write a short poem about the sea and the lighthouse keeper.",
+        "List the planets of the solar system, from the sun outward, with one fact about each of them.",
+        "Explain in a few sentences how a heat pump moves thermal energy from a cold source to a warm sink.",
+    };
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.MINUTES, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void sessionsStartedTogetherOnTheDiskTierMatchRunningAlone() throws Exception {
+        String library = System.getProperty("euhedral.cuda.library");
+        assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
+        String artifact = System.getProperty("euhedral.qwen.nvfp4-artifact");
+        assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no NVFP4 artifact");
+        String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
+        assumeTrue(tokenizer != null, "no tokenizer directory");
+        var config = new InferenceConfig(
+                Path.of(artifact),
+                Path.of(tokenizer),
+                Path.of(library),
+                SystemInfo.getPCpuSet(),
+                CONTEXT_TOKENS,
+                Duration.ofSeconds(30),
+                0,
+                2048,
+                null,
+                SEQUENCES);
+        System.setProperty("euhedral.residency.device-budget-bytes", Long.toString(8L << 30));
+        System.setProperty("euhedral.residency.host-budget-bytes", Long.toString(2L << 30));
+        try (InferenceEngine engine = InferenceEngine.load(config)) {
+            var runtime = (Qwen38Runtime) engine.modelRuntime();
+            assertTrue(runtime.diskBackedWeightBytes() > 0, "weights beyond the host budget are read from disk");
+            int count = Math.min(engine.maxSequences(), SEQUENCES);
+            assertTrue(count >= 2, "the engine admits at least two sequences");
+            SessionOptions options = new SessionOptions(false);
+            int[][] prompts = new int[count][];
+            for (int i = 0; i < count; i++) prompts[i] = engine.tokenizer().encodeWithModelSpecialTokens(PROMPTS[i]);
+            List<List<Integer>> alone = new ArrayList<>();
+            for (int[] prompt : prompts)
+                alone.add(generate(engine, prompt, options).get(10, TimeUnit.MINUTES));
+            List<GenerationSession> sessions = new ArrayList<>();
+            List<CompletableFuture<List<Integer>>> futures = new ArrayList<>();
+            for (int[] prompt : prompts) {
+                GenerationSession session = engine.createGenerationSession(GenerationConfig.greedy(7L), options);
+                sessions.add(session);
+                futures.add(session.generateAsync(prompt, NEW_TOKENS, text -> {}, null, null));
+            }
+            try {
+                for (int i = 0; i < count; i++)
+                    assertEquals(
+                            alone.get(i),
+                            futures.get(i).get(10, TimeUnit.MINUTES),
+                            "session " + i + " changed when run together");
+            } finally {
+                for (GenerationSession session : sessions) session.close();
+            }
+        } finally {
+            System.clearProperty("euhedral.residency.device-budget-bytes");
+            System.clearProperty("euhedral.residency.host-budget-bytes");
+        }
+    }
+
+    private static CompletableFuture<List<Integer>> generate(
+            InferenceEngine engine, int[] prompt, SessionOptions options) {
+        GenerationSession session = engine.createGenerationSession(GenerationConfig.greedy(7L), options);
+        return session.generateAsync(prompt, NEW_TOKENS, text -> {}, null, null).whenComplete((done, failure) -> {
+            try {
+                session.close();
+            } catch (RuntimeException ignored) {
+                // The outcome is the future's.
+            }
+        });
+    }
+}
