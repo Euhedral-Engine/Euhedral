@@ -78,12 +78,10 @@ class TokenIdsTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(request("\"stream\":true,\"return_token_ids\":true")))
                 .andReturn();
-        var response = started.getRequest().isAsyncStarted()
-                ? this.mvc.perform(asyncDispatch(started))
-                : this.mvc.perform(post("/v1/chat/completions")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(request("\"stream\":true,\"return_token_ids\":true")));
-        response.andExpect(status().isBadRequest())
+        assertTrue(started.getRequest().isAsyncStarted());
+        this.mvc
+                .perform(asyncDispatch(started))
+                .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.param").value("return_token_ids"));
     }
 

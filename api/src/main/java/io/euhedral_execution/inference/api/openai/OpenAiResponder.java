@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.api.chat.GenerationService;
 import io.euhedral_execution.inference.api.chat.TokenUsage;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.http.MediaType;
@@ -44,7 +45,7 @@ record OpenAiResponder(long created, String model, boolean includeUsage) impleme
     }
 
     private static List<Integer> ids(int[] tokenIds) {
-        return java.util.Arrays.stream(tokenIds).boxed().toList();
+        return Arrays.stream(tokenIds).boxed().toList();
     }
 
     private static ToolCall toolCall(GeneratedCall call) {
