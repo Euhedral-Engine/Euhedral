@@ -477,8 +477,8 @@ public final class Session implements GenerationSession {
             // A greedy, unconstrained call selects each token on the device and reads back only its ID.
             hostLogits.selectOnDevice(sampler.greedy() && this.constraint == null);
             if (speculation != null
-                    && sampler.greedy()
                     && this.constraint == null
+                    && (sampler.greedy() || speculation.samples())
                     && !promptPrefilled
                     && sequence.currentTokenPosition() == 0
                     && this.maxNewTokens > 0) {
@@ -800,6 +800,7 @@ public final class Session implements GenerationSession {
             if (speculative == null)
                 speculative = speculation.open(
                         runtime, plan, gpu, sequence, tokenizer::isGenerationEosToken, prefillChunkTokens);
+            speculative.sampleWith(sampler);
             PrefixCache cache = prefixCache;
             if (cache == null) {
                 start(speculative.start(

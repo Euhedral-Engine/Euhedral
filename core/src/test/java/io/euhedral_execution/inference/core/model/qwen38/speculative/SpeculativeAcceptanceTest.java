@@ -53,4 +53,12 @@ class SpeculativeAcceptanceTest {
         assertArrayEquals(new int[] {6, 7}, budget.outputs());
         assertEquals(2, budget.committedRows());
     }
+
+    @Test
+    void aSampledVerificationAcceptsOnlyDraftsEqualToTheSampledTokens() {
+        var acceptance = resolve(new int[] {1, 5, 6, 7}, new int[] {5, 6, 9, 2}, 16);
+        assertEquals(2, acceptance.acceptedDrafts());
+        assertArrayEquals(new int[] {5, 6, 9}, acceptance.outputs());
+        assertEquals(3, acceptance.committedRows());
+    }
 }
