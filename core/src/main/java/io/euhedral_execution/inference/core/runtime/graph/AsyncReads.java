@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// File reads that do not hold a worker: a worker submits the read to the kernel (io_uring) and goes on, and
 /// the read's completion is a frame, emitted by this sink when the lattice's workers poll it, like any other
@@ -61,6 +63,8 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         /// here. It must neither block nor throw.
         protected void reaped() {}
     }
+
+    private static final Logger LOG = LoggerFactory.getLogger(AsyncReads.class);
 
     private static final int ENTRIES = 1024;
     private static final int MAX_RINGS = 256;
@@ -191,7 +195,9 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     /// reaper drops.
     private static final long DEFUSED = -1L;
 
-    /// The step that hands a ring's prepared entries to the kernel: `io_uring_submit`, or a test's stand-in.
+    /// The step that hands a ring's prepared entries to the kernel: `io_uring_submit`, or a test's stand-in. A
+    /// stand-in may refuse (a negated errno, or fewer entries than were prepared) or throw only before the kernel
+    /// took any entry; it must not throw after the kernel took entries, nor report more entries than were prepared.
     @FunctionalInterface
     public interface Submitter {
         /// The number of entries the kernel took, or a negated errno.
@@ -419,7 +425,10 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                 int slot = (int) tag;
                 Read read = this.pending.get(slot);
                 // Never expected: an entry is defused before its read gives its slot back.
-                if (read == null) continue;
+                if (read == null) {
+                    LOG.error("an io_uring completion (tag {}, result {}) belongs to no pending read", tag, result);
+                    continue;
+                }
                 if (result > 0 && result < read.remaining) {
                     // A short read: the rest is read on this thread's ring, under the same slot. A rest that cannot be
                     // submitted ends the read as failed (EIO), so it still completes.
@@ -431,6 +440,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                     try {
                         resubmitted = here != null && enqueue(here, read, slot);
                     } catch (RuntimeException | Error failure) {
+                        LOG.error("submitting the rest of a short read failed; the read fails", failure);
                         resubmitted = false;
                     }
                     if (resubmitted) continue;
