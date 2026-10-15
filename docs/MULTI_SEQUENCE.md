@@ -72,7 +72,7 @@ explicitly.
 | 8 | device | off | 20570 MiB | 3.11 s | 7.84 | 6.7 | 5.2 | ran 10 min |
 | 8 | host-mapped | off | 20570 MiB | 3.40 s | 7.65 | 5.9 | 4.7 | ran 10 min |
 | 8 | device | 2 GiB | 20570 MiB | 3.12 s | 7.92 | 6.5 | 5.4 | ran 10 min |
-| 12 | host-mapped | off | 23630 MiB | 3.88 s | 9.25 | 6.4 (not sustained) | | stalled after 1.5 min |
+| 12 | host-mapped | off | 23630 MiB | 3.88 s | 9.25 | 6.3 (not sustained) | | stalled after 1.5 min |
 
 Decode tok/s is segments per verify pass times tokens per verification over the pass period; whole-run tok/s divides the
 tokens of all verification passes by the run's wall time, so it includes the prefill passes at the start and the
