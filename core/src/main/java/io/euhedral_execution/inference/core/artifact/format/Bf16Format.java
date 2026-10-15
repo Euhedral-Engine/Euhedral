@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.artifact.format;
 
-import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
@@ -31,7 +30,7 @@ final class Bf16Format implements LinearFormat {
 
     @Override
     public long byteSize(long[] shape, TensorDataType dataType) {
-        return CompactTensorLayout.directSize(shape, dataType, WeightFormat.BF16);
+        return PayloadSizes.directSize(shape, dataType, WeightFormat.BF16);
     }
 
     @Override

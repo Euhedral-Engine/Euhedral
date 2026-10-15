@@ -11,8 +11,11 @@ import java.util.Optional;
 /// The registry of linear weight formats, keyed by `(WeightFormat, WeightLayout)`.
 public final class LinearFormats {
 
+    /// The Q3 grouped format, which an instruction with no weights routes as.
+    private static final LinearFormat NO_WEIGHTS = new GroupedFormat(WeightFormat.Q3_G64_FP16);
+
     private static final List<LinearFormat> ALL = List.of(
-            new GroupedFormat(WeightFormat.Q3_G64_FP16),
+            NO_WEIGHTS,
             new GroupedFormat(WeightFormat.Q4_G64_FP16),
             new GroupedFormat(WeightFormat.Q5_G64_FP16),
             new P2e2Format(),
@@ -29,10 +32,13 @@ public final class LinearFormats {
         return Optional.empty();
     }
 
-    /// The format that routes (and sizes the scratch of) an instruction whose weights are `format` and `layout`: the
-    /// registered one, else the Q3 grouped format, which anything unregistered has always been routed as.
+    /// The format that routes (and sizes the scratch of) an instruction with weights in `format` and `layout`.
+    /// No weights (`format` null) route as the Q3 grouped format; an unregistered key is refused.
     public static LinearFormat routing(WeightFormat format, WeightLayout layout) {
-        return find(format, layout).orElseGet(() -> ALL.getFirst());
+        if (format == null) return NO_WEIGHTS;
+        return find(format, layout)
+                .orElseThrow(() ->
+                        new IllegalArgumentException("unsupported linear weight format " + format + "/" + layout));
     }
 
     public static LinearFormat of(TensorDescriptor descriptor) {

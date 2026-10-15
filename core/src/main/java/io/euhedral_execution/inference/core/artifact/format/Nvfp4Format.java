@@ -12,7 +12,6 @@ import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
-import io.euhedral_execution.inference.core.model.qwen38.Stages;
 import java.lang.foreign.MemorySegment;
 import java.util.Arrays;
 import java.util.List;
@@ -168,7 +167,14 @@ public final class Nvfp4Format implements LinearFormat {
                 weight.byteSize());
     }
 
-    /// An NVFP4 linear over `rows` rows in the calls [Stages#nvfp4RowsPerCall] allows.
+    /// Rows per call of an NVFP4 linear: all of them, or at most [ExecutionGpu#NVFP4_PLAIN_LOAD_MAX_ROWS] when the
+    /// weights are host-mapped, so that no call reaches the tile kernels (TMA over mapped host memory) or the
+    /// scalar reference (a sweep of the weights over the bus per row).
+    public static int rowsPerCall(boolean hostMapped, int rows) {
+        return hostMapped ? Math.min(rows, ExecutionGpu.NVFP4_PLAIN_LOAD_MAX_ROWS) : rows;
+    }
+
+    /// An NVFP4 linear over `rows` rows in the calls [#rowsPerCall] allows.
     public static void linear(
             ExecutionGpu gpu,
             boolean hostMapped,
@@ -179,7 +185,7 @@ public final class Nvfp4Format implements LinearFormat {
             int inFeatures,
             int outFeatures,
             long weightBytes) {
-        int perCall = Stages.nvfp4RowsPerCall(hostMapped, rows);
+        int perCall = rowsPerCall(hostMapped, rows);
         for (int first = 0; first < rows; first += perCall)
             gpu.linearNvfp4Bf16(
                     input + (long) first * inFeatures * Short.BYTES,
