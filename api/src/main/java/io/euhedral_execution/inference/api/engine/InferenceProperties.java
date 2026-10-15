@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.engine;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.ProcessorTopology;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -11,7 +12,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /// Engine inputs bound from `euhedral.inference.*` (or `EUHEDRAL_INFERENCE_*` environment variables).
 ///
 /// `workerCpus` lists processor IDs accepted by Euhedral, not a worker count: comma-separated IDs and
-/// inclusive ranges such as `2,3,8-11`. `modelId` is the public name clients send as `model`.
+/// inclusive ranges such as `2,3,8-11`; unset, every processor the process may run on, and Euhedral pins one worker
+/// per core. `modelId` is the public name clients send as `model`.
 /// `maxContextTokens` is the longest prompt plus completion a request may use (default 32768); the
 /// engine keeps device memory for that much context and holds back weights in pinned host memory when
 /// the GPU cannot fit both. `prefixCacheBytes` is the pinned host memory that keeps the state of earlier prompts,
@@ -38,11 +40,10 @@ public record InferenceProperties(
         require(artifactPath, "artifact-path");
         require(tokenizerDirectory, "tokenizer-directory");
         require(cudaLibraryPath, "cuda-library-path");
-        require(workerCpus, "worker-cpus");
         require(shutdownTimeout, "shutdown-timeout");
         require(modelId, "model-id");
         if (modelId.isBlank()) throw new IllegalArgumentException("euhedral.inference.model-id must not be blank");
-        parseCpus(workerCpus);
+        if (workerCpus != null) parseCpus(workerCpus);
         if (maxContextTokens <= 0)
             throw new IllegalArgumentException("euhedral.inference.max-context-tokens must be positive");
         if (prefixCacheBytes < 0)
@@ -60,13 +61,20 @@ public record InferenceProperties(
                 this.artifactPath,
                 this.tokenizerDirectory,
                 this.cudaLibraryPath,
-                parseCpus(this.workerCpus),
+                selectedCpus(),
                 this.maxContextTokens,
                 this.shutdownTimeout,
                 this.prefixCacheBytes,
                 this.prefixCacheCheckpointTokens,
                 this.kvCache,
                 this.maxSequences);
+    }
+
+    /// The selected processors: the configured ones, or every available one when none are configured.
+    BitSet selectedCpus() {
+        return workerCpus == null || workerCpus.isBlank()
+                ? ProcessorTopology.system().availableProcessorIds()
+                : parseCpus(workerCpus);
     }
 
     static BitSet parseCpus(String specification) {

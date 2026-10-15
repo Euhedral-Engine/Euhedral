@@ -12,7 +12,7 @@ and `.env` gives the host paths mounted on them (`EUHEDRAL_ARTIFACT_FILE`, `EUHE
 | `euhedral.inference.artifact-path` | required | The `.edrl` artifact to serve. |
 | `euhedral.inference.tokenizer-directory` | required | The checkpoint directory (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`). |
 | `euhedral.inference.cuda-library-path` | required | `libeuhedral_cuda.so` (`euhedral_cuda.dll` on Windows). `libllguidance.so` sits beside it and the kernel sources in `../share/euhedral_cuda/`, as the build lays them out. |
-| `euhedral.inference.worker-cpus` | required | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`. |
+| `euhedral.inference.worker-cpus` | every available processor | Processor IDs or ranges for the engine's worker threads, for example `2-5,8`; Euhedral pins one worker per selected core. |
 | `euhedral.inference.model-id` | required | The name clients send as `model`. |
 | `euhedral.inference.max-context-tokens` | 32768 | The longest prompt plus completion. The engine keeps device memory for that much KV cache and holds weights in pinned host memory when both do not fit. At most the model's 262144 positions. |
 | `euhedral.inference.prefix-cache-bytes` | 4294967296 | Pinned host memory for the prefix cache ([PREFIX_CACHE.md](PREFIX_CACHE.md)); 0 turns it off. |

@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.ProcessorTopology;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -57,6 +58,21 @@ class InferencePropertiesTest {
         return new Binder(new MapConfigurationPropertySource(values))
                 .bind("euhedral.inference", InferenceProperties.class)
                 .get();
+    }
+
+    @Test
+    void workerCpusDefaultToEveryAvailableProcessor() {
+        Map<String, String> values = new HashMap<>(Map.of(
+                "euhedral.inference.artifact-path", "/m.edrl",
+                "euhedral.inference.tokenizer-directory", "/t",
+                "euhedral.inference.cuda-library-path", "/lib.so",
+                "euhedral.inference.model-id", "m"));
+        InferenceProperties unset = new Binder(new MapConfigurationPropertySource(values))
+                .bind("euhedral.inference", InferenceProperties.class)
+                .get();
+        assertEquals(
+                ProcessorTopology.system().availableProcessorIds(),
+                unset.toInferenceConfig().workerCpus());
     }
 
     @Test
