@@ -128,13 +128,13 @@ public final class MtpDecoder implements SpeculativeDecoding {
     private final int prefillChunk;
     private final int hidden;
     private final HostLogits baseLogits;
-    /// Selects the base model's tokens; null decodes greedily on the device.
-    private LogitsSampler sampler;
     private final HostLogits draftLogits;
     private final int[] draftTokens;
     /// Whether each vocabulary token is in the draft head's shortlist.
     private final boolean[] inShortlist;
     private final MtpCheckpoint checkpoint;
+    /// Selects the base model's tokens; null decodes greedily on the device.
+    private LogitsSampler sampler;
     private Statistics statistics;
     private StepListener steps;
     /// Whether each step commits one token, so that every output position starts a step.
@@ -282,8 +282,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
         return Float.intBitsToFloat((bits & 0xFFFF) << 16);
     }
 
-    /// Prefills `prompt` and generates up to `maxNewTokens` tokens, exactly as greedy decode would,
-    /// reporting each token as it is committed.
+    /// Prefills `prompt` and generates up to `maxNewTokens` tokens, greedily unless [#sampleWith] was given a
+    /// non-greedy sampler, reporting each token as it is committed.
     public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken)
             throws InterruptedException, ExecutionException {
         return generate(prompt, maxNewTokens, onToken, null);
@@ -570,7 +570,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 if (last) {
                     first = sampler == null
                             ? baseLogits.selectedToken()
-                            : sampler.selectToken(baseLogits, null, prompt.length);
+                            : sampler.selectToken(baseLogits, null, sequence.currentTokenPosition());
                     if (timing != null) timing.firstTokenSelected(System.nanoTime(), first);
                     next[next.length - 1] = first;
                 } else next[next.length - 1] = prompt[end];

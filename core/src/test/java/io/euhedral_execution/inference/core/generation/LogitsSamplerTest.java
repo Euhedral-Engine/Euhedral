@@ -263,8 +263,9 @@ class LogitsSamplerTest {
             for (int j = 1; j < rows; j++) verified[j] = j <= matching ? ordinary[j - 1] : (ordinary[j - 1] + 1) % 4;
             var acceptance = new SpeculativeAcceptance(verified, token -> false, 100);
             acceptance.resolve(selector.select(logits));
-            assertEquals(Math.min(matching, rows - 1), acceptance.acceptedDrafts());
+            assertEquals(matching, acceptance.acceptedDrafts());
             int[] outputs = acceptance.outputs();
+            assertEquals(matching + 1, outputs.length);
             assertArrayEquals(Arrays.copyOf(ordinary, outputs.length), outputs, "matching " + matching);
         }
     }
