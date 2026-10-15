@@ -32,6 +32,7 @@ class FakeServer:
         self.bodies: list[dict] = []
         self.fail_first = fail_first
         self.fail_code = "service_unavailable"
+        self.context = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -44,6 +45,17 @@ class FakeServer:
                     outer.fail_first -= 1
                     data = json.dumps({"error": {"code": outer.fail_code}}).encode()
                     self.send_response(503)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                prompt = len(render(body["messages"]))
+                if outer.context is not None and prompt + body["max_tokens"] > outer.context:
+                    data = json.dumps({"error": {"code": "context_length_exceeded", "message":
+                        f"This model's maximum context length is {outer.context} tokens. However, you requested "
+                        f"{prompt + body['max_tokens']} tokens ({prompt} in the messages, {body['max_tokens']} "
+                        "in the completion)."}}).encode()
+                    self.send_response(400)
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
@@ -166,6 +178,19 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(sleeps, [1.0])
         self.assertEqual(result.token_ids, [1001, 2001])
         self.assertEqual(result.message["reasoning_content"], "thought")
+
+    def test_max_tokens_shrinks_to_the_room_beside_the_prompt(self):
+        self.server.context = 10
+        client = chat_client.ChatClient(self.server.url, "m", sleep=lambda s: None)
+        result = client.complete([{"role": "user", "content": "x"}], [], records.Decoding("greedy", None), 8)
+        self.assertEqual(result.token_ids, [1001, 2001])
+        self.assertEqual([b["max_tokens"] for b in self.server.bodies], [7])
+
+    def test_a_prompt_that_fills_the_context_is_an_error(self):
+        self.server.context = 3
+        client = chat_client.ChatClient(self.server.url, "m", sleep=lambda s: None)
+        with self.assertRaisesRegex(RuntimeError, "server answered 400"):
+            client.complete([{"role": "user", "content": "x"}], [], records.Decoding("greedy", None), 8)
 
     def test_several_tool_calls_in_one_turn(self):
         self.write([row("multi", "tool_use", tools=[TOOL], fixture="fx.json")])

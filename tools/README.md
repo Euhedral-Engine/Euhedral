@@ -182,7 +182,7 @@ conversation's fixture. Greedy or sampled decoding comes from `t5.records.plan_d
 the server (`return_token_ids`), not re-tokenized. `--parallel` is required and must match the server's maximum number of
 sequences. The server must run with `euhedral.api.max-queued-generations` at least `--parallel` and with
 `euhedral.api.request-timeout` above the longest request (its 30m default is counted from arrival including queue
-wait, and BF16 requests take 45+ minutes; use for example 6h). A timeout answer is recorded as an error and not
+wait, and BF16 requests take 45+ minutes; use for example 6h). A request whose prompt plus `--max-tokens` exceeds the server's context is sent again with `max_tokens` cut to the room left. A timeout answer is recorded as an error and not
 retried; a full queue or restarting server (502/503/504) is retried with backoff for about 30 minutes. Ctrl-C stops
 the run: workers stop before their next request and an interrupted conversation is not recorded; a request in
 flight is not abandoned, so the process exits when it returns (a second Ctrl-C exits at once). Finished
