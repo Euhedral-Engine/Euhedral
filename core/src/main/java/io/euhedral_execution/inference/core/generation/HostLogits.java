@@ -277,9 +277,9 @@ public final class HostLogits implements AutoCloseable {
             if (this.row != null) this.row.close();
             if (this.rows != null) this.rows.close();
             if (this.selection != null) this.selection.close();
-            if (this.deviceSelection != 0) this.gpu.free(this.deviceSelection);
+            if (this.deviceSelection != 0) this.gpu.freeAsync(this.deviceSelection);
             if (this.rowSelections != null) this.rowSelections.close();
-            if (this.deviceRowSelections != 0) this.gpu.free(this.deviceRowSelections);
+            if (this.deviceRowSelections != 0) this.gpu.freeAsync(this.deviceRowSelections);
             this.row = null;
             this.rows = null;
             this.rowsCapacityBytes = 0;

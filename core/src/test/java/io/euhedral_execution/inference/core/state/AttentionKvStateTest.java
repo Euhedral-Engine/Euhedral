@@ -358,6 +358,18 @@ class AttentionKvStateTest {
         assertThrows(IllegalStateException.class, state::length);
     }
 
+    /// Closing runs on a worker: a synchronous free there would wait for the whole device.
+    @Test
+    void closeFreesEverythingInStreamOrder() {
+        RecordingGpu gpu = new RecordingGpu();
+        AttentionKvState state = new AttentionKvState(gpu, 1024);
+        state.prepareAppend(0, 300);
+        state.decodeScratchAddress(24);
+        state.close();
+        assertTrue(gpu.allocations.isEmpty());
+        assertEquals(0, gpu.syncFrees, "nothing is freed synchronously");
+    }
+
     @Test
     void decodeScratchIsStableAndOwnedAndHugeCapacityFailsBeforeAllocation() {
         RecordingGpu gpu = new RecordingGpu();
@@ -397,6 +409,10 @@ class AttentionKvStateTest {
 
         @Override
         public void freeAsync(long address) {
+            if (address == failFreeAddress) {
+                failFreeAddress = 0;
+                throw new IllegalStateException("injected release failure");
+            }
             asyncFreed.add(address);
             assertNotNull(allocations.remove(address), "unknown or duplicate stream-ordered free");
         }

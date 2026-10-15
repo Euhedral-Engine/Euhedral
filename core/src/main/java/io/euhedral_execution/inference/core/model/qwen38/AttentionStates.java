@@ -178,20 +178,20 @@ public final class AttentionStates implements AutoCloseable {
         Throwable failure = null;
         // Each buffer is forgotten only once freed, so a failed close can be retried.
         try {
-            if (this.draftSeedRows != 0) this.gpu.free(this.draftSeedRows);
+            if (this.draftSeedRows != 0) this.gpu.freeAsync(this.draftSeedRows);
             this.draftSeedRows = 0;
         } catch (Throwable cleanupFailure) {
             failure = cleanupFailure;
         }
         try {
-            if (this.draftRecursionHidden != 0) this.gpu.free(this.draftRecursionHidden);
+            if (this.draftRecursionHidden != 0) this.gpu.freeAsync(this.draftRecursionHidden);
             this.draftRecursionHidden = 0;
         } catch (Throwable cleanupFailure) {
             if (failure == null) failure = cleanupFailure;
             else failure.addSuppressed(cleanupFailure);
         }
         try {
-            if (this.decodeScratch != 0) this.gpu.free(this.decodeScratch);
+            if (this.decodeScratch != 0) this.gpu.freeAsync(this.decodeScratch);
             this.decodeScratch = 0;
         } catch (Throwable cleanupFailure) {
             if (failure == null) failure = cleanupFailure;
