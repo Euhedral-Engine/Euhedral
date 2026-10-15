@@ -22,7 +22,9 @@ public final class PassAssembler<S, O> {
     /// Runs one formed pass.
     @FunctionalInterface
     public interface Passes<O> {
-        /// Admits the pass and returns how many retirements it will report.
+        /// Admits the pass and returns how many retirements it will report. Must not throw once anything was
+        /// admitted: admission failures are reported through the admitted quantum's continuation. A throw is
+        /// counted as no retirements and surfaces as an `IllegalStateException`.
         int run(List<O> pass);
     }
 
@@ -33,10 +35,18 @@ public final class PassAssembler<S, O> {
     private final Passes<O> passes;
     private final ArrayDeque<O> pending = new ArrayDeque<>();
     private final Set<S> awaiting = new HashSet<>();
+    private final Set<S> pendingSequences = new HashSet<>();
+    private final Set<S> flight = new HashSet<>();
+    private final Set<S> departed = new HashSet<>();
     private int inFlight;
     private boolean running;
     private boolean again;
 
+    /// @param sequenceOf the sequence an offer belongs to
+    /// @param rowsOf the rows an offer occupies in a pass
+    /// @param maxRows the row cap of a pass
+    /// @param maxParts the offer cap of a pass
+    /// @param passes runs a formed pass
     public PassAssembler(
             Function<O, S> sequenceOf, ToIntFunction<O> rowsOf, int maxRows, int maxParts, Passes<O> passes) {
         if (maxRows < 1 || maxParts < 1) {
@@ -55,25 +65,43 @@ public final class PassAssembler<S, O> {
         if (rows < 1 || rows > maxRows) {
             throw new IllegalArgumentException("a step of " + rows + " rows does not fit a pass of " + maxRows);
         }
-        awaiting.remove(sequenceOf.apply(offer));
+        S sequence = sequenceOf.apply(offer);
+        if (!pendingSequences.add(sequence)) {
+            throw new IllegalStateException("a sequence already has a pending step");
+        }
+        awaiting.remove(sequence);
         pending.add(offer);
         tryRun();
     }
 
-    /// Releases the wait for a sequence that will not offer again.
+    /// Releases the wait for a sequence that will not offer again. A member of the pass in flight is recorded as
+    /// departed so that its retirement does not await it.
     public void leave(S sequence) {
         if (awaiting.remove(sequence)) {
             tryRun();
+        } else if (flight.contains(sequence)) {
+            departed.add(sequence);
         }
     }
 
-    /// Retires the pass in flight; its members must report before the next pass forms.
+    /// Retires one quantum of the pass in flight; its members must report before the next pass forms, unless they
+    /// already offered or left. Must be applied by an owner frame later than the one whose `Passes#run` returned
+    /// the count.
     public void retired(Collection<S> members) {
         if (inFlight == 0) {
             throw new IllegalStateException("no pass is in flight");
         }
         inFlight--;
-        awaiting.addAll(members);
+        for (S member : members) {
+            flight.remove(member);
+            if (!departed.remove(member) && !pendingSequences.contains(member)) {
+                awaiting.add(member);
+            }
+        }
+        if (inFlight == 0) {
+            flight.clear();
+            departed.clear();
+        }
         tryRun();
     }
 
@@ -84,20 +112,24 @@ public final class PassAssembler<S, O> {
             O o = it.next();
             if (selected.test(o)) {
                 it.remove();
+                pendingSequences.remove(sequenceOf.apply(o));
                 out.add(o);
             }
         }
         return out;
     }
 
+    /// Returns the number of offers waiting for a pass.
     public int pendingCount() {
         return pending.size();
     }
 
+    /// Returns the number of members of the last retired pass yet to report.
     public int awaitingCount() {
         return awaiting.size();
     }
 
+    /// Returns the number of retirements the passes in flight still owe.
     public int passesInFlight() {
         return inFlight;
     }
@@ -121,9 +153,24 @@ public final class PassAssembler<S, O> {
                         && rows + rowsOf.applyAsInt(pending.peek()) <= maxRows) {
                     O next = pending.poll();
                     rows += rowsOf.applyAsInt(next);
+                    pendingSequences.remove(sequenceOf.apply(next));
                     pass.add(next);
                 }
-                inFlight += passes.run(pass);
+                int retirements;
+                try {
+                    retirements = passes.run(pass);
+                } catch (RuntimeException e) {
+                    throw new IllegalStateException("a pass of " + pass.size() + " steps failed to run: " + pass, e);
+                }
+                if (retirements < 0) {
+                    throw new IllegalStateException("a pass reported " + retirements + " retirements");
+                }
+                if (retirements > 0) {
+                    inFlight += retirements;
+                    for (O o : pass) {
+                        flight.add(sequenceOf.apply(o));
+                    }
+                }
             } while (again);
         } finally {
             running = false;
