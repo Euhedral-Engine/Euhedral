@@ -15,9 +15,12 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -43,6 +46,8 @@ import java.util.stream.Stream;
 ///   `tensor_storage` for the text modules, as exllamav3's `create_quantization_config_json` does.
 ///
 /// Only one layer's results are held at a time and source tensors are streamed through a fixed chunk buffer.
+///
+/// Portions ported from exllamav3 (MIT License, Copyright (c) 2025 Turboderp).
 public final class Exl3Writer implements AutoCloseable {
 
     /// The multiplier of the `mul1` codebook, as the signed I32 exllamav3 stores.
@@ -75,15 +80,6 @@ public final class Exl3Writer implements AutoCloseable {
             "mlp.gate_proj",
             "mlp.down_proj");
     private static final List<String> STORED_ORDER = List.of("weight", "suh", "svh", "mul1", "trellis");
-    private static final List<String> MTP_LINEARS = List.of(
-            "mtp.fc",
-            "mtp.layers.0.self_attn.q_proj",
-            "mtp.layers.0.self_attn.k_proj",
-            "mtp.layers.0.self_attn.v_proj",
-            "mtp.layers.0.self_attn.o_proj",
-            "mtp.layers.0.mlp.gate_proj",
-            "mtp.layers.0.mlp.up_proj",
-            "mtp.layers.0.mlp.down_proj");
     private static final Map<String, String> TORCH_DTYPES = Map.of(
             "I16", "torch.int16",
             "F16", "torch.float16",
@@ -104,10 +100,19 @@ public final class Exl3Writer implements AutoCloseable {
     private final Map<String, String> weightMap = new LinkedHashMap<>();
     private final Map<String, Map<String, Stored>> modules = new HashMap<>();
     private final Map<String, Long> fileBytes = new HashMap<>();
+    private final int writeBufferBytes;
     private boolean mtpWritten;
 
-    /// `bits` is the average bits per weight of the text linears, `rows` and `columns` the calibration shape.
+    /// As [#Exl3Writer(Path, Path, double, int, int, int)] with a 16 MiB write buffer.
     public Exl3Writer(Path source, Path out, double bits, int rows, int columns) throws IOException {
+        this(source, out, bits, rows, columns, SafetensorsWriter.DEFAULT_BUFFER_BYTES);
+    }
+
+    /// `bits` is the average bits per weight of the text linears, `rows` and `columns` the calibration shape and
+    /// `writeBufferBytes` the size of the buffer each file is copied through.
+    public Exl3Writer(Path source, Path out, double bits, int rows, int columns, int writeBufferBytes)
+            throws IOException {
+        this.writeBufferBytes = writeBufferBytes;
         this.source = source;
         this.out = out;
         this.bits = bits;
@@ -167,7 +172,7 @@ public final class Exl3Writer implements AutoCloseable {
         }
 
         void write() throws IOException {
-            try (SafetensorsWriter writer = new SafetensorsWriter(out.resolve(file))) {
+            try (SafetensorsWriter writer = new SafetensorsWriter(out.resolve(file), writeBufferBytes)) {
                 for (var e : tensors.entrySet()) {
                     Pending p = e.getValue();
                     writer.add(e.getKey(), p.dtype(), p.shape(), p.bytes(), p.source());
@@ -268,14 +273,15 @@ public final class Exl3Writer implements AutoCloseable {
     /// Writes `mtp.safetensors`: the eight MTP linears (keyed by tensor name without `.weight`, 4 bits each) and the
     /// remaining `mtp.*` tensors as in the source.
     public void mtp(Map<String, TrellisQuantizer.Result> quantized) throws IOException {
-        if (!quantized.keySet().equals(Set.copyOf(MTP_LINEARS)))
-            throw new IllegalArgumentException("mtp linears are " + MTP_LINEARS + ", got " + quantized.keySet());
+        if (!quantized.keySet().equals(Set.copyOf(Linears.MTP_LINEARS)))
+            throw new IllegalArgumentException(
+                    "mtp linears are " + Linears.MTP_LINEARS + ", got " + quantized.keySet());
         Shard shard = new Shard("mtp.safetensors");
-        for (String linear : MTP_LINEARS) quantizedLinear(shard, linear, quantized.get(linear), MTP_BITS);
+        for (String linear : Linears.MTP_LINEARS) quantizedLinear(shard, linear, quantized.get(linear), MTP_BITS);
         for (String name : sorted(store.names())) {
             if (!name.startsWith("mtp.")) continue;
             boolean linear = name.endsWith(".weight")
-                    && MTP_LINEARS.contains(name.substring(0, name.length() - ".weight".length()));
+                    && Linears.MTP_LINEARS.contains(name.substring(0, name.length() - ".weight".length()));
             if (!linear) shard.copy(name);
         }
         shard.write();
@@ -397,11 +403,11 @@ public final class Exl3Writer implements AutoCloseable {
 
     private Set<String> expectedMtpTensors() {
         Set<String> expected = new TreeSet<>();
-        for (String linear : MTP_LINEARS)
+        for (String linear : Linears.MTP_LINEARS)
             for (String part : List.of("trellis", "suh", "svh", "mul1")) expected.add(linear + "." + part);
         for (String name : store.names()) {
             boolean linear = name.endsWith(".weight")
-                    && MTP_LINEARS.contains(name.substring(0, name.length() - ".weight".length()));
+                    && Linears.MTP_LINEARS.contains(name.substring(0, name.length() - ".weight".length()));
             if (name.startsWith("mtp.") && !linear) expected.add(name);
         }
         return expected;
@@ -428,8 +434,7 @@ public final class Exl3Writer implements AutoCloseable {
 
     /// The tensors of a safetensors file, from its header only.
     private static Map<String, Stored> readHeader(Path file) throws IOException {
-        try (java.nio.channels.FileChannel channel =
-                java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
             ByteBuffer size = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
             readFully(channel, size, 0);
             long headerBytes = size.getLong(0);
@@ -437,7 +442,7 @@ public final class Exl3Writer implements AutoCloseable {
                 throw new IOException(file + ": bad header size " + headerBytes);
             ByteBuffer header = ByteBuffer.allocate((int) headerBytes);
             readFully(channel, header, 8);
-            JsonNode root = JSON.readTree(new String(header.array(), java.nio.charset.StandardCharsets.UTF_8));
+            JsonNode root = JSON.readTree(new String(header.array(), StandardCharsets.UTF_8));
             Map<String, Stored> found = new HashMap<>();
             for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
                 var entry = it.next();
@@ -454,8 +459,7 @@ public final class Exl3Writer implements AutoCloseable {
         }
     }
 
-    private static void readFully(java.nio.channels.FileChannel channel, ByteBuffer buffer, long position)
-            throws IOException {
+    private static void readFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
         while (buffer.hasRemaining()) {
             int read = channel.read(buffer, position);
             if (read < 0) throw new IOException("unexpected end of file");
@@ -472,7 +476,7 @@ public final class Exl3Writer implements AutoCloseable {
         ObjectNode calibration = q.putObject("calibration");
         calibration.put("rows", rows);
         calibration.put("cols", columns);
-        q.put("out_scales", "auto");
+        q.put("out_scales", "always");
         q.put("codebook", "mul1");
         if (mtpWritten) q.put("mtp_bits", MTP_BITS);
         return q;

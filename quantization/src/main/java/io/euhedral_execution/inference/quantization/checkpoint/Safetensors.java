@@ -11,10 +11,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 
 /// The tensors of a Hugging Face checkpoint directory: `model.safetensors.index.json` and its shards, or a single
 /// `model.safetensors`. Tensors are read with positioned reads, never memory-mapped: the checkpoints live on a shared
@@ -44,7 +47,7 @@ public final class Safetensors implements AutoCloseable {
         List<Path> shards;
         if (Files.isRegularFile(index)) {
             JsonNode weightMap = JSON.readTree(index.toFile()).get("weight_map");
-            var names = new java.util.TreeSet<String>();
+            var names = new TreeSet<String>();
             for (Iterator<JsonNode> it = weightMap.elements(); it.hasNext(); )
                 names.add(it.next().asText());
             shards = names.stream().map(directory::resolve).toList();
@@ -89,8 +92,8 @@ public final class Safetensors implements AutoCloseable {
     }
 
     /// The names of all tensors.
-    public java.util.Set<String> names() {
-        return java.util.Collections.unmodifiableSet(tensors.keySet());
+    public Set<String> names() {
+        return Collections.unmodifiableSet(tensors.keySet());
     }
 
     public boolean contains(String name) {

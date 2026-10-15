@@ -17,6 +17,17 @@ public final class Linears {
 
     private static final String TEXT = "model.language_model.layers.";
 
+    /// The eight linears of the MTP layer (tensor names without `.weight`).
+    public static final List<String> MTP_LINEARS = List.of(
+            "mtp.fc",
+            "mtp.layers.0.self_attn.q_proj",
+            "mtp.layers.0.self_attn.k_proj",
+            "mtp.layers.0.self_attn.v_proj",
+            "mtp.layers.0.self_attn.o_proj",
+            "mtp.layers.0.mlp.gate_proj",
+            "mtp.layers.0.mlp.up_proj",
+            "mtp.layers.0.mlp.down_proj");
+
     /// A linear of a decoder layer: `tensor` is its name without `.weight`, `[rows, columns]` = `[n, k]`,
     /// `hessianObject` the object whose observed Hessian it shares, `quantized` false when `n` or `k` is not a
     /// multiple of 128.

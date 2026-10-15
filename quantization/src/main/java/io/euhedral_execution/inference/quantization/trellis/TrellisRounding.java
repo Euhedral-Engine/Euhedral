@@ -35,17 +35,6 @@ public final class TrellisRounding implements AutoCloseable {
     /// Seed of the MTP linears' signs (a decoder layer's is its index).
     static final long MTP_SEED = 64;
 
-    private static final String[] MTP_LINEARS = {
-        "mtp.fc",
-        "mtp.layers.0.self_attn.q_proj",
-        "mtp.layers.0.self_attn.k_proj",
-        "mtp.layers.0.self_attn.v_proj",
-        "mtp.layers.0.self_attn.o_proj",
-        "mtp.layers.0.mlp.gate_proj",
-        "mtp.layers.0.mlp.up_proj",
-        "mtp.layers.0.mlp.down_proj"
-    };
-
     private final Device device;
     private final CalibrationLattice lattice;
     private final Qwen38Objects checkpoint;
@@ -70,6 +59,12 @@ public final class TrellisRounding implements AutoCloseable {
             long reserveMib) {
         this.fixedLanes = fixedLanes;
         this.viterbiScratchBytes = viterbiScratchMib << 20;
+        long tile = TrellisKernels.scratchBytes(1, Exl3Writer.MTP_BITS);
+        for (double rate : bits.values()) tile = Math.max(tile, TrellisKernels.scratchBytes(1, rate));
+        if (viterbiScratchBytes < tile)
+            throw new IllegalArgumentException("--viterbi-scratch-mib " + viterbiScratchMib
+                    + " holds less than one tile of the largest rate (" + tile + " bytes, "
+                    + ((tile + (1L << 20) - 1) >> 20) + " MiB)");
         this.reserveBytes = reserveMib << 20;
         this.device = device;
         this.lattice = lattice;
@@ -264,7 +259,7 @@ public final class TrellisRounding implements AutoCloseable {
             TrellisQuantizer quantizer = quantizer(stream);
             Map<String, TrellisQuantizer.Result> results = new LinkedHashMap<>();
             try {
-                for (String linear : MTP_LINEARS) {
+                for (String linear : Linears.MTP_LINEARS) {
                     long started = System.nanoTime();
                     var tensor = checkpoint.store().tensor(linear + ".weight");
                     long weight = device.gpu.allocate(tensor.bytes());

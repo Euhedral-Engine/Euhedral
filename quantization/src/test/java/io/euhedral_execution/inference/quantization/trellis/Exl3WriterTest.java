@@ -329,7 +329,7 @@ class Exl3WriterTest {
         assertEquals(16, q.get("head_bits").asInt());
         assertEquals(4, q.get("calibration").get("rows").asInt());
         assertEquals(8, q.get("calibration").get("cols").asInt());
-        assertEquals("auto", q.get("out_scales").asText());
+        assertEquals("always", q.get("out_scales").asText());
         assertEquals("mul1", q.get("codebook").asText());
         assertEquals(4, q.get("mtp_bits").asInt());
         assertFalse(q.has("vision_bits"));

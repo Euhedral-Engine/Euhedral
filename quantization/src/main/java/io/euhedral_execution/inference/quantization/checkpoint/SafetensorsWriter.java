@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -36,19 +37,29 @@ public final class SafetensorsWriter implements AutoCloseable {
 
     private static final Map<String, Integer> ELEMENT_BYTES =
             Map.of("I16", 2, "F16", 2, "BF16", 2, "F32", 4, "I32", 4, "I64", 8, "U8", 1, "I8", 1);
-    private static final int CHUNK = 16 << 20;
+    /// The copy buffer of [#SafetensorsWriter(Path)]: 16 MiB.
+    public static final int DEFAULT_BUFFER_BYTES = 16 << 20;
+
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private record Entry(String name, String dtype, long[] shape, long bytes, Source source) {}
 
     private final Path file;
+    private final int bufferBytes;
     private final List<Entry> entries = new ArrayList<>();
     private final Set<String> names = new HashSet<>();
     private long dataBytes;
     private boolean closed;
 
     public SafetensorsWriter(Path file) {
+        this(file, DEFAULT_BUFFER_BYTES);
+    }
+
+    /// `bufferBytes` is the size of the buffer the tensors are copied to the file through.
+    public SafetensorsWriter(Path file, int bufferBytes) {
+        if (bufferBytes < 1) throw new IllegalArgumentException("buffer must hold a byte: " + bufferBytes);
         this.file = file;
+        this.bufferBytes = bufferBytes;
     }
 
     /// Adds a tensor held in `data`, which must stay valid until [#close].
@@ -95,8 +106,8 @@ public final class SafetensorsWriter implements AutoCloseable {
             offset += entry.bytes();
         }
         byte[] encoded = JSON.writeValueAsString(header).getBytes(StandardCharsets.UTF_8);
-        byte[] json = java.util.Arrays.copyOf(encoded, (encoded.length + 7) / 8 * 8);
-        java.util.Arrays.fill(json, encoded.length, json.length, (byte) ' ');
+        byte[] json = Arrays.copyOf(encoded, (encoded.length + 7) / 8 * 8);
+        Arrays.fill(json, encoded.length, json.length, (byte) ' ');
         Path part = file.resolveSibling(file.getFileName() + ".part");
         try {
             try (FileChannel out = FileChannel.open(
@@ -109,10 +120,10 @@ public final class SafetensorsWriter implements AutoCloseable {
                 size.putLong(json.length).flip();
                 writeFully(out, size);
                 writeFully(out, ByteBuffer.wrap(json));
-                MemorySegment chunk = arena.allocate(CHUNK, 8);
+                MemorySegment chunk = arena.allocate(bufferBytes, 8);
                 for (Entry entry : entries) {
-                    for (long at = 0; at < entry.bytes(); at += CHUNK) {
-                        MemorySegment piece = chunk.asSlice(0, Math.min(CHUNK, entry.bytes() - at));
+                    for (long at = 0; at < entry.bytes(); at += bufferBytes) {
+                        MemorySegment piece = chunk.asSlice(0, Math.min(bufferBytes, entry.bytes() - at));
                         entry.source().read(at, piece);
                         writeFully(out, piece.asByteBuffer());
                     }

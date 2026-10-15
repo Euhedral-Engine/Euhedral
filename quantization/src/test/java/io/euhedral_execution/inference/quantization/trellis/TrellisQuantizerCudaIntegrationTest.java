@@ -65,7 +65,7 @@ class TrellisQuantizerCudaIntegrationTest {
             // rank-deficient H: the fixture's H with its first 512 rows and columns zeroed
             f.zeroLeading(512);
             var result = f.quantizer.quantize(f.weight, 512, 1024, f.hessian, 4096, 3.0, 0, true);
-            assertTrue(Double.isFinite(result.proxyError()), "quantized after damping retries");
+            assertTrue(Double.isFinite(result.proxyError()), "quantized with the damping alone");
             f.gpu.free(result.decoded());
         }
     }
