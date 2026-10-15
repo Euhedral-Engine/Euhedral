@@ -150,6 +150,30 @@ up to 0.75 tokens per verification between the four prompts of each length. Roun
 instead gave 2.95 at 32K, so the draft head stays rounded by GPTQ. `q3` (`q3-compressed`): 2.43 (2.47) tokens per
 verification at 4K and 2.47 (2.50) at 32K, 127 (107) tok/s at 4K and 112 (97) at 32K.
 
+## Trellis (EXL3) quantization
+
+`quantization calibrate --format trellis --bits B` writes Swift-1.5 (Qwen3.8) as an exllamav3 1.6.1 checkpoint: QTIP-style
+trellis rounding of each linear (256-weight tiles, a 16-bit state, the mul1
+codebook, signed 128-point Hadamard rotations of both sides, LDLQ error feedback through the Viterbi search, fp16
+row and column scales refit in the Hessian metric), with rates from 2 to 6 bits and half-bit steps allocated per linear
+to the average. The Hessians come from the Swift calibration trace (218 sequences of 2048 tokens) run through the
+BF16 layers one at a time; the LM head is stored as F16 (BF16 source), the MTP layer is rounded at 4 bits without a
+Hessian, the vision tower is copied. The engine does not run this format yet; the numbers below were scored with
+exllamav3 against the same Swift-1.5 BF16 references as above (`dNLL ± chunk-level SE / mean KL / top-1`; exllamav3's
+scores carry no standard errors).
+
+| Quantizer | T1 | T2 wikitext | T3 code | T4 own generations |
+|---|---|---|---|---|
+| exllamav3 converter, default calibration, 3.0 bpw | +0.0372 ± — / 0.0447 / 89.2% | -0.0126 ± — / 0.0535 / 91.3% | +0.1035 ± — / 0.1531 / 94.3% | -0.1041 ± — / 0.2988 / 90.0% |
+| exllamav3 converter, Swift trace, 3.0 bpw | +0.0466 ± — / 0.0444 / 88.6% | +0.0222 ± — / 0.0485 / 92.2% | +0.0691 ± — / 0.1140 / 95.3% | +0.1217 ± — / 0.1906 / 92.7% |
+| exllamav3 converter, Swift trace, 2.5 bpw | +0.0779 ± — / 0.1009 / 84.4% | +0.0213 ± — / 0.0889 / 88.4% | +0.1398 ± — / 0.2041 / 93.2% | +0.1390 ± — / 0.2982 / 90.5% |
+| `quantization calibrate --format trellis`, Swift trace, 3.5 bpw | +0.0290 ± 0.0070 / 0.0226 / 92.0% | -0.0017 ± 0.0047 / 0.0258 / 94.5% | +0.0392 ± 0.0056 / 0.0608 / 96.8% | +0.0821 ± 0.0241 / 0.1231 / 94.0% |
+
+The module converted at 3.5 bits per weight in 3267 s on a 16 GB RTX 50-series card with 2 rounding lanes: per layer
+about 6.5 s of Hessian capture, 39.6 s of rounding and 4.3 s of propagation. Over the 192 linears of that run, the
+per-linear proxy error `tr(E H Eᵀ) / tr(W H Wᵀ)` matched exllamav3's converter on the same weights and Hessians
+(median ratio 1.001).
+
 ## Weight-only error
 
 `tools/holdout/weight_only.sh` writes an artifact's dequantized weights into a copy of the BF16 GGUF

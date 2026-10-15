@@ -36,6 +36,43 @@ settings resumes there.
 Options: `--act-order` (columns by decreasing diag H), `--damp` (0.01), `--batch` (sequences per batch, 8),
 `--sequences N`, `--layers N` (a short run), `--skip-mtp`, `--library` (the engine's native library).
 
+## Trellis calibration
+
+```bash
+./gradlew :quantization:run --args="calibrate --format trellis --bits 3.5 --model /path/to/checkpoint \
+    --tokens tokens.npy --out exl3/"
+```
+
+Writes the checkpoint in exllamav3's EXL3 trellis format instead of GPTQ codes. `--bits B` is the average bits per
+weight of the text linears: each linear gets a rate of 2 to 6 bits in half-bit steps (exllamav3's allocation), and the
+rounding is the same layer-by-layer pass as above, with the layer's Hessians from the BF16 forward and each linear
+rounded by the trellis quantizer (`trellis.cu`; ported from exllamav3 1.6.1) as a lattice frame on its own stream.
+
+Output (`--out`, loadable by exllamav3): one `model.language_model.layers.<i>.safetensors` per decoder layer,
+`mtp.safetensors` (the MTP linears at 4 bits, uncalibrated), `lm_head.safetensors` (F16), the token embedding,
+`model.visual.safetensors` (vision tower copied unquantized), `model.safetensors.index.json`, `config.json` with the
+`quantization_config` block and `quantization_config.json`.
+
+Resource flags:
+
+- `--rounding-lanes N`: linears rounded at once (default: sized from the device memory free at each layer, less the
+  reserve and the decoded weights the layer keeps).
+- `--viterbi-scratch-mib N` (256): each quantizer's Viterbi history; it must hold at least one tile at the largest rate
+  of the run (about 8.1 MiB at 2.5 bits, 4 MiB at 2), otherwise the run is refused.
+- `--memory-reserve-mib N` (1024): device memory the lane sizing leaves free.
+- `--write-buffer-mib N` (16): the buffer each output file is copied through.
+- `--batch`, `--sequences`, `--layers`, `--library` as above.
+
+The GPTQ-only flags (`--skip-mtp`, `--act-order`, `--damp`, `--quantization`, `--compressed`, `--output-head`,
+`--draft-ids-from`, `--nvfp4-above`, `--nvfp4-scale-max`) are rejected with `--format trellis`. `--bits` and every
+allocated rate are validated before any GPU work.
+
+Resuming: the hidden states are checkpointed every 8 layers into one `hidden.bin` (a `ResumeFile`, overwritten in
+place) and a run with the same tokens, shape and `--bits` resumes after the last checkpoint; the layer files already
+written are adopted rather than rounded again. The checkpoint is dropped only after the final files are written. The
+MTP layer and the final files are written only when every layer runs (`--layers` below the model's layer count
+stops after the layers, with no MTP file and no index).
+
 ## Scoring
 
 ```bash
