@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -193,25 +192,47 @@ class BatchedSegmentsTest {
         assertSame(some.segments()[1].part().sequence(), some.segments()[1].sequence());
     }
 
+    /// Records the source and size of every device-to-host copy.
+    private static final class CopyRecordingGpu extends EngineExecutionFixture.SamplingGpu {
+        final List<long[]> copies = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        CopyRecordingGpu() {
+            super(8);
+        }
+
+        @Override
+        public void copyDeviceToHost(java.lang.foreign.MemorySegment destination, long source, long byteSize) {
+            this.copies.add(new long[] {source, byteSize});
+            super.copyDeviceToHost(destination, source, byteSize);
+        }
+    }
+
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    void aVerifyingPartWithoutDeviceSelectionFailsTheQuantumForNow() throws Exception {
-        // TEMPORARY: replaced when a batched verification copies every row's logits to the host.
-        var gpu = new EngineExecutionFixture.SamplingGpu(8);
+    void aVerifyingPartWithoutDeviceSelectionCopiesEveryOfItsRows() throws Exception {
+        var gpu = new CopyRecordingGpu();
         var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
         var execution = new Execution(new PullingLattice(), plan, gpu);
         var a = new Sequence(1);
         try {
             var logits = new HostLogits(gpu, 8);
             var acceptance = new SpeculativeAcceptance(new int[] {1, 2}, t -> false, 8);
-            var part = new Quantum.Part(a, 0, new int[] {1, 2})
-                    .verifying(logits, acceptance, SpeculativeAcceptance.Selector.GREEDY);
+            var part = new Quantum.Part(a, 0, new int[] {1, 2}).verifying(logits, acceptance, h -> {
+                // Acceptance reads the rows at stage commit, before the quantum retires.
+                assertEquals(2, h.rowCount());
+                return new int[] {2, 0};
+            });
             var outcome = execution
                     .submit(Quantum.batch(
                             plan, Quantum.ExecutionKind.VERIFY, List.of(part), LogitsRequirement.ALL_TOKENS))
                     .get(10, TimeUnit.SECONDS);
-            assertEquals(Quantum.Status.FAILED, outcome.status());
-            assertInstanceOf(UnsupportedOperationException.class, outcome.failure());
+            assertEquals(Quantum.Status.SUCCESS, outcome.status(), String.valueOf(outcome.failure()));
+            long rowsBytes = 2L * 8 * Short.BYTES;
+            assertTrue(
+                    gpu.copies.stream().anyMatch(copy -> copy[1] == rowsBytes),
+                    "both rows cross to the host in one copy");
+            assertEquals(2, logits.rowCount());
+            assertEquals(2, a.currentTokenPosition());
         } finally {
             a.complete();
             execution.close();

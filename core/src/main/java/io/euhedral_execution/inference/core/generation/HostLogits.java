@@ -34,6 +34,10 @@ public final class HostLogits implements AutoCloseable {
     private int rowSelectionCapacity;
     private int queuedRows;
     private int readyRows;
+    private ExecutionGpu.ReadbackBuffer rows;
+    private long rowsCapacityBytes;
+    private int queuedFullRows;
+    private int readyFullRows;
     private boolean selectOnDevice;
     private boolean scoreOnDevice;
     /// Whether the queued or latest retired selection carries a log-probability.
@@ -63,8 +67,9 @@ public final class HostLogits implements AutoCloseable {
                 .add(this.gpu, this.deviceSelection);
         fingerprint.add(this.gpu, this.deviceRowSelections);
         fingerprint.add(this.rowSelectionCapacity);
+        fingerprint.add(this.rowsCapacityBytes);
         for (ExecutionGpu.ReadbackBuffer buffer :
-                new ExecutionGpu.ReadbackBuffer[] {this.row, this.selection, this.rowSelections})
+                new ExecutionGpu.ReadbackBuffer[] {this.row, this.selection, this.rowSelections, this.rows})
             fingerprint.add(this.gpu, buffer == null ? 0 : buffer.segment().address());
     }
 
@@ -93,6 +98,7 @@ public final class HostLogits implements AutoCloseable {
         if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
         this.ready = false;
         this.selectionReady = false;
+        this.readyFullRows = 0;
         long finalRow = Math.addExact(logitsAddress, Math.multiplyExact((long) (rows - 1), this.rowBytes));
         if (this.selectOnDevice) {
             // Allocated and pinned once per session, while the host runs ahead of the device.
@@ -131,6 +137,7 @@ public final class HostLogits implements AutoCloseable {
         this.ready = false;
         this.selectionReady = false;
         this.readyRows = 0;
+        this.readyFullRows = 0;
         if (rows > this.rowSelectionCapacity) {
             // Grown between sessions' first verifications; the previous quantum retired before this one.
             if (this.rowSelections != null) this.rowSelections.close();
@@ -153,6 +160,31 @@ public final class HostLogits implements AutoCloseable {
         this.queuedRows = rows;
     }
 
+    /// Queues the copy of all `rows` BF16 logits rows at `logitsAddress`: a sampled verification reads every
+    /// row ([#row(int)]). The pinned buffer grows between quanta, as the previous quantum retired before this
+    /// one is queued.
+    public void queueRows(long logitsAddress, int rows) {
+        if (this.closed) throw new IllegalStateException("host logits are closed");
+        if (rows <= 0) throw new IllegalArgumentException("rows must be positive");
+        this.ready = false;
+        this.selectionReady = false;
+        this.readyRows = 0;
+        this.readyFullRows = 0;
+        long bytes = Math.multiplyExact((long) rows, this.rowBytes);
+        if (bytes > this.rowsCapacityBytes) {
+            if (this.rows != null) this.rows.close();
+            this.rows = null;
+            this.rowsCapacityBytes = 0;
+            this.rows = this.gpu.allocateReadbackBuffer(bytes);
+            this.rowsCapacityBytes = bytes;
+        }
+        this.gpu.copyDeviceToReadback(this.rows, logitsAddress, bytes);
+        this.queued = false;
+        this.queuedSelection = false;
+        this.queuedRows = 0;
+        this.queuedFullRows = rows;
+    }
+
     /// Publishes a queued row or selection once its quantum retired; only a successful quantum's
     /// result becomes readable.
     public void retired(boolean succeeded) {
@@ -164,6 +196,8 @@ public final class HostLogits implements AutoCloseable {
         this.queued = false;
         this.queuedSelection = false;
         this.queuedRows = 0;
+        this.readyFullRows = succeeded ? this.queuedFullRows : 0;
+        this.queuedFullRows = 0;
     }
 
     /// The device's greedy token for each row of the latest retired verification (lowest token ID among
@@ -209,6 +243,21 @@ public final class HostLogits implements AutoCloseable {
         return this.row.segment();
     }
 
+    /// How many rows the latest queued copy (while its quantum retires) or retired copy of [#queueRows] holds.
+    public int rowCount() {
+        int count = this.queuedFullRows > 0 ? this.queuedFullRows : this.readyFullRows;
+        if (count == 0 || this.closed) throw new IllegalStateException("no verified logits rows are available");
+        return count;
+    }
+
+    /// Row `index` of the latest [#queueRows] copy, BF16 in vocabulary order. Valid from that quantum's
+    /// retirement on; acceptance reads it at stage commit, before [#retired], once the device work finished.
+    public MemorySegment row(int index) {
+        int count = rowCount();
+        if (index < 0 || index >= count) throw new IndexOutOfBoundsException("row " + index + " of " + count);
+        return this.rows.segment().asSlice((long) index * this.rowBytes, this.rowBytes);
+    }
+
     /// Releases the pinned row, the selection and its device word. A GPU that cannot prove its
     /// submitted work stopped may still write them, so they are then retained.
     @Override
@@ -217,18 +266,23 @@ public final class HostLogits implements AutoCloseable {
         this.ready = false;
         this.selectionReady = false;
         this.readyRows = 0;
+        this.readyFullRows = 0;
         if (this.row != null
+                || this.rows != null
                 || this.selection != null
                 || this.deviceSelection != 0
                 || this.rowSelections != null
                 || this.deviceRowSelections != 0) {
             if (!this.gpu.completionProven()) return;
             if (this.row != null) this.row.close();
+            if (this.rows != null) this.rows.close();
             if (this.selection != null) this.selection.close();
             if (this.deviceSelection != 0) this.gpu.free(this.deviceSelection);
             if (this.rowSelections != null) this.rowSelections.close();
             if (this.deviceRowSelections != 0) this.gpu.free(this.deviceRowSelections);
             this.row = null;
+            this.rows = null;
+            this.rowsCapacityBytes = 0;
             this.selection = null;
             this.deviceSelection = 0;
             this.rowSelections = null;

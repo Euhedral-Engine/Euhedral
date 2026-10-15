@@ -6,7 +6,9 @@ import java.util.SplittableRandom;
 import java.util.function.DoubleSupplier;
 import java.util.function.IntPredicate;
 
-/// Selects one token from a single vocabulary-logit row using a generation-local random stream.
+/// Selects one token from a single vocabulary-logit row using a generation-local random stream, or, in the
+/// overloads that take a `position`, using a draw keyed by the seed and that position: those calls are independent
+/// of call order and of the sequential stream's state, so a position samples the same token however it is reached.
 /// Create one sampler per generation; instances are not thread-safe and must not be shared concurrently.
 /// Sampling excludes NaN and negative infinity; positive infinities share probability mass equally.
 ///

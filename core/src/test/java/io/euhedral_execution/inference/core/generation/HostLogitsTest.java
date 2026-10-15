@@ -125,6 +125,39 @@ class HostLogitsTest {
         assertThrows(IllegalArgumentException.class, logits::selectedToken);
     }
 
+    @Test
+    void copiesEveryRowAndExposesThemFromRetirement() {
+        var gpu = new ReadbackGpu();
+        var logits = new HostLogits(gpu, 4);
+        assertThrows(IllegalStateException.class, () -> logits.row(0), "nothing was queued");
+        assertThrows(IllegalStateException.class, logits::rowCount);
+
+        logits.queueRows(1000, 3);
+        assertEquals(3, logits.rowCount(), "acceptance reads the rows before the quantum retires");
+        assertEquals(List.of(1000L), gpu.sources, "one copy of all three rows");
+        assertEquals(List.of(3L * 4 * Short.BYTES), gpu.copyBytes);
+        logits.retired(true);
+        assertEquals(3, logits.rowCount());
+        assertEquals((short) 1000, logits.row(0).get(ValueLayout.JAVA_SHORT, 0));
+        assertEquals(4L * Short.BYTES, logits.row(1).byteSize());
+        assertThrows(IndexOutOfBoundsException.class, () -> logits.row(3));
+
+        logits.retired(false);
+        assertThrows(IllegalStateException.class, () -> logits.row(1), "nothing is queued, nothing stays readable");
+        assertThrows(IllegalStateException.class, logits::rowCount);
+
+        logits.queueRows(2000, 2);
+        logits.retired(false);
+        assertThrows(IllegalStateException.class, () -> logits.row(0), "a failed quantum never exposes its rows");
+        logits.queueRows(2000, 5);
+        logits.retired(true);
+        assertEquals(5, logits.rowCount(), "the buffer grew between quanta");
+        assertEquals(2, gpu.allocations, "the first buffer was replaced by a larger one");
+        assertEquals(1, gpu.releases);
+        logits.queueFinalRow(3000, 1);
+        assertThrows(IllegalStateException.class, () -> logits.row(0), "a new quantum invalidates the old rows");
+    }
+
     private static final class ReadbackGpu extends ExecutionFixtures.RecordingGpu {
         final List<Long> sources = new ArrayList<>();
         final List<Long> selected = new ArrayList<>();

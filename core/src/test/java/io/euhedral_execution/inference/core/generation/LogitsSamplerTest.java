@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
+import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -212,6 +213,75 @@ class LogitsSamplerTest {
         }
 
         assertEquals(List.of(LOGITS_ADDRESS), gpu.freedAddresses);
+    }
+
+    @Test
+    void selectRowsSamplesEachRowAtItsPosition() {
+        int rows = 24;
+        var gpu = new RowsGpu(rows, 4);
+        var logits = new HostLogits(gpu, 4);
+        logits.queueRows(1 << 20, rows);
+        logits.retired(true);
+        var config = new GenerationConfig(1.0f, 0, 1.0f, 99L, false);
+
+        int[] selected = new LogitsSampler(config, 4).selectRows(logits, 100);
+        assertEquals(rows, selected.length);
+        var sampler = new LogitsSampler(config, 4);
+        for (int row = 0; row < rows; row++) assertEquals(sampler.selectRow(logits, row, 100 + row), selected[row]);
+
+        var reverse = new LogitsSampler(config, 4);
+        for (int row = rows - 1; row >= 0; row--)
+            assertEquals(selected[row], reverse.selectRow(logits, row, 100 + row), "row " + row);
+        assertArrayEquals(selected, new LogitsSampler(config, 4).selectRows(logits, 100), "a fresh sampler agrees");
+        assertTrue(java.util.Arrays.stream(selected).distinct().count() > 1, "the rows are not all one token");
+
+        logits.queueFinalRow(1 << 20, 1);
+        logits.retired(true);
+        var keyed = new LogitsSampler(config, 4);
+        for (long position = 100; position < 100 + rows; position++)
+            assertEquals(
+                    keyed.selectToken(logits, null, position),
+                    keyed.selectToken(logits, token -> true, position),
+                    "a keyed selection of a position repeats");
+    }
+
+    @Test
+    void selectRowsOfADeviceSelectingCopyAreTheDeviceChoices() {
+        var gpu = new RowsGpu(3, 4);
+        gpu.selectable = true;
+        var logits = new HostLogits(gpu, 4);
+        logits.selectOnDevice(true);
+        logits.queueRowSelections(1 << 20, 3);
+        logits.retired(true);
+        assertArrayEquals(
+                logits.selectedTokens(), new LogitsSampler(GenerationConfig.greedy(1L), 4).selectRows(logits, 0));
+    }
+
+    /// Fills each copied row with the same flat logits; device selection, when enabled, picks token 2.
+    private static final class RowsGpu extends ExecutionFixtures.RecordingGpu {
+        boolean selectable;
+
+        RowsGpu(int rows, int vocabulary) {
+            this.nextAddress.set(1L << 40);
+        }
+
+        @Override
+        public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
+            return this.selectable;
+        }
+
+        @Override
+        public void copyDeviceToHost(MemorySegment destination, long source, long byteSize) {
+            if (byteSize % 8 != 0) return;
+            if (this.selectable && byteSize <= 3 * Long.BYTES) {
+                for (long offset = 0; offset < byteSize; offset += Long.BYTES)
+                    destination.set(ValueLayout.JAVA_LONG, offset, 0xFFFF_FFFFL - 2);
+                return;
+            }
+            short[] flat = {bf16(0.1f), bf16(0.4f), bf16(0.2f), bf16(0.3f)};
+            for (long i = 0; i * Short.BYTES < byteSize; i++)
+                destination.set(ValueLayout.JAVA_SHORT, i * Short.BYTES, flat[(int) (i % 4)]);
+        }
     }
 
     private static short bf16(float value) {
