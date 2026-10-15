@@ -56,7 +56,7 @@ identical state, bitwise.
 
 ## 3. Memory
 
-MTP is never host-backed: `HostWeightSelection` only takes `text/layers/N/...` projections and the token embedding. Sizes of the
+MTP is never host-backed: `HostWeightSelection` only takes `text/layers/N/...` projections and the token embedding (the planner also maps the LM head, read in place, when the device needs room for more sequences; the draft head stays resident because every draft reads it). Sizes of the
 `nvfp4` artifact's objects ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md) for how the engine fits them):
 
 | Item | MiB |

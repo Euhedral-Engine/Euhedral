@@ -22,6 +22,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner;
 import io.euhedral_execution.inference.core.model.qwen4.Qwen4Runtime;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
@@ -598,7 +599,8 @@ public final class InferenceEngine implements AutoCloseable {
             if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
                 throw new IOException("the weights the GPU cannot hold need "
                         + ((plan.hostArenaBytes() + plan.windowBytes()) >> 20) + " MiB of host memory (the token "
-                        + "embedding, the host-backed weights and the disk window), more than the " + (host >> 20)
+                        + "embedding, the LM head, the host-backed weights and the disk window), more than the "
+                        + (host >> 20)
                         + " MiB host budget; set " + HostBudget.ENVIRONMENT + " higher or a smaller max context");
             if (!plan.fits())
                 throw new IOException((sequences == 1 ? "a context" : sequences + " sequences") + " of "
@@ -619,6 +621,16 @@ public final class InferenceEngine implements AutoCloseable {
                     diskBytes >> 20,
                     plan.windowBytes() >> 20,
                     host >> 20);
+            if (plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD)) {
+                long head = 0;
+                for (var tensor : artifact.tensors())
+                    if (tensor.name().equals(HostWeightSelection.OUTPUT_HEAD)) head = tensor.byteSize();
+                // Streamed over the bus once per pass at about 40 GB/s, whatever the sequence count.
+                LOG.info(
+                        "The LM head ({} MiB) is mapped in host memory and read in place: about {} ms of bus time per pass",
+                        head >> 20,
+                        head / 40_000_000L);
+            }
             return Qwen38Model.load(path, artifact, gpu, profile.speculation(), plan.hostBacked(), plan.diskBacked());
         }
 

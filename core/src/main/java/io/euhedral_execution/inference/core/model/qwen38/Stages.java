@@ -16,6 +16,28 @@ import java.util.Objects;
 /// quantum rebinds only the graph's quantum, and the frame launches its operation on that quantum's stream.
 public final class Stages {
 
+    /// Rows per call of an NVFP4 linear: all of them, or at most [ExecutionGpu#NVFP4_PLAIN_LOAD_MAX_ROWS] when the
+    /// weights are host-mapped, so that no call reaches the tile kernels (TMA over mapped host memory) or the
+    /// scalar reference (a sweep of the weights over the bus per row).
+    static int nvfp4RowsPerCall(boolean hostMapped, int rows) {
+        return hostMapped ? Math.min(rows, ExecutionGpu.NVFP4_PLAIN_LOAD_MAX_ROWS) : rows;
+    }
+
+    /// Runs `instruction`'s NVFP4 linear over `rows` rows in the calls [#nvfp4RowsPerCall] allows.
+    static void linearNvfp4(
+            ExecutionGpu gpu, ExecutionPlan.Instruction instruction, long input, long output, int rows) {
+        int perCall = nvfp4RowsPerCall(instruction.weightHostMapped(), rows);
+        for (int first = 0; first < rows; first += perCall)
+            gpu.linearNvfp4Bf16(
+                    input + (long) first * instruction.inputWidth() * Short.BYTES,
+                    instruction.weightAddress(),
+                    output + (long) first * instruction.outputWidth() * Short.BYTES,
+                    Math.min(perCall, rows - first),
+                    instruction.inputWidth(),
+                    instruction.outputWidth(),
+                    instruction.weightByteSize());
+    }
+
     private Stages() {}
 
     /// The stage frame of one instruction: stage `instruction.id()` of a single-chunk graph.
@@ -468,14 +490,7 @@ public final class Stages {
                     && (instruction.kind() == ExecutionPlan.Kind.Q3_LINEAR
                             || instruction.kind() == ExecutionPlan.Kind.Q4_LINEAR
                             || instruction.kind() == ExecutionPlan.Kind.Q5_LINEAR)) {
-                gpu().linearNvfp4Bf16(
-                                input,
-                                instruction.weightAddress(),
-                                output,
-                                rows,
-                                instruction.inputWidth(),
-                                instruction.outputWidth(),
-                                instruction.weightByteSize());
+                linearNvfp4(gpu(), instruction, input, output, rows);
                 if (logits) context.logitsProduced(output);
                 return;
             }
@@ -1325,14 +1340,7 @@ public final class Stages {
                 long in = input(context, instruction, 0) + (long) instruction.inputWidth() * Short.BYTES;
                 long out = output(context, instruction, 0);
                 if (instruction.weightFormat() == WeightFormat.NVFP4)
-                    gpu().linearNvfp4Bf16(
-                                    in,
-                                    instruction.weightAddress(),
-                                    out,
-                                    rows - 1,
-                                    instruction.inputWidth(),
-                                    instruction.outputWidth(),
-                                    instruction.weightByteSize());
+                    linearNvfp4(gpu(), instruction, in, out, rows - 1);
                 else if (instruction.weightFormat() == WeightFormat.BF16)
                     io.euhedral_execution.inference.core.model.qwen4.Ops.linearBf16RowExact(
                             gpu(),

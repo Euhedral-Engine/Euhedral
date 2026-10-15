@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.ModelRuntime;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model.qwen38.prefix.PrefixCache;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DFlash2Decoder;
 import io.euhedral_execution.inference.core.prefix.PrefixCacheStats;
@@ -268,7 +269,8 @@ public final class Qwen38Runtime implements ModelRuntime {
     public long hostBackedWeightBytes() {
         long bytes = 0;
         for (var handle : this.model.weights().runtimeObjects().values())
-            if (handle.hostBacked()) bytes += handle.byteSize();
+            if (handle.hostBacked() || handle.name().equals(HostWeightSelection.OUTPUT_HEAD) && handle.hostMapped())
+                bytes += handle.byteSize();
         return bytes;
     }
 

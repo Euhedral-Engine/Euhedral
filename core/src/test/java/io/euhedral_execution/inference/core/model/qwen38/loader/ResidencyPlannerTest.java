@@ -161,6 +161,55 @@ class ResidencyPlannerTest {
     }
 
     @Test
+    void anNvfp4HeadIsNotMappedWhenVerificationOutgrowsTheDecodeKernels() {
+        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
+                + ResidencyPlanner.kvBytes(config(2), 4096)
+                + ResidencyPlanner.RESERVE_BYTES;
+        long free = resident - 1000 * MIB;
+        // Rows per verification are sequences x (1 + draft depth).
+        int depth = PROFILE.speculativeDepth();
+        int most = ResidencyPlanner.NVFP4_ROW_EXACT_MAX_ROWS / (1 + depth);
+        var within = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most, true);
+        assertTrue(within.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        var beyond =
+                ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most + 1, true);
+        assertFalse(beyond.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        var late =
+                ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, most + 1, false);
+        assertFalse(late.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertFalse(late.fits());
+    }
+
+    @Test
+    void theEarlyHeadStaysLastAndTheArenaSplitKeepsItInHostMemory() {
+        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
+                + ResidencyPlanner.kvBytes(config(2), 4096)
+                + ResidencyPlanner.RESERVE_BYTES;
+        var plan = ResidencyPlanner.plan(
+                artifact(), PROFILE, resident - 100 * MIB, 4096, 1100 * MIB, KvFormat.NVFP4, 1, true);
+        var order = new ArrayList<>(plan.hostBacked());
+        order.addAll(plan.diskBacked());
+        assertTrue(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertFalse(plan.diskBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertEquals(HostWeightSelection.EMBEDDING, order.getFirst());
+        // The head's bytes are in the arena before earlier objects are placed in the window.
+        assertTrue(plan.hostArenaBytes() + plan.windowBytes() <= 1100 * MIB || !plan.fits());
+        assertTrue(plan.hostArenaBytes() >= 1000 * MIB);
+    }
+
+    @Test
+    void aPartiallyOffloadedDefaultPlanKeepsTheHeadAndIsTheSelection() {
+        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
+                + ResidencyPlanner.kvBytes(config(2), 4096)
+                + ResidencyPlanner.RESERVE_BYTES;
+        var plan = ResidencyPlanner.plan(
+                artifact(), PROFILE, resident - 100 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, false);
+        assertTrue(plan.fits());
+        assertFalse(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertTrue(HostWeightSelection.select(artifact(), 1L << 40).containsAll(plan.hostBacked()));
+    }
+
+    @Test
     void moreSequencesKeepFewerWeightsOnTheDevice() {
         long free = 3000L * MIB;
         var one = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
