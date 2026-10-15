@@ -321,4 +321,31 @@ class DiskReaderTest {
         assertEquals(0, flagWhenFailed[0], "the quantum failed before the slot rose");
         assertEquals(1, held.size(), "the completion frame has not run");
     }
+
+    /// A quantum whose failure throws still has its slot raised and handed on: a slot left down would hold the
+    /// device for good.
+    @Test
+    void aSlotRisesAndServesItsNextUseWhenFailingTheQuantumThrows() throws Exception {
+        open(true);
+        DiskUse past = new DiskUse("q1/past", FILE_BYTES + 65_536L, 9_000, 3);
+        DiskUse next = new DiskUse("q1/next", 0, 9_000, 3);
+        this.reader.enqueue(1, List.of(past, next), cause -> {
+            throw new Error("failing the quantum threw");
+        });
+        List<AbstractFrame> held = new ArrayList<>();
+        Error thrown = null;
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (this.window.flag(3) != 1) {
+            assertTrue(System.nanoTime() < deadline, "the slot was never raised");
+            try {
+                pumpHolding(held);
+            } catch (Error error) {
+                thrown = error;
+            }
+        }
+        assertEquals("failing the quantum threw", thrown == null ? null : thrown.getMessage());
+        assertEquals(0, this.reader.readsInFlight());
+        this.window.lower(3);
+        consume(next);
+    }
 }

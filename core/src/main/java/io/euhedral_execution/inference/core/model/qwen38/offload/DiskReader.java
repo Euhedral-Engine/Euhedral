@@ -288,13 +288,17 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         /// A failed read fails its quantum before the flag rises, so the device's copy of the slot's stale
         /// bytes belongs to a quantum that cannot commit. Failing a quantum is a compare-and-set: `onFailure`
         /// must not block.
+        /// The slot rises whatever `onFailure` throws: a slot left down would hold the device for good.
         @Override
         protected void reaped() {
-            IOException failure = failure();
-            if (failure != null) failQuantum(this.pending, failure);
-            DiskReader.this.window.raise(this.slot);
-            DiskReader.this.reaped.set(this.slot, 1);
-            DiskReader.this.inFlight.decrementAndGet();
+            try {
+                IOException failure = failure();
+                if (failure != null) failQuantum(this.pending, failure);
+            } finally {
+                DiskReader.this.window.raise(this.slot);
+                DiskReader.this.reaped.set(this.slot, 1);
+                DiskReader.this.inFlight.decrementAndGet();
+            }
         }
 
         @Override
