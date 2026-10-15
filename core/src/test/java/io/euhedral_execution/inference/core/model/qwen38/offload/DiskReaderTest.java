@@ -47,6 +47,10 @@ class DiskReaderTest {
     }
 
     private void open(boolean async) throws Exception {
+        open(async, AsyncReads.NATIVE_SUBMIT);
+    }
+
+    private void open(boolean async, AsyncReads.Submitter submitter) throws Exception {
         if (async) assumeTrue(AsyncReads.available(), "the machine has no asynchronous reads");
         this.contents = new byte[FILE_BYTES];
         for (int index = 0; index < FILE_BYTES; index++) this.contents[index] = (byte) (index * 31 + (index >>> 9));
@@ -55,7 +59,7 @@ class DiskReaderTest {
         MemorySegment slots = this.arena.allocate(SLOT_BYTES * DiskWindow.SLOTS, 4096);
         MemorySegment flags = this.arena.allocate(4096, 4096);
         this.window = new DiskWindow(slots, flags, SLOT_BYTES);
-        this.reads = async ? AsyncReads.open() : null;
+        this.reads = async ? AsyncReads.open(submitter) : null;
         if (this.reads != null)
             this.reads.getDelegate().addDownstream(new io.euhedral_execution.core.generics.LatticeReceiver() {
                 @Override
@@ -346,6 +350,33 @@ class DiskReaderTest {
         assertEquals("failing the quantum threw", thrown == null ? null : thrown.getMessage());
         assertEquals(0, this.reader.readsInFlight());
         this.window.lower(3);
+        consume(next);
+    }
+
+    /// The positional reads and a refused submission fail a quantum on the poll itself: the slot rises and serves its
+    /// next use even when failing the quantum throws.
+    @ParameterizedTest
+    @ValueSource(strings = {"positional", "refused"})
+    void aSlotReadOnThePollRisesWhenFailingTheQuantumThrows(String path) throws Exception {
+        if (path.equals("positional")) open(false);
+        else open(true, ring -> -16); // every submission refused (EBUSY): the poll reads the slot itself
+        DiskUse past = new DiskUse("q1/past", FILE_BYTES + 65_536L, 9_000, 4);
+        DiskUse next = new DiskUse("q1/next", 0, 9_000, 4);
+        this.reader.enqueue(1, List.of(past, next), cause -> {
+            throw new Error("failing the quantum threw");
+        });
+        Error thrown = null;
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (this.window.flag(4) != 1) {
+            assertTrue(System.nanoTime() < deadline, "the slot was never raised");
+            try {
+                this.reader.poll();
+            } catch (Error error) {
+                thrown = error;
+            }
+        }
+        assertEquals("failing the quantum threw", thrown == null ? null : thrown.getMessage());
+        this.window.lower(4);
         consume(next);
     }
 }
