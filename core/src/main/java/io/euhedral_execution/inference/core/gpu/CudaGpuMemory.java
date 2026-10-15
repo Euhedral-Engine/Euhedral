@@ -107,8 +107,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     private final AtomicInteger openStreams = new AtomicInteger();
     private final AtomicReference<Throwable> poisoned = new AtomicReference<>();
     private final MpmcQueue<Long> availableEvents = new MpmcQueue<>(64, 4);
-    private final ConcurrentLinkedQueue<MemorySegment> pinnedUploads = new ConcurrentLinkedQueue<>();
-    private final AtomicInteger pinnedUploadCount = new AtomicInteger();
+    /// Released pinned buffers by capacity, kept for reuse until the memory closes: freeing pinned memory
+    /// synchronizes the device, and a worker blocked in that call cannot reap the reads the device may be waiting
+    /// for. The pool holds the most buffers of a capacity that were ever in use at once.
+    private final java.util.concurrent.ConcurrentHashMap<Long, ConcurrentLinkedQueue<MemorySegment>> pinnedPool =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /// The size of every live device allocation, by address; [#allocate] is the only native allocator.
     private final ConcurrentHashMap<Long, Long> allocationSizes = new ConcurrentHashMap<>();
     /// Live device allocations and pinned readback buffers by start address: a serial per allocation.
@@ -1064,13 +1067,11 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         if (size != null) allocatedBytes.addAndGet(-size);
     }
 
-    /// Pinned staging memory is page-locked, so allocating it per quantum costs about a millisecond.
-    /// Small buffers are retained for reuse; larger ones are freed on release. A quantum holds its
-    /// token staging and, when its KV reservation grows, one page-table staging per full-attention
-    /// layer until it retires, so the cache covers a growing quantum without allocating.
+    /// Pinned staging memory is page-locked, so allocating it per quantum costs about a millisecond. Upload buffers
+    /// of up to this many bytes share one capacity, so a released one serves any of them; a quantum holds its token
+    /// staging and, when its KV reservation grows, one page-table staging per full-attention layer until it
+    /// retires. Released buffers are kept ([#pinnedPool]).
     private static final long PINNED_CACHE_BYTES = 64 * 1024;
-
-    private static final int PINNED_CACHE_ENTRIES = 32;
 
     private long finishSubmission() {
         try {
@@ -1096,19 +1097,9 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         ensureOpen();
         if (byteSize <= 0) throw new IllegalArgumentException("byteSize must be positive");
         try {
-            boolean cacheable = byteSize <= PINNED_CACHE_BYTES;
-            long capacity = cacheable ? PINNED_CACHE_BYTES : byteSize;
-            MemorySegment address = cacheable ? pinnedUploads.poll() : null;
-            if (address != null) {
-                pinnedUploadCount.decrementAndGet();
-            } else {
-                address = (MemorySegment) hostMalloc.invokeExact(capacity);
-                if (address.address() == 0) throw new GpuMemoryException("CUDA pinned upload allocation returned null");
-                address = address.reinterpret(capacity);
-                pageLocked.put(address.address(), address.address() + capacity);
-            }
-            MemorySegment allocation = address;
-            return new UploadBuffer(allocation.asSlice(0, byteSize), () -> releasePinnedUpload(allocation, cacheable));
+            long capacity = byteSize <= PINNED_CACHE_BYTES ? PINNED_CACHE_BYTES : byteSize;
+            MemorySegment allocation = acquirePinned(capacity);
+            return new UploadBuffer(allocation.asSlice(0, byteSize), () -> releasePinned(allocation));
         } catch (GpuMemoryException failure) {
             throw failure;
         } catch (Throwable failure) {
@@ -1116,13 +1107,23 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         }
     }
 
-    private void releasePinnedUpload(MemorySegment allocation, boolean cacheable) {
-        if (cacheable && !closed && pinnedUploadCount.incrementAndGet() <= PINNED_CACHE_ENTRIES) {
-            pinnedUploads.offer(allocation);
-            return;
-        }
-        if (cacheable) pinnedUploadCount.decrementAndGet();
-        freePinned(allocation);
+    /// A pinned buffer of `capacity` bytes: a released one, or a new allocation.
+    private MemorySegment acquirePinned(long capacity) throws Throwable {
+        ConcurrentLinkedQueue<MemorySegment> released = pinnedPool.get(capacity);
+        MemorySegment reused = released == null ? null : released.poll();
+        if (reused != null) return reused;
+        MemorySegment address = (MemorySegment) hostMalloc.invokeExact(capacity);
+        if (address.address() == 0) throw new GpuMemoryException("CUDA pinned allocation returned null");
+        address = address.reinterpret(capacity);
+        pageLocked.put(address.address(), address.address() + capacity);
+        return address;
+    }
+
+    /// Keeps `allocation` for reuse; the memory frees it when it closes.
+    private void releasePinned(MemorySegment allocation) {
+        pinnedPool
+                .computeIfAbsent(allocation.byteSize(), size -> new ConcurrentLinkedQueue<>())
+                .offer(allocation);
     }
 
     @Override
@@ -1312,19 +1313,18 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     public ReadbackBuffer allocateReadbackBuffer(long byteSize) {
         ensureOpen();
         if (byteSize <= 0) throw new IllegalArgumentException("byteSize must be positive");
-        MemorySegment address;
+        MemorySegment allocation;
         try {
-            address = (MemorySegment) hostMalloc.invokeExact(byteSize);
+            allocation = acquirePinned(byteSize);
+        } catch (GpuMemoryException failure) {
+            throw failure;
         } catch (Throwable failure) {
             throw new GpuMemoryException("CUDA pinned readback allocation failed", failure);
         }
-        if (address.address() == 0) throw new GpuMemoryException("CUDA pinned readback allocation returned null");
-        MemorySegment allocation = address.reinterpret(byteSize);
-        pageLocked.put(allocation.address(), allocation.address() + byteSize);
         allocationIds.put(allocation.address(), allocationSerial.incrementAndGet());
         return new ReadbackBuffer(allocation, () -> {
             allocationIds.remove(allocation.address());
-            freePinned(allocation);
+            releasePinned(allocation);
         });
     }
 
@@ -3274,7 +3274,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
         // before releasing the FFM upcall stub or unloading its library arena.
         synchronize();
         for (Long event; (event = availableEvents.poll()) != null; ) destroyEvent(event);
-        for (MemorySegment pinned; (pinned = pinnedUploads.poll()) != null; ) freePinned(pinned);
+        for (var released : pinnedPool.values())
+            for (MemorySegment pinned; (pinned = released.poll()) != null; ) freePinned(pinned);
         closed = true;
         arena.close();
     }
