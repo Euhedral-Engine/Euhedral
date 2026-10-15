@@ -52,7 +52,8 @@ public final class LogitsSampler {
         return select(logits.row(), allowed, position);
     }
 
-    /// Selects row `row` of the verification copy ([HostLogits#queueRows]) at `position`.
+    /// Selects row `row` of the verification copy ([HostLogits#queueRows]) at `position`. No vocabulary
+    /// constraint is applied: constrained sessions do not verify speculatively.
     public int selectRow(HostLogits logits, int row, long position) {
         Objects.requireNonNull(logits, "logits");
         requireVocabulary(logits.vocabularySize());
@@ -60,11 +61,14 @@ public final class LogitsSampler {
     }
 
     /// Each verified row's selection: the device's greedy choices, or each row sampled at its own position
-    /// (`firstPosition` is the position the first row's token occupies).
+    /// (`firstPosition` is the position the first row's token occupies). No vocabulary constraint is applied.
     public int[] selectRows(HostLogits logits, long firstPosition) {
         Objects.requireNonNull(logits, "logits");
         requireVocabulary(logits.vocabularySize());
-        if (logits.selectsOnDevice()) return logits.selectedTokens();
+        if (logits.selectsOnDevice()) {
+            if (!greedy()) throw new IllegalStateException("device selection is greedy only");
+            return logits.selectedTokens();
+        }
         int[] tokens = new int[logits.rowCount()];
         for (int row = 0; row < tokens.length; row++) tokens[row] = selectRow(logits, row, firstPosition + row);
         return tokens;

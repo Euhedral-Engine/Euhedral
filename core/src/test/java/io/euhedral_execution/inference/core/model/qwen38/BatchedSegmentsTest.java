@@ -10,8 +10,10 @@ import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeAcceptance;
 import io.euhedral_execution.inference.core.runtime.PullingLattice;
+import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -194,14 +196,14 @@ class BatchedSegmentsTest {
 
     /// Records the source and size of every device-to-host copy.
     private static final class CopyRecordingGpu extends EngineExecutionFixture.SamplingGpu {
-        final List<long[]> copies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final List<long[]> copies = new CopyOnWriteArrayList<>();
 
         CopyRecordingGpu() {
             super(8);
         }
 
         @Override
-        public void copyDeviceToHost(java.lang.foreign.MemorySegment destination, long source, long byteSize) {
+        public void copyDeviceToHost(MemorySegment destination, long source, long byteSize) {
             this.copies.add(new long[] {source, byteSize});
             super.copyDeviceToHost(destination, source, byteSize);
         }
@@ -214,35 +216,43 @@ class BatchedSegmentsTest {
         var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
         var execution = new Execution(new PullingLattice(), plan, gpu);
         var a = new Sequence(1);
+        var b = new Sequence(2);
         try {
             var logits = new HostLogits(gpu, 8);
+            var logitsB = new HostLogits(gpu, 8);
             var acceptance = new SpeculativeAcceptance(new int[] {1, 2}, t -> false, 8);
-            var part = new Quantum.Part(a, 0, new int[] {1, 2}).verifying(logits, acceptance, h -> {
-                // Acceptance reads the rows at stage commit, before the quantum retires.
-                assertEquals(2, h.rowCount());
-                return new int[] {2, 0};
-            });
+            var parts = List.of(
+                    new Quantum.Part(a, 0, new int[] {1, 2}).verifying(logits, acceptance, h -> {
+                        // Acceptance reads the rows at stage commit, before the quantum retires.
+                        assertEquals(2, h.rowCount());
+                        return new int[] {2, 0};
+                    }),
+                    new Quantum.Part(b, 0, new int[] {3, 4}).sampling(logitsB));
             var outcome = execution
-                    .submit(Quantum.batch(
-                            plan, Quantum.ExecutionKind.VERIFY, List.of(part), LogitsRequirement.ALL_TOKENS))
+                    .submit(Quantum.batch(plan, Quantum.ExecutionKind.VERIFY, parts, LogitsRequirement.ALL_TOKENS))
                     .get(10, TimeUnit.SECONDS);
             assertEquals(Quantum.Status.SUCCESS, outcome.status(), String.valueOf(outcome.failure()));
-            long rowsBytes = 2L * 8 * Short.BYTES;
+            long row = 8L * Short.BYTES;
+            var rowsCopy = gpu.copies.stream()
+                    .filter(copy -> copy[1] == 2 * row)
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("both rows cross to the host in one copy"));
             assertTrue(
-                    gpu.copies.stream().anyMatch(copy -> copy[1] == rowsBytes),
-                    "both rows cross to the host in one copy");
+                    gpu.copies.stream().anyMatch(copy -> copy[1] == row && copy[0] == rowsCopy[0] + 3 * row),
+                    "the sampling part copies only its final row, after the verifying part's two rows");
             assertEquals(2, logits.rowCount());
             assertEquals(2, a.currentTokenPosition());
         } finally {
             a.complete();
+            b.complete();
             execution.close();
         }
     }
 
     /// Records the rows each device selection reads and where every norm writes.
     private static final class RecordingSelectionGpu extends EngineExecutionFixture.SamplingGpu {
-        final List<Long> argmaxAddresses = new java.util.concurrent.CopyOnWriteArrayList<>();
-        final List<Long> normOutputs = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final List<Long> argmaxAddresses = new CopyOnWriteArrayList<>();
+        final List<Long> normOutputs = new CopyOnWriteArrayList<>();
 
         RecordingSelectionGpu() {
             super(8);

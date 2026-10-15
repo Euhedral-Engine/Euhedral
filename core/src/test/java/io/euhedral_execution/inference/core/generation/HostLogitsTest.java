@@ -140,6 +140,12 @@ class HostLogitsTest {
         assertEquals(3, logits.rowCount());
         assertEquals((short) 1000, logits.row(0).get(ValueLayout.JAVA_SHORT, 0));
         assertEquals(4L * Short.BYTES, logits.row(1).byteSize());
+        for (int row = 0; row < 3; row++)
+            for (int token = 0; token < 4; token++)
+                assertEquals(
+                        (short) (1000 + row * 4 + token),
+                        logits.row(row).get(ValueLayout.JAVA_SHORT, (long) token * Short.BYTES),
+                        "row " + row + " token " + token);
         assertThrows(IndexOutOfBoundsException.class, () -> logits.row(3));
 
         logits.retired(false);
@@ -207,7 +213,9 @@ class HostLogitsTest {
                 return;
             }
             this.sources.add(source);
-            destination.set(ValueLayout.JAVA_SHORT, 0, (short) source);
+            // Element i of the copy is source + i, so every row's content is distinct.
+            for (long i = 0; i * Short.BYTES < byteSize; i++)
+                destination.set(ValueLayout.JAVA_SHORT, i * Short.BYTES, (short) (source + i));
         }
 
         @Override
