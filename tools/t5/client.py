@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import socket
 import sys
 import time
@@ -36,6 +37,7 @@ except ImportError:  # run as a script
 
 RETRYABLE_STATUS = frozenset({502, 503, 504})
 BACKOFF_CAP = 300.0
+_CONTEXT = re.compile(r"maximum context length is (\d+) tokens.*?\((\d+) in the messages")
 
 
 class ServerTimeout(RuntimeError):
@@ -73,6 +75,18 @@ def parse_response(payload: dict) -> ChatResult:
     return ChatResult(message, choice.get("finish_reason") or "", prompt_ids, token_ids)
 
 
+def _room(body: str):
+    """The completion tokens left beside the prompt, from a `context_length_exceeded` answer, or None."""
+    if _error_code(body) != "context_length_exceeded":
+        return None
+    try:
+        message = json.loads(body)["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    match = _CONTEXT.search(message or "")
+    return int(match.group(1)) - int(match.group(2)) if match else None
+
+
 def _error_code(body: str):
     try:
         error = json.loads(body).get("error")
@@ -91,15 +105,25 @@ class ChatClient:
         self._sleep = sleep
 
     def complete(self, messages: list[dict], tools: list[dict], decoding: Decoding, max_tokens: int) -> ChatResult:
-        data = json.dumps(request_body(self.model, messages, tools, decoding, max_tokens),
-                          ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(self.url, data=data, headers={"Content-Type": "application/json"})
+        """Sends one request. When prompt plus `max_tokens` exceed the server's context, `max_tokens` shrinks to the
+        room left beside the prompt and the request is sent again."""
+        def build(limit: int) -> urllib.request.Request:
+            data = json.dumps(request_body(self.model, messages, tools, decoding, limit),
+                              ensure_ascii=False).encode("utf-8")
+            return urllib.request.Request(self.url, data=data, headers={"Content-Type": "application/json"})
+
+        request = build(max_tokens)
+        shrunk = False
         for attempt in range(self.retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     return parse_response(json.loads(response.read().decode("utf-8")))
             except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", "replace")[:500]
+                detail = e.read().decode("utf-8", "replace")[:1000]
+                room = _room(detail) if e.code == 400 else None
+                if room is not None and not shrunk and 0 < room < max_tokens:
+                    request, shrunk = build(room), True
+                    continue
                 if _error_code(detail) == "timeout":
                     raise ServerTimeout("the server's request-timeout expired before the request completed; "
                                         "start it with euhedral.api.request-timeout above the longest request "
