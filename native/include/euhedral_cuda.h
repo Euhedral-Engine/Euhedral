@@ -425,6 +425,14 @@ EUHEDRAL_CUDA_EXPORT int euhedral_cuda_qwen4_launch(int32_t kernel, uint32_t gri
         uint32_t block_x, uint32_t block_y, uint32_t block_z, uint32_t shared_bytes,
         const uint64_t* words, const uint8_t* sizes, int32_t count);
 
+/// The shared linear kernels (the weight formats' own launches): one table, one launcher, the qwen4 ABI. Entries may live in
+/// several modules; the launcher checks every argument's count and width against the compiled kernel.
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_kernel_count(void);
+EUHEDRAL_CUDA_EXPORT const char* euhedral_cuda_linear_kernel_name(int index);
+EUHEDRAL_CUDA_EXPORT int euhedral_cuda_linear_launch(int32_t kernel, uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+        uint32_t block_x, uint32_t block_y, uint32_t block_z, uint32_t shared_bytes,
+        const uint64_t* words, const uint8_t* sizes, int32_t count);
+
 #ifdef __cplusplus
 }
 #endif

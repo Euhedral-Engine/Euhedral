@@ -1,8 +1,13 @@
 package io.euhedral_execution.inference.core.gpu;
 
-/// A kernel of the native kernel table (`euhedral_cuda_qwen4_launch`), launched by its index in that table.
-/// A model's kernel enum implements it; its declaration order must be the table's order.
+/// A kernel of a native kernel table ([KernelTable]), launched by its index in that table. A kernel enum implements
+/// it; its declaration order must be the table's order.
 public interface TableKernel {
+
+    /// The table the kernel belongs to; the Flash-Next table unless the kernel says otherwise.
+    default KernelTable table() {
+        return KernelTable.QWEN4;
+    }
 
     /// The kernel's index in the native table.
     int index();

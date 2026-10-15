@@ -25,7 +25,9 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 | `q3_mx.c` | The block-scaled MXFP8 route for Q3/Q4/Q5 linears and the paired gate/up SwiGLU region. |
 | `reference.c`, `.h` | The scalar numerical references (Q3, Q4/Q5, NVFP4 plain and SD4): the oracle exact numerics select, and the fallback for shapes no kernel takes. |
 | `qwen_layer_ops.c` | GDN control, convolution, recurrence and gated norm; residual add, residual RMSNorm and SwiGLU; NVFP4 KV append, QK norm/RoPE and attention; greedy argmax; the BF16-to-FP32 linear. |
-| `qwen4_ops.c` | The Flash-Next (`qwen4_exp`) kernels behind one launcher: `qwen4_kernel_count`/`qwen4_kernel_name` and `qwen4_launch`, which checks every argument's count and width against the compiled kernel. |
+| `kernel_table.{c,h}` | The table-generic launcher: loads each entry's module once, discovers every kernel's parameter sizes, checks a launch's argument count and widths against them and launches on the submission stream. Entries name their module root, so a table may span modules. |
+| `qwen4_ops.c` | The Flash-Next (`qwen4_exp`) kernels as a `kernel_table`: `qwen4_kernel_count`/`qwen4_kernel_name` and `qwen4_launch`. |
+| `linear_kernels.c` | The shared `linear` table, the weight formats' own launches: `linear_kernel_count`/`linear_kernel_name` and `linear_launch`, same ABI as the Flash-Next table. |
 | `decode_shapes.h`, `q3_p2e2_geometry.h` | Shape-only dispatch decisions and layout geometry checks (header-only). |
 
 Quantized linears dispatch on the row count: 1 to 8 rows run the decode kernels (every row of the twins is bit for bit the one-row
@@ -52,6 +54,7 @@ root the host loads; its headers are that module's leaves and strategies:
 | `attention/` | NVFP4 KV append, QK norm/RoPE, per-head and GQA decode attention with row twins, the 32-row prefill tile and the producer-warp FA2 prefill kernel, and the exact twins and single-warp controls used as test oracles. |
 | `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
 | `qwen4/` | The Flash-Next (`qwen4_exp`) operators: BF16 linear, embedding gather, grouped RMSNorm, the hyper-connection mix and injection, the per-layer embedding (n-gram record expansion, gate, dilated convolution) and the rows of its convolution history, and (with the model's other blocks) the GDN control and gated norm, the router and the shared expert's SwiGLU. [docs/FLASH_NEXT_EXECUTION.md](../docs/FLASH_NEXT_EXECUTION.md). |
+| `trellis/` | Trellis (EXL3) linear kernels, module root `trellis/kernels.cu`: the entries of the `linear` table that name it. |
 | `dflash/` | The DFlash2 drafter: BF16 tensor-core linear (rows independent of the row count), Qwen3 RMSNorm, grouped dynamic convolution, Q/K norm and RoPE, the context ring append, sliding-window block attention on tensor cores (key splits and a merge), SwiGLU, top-16 and the candidate selector, each rounding where the published PyTorch model rounds. |
 
 Includes within a folder are relative; includes across folders name the path from the tree root
@@ -74,7 +77,8 @@ The exported C API (`include/euhedral_cuda.h`) falls into these groups:
 - attention: `attention_kv_append_nvfp4`, `attention_kv_append_bf16`, `attention_qk_norm_rope_bf16`,
   `attention_causal_nvfp4`, `attention_causal_bf16`;
 - sampling: `argmax_bf16`;
-- Flash-Next: `qwen4_kernel_count`, `qwen4_kernel_name`, `qwen4_launch`.
+- Flash-Next: `qwen4_kernel_count`, `qwen4_kernel_name`, `qwen4_launch`;
+- shared linear table: `linear_kernel_count`, `linear_kernel_name`, `linear_launch`.
 
 ## Tests
 
