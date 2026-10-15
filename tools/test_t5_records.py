@@ -138,6 +138,14 @@ class RecordsTest(unittest.TestCase):
         self.assertEqual(self.check_docs([self.document(), self.document(id="d1", order=1)]), [])
         self.assertTrue(any("documents code" in e for e in self.check_docs([self.document(order=2)])))
 
+    def test_code_language_coverage_counts_only_the_used_documents(self):
+        used = self.document(language="java")
+        spare = self.document(id="d1", language="python", order=1)
+        run = lambda docs: records.validate_documents(  # noqa: E731
+            docs, self.store, self.excluded, chunks={"code": 1}, code_languages=frozenset({"python"}))
+        self.assertTrue(any("missing languages ['python']" in e for e in run([used, spare])))
+        self.assertEqual(run([self.document(), spare]), [])
+
     def test_non_english_prose_is_capped_among_the_used(self):
         def prose(i, language, order):
             return records.Document(f"p{i}", "prose", language, "d.py", hashlib.sha256(b"print(1)\n").hexdigest(),

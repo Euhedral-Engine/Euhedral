@@ -287,9 +287,10 @@ def validate_documents(documents: list[Document], store: Path, excluded: dict,
             errors.append(f"documents prose: {len(foreign)} non-English among the {len(used)} used "
                           f"(at most {MAX_NON_ENGLISH_PROSE}): {foreign}")
     if "code" in chunks:
-        covered = {d.language for d in documents if d.kind == "code"}
+        covered = {d.language for d in documents if d.kind == "code" and isinstance(d.order, int)
+                   and d.order < chunks["code"]}
         if code_languages - covered:
-            errors.append(f"code documents: missing languages {sorted(code_languages - covered)}")
+            errors.append(f"code documents (the used ones): missing languages {sorted(code_languages - covered)}")
     return errors
 
 
