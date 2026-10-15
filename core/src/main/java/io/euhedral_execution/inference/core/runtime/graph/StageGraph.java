@@ -415,7 +415,7 @@ public final class StageGraph implements AutoCloseable {
         quantum.stagesPublishing();
         // Admission holds one count so that fast roots cannot retire the quantum before all publish.
         this.live.set(ready + 1 + count);
-        for (StageFrame root : this.roots) if (root.externalIn == 0 && root.passGate()) this.source.publish(root);
+        for (StageFrame root : this.roots) if (root.externalIn == 0) publishGated(root);
         for (int index = 0; index < count; index++) register(edges[index]);
         stageFinished();
     }
@@ -502,12 +502,26 @@ public final class StageGraph implements AutoCloseable {
             stage.doFinally();
             return;
         }
-        if (stage.passGate()) this.source.publish(stage);
+        publishGated(stage);
     }
 
-    /// Publishes `stage`, which [StageFrame#passGate] held; its live count was taken when it was held.
+    /// Publishes `stage`, whose live count is taken, unless its gate holds it. A gate that throws fails the quantum
+    /// and drops the stage's count: the stage never runs, and the graph still quiesces.
+    private void publishGated(StageFrame stage) {
+        boolean pass;
+        try {
+            pass = stage.passGate();
+        } catch (RuntimeException | Error failure) {
+            stageFailed(failure);
+            return;
+        }
+        if (pass) this.source.publish(stage);
+    }
+
+    /// Publishes `stage`, which [StageFrame#passGate] held; its live count was taken when it was held. A lake that
+    /// refuses it (closing) has it run here, so the held count is always dropped.
     void releaseGated(StageFrame stage) {
-        this.source.publish(stage);
+        this.source.publishOrRun(stage);
     }
 
     void stageFailed(Throwable failure) {

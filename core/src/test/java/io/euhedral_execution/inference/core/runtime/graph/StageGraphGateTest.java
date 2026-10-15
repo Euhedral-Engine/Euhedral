@@ -28,7 +28,9 @@ class StageGraphGateTest {
     /// A stage whose gate is closed until the test releases it.
     private static final class Gated extends StageFrame {
         final boolean gated;
+        volatile RuntimeException gateFailure;
         int gateCalls;
+        int abandons;
 
         Gated(StageGraph graph, int stage, boolean gated) {
             super(graph, stage);
@@ -38,7 +40,13 @@ class StageGraphGateTest {
         @Override
         protected boolean passGate() {
             this.gateCalls++;
+            if (this.gateFailure != null) throw this.gateFailure;
             return !this.gated;
+        }
+
+        @Override
+        protected void abandoned(io.euhedral_execution.inference.core.gpu.GpuStream home) {
+            this.abandons++;
         }
 
         void release() {
@@ -73,5 +81,53 @@ class StageGraphGateTest {
         drain(this.source);
         assertTrue(quantum.outcome.isDone());
         assertEquals("SUCCESS", quantum.outcome.join());
+    }
+
+    private StageGraph chain(boolean gateRoot) {
+        return new StageGraph(
+                CHAIN,
+                (owner, stage) -> new Gated(owner, stage, stage == 0 && gateRoot),
+                this.stream,
+                this.source,
+                this.recycler);
+    }
+
+    /// Runs what the lake holds, retires what the lanes queued, and runs the retirement.
+    private void settle() {
+        drain(this.source);
+        while (this.stream.armed() > 0) {
+            this.stream.retireNext(false);
+            drain(this.source);
+        }
+    }
+
+    @Test
+    void aGateThatThrowsFailsTheQuantumAndTheGraphStillQuiesces() {
+        StageGraph graph = chain(false);
+        ((Gated) graph.stage(0)).gateFailure = new IllegalStateException("the gate broke");
+        this.source.admit();
+        TestQuantum quantum = new TestQuantum();
+        graph.start(quantum);
+        settle();
+        assertEquals("FAILED", quantum.outcome.join());
+        assertEquals("the gate broke", quantum.failure.get().getMessage());
+        assertEquals(List.of(), this.stream.kernels, "no stage ran");
+        assertEquals(List.of(graph), this.recycler.recycled, "the graph quiesced and was recycled");
+    }
+
+    @Test
+    void aHeldStageOfAStoppedQuantumRunsNothingWhenReleasedAndIsAbandoned() {
+        StageGraph graph = chain(true);
+        this.source.admit();
+        TestQuantum quantum = new TestQuantum();
+        graph.start(quantum);
+        assertEquals(List.of(), take(this.source));
+        quantum.cancelled = true;
+        assertFalse(quantum.outcome.isDone(), "the held stage keeps the stopped quantum live");
+        ((Gated) graph.stage(0)).release();
+        settle();
+        assertEquals("CANCELLED", quantum.outcome.join());
+        assertEquals(List.of(), this.stream.kernels, "the released stage of a stopped quantum queues nothing");
+        assertEquals(1, ((Gated) graph.stage(0)).abandons, "and gets its abandoned turn");
     }
 }
