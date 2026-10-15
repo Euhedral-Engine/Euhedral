@@ -113,7 +113,8 @@ public interface InferenceBackend {
     /// `completionTokens` counts every sampled token, including a terminating stop token; `reasoningTokens` counts
     /// those of the reasoning, before `</think>`; `cachedPromptTokens` of the prompt were restored from the prefix
     /// cache instead of prefilled. `tokenIds` are the sampled tokens themselves, terminator included (empty when a
-    /// backend does not report them).
+    /// backend does not report them); with a matched stop or `parallel_tool_calls: false` they may continue past
+    /// the returned text, up to the end of the step in which decoding stopped.
     record Result(
             int completionTokens,
             boolean stopTokenReached,

@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.IntStream;
 
 /// Test backend that follows the engine's asynchronous contract without CUDA: a small pool stands in for the
 /// lattice's workers, which encode prompts and run generations; text is emitted on a worker between
@@ -194,7 +195,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
                     this.encoded.incrementAndGet();
                     return new EncodedPrompt(
                             prompt,
-                            java.util.stream.IntStream.range(0, countPromptTokens(prompt))
+                            IntStream.range(0, countPromptTokens(prompt))
                                     .map(position -> PROMPT_ID_BASE + position)
                                     .toArray());
                 },
@@ -297,7 +298,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         /// The scripted tokens carry the IDs `COMPLETION_ID_BASE + position`, the terminator last.
         private static Result withTokenIds(Result result) {
             if (!result.tokenIds().isEmpty()) return result;
-            List<Integer> ids = java.util.stream.IntStream.range(0, result.completionTokens())
+            List<Integer> ids = IntStream.range(0, result.completionTokens())
                     .mapToObj(position -> COMPLETION_ID_BASE + position)
                     .toList();
             return new Result(
