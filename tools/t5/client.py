@@ -11,7 +11,9 @@ Decision: tokens come from the server (`return_token_ids`), not from re-tokeniza
 
 Request fields: `model`, `messages`, `max_tokens`, `stream` false, `return_token_ids` true, the decoding fields
 (`temperature`; sampled adds `top_p`, `top_k`, `min_p`, `seed`), and with tools `tools`, `tool_choice` "auto" and
-`parallel_tool_calls` true. Response fields: `choices[0].message` (`content`, `reasoning_content`, `tool_calls`),
+`parallel_tool_calls` true. A 503 whose error code is "timeout" is the server's request-timeout and is raised as `ServerTimeout` without a
+retry; other 502/503/504 answers and connection errors are retried with backoff 2**k seconds capped at 300 (the
+default 14 retries ride out about 30 minutes of server restart). Response fields: `choices[0].message` (`content`, `reasoning_content`, `tool_calls`),
 `choices[0].finish_reason`, top-level `prompt_token_ids` and `choices[0].token_ids` (every generated token,
 thinking and tool-call envelope and terminator included).
 """
@@ -34,6 +36,11 @@ except ImportError:  # run as a script
 
 RETRYABLE_STATUS = frozenset({502, 503, 504})
 BACKOFF_CAP = 300.0
+
+
+class ServerTimeout(RuntimeError):
+    """The server gave up on a request (its request-timeout, counted from arrival including queue wait).
+    Retrying would only repeat the wait, so it is not retried."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,8 +73,16 @@ def parse_response(payload: dict) -> ChatResult:
     return ChatResult(message, choice.get("finish_reason") or "", prompt_ids, token_ids)
 
 
+def _error_code(body: str):
+    try:
+        error = json.loads(body).get("error")
+        return error.get("code") if isinstance(error, dict) else None
+    except (ValueError, AttributeError):
+        return None
+
+
 class ChatClient:
-    def __init__(self, base_url: str, model: str, timeout: float = 6 * 3600, retries: int = 8,
+    def __init__(self, base_url: str, model: str, timeout: float = 6 * 3600, retries: int = 14,
                  sleep=time.sleep) -> None:
         self.url = base_url.rstrip("/") + "/v1/chat/completions"
         self.model = model
@@ -85,6 +100,10 @@ class ChatClient:
                     return parse_response(json.loads(response.read().decode("utf-8")))
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:500]
+                if _error_code(detail) == "timeout":
+                    raise ServerTimeout("the server's request-timeout expired before the request completed; "
+                                        "start it with euhedral.api.request-timeout above the longest request "
+                                        f"(for example 6h): {detail}") from e
                 if e.code not in RETRYABLE_STATUS or attempt == self.retries:
                     raise RuntimeError(f"server answered {e.code}: {detail}") from e
             except (urllib.error.URLError, ConnectionError, socket.timeout, TimeoutError) as e:

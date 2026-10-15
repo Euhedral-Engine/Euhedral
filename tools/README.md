@@ -179,9 +179,14 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
 [--max-tokens N] [--target-tokens N] [--artifact-manifest PATH]` (run from `tools/`) drives the scripted
 conversations in `STORE/conversations.jsonl` through the server's chat API, executing tool calls against each
 conversation's fixture. Greedy or sampled decoding comes from `t5.records.plan_decoding`. Token ids are taken from
-the server (`return_token_ids`), not re-tokenized. `--parallel` should match the server's maximum number of
-sequences; a full queue (503) is retried with backoff.
+the server (`return_token_ids`), not re-tokenized. `--parallel` is required and must match the server's maximum number of
+sequences. The server must run with `euhedral.api.max-queued-generations` at least `--parallel` and with
+`euhedral.api.request-timeout` above the longest request (its 30m default is counted from arrival including queue
+wait, and BF16 requests take 45+ minutes; use for example 6h). A timeout answer is recorded as an error and not
+retried; a full queue or restarting server (502/503/504) is retried with backoff for about 30 minutes. Ctrl-C stops
+the run; finished conversations stay in the file.
 
 All output is one file, `STORE/generation/progress.json`, rewritten atomically after every finished conversation.
 Rerunning the same command resumes: finished conversations are skipped, an interrupted one restarts from its
-beginning, and a changed server, model, seed, limit, artifact or input file is refused.
+beginning, and a changed server, model, seed, limit, artifact, input file or git commit is refused. `--allow-new-commit`
+resumes at a new commit and keeps both commits in the file.
