@@ -42,12 +42,14 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     volatile boolean emptyReasoning;
     /// Generations the service may run at once.
     volatile int maxActive = 1;
-    /// When set, the next generation opened finds `workers()` null once afterwards, so starting its job fails.
+    /// When set, the next generation opened finds `workers()` failing once afterwards, so starting its job fails.
     volatile boolean failNextStart;
 
-    private volatile boolean nullWorkersOnce;
-    /// While set, a task started by the service's `release` waits for this latch.
-    volatile CountDownLatch holdReleaseStarts;
+    private volatile boolean failWorkersOnce;
+    /// While set, every task submitted through a `workers()` call made afterwards waits for this latch.
+    volatile CountDownLatch holdStarts;
+    /// Counts down when such a task is submitted.
+    volatile CountDownLatch entered = new CountDownLatch(1);
 
     /// Behavior of the next generations. Implementations must honor `generation.isCancelled()`.
     @FunctionalInterface
@@ -160,23 +162,23 @@ final class ScriptedInferenceBackend implements InferenceBackend {
 
     @Override
     public Executor workers() {
-        if (this.nullWorkersOnce) {
-            this.nullWorkersOnce = false;
-            return null;
+        if (this.failWorkersOnce) {
+            this.failWorkersOnce = false;
+            throw new IllegalStateException("the workers are gone");
         }
-        CountDownLatch hold = this.holdReleaseStarts;
-        if (hold != null
-                && StackWalker.getInstance()
-                        .walk(frames ->
-                                frames.anyMatch(frame -> frame.getMethodName().equals("release")))) {
-            return task -> this.workers.execute(() -> {
-                try {
-                    hold.await();
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                }
-                task.run();
-            });
+        CountDownLatch hold = this.holdStarts;
+        if (hold != null) {
+            return task -> {
+                this.entered.countDown();
+                this.workers.execute(() -> {
+                    try {
+                        hold.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    task.run();
+                });
+            };
         }
         return this.workers;
     }
@@ -220,7 +222,7 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         this.generations.add(generation);
         if (this.failNextStart) {
             this.failNextStart = false;
-            this.nullWorkersOnce = true;
+            this.failWorkersOnce = true;
         }
         return generation;
     }

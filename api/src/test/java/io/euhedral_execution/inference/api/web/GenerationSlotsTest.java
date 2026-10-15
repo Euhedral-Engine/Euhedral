@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.web;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.micrometer.core.instrument.MeterRegistry;
@@ -118,6 +119,17 @@ class GenerationSlotsTest {
             await(() -> active() == 0);
             assertEquals(200, status(client, SHORT));
         }
+    }
+
+    /// A stream already answered 200 when its job fails to build: the stream ends instead of idling to the timeout.
+    @Test
+    void aStreamWhoseStartFailsAfterOpeningEndsAndReleasesItsSlot() throws Exception {
+        this.backend.failNextStart = true;
+        try (var stream = SseTestClient.post(this.port, "/v1/chat/completions", BODY)) {
+            assertThrows(java.io.IOException.class, () -> stream.readUntil(line -> line.contains("never")));
+        }
+        assertTrue(this.backend.only().closed.await(10, TimeUnit.SECONDS));
+        await(() -> active() == 0);
     }
 
     @Test
