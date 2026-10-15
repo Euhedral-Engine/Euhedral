@@ -14,7 +14,8 @@ import java.util.Objects;
 /// earlier prompts for reuse (0 turns the cache off) and `prefixCacheCheckpointTokens` the prompt tokens between
 /// stored checkpoints, a multiple of the prefill chunk. `kvCache` is the format sequences keep their attention
 /// caches in; null takes the artifact's. `maxSequences` is the number of concurrent sequences device memory is
-/// sized for: 0 sizes for as many as fit, otherwise at least 1.
+/// sized for: at least 1, planned exactly as asked (weights may leave the device to make room), or 0 for as many
+/// as fit without offloading more weights than one sequence does.
 public record InferenceConfig(
         Path artifactPath,
         Path tokenizerDirectory,

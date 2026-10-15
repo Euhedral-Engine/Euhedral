@@ -1043,7 +1043,8 @@ public final class Stages {
         /// the decode row twins: far more parallel over a long cache than a 32-row prefill tile (at 32K keys
         /// about 0.45-0.75 ms against 9.5 ms for 2-4 rows), and drafts only propose tokens.
         private static boolean draftRowTwins(Quantum context) {
-            return context.kind() == Quantum.ExecutionKind.DRAFT && context.inputTokenCount() <= 8;
+            return context.kind() == Quantum.ExecutionKind.DRAFT
+                    && context.inputTokenCount() <= AttentionStates.DRAFT_TWIN_ROWS;
         }
     }
 

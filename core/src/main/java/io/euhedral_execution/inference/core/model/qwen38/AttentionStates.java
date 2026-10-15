@@ -108,6 +108,18 @@ public final class AttentionStates implements AutoCloseable {
         return this.dflash2;
     }
 
+    /// Split areas of one decode row's scratch, and the floats of each.
+    public static final int DECODE_SPLITS = 64;
+
+    public static final int DECODE_SPLIT_FLOATS = 258;
+    /// Most rows of a draft quantum (MTP catch-up) that run on the decode row twins.
+    public static final int DRAFT_TWIN_ROWS = 8;
+
+    /// Bytes of the decode scratch for `rows` rows of `queryHeads` heads.
+    public static long decodeScratchBytes(int queryHeads, int rows) {
+        return Math.multiplyExact((long) queryHeads * rows, (long) DECODE_SPLITS * DECODE_SPLIT_FLOATS * Float.BYTES);
+    }
+
     /// Split-KV scratch for `rows` decode rows: one one-row area (queryHeads x 64 splits x 258 floats) per
     /// row, as one-row decode (one area) and the row-exact attention twins of a verification (one per
     /// verified row) need. It grows when a verification first needs more rows.
@@ -120,8 +132,7 @@ public final class AttentionStates implements AutoCloseable {
             if (this.decodeScratch != 0) this.gpu.freeAsync(this.decodeScratch);
             this.decodeScratch = 0;
             this.decodeScratchRows = 0;
-            this.decodeScratch =
-                    this.gpu.allocateAsync(Math.multiplyExact((long) queryHeads * rows, 64L * 258 * Float.BYTES));
+            this.decodeScratch = this.gpu.allocateAsync(decodeScratchBytes(queryHeads, rows));
             this.decodeScratchHeads = queryHeads;
             this.decodeScratchRows = rows;
         }

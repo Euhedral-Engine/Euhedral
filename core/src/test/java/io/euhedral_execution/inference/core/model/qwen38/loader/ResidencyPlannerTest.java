@@ -122,12 +122,31 @@ class ResidencyPlannerTest {
         assertTrue(four.hostBacked().size() >= one.hostBacked().size());
         long kv = ResidencyPlanner.kvBytes(config(2), 4096);
         assertTrue(four.deviceBytes() >= one.deviceBytes() + 3 * kv);
-        var explicit = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
-        assertEquals(one.deviceBytes(), explicit.deviceBytes());
         assertEquals(
                 one.deviceBytes(),
                 ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4)
                         .deviceBytes());
+    }
+
+    @Test
+    void autoSequencesNeverOffloadMoreThanOneSequenceDoes() {
+        long free = 3000L * MIB;
+        var artifact = artifact();
+        var one = ResidencyPlanner.plan(artifact, PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);
+        assertFalse(one.hostBacked().isEmpty());
+        int chosen =
+                ResidencyPlanner.sequencesFor(artifact, PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1_000_000);
+        assertTrue(chosen > 1);
+        var atChosen = ResidencyPlanner.plan(artifact, PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, chosen);
+        var beyond = ResidencyPlanner.plan(artifact, PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, chosen + 1);
+        assertTrue(atChosen.fits());
+        assertEquals(one.hostBacked(), atChosen.hostBacked());
+        assertTrue(!beyond.fits() || !beyond.hostBacked().equals(one.hostBacked()));
+        assertEquals(
+                7,
+                ResidencyPlanner.sequencesFor(artifact, PROFILE, 64L << 30, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 7));
+        assertEquals(
+                1, ResidencyPlanner.sequencesFor(artifact, PROFILE, 1L << 30, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 7));
     }
 
     @Test
