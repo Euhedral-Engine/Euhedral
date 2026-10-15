@@ -35,13 +35,13 @@ import time
 from pathlib import Path
 
 try:
-    from t5 import records
+    from t5 import follow_ups, records
     from t5.client import ChatClient
     from t5.fixtures import Fixture, canonical, load_fixture
     from t5.progress import Progress
 except ImportError:  # run as a script
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from t5 import records
+    from t5 import follow_ups, records
     from t5.client import ChatClient
     from t5.fixtures import Fixture, canonical, load_fixture
     from t5.progress import Progress
@@ -74,6 +74,7 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
     messages = [{"role": "system", "content": conversation.system}] if conversation.system else []
     requests: list[dict] = []
     state = {"last": None, "error": None}
+    record: dict = {}
 
     def finish(ended: str) -> dict:
         # `messages` is the history so far: after "tool_rounds" it includes the tool results appended after the
@@ -83,11 +84,14 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
         return {"id": conversation.id, "domain": conversation.domain, "language": conversation.language,
                 "decoding": {"mode": decoding.mode, "seed": decoding.seed}, "requests": requests,
                 "messages": messages, "tokens": tokens, "length": len(tokens), "ended": ended,
-                "error": state["error"]}
+                "error": state["error"], **record}
 
     previous = None
     try:
-        for turn in conversation.turns:
+        extra = follow_ups.for_conversation(conversation.id, conversation.domain, conversation.language)
+        for index, turn in enumerate(list(conversation.turns) + extra):
+            if index == len(conversation.turns):
+                record["follow_ups_from"] = len(messages)
             messages.append({"role": "user", "content": turn})
             for _ in range(limits.max_tool_rounds + 1):
                 if stop is not None and stop.is_set():
@@ -116,7 +120,7 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
                 return finish("tool_rounds")
             if len(previous) >= limits.target_tokens:
                 return finish("target")
-        return finish("turns")
+        return finish("follow_ups")
     except Interrupted:
         raise
     except Exception as e:  # recorded, retried on resume; the other conversations continue

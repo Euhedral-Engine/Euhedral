@@ -178,7 +178,7 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
 `python3 -m t5.generate SERVER_URL STORE --model ID --base-seed N --parallel N [--domains D ...] [--limit N]
 [--max-tokens N] [--target-tokens N] [--artifact-manifest PATH] [--allow-new-commit]` (run from `tools/`) drives the scripted
 conversations in `STORE/conversations.jsonl` through the server's chat API, executing tool calls against each
-conversation's fixture. Greedy or sampled decoding comes from `t5.records.plan_decoding`. Token ids are taken from
+conversation's fixture. A script that ends before `--target-tokens` continues with follow-up turns from `t5/follow_ups.py` (depth, examples, edge cases; per domain and language). Greedy or sampled decoding comes from `t5.records.plan_decoding`. Token ids are taken from
 the server (`return_token_ids`), not re-tokenized. `--parallel` is required and must match the server's maximum number of
 sequences. The server must run with `euhedral.api.max-queued-generations` at least `--parallel` and with
 `euhedral.api.request-timeout` above the longest request (its 30m default is counted from arrival including queue

@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from t5 import client as chat_client, fixtures, generate, progress, records  # noqa: E402
+from t5 import follow_ups, client as chat_client, fixtures, generate, progress, records  # noqa: E402
 
 TOOL = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
 FIXTURE = {"tools": {"lookup": {"rules": [{"match": {"q": 1}, "result": {"answer": 42}}]}}}
@@ -134,7 +134,7 @@ class GenerateTest(unittest.TestCase):
 
     def test_tool_round_trip(self):
         self.write([row("a", "tool_use", tools=[TOOL], fixture="fx.json")])
-        code, _ = self.run_main(domain="tool_use")
+        code, _ = self.run_main("--target-tokens", "1", domain="tool_use")
         self.assertEqual(code, 0)
         second = self.server.bodies[1]["messages"]
         expected = fixtures.Fixture(FIXTURE).call("lookup", "{\"q\": 1}")
@@ -143,17 +143,34 @@ class GenerateTest(unittest.TestCase):
         record = json.loads((self.store / "generation" / "progress.json").read_text())["conversations"]["a"]
         self.assertEqual(record["tokens"], render(second) + [1000 + len(second), 2000 + len(second)])
         self.assertEqual(record["length"], len(record["tokens"]))
-        self.assertEqual(record["ended"], "turns")
+        self.assertEqual(record["ended"], "target")
         self.assertEqual(len(record["requests"]), 2)
         self.assertTrue(all(r["prefix_consistent"] for r in record["requests"]))
         self.assertEqual(record["decoding"], {"mode": "greedy", "seed": None})
 
+    def test_a_short_script_continues_with_follow_ups_until_the_target(self):
+        self.write([row("a")])
+        self.assertEqual(self.run_main("--target-tokens", "20")[0], 0)
+        record = json.loads((self.store / "generation" / "progress.json").read_text())["conversations"]["a"]
+        self.assertEqual(record["ended"], "target")
+        self.assertGreaterEqual(record["length"], 20)
+        self.assertEqual(record["follow_ups_from"], 2)
+        asked = [m["content"] for m in record["messages"][2:] if m["role"] == "user"]
+        self.assertEqual(asked, follow_ups.for_conversation("a", "conversation", "en")[:len(asked)])
+
+    def test_follow_ups_run_out(self):
+        self.write([row("a")])
+        self.assertEqual(self.run_main("--target-tokens", "100000")[0], 0)
+        record = json.loads((self.store / "generation" / "progress.json").read_text())["conversations"]["a"]
+        self.assertEqual(record["ended"], "follow_ups")
+        self.assertEqual(len(record["requests"]), 1 + len(follow_ups.pool("conversation", "en")))
+
     def test_resume_skips_finished(self):
         self.write([row(n, order=i) for i, n in enumerate("abc")])
-        self.assertEqual(self.run_main("--limit", "2")[0], 0)
+        self.assertEqual(self.run_main("--limit", "2", "--target-tokens", "1")[0], 0)
         self.assertEqual(sorted(self.server.users()), ["hello a", "hello b"])
         self.server.bodies.clear()
-        self.assertEqual(self.run_main()[0], 0)
+        self.assertEqual(self.run_main("--target-tokens", "1")[0], 0)
         self.assertEqual(self.server.users(), ["hello c"])
 
     def test_progress_is_one_file_rewritten_in_place(self):
