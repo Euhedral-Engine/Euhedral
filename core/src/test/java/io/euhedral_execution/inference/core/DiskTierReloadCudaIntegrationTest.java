@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -14,19 +15,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 /// The `bf16` artifact loaded and closed several times in one JVM with a 24 GiB pinned host budget, each engine
-/// staging host-backed and disk-backed weights for a speculative decode or a 2048-token prefill: every reload runs as
-/// the first load did. A run that does not finish within its bound ends the JVM, whose device
+/// staging host-backed and disk-backed weights for a speculative decode or a 2048-token prefill: every load's
+/// generation produces tokens within a time bound. A generation that misses the bound ends the JVM, whose stuck device
 /// work could not be released otherwise. Skipped unless -Peuhedral.qwen.bf16-artifact names the artifact and
 /// -Peuhedral.qwen.tokenizer-dir its tokenizer.
 // Own JVM: sets the global residency budget property and loads the engine several times.
 @ModelGroup.OwnJvm
-class HostWeightsReloadCudaIntegrationTest {
+class DiskTierReloadCudaIntegrationTest {
 
     private static final int PROMPT_TOKENS = 2048;
     private static final int DECODE_TOKENS = 64;
@@ -38,7 +40,7 @@ class HostWeightsReloadCudaIntegrationTest {
 
     @Test
     @Timeout(value = 3600, unit = TimeUnit.SECONDS)
-    void everyReloadPrefillsLikeTheFirst() throws Exception {
+    void everyLoadGeneratesWithinItsBound() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         String artifactProperty = System.getProperty("euhedral.qwen.bf16-artifact");
@@ -46,7 +48,7 @@ class HostWeightsReloadCudaIntegrationTest {
         Path artifact = Path.of(artifactProperty);
         Path tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir"));
         int cycles = Integer.getInteger("euhedral.reload.cycles", 4);
-        long minutes = Long.getLong("euhedral.reload.prefill-minutes", 10L);
+        long minutes = Long.getLong("euhedral.reload.minutes", 10L);
         System.out.printf(
                 "[reload] pid %d, %d cycles%n", ProcessHandle.current().pid(), cycles);
         System.setProperty("euhedral.residency.host-budget-bytes", Long.toString(24L << 30));
@@ -68,7 +70,7 @@ class HostWeightsReloadCudaIntegrationTest {
                     System.out.printf(
                             "[reload] cycle %d loaded in %.1f s, %d MiB from disk%n",
                             cycle, (System.nanoTime() - loadStart) / 1e9, dense.diskBackedWeightBytes() >> 20);
-                    // Cycles follow decode without speculation, decode with it, then a long prefill.
+                    // Loads take the modes of euhedral.reload.modes in turn: a speculative decode, then a long prefill.
                     String mode = MODES[(cycle - 1) % MODES.length];
                     boolean speculation = mode.equals("decode-speculative");
                     int[] prompt = mode.equals("prefill") ? prompt(engine) : chat(engine);
@@ -77,8 +79,9 @@ class HostWeightsReloadCudaIntegrationTest {
                     try (GenerationSession session = engine.createGenerationSession(
                             GenerationConfig.greedy(91L), new SessionOptions(speculation))) {
                         try {
-                            session.generateAsync(prompt, newTokens, text -> {}, null, null)
+                            List<Integer> tokens = session.generateAsync(prompt, newTokens, text -> {}, null, null)
                                     .get(minutes, TimeUnit.MINUTES);
+                            assertFalse(tokens.isEmpty(), "load " + cycle + " generated no token");
                         } catch (TimeoutException hung) {
                             // A thread dump would wait for a safepoint behind the stuck worker; take one with jcmd. The
                             // engine cannot close while its device work is stuck: end the JVM rather than hang.
