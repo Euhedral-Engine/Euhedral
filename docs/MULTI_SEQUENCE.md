@@ -50,6 +50,6 @@ Per conversation (a 1.5K-token prompt; 200 generated tokens per assistant turn; 
 | Tool use: 5 assistant turns, 4 tool results of 300 tokens | 3 + 4 = 7 | 21.7 s | 333 | 258 s | 7.8% |
 | Plain: 4 user messages (3 follow-ups of about 100 tokens), 4 assistant turns | 3 + 3 = 6 | 18.6 s | 267 | 207 s | 8.2% |
 
-Prefill would take about 8% of wall time at N = 4: prefill not batched: 8%. The share reaches 20% when a
-conversation generates fewer than about 340 tokens in total (about 70 per turn), or at N of about 8, which the
+Prefill would take about 8% of wall time at N = 4 when it is not batched. The share reaches 20% when a
+conversation generates fewer than about 340 tokens in total (about 70 per turn), or at N of about 12, which the
 card's memory does not allow.
