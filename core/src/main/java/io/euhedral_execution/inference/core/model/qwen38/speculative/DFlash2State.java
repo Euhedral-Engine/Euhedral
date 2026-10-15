@@ -29,6 +29,9 @@ public final class DFlash2State implements AutoCloseable {
         this.config = Objects.requireNonNull(config, "config");
         this.ringKeys = new long[config.layers()];
         this.ringValues = new long[config.layers()];
+        // Stream-ordered, so closing frees them without synchronizing the device; made inside a recorded submission
+        // (its state is created by a sequence's first DFlash2 quantum) they fall back to ordinary allocations, the
+        // recording is dropped, and closing frees them with a synchronizing cudaFree.
         try {
             for (int layer = 0; layer < config.layers(); layer++) {
                 this.ringKeys[layer] = gpu.allocateAsync(ringBytes());
@@ -94,6 +97,9 @@ public final class DFlash2State implements AutoCloseable {
     public void close() {
         Throwable failure = null;
         // Each buffer is forgotten only once freed, so a failed close can be retried.
+        // Freed in stream order on the calling thread's stream (the legacy default stream on a worker), which the
+        // lanes' streams
+        // are not ordered against: safe because every quantum that read this memory retired before the close.
         long[][] rings = {this.ringKeys, this.ringValues};
         for (long[] ring : rings) {
             for (int layer = 0; layer < ring.length; layer++) {

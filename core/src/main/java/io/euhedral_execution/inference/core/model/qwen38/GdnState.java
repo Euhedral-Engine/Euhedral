@@ -217,6 +217,9 @@ public final class GdnState implements AutoCloseable {
                 failure = cleanupFailure;
             }
         }
+        // Freed in stream order on the calling thread's stream (the legacy default stream on a worker), which the
+        // lanes' streams
+        // are not ordered against: safe because every quantum that read this memory retired before the close.
         failure = free(this.convolutionStateAddress, failure, true);
         failure = free(this.recurrentStateAddress, failure, false);
         if (failure != null) throw propagate(failure);
