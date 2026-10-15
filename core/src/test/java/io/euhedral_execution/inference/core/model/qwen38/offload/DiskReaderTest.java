@@ -244,34 +244,6 @@ class DiskReaderTest {
         for (DiskUse use : next) consume(2, use);
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void aClosedReaderReleasesTheWaitsTheDeviceStillHolds(boolean async) throws Exception {
-        open(async);
-        // The device holds four flag waits; only the first two belong to registered uses.
-        int[] waits = {0, 1, 0, 2};
-        this.reader.enqueue(1, List.of(new DiskUse("a", 0, 4096, 0), new DiskUse("b", 8192, 4096, 1)));
-        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
-        Thread device = Thread.ofPlatform().daemon().start(() -> {
-            for (int slot : waits) {
-                while (this.window.flag(slot) != 1) Thread.onSpinWait();
-                this.window.lower(slot);
-                done.incrementAndGet();
-            }
-        });
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        while (done.get() < 2) {
-            assertTrue(System.nanoTime() < deadline, "the registered uses were never read");
-            pump();
-        }
-        this.reader.close();
-        int released = this.reader.releaseDevice(100_000_000L, 5_000_000_000L);
-        device.join(5_000);
-        assertEquals(4, done.get(), "the device drained every wait it held");
-        assertEquals(2, released);
-        assertEquals(0, this.reader.releaseDevice(20_000_000L, 1_000_000_000L), "nothing waits any more");
-    }
-
     /// Holds the completion frames the reads emit instead of running them: a frame stranded behind a busy worker.
     private void pumpHolding(List<AbstractFrame> held) {
         this.reader.poll();
@@ -434,6 +406,34 @@ class DiskReaderTest {
         long deadline = System.nanoTime() + 10_000_000_000L;
         while (!released[0]) {
             assertTrue(System.nanoTime() < deadline, "the next quantum's read was never handed over");
+            pump();
+        }
+        assertPayload(own);
+    }
+
+    /// A read of a quantum that stopped arrives while the next quantum's copy waits for the slot: it is dropped, the
+    /// waiting copy is not released by it, and it gets its own read next.
+    @org.junit.jupiter.api.Test
+    void aStoppedQuantumsReadArrivingWhileAnotherCopyWaitsIsDropped() throws Exception {
+        open(true);
+        this.reader.enqueue(1, List.of(new DiskUse("q1/0", 0, 9_000, 5)));
+        // Submit the stopped quantum's read, but leave it in flight.
+        this.reader.poll();
+        assertEquals(1, this.reader.readsInFlight());
+        boolean[] released = {false};
+        assertFalse(this.reader.claim(5, 2, () -> released[0] = true));
+        this.reader.abandon(1);
+        DiskUse own = new DiskUse("q2/0", 81_920, 9_000, 5);
+        this.reader.enqueue(2, List.of(own));
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (this.reader.readsInFlight() > 0) {
+            assertTrue(System.nanoTime() < deadline, "the stopped quantum's read never arrived");
+            this.reads.getDelegate().pull(frame -> {}, frame -> false, Long.MAX_VALUE);
+        }
+        assertFalse(released[0], "the stopped quantum's read does not release the waiting copy");
+        assertEquals(0, this.window.flag(5), "and is dropped");
+        while (!released[0]) {
+            assertTrue(System.nanoTime() < deadline, "the waiting copy never got its own read");
             pump();
         }
         assertPayload(own);

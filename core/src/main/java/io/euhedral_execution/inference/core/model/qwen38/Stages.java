@@ -362,7 +362,8 @@ public final class Stages {
         private final long destination;
         private final long byteSize;
         private final int windowSlot;
-        /// The quantum whose read of the slot this stage last claimed.
+        /// The quantum whose read of the slot this stage claimed and whose flag no queued work lowers yet; null once
+        /// the copy's flag write is queued, or the stand-in's.
         private Object claimed;
 
         DiskTransfer(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
@@ -393,6 +394,9 @@ public final class Stages {
             long flag = context.plan().window().flagDevice(this.windowSlot);
             gpu().copyHostWeightsToDevice(this.destination, this.source, this.byteSize);
             gpu().writeHostFlag(flag, 0);
+            // The lowering is queued: should the stage still fail its submission, its stand-in must not lower the
+            // flag a second time, after the slot's next read raised it.
+            this.claimed = null;
         }
 
         @Override
