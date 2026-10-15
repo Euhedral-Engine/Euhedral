@@ -19,11 +19,15 @@ import java.util.regex.Pattern;
 /// every one is read once per decode token, so each host-backed byte costs the same transfer time
 /// whichever tensor it belongs to. The choice therefore minimizes the staging ring instead: whole
 /// families are taken smallest tensor first, and within the last family the layers are spread evenly,
-/// so that transfers interleave with resident work. The LM head is never host-backed.
+/// so that transfers interleave with resident work. [#select] never takes the LM head: [ResidencyPlanner] maps
+/// it last, because it is too large for the staging slots and is read in place like the embedding.
 public final class HostWeightSelection {
 
     /// The token embedding, the one host-mapped object.
     public static final String EMBEDDING = "text/token_embedding";
+
+    /// The LM head, the other object read in place from host memory when the device needs room.
+    public static final String OUTPUT_HEAD = "text/output_head";
 
     /// Families in selection order, smallest tensor first.
     private static final List<String> FAMILIES = List.of(
@@ -82,6 +86,11 @@ public final class HostWeightSelection {
             if (remaining <= 0) break;
         }
         return selected;
+    }
+
+    /// Whether the named object, when host-backed, is read in place over the bus instead of staged.
+    public static boolean mapped(String name) {
+        return name.equals(EMBEDDING) || name.equals(OUTPUT_HEAD);
     }
 
     /// Whether `tensor` is a layer projection of the listed families that a transfer can stage whole: grouped

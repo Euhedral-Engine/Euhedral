@@ -108,9 +108,9 @@ final class CompactWeightLoader {
                     handles.put(descriptor.name(), TensorHandle.disk(descriptor));
                 } else if (host.contains(descriptor.name())) {
                     TensorHandle loaded = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
-                    // The embedding and the codebooks are gathers: kernels read their rows in place instead of
-                    // staging them.
-                    if (descriptor.name().equals(HostWeightSelection.EMBEDDING) || mapped.contains(descriptor.name()))
+                    // The embedding and the codebooks are gathers, and the output head a streamed matrix: kernels
+                    // read them in place over the bus instead of staging them.
+                    if (HostWeightSelection.mapped(descriptor.name()) || mapped.contains(descriptor.name()))
                         loaded = mapped(loaded, gpuMemory.hostWeightsDeviceAddress(loaded.hostAddress()));
                     handles.put(descriptor.name(), loaded);
                     hostOffset += hostSlot(descriptor.byteSize());
