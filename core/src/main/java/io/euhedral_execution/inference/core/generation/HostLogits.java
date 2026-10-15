@@ -68,6 +68,11 @@ public final class HostLogits implements AutoCloseable {
             fingerprint.add(this.gpu, buffer == null ? 0 : buffer.segment().address());
     }
 
+    /// Whether verified rows and sampled rows select their tokens on the device ([#selectOnDevice]).
+    public boolean selectsOnDevice() {
+        return this.selectOnDevice;
+    }
+
     /// Whether the next sampling quanta select greedily on the device instead of copying the row. Only
     /// for a greedy sampler with no vocabulary constraint; set between quanta.
     public void selectOnDevice(boolean enabled) {
