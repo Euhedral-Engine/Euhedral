@@ -58,6 +58,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// buffers): start address to exclusive end. Asynchronous host copies must stay inside one of them.
     private final java.util.concurrent.ConcurrentSkipListMap<Long, Long> pageLocked =
             new java.util.concurrent.ConcurrentSkipListMap<>();
+    /// Host weight arenas whose unregistration failed and was logged; each is logged once.
+    private final java.util.Set<Long> leakedHostWeights = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final MethodHandle deviceMemoryInfo;
     private final MethodHandle copyHostToDevice;
     private final MethodHandle copyUploadToDevice;
@@ -1158,28 +1160,41 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     @Override
     public void freeHostWeights(long address) {
         ensureOpen();
-        if (!this.hostWeights.containsKey(address))
-            throw new IllegalArgumentException("not a host weight allocation: " + address);
-        // No copy may be queued from the range once it is freed; a failed unregistration keeps the memory (the
-        // driver still pins it) and the record, so a later close retries.
+        // Both records go before the memory does: an allocation that reuses the range after the free records its
+        // own. No copy may be queued from the range once it is freed.
+        Long byteSize = this.hostWeights.remove(address);
+        if (byteSize == null) throw new IllegalArgumentException("not a host weight allocation: " + address);
         this.pageLocked.remove(address);
+        int status;
         try {
-            int status = (int) hostWeightsFree.invokeExact(MemorySegment.ofAddress(address));
-            if (status != 0) {
-                this.pageLocked.put(address, address + this.hostWeights.get(address));
-                throw new GpuMemoryException("CUDA host weight free", status);
-            }
-            this.hostWeights.remove(address);
-        } catch (GpuMemoryException failure) {
-            throw failure;
+            status = (int) hostWeightsFree.invokeExact(MemorySegment.ofAddress(address));
         } catch (Throwable failure) {
+            keepHostWeights(address, byteSize);
             throw new GpuMemoryException("CUDA host weight free invocation failed", failure);
         }
+        if (status != 0) {
+            // A failed unregistration keeps the memory (the driver still pins it) and its records: a later close
+            // retries.
+            keepHostWeights(address, byteSize);
+            if (this.leakedHostWeights.add(address))
+                LOG.warn(
+                        "unregistering {} bytes of host weights at 0x{} failed (status {}); the memory is kept",
+                        byteSize,
+                        Long.toHexString(address),
+                        status);
+            throw new GpuMemoryException("CUDA host weight free", status);
+        }
+        this.leakedHostWeights.remove(address);
+    }
+
+    private void keepHostWeights(long address, long byteSize) {
+        this.hostWeights.put(address, byteSize);
+        this.pageLocked.put(address, address + byteSize);
     }
 
     /// An asynchronous copy's host range must lie in page-locked memory this binding allocated. From pageable memory
     /// the driver copies synchronously through its own staging buffers, so the submitting worker would wait for
-    /// the stream's earlier work: a stream that waits for a disk-window flag the lattice raises then never drains.
+    /// the stream's earlier work.
     private void requirePageLocked(long address, long byteSize, String what) {
         var range = this.pageLocked.floorEntry(address);
         if (range == null || byteSize > range.getValue() - address)
@@ -1191,6 +1206,7 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
     /// The CUDA memory type of `address`: 0 pageable, 1 page-locked host, 2 device, 3 managed; a negated CUDA error
     /// when the query fails.
     public int memoryType(long address) {
+        ensureOpen();
         try {
             return (int) memoryType.invokeExact(MemorySegment.ofAddress(address));
         } catch (Throwable failure) {
@@ -1329,14 +1345,19 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
 
     private void freePinned(MemorySegment address) {
         ensureOpen();
+        // The record goes before the memory does: an allocation that reuses the address after the free records its
+        // own. A failed free keeps the memory and its record.
+        Long end = pageLocked.remove(address.address());
+        int status;
         try {
-            int status = (int) hostFree.invokeExact(address);
-            if (status != 0) throw new GpuMemoryException("CUDA pinned host free", status);
-            pageLocked.remove(address.address());
-        } catch (GpuMemoryException failure) {
-            throw failure;
+            status = (int) hostFree.invokeExact(address);
         } catch (Throwable failure) {
+            if (end != null) pageLocked.put(address.address(), end);
             throw new GpuMemoryException("CUDA pinned host free invocation failed", failure);
+        }
+        if (status != 0) {
+            if (end != null) pageLocked.put(address.address(), end);
+            throw new GpuMemoryException("CUDA pinned host free", status);
         }
     }
 
