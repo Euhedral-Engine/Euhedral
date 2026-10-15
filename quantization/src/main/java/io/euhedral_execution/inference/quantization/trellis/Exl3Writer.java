@@ -13,11 +13,15 @@ import io.euhedral_execution.inference.quantization.checkpoint.SafetensorsWriter
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -99,7 +103,7 @@ public final class Exl3Writer implements AutoCloseable {
 
     private final Map<String, String> weightMap = new LinkedHashMap<>();
     private final Map<String, Map<String, Stored>> modules = new HashMap<>();
-    private long totalSize;
+    private final Map<String, Long> fileBytes = new HashMap<>();
     private boolean mtpWritten;
 
     /// `bits` is the average bits per weight of the text linears, `rows` and `columns` the calibration shape.
@@ -169,12 +173,15 @@ public final class Exl3Writer implements AutoCloseable {
                     writer.add(e.getKey(), p.dtype(), p.shape(), p.bytes(), p.source());
                 }
             }
+            weightMap.values().removeIf(file::equals); // a rewritten file replaces its earlier tensors
+            long bytes = 0;
             for (var e : tensors.entrySet()) {
                 Pending p = e.getValue();
                 weightMap.put(e.getKey(), file);
-                totalSize += p.bytes();
+                bytes += p.bytes();
                 record(e.getKey(), new Stored(p.dtype(), p.shape(), p.bytes()));
             }
+            fileBytes.put(file, bytes);
         }
     }
 
@@ -278,26 +285,27 @@ public final class Exl3Writer implements AutoCloseable {
     /// Writes the embedding, the final norm, `lm_head` (F16), the vision tower, the index, both configs and the
     /// auxiliary files, once every source tensor is accounted for.
     public void finish(Map<String, Double> bitsByLinear) throws IOException {
-        Shard embedding = new Shard(TEXT + "embed_tokens.safetensors");
-        embedding.copy(TEXT + "embed_tokens.weight");
-        embedding.write();
-        Shard head = new Shard("lm_head.safetensors");
-        head.copyAsHalf("lm_head.weight");
-        head.copy(TEXT + "norm.weight");
-        head.write();
-        Shard vision = new Shard("model.visual.safetensors");
-        for (String name : sorted(store.names())) if (name.startsWith("model.visual.")) vision.copy(name);
-        if (!vision.tensors.isEmpty()) vision.write();
+        adoptFilesFromEarlierRun();
+        Set<String> headNames = new TreeSet<>();
+        headNames.add(TEXT + "embed_tokens.weight");
+        headNames.add("lm_head.weight");
+        headNames.add(TEXT + "norm.weight");
+        List<String> visionNames = sorted(store.names()).stream()
+                .filter(n -> n.startsWith("model.visual."))
+                .toList();
 
+        // everything is checked before the large files are written
         List<String> missing = new ArrayList<>();
         for (String name : sorted(store.names())) {
             String linear = name.endsWith(".weight") ? name.substring(0, name.length() - ".weight".length()) : name;
-            if (!weightMap.containsKey(name) && !weightMap.containsKey(linear + ".trellis")) missing.add(name);
+            if (!weightMap.containsKey(name)
+                    && !weightMap.containsKey(linear + ".trellis")
+                    && !headNames.contains(name)
+                    && !visionNames.contains(name)) missing.add(name);
         }
         if (!missing.isEmpty())
             throw new IllegalStateException(missing.size() + " source tensors were not written, e.g. "
                     + missing.subList(0, Math.min(5, missing.size())));
-
         for (var e : bitsByLinear.entrySet()) {
             Map<String, Stored> module = modules.get(e.getKey());
             if (module != null
@@ -305,12 +313,41 @@ public final class Exl3Writer implements AutoCloseable {
                     && module.get("trellis").shape()[2] != Math.round(e.getValue() * 16))
                 throw new IllegalStateException(e.getKey() + " is stored at a different rate than " + e.getValue());
         }
+        Set<String> expectedFiles = new HashSet<>(weightMap.values());
+        expectedFiles.add(TEXT + "embed_tokens.safetensors");
+        expectedFiles.add("lm_head.safetensors");
+        if (!visionNames.isEmpty()) expectedFiles.add("model.visual.safetensors");
+        try (Stream<Path> files = Files.list(out)) {
+            List<String> stray = files.map(p -> p.getFileName().toString())
+                    .filter(f -> f.endsWith(".safetensors") && !expectedFiles.contains(f))
+                    .sorted()
+                    .toList();
+            if (!stray.isEmpty())
+                throw new IllegalStateException(
+                        "unexpected safetensors files in " + out + " (a loader reads them all): " + stray);
+        }
+
+        Shard embedding = new Shard(TEXT + "embed_tokens.safetensors");
+        embedding.copy(TEXT + "embed_tokens.weight");
+        embedding.write();
+        Shard head = new Shard("lm_head.safetensors");
+        head.copyAsHalf("lm_head.weight");
+        head.copy(TEXT + "norm.weight");
+        head.write();
+        if (!visionNames.isEmpty()) {
+            Shard vision = new Shard("model.visual.safetensors");
+            for (String name : visionNames) vision.copy(name);
+            vision.write();
+        }
 
         for (String file : auxiliaryFiles(source))
             Files.copy(source.resolve(file), out.resolve(file), StandardCopyOption.REPLACE_EXISTING);
 
         ObjectNode index = JSON.createObjectNode();
-        index.putObject("metadata").put("total_size", totalSize);
+        index.putObject("metadata")
+                .put(
+                        "total_size",
+                        fileBytes.values().stream().mapToLong(Long::longValue).sum());
         ObjectNode map = index.putObject("weight_map");
         weightMap.forEach(map::put);
         writeJson(out.resolve("model.safetensors.index.json"), index);
@@ -327,6 +364,103 @@ public final class Exl3Writer implements AutoCloseable {
         ObjectNode full = quantization.deepCopy();
         full.set("tensor_storage", tensorStorage());
         writeJson(out.resolve("quantization_config.json"), full);
+    }
+
+    /// Records the layer and MTP files an earlier run left in `out` (the tensor names, shapes and sizes come from
+    /// their headers), after checking each holds exactly the tensors this writer would write.
+    private void adoptFilesFromEarlierRun() throws IOException {
+        for (int index = 0; index < objects.config.layers(); index++) {
+            String file = TEXT + "layers." + index + ".safetensors";
+            if (fileBytes.containsKey(file) || !Files.isRegularFile(out.resolve(file))) continue;
+            adopt(file, expectedLayerTensors(index));
+        }
+        String file = "mtp.safetensors";
+        if (!fileBytes.containsKey(file) && Files.isRegularFile(out.resolve(file))) {
+            adopt(file, expectedMtpTensors());
+            mtpWritten = true;
+        }
+    }
+
+    private Set<String> expectedLayerTensors(int index) {
+        String prefix = TEXT + "layers." + index + ".";
+        Set<String> expected = new TreeSet<>();
+        Set<String> linears = new HashSet<>();
+        for (Linears.Linear linear : Linears.layer(objects, index)) {
+            linears.add(linear.tensor() + ".weight");
+            if (linear.quantized())
+                for (String part : List.of("trellis", "suh", "svh", "mul1")) expected.add(linear.tensor() + "." + part);
+            else expected.add(linear.tensor() + ".weight");
+        }
+        for (String name : store.names()) if (name.startsWith(prefix) && !linears.contains(name)) expected.add(name);
+        return expected;
+    }
+
+    private Set<String> expectedMtpTensors() {
+        Set<String> expected = new TreeSet<>();
+        for (String linear : MTP_LINEARS)
+            for (String part : List.of("trellis", "suh", "svh", "mul1")) expected.add(linear + "." + part);
+        for (String name : store.names()) {
+            boolean linear = name.endsWith(".weight")
+                    && MTP_LINEARS.contains(name.substring(0, name.length() - ".weight".length()));
+            if (name.startsWith("mtp.") && !linear) expected.add(name);
+        }
+        return expected;
+    }
+
+    private void adopt(String file, Set<String> expected) throws IOException {
+        Map<String, Stored> found = readHeader(out.resolve(file));
+        if (!found.keySet().equals(expected)) {
+            Set<String> absent = new TreeSet<>(expected);
+            absent.removeAll(found.keySet());
+            Set<String> extra = new TreeSet<>(found.keySet());
+            extra.removeAll(expected);
+            throw new IllegalStateException(file + " from an earlier run does not hold the expected tensors; missing "
+                    + absent + ", unexpected " + extra);
+        }
+        long bytes = 0;
+        for (var e : new TreeMap<>(found).entrySet()) {
+            weightMap.put(e.getKey(), file);
+            bytes += e.getValue().bytes();
+            record(e.getKey(), e.getValue());
+        }
+        fileBytes.put(file, bytes);
+    }
+
+    /// The tensors of a safetensors file, from its header only.
+    private static Map<String, Stored> readHeader(Path file) throws IOException {
+        try (java.nio.channels.FileChannel channel =
+                java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
+            ByteBuffer size = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+            readFully(channel, size, 0);
+            long headerBytes = size.getLong(0);
+            if (headerBytes <= 0 || headerBytes > (1L << 30))
+                throw new IOException(file + ": bad header size " + headerBytes);
+            ByteBuffer header = ByteBuffer.allocate((int) headerBytes);
+            readFully(channel, header, 8);
+            JsonNode root = JSON.readTree(new String(header.array(), java.nio.charset.StandardCharsets.UTF_8));
+            Map<String, Stored> found = new HashMap<>();
+            for (Iterator<Map.Entry<String, JsonNode>> it = root.fields(); it.hasNext(); ) {
+                var entry = it.next();
+                if (entry.getKey().equals("__metadata__")) continue;
+                JsonNode node = entry.getValue();
+                long[] shape = new long[node.get("shape").size()];
+                for (int i = 0; i < shape.length; i++)
+                    shape[i] = node.get("shape").get(i).asLong();
+                long bytes = node.get("data_offsets").get(1).asLong()
+                        - node.get("data_offsets").get(0).asLong();
+                found.put(entry.getKey(), new Stored(node.get("dtype").asText(), shape, bytes));
+            }
+            return found;
+        }
+    }
+
+    private static void readFully(java.nio.channels.FileChannel channel, ByteBuffer buffer, long position)
+            throws IOException {
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, position);
+            if (read < 0) throw new IOException("unexpected end of file");
+            position += read;
+        }
     }
 
     ObjectNode quantizationConfig() {

@@ -94,30 +94,36 @@ public final class SafetensorsWriter implements AutoCloseable {
             node.putArray("data_offsets").add(offset).add(offset + entry.bytes());
             offset += entry.bytes();
         }
-        StringBuilder text = new StringBuilder(JSON.writeValueAsString(header));
-        while (text.length() % 8 != 0) text.append(' ');
-        byte[] json = text.toString().getBytes(StandardCharsets.UTF_8);
+        byte[] encoded = JSON.writeValueAsString(header).getBytes(StandardCharsets.UTF_8);
+        byte[] json = java.util.Arrays.copyOf(encoded, (encoded.length + 7) / 8 * 8);
+        java.util.Arrays.fill(json, encoded.length, json.length, (byte) ' ');
         Path part = file.resolveSibling(file.getFileName() + ".part");
-        try (FileChannel out = FileChannel.open(
-                        part,
-                        StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING,
-                        StandardOpenOption.WRITE);
-                Arena arena = Arena.ofConfined()) {
-            ByteBuffer size = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
-            size.putLong(json.length).flip();
-            writeFully(out, size);
-            writeFully(out, ByteBuffer.wrap(json));
-            MemorySegment chunk = arena.allocate(CHUNK, 8);
-            for (Entry entry : entries) {
-                for (long at = 0; at < entry.bytes(); at += CHUNK) {
-                    MemorySegment piece = chunk.asSlice(0, Math.min(CHUNK, entry.bytes() - at));
-                    entry.source().read(at, piece);
-                    writeFully(out, piece.asByteBuffer());
+        try {
+            try (FileChannel out = FileChannel.open(
+                            part,
+                            StandardOpenOption.CREATE,
+                            StandardOpenOption.TRUNCATE_EXISTING,
+                            StandardOpenOption.WRITE);
+                    Arena arena = Arena.ofConfined()) {
+                ByteBuffer size = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+                size.putLong(json.length).flip();
+                writeFully(out, size);
+                writeFully(out, ByteBuffer.wrap(json));
+                MemorySegment chunk = arena.allocate(CHUNK, 8);
+                for (Entry entry : entries) {
+                    for (long at = 0; at < entry.bytes(); at += CHUNK) {
+                        MemorySegment piece = chunk.asSlice(0, Math.min(CHUNK, entry.bytes() - at));
+                        entry.source().read(at, piece);
+                        writeFully(out, piece.asByteBuffer());
+                    }
                 }
+                out.force(true);
             }
+            Files.move(part, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException | RuntimeException | Error e) {
+            Files.deleteIfExists(part);
+            throw e;
         }
-        Files.move(part, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static void writeFully(FileChannel out, ByteBuffer buffer) throws IOException {

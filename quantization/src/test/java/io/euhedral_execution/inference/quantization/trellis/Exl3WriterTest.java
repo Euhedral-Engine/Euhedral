@@ -375,8 +375,140 @@ class Exl3WriterTest {
     void failsLoudlyWhenAnUnquantizedLinearOverflowsHalfPrecision(@TempDir Path dir) throws Exception {
         tiny(dir.resolve("source"), true);
         try (Exl3Writer writer = new Exl3Writer(dir.resolve("source"), dir.resolve("out"), 2.0, 4, 8)) {
+            Map<String, Double> bits = new HashMap<>();
+            writer.layer(0, miniatureLayer(bits), bits);
+            writer.mtp(miniatureMtp());
             ArithmeticException e = assertThrows(ArithmeticException.class, () -> writer.finish(Map.of()));
             assertTrue(e.getMessage().contains("lm_head.weight"));
         }
+    }
+
+    private static Map<String, TrellisQuantizer.Result> miniatureMtp() {
+        Map<String, TrellisQuantizer.Result> mtp = new HashMap<>();
+        for (String role : new String[] {
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj"
+        }) mtp.put("mtp.layers.0." + role, zeros(128, 128, 4));
+        mtp.put("mtp.fc", zeros(128, 256, 4));
+        return mtp;
+    }
+
+    private static Map<String, TrellisQuantizer.Result> miniatureLayer(Map<String, Double> bits) {
+        String l = "model.language_model.layers.0.";
+        Map<String, TrellisQuantizer.Result> results = new HashMap<>();
+        for (String linear : new String[] {
+            l + "linear_attn.in_proj_qkv",
+            l + "linear_attn.in_proj_z",
+            l + "linear_attn.out_proj",
+            l + "mlp.gate_proj",
+            l + "mlp.up_proj",
+            l + "mlp.down_proj"
+        }) {
+            results.put(linear, zeros(128, 128, 2.0));
+            bits.put(linear, 2.0);
+        }
+        return results;
+    }
+
+    @Test
+    void aRunResumedOverEarlierFilesFinishesWithACompleteIndex(@TempDir Path dir) throws Exception {
+        Path source = dir.resolve("source"), out = dir.resolve("out");
+        tiny(source, false);
+        Map<String, Double> bits = new HashMap<>();
+        var layer = miniatureLayer(bits);
+        try (Exl3Writer first = new Exl3Writer(source, out, 2.0, 4, 8)) {
+            first.layer(0, layer, bits);
+        }
+        try (Exl3Writer second = new Exl3Writer(source, out, 2.0, 4, 8)) {
+            second.mtp(miniatureMtp());
+            second.finish(bits);
+        }
+        try (Exl3Writer third = new Exl3Writer(source, out, 2.0, 4, 8)) { // mtp from disk as well
+            third.finish(bits);
+        }
+        JsonNode index =
+                JSON.readTree(out.resolve("model.safetensors.index.json").toFile());
+        try (Safetensors written = Safetensors.open(out)) {
+            Set<String> mapped = new HashSet<>();
+            index.get("weight_map").fieldNames().forEachRemaining(mapped::add);
+            assertEquals(written.names(), mapped);
+            long total = 0;
+            for (String name : mapped) total += written.tensor(name).bytes();
+            assertEquals(total, index.get("metadata").get("total_size").asLong());
+        }
+        JsonNode q = JSON.readTree(out.resolve("quantization_config.json").toFile());
+        assertEquals(4, q.get("mtp_bits").asInt());
+        String l = "model.language_model.layers.0.";
+        assertEquals(
+                2212286765L,
+                q.get("tensor_storage")
+                        .get(l + "mlp.up_proj")
+                        .get("mul1_multiplier")
+                        .asLong());
+        assertEquals(14, q.get("tensor_storage").size());
+    }
+
+    @Test
+    void aLayerFileMissingTensorsFromAnEarlierRunFailsFinish(@TempDir Path dir) throws Exception {
+        Path source = dir.resolve("source"), out = dir.resolve("out");
+        tiny(source, false);
+        Files.createDirectories(out);
+        try (var w = new SafetensorsWriter(out.resolve("model.language_model.layers.0.safetensors"))) {
+            w.add(
+                    "model.language_model.layers.0.input_layernorm.weight",
+                    "BF16",
+                    new long[] {128},
+                    MemorySegment.ofArray(new short[128]));
+        }
+        try (Exl3Writer writer = new Exl3Writer(source, out, 2.0, 4, 8)) {
+            var e = assertThrows(IllegalStateException.class, () -> writer.finish(Map.of()));
+            assertTrue(e.getMessage().contains("layers.0.safetensors"));
+        }
+    }
+
+    @Test
+    void finishChecksBeforeWritingTheLargeFilesAndRejectsStrayShards(@TempDir Path dir) throws Exception {
+        Path source = dir.resolve("source"), out = dir.resolve("out");
+        tiny(source, false);
+        Map<String, Double> bits = new HashMap<>();
+        try (Exl3Writer writer = new Exl3Writer(source, out, 2.0, 4, 8)) {
+            writer.layer(0, miniatureLayer(bits), bits);
+            Files.writeString(out.resolve("model-00001-of-00002.safetensors"), "x");
+            assertThrows(IllegalStateException.class, () -> writer.finish(bits));
+            assertFalse(Files.exists(out.resolve("lm_head.safetensors")));
+            Files.delete(out.resolve("model-00001-of-00002.safetensors"));
+            writer.mtp(miniatureMtp());
+            bits.put("model.language_model.layers.0.mlp.up_proj", 3.0);
+            assertThrows(IllegalStateException.class, () -> writer.finish(bits));
+            assertFalse(Files.exists(out.resolve("lm_head.safetensors")));
+        }
+    }
+
+    @Test
+    void rewritingALayerDoesNotCountItTwice(@TempDir Path dir) throws Exception {
+        Path source = dir.resolve("source"), out = dir.resolve("out");
+        tiny(source, false);
+        Map<String, Double> bits = new HashMap<>();
+        try (Exl3Writer writer = new Exl3Writer(source, out, 2.0, 4, 8)) {
+            writer.layer(0, miniatureLayer(bits), bits);
+            writer.layer(0, miniatureLayer(bits), bits);
+            writer.mtp(miniatureMtp());
+            writer.finish(bits);
+        }
+        long total = 0;
+        try (Safetensors written = Safetensors.open(out)) {
+            for (String name : written.names()) total += written.tensor(name).bytes();
+        }
+        assertEquals(
+                total,
+                JSON.readTree(out.resolve("model.safetensors.index.json").toFile())
+                        .get("metadata")
+                        .get("total_size")
+                        .asLong());
     }
 }

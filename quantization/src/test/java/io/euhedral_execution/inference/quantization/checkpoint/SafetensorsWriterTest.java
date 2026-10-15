@@ -91,4 +91,28 @@ class SafetensorsWriterTest {
                 IllegalArgumentException.class,
                 () -> writer.add("c", "F8", new long[] {2}, MemorySegment.ofArray(new short[2])));
     }
+
+    @Test
+    void padsTheHeaderOnItsEncodedLength(@TempDir Path dir) throws Exception {
+        try (var writer = new SafetensorsWriter(dir.resolve("model.safetensors"))) {
+            writer.add("t\u00e9nsor\u00e9", "F16", new long[] {1}, MemorySegment.ofArray(new short[1]));
+        }
+        ByteBuffer file = ByteBuffer.wrap(Files.readAllBytes(dir.resolve("model.safetensors")))
+                .order(ByteOrder.LITTLE_ENDIAN);
+        assertEquals(0, file.getLong(0) % 8);
+        try (Safetensors store = Safetensors.open(dir)) {
+            assertEquals("F16", store.tensor("t\u00e9nsor\u00e9").dtype());
+        }
+    }
+
+    @Test
+    void aFailedWriteLeavesNoPartFile(@TempDir Path dir) {
+        var writer = new SafetensorsWriter(dir.resolve("model.safetensors"));
+        writer.add("a", "F16", new long[] {1}, 2, (offset, destination) -> {
+            throw new java.io.IOException("boom");
+        });
+        assertThrows(java.io.IOException.class, writer::close);
+        assertFalse(Files.exists(dir.resolve("model.safetensors.part")));
+        assertFalse(Files.exists(dir.resolve("model.safetensors")));
+    }
 }
