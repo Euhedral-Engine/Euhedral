@@ -1,11 +1,12 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
-import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.model.qwen38.loader.AttentionWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Config;
 import io.euhedral_execution.inference.core.model.qwen38.loader.DFlash2Weights;
@@ -1016,6 +1017,9 @@ public final class ExecutionPlan {
             }
             if (regions
                     && first.kind() == Kind.Q3_LINEAR
+                    && LinearFormats.find(first.weightFormat(), first.weightLayout())
+                            .map(LinearFormat::gateUpRegion)
+                            .orElse(false)
                     && next != null
                     && first.outputBuffers().equals(List.of(Buffer.GATE_UP))
                     && next.kind() == Kind.SWIGLU
@@ -2370,63 +2374,24 @@ public final class ExecutionPlan {
         return validateQuantized(handle, rows, width, EMBEDDING_FORMAT);
     }
 
-    private static boolean grouped(WeightFormat format) {
-        return format == WeightFormat.Q3_G64_FP16
-                || format == WeightFormat.Q4_G64_FP16
-                || format == WeightFormat.Q5_G64_FP16;
-    }
-
-    /// The linear kind that runs `weight`: the artifact chooses each grouped projection's width (Q3, Q4 or Q5);
-    /// NVFP4 weights keep the role's kind, which the stage dispatches by format.
+    /// The linear kind that runs `weight`: its format's ([LinearFormat#kind]); the artifact chooses each grouped
+    /// projection's width (Q3, Q4 or Q5), and NVFP4 weights keep the role's kind.
     private static Kind linearKind(TensorHandle weight, Kind role) {
-        return switch (weight.format()) {
-            case Q3_G64_FP16 -> Kind.Q3_LINEAR;
-            case Q4_G64_FP16 -> Kind.Q4_LINEAR;
-            case Q5_G64_FP16 -> Kind.Q5_LINEAR;
-            case BF16 -> Kind.BF16_PROJECTION;
-            default -> role;
-        };
+        return LinearFormats.find(weight.format(), weight.layout())
+                .map(format -> format.kind(role))
+                .orElse(role);
     }
 
-    private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat format) {
+    private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat roleFormat) {
         Objects.requireNonNull(handle, "weight");
-        long[] shape = handle.shape();
         // The unquantized model's projections: BF16 values the tensor-core kernels take whole.
-        if (handle.format() == WeightFormat.BF16) {
-            if (shape == null
-                    || shape.length != 2
-                    || shape[0] != rows
-                    || shape[1] != width
-                    || width % 32 != 0
-                    || rows % 8 != 0
-                    || (handle.deviceAddress() == 0 && !handle.hostBacked() && !handle.diskBacked())
-                    || handle.dataType() != TensorDataType.BF16
-                    || handle.layout() != WeightLayout.CONTIGUOUS_LE_V1
-                    || handle.byteSize() != rows * width * Short.BYTES)
-                throw new IllegalArgumentException(
-                        "unsupported BF16 projection layout or dimensions: " + handle.name());
-            return copyHandle(handle);
-        }
-        if (shape == null
-                || shape.length != 2
-                || shape[0] != rows
-                || shape[1] != width
-                || width % 64 != 0
-                || (handle.deviceAddress() == 0 && !handle.hostBacked() && !handle.diskBacked())
-                || handle.dataType() != TensorDataType.BF16
-                || !(handle.format() == format
-                        || handle.format() == WeightFormat.NVFP4
-                        || (grouped(format) && grouped(handle.format())))
-                || !(handle.layout() == WeightLayout.ROW_SPLIT_K128_V1
-                        || (handle.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
-                                && handle.format() == WeightFormat.Q3_G64_FP16)
-                        || (handle.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1
-                                && handle.format() == WeightFormat.NVFP4))
-                || !CompactTensorLayout.acceptsByteSize(
-                        shape, handle.dataType(), handle.format(), handle.layout(), handle.byteSize())) {
-            throw new IllegalArgumentException("unsupported quantized weight layout or dimensions: " + handle.name());
-        }
-        return copyHandle(handle);
+        LinearFormat format = handle.format() == WeightFormat.BF16
+                ? LinearFormats.find(WeightFormat.BF16, WeightLayout.CONTIGUOUS_LE_V1)
+                        .orElseThrow()
+                : LinearFormats.find(handle.format(), handle.layout())
+                        .orElseThrow(() -> new IllegalArgumentException(
+                                "unsupported quantized weight layout or dimensions: " + handle.name()));
+        return copyHandle(format.validateHandle(handle, rows, width, roleFormat));
     }
 
     private static TensorHandle copyHandle(TensorHandle handle) {

@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.artifact;
 
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -74,22 +75,8 @@ public final class TensorLoader {
     }
 
     private static void validate(TensorDescriptor descriptor, MemorySegment payload) throws WeightLoadException {
-        if (descriptor.format() == WeightFormat.NVFP4 && Nvfp4Layout.supports(descriptor.layout())) {
-            try {
-                Nvfp4Layout.validate(payload, descriptor.shape()[0], descriptor.shape()[1], descriptor.layout());
-            } catch (IllegalArgumentException exception) {
-                throw new WeightLoadException(
-                        "invalid NVFP4 tensor '" + descriptor.name() + "': " + exception.getMessage());
-            }
-        }
-        if (descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1) {
-            try {
-                P2e2Layout.validate(payload, descriptor.shape()[0], descriptor.shape()[1]);
-            } catch (IllegalArgumentException exception) {
-                throw new WeightLoadException(
-                        "invalid P2E2 tensor '" + descriptor.name() + "': " + exception.getMessage());
-            }
-        }
+        var format = LinearFormats.find(descriptor.format(), descriptor.layout());
+        if (format.isPresent()) format.get().validatePayload(descriptor, payload);
     }
 
     private static TensorHandle propagate(Throwable failure) throws IOException {

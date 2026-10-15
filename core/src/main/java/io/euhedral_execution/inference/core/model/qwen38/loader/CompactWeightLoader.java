@@ -1,6 +1,5 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
-import io.euhedral_execution.inference.core.artifact.Nvfp4Layout;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
@@ -8,6 +7,9 @@ import io.euhedral_execution.inference.core.artifact.TensorLoader;
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightLoadException;
+import io.euhedral_execution.inference.core.artifact.format.ExpectedTensor;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
@@ -17,6 +19,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -273,67 +276,20 @@ final class CompactWeightLoader {
     private static void splitMtpAttention(Map<String, TensorHandle> handles, GpuMemory gpu) {
         TensorHandle packed = handles.get(MTP_ATTENTION);
         if (packed == null || packed.hostBacked() || packed.diskBacked()) return;
-        if (packed.format() == WeightFormat.BF16) {
-            long half = packed.shape()[0] / 2;
-            handles.put(
-                    "mtp/layer/attention/query_key", bf16Rows(packed, 0, half, "mtp/layer/attention/query_key", gpu));
-            handles.put(
-                    "mtp/layer/attention/gate_value",
-                    bf16Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
-            handles.remove(MTP_ATTENTION);
-            gpu.free(packed.deviceAddress());
-            return;
-        }
-        if (packed.format() != WeightFormat.NVFP4) return;
-        long rows = packed.shape()[0], k = packed.shape()[1];
-        long half = rows / 2;
-        handles.put("mtp/layer/attention/query_key", nvfp4Rows(packed, 0, half, "mtp/layer/attention/query_key", gpu));
+        LinearFormat format =
+                LinearFormats.find(packed.format(), packed.layout()).orElse(null);
+        if (format == null || !format.splitsRows()) return;
+        long half = packed.shape()[0] / 2;
         handles.put(
-                "mtp/layer/attention/gate_value", nvfp4Rows(packed, half, half, "mtp/layer/attention/gate_value", gpu));
+                "mtp/layer/attention/query_key",
+                format.rows(List.of(packed), 0, half, "mtp/layer/attention/query_key", gpu)
+                        .getFirst());
+        handles.put(
+                "mtp/layer/attention/gate_value",
+                format.rows(List.of(packed), half, half, "mtp/layer/attention/gate_value", gpu)
+                        .getFirst());
         handles.remove(MTP_ATTENTION);
         gpu.free(packed.deviceAddress());
-    }
-
-    /// Rows `first .. first + rows` of a BF16 matrix, copied into an allocation of their own.
-    private static TensorHandle bf16Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
-        long k = source.shape()[1], bytes = rows * k * Short.BYTES;
-        long address = gpu.allocate(bytes);
-        try {
-            gpu.copyDeviceToDevice(address, source.deviceAddress() + first * k * Short.BYTES, bytes);
-        } catch (RuntimeException | Error failure) {
-            gpu.free(address);
-            throw failure;
-        }
-        return new TensorHandle(
-                name,
-                new long[] {rows, k},
-                source.dataType(),
-                WeightFormat.BF16,
-                WeightLayout.CONTIGUOUS_LE_V1,
-                address,
-                bytes);
-    }
-
-    private static TensorHandle nvfp4Rows(TensorHandle source, long first, long rows, String name, GpuMemory gpu) {
-        long k = source.shape()[1];
-        WeightLayout layout = source.layout();
-        long rowBytes = Nvfp4Layout.paddedK(k) / 2, rowScales = Nvfp4Layout.rowScaleBytes(k, layout);
-        long sourceScales = Nvfp4Layout.scaleOffset(source.shape()[0], k);
-        long sourceTrailer = Nvfp4Layout.trailerOffset(source.shape()[0], k, layout);
-        long scales = Nvfp4Layout.scaleOffset(rows, k), trailer = Nvfp4Layout.trailerOffset(rows, k, layout);
-        long bytes = Nvfp4Layout.byteSize(rows, k, layout);
-        long address = gpu.allocate(bytes);
-        try {
-            long base = source.deviceAddress();
-            gpu.copyDeviceToDevice(address, base + first * rowBytes, rows * rowBytes);
-            gpu.copyDeviceToDevice(address + scales, base + sourceScales + first * rowScales, rows * rowScales);
-            gpu.copyDeviceToDevice(address + trailer, base + sourceTrailer, Nvfp4Layout.trailerBytes(layout));
-        } catch (RuntimeException | Error failure) {
-            gpu.free(address);
-            throw failure;
-        }
-        return new TensorHandle(
-                name, new long[] {rows, k}, source.dataType(), WeightFormat.NVFP4, source.layout(), address, bytes);
     }
 
     private static MtpWeights buildMtp(Map<String, TensorHandle> handles) throws WeightLoadException {
@@ -448,31 +404,19 @@ final class CompactWeightLoader {
         }
     }
 
-    /// Q3, Q4 and Q5 grouped formats: the artifact chooses each grouped projection's width, and the plan runs the
-    /// matching kernel (`ExecutionPlan.linearKind`).
-    private static boolean grouped(WeightFormat format) {
-        return format == WeightFormat.Q3_G64_FP16
-                || format == WeightFormat.Q4_G64_FP16
-                || format == WeightFormat.Q5_G64_FP16;
-    }
-
     private static void validateExpectedDescriptor(TensorDescriptor descriptor) throws WeightLoadException {
         String name = descriptor.name();
         if (descriptor.layout() == null) {
             throw new WeightLoadException("runtime object has no persistent layout: " + name);
         }
-        boolean quantized = descriptor.format() == WeightFormat.Q3_G64_FP16
-                || descriptor.format() == WeightFormat.Q4_G64_FP16
-                || descriptor.format() == WeightFormat.Q5_G64_FP16
-                || descriptor.format() == WeightFormat.NVFP4;
-        boolean p2e2 = descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
-                && descriptor.format() == WeightFormat.Q3_G64_FP16;
-        boolean sd4 =
-                descriptor.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1 && descriptor.format() == WeightFormat.NVFP4;
-        if (quantized && descriptor.layout() != WeightLayout.ROW_SPLIT_K128_V1 && !p2e2 && !sd4) {
+        boolean registered =
+                LinearFormats.find(descriptor.format(), descriptor.layout()).isPresent();
+        if (!registered && LinearFormats.quantized(descriptor.format())) {
             throw new WeightLoadException("quantized runtime object has unsupported layout: " + name);
         }
-        if (!quantized && descriptor.layout() != WeightLayout.CONTIGUOUS_LE_V1) {
+        if (!registered
+                && !LinearFormats.quantized(descriptor.format())
+                && descriptor.layout() != WeightLayout.CONTIGUOUS_LE_V1) {
             throw new WeightLoadException("direct runtime object has unsupported layout: " + name);
         }
         Expected expected = expectedDescriptor(name);
@@ -483,27 +427,18 @@ final class CompactWeightLoader {
     }
 
     /// Whether `descriptor` may stand for the registered `expected` object: the same shape and data type, and the
-    /// expected format and layout, any grouped width where a grouped one is expected, NVFP4 (plain, or SD4) where
-    /// a row-split object is, P2E2 for row-split Q3, or BF16 values (contiguous) for any quantized object.
+    /// expected format and layout, or what the descriptor's [LinearFormat] allows in their place (any grouped
+    /// width where a grouped one is expected, NVFP4 plain or SD4 where a row-split object is, P2E2 for row-split
+    /// Q3, BF16 values for any quantized object).
     static boolean accepts(Expected expected, TensorDescriptor descriptor) {
-        boolean p2e2 = descriptor.layout() == WeightLayout.ROW_SPLIT_P2E2_V1
-                && descriptor.format() == WeightFormat.Q3_G64_FP16;
-        boolean sd4 =
-                descriptor.layout() == WeightLayout.ROW_SPLIT_K128_SD4_V1 && descriptor.format() == WeightFormat.NVFP4;
-        boolean bf16 = descriptor.format() == WeightFormat.BF16
-                && descriptor.layout() == WeightLayout.CONTIGUOUS_LE_V1
-                && (grouped(expected.format()) || expected.format() == WeightFormat.NVFP4);
-        if (bf16)
-            return java.util.Arrays.equals(expected.shape(), descriptor.shape())
-                    && expected.dataType() == descriptor.dataType();
-        return !(!java.util.Arrays.equals(expected.shape(), descriptor.shape())
-                || expected.dataType() != descriptor.dataType()
-                || !(expected.format() == descriptor.format()
-                        || (descriptor.format() == WeightFormat.NVFP4
-                                && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)
-                        || (grouped(expected.format()) && grouped(descriptor.format())))
-                || !(expected.layout() == descriptor.layout()
-                        || ((p2e2 || sd4) && expected.layout() == WeightLayout.ROW_SPLIT_K128_V1)));
+        ExpectedTensor registered =
+                new ExpectedTensor(expected.shape(), expected.dataType(), expected.format(), expected.layout());
+        return LinearFormats.find(descriptor.format(), descriptor.layout())
+                .map(format -> format.accepts(descriptor, registered))
+                .orElseGet(() -> java.util.Arrays.equals(expected.shape(), descriptor.shape())
+                        && expected.dataType() == descriptor.dataType()
+                        && expected.format() == descriptor.format()
+                        && expected.layout() == descriptor.layout());
     }
 
     static Expected expectedDescriptor(String name) {

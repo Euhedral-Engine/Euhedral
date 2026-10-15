@@ -1,7 +1,8 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
-import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.runtime.graph.GraphShape;
@@ -196,23 +197,27 @@ public final class Shape implements GraphShape {
     }
 
     private static ScratchUse scratchUse(ExecutionPlan.Instruction instruction, View view) {
-        boolean nvfp4 = !instruction.weights().isEmpty() && instruction.weightFormat() == WeightFormat.NVFP4;
-        if (instruction.kind() == ExecutionPlan.Kind.Q3_GATE_UP_SWIGLU)
-            return nvfp4 ? ScratchUse.NVFP4_GATE_UP : ScratchUse.Q3_GATE_UP;
+        switch (instruction.kind()) {
+            case Q3_GATE_UP_SWIGLU,
+                    Q3_LINEAR,
+                    Q4_LINEAR,
+                    Q5_LINEAR,
+                    BF16_PROJECTION,
+                    DFLASH_LINEAR,
+                    DFLASH_LM_HEAD -> {}
+            default -> {
+                return null;
+            }
+        }
         boolean multiRow =
                 switch (view) {
                     case DECODE, DECODE_PRELOADED, MTP_DRAFT -> false;
                     default -> true;
                 };
-        if (!multiRow) return null;
-        return switch (instruction.kind()) {
-            case Q3_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.Q3_LINEAR;
-            case Q4_LINEAR, Q5_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.MX_LINEAR;
-            case BF16_PROJECTION -> null;
-            case DFLASH_LINEAR -> nvfp4 ? ScratchUse.NVFP4_LINEAR : null;
-            case DFLASH_LM_HEAD -> nvfp4 ? ScratchUse.NVFP4_LINEAR : ScratchUse.Q3_LINEAR;
-            default -> null;
-        };
+        LinearFormat format = instruction.weights().isEmpty()
+                ? LinearFormats.routing(null, null)
+                : LinearFormats.routing(instruction.weightFormat(), instruction.weightLayout());
+        return format.scratchUse(instruction.kind(), multiRow);
     }
 
     private int[][] declareWorkspaceBuffers() {

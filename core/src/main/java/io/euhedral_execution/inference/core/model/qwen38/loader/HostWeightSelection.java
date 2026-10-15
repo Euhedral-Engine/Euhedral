@@ -1,7 +1,8 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
-import io.euhedral_execution.inference.core.artifact.WeightFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormat;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -93,17 +94,15 @@ public final class HostWeightSelection {
         return name.equals(EMBEDDING) || name.equals(OUTPUT_HEAD);
     }
 
-    /// Whether `tensor` is a layer projection of the listed families that a transfer can stage whole: grouped
-    /// (`ROW_SPLIT_K128_V1`, `ROW_SPLIT_K128_SD4_V1`) or BF16 (`CONTIGUOUS_LE_V1`). A P2E2 payload is never staged:
-    /// its row offsets index the payload where it was loaded.
+    /// Whether `tensor` is a layer projection of the listed families whose format a transfer can stage whole
+    /// ([LinearFormat#stageable]). A P2E2 payload is never staged: its row offsets index the payload where it was
+    /// loaded.
     public static boolean stageable(TensorDescriptor tensor) {
         Matcher matcher = LAYER_OBJECT.matcher(tensor.name());
         if (!matcher.matches() || !FAMILIES.contains(matcher.group(2))) return false;
-        return switch (tensor.layout()) {
-            case ROW_SPLIT_K128_V1, ROW_SPLIT_K128_SD4_V1 -> true;
-            case CONTIGUOUS_LE_V1 -> tensor.format() == WeightFormat.BF16;
-            default -> false;
-        };
+        return LinearFormats.find(tensor.format(), tensor.layout())
+                .map(LinearFormat::stageable)
+                .orElse(false);
     }
 
     private static int layer(TensorDescriptor tensor) {
