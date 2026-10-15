@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.generation.DeviceLogits;
 import io.euhedral_execution.inference.core.generation.HostLogits;
@@ -221,6 +222,7 @@ class BatchedVerifyCudaIntegrationTest {
     @Timeout(value = 900, unit = TimeUnit.SECONDS)
     void batchedSegmentsResolveTheirOwnGreedyAcceptance() throws Throwable {
         withSequences((model, runtime, plan, gpu, documents, batched, alone) -> {
+            // Draft index of each sequence's wrong token; 0 means none.
             int[] wrongDraft = {2, 0, 1};
             int vocabulary = model.weights().config().vocabSize();
             List<HostLogits> logitsToClose = new ArrayList<>();
@@ -259,9 +261,6 @@ class BatchedVerifyCudaIntegrationTest {
                 var outcome = runtime.submit(context).get(600, TimeUnit.SECONDS);
                 if (outcome.status() != Quantum.Status.SUCCESS) throw new AssertionError(outcome.failure());
                 for (int s = 0; s < documents.length; s++) {
-                    System.out.println("segment " + s + " accepted "
-                            + batchedAcceptance.get(s).acceptedDrafts() + " drafts, outputs "
-                            + Arrays.toString(batchedAcceptance.get(s).outputs()));
                     assertArrayEquals(
                             aloneAcceptance.get(s).outputs(),
                             batchedAcceptance.get(s).outputs(),
@@ -269,10 +268,24 @@ class BatchedVerifyCudaIntegrationTest {
                     assertEquals(
                             aloneAcceptance.get(s).committedRows(), context.committedRows(s), "committed rows " + s);
                     assertEquals(
+                            batchedAcceptance.get(s).committedRows(),
+                            context.committedRows(s),
+                            "resolved committed rows " + s);
+                    assertEquals(
+                            aloneAcceptance.get(s).acceptedDrafts(),
+                            batchedAcceptance.get(s).acceptedDrafts(),
+                            "accepted drafts " + s);
+                    assertEquals(
                             alone.get(s).currentTokenPosition(),
                             batched.get(s).currentTokenPosition(),
                             "position " + s);
                 }
+                assertTrue(
+                        aloneAcceptance.get(0).acceptedDrafts()
+                                        != aloneAcceptance.get(1).acceptedDrafts()
+                                || aloneAcceptance.get(1).acceptedDrafts()
+                                        != aloneAcceptance.get(2).acceptedDrafts(),
+                        "the sequences must accept different numbers of drafts");
                 for (int s = 0; s < documents.length; s++)
                     SpeculativeVerifyCudaIntegrationTest.assertStatesEqual(
                             gpu, model.weights().config().layerTypes(), alone.get(s), batched.get(s));
@@ -310,7 +323,11 @@ class BatchedVerifyCudaIntegrationTest {
             }
             return tokens;
         } finally {
-            probe.complete();
+            try {
+                probe.complete();
+            } catch (RuntimeException ignored) {
+                // Completing the probe must not mask the failure that ended the decode.
+            }
         }
     }
 
