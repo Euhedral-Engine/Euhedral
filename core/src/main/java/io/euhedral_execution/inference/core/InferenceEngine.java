@@ -332,13 +332,13 @@ public final class InferenceEngine implements AutoCloseable {
         return this.model.prefillChunkTokens();
     }
 
-    /// Returns the configuration this engine was loaded with; its worker IDs are the engine's workers.
     /// The number of concurrent sequences device memory was sized for: the configured count, or for automatic
-    /// sizing (0) the most that fit.
+    /// sizing (0) the most that fit without offloading more weights than one sequence does.
     public int maxSequences() {
         return this.maxSequences;
     }
 
+    /// Returns the configuration this engine was loaded with; its worker IDs are the engine's workers.
     public InferenceConfig config() {
         return this.config;
     }
@@ -528,8 +528,12 @@ public final class InferenceEngine implements AutoCloseable {
         }
 
         /// The sequences to size device memory for: `requested` when it is at least 1, otherwise (0, automatic)
-        /// the largest count whose [ResidencyPlanner] plan fits. The count is at most the rows a shared pass
-        /// holds (`euhedral.batch.max-rows`, a prefill chunk by default) over a verification's rows.
+        /// the largest count whose [ResidencyPlanner] plan fits and offloads no more weight bytes than one
+        /// sequence's plan, so more sequences never evict resident weights.
+        ///
+        /// The count is at most the rows a shared pass holds (`euhedral.batch.max-rows`, a prefill chunk by
+        /// default) over a verification's rows, and 1 without a profile or with a DFlash2 drafter, whose
+        /// sequences never share a pass.
         int resolveSequences(
                 Artifact artifact,
                 ArtifactProfile profile,
@@ -539,7 +543,9 @@ public final class InferenceEngine implements AutoCloseable {
                 int requested)
                 throws IOException {
             if (requested >= 1) return requested;
-            int rows = Execution.positiveProperty("euhedral.batch.max-rows", InferenceConfig.PREFILL_CHUNK_TOKENS);
+            if (profile == null || profile.speculation() == ArtifactProfile.Speculation.DFLASH2) return 1;
+            int chunk = InferenceConfig.PREFILL_CHUNK_TOKENS;
+            int rows = Math.min(chunk, Execution.positiveProperty("euhedral.batch.max-rows", chunk));
             int cap = Math.max(
                     1,
                     rows
@@ -549,15 +555,7 @@ public final class InferenceEngine implements AutoCloseable {
                                             : 0)));
             long free = deviceBudget(gpu);
             long host = hostBudget();
-            int low = 1;
-            int high = cap;
-            // Fitting is monotone in the count: search for the largest that fits.
-            while (low < high) {
-                int middle = (low + high + 1) >>> 1;
-                if (ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat, middle)
-                        .fits()) low = middle;
-                else high = middle - 1;
-            }
+            int low = ResidencyPlanner.sequencesFor(artifact, profile, free, maxContextTokens, host, kvFormat, cap);
             LOG.info("Sequences: {} of {} tokens each (auto)", low, maxContextTokens);
             return low;
         }
@@ -611,8 +609,8 @@ public final class InferenceEngine implements AutoCloseable {
             for (var tensor : artifact.tensors())
                 if (plan.diskBacked().contains(tensor.name())) diskBytes += tensor.byteSize();
             LOG.info(
-                    "Context {} tokens x {} sequences: {} MiB of the {} MiB free on the GPU, {} MiB of weights in host memory, {} MiB"
-                            + " read from the artifact through a {} MiB window (host budget {} MiB)",
+                    "Context {} tokens x {} sequences: {} MiB of the {} MiB free on the GPU, {} MiB of weights in"
+                            + " host memory, {} MiB read from the artifact through a {} MiB window (host budget {} MiB)",
                     maxContextTokens,
                     sequences,
                     plan.deviceBytes() >> 20,

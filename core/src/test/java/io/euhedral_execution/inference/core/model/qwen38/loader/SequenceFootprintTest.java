@@ -3,6 +3,8 @@ package io.euhedral_execution.inference.core.model.qwen38.loader;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
 import io.euhedral_execution.inference.core.model.qwen38.GdnState;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
@@ -52,7 +54,7 @@ class SequenceFootprintTest {
             }
         }
         assertTrue(layers > 0);
-        assertEquals(gpu.bytes, SequenceFootprint.gdnBytes(config, 5));
+        assertEquals(SequenceFootprint.gdnBytes(config, 5), gpu.bytes);
         // Below eight rows the buffers still hold eight; above, they grow with the rows.
         assertEquals(SequenceFootprint.gdnBytes(config, 8), SequenceFootprint.gdnBytes(config, 1));
         assertTrue(SequenceFootprint.gdnBytes(config, 16) > SequenceFootprint.gdnBytes(config, 8));
@@ -68,5 +70,29 @@ class SequenceFootprintTest {
         assertTrue(drafting > plain);
         assertTrue(longer > drafting);
         assertEquals(plain, SequenceFootprint.extraSequenceBytes(config, KvFormat.BF16, 8192, 5, false));
+    }
+
+    @Test
+    void theDecodeScratchSeedRowsAndRecursionHiddenAreCounted() {
+        Qwen38Config config = ExecutionFixtures.statefulCompactWeights(8).config();
+        int rows = 5;
+        var gpu = new CountingGpu();
+        long scratchAndSeeds;
+        try (AttentionStates states = AttentionStates.allocate(
+                gpu,
+                config.layerTypes(),
+                config.numKeyValueHeads() * config.attentionHeadDim(),
+                false,
+                KvFormat.BF16)) {
+            states.decodeScratch(config.numAttentionHeads(), Math.max(rows, AttentionStates.DRAFT_TWIN_ROWS));
+            states.draftSeedRows(InferenceConfig.PREFILL_CHUNK_TOKENS, config.hiddenSize());
+            states.draftRecursionHidden(config.hiddenSize());
+            scratchAndSeeds = gpu.bytes;
+        }
+        long selection = 16 + rows * 8L;
+        long mtpCache = ResidencyPlanner.kvBytes(config, 4096, KvFormat.BF16);
+        assertEquals(
+                SequenceFootprint.gdnBytes(config, rows) + scratchAndSeeds + selection + mtpCache,
+                SequenceFootprint.extraSequenceBytes(config, KvFormat.BF16, 4096, rows, true));
     }
 }

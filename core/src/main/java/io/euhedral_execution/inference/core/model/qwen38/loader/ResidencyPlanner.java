@@ -109,6 +109,40 @@ public final class ResidencyPlanner {
         }
     }
 
+    /// The largest count of sequences, at most `cap`, whose plan fits and offloads (host- plus disk-backed) no more
+    /// weight bytes than one sequence's plan: more sequences never evict resident weights. 1 when even one does not
+    /// fit.
+    public static int sequencesFor(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int cap) {
+        Plan single = plan(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, 1);
+        if (!single.fits()) return 1;
+        long offloaded = offloadedBytes(artifact, single);
+        int low = 1;
+        int high = cap;
+        // Fitting and the offloaded bytes only worsen with the count: search for the largest that is no worse.
+        while (low < high) {
+            int middle = (low + high + 1) >>> 1;
+            Plan candidate = plan(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, middle);
+            if (candidate.fits() && offloadedBytes(artifact, candidate) <= offloaded) low = middle;
+            else high = middle - 1;
+        }
+        return low;
+    }
+
+    private static long offloadedBytes(Artifact artifact, Plan plan) {
+        long bytes = 0;
+        for (TensorDescriptor tensor : artifact.tensors())
+            if (plan.hostBacked().contains(tensor.name()) || plan.diskBacked().contains(tensor.name()))
+                bytes += tensor.byteSize();
+        return bytes;
+    }
+
     /// Plans residency for `artifact` on a device with `freeBytes` free, with unlimited host memory, or returns the
     /// plan that comes closest (`fits` false) when even the largest host-backed selection does not make room.
     public static Plan plan(Artifact artifact, ArtifactProfile profile, long freeBytes, int maxContextTokens) {

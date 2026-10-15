@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.state.AttentionKvState;
@@ -8,7 +9,7 @@ import io.euhedral_execution.inference.core.state.KvFormat;
 
 /// The device memory a sequence needs beyond its attention KV, derived from the model configuration and the sizes
 /// the sequence's states allocate: the GDN state and its verification buffers, the draft seed rows, the MTP layer's
-/// cache and the device words of a host-logits selection.
+/// cache, the decode scratch and the device words of a host-logits selection.
 public final class SequenceFootprint {
 
     /// Rows `GdnState#speculative` allocates at least, however few are verified.
@@ -42,14 +43,22 @@ public final class SequenceFootprint {
         return Math.multiplyExact(layers, recurrent + convolution + verification);
     }
 
-    /// Device bytes one more sequence needs beyond its attention KV: gdnBytes, the draft seed rows of a prefill
-    /// chunk, the MTP layer's cache for `contextTokens` (when it drafts), and its host-logits device words.
+    /// Device bytes one more sequence needs beyond its attention KV:
+    /// - gdnBytes;
+    /// - the decode scratch for the most rows it verifies (when it drafts, or catches up on the decode twins);
+    /// - its host-logits device words;
+    /// - when it drafts: the draft seed rows of a prefill chunk, the MTP layer's cache for `contextTokens` and the
+    ///   recursion hidden.
     public static long extraSequenceBytes(
             Qwen38Config config, KvFormat format, int contextTokens, int verifiedRows, boolean drafts) {
-        long total = gdnBytes(config, verifiedRows) + SELECTION_BYTES + (long) verifiedRows * Long.BYTES;
+        int scratchRows = drafts ? Math.max(verifiedRows, AttentionStates.DRAFT_TWIN_ROWS) : verifiedRows;
+        long total = gdnBytes(config, verifiedRows)
+                + AttentionStates.decodeScratchBytes(config.numAttentionHeads(), scratchRows)
+                + SELECTION_BYTES
+                + (long) verifiedRows * Long.BYTES;
         if (!drafts) return total;
         long seedRows = Math.max(InferenceConfig.PREFILL_CHUNK_TOKENS, MINIMUM_ROWS);
-        total += seedRows * config.hiddenSize() * Short.BYTES;
+        total += seedRows * config.hiddenSize() * Short.BYTES + (long) config.hiddenSize() * Short.BYTES;
         // The MTP layer is one full-attention layer's cache.
         long pages = (contextTokens + AttentionKvState.PAGE_TOKENS - 1L) / AttentionKvState.PAGE_TOKENS;
         int width = config.numKeyValueHeads() * config.attentionHeadDim();
