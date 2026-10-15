@@ -61,7 +61,7 @@ class InferencePropertiesTest {
     }
 
     @Test
-    void workerCpusDefaultToTheCoresTheProcessHasCpuTimeFor() {
+    void workerCpusDefaultToEveryAvailableProcessor() {
         Map<String, String> values = new HashMap<>(Map.of(
                 "euhedral.inference.artifact-path", "/m.edrl",
                 "euhedral.inference.tokenizer-directory", "/t",
@@ -71,8 +71,7 @@ class InferencePropertiesTest {
                 .bind("euhedral.inference", InferenceProperties.class)
                 .get();
         assertEquals(
-                ProcessorTopology.system()
-                        .processorsOfCores(Runtime.getRuntime().availableProcessors()),
+                ProcessorTopology.system().availableProcessorIds(),
                 unset.toInferenceConfig().workerCpus());
     }
 
