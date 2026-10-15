@@ -193,12 +193,12 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
 
     /// The step that hands a ring's prepared entries to the kernel: `io_uring_submit`, or a test's stand-in.
     @FunctionalInterface
-    interface Submitter {
+    public interface Submitter {
         /// The number of entries the kernel took, or a negated errno.
         int submit(MemorySegment ring) throws Throwable;
     }
 
-    static final Submitter NATIVE_SUBMIT = ring -> (int) SUBMIT.invokeExact(ring);
+    public static final Submitter NATIVE_SUBMIT = ring -> (int) SUBMIT.invokeExact(ring);
 
     private final Submitter submitter;
     private final Arena arena = Arena.ofShared();
@@ -226,7 +226,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     }
 
     /// As [#open()], with `submitter` in place of `io_uring_submit` (tests).
-    static AsyncReads open(Submitter submitter) {
+    public static AsyncReads open(Submitter submitter) {
         if (UNAVAILABLE != null)
             throw new UnsupportedOperationException("asynchronous reads are unavailable", UNAVAILABLE);
         AsyncReads reads = new AsyncReads(Objects.requireNonNull(submitter, "submitter"));
@@ -318,12 +318,28 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         int slot = (int) (tag & (PENDING - 1));
         if (!this.pending.compareAndSet(slot, null, done)) return false;
         if (this.inFlight.incrementAndGet() == 1) this.busySince = System.nanoTime();
-        if (!enqueue(ring, done, slot)) {
-            this.pending.set(slot, null);
-            if (this.inFlight.decrementAndGet() == 0) this.busyNanos.add(System.nanoTime() - this.busySince);
-            return false;
+        boolean taken;
+        try {
+            taken = enqueue(ring, done, slot);
+        } catch (RuntimeException | Error failure) {
+            handBack(slot);
+            throw failure;
         }
-        return true;
+        if (!taken) handBack(slot);
+        return taken;
+    }
+
+    /// A read that was not submitted gives its pending slot and its count in flight back.
+    private void handBack(int slot) {
+        this.pending.set(slot, null);
+        if (this.inFlight.decrementAndGet() == 0) this.busyNanos.add(System.nanoTime() - this.busySince);
+    }
+
+    /// Reads holding a pending slot: submitted and not yet reaped (tests).
+    int pendingReads() {
+        int count = 0;
+        for (int slot = 0; slot < PENDING; slot++) if (this.pending.get(slot) != null) count++;
+        return count;
     }
 
     /// Puts the read's next piece on `ring` and submits it. True when the kernel took every entry the ring had
@@ -339,6 +355,7 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         }
         if (sqe.address() == 0) return false;
         boolean taken = false;
+        RuntimeException thrown = null;
         try {
             int length = (int) Math.min(read.remaining, Integer.MAX_VALUE & ~4095L);
             PREP_READ.invokeExact(sqe, read.fd, MemorySegment.ofAddress(read.address), length, read.offset);
@@ -348,12 +365,23 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
             taken = submitted >= prepared;
             return taken;
         } catch (Throwable failure) {
-            throw new IllegalStateException("io_uring submission failed", failure);
+            thrown = new IllegalStateException("io_uring submission failed", failure);
+            throw thrown;
         } finally {
-            if (!taken) defuse(sqe);
+            if (!taken) {
+                try {
+                    defuse(sqe);
+                } catch (RuntimeException defuseFailure) {
+                    // The submission's own failure stays the one reported.
+                    if (thrown == null) throw defuseFailure;
+                    thrown.addSuppressed(defuseFailure);
+                }
+            }
         }
     }
 
+    /// Rewriting an entry the kernel has not taken is safe only because no ring polls its queue from a kernel
+    /// thread (no SQPOLL): the kernel reads entries when a submission enters it.
     private static void defuse(MemorySegment sqe) {
         try {
             PREP_NOP.invokeExact(sqe);
@@ -390,13 +418,22 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                 if (tag == DEFUSED) continue;
                 int slot = (int) tag;
                 Read read = this.pending.get(slot);
+                // Never expected: an entry is defused before its read gives its slot back.
+                if (read == null) continue;
                 if (result > 0 && result < read.remaining) {
-                    // A short read: the rest is read on this thread's ring, under the same slot.
+                    // A short read: the rest is read on this thread's ring, under the same slot. A rest that cannot be
+                    // submitted ends the read as failed (EIO), so it still completes.
                     read.address += result;
                     read.offset += result;
                     read.remaining -= result;
                     Ring here = ring();
-                    if (here != null && enqueue(here, read, slot)) continue;
+                    boolean resubmitted;
+                    try {
+                        resubmitted = here != null && enqueue(here, read, slot);
+                    } catch (RuntimeException | Error failure) {
+                        resubmitted = false;
+                    }
+                    if (resubmitted) continue;
                     result = -5;
                 }
                 this.pending.set(slot, null);
