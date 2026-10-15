@@ -35,7 +35,7 @@ class TokenIdentityCudaIntegrationTest {
     private static final int NEW_TOKENS = 32;
     private static final Path GOLDENS = Path.of("src/test/resources/identity");
     private static final String QWEN38_TOKENIZER =
-            System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen");
+            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
 
     /// Flash-Next first: it pins host memory from the process's cgroup headroom, which the page cache of the dense
     /// artifacts read later would take.
@@ -50,26 +50,21 @@ class TokenIdentityCudaIntegrationTest {
         return Stream.of(
                 Arguments.of(
                         "flash-next",
-                        System.getProperty(
-                                "euhedral.qwen4.artifact",
-                                "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"),
-                        System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4")),
+                        System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"),
+                        System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir")),
                 Arguments.of(
                         "q3",
-                        System.getProperty(
-                                "euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl"),
+                        System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"),
                         QWEN38_TOKENIZER),
                 Arguments.of(
                         "nvfp4",
-                        System.getProperty(
-                                "euhedral.qwen.nvfp4-artifact",
-                                "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl"),
+                        System.getProperty("euhedral.qwen.nvfp4-artifact", "unset-euhedral.qwen.nvfp4-artifact"),
                         QWEN38_TOKENIZER),
                 Arguments.of(
                         "nvfp4-compressed",
                         System.getProperty(
                                 "euhedral.qwen.nvfp4-compressed-artifact",
-                                "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl"),
+                                "unset-euhedral.qwen.nvfp4-compressed-artifact"),
                         QWEN38_TOKENIZER));
     }
 

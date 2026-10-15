@@ -24,14 +24,15 @@ import org.junit.jupiter.api.Timeout;
 class ScratchCudaIntegrationTest {
 
     private static final String TOKENIZER =
-            System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen");
+            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
 
     @Test
     @Timeout(900)
     void prefillAndDecodeTakeOnlyTheBoundScratch() throws Exception {
         String name = System.getProperty("euhedral.scratch.artifact");
         assumeTrue(name != null, "select an artifact with -Peuhedral.scratch.artifact");
-        String artifact = "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_" + name.replace('-', '_') + ".edrl";
+        String artifact = System.getProperty("euhedral.qwen.artifact-dir", "unset-euhedral.qwen.artifact-dir")
+                + "/qwen3_8_27b_" + name.replace('-', '_') + ".edrl";
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
         assumeTrue(Files.isRegularFile(Path.of(artifact)), "no artifact " + artifact);

@@ -32,7 +32,7 @@ class DFlash2LoadCudaIntegrationTest {
         cpus.set(0, Math.min(8, Runtime.getRuntime().availableProcessors()));
         var config = new InferenceConfig(
                 artifact,
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")),
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")),
                 Path.of(System.getProperty("euhedral.cuda.library")),
                 cpus,
                 4096,

@@ -25,7 +25,8 @@ import org.junit.jupiter.params.provider.MethodSource;
 class ShapeIdentityCudaIntegrationTest {
 
     private static final Path GOLDENS = Path.of("src/test/resources/shapes");
-    private static final String TOKENIZER = "/mnt/shared/qwen38-quant/source/qwen";
+    private static final String TOKENIZER =
+            System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir");
     private static final List<String> NAMES = List.of("q3", "nvfp4", "nvfp4-compressed");
     /// The device memory the residency planner sees: below what is free on the 16 GB card, whatever else runs.
     private static final long DEVICE_BUDGET = 14L << 30;
@@ -37,20 +38,15 @@ class ShapeIdentityCudaIntegrationTest {
                 if (!NAMES.contains(name))
                     throw new IllegalArgumentException("euhedral.shapes.artifacts names no artifact: " + name);
         return Stream.of(
-                Arguments.of(
-                        "q3",
-                        System.getProperty(
-                                "euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl")),
+                Arguments.of("q3", System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact")),
                 Arguments.of(
                         "nvfp4",
-                        System.getProperty(
-                                "euhedral.qwen.nvfp4-artifact",
-                                "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl")),
+                        System.getProperty("euhedral.qwen.nvfp4-artifact", "unset-euhedral.qwen.nvfp4-artifact")),
                 Arguments.of(
                         "nvfp4-compressed",
                         System.getProperty(
                                 "euhedral.qwen.nvfp4-compressed-artifact",
-                                "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl")));
+                                "unset-euhedral.qwen.nvfp4-compressed-artifact")));
     }
 
     @ParameterizedTest(name = "{0}")

@@ -175,7 +175,7 @@ class KvFormatCudaIntegrationTest {
 
     private static QwenTokenizer tokenizer() throws Exception {
         return QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
     }
 
     private static int[] document(QwenTokenizer tokenizer) throws Exception {

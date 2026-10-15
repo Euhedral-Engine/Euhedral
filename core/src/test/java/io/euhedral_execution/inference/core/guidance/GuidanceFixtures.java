@@ -17,7 +17,7 @@ final class GuidanceFixtures {
     static synchronized QwenTokenizer tokenizer() throws Exception {
         if (tokenizer == null) {
             Path checkpoint =
-                    Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                    Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
             assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
             tokenizer = QwenTokenizer.load(checkpoint);
         }

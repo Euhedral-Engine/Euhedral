@@ -50,15 +50,14 @@ class DiskTierCudaIntegrationTest {
     }
 
     private static Path artifact() {
-        Path artifact = Path.of(System.getProperty(
-                "euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts" + "/qwen3_8_27b_q3.edrl"));
+        Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"));
         assumeTrue(Files.isRegularFile(artifact), "no artifact " + artifact);
         return artifact;
     }
 
     private static int[] prompt() throws Exception {
         Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int[] text = QwenTokenizer.load(tokenizer)
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));

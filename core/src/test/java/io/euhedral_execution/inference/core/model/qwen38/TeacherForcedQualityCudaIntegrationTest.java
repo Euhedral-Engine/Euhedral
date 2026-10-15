@@ -50,7 +50,7 @@ class TeacherForcedQualityCudaIntegrationTest {
         int prefix = Integer.getInteger("euhedral.quality.prefix", 512);
         int steps = Integer.getInteger("euhedral.quality.steps", 2048);
         QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
         int[] document = tokenizer.encodeText(Files.readString(SpeculativeVerifyCudaIntegrationTest.repositoryRoot()
                 .resolve("benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/"
                         + "chat-corpus-v1-document.md")));

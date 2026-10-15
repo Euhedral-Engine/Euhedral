@@ -34,7 +34,7 @@ class SpeculativeVerifyCudaIntegrationTest {
     @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void verificationRowsAndCommittedStateEqualSequentialDecode() throws Throwable {
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
         int rows = Integer.getInteger("euhedral.speculative.rows", 4);
         int[] text = QwenTokenizer.load(tokenizerDirectory)
@@ -91,7 +91,7 @@ class SpeculativeVerifyCudaIntegrationTest {
     @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void partiallyCommittedVerificationsLeaveSequentialState() throws Throwable {
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int prefix = Integer.getInteger("euhedral.speculative.prefix", 300);
         int[] text = QwenTokenizer.load(tokenizerDirectory)
                 .encodeText(Files.readString(repositoryRoot().resolve("docs/FRAME_MODEL.md")));

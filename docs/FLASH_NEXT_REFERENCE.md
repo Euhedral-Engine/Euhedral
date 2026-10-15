@@ -8,7 +8,7 @@ shapes below are the contract.
 * Upstream: transformers `qwen4_exp` at revision `f5ab85619d989359ef47b5efed8a91a15045627b` (source copy in
   `~/src/third_party/transformers-qwen4/`, installed from that commit in the venv).
 * Code: `tools/flash_next_reference.py` (CLI), `tools/flash_next_reference/` (package), `tools/test_flash_next_reference.py`.
-* Fixtures are not in the repository: `/home/brandon/fixtures/flash-next/<case>/` (about 1 GB for all cases).
+* Fixtures are not in the repository: `$EUHEDRAL_FLASH_NEXT_FIXTURES/<case>/` (about 1 GB for all cases).
 
 ## Regenerating
 
@@ -18,7 +18,7 @@ PY=~/.cache/flash-next-ref-venv/bin/python        # torch 2.14 cu130, transforme
 export PYTHONPATH=tools
 $PY tools/flash_next_reference.py list-cases
 $PY tools/flash_next_reference.py check-artifact [--full]       # config vs metadata, CRC-32 of a sample of objects
-$PY tools/flash_next_reference.py fixtures --out /home/brandon/fixtures/flash-next --case short   # or --case all
+$PY tools/flash_next_reference.py fixtures --out "$EUHEDRAL_FLASH_NEXT_FIXTURES" --case short   # or --case all
 $PY tools/flash_next_reference.py fixtures --out DIR --case layer_qsa_short --kv-format nvfp4
 $PY tools/flash_next_reference.py generate --prompt "The capital of France is" --steps 6        # or --prompt-ids 760 6511 ...
 $PY tools/flash_next_reference.py fp32-chunk-check               # chunk invariance of real layers in fp32

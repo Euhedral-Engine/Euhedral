@@ -10,7 +10,7 @@ The artifact holds everything the runtime needs (configuration, tokenizer-indepe
 
 ## Source checkpoint
 
-`/mnt/shared/qwen38-flash-next/nvfp4`: 131 safetensors shards, 2,732 tensors, 104,810,594,748 stored bytes. It is already NVFP4
+The Flash-Next NVFP4 checkpoint: 131 safetensors shards, 2,732 tensors, 104,810,594,748 stored bytes. It is already NVFP4
 (E2M1 codes, E4M3 block scales of 16, FP32 global scales; routed experts carry one global scale per expert). The converter
 copies every code, scale and global scale unchanged; nothing is quantized again.
 
@@ -110,8 +110,8 @@ rows.
 ## Converting
 
 ```bash
-python3 tools/convert_flash_next.py convert /mnt/shared/qwen38-flash-next/nvfp4 ARTIFACT.edrl [--jobs 4] [--force]
-python3 tools/convert_flash_next.py verify  ARTIFACT.edrl --checkpoint /mnt/shared/qwen38-flash-next/nvfp4
+python3 tools/convert_flash_next.py convert CHECKPOINT_DIR ARTIFACT.edrl [--jobs 4] [--force]
+python3 tools/convert_flash_next.py verify  ARTIFACT.edrl --checkpoint CHECKPOINT_DIR
 ```
 
 `convert` plans the objects from the checkpoint (rejecting unknown tensors, incomplete NVFP4 triples, inconsistent shapes, or
@@ -124,7 +124,7 @@ CRC-32, and with `--checkpoint` every byte of every object against the checkpoin
 
 ## Artifact
 
-`/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl`: 104,913,957,888 bytes (97.71 GiB), 1,606 objects (1,557
+`qwen3_8_flash_next_nvfp4.edrl`: 104,913,957,888 bytes (97.71 GiB), 1,606 objects (1,557
 tensors, 49 expert banks of 512 records), SHA-256 `c52ef26dee424671a1f852a762eca12ad6b35c357c3aed54c65a9a726a0f46ec`.
 
 | | bytes |

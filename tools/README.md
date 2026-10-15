@@ -21,8 +21,8 @@ Pass exactly one. Quantization runs on the GPU when PyTorch finds one (`--device
 needs NumPy; the GPU path needs PyTorch.
 
 ```bash
-CHECKPOINT=/mnt/shared/qwen38-quant/source/qwen
-OUT=/mnt/shared/qwen38-quant/artifacts
+CHECKPOINT=/path/to/checkpoint
+OUT=/path/to/artifacts
 RANKING=/path/to/token-ranking.i64
 
 # q3
@@ -140,7 +140,7 @@ speculates with DFlash2 (docs/DFLASH2.md). `--dflash2-projections` stores the dr
 
 ```bash
 python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.edrl \
-    --dflash2 /mnt/shared/Qwen3.8-27B-DFlash2 --dflash2-projections nvfp4 \
+    --dflash2 DFLASH2_DIR --dflash2-projections nvfp4 \
     --out $OUT/qwen3_8_27b_nvfp4_compressed_dflash2.edrl
 ```
 

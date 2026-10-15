@@ -39,7 +39,7 @@ class PerformanceCudaIntegrationTest {
     /// all the docs; a longer one repeats what there is.
     static synchronized int[] corpus(int tokens) throws IOException {
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
+                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(tokenizerDirectory.resolve("tokenizer.json")), "no tokenizer");
         int characters = (int) Math.min(Integer.MAX_VALUE, Math.max(1L << 16, tokens * 16L));
         int[] ids = ENCODED.get(characters);

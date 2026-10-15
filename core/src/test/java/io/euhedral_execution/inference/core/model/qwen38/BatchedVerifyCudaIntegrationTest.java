@@ -39,7 +39,7 @@ class BatchedVerifyCudaIntegrationTest {
     @Timeout(value = 600, unit = TimeUnit.SECONDS)
     void batchedRowsAndStatesEqualEachSequenceVerifiedAlone() throws Throwable {
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int[] text = QwenTokenizer.load(tokenizerDirectory)
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));
@@ -127,7 +127,7 @@ class BatchedVerifyCudaIntegrationTest {
 
     private static void withSequences(Body body) throws Throwable {
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int[] text = QwenTokenizer.load(tokenizerDirectory)
                 .encodeText(Files.readString(
                         SpeculativeVerifyCudaIntegrationTest.repositoryRoot().resolve("docs/FRAME_MODEL.md")));

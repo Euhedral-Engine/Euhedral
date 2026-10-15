@@ -38,7 +38,7 @@ class DFlash2PrefixCacheCudaIntegrationTest {
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)));
         Path artifact = Path.of(System.getProperty("euhedral.qwen.dflash2-artifact", ""));
         Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(artifact), "no DFlash2 artifact: " + artifact);
         BitSet cpus = new BitSet();
         var available = SystemInfo.getPCpuSet();

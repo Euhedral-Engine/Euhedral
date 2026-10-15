@@ -22,8 +22,8 @@ Change one variable at a time and keep the JSON for every run you compare.
 
    ```bash
    ./gradlew test
-   ./gradlew :core:tokenizerReferenceTest -Peuhedral.qwen.tokenizer-dir=/mnt/shared/qwen38-quant/source/qwen
-   ./gradlew cudaIntegrationTest -Peuhedral.qwen.artifact=/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl
+   ./gradlew :core:tokenizerReferenceTest -Peuhedral.qwen.tokenizer-dir=CHECKPOINT_DIR
+   ./gradlew cudaIntegrationTest -Peuhedral.qwen.artifact=ARTIFACT.edrl
    ```
 
 3. **Check the GPU is free.** The engine refuses to load, and the run exits with code 3 without

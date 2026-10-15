@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import gc
 import platform
 import random
@@ -316,7 +317,7 @@ def run_ngram_ids(case: Case, art_path, out_root: Path, device="cpu", log=print)
     return {"bytes": total, "seconds": time.time() - started, "gpu_peak_gib": 0.0}
 
 
-def run_case(name: str, art_path=DEFAULT_ARTIFACT, out_root: Path = Path("/home/brandon/fixtures/flash-next"),
+def run_case(name: str, art_path=DEFAULT_ARTIFACT, out_root: Path = Path(os.environ.get("EUHEDRAL_FLASH_NEXT_FIXTURES", "unset-EUHEDRAL_FLASH_NEXT_FIXTURES")),
              device="cuda", capture_layers=None, logit_rows=1, kv_format="bf16", log=print) -> dict:
     case = CASES[name]
     try:

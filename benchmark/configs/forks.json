@@ -1,6 +1,6 @@
 {
-  "artifact": "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl",
-  "tokenizer": "/mnt/shared/qwen38-quant/source/qwen",
+  "artifact": "/path/to/qwen3_8_27b_q3.edrl",
+  "tokenizer": "/path/to/checkpoint",
   "cudaLibrary": "build/native/linux-x64/lib/libeuhedral_cuda.so",
   "output": "benchmark-results/forks.jsonl",
   "append": true

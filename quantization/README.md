@@ -125,7 +125,7 @@ The fixtures below are frozen outputs of a PyTorch reference of the calibration 
 - `GptqCudaIntegrationTest`: one object in Q3, Q5, NVFP4 and NVFP4-SD4, with and without act-order, against the
   reference (fixture in the test resources): tensor scales exactly, codes by agreement and output error under H.
 - `LayerForwardCudaIntegrationTest`: layers 0 and 3 against the reference's BF16 forward (fixture in
-  `/mnt/shared/qwen38-quant/quality/fixtures/forward-fixture`, or `-Peuhedral.quantization.forward-fixture=DIR`).
+  `-Peuhedral.quantization.forward-fixture=DIR`).
 - `ForwardPipelineCudaIntegrationTest`: the frame pipeline equals the sequential forward bit for bit.
 
 ```bash

@@ -42,7 +42,7 @@ class DFlash2QualityCudaIntegrationTest {
         assumeTrue(Files.isRegularFile(artifact) && !report.isEmpty(), "needs a DFlash2 artifact and a report path");
         int budget = Integer.getInteger("euhedral.speculative.tokens", 256);
         QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
         try (CudaGpuMemory gpu = new CudaGpuMemory(Path.of(System.getProperty("euhedral.cuda.library")));
                 Qwen38Model model = DFlash2SpeculativeDecodeCudaIntegrationTest.load(artifact, gpu, 4096);
                 var lattice = new PullingLattice();
