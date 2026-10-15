@@ -32,8 +32,9 @@ import org.slf4j.LoggerFactory;
 /// Each quantum registers its disk uses at admission ([#enqueue]), in the order the device consumes them. Every
 /// window slot keeps its own queue of uses, in admission order and, within a quantum, in use order: the order its
 /// copies run on the device, which the staging ring's edges fix. A poll gives each slot whose flag the device lowered
-/// the next use of its queue: it submits the read ([AsyncReads], io_uring) and the read's completion frame raises
-/// the flag. Without asynchronous reads the poll reads positionally itself, one slot at a time.
+/// the next use of its queue: it submits the read ([AsyncReads], io_uring), the worker that reaps the read raises the
+/// flag, and the read's completion frame then hands the slot back to the poll. Without asynchronous reads the poll
+/// reads positionally itself, one slot at a time.
 ///
 /// A quantum that stops before its device work consumed every use is abandoned ([#abandon]): its uses not yet read
 /// raise their flags unread, so the device, which drains them in order, never waits on them and the next quantum's
@@ -256,7 +257,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         }
     }
 
-    /// The completion of slot `slot`'s read: fails the quantum when the read failed, raises the flag either way.
+    /// The completion of slot `slot`'s read. The flag rises when the read is reaped ([#reaped]); the frame then fails
+    /// the quantum when the read failed and hands the slot back to the poll.
     private final class SlotRead extends AsyncReads.Read {
         private final int slot;
         private Pending pending;
@@ -264,6 +266,14 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         SlotRead(int slot, long seed) {
             super(seed);
             this.slot = slot;
+        }
+
+        /// The device's copy waits on the flag alone: raised here, it never waits for this frame, which can queue
+        /// behind a worker blocked in a CUDA call that itself waits for the device to pass this slot. A failed
+        /// read's bytes are copied all the same; its quantum fails when the frame runs.
+        @Override
+        protected void reaped() {
+            DiskReader.this.window.raise(this.slot);
         }
 
         @Override
@@ -274,7 +284,6 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
             this.pending = null;
             IOException failure = failure();
             if (failure != null) failed(done, failure);
-            DiskReader.this.window.raise(this.slot);
             int slot = this.slot;
             try {
                 if (!DiskReader.this.closed) post(() -> DiskReader.this.state[slot] = FILLED);
