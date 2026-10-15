@@ -31,6 +31,7 @@ class FakeServer:
     def __init__(self, fail_first: int = 0) -> None:
         self.bodies: list[dict] = []
         self.fail_first = fail_first
+        self.fail_code = "service_unavailable"
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -41,18 +42,25 @@ class FakeServer:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if outer.fail_first > 0:
                     outer.fail_first -= 1
+                    data = json.dumps({"error": {"code": outer.fail_code}}).encode()
                     self.send_response(503)
-                    self.send_header("Content-Length", "0")
+                    self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
+                    self.wfile.write(data)
                     return
                 outer.bodies.append(body)
                 messages = body["messages"]
                 message = {"role": "assistant", "content": "answer", "reasoning_content": "thought"}
+                finish = "stop"
+                first = next(m["content"] for m in messages if m["role"] == "user")
                 if body.get("tools") and messages[-1]["role"] == "user":
+                    calls = [("call_1", {"q": 1})] + ([("call_2", {"q": 2})] if "multi" in first else [])
                     message = {"role": "assistant", "content": None, "tool_calls": [
-                        {"id": "call_1", "type": "function",
-                         "function": {"name": "lookup", "arguments": "{\"q\": 1}"}}]}
-                payload = {"choices": [{"index": 0, "message": message, "finish_reason": "stop",
+                        {"id": i, "type": "function", "function": {"name": "lookup", "arguments": json.dumps(a)}}
+                        for i, a in calls]}
+                if "long" in first:
+                    finish = "length"
+                payload = {"choices": [{"index": 0, "message": message, "finish_reason": finish,
                                         "token_ids": [1000 + len(messages), 2000 + len(messages)]}],
                            "prompt_token_ids": render(messages)}
                 data = json.dumps(payload).encode()
@@ -158,6 +166,66 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(sleeps, [1.0])
         self.assertEqual(result.token_ids, [1001, 2001])
         self.assertEqual(result.message["reasoning_content"], "thought")
+
+    def test_several_tool_calls_in_one_turn(self):
+        self.write([row("multi", "tool_use", tools=[TOOL], fixture="fx.json")])
+        self.run_main(domain="tool_use")
+        tail = self.server.bodies[1]["messages"][-2:]
+        self.assertEqual([m["tool_call_id"] for m in tail], ["call_1", "call_2"])
+        fixture = fixtures.Fixture(FIXTURE)
+        self.assertEqual(tail[0]["content"], fixture.call("lookup", "{\"q\": 1}"))
+        self.assertEqual(tail[1]["content"], fixture.call("lookup", "{\"q\": 2}"))
+        self.assertIn("no result", tail[1]["content"])
+
+    def test_length_finish_ends_conversation(self):
+        self.write([{**row("long"), "turns": ["long one", "second"]}])
+        self.run_main()
+        self.assertEqual(len(self.server.bodies), 1)
+        record = json.loads((self.store / "generation" / "progress.json").read_text())["conversations"]["long"]
+        self.assertEqual(record["ended"], "length")
+
+    def test_target_tokens_stops_after_the_turn(self):
+        self.write([{**row("a"), "turns": ["one", "two", "three"]}])
+        self.run_main("--target-tokens", "5")
+        self.assertEqual(len(self.server.bodies), 1)
+        record = json.loads((self.store / "generation" / "progress.json").read_text())["conversations"]["a"]
+        self.assertEqual(record["ended"], "target")
+
+    def test_sampling_parameters_reach_the_wire(self):
+        self.write([row("a", order=0), row("b", order=1)])
+        self.run_main()
+        sampled = next(b for b in self.server.bodies if "b" in b["messages"][0]["content"][-1:])
+        for key, value in {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}.items():
+            self.assertEqual(sampled[key], value)
+        self.assertIsInstance(sampled["seed"], int)
+        greedy = next(b for b in self.server.bodies if b is not sampled)
+        self.assertEqual(greedy["temperature"], 0)
+        self.assertNotIn("seed", greedy)
+
+    def test_timeout_503_is_not_retried(self):
+        self.server.fail_first = 5
+        self.server.fail_code = "timeout"
+        sleeps = []
+        client = chat_client.ChatClient(self.server.url, "m", sleep=sleeps.append)
+        with self.assertRaises(chat_client.ServerTimeout):
+            client.complete([{"role": "user", "content": "x"}], [], records.Decoding("greedy", None), 8)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self.server.fail_first, 4)
+
+    def test_new_commit_needs_permission(self):
+        path = self.store / "p.json"
+        progress.Progress.open(path, {"git_commit": "a", "seed": 1})
+        with self.assertRaises(ValueError):
+            progress.Progress.open(path, {"git_commit": "b", "seed": 1})
+        reopened = progress.Progress.open(path, {"git_commit": "b", "seed": 1}, mutable=("git_commit",))
+        self.assertEqual(reopened.settings["previous"], [{"git_commit": "a"}])
+        progress.Progress.open(path, {"git_commit": "b", "seed": 1})
+
+    def test_first_mismatch_index(self):
+        self.assertIsNone(generate._first_mismatch(None, [1]))
+        self.assertIsNone(generate._first_mismatch([1, 2], [1, 2, 3]))
+        self.assertEqual(generate._first_mismatch([1, 2, 3], [1, 9, 3]), 1)
+        self.assertEqual(generate._first_mismatch([1, 2, 3], [1, 2]), 2)
 
     def test_error_is_recorded_and_retried_on_resume(self):
         self.write([row("a")])

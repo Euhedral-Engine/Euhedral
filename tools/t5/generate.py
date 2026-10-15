@@ -6,8 +6,16 @@ Usage (from tools/): python3 -m t5.generate SERVER_URL STORE --model ID --base-s
 A conversation's corpus sequence is its last request's `prompt_token_ids + token_ids`: the deployed rendering of
 the whole conversation, with reasoning replayed through `reasoning_content`. Each request also records whether its
 prompt ids start with the previous request's prompt and completion ids (`prefix_consistent`), so template trimming
-is visible. See client.py for why the ids come from the server. `--parallel` should match the server's maximum
-number of sequences.
+is visible, with the index of the first differing id. See client.py for why the ids come from the server.
+
+Server requirements: `--parallel` must match the server's maximum number of sequences and
+`euhedral.api.max-queued-generations` must be at least `--parallel`. The server's `euhedral.api.request-timeout`
+(30m by default, counted from arrival including queue wait) must exceed the longest request; BF16 requests take
+45+ minutes, so start it with, for example, 6h. A timeout answer is recorded as an error and is not retried. The
+server does not expose these settings, so they cannot be checked at startup.
+
+Resume: the progress file records the git commit; a different commit refuses to resume unless
+`--allow-new-commit` is given, which keeps both commits in the file.
 """
 from __future__ import annotations
 
@@ -42,6 +50,16 @@ class Limits:
     max_tool_rounds: int = 8
 
 
+def _first_mismatch(previous, prompt) -> int | None:
+    """Index of the first prompt id that differs from the previous request's prompt + completion, else None."""
+    if previous is None:
+        return None
+    for index, expected in enumerate(previous):
+        if index >= len(prompt) or prompt[index] != expected:
+            return index
+    return None
+
+
 def run_conversation(conversation: records.Conversation, decoding: records.Decoding, client: ChatClient,
                      fixture: Fixture | None, limits: Limits) -> dict:
     messages = [{"role": "system", "content": conversation.system}] if conversation.system else []
@@ -49,6 +67,8 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
     state = {"last": None, "error": None}
 
     def finish(ended: str) -> dict:
+        # `messages` is the history so far: after "tool_rounds" it includes the tool results appended after the
+        # last request, which `tokens` (the last request's ids) does not cover.
         last = state["last"]
         tokens = last.prompt_token_ids + last.token_ids if last else []
         return {"id": conversation.id, "domain": conversation.domain, "language": conversation.language,
@@ -62,10 +82,11 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
             messages.append({"role": "user", "content": turn})
             for _ in range(limits.max_tool_rounds + 1):
                 result = client.complete(messages, list(conversation.tools), decoding, limits.max_tokens)
-                consistent = previous is None or result.prompt_token_ids[:len(previous)] == previous
+                mismatch = _first_mismatch(previous, result.prompt_token_ids)
                 requests.append({"prompt_tokens": len(result.prompt_token_ids),
                                  "completion_tokens": len(result.token_ids),
-                                 "finish_reason": result.finish_reason, "prefix_consistent": consistent})
+                                 "finish_reason": result.finish_reason, "prefix_consistent": mismatch is None,
+                                 "first_mismatch": mismatch})
                 previous = result.prompt_token_ids + result.token_ids
                 state["last"] = result
                 messages.append(result.message)
@@ -126,7 +147,10 @@ def main(argv: list[str] | None = None, validation: dict | None = None) -> int:
     parser.add_argument("store", type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-seed", type=int, required=True)
-    parser.add_argument("--parallel", type=int, default=4)
+    parser.add_argument("--parallel", type=int, required=True,
+                        help="concurrent conversations; set to the server's maximum number of sequences")
+    parser.add_argument("--allow-new-commit", action="store_true",
+                        help="resume although this repository is at a different commit than the progress file records")
     parser.add_argument("--domains", nargs="+")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-tokens", type=int, default=Limits.max_tokens)
@@ -143,7 +167,8 @@ def main(argv: list[str] | None = None, validation: dict | None = None) -> int:
             print(error)
         return 2
     plan = records.plan_decoding(conversations, args.base_seed)
-    progress = Progress.open(store / "generation" / "progress.json", build_settings(args, store, limits, conversations))
+    progress = Progress.open(store / "generation" / "progress.json", build_settings(args, store, limits, conversations),
+                         mutable=("git_commit",) if args.allow_new_commit else ())
     finished = progress.done()
     pending = sorted((c for c in conversations if c.id not in finished
                       and (not args.domains or c.domain in args.domains)),
@@ -165,13 +190,18 @@ def main(argv: list[str] | None = None, validation: dict | None = None) -> int:
             print(f"{record['id']} length {record['length']} ended {record['ended']} {rate:.1f} tok/s", flush=True)
 
     failed = 0
-    with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max(1, args.parallel))
+    try:
         for conversation, future in [(c, pool.submit(work, c)) for c in pending]:
             try:
                 future.result()
             except Exception as e:  # fixture load or progress failure: report, keep going
                 failed += 1
                 print(f"{conversation.id} failed: {type(e).__name__}: {e}", flush=True)
+    except KeyboardInterrupt:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown()
     errored = sum(1 for c in pending if progress.conversations.get(c.id, {}).get("ended") == "error")
     print(f"{len(pending)} conversations run, {errored + failed} failed, {len(progress.done())} done")
     return 1 if errored or failed else 0

@@ -20,16 +20,25 @@ class Progress:
         self._lock = threading.Lock()
 
     @classmethod
-    def open(cls, path: Path, settings: dict) -> "Progress":
+    def open(cls, path: Path, settings: dict, mutable: tuple = ()) -> "Progress":
+        """`mutable` names settings that may differ from the stored ones (their old values are kept under
+        `previous` in the settings, so the file records every value it was written with)."""
         settings = json.loads(json.dumps(settings))
         path = Path(path)
         if path.exists():
             stored = json.loads(path.read_text(encoding="utf-8"))
-            if stored.get("settings") != settings:
-                changed = sorted(k for k in set(stored.get("settings", {})) | set(settings)
-                                 if stored.get("settings", {}).get(k) != settings.get(k))
+            old = stored.get("settings", {})
+            changed = sorted(k for k in set(old) | set(settings) if k != "previous" and old.get(k) != settings.get(k))
+            if set(changed) - set(mutable):
                 raise ValueError(f"{path} was written with different settings: {', '.join(changed)}")
-            return cls(path, settings, stored.get("conversations", {}))
+            if changed:
+                settings["previous"] = old.get("previous", []) + [{k: old.get(k) for k in changed}]
+            else:
+                settings = old
+            result = cls(path, settings, stored.get("conversations", {}))
+            if changed:
+                result._save()
+            return result
         path.parent.mkdir(parents=True, exist_ok=True)
         progress = cls(path, settings, {})
         progress._save()
