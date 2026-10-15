@@ -35,6 +35,9 @@ val latticeTest = tasks.register<Test>("latticeTest") {
     testClassesDirs = testSourceSet.output.classesDirs
     classpath = testSourceSet.runtimeClasspath
     include(latticeTestClasses)
+    providers.gradleProperty("euhedral.qwen.tokenizer-dir").orNull?.let {
+        systemProperty("euhedral.qwen.tokenizer-dir", it)
+    }
     forkEvery = 1
     // Each JVM starts its own lattice on its own worker threads (no ports, no shared files), so JVMs can overlap.
     maxParallelForks = maxOf(1, Runtime.getRuntime().availableProcessors() / 4)
@@ -42,6 +45,9 @@ val latticeTest = tasks.register<Test>("latticeTest") {
 }
 
 tasks.named<Test>("test") {
+    providers.gradleProperty("euhedral.qwen.tokenizer-dir").orNull?.let {
+        systemProperty("euhedral.qwen.tokenizer-dir", it)
+    }
     exclude(latticeTestClasses)
     finalizedBy(latticeTest)
     // The converted Flash-Next artifact (tools/convert_flash_next.py); tests that need it skip when it is absent.
