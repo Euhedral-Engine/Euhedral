@@ -713,7 +713,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             return;
         }
         if (this.hostLogits == null) return;
-        if (this.kind == ExecutionKind.VERIFY) {
+        if (this.acceptance != null || this.forcedCommittedRows > 0) {
             if (this.hostLogits.selectsOnDevice()) this.hostLogits.queueRowSelections(address, logitsRowCount());
             else this.hostLogits.queueRows(address, logitsRowCount());
         } else this.hostLogits.queueFinalRow(address, logitsRowCount());

@@ -12,6 +12,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -218,7 +219,7 @@ class LogitsSamplerTest {
     @Test
     void selectRowsSamplesEachRowAtItsPosition() {
         int rows = 24;
-        var gpu = new RowsGpu(rows, 4);
+        var gpu = new RowsGpu();
         var logits = new HostLogits(gpu, 4);
         logits.queueRows(1 << 20, rows);
         logits.retired(true);
@@ -226,6 +227,8 @@ class LogitsSamplerTest {
 
         int[] selected = new LogitsSampler(config, 4).selectRows(logits, 100);
         assertEquals(rows, selected.length);
+        // Row r peaks at token r % 4, so a wrong row or slice offset selects another token.
+        for (int row = 0; row < rows; row++) assertEquals(row % 4, selected[row], "row " + row);
         var sampler = new LogitsSampler(config, 4);
         for (int row = 0; row < rows; row++) assertEquals(sampler.selectRow(logits, row, 100 + row), selected[row]);
 
@@ -233,21 +236,34 @@ class LogitsSamplerTest {
         for (int row = rows - 1; row >= 0; row--)
             assertEquals(selected[row], reverse.selectRow(logits, row, 100 + row), "row " + row);
         assertArrayEquals(selected, new LogitsSampler(config, 4).selectRows(logits, 100), "a fresh sampler agrees");
-        assertTrue(java.util.Arrays.stream(selected).distinct().count() > 1, "the rows are not all one token");
+    }
+
+    @Test
+    void aKeyedSelectionOfTheFinalRowRepeatsAndMatchesTheSameRowOfACopyOfAllRows() {
+        var gpu = new RowsGpu();
+        gpu.peak = 1.0f;
+        var logits = new HostLogits(gpu, 4);
+        var config = new GenerationConfig(1.0f, 0, 1.0f, 99L, false);
+        var sampler = new LogitsSampler(config, 4);
+        int positions = 64;
+        int[] expected = new int[positions];
+        logits.queueRows(1 << 20, 1);
+        logits.retired(true);
+        for (int position = 0; position < positions; position++)
+            expected[position] = sampler.selectRow(logits, 0, position);
+        assertTrue(Arrays.stream(expected).distinct().count() > 1, "the flat row samples several tokens");
 
         logits.queueFinalRow(1 << 20, 1);
         logits.retired(true);
-        var keyed = new LogitsSampler(config, 4);
-        for (long position = 100; position < 100 + rows; position++)
-            assertEquals(
-                    keyed.selectToken(logits, null, position),
-                    keyed.selectToken(logits, token -> true, position),
-                    "a keyed selection of a position repeats");
+        for (int position = 0; position < positions; position++) {
+            assertEquals(expected[position], sampler.selectToken(logits, null, position), "position " + position);
+            assertEquals(expected[position], sampler.selectToken(logits, token -> true, position));
+        }
     }
 
     @Test
     void selectRowsOfADeviceSelectingCopyAreTheDeviceChoices() {
-        var gpu = new RowsGpu(3, 4);
+        var gpu = new RowsGpu();
         gpu.selectable = true;
         var logits = new HostLogits(gpu, 4);
         logits.selectOnDevice(true);
@@ -257,11 +273,12 @@ class LogitsSamplerTest {
                 logits.selectedTokens(), new LogitsSampler(GenerationConfig.greedy(1L), 4).selectRows(logits, 0));
     }
 
-    /// Fills each copied row with the same flat logits; device selection, when enabled, picks token 2.
+    /// Fills copied row r with a peak of `peak` at token r % 4; device selection, when enabled, picks token 2.
     private static final class RowsGpu extends ExecutionFixtures.RecordingGpu {
         boolean selectable;
+        float peak = 20.0f;
 
-        RowsGpu(int rows, int vocabulary) {
+        RowsGpu() {
             this.nextAddress.set(1L << 40);
         }
 
@@ -278,9 +295,10 @@ class LogitsSamplerTest {
                     destination.set(ValueLayout.JAVA_LONG, offset, 0xFFFF_FFFFL - 2);
                 return;
             }
-            short[] flat = {bf16(0.1f), bf16(0.4f), bf16(0.2f), bf16(0.3f)};
-            for (long i = 0; i * Short.BYTES < byteSize; i++)
-                destination.set(ValueLayout.JAVA_SHORT, i * Short.BYTES, flat[(int) (i % 4)]);
+            for (long i = 0; i * Short.BYTES < byteSize; i++) {
+                long row = i / 4;
+                destination.set(ValueLayout.JAVA_SHORT, i * Short.BYTES, bf16(i % 4 == row % 4 ? this.peak : 0.0f));
+            }
         }
     }
 
