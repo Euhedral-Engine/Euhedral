@@ -58,6 +58,14 @@ public final class EngineMetrics implements MeterBinder {
                 .description("Weights held in pinned host memory and streamed to the device")
                 .baseUnit("bytes")
                 .register(registry);
+        Gauge.builder("euhedral.engine.pinned.pool.bytes", engine, InferenceEngine::pinnedPoolBytes)
+                .description("Released pinned staging buffers kept for reuse")
+                .baseUnit("bytes")
+                .register(registry);
+        io.micrometer.core.instrument.FunctionCounter.builder(
+                        "euhedral.engine.pinned.pool.overflows", engine, InferenceEngine::pinnedPoolOverflows)
+                .description("Released pinned staging buffers the pool had no room for")
+                .register(registry);
         if (engine.prefixCacheStats() == null) return;
         cacheCounter(registry, "euhedral.prefix.lookups", "Prefix cache lookups", PrefixCacheStats::lookups);
         cacheCounter(

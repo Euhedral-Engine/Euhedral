@@ -259,6 +259,8 @@ public final class InferenceEngine implements AutoCloseable {
     public synchronized GenerationSession createGenerationSession(GenerationConfig config, SessionOptions options) {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
         this.model.gpu().ensureHealthy();
+        // A caller's thread, not a worker: it may wait for the device while released pinned buffers are freed.
+        this.model.gpu().trimPinnedPool();
         var session = this.model.createSession(
                 Objects.requireNonNull(config, "config"),
                 Objects.requireNonNull(options, "options"),
@@ -384,6 +386,19 @@ public final class InferenceEngine implements AutoCloseable {
     public synchronized long hostBackedWeightBytes() {
         if (this.closing) throw new IllegalStateException("inference engine is closed");
         return this.model.hostBackedWeightBytes();
+    }
+
+    /// Bytes of released pinned host buffers the engine keeps for reuse (`euhedral.cuda.pinned-pool-bytes` at most),
+    /// outside the host budget of weights.
+    public synchronized long pinnedPoolBytes() {
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        return this.model.gpu().pinnedPoolBytes();
+    }
+
+    /// Released pinned host buffers the pool had no room for, freed later on a caller's thread.
+    public synchronized long pinnedPoolOverflows() {
+        if (this.closing) throw new IllegalStateException("inference engine is closed");
+        return this.model.gpu().pinnedPoolOverflows();
     }
 
     /// Device bytes this engine owns: model weights, open sessions' persistent state, and the reusable
