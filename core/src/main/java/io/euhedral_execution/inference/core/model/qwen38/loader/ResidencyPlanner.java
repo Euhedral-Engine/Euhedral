@@ -19,10 +19,18 @@ import java.util.Set;
 /// The device budget is the resident weights, the staging ring for host-backed projections, the KV pages
 /// of every sequence of `maxContextTokens`, a fixed reserve for the first sequence's GDN state, the
 /// execution workspaces, the shared scratch and the kernel modules loaded after the model.
+///
+/// The LM head (the one object too large for the staging slots) leaves the device last: it is mapped into host
+/// memory and read in place over the bus, once per pass whatever the sequence count, when everything else
+/// offloadable is offloaded and the plan still does not fit, or from the first offload with
+/// [#MAP_OUTPUT_HEAD]. The draft head stays resident: every draft of every sequence reads it.
 public final class ResidencyPlanner {
 
     /// Everything outside weights and KV that a running sequence needs on the device.
     static final long RESERVE_BYTES = 1280L << 20;
+
+    /// System property that maps the LM head with the first offloaded object instead of last.
+    public static final String MAP_OUTPUT_HEAD = "euhedral.residency.map-output-head";
 
     private ResidencyPlanner() {}
 
@@ -82,6 +90,27 @@ public final class ResidencyPlanner {
             long hostBytes,
             KvFormat kvFormat,
             int sequences) {
+        return plan(
+                artifact,
+                profile,
+                freeBytes,
+                maxContextTokens,
+                hostBytes,
+                kvFormat,
+                sequences,
+                Boolean.getBoolean(MAP_OUTPUT_HEAD));
+    }
+
+    /// As above; `mapOutputHeadEarly` maps the LM head with the first offloaded object rather than last.
+    public static Plan plan(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int sequences,
+            boolean mapOutputHeadEarly) {
         if (sequences < 1) throw new IllegalArgumentException("sequences must be at least 1");
         long extra = sequences == 1
                 ? 0
@@ -103,9 +132,18 @@ public final class ResidencyPlanner {
         // tensor, so each step re-evaluates the whole selection.
         long step = 64L << 20;
         for (long bytes = step; ; bytes += step) {
-            Plan candidate = deviceNeed(artifact, profile, HostWeightSelection.select(artifact, bytes));
+            Set<String> selection = HostWeightSelection.select(artifact, bytes);
+            Plan candidate =
+                    deviceNeed(artifact, profile, mapOutputHeadEarly ? withHead(artifact, selection) : selection);
             if (candidate.deviceBytes() + fixed <= freeBytes) return tiers(artifact, candidate, fixed, hostBytes, true);
-            if (bytes > all) return tiers(artifact, candidate, fixed, hostBytes, false);
+            if (bytes > all) {
+                // Everything else offloadable is offloaded: the LM head goes last.
+                Set<String> mapped = withHead(artifact, selection);
+                if (mapped.size() == selection.size() || mapOutputHeadEarly)
+                    return tiers(artifact, candidate, fixed, hostBytes, false);
+                Plan last = deviceNeed(artifact, profile, mapped);
+                return tiers(artifact, last, fixed, hostBytes, last.deviceBytes() + fixed <= freeBytes);
+            }
         }
     }
 
@@ -135,6 +173,14 @@ public final class ResidencyPlanner {
         return low;
     }
 
+    /// `selection` followed by the LM head, when the artifact has one.
+    private static Set<String> withHead(Artifact artifact, Set<String> selection) {
+        Set<String> result = new java.util.LinkedHashSet<>(selection);
+        for (TensorDescriptor tensor : artifact.tensors())
+            if (tensor.name().equals(HostWeightSelection.OUTPUT_HEAD)) result.add(tensor.name());
+        return result;
+    }
+
     private static long offloadedBytes(Artifact artifact, Plan plan) {
         long bytes = 0;
         for (TensorDescriptor tensor : artifact.tensors())
@@ -150,9 +196,9 @@ public final class ResidencyPlanner {
     }
 
     /// Splits `plan`'s offloaded objects (its `hostBacked`, in selection order) between host memory and the
-    /// artifact file. The embedding stays in host memory; then each object goes to host memory while the arena and
-    /// the window that the remaining objects would need fit in `hostBytes`, and from the first that does not, every
-    /// object goes to disk.
+    /// artifact file. The embedding and the LM head stay in host memory (read in place); then each object goes to
+    /// host memory while the arena and the window that the remaining objects would need fit in `hostBytes`, and
+    /// the first that does not, every object goes to disk.
     private static Plan tiers(Artifact artifact, Plan plan, long fixed, long hostBytes, boolean deviceFits) {
         java.util.Map<String, TensorDescriptor> tensors = new java.util.HashMap<>();
         for (TensorDescriptor tensor : artifact.tensors()) tensors.put(tensor.name(), tensor);
@@ -165,20 +211,24 @@ public final class ResidencyPlanner {
         long[] largestFrom = new long[order.size() + 1];
         for (int index = order.size() - 1; index >= 0; index--) {
             String name = order.get(index);
-            long size = name.equals(HostWeightSelection.EMBEDDING)
-                    ? 0
-                    : tensors.get(name).byteSize();
+            long size = HostWeightSelection.mapped(name) ? 0 : tensors.get(name).byteSize();
             largestFrom[index] = Math.max(largestFrom[index + 1], size);
         }
         Set<String> host = new java.util.LinkedHashSet<>();
         Set<String> disk = new java.util.LinkedHashSet<>();
+        // The LM head's bytes are in the arena whatever comes before it.
+        long head = plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD)
+                ? tensors.get(HostWeightSelection.OUTPUT_HEAD).byteSize()
+                : 0;
         long arena = 0;
         long largestDisk = 0;
         for (int index = 0; index < order.size(); index++) {
             String name = order.get(index);
             long size = tensors.get(name).byteSize();
-            boolean embedding = name.equals(HostWeightSelection.EMBEDDING);
-            if (disk.isEmpty() && (embedding || arena + size + windowBytes(largestFrom[index + 1]) <= hostBytes)) {
+            boolean mapped = HostWeightSelection.mapped(name);
+            long reserved = mapped ? 0 : head;
+            if (mapped
+                    || (disk.isEmpty() && arena + size + windowBytes(largestFrom[index + 1]) + reserved <= hostBytes)) {
                 host.add(name);
                 arena += size;
             } else {
@@ -216,7 +266,7 @@ public final class ResidencyPlanner {
             if (!CompactWeightLoader.uploads(tensor.name(), profile.speculation())) continue;
             if (DFlash2Inventory.MAPPED.contains(tensor.name())) continue;
             boolean hostBacked = host.contains(tensor.name());
-            if (hostBacked && tensor.name().equals(HostWeightSelection.EMBEDDING)) continue;
+            if (hostBacked && HostWeightSelection.mapped(tensor.name())) continue;
             if (hostBacked) largest = Math.max(largest, tensor.byteSize());
             else resident += tensor.byteSize();
         }

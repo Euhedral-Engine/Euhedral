@@ -50,4 +50,11 @@ class HostWeightSelectionTest {
             assertTrue(!everything.contains("text/output_head"));
         }
     }
+
+    @Test
+    void embeddingAndOutputHeadAreReadInPlace() {
+        assertTrue(HostWeightSelection.mapped("text/token_embedding"));
+        assertTrue(HostWeightSelection.mapped("text/output_head"));
+        assertTrue(!HostWeightSelection.mapped("text/draft_head"));
+    }
 }

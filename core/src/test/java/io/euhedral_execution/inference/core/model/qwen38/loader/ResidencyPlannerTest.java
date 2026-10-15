@@ -113,6 +113,54 @@ class ResidencyPlannerTest {
     }
 
     @Test
+    void theOutputHeadIsMappedOnlyWhenEverythingElseOffloadableIsNotEnough() {
+        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
+                + ResidencyPlanner.kvBytes(config(2), 4096)
+                + ResidencyPlanner.RESERVE_BYTES;
+        // Embedding and every projection leave 880 MiB net of the staging ring: 1000 MiB needs the head too.
+        var plan = ResidencyPlanner.plan(
+                artifact(), PROFILE, resident - 1000 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, false);
+        assertTrue(plan.fits());
+        assertTrue(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertFalse(plan.hostBacked().contains("text/draft_head"));
+        assertTrue(plan.diskBacked().isEmpty());
+        assertEquals(new java.util.ArrayList<>(plan.hostBacked()).getLast(), HostWeightSelection.OUTPUT_HEAD);
+        // The head is in the host arena and not in the staging ring.
+        assertEquals((400 + 600 + 8 * 110) * MIB, plan.hostArenaBytes());
+        assertTrue(plan.deviceBytes() <= resident - 1000 * MIB);
+        var tooLittle = ResidencyPlanner.plan(
+                artifact(), PROFILE, resident - 2000 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, false);
+        assertFalse(tooLittle.fits());
+    }
+
+    @Test
+    void theOutputHeadStaysInHostMemoryWhenTheWindowSendsEarlierObjectsToDisk() {
+        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
+                + ResidencyPlanner.kvBytes(config(2), 4096)
+                + ResidencyPlanner.RESERVE_BYTES;
+        var plan = ResidencyPlanner.plan(
+                artifact(), PROFILE, resident - 1000 * MIB, 4096, 1100 * MIB, KvFormat.NVFP4, 1, false);
+        assertTrue(plan.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertFalse(plan.diskBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        assertTrue(plan.hostBacked().contains(HostWeightSelection.EMBEDDING));
+    }
+
+    @Test
+    void theOutputHeadPropertyMapsItWithTheFirstOffload() {
+        long resident = (400 + 600 + 8 * 110 + 50 + 70) * MIB
+                + ResidencyPlanner.kvBytes(config(2), 4096)
+                + ResidencyPlanner.RESERVE_BYTES;
+        var early = ResidencyPlanner.plan(
+                artifact(), PROFILE, resident - 100 * MIB, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, true);
+        assertTrue(early.fits());
+        assertTrue(early.hostBacked().contains(HostWeightSelection.OUTPUT_HEAD));
+        // Plans that fit resident are unchanged.
+        var fits = ResidencyPlanner.plan(artifact(), PROFILE, 64L << 30, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1, true);
+        assertTrue(fits.hostBacked().isEmpty());
+        assertEquals(ResidencyPlanner.plan(artifact(), PROFILE, 64L << 30, 4096).deviceBytes(), fits.deviceBytes());
+    }
+
+    @Test
     void moreSequencesKeepFewerWeightsOnTheDevice() {
         long free = 3000L * MIB;
         var one = ResidencyPlanner.plan(artifact(), PROFILE, free, 4096, Long.MAX_VALUE, KvFormat.NVFP4, 1);

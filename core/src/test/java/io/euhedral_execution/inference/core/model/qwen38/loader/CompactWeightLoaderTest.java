@@ -386,6 +386,33 @@ class CompactWeightLoaderTest {
     }
 
     @Test
+    void aHostBackedOutputHeadIsMappedNotStaged() throws Exception {
+        Path file = directory.resolve("small.edrl");
+        smallFile(file);
+        TensorDescriptor head = new TensorDescriptor(
+                "text/output_head",
+                new long[] {64, 32},
+                TensorDataType.BF16,
+                WeightFormat.BF16,
+                WeightLayout.CONTIGUOUS_LE_V1,
+                256,
+                4096);
+        var gpu = new CountingGpuMemory();
+        Map<String, TensorHandle> handles = CompactWeightLoader.loadObjects(
+                file,
+                java.util.List.of(head),
+                gpu,
+                ArtifactProfile.Speculation.NONE,
+                Set.of("text/output_head"),
+                Set.of());
+        TensorHandle loaded = handles.get("text/output_head");
+        assertTrue(loaded.hostMapped());
+        assertFalse(loaded.hostBacked());
+        assertEquals(4096, gpu.hostBytes);
+        assertEquals(0, gpu.deviceBytes);
+    }
+
+    @Test
     void anObjectThatCannotBeStagedIsNeverDiskBacked() throws Exception {
         Path file = directory.resolve("small.edrl");
         Map<String, TensorDescriptor> descriptors = smallFile(file);
