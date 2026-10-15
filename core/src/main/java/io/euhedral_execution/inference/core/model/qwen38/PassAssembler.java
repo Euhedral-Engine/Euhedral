@@ -13,7 +13,8 @@ import java.util.function.ToIntFunction;
 /// Forms passes from the ready steps of concurrent generations. Confined to the workspace's owner: every event is
 /// applied by an owner frame, and the record never waits. Rule: no pass forms while one is in flight, nor while a
 /// member of the last retired pass has not reported (offered its next step or left); a pass then takes the pending
-/// offers in arrival order, up to `maxRows` rows and `maxParts` offers. `Passes#run` returns how many retirements
+/// offers in arrival order, up to `maxRows` rows and `maxParts` offers; a step over `maxRows` forms a pass of its own.
+/// `Passes#run` returns how many retirements
 /// the pass will report (one per quantum it admitted).
 ///
 /// @param <S> the sequence a step belongs to
@@ -62,10 +63,12 @@ public final class PassAssembler<S, O> {
     /// Queues a ready step, which also counts as its sequence's report.
     public void offer(O offer) {
         int rows = rowsOf.applyAsInt(offer);
-        if (rows < 1 || rows > maxRows) {
-            throw new IllegalArgumentException("a step of " + rows + " rows does not fit a pass of " + maxRows);
-        }
         S sequence = sequenceOf.apply(offer);
+        if (rows < 1) {
+            // The refused offer is still the sequence's report: it must not hold back the others.
+            if (awaiting.remove(sequence)) tryRun();
+            throw new IllegalArgumentException("a step of " + rows + " rows");
+        }
         if (!pendingSequences.add(sequence)) {
             throw new IllegalStateException("a sequence already has a pending step");
         }
@@ -150,7 +153,7 @@ public final class PassAssembler<S, O> {
                 int rows = 0;
                 while (!pending.isEmpty()
                         && pass.size() < maxParts
-                        && rows + rowsOf.applyAsInt(pending.peek()) <= maxRows) {
+                        && (pass.isEmpty() || rows + rowsOf.applyAsInt(pending.peek()) <= maxRows)) {
                     O next = pending.poll();
                     rows += rowsOf.applyAsInt(next);
                     pendingSequences.remove(sequenceOf.apply(next));
@@ -165,7 +168,10 @@ public final class PassAssembler<S, O> {
                 if (retirements < 0) {
                     throw new IllegalStateException("a pass reported " + retirements + " retirements");
                 }
-                if (retirements > 0) {
+                if (retirements == 0) {
+                    // Nothing retires to wake the offers behind this pass: keep forming.
+                    again = true;
+                } else {
                     inFlight += retirements;
                     for (O o : pass) {
                         flight.add(sequenceOf.apply(o));

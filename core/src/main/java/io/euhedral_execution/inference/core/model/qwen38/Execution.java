@@ -26,6 +26,9 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
@@ -78,6 +81,8 @@ public final class Execution implements AutoCloseable {
     private boolean closed;
     /// Forms passes from the ready steps of concurrent generations; confined to the workspace's owner.
     private final PassAssembler<Sequence, Offer> assembler;
+    /// The offers waiting in the assembler; written on the owner, read by [#close] to know whether to wait.
+    private final AtomicInteger pendingOffers = new AtomicInteger();
 
     /// A ready step and the continuation that takes its outcome.
     private record Offer(Quantum.Part part, AbstractFrame select) {}
@@ -135,9 +140,9 @@ public final class Execution implements AutoCloseable {
                 new EuhedralInferenceRuntime.Lanes(compute, transfers, captureGraphs),
                 SharedWorkspace.bufferCount(this.plan));
         this.prompts = new PromptShapes(this.runtime);
-        int passRows = Math.min(maxRows, Integer.getInteger("euhedral.batch.max-rows", maxRows));
+        int passRows = Math.min(maxRows, positiveProperty("euhedral.batch.max-rows", maxRows));
         int passParts =
-                this.plan.draftsWithDFlash2() ? 1 : Integer.getInteger("euhedral.batch.max-parts", Integer.MAX_VALUE);
+                this.plan.draftsWithDFlash2() ? 1 : positiveProperty("euhedral.batch.max-parts", Integer.MAX_VALUE);
         this.assembler =
                 new PassAssembler<>(o -> o.part().sequence(), o -> o.part().rows(), passRows, passParts, this::runPass);
         if (this.plan.window() == null) {
@@ -157,6 +162,18 @@ public final class Execution implements AutoCloseable {
         this.asyncReads = reads;
         if (reads != null) this.lake.attach(reads.getDelegate());
         this.lake.attach(this.diskReader.getDelegate());
+    }
+
+    /// The integer property `name` when it is at least 1; otherwise (unset, malformed or smaller) `fallback`, with a
+    /// warning for a value that was set.
+    private static int positiveProperty(String name, int fallback) {
+        Integer value = Integer.getInteger(name);
+        if (value == null) return fallback;
+        if (value < 1) {
+            LOG.warn("{}={} is ignored: a pass needs at least one row and one part", name, value);
+            return fallback;
+        }
+        return value;
     }
 
     /// The machine's asynchronous reads, or null: the disk reader then reads positionally on its poll.
@@ -337,8 +354,18 @@ public final class Execution implements AutoCloseable {
         Objects.requireNonNull(part, "part");
         Objects.requireNonNull(select, "select");
         Offer offer = new Offer(part, select);
-        if (this.plan.draftsWithDFlash2()) admitAlone(offer, false);
-        else this.assembler.offer(offer);
+        if (this.plan.draftsWithDFlash2()) {
+            admitAlone(offer, false);
+            return;
+        }
+        try {
+            this.pendingOffers.incrementAndGet();
+            this.assembler.offer(offer);
+        } catch (RuntimeException refused) {
+            this.pendingOffers.decrementAndGet();
+            // The assembler did not take the step (a duplicate for its sequence): it concludes failed.
+            refuse(List.of(offer), refused);
+        }
     }
 
     /// The generation of `sequence` ended: it no longer holds back a pass. Any thread.
@@ -351,8 +378,10 @@ public final class Execution implements AutoCloseable {
     /// thread.
     public void withdrawCancelled() {
         this.runtime.publishOnOwner(() -> {
-            for (Offer offer : this.assembler.withdraw(o -> o.part().sequence().cancellationRequested()))
-                admitAlone(offer, false);
+            List<Offer> cancelled =
+                    this.assembler.withdraw(o -> o.part().sequence().cancellationRequested());
+            this.pendingOffers.addAndGet(-cancelled.size());
+            for (Offer offer : cancelled) admitAlone(offer, false);
         });
     }
 
@@ -364,6 +393,7 @@ public final class Execution implements AutoCloseable {
     /// Runs one formed pass on the owner and returns how many quanta it admitted (each owes one retirement). Total:
     /// an offer that cannot be admitted concludes through its own select, failed.
     private int runPass(List<Offer> pass) {
+        this.pendingOffers.addAndGet(-pass.size());
         List<Offer> unconcluded = new ArrayList<>(pass);
         try {
             if (pass.size() == 1) {
@@ -453,29 +483,47 @@ public final class Execution implements AutoCloseable {
     /// Concludes each of `offers` through its own select, failed with `cause`, as a refusal of [#admit] is: a
     /// stand-in quantum that never started carries the failure. Owes no retirement.
     private void refuse(List<Offer> offers, Throwable cause) {
+        refuse(offers, cause, false);
+    }
+
+    /// As above; with `inline` each select runs on this thread, as a worker would run it, instead of being
+    /// published: at close the lake may complete before it carries a frame that belongs to no admitted unit.
+    private void refuse(List<Offer> offers, Throwable cause, boolean inline) {
         for (Offer offer : offers) {
             try {
                 Quantum standIn;
                 try {
                     standIn = Quantum.alone(this.plan, offer.part());
                 } catch (RuntimeException invalid) {
+                    // Built from the part's sequence alone: no host logits, no range check on the part.
                     standIn = new Quantum(
-                            this.plan,
-                            offer.part().sequence(),
-                            Quantum.ExecutionKind.DECODE,
-                            offer.part().startPosition(),
-                            offer.part().tokenIds());
+                            this.plan, offer.part().sequence(), Quantum.ExecutionKind.DECODE, 0, new int[] {0});
                 }
-                standIn.continueWith(
-                        this.lake,
-                        new PassRetirement(
-                                this, this.lake, List.of(offer.part().sequence()), List.of(offer.select()), false));
                 standIn.fail(cause);
-                standIn.concludeUnstarted();
+                // Retired here, not through a continuation: the select is published from this frame, one hop.
+                standIn.retire(null);
+                if (offer.select() instanceof AbstractQuantum.Continuation told) told.concluded(standIn);
+                dispatch(offer.select(), inline);
             } catch (RuntimeException | Error lost) {
-                LOG.error("a refused step could not be concluded", lost);
+                LOG.error("a refused step could not be concluded; its select runs without a quantum", lost);
+                // Never lose a select: it fails its generation when it finds no concluded step.
+                dispatch(offer.select(), inline);
             }
         }
+    }
+
+    private void dispatch(AbstractFrame select, boolean inline) {
+        if (!inline) {
+            this.lake.publishOrRun(select);
+            return;
+        }
+        try {
+            select.execute();
+        } catch (Throwable failed) {
+            select.doFinallyWithError(failed);
+            return;
+        }
+        select.doFinally();
     }
 
     /// Admits `context` ahead of a later quantum of its sequence whose continuation reads both: no frame follows
@@ -602,6 +650,30 @@ public final class Execution implements AutoCloseable {
         return this.lake.isAttached();
     }
 
+    /// Concludes the offers still waiting for a pass, failed, so no generation waits on them for ever; skipped (and
+    /// not waited for) when none waits. A lake that no longer takes frames runs the work inline off the owner
+    /// ([EuhedralInferenceRuntime#publishOnOwner]), which is safe because nothing else offers any more.
+    private void concludePending() {
+        if (this.pendingOffers.get() == 0) return;
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        try {
+            this.runtime.publishOnOwner(() -> {
+                try {
+                    List<Offer> waiting = this.assembler.withdraw(o -> true);
+                    this.pendingOffers.addAndGet(-waiting.size());
+                    refuse(waiting, new IllegalStateException("the execution is closing"), true);
+                } finally {
+                    done.complete(null);
+                }
+            });
+            done.get(RELEASE_BOUND_NANOS, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException | RuntimeException unfinished) {
+            LOG.warn("the offers waiting for a pass were not concluded at close", unfinished);
+        }
+    }
+
     /// Stops the host work, waits for every accepted quantum to retire and releases the graphs and lanes, then
     /// completes the lake and waits for it: the order the dense runtime closed in.
     @Override
@@ -611,6 +683,7 @@ public final class Execution implements AutoCloseable {
             this.closed = true;
         }
         RuntimeException failure = null;
+        concludePending();
         try {
             this.hostTasks.close();
         } catch (RuntimeException completionFailure) {
