@@ -88,6 +88,11 @@ public final class Safetensors implements AutoCloseable {
         return tensor;
     }
 
+    /// The names of all tensors.
+    public java.util.Set<String> names() {
+        return java.util.Collections.unmodifiableSet(tensors.keySet());
+    }
+
     public boolean contains(String name) {
         return tensors.containsKey(name);
     }

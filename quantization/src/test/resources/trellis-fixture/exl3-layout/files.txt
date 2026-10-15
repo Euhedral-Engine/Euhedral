@@ -1,0 +1,20 @@
+total 13243112
+drwxrwxr-x 2 brandon brandon       4096 Oct 14 19:40 .
+drwxrwxr-x 3 brandon brandon       4096 Oct 14 18:29 ..
+-rwxr-xr-x 1 brandon brandon      13306 Oct 14 19:40 LICENSE
+-rwxr-xr-x 1 brandon brandon      11544 Oct 14 19:40 LICENSE-APACHE-2.0
+-rwxr-xr-x 1 brandon brandon       1133 Oct 14 19:40 NOTICE
+-rwxr-xr-x 1 brandon brandon      23707 Oct 14 19:40 README.md
+-rwxr-xr-x 1 brandon brandon       8952 Oct 14 19:40 chat_template.jinja
+-rw-rw-r-- 1 brandon brandon       4646 Oct 14 19:40 config.json
+-rwxr-xr-x 1 brandon brandon        202 Oct 14 19:40 generation_config.json
+-rwxr-xr-x 1 brandon brandon    3353259 Oct 14 19:40 merges.txt
+-rw-rw-r-- 1 brandon brandon 8535982073 Oct 14 19:40 model-00001-of-00002.safetensors
+-rw-rw-r-- 1 brandon brandon 5001014282 Oct 14 19:40 model-00002-of-00002.safetensors
+-rw-rw-r-- 1 brandon brandon     295441 Oct 14 19:40 model.safetensors.index.json
+-rwxr-xr-x 1 brandon brandon        390 Oct 14 19:40 preprocessor_config.json
+-rw-rw-r-- 1 brandon brandon     629015 Oct 14 19:40 quantization_config.json
+-rwxr-xr-x 1 brandon brandon   12809320 Oct 14 19:40 tokenizer.json
+-rwxr-xr-x 1 brandon brandon      17928 Oct 14 19:40 tokenizer_config.json
+-rwxr-xr-x 1 brandon brandon        385 Oct 14 19:40 video_preprocessor_config.json
+-rwxr-xr-x 1 brandon brandon    6722759 Oct 14 19:40 vocab.json
