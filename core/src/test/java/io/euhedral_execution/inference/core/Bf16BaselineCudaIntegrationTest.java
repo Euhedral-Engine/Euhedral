@@ -44,7 +44,7 @@ class Bf16BaselineCudaIntegrationTest {
                     + " through an evaporator, a compressor, a condenser and an expansion valve. ";
 
     @Test
-    @Timeout(value = 7200, unit = TimeUnit.SECONDS)
+    @Timeout(value = 45, unit = TimeUnit.MINUTES, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void decodeAndPrefillCostsOfTheUnquantizedModel() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
@@ -53,14 +53,15 @@ class Bf16BaselineCudaIntegrationTest {
         Path artifact = Path.of(artifactProperty);
         Path tokenizer = Path.of(System.getProperty("euhedral.qwen.tokenizer-dir"));
         Path lib = Path.of(library);
-        // The pinned host budget decides how much of the model is read from disk: 24 GiB leaves about half of it there.
-        System.setProperty(
-                "euhedral.residency.host-budget-bytes",
-                Long.toString(Long.getLong("euhedral.baseline.host-budget-gib", 24L) << 30));
+        // A fixed test parameter: 24 GiB of pinned host memory leaves 19550 MiB of the weights to be read from disk.
+        String budget = "euhedral.residency.host-budget-bytes";
+        String previous = System.getProperty(budget);
+        System.setProperty(budget, Long.toString(24L << 30));
         try {
             run(artifact, tokenizer, lib);
         } finally {
-            System.clearProperty("euhedral.residency.host-budget-bytes");
+            if (previous == null) System.clearProperty(budget);
+            else System.setProperty(budget, previous);
         }
     }
 
@@ -70,6 +71,8 @@ class Bf16BaselineCudaIntegrationTest {
         try (InferenceEngine engine = InferenceEngine.load(config(artifact, tokenizer, lib, 0L))) {
             List<Integer> plain = decode(engine, false);
             List<Integer> speculative = decode(engine, true);
+            assertEquals(NEW_TOKENS, plain.size(), "speculation off generates the requested tokens");
+            assertEquals(NEW_TOKENS, speculative.size(), "speculation on generates the requested tokens");
             assertEquals(plain, speculative, "speculation must not change greedy output");
             prefill(engine, "prefix cache off", false);
         }
@@ -133,7 +136,7 @@ class Bf16BaselineCudaIntegrationTest {
             try (GenerationSession session =
                     engine.createGenerationSession(GenerationConfig.greedy(91L), new SessionOptions(speculation))) {
                 tokens = session.generateAsync(prompt, NEW_TOKENS, text -> {}, null, timing)
-                        .get(60, TimeUnit.MINUTES);
+                        .get(15, TimeUnit.MINUTES);
             }
             double seconds = (System.nanoTime() - start) / 1e9;
             System.out.printf(
@@ -187,7 +190,7 @@ class Bf16BaselineCudaIntegrationTest {
                     long startNanos, long executedNanos, long selectedNanos, boolean sampled, int selectedTokenId) {}
         };
         long start = System.nanoTime();
-        session.generateAsync(ids, 1, text -> {}, null, timing).get(30, TimeUnit.MINUTES);
+        session.generateAsync(ids, 1, text -> {}, null, timing).get(3, TimeUnit.MINUTES);
         double wall = (System.nanoTime() - start) / 1e9;
         PassStatistics after = execution.statistics(Quantum.ExecutionKind.PREFILL);
         long quanta = after.quanta() - before.quanta();
