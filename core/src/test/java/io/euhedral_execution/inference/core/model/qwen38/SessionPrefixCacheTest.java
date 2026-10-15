@@ -35,7 +35,7 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 class SessionPrefixCacheTest {
 
     private static final Path TOKENIZER_DIRECTORY =
-            Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+            Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
     private static final AtomicLong LATTICE_ID = new AtomicLong();
     private static QwenTokenizer tokenizer;
 

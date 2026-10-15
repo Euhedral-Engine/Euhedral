@@ -4,7 +4,7 @@ implementation over the weights of the NVFP4 EDRL v3 artifact. See docs/FLASH_NE
 
   PYTHONPATH=tools ~/.cache/flash-next-ref-venv/bin/python tools/flash_next_reference.py list-cases
   ... check-artifact
-  ... fixtures --out /home/brandon/fixtures/flash-next --case short
+  ... fixtures --out FIXTURES_DIR --case short
   ... generate --prompt-ids 785 6722 --steps 4
 """
 import sys

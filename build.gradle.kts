@@ -29,6 +29,13 @@ subprojects {
         the<JavaPluginExtension>().toolchain {
             languageVersion = JavaLanguageVersion.of(25)
         }
+        // Machine-specific inputs (artifacts, tokenizer and checkpoint directories, fixtures) come only from -P or
+        // ~/.gradle/gradle.properties: every `euhedral.*` Gradle property reaches every test JVM, and tests that need
+        // an unset one skip.
+        tasks.withType<Test>().configureEach {
+            rootProject.properties.filterKeys { it.startsWith("euhedral.") }
+                .forEach { (name, value) -> systemProperty(name, value.toString()) }
+        }
         tasks.named<Test>("test") {
             // Every *IntegrationTest needs a GPU (and usually an artifact); cudaIntegrationTest runs them.
             exclude("**/*IntegrationTest.class")
@@ -72,17 +79,9 @@ subprojects {
             systemProperty(
                     "euhedral.cuda.library",
                     nativeBuildDirectory.get().dir(hostProductId).file("lib/$hostLibraryFilename").asFile.absolutePath)
-            systemProperty(
-                    "euhedral.qwen.artifact",
-                    providers.gradleProperty("euhedral.qwen.artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl")
-                            .get())
+            providers.gradleProperty("euhedral.qwen.artifact").orNull?.let { systemProperty("euhedral.qwen.artifact", it) }
             // Optional NVFP4 artifact (tools/convert_checkpoint.py --quantization nvfp4).
-            systemProperty(
-                    "euhedral.qwen.nvfp4-artifact",
-                    providers.gradleProperty("euhedral.qwen.nvfp4-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4.edrl")
-                            .get())
+            providers.gradleProperty("euhedral.qwen.nvfp4-artifact").orNull?.let { systemProperty("euhedral.qwen.nvfp4-artifact", it) }
             // Optional unquantized artifact (tools/convert_checkpoint.py --quantization bf16), on local disk.
             providers.gradleProperty("euhedral.qwen.bf16-artifact").orNull?.let {
                 systemProperty("euhedral.qwen.bf16-artifact", it)
@@ -95,32 +94,16 @@ subprojects {
                 systemProperty("euhedral.test.worker-cpus", it)
             }
             // Optional Qwen3.8-Flash-Next artifact (qwen4_exp).
-            systemProperty(
-                    "euhedral.qwen4.artifact",
-                    providers.gradleProperty("euhedral.qwen4.artifact")
-                            .orElse("/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl")
-                            .get())
+            providers.gradleProperty("euhedral.qwen4.artifact").orNull?.let { systemProperty("euhedral.qwen4.artifact", it) }
             // Optional DFlash2 artifact (tools/convert_checkpoint.py --extend ... --dflash2 ...).
-            systemProperty(
-                    "euhedral.qwen.dflash2-artifact",
-                    providers.gradleProperty("euhedral.qwen.dflash2-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed_dflash2_bf16.edrl")
-                            .get())
+            providers.gradleProperty("euhedral.qwen.dflash2-artifact").orNull?.let { systemProperty("euhedral.qwen.dflash2-artifact", it) }
             // Optional DFlash2 reference fixtures (tools/dflash2_reference.py) and the fixtures the engine writes.
             for (name in listOf("fixtures", "dump", "report", "verified", "prompt-tokens"))
                 providers.gradleProperty("euhedral.dflash2.$name").orNull?.let { systemProperty("euhedral.dflash2.$name", it) }
             // Optional compressed Q3 artifact (tools/convert_checkpoint.py --quantization q3 --compressed).
-            systemProperty(
-                    "euhedral.qwen.q3-compressed-artifact",
-                    providers.gradleProperty("euhedral.qwen.q3-compressed-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3_compressed.edrl")
-                            .get())
+            providers.gradleProperty("euhedral.qwen.q3-compressed-artifact").orNull?.let { systemProperty("euhedral.qwen.q3-compressed-artifact", it) }
             // Optional compressed NVFP4 artifact; the token-identity gate covers it.
-            systemProperty(
-                    "euhedral.qwen.nvfp4-compressed-artifact",
-                    providers.gradleProperty("euhedral.qwen.nvfp4-compressed-artifact")
-                            .orElse("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl")
-                            .get())
+            providers.gradleProperty("euhedral.qwen.nvfp4-compressed-artifact").orNull?.let { systemProperty("euhedral.qwen.nvfp4-compressed-artifact", it) }
             // Token-identity gate: `-Peuhedral.identity.record=true` rewrites the goldens instead of comparing.
             providers.gradleProperty("euhedral.identity.record").orNull?.let { systemProperty("euhedral.identity.record", it) }
             providers.gradleProperty("euhedral.identity.artifacts").orNull?.let { systemProperty("euhedral.identity.artifacts", it) }

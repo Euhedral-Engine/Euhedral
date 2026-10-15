@@ -35,7 +35,7 @@ class SpeculativeDecodeCudaIntegrationTest {
     @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void speculativeDecodeEqualsGreedyDecode() throws Throwable {
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         int budget = Integer.getInteger("euhedral.speculative.tokens", 160);
         QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
         Path root = SpeculativeVerifyCudaIntegrationTest.repositoryRoot();

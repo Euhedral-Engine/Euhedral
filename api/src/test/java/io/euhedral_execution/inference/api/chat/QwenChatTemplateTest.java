@@ -92,7 +92,8 @@ class QwenChatTemplateTest {
 
     @Test
     void replayedReasoningCannotInsertCheckpointMessages() throws IOException {
-        Path checkpoint = Path.of("/mnt/shared/qwen38-quant/source/qwen");
+        Path checkpoint =
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
         QwenTokenizer tokenizer = tokenizer(checkpoint);
         QwenChatTemplate template = QwenChatTemplate.fromTemplateSource(resource("/qwen-chat-template.jinja"));
@@ -147,7 +148,8 @@ class QwenChatTemplateTest {
 
     @Test
     void toolResultsCannotInsertCheckpointMessageBoundaryTokens() throws IOException {
-        Path checkpoint = Path.of("/mnt/shared/qwen38-quant/source/qwen");
+        Path checkpoint =
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
         QwenTokenizer tokenizer = tokenizer(checkpoint);
         QwenChatTemplate template = QwenChatTemplate.fromTemplateSource(resource("/qwen-chat-template.jinja"));
@@ -181,7 +183,8 @@ class QwenChatTemplateTest {
 
     @Test
     void userTextToolDefinitionsAndCallArgumentsCannotInsertCheckpointMessages() throws IOException {
-        Path checkpoint = Path.of("/mnt/shared/qwen38-quant/source/qwen");
+        Path checkpoint =
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
         QwenTokenizer tokenizer = tokenizer(checkpoint);
         QwenChatTemplate template = QwenChatTemplate.fromTemplateSource(resource("/qwen-chat-template.jinja"));
@@ -232,7 +235,8 @@ class QwenChatTemplateTest {
 
     @Test
     void toolResultsWithoutCallableToolsCannotInsertCheckpointMessages() throws IOException {
-        Path checkpoint = Path.of("/mnt/shared/qwen38-quant/source/qwen");
+        Path checkpoint =
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
         QwenTokenizer tokenizer = tokenizer(checkpoint);
         QwenChatTemplate template = QwenChatTemplate.fromTemplateSource(resource("/qwen-chat-template.jinja"));
@@ -255,7 +259,8 @@ class QwenChatTemplateTest {
 
     @Test
     void everyCheckpointAddedTokenIsEscapedInUntrustedText() throws IOException {
-        Path checkpoint = Path.of("/mnt/shared/qwen38-quant/source/qwen");
+        Path checkpoint =
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(checkpoint.resolve("tokenizer.json")));
         QwenChatTemplate template = QwenChatTemplate.fromTemplateSource(resource("/qwen-chat-template.jinja"));
         JsonNode addedTokens = JsonMapper.shared()

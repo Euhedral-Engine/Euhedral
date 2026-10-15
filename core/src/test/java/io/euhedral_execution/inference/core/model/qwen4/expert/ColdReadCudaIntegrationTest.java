@@ -59,8 +59,7 @@ class ColdReadCudaIntegrationTest {
     @Test
     void coldReadsAndPreloadByConcurrency() throws Throwable {
         assumeTrue(System.getenv("EUHEDRAL_QWEN4_BENCH_COLD") != null, "set EUHEDRAL_QWEN4_BENCH_COLD=1");
-        Path path = Path.of(System.getProperty(
-                "euhedral.qwen4.artifact", "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"));
+        Path path = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
         assumeTrue(Files.isRegularFile(path), "no artifact");
         Artifact artifact = ArtifactReader.read(path);
         ExpertBank[] banks = artifact.banks();

@@ -12,7 +12,7 @@ set -euo pipefail
 name=$1 artifact=$2 template=$3 reference=$4 results=$5 keep=${6:-}
 work=${WORK:-/tmp}
 python=${PYTHON:-python3}
-perplexity=${LLAMA_PERPLEXITY:-/mnt/shared/qwen38-quant/quality/bin/llama-gpu llama-perplexity}
+perplexity=${LLAMA_PERPLEXITY:?set LLAMA_PERPLEXITY to the llama-perplexity command}
 gguf=$work/$name.gguf
 trap 'rm -f "$gguf"' EXIT
 "$python" tools/holdout/dequantize_gguf.py "$artifact" "$template" "$gguf" ${keep:+--keep "$keep"} > "$work/$name.dequantize.log"

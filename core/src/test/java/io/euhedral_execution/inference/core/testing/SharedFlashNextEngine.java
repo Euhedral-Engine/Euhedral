@@ -48,11 +48,10 @@ public final class SharedFlashNextEngine {
     }
 
     private static InferenceConfig config(int context) {
-        Path artifact = Path.of(System.getProperty(
-                "euhedral.qwen4.artifact", "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"));
+        Path artifact = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
         assumeTrue(Files.isRegularFile(artifact), "no Flash-Next artifact at " + artifact);
         Path tokenizers =
-                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
+                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(tokenizers.resolve("tokenizer.json")), "no tokenizer at " + tokenizers);
         BitSet cpus = new BitSet();
         cpus.set(0);

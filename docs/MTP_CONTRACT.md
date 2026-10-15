@@ -2,9 +2,9 @@
 
 This is the contract written before implementation. Sources:
 
-- **Checkpoint:** `/mnt/shared/qwen38-quant/source/qwen`: `config.json` and the safetensors index.
+- **Checkpoint:** the Qwen3.8 checkpoint: `config.json` and the safetensors index.
 - **This repository's converter:** `tools/convert_checkpoint.py` (`tools/euhedral_artifacts/inventory.py` lists the objects).
-- **llama.cpp at 67a17c17c** (`/mnt/shared/qwen38-quant/llama.cpp`): `src/models/qwen35.cpp`,
+- **llama.cpp at 67a17c17c**: `src/models/qwen35.cpp`,
   `common/speculative.cpp`, `conversion/qwen.py` and `src/llama-memory-recurrent.cpp`. File:line
   references below are to this tree.
 - **ninfer** (`~/.hermes/worktrees/ninfer-upstream`), an independent implementation:

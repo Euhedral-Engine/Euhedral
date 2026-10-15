@@ -96,8 +96,7 @@ class ExpertFixtureCudaIntegrationTest {
     void layerZeroExpertsMatchTheUpstreamFixtures() throws IOException {
         Path directory = fixtures();
         assumeTrue(ReferenceFixtures.exists(directory), "no fixtures at " + directory);
-        Path artifactPath = Path.of(System.getProperty(
-                "euhedral.qwen4.artifact", "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"));
+        Path artifactPath = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
         assumeTrue(Files.isRegularFile(artifactPath), "no Flash-Next artifact at " + artifactPath);
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null, "euhedral.cuda.library is not set");

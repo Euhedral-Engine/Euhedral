@@ -88,10 +88,10 @@ table entry.
 ## Converter
 
 ```bash
-python3 tools/convert_checkpoint.py --model /mnt/shared/qwen38-quant/source/swift-1.5 --quantization nvfp4 --compressed \
-    --draft-ids-from /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl \
-    --imatrix /mnt/shared/qwen38-quant/imatrix/imatrix-swift15-v1mix.gguf \
-    --out /mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_nvfp4_compressed.edrl
+python3 tools/convert_checkpoint.py --model CHECKPOINT_DIR --quantization nvfp4 --compressed \
+    --draft-ids-from Q3_ARTIFACT.edrl \
+    --imatrix IMATRIX.gguf \
+    --out OUT.edrl
 ```
 
 The shipped artifact is converted from Swift-1.5 with its own importance matrix (see `tools/README.md`); for Qwen3.8-27B pass

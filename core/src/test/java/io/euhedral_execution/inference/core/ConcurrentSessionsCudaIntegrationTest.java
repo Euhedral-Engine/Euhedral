@@ -29,10 +29,9 @@ class ConcurrentSessionsCudaIntegrationTest {
     void twoFlashNextSessionsAtOnceGenerateWhatEachGeneratesAlone() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
-        Path artifact = Path.of(System.getProperty(
-                "euhedral.qwen4.artifact", "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"));
+        Path artifact = Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
         Path tokenizer =
-                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "/mnt/shared/qwen38-flash-next/nvfp4"));
+                Path.of(System.getProperty("euhedral.qwen4.tokenizer-dir", "unset-euhedral.qwen4.tokenizer-dir"));
         assumeTrue(Files.isRegularFile(artifact), "no artifact " + artifact);
         assumeTrue(Files.isRegularFile(tokenizer.resolve("tokenizer.json")), "no tokenizer in " + tokenizer);
         var config = new InferenceConfig(

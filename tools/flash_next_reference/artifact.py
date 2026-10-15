@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import os
 from pathlib import Path
 import struct
 import zlib
@@ -15,9 +16,12 @@ from euhedral_artifacts.nvfp4 import nvfp4_offsets
 
 from .nvfp4 import PackedNvfp4, expand_nvfp4
 
-DEFAULT_ARTIFACT = Path("/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl")
-DEFAULT_HF_CONFIG = Path("/mnt/shared/qwen38-flash-next/nvfp4/config.json")
-DEFAULT_TOKENIZER = Path("/mnt/shared/qwen38-flash-next/nvfp4/tokenizer.json")
+# Machine-specific locations come from the environment: EUHEDRAL_QWEN4_ARTIFACT (the converted .edrl) and
+# EUHEDRAL_QWEN4_TOKENIZER_DIR (the checkpoint directory with config.json and tokenizer.json).
+DEFAULT_ARTIFACT = Path(os.environ.get("EUHEDRAL_QWEN4_ARTIFACT", "unset-EUHEDRAL_QWEN4_ARTIFACT"))
+_CHECKPOINT = Path(os.environ.get("EUHEDRAL_QWEN4_TOKENIZER_DIR", "unset-EUHEDRAL_QWEN4_TOKENIZER_DIR"))
+DEFAULT_HF_CONFIG = _CHECKPOINT / "config.json"
+DEFAULT_TOKENIZER = _CHECKPOINT / "tokenizer.json"
 FORMAT_BF16, FORMAT_NVFP4 = 0, 7
 LAYOUT_ROW_SPLIT, LAYOUT_NGRAM = 1, 4
 NGRAM_ROW_VALUES = 160

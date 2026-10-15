@@ -19,8 +19,7 @@ import org.junit.jupiter.api.Test;
 class RealArtifactTest {
 
     static Path artifactPath() {
-        return Path.of(System.getProperty(
-                "euhedral.qwen4.artifact", "/home/brandon/models/qwen3_8_flash_next/qwen3_8_flash_next_nvfp4.edrl"));
+        return Path.of(System.getProperty("euhedral.qwen4.artifact", "unset-euhedral.qwen4.artifact"));
     }
 
     @Test

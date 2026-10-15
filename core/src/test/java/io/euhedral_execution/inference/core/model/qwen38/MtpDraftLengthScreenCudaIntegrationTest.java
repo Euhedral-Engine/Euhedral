@@ -48,7 +48,7 @@ class MtpDraftLengthScreenCudaIntegrationTest {
         for (String arm : System.getProperty("euhedral.mtp.arms", "4,3-7@-0.5").split(","))
             arms.add(parse(arm.strip()));
         QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
         var mapper = new ObjectMapper();
         List<JsonNode> entries = new ArrayList<>();
         for (String line : Files.readAllLines(prompts)) if (!line.isBlank()) entries.add(mapper.readTree(line));

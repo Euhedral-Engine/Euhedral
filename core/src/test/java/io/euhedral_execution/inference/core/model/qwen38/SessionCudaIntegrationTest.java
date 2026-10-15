@@ -37,7 +37,7 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 @ModelGroup.CompactQ3
 class SessionCudaIntegrationTest {
 
-    private static final Path DEFAULT_TOKENIZER = Path.of("/mnt/shared/qwen38-quant/source/qwen");
+    private static final Path DEFAULT_TOKENIZER = Path.of("unset-euhedral.qwen.tokenizer-dir");
     private static final AtomicLong LATTICE_ID = new AtomicLong();
 
     @Test

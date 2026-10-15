@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 
 class PromptMaterialTest {
     private static final Path TOKENIZER =
-            Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+            Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
 
     /// One token per word plus one per trailing punctuation mark.
     private static int count(String text) {

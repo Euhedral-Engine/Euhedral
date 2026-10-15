@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
 class PromptTokenizationTest {
 
     private static final Path TOKENIZER_DIRECTORY =
-            Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+            Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
 
     private static QwenTokenizer tokenizer;
     private static ExecutorService workers;

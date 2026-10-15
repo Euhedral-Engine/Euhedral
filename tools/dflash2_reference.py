@@ -212,8 +212,8 @@ def select_with_scores(selector, hidden, logits, anchor_ids, recorder: Recorder)
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--draft", type=Path, default=Path("/mnt/shared/Qwen3.8-27B-DFlash2"))
-    parser.add_argument("--target", type=Path, default=Path("/mnt/shared/qwen38-quant/source/qwen"))
+    parser.add_argument("--draft", type=Path, required=True)
+    parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--dflash-src", type=Path, default=Path.home() / "src/third_party/dflash")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--inputs", type=Path)

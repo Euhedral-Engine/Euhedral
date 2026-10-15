@@ -22,7 +22,8 @@ import org.junit.jupiter.api.io.TempDir;
 /// uncalibrated into `mtp.safetensors`. Needs the checkpoint and the calibration tokens (skips without).
 class TrellisCalibrateCudaIntegrationTest {
 
-    private static final Path TOKENS = Path.of("/mnt/shared/qwen38-quant/quality/gptq/calibration/tokens-218.npy");
+    private static final Path TOKENS = Path.of(System.getProperty(
+            "euhedral.quantization.calibration-tokens", "unset-euhedral.quantization.calibration-tokens"));
 
     @AfterEach
     void resetHooks() {

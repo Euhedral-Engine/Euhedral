@@ -32,7 +32,7 @@ from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextCo
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextExperts, Qwen4ExpTextModel  # noqa: E402
 
 from flash_next_reference import kvcodec  # noqa: E402
-from flash_next_reference.artifact import DEFAULT_ARTIFACT, Artifact, ExpertRecord  # noqa: E402
+from flash_next_reference.artifact import DEFAULT_ARTIFACT, DEFAULT_HF_CONFIG, Artifact, ExpertRecord  # noqa: E402
 from flash_next_reference.instrument import (Capture, RecordingPLELayer, RecordingQSAIndexer, ReplayMismatch,  # noqa: E402
                                              stable_topk)
 from flash_next_reference.model import (IdsOnlyEmbedding, LazyExperts, make_ngram_module,  # noqa: E402
@@ -598,7 +598,7 @@ class RealArtifactTest(unittest.TestCase):
 
     def test_config_matches_hf_config_and_ngram_tables(self):
         from flash_next_reference.model import assert_config_matches, load_hf_text_config, make_config
-        if not Path("/mnt/shared/qwen38-flash-next/nvfp4/config.json").exists():
+        if not DEFAULT_HF_CONFIG.exists():
             self.skipTest("HF config missing")
         cfg = make_config(load_hf_text_config())
         assert_config_matches(cfg, self.art.metadata)

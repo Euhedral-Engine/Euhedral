@@ -45,7 +45,7 @@ class MtpDraftConfidenceCudaIntegrationTest {
         int drafts = Integer.getInteger("euhedral.mtp.drafts", MtpDecoder.MAX_DRAFTS);
         int context = Integer.getInteger("euhedral.mtp.context", 16384);
         QwenTokenizer tokenizer = QwenTokenizer.load(
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")));
         var mapper = new ObjectMapper();
         List<JsonNode> entries = Files.readAllLines(prompts).stream()
                 .filter(line -> !line.isBlank())

@@ -24,12 +24,11 @@ class DiskTierEngineCudaIntegrationTest {
     void theEngineReadsWeightsBeyondItsHostBudgetFromDisk() throws Exception {
         String library = System.getProperty("euhedral.cuda.library");
         assumeTrue(library != null && Files.isRegularFile(Path.of(library)), "no CUDA library");
-        Path artifact = Path.of(
-                System.getProperty("euhedral.qwen.artifact", "/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl"));
+        Path artifact = Path.of(System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"));
         assumeTrue(Files.isRegularFile(artifact), "no artifact " + artifact);
         var config = new InferenceConfig(
                 artifact,
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen")),
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir")),
                 Path.of(library),
                 SystemInfo.getPCpuSet(),
                 Duration.ofSeconds(30));

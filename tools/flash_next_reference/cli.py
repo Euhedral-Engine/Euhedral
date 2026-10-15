@@ -10,7 +10,7 @@ import time
 import torch
 
 from . import UPSTREAM_REVISION
-from .artifact import DEFAULT_ARTIFACT, DEFAULT_TOKENIZER, Artifact
+from .artifact import DEFAULT_ARTIFACT, DEFAULT_HF_CONFIG, DEFAULT_TOKENIZER, Artifact
 from .cases import CASES, build, fp32_chunk_check, run_case, text_tokens
 from .model import assert_config_matches, load_hf_text_config, make_config, ngram_tables_from_metadata
 
@@ -177,7 +177,7 @@ def main(argv: list[str]) -> int:
     p.set_defaults(func=cmd_list)
     p = sub.add_parser("check-artifact", help="config/metadata cross-check and CRC-32 of a sample of objects")
     common(p)
-    p.add_argument("--hf-config", type=Path, default=Path("/mnt/shared/qwen38-flash-next/nvfp4/config.json"))
+    p.add_argument("--hf-config", type=Path, default=DEFAULT_HF_CONFIG)
     p.add_argument("--full", action="store_true", help="also CRC the 1.2 GB embedding and head")
     p.set_defaults(func=cmd_check)
     p = sub.add_parser("fp32-chunk-check", help="chunk invariance of real layers in fp32 (implementation error only)")

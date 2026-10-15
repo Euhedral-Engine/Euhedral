@@ -60,7 +60,7 @@ tasks.named("check") {
 }
 
 val tokenizerReferenceDirectory = providers.gradleProperty("euhedral.qwen.tokenizer-dir")
-    .orElse("/mnt/shared/qwen38-quant/source/qwen")
+    .orElse("unset-euhedral.qwen.tokenizer-dir")
 
 tasks.register<Test>("tokenizerReferenceTest") {
     group = "verification"

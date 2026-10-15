@@ -63,7 +63,7 @@ class RelaxedNumericsDriftCudaIntegrationTest {
         // Calibration: "exact" runs the exact kernels on both sequences (determinism floor).
         boolean candidate = "exact".equals(System.getProperty("euhedral.numerics.drift.candidate", ""));
         Path tokenizerDirectory =
-                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "/mnt/shared/qwen38-quant/source/qwen"));
+                Path.of(System.getProperty("euhedral.qwen.tokenizer-dir", "unset-euhedral.qwen.tokenizer-dir"));
         String prefixes = System.getProperty("euhedral.numerics.drift.prefix", "256,384,512");
         QwenTokenizer tokenizer = QwenTokenizer.load(tokenizerDirectory);
         List<Double> peaks = new ArrayList<>();

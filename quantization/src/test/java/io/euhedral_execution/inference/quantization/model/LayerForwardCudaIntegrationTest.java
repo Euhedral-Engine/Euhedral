@@ -19,8 +19,8 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /// Layers 0 (GDN) and 3 (attention) on the engine's kernels against the BF16 forward of a PyTorch reference of the
-/// calibration (tools/gptq, last at commit 9ff02525) on the same input (frozen fixture, by default in
-/// /mnt/shared/qwen38-quant/quality/fixtures/forward-fixture; `euhedral.quantization.forward-fixture` names another).
+/// calibration (tools/gptq, last at commit 9ff02525) on the same input (frozen fixture named by
+/// `euhedral.quantization.forward-fixture`; skips without it).
 /// Each layer's update of the hidden states is compared. The engine keeps attention's keys and values in its NVFP4
 /// cache, so layer 3 is held to the reference with the same cache codec, and its distance from plain BF16 is reported.
 class LayerForwardCudaIntegrationTest {
@@ -29,7 +29,7 @@ class LayerForwardCudaIntegrationTest {
     void layersMatchThePythonCalibrationModel() throws Exception {
         String checkpoint = System.getProperty("euhedral.quantization.checkpoint", "");
         Path fixture = Path.of(System.getProperty(
-                "euhedral.quantization.forward-fixture", "/mnt/shared/qwen38-quant/quality/fixtures/forward-fixture"));
+                "euhedral.quantization.forward-fixture", "unset-euhedral.quantization.forward-fixture"));
         assumeTrue(!checkpoint.isBlank() && Files.isDirectory(fixture), "needs the checkpoint and the forward fixture");
         float[] input = bf16(fixture.resolve("input.npy"));
         int sequences = 2, length = 256, hidden = 5120, rows = sequences * length;

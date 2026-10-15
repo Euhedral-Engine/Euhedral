@@ -52,7 +52,7 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 class EuhedralInferenceRuntimeLatticeTest {
 
     private static final Path DEFAULT_COMPACT_ARTIFACT =
-            Path.of("/mnt/shared/qwen38-quant/artifacts/qwen3_8_27b_q3.edrl");
+            Path.of(System.getProperty("euhedral.qwen.artifact", "unset-euhedral.qwen.artifact"));
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
