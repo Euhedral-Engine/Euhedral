@@ -298,6 +298,25 @@ public final class Shape implements GraphShape {
         return this.diskUses;
     }
 
+    /// The bytes this view reads from disk: the aligned reads of its disk uses.
+    public long diskReadBytes() {
+        long bytes = 0;
+        for (var use : this.diskUses) bytes += use.readBytes();
+        return bytes;
+    }
+
+    /// The bytes this view copies into the staging ring: its staged weights, host-backed or disk-backed.
+    public long transferBytes() {
+        long bytes = 0;
+        for (var instruction : this.instructions) {
+            if (instruction.kind() != ExecutionPlan.Kind.WEIGHT_TRANSFER
+                    && instruction.kind() != ExecutionPlan.Kind.DISK_TRANSFER) continue;
+            var weight = instruction.weight();
+            if (weight != null) bytes += weight.byteSize();
+        }
+        return bytes;
+    }
+
     /// Whether this view copies host-backed weights into the staging ring.
     public boolean stagesWeights() {
         return this.instructions.stream()
