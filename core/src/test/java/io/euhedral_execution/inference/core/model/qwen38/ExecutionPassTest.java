@@ -26,7 +26,7 @@ import org.junit.jupiter.api.Timeout;
 class ExecutionPassTest {
 
     /// A select that records its quantum and then runs `next`.
-    private static final class Told extends AbstractFrame implements AbstractQuantum.Continuation {
+    private static class Told extends AbstractFrame implements AbstractQuantum.Continuation {
         final CompletableFuture<Quantum> seen = new CompletableFuture<>();
         private final Consumer<Quantum> next;
         private Quantum quantum;
@@ -177,7 +177,7 @@ class ExecutionPassTest {
         var c = new Sequence(3);
         var d = new Sequence(4);
         try {
-            // Held in flight so that b, c and d are pending together when the pass forms.
+            // a is in flight while b and c are pending, so b and c form one pass.
             var toldA = new Told();
             var toldB = new Told();
             var toldC = new Told();
@@ -197,8 +197,7 @@ class ExecutionPassTest {
                     toldC.seen.get(10, TimeUnit.SECONDS).conclusion().status());
             assertEquals(1, c.currentTokenPosition());
             assertEquals(0, b.currentTokenPosition());
-            // The failed step's sequence is not awaited: a later offer of another sequence forms a pass at once.
-            execution.leave(b);
+            // b's step never ran, so b is not awaited: d's offer forms a pass once c, which ran, has left.
             execution.leave(c);
             execution.runtime().publishOnOwner(() -> execution.offer(part(d, 0, 7), toldD));
             assertEquals(
@@ -240,6 +239,108 @@ class ExecutionPassTest {
             assertNull(qa.conclusion().failure());
         } finally {
             for (var s : List.of(a, b, c)) s.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aDuplicatePendingOfferConcludesFailedAndTheOthersAreUnaffected() throws Exception {
+        var plan = plan();
+        var execution = execution(plan);
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        try {
+            var toldA = new Told(q -> execution.leave(a));
+            var toldB = new Told();
+            var toldDuplicate = new Told();
+            execution.runtime().publishOnOwner(() -> {
+                execution.offer(part(a, 0, 1), toldA);
+                execution.offer(part(b, 0, 5), toldB);
+                execution.offer(part(b, 0, 6), toldDuplicate);
+            });
+            assertEquals(
+                    Quantum.Status.FAILED,
+                    toldDuplicate.seen.get(10, TimeUnit.SECONDS).conclusion().status());
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    toldB.seen.get(10, TimeUnit.SECONDS).conclusion().status());
+            assertEquals(1, b.currentTokenPosition());
+        } finally {
+            a.complete();
+            b.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aStepOverThePassRowCapRunsAloneAndWedgesNothing() throws Exception {
+        var plan = plan();
+        var execution =
+                new Execution(new PullingLattice(), plan, new EngineExecutionFixture.SamplingGpu(8), 1, false, 4);
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        try {
+            var toldBig = new Told(q -> execution.leave(a));
+            var toldB = new Told();
+            execution.runtime().publishOnOwner(() -> {
+                execution.offer(new Quantum.Part(a, 0, new int[] {1, 2, 3, 4, 5, 6}), toldBig);
+                execution.offer(part(b, 0, 5), toldB);
+            });
+            assertTrue(toldBig.seen.get(10, TimeUnit.SECONDS) != null);
+            assertEquals(
+                    Quantum.Status.SUCCESS,
+                    toldB.seen.get(10, TimeUnit.SECONDS).conclusion().status());
+        } finally {
+            a.complete();
+            b.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void closingConcludesTheOffersStillWaitingForAPass() throws Exception {
+        var plan = plan();
+        var execution = execution(plan);
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        var toldA = new Told();
+        var toldB = new Told();
+        try {
+            execution.runtime().publishOnOwner(() -> {
+                execution.offer(part(a, 0, 1), toldA);
+                execution.offer(part(b, 0, 5), toldB);
+            });
+            toldA.seen.get(10, TimeUnit.SECONDS);
+        } finally {
+            execution.close();
+        }
+        // a never reported, so b's offer was still pending when the execution closed.
+        assertEquals(
+                Quantum.Status.FAILED,
+                toldB.seen.get(10, TimeUnit.SECONDS).conclusion().status());
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aSelectThatFailsToBeToldDoesNotKeepTheOthersFromRunning() {
+        var plan = plan();
+        var execution = execution(plan);
+        try {
+            var first = new Told() {
+                @Override
+                public void concluded(AbstractQuantum quantum) {
+                    throw new IllegalStateException("not told");
+                }
+            };
+            var second = new Told();
+            var retirement = new PassRetirement(execution, execution.lake(), List.of(), List.of(first, second), false);
+            retirement.concluded(new Quantum(plan, new Sequence(9), Quantum.ExecutionKind.DECODE, 0, new int[] {1}));
+            assertThrows(IllegalStateException.class, retirement::execute);
+            assertTrue(second.seen.orTimeout(10, TimeUnit.SECONDS).join() != null);
+        } finally {
             execution.close();
         }
     }

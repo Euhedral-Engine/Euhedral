@@ -107,12 +107,43 @@ class PassAssemblerTest {
     }
 
     @Test
-    void anOversizedStepIsRefused() {
+    void anOversizedStepRunsAloneAndAnEmptyOneIsRefused() {
         var a = assembler(4, 8);
-        assertThrows(IllegalArgumentException.class, () -> a.offer(step("A", 5)));
-        assertThrows(IllegalArgumentException.class, () -> a.offer(step("A", 0)));
+        Step big = step("A", 5);
+        a.offer(big);
+        assertEquals(List.of(List.of(big)), passes);
+        assertThrows(IllegalArgumentException.class, () -> a.offer(step("B", 0)));
         assertEquals(0, a.pendingCount());
-        assertEquals(0, passes.size());
+        assertEquals(1, passes.size());
+    }
+
+    @Test
+    void anEmptyStepStillReportsItsSequence() {
+        var a = assembler(4, 8);
+        a.offer(step("A", 1));
+        a.offer(step("B", 1));
+        a.retired(List.of("A"));
+        assertEquals(1, passes.size());
+        assertThrows(IllegalArgumentException.class, () -> a.offer(step("A", 0)));
+        assertEquals(2, passes.size());
+    }
+
+    @Test
+    void aPassThatAdmitsNothingDoesNotStrandTheOffersBehindIt() {
+        List<List<Step>> seen = new ArrayList<>();
+        var a = new PassAssembler<String, Step>(Step::sequence, Step::rows, 8, 1, pass -> {
+            seen.add(List.copyOf(pass));
+            return pass.get(0).sequence().equals("BAD") ? 0 : 1;
+        });
+        a.offer(step("X", 1));
+        a.offer(step("BAD", 1));
+        a.offer(step("B", 1));
+        a.retired(List.of());
+        assertEquals(
+                List.of("X", "BAD", "B"),
+                seen.stream().map(p -> p.get(0).sequence()).toList());
+        assertEquals(0, a.pendingCount());
+        assertEquals(1, a.passesInFlight());
     }
 
     @Test
