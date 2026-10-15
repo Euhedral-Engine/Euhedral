@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.web;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.api.chat.GenerationService;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -104,9 +105,10 @@ class GenerationQueueTest {
             var third = queued(client);
             await(() -> queuedCount() == 1);
             // The freed slot's start is held on a worker while the service shuts down.
-            this.backend.holdReleaseStarts = hold;
+            this.backend.entered = new CountDownLatch(1);
+            this.backend.holdStarts = hold;
             first.close();
-            await(() -> this.backend.generations.stream().anyMatch(g -> g.closeCount.get() > 0));
+            assertTrue(this.backend.entered.await(10, TimeUnit.SECONDS), "the freed slot's start was submitted");
             var stopping = CompletableFuture.runAsync(this.service::stop);
             await(() -> !this.service.isRunning());
             hold.countDown();
@@ -115,7 +117,7 @@ class GenerationQueueTest {
             assertEquals(2, this.backend.generations.size(), "the refused request opens no session");
         } finally {
             hold.countDown();
-            this.backend.holdReleaseStarts = null;
+            this.backend.holdStarts = null;
             this.service.start();
         }
         await(() -> this.registry.get("euhedral.generations.active").gauge().value() == 0);

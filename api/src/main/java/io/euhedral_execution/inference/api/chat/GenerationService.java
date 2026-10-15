@@ -217,6 +217,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
             return;
         }
         ChatGeneration job;
+        SseEmitter streamed = null;
         try {
             Responder responder = admission.planned.responder();
             CompletionSink sink;
@@ -242,6 +243,7 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
                         .header("Cache-Control", "no-cache")
                         .header("X-Accel-Buffering", "no")
                         .body(emitter));
+                streamed = emitter;
             } else {
                 sink = responder.json(plan, admission.result);
                 clientGone = () -> admission.result.setErrorResult(ApiException.clientClosed());
@@ -256,14 +258,17 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
                     new ChatGeneration.Telemetry(this.metrics, admission.api, admission.arrivedNanos));
         } catch (RuntimeException | Error failure) {
             // Nothing runs the generation: give back its session and the slot, and answer the request.
-            generation.close();
             this.metrics.request(admission.api, ServerMetrics.Outcome.FAILED);
             try {
-                admission.result.setErrorResult(apiException(failure));
+                generation.close();
+                // A stream's response was already sent as its emitter; end it with the failure.
+                if (streamed != null) streamed.completeWithError(failure);
+                else admission.result.setErrorResult(apiException(failure));
             } catch (RuntimeException completed) {
-                // The container already ended the request.
+                // The container already ended the request, or the session failed to close.
+            } finally {
+                release(admission);
             }
-            release(admission);
             return;
         }
         admission.generation = job;
