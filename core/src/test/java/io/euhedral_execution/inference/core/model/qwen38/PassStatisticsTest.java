@@ -50,4 +50,23 @@ class PassStatisticsTest {
             execution.close();
         }
     }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void anAdmittedStagedQuantumCountsItsViewsTransfers() throws Exception {
+        ExecutionPlan plan = StagingEdgesTest.stagedPlan();
+        var execution = new Execution(new PullingLattice(), plan, new ExecutionFixtures.RecordingGpu());
+        try {
+            var sequence = new Sequence(7);
+            var quantum = new Quantum(plan, sequence, Quantum.ExecutionKind.DECODE, 0, new int[] {1});
+            long expected = quantum.shape().transferBytes();
+            assertTrue(expected > 0);
+            execution.submit(quantum).get(10, TimeUnit.SECONDS);
+            assertEquals(
+                    expected, execution.statistics(Quantum.ExecutionKind.DECODE).transferBytes());
+            sequence.complete();
+        } finally {
+            execution.close();
+        }
+    }
 }

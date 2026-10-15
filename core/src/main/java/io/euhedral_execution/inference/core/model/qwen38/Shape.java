@@ -64,6 +64,8 @@ public final class Shape implements GraphShape {
     private final ScratchUse[] scratchUses;
 
     private final List<io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse> diskUses;
+    private final long diskReadBytes;
+    private final long transferBytes;
 
     Shape(View view, ExecutionPlan plan, ExecutionPlan.PlanData data, boolean reuseStorage, boolean prefetchesRing) {
         this.view = Objects.requireNonNull(view, "view");
@@ -74,6 +76,17 @@ public final class Shape implements GraphShape {
         this.bufferSpecs = List.copyOf(data.bufferSpecs());
         this.firstLayer = data.firstLayer();
         this.diskUses = data.diskUses();
+        long disk = 0;
+        for (var use : this.diskUses) disk += use.readBytes();
+        this.diskReadBytes = disk;
+        long transfer = 0;
+        for (var instruction : this.instructions) {
+            if (instruction.kind() != ExecutionPlan.Kind.WEIGHT_TRANSFER
+                    && instruction.kind() != ExecutionPlan.Kind.DISK_TRANSFER) continue;
+            var weight = instruction.weight();
+            if (weight != null) transfer += weight.byteSize();
+        }
+        this.transferBytes = transfer;
         this.reuseStorage = reuseStorage;
         List<List<Integer>> edges = new ArrayList<>();
         for (int index = 0; index < this.instructions.size(); index++) edges.add(new ArrayList<>());
@@ -300,21 +313,12 @@ public final class Shape implements GraphShape {
 
     /// The bytes this view reads from disk: the aligned reads of its disk uses.
     public long diskReadBytes() {
-        long bytes = 0;
-        for (var use : this.diskUses) bytes += use.readBytes();
-        return bytes;
+        return this.diskReadBytes;
     }
 
     /// The bytes this view copies into the staging ring: its staged weights, host-backed or disk-backed.
     public long transferBytes() {
-        long bytes = 0;
-        for (var instruction : this.instructions) {
-            if (instruction.kind() != ExecutionPlan.Kind.WEIGHT_TRANSFER
-                    && instruction.kind() != ExecutionPlan.Kind.DISK_TRANSFER) continue;
-            var weight = instruction.weight();
-            if (weight != null) bytes += weight.byteSize();
-        }
-        return bytes;
+        return this.transferBytes;
     }
 
     /// Whether this view copies host-backed weights into the staging ring.
