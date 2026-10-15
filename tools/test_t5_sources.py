@@ -5,6 +5,8 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -110,10 +112,10 @@ class SourcesTest(unittest.TestCase):
         def fetch(url):
             if url.endswith("/repos/o/r"):
                 return {"created_at": "2026-01-01T00:00:00Z"}, {}
-            if url.endswith("/commits/s1"):
+            if "/commits/s1" in url:
                 return {"parents": [{"sha": "p1"}], "files": [
                     {"filename": "a.py", "status": status, "previous_filename": "old/a.py"}]}, {}
-            if url.endswith("/commits/s0"):
+            if "/commits/s0" in url:
                 return {"parents": [], "files": [{"filename": "old/a.py", "status": "added"}]}, {}
             if "sha=p1&path=old/a.py" in url:
                 return [{"sha": "s0", **commit(old_date)}], {}
@@ -132,6 +134,101 @@ class SourcesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             result, failed = self._file_store(d, self._renamed("renamed", "2026-10-05T00:00:00Z"))
         self.assertFalse(failed)
+
+    def _path_fetch(self, details, commits):
+        """fetch for the path-history endpoints: `details[sha]` is a list of file pages, `commits[ref_path]` the log."""
+        def fetch(url):
+            if "/commits?" in url:
+                for key, value in commits.items():
+                    if key in url:
+                        return value
+                raise OSError("404")
+            sha = url.split("/commits/")[1].split("?")[0]
+            page = int(url.split("&page=")[1]) if "&page=" in url else 1
+            pages = details[sha]
+            if isinstance(pages, Exception):
+                raise pages
+            return {"parents": [{"sha": "p" + sha}], "files": pages[page - 1]}, {}
+        return fetch
+
+    def test_path_absent_from_the_commit_files_is_unverified(self):
+        fetch = self._path_fetch({"s1": [[{"filename": "other.py", "status": "added"}]]},
+                                 {"path=a.py": ([{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {})})
+        with self.assertRaises(sources.Unverified):
+            sources.github_path_first_commit("o", "r", "a.py", fetch)
+
+    def test_file_list_pages_are_read_until_the_path_appears(self):
+        full = [{"filename": f"f{i}", "status": "added"} for i in range(sources.FILES_PER_PAGE)]
+        fetch = self._path_fetch({"s1": [full, [{"filename": "a.py", "status": "added"}]]},
+                                 {"path=a.py": ([{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {})})
+        self.assertEqual(sources.github_path_first_commit("o", "r", "a.py", fetch), datetime.date(2026, 10, 5))
+        absent = self._path_fetch({"s1": [full, [{"filename": "b.py", "status": "added"}]]},
+                                  {"path=a.py": ([{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {})})
+        with self.assertRaises(sources.Unverified):
+            sources.github_path_first_commit("o", "r", "a.py", absent)
+
+    def test_commit_detail_http_error_is_unverified_and_fails_the_check(self):
+        err = urllib.error.HTTPError("u", 502, "bad gateway", {}, None)
+        fetch = self._path_fetch({"s1": err}, {"path=a.py": ([{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {})})
+        with self.assertRaises(sources.Unverified):
+            sources.github_path_first_commit("o", "r", "a.py", fetch)
+        with self.assertRaises(sources.Unverified):  # not swallowed as "try the next ref split"
+            sources.published_date("https://github.com/o/r/blob/main/a.py", fetch)
+
+    def _chain(self, hops):
+        details, commits = {}, {}
+        for i in range(hops + 1):
+            name = f"f{i}.py"
+            nxt = f"f{i + 1}.py"
+            status = {"filename": name, "status": "renamed", "previous_filename": nxt} if i < hops \
+                else {"filename": name, "status": "added"}
+            details[f"s{i}"] = [[status]]
+            date = "2026-10-05T00:00:00Z" if i < hops else "2026-03-01T00:00:00Z"
+            ref = "" if i == 0 else f"sha=p{'s' + str(i - 1)}&"
+            commits[f"{ref}path={name}&"] = ([{"sha": f"s{i}", **commit(date)}], {})
+        return self._path_fetch(details, commits)
+
+    def test_rename_chain_of_several_hops_takes_the_earliest_date(self):
+        self.assertEqual(sources.github_path_first_commit("o", "r", "f0.py", self._chain(3)),
+                         datetime.date(2026, 3, 1))
+
+    def test_exhausting_max_follow_is_unverified(self):
+        with mock.patch.object(sources, "MAX_FOLLOW", 2):
+            with self.assertRaises(sources.Unverified):
+                sources.github_path_first_commit("o", "r", "f0.py", self._chain(3))
+            self.assertEqual(sources.github_path_first_commit("o", "r", "f0.py", self._chain(2)),
+                             datetime.date(2026, 3, 1))
+
+    def test_rename_on_the_last_page_of_a_multi_page_log(self):
+        def fetch(url):
+            if url == "https://api.github.com/p?page=2":
+                return [{"sha": "s9", **commit("2026-10-02T00:00:00Z")}], {}
+            if "/commits?" in url and "path=a.py" in url and "sha=ps9" not in url:
+                return [{"sha": "s1", **commit("2026-11-01T00:00:00Z")}], {"link": '<https://api.github.com/p?page=2>; rel="last"'}
+            if "/commits/s9" in url:
+                return {"parents": [{"sha": "ps9"}], "files": [
+                    {"filename": "a.py", "status": "renamed", "previous_filename": "old.py"}]}, {}
+            if "sha=ps9&path=old.py" in url:
+                return [{"sha": "s0", **commit("2026-02-01T00:00:00Z")}], {}
+            if "/commits/s0" in url:
+                return {"parents": [], "files": [{"filename": "old.py", "status": "added"}]}, {}
+            raise OSError(url)
+        self.assertEqual(sources.github_path_first_commit("o", "r", "a.py", fetch), datetime.date(2026, 2, 1))
+
+    def test_url_path_is_decoded(self):
+        seen = []
+
+        def fetch(url):
+            seen.append(url)
+            if url.endswith("/repos/o/r"):
+                return {"created_at": "2026-09-30T00:00:00Z"}, {}
+            if "main%2Fdocs" in url:
+                raise OSError("404")
+            if "/commits/" in url:
+                return {"files": [{"filename": "docs/a b.md", "status": "added"}]}, {}
+            return [{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {}
+        sources.published_date("https://github.com/o/r/blob/main/docs/a%20b.md", fetch)
+        self.assertTrue(any("path=docs/a%20b.md" in u for u in seen))
 
     def test_check_flags_mismatch_and_old_dates(self):
         rows = []

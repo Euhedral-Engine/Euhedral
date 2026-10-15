@@ -18,7 +18,7 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 try:
     from t5 import records
@@ -28,6 +28,8 @@ except ImportError:  # run as a script
 
 API = "https://api.github.com"
 MAX_FOLLOW = 10  # renames followed back through a path's history
+FILES_PER_PAGE = 300  # the commit endpoint caps its file list per page
+MAX_FILE_PAGES = 10
 
 
 def urlopen_json(url: str):
@@ -55,12 +57,40 @@ def github_repo_created(owner: str, repo: str, fetch=urlopen_json) -> datetime.d
     return _date(data["created_at"])
 
 
+class Unverified(Exception):
+    """The publication date cannot be established with certainty; the source counts as failed."""
+
+
+def _commit_files(owner: str, repo: str, sha: str, path: str, fetch) -> tuple[dict, dict | None]:
+    """(commit detail, the file entry for `path`). The commit's file list is capped per page, so the following
+    pages are read until the path turns up or a short page ends the list; a path that never appears leaves the
+    commit unverified."""
+    try:
+        detail, _ = fetch(f"{API}/repos/{owner}/{repo}/commits/{sha}?per_page={FILES_PER_PAGE}")
+        page = 1
+        while True:
+            files = detail.get("files", [])
+            for entry in files:
+                if entry.get("filename") == path:
+                    return detail, entry
+            if len(files) < FILES_PER_PAGE or page >= MAX_FILE_PAGES:
+                break
+            page += 1
+            more, _ = fetch(f"{API}/repos/{owner}/{repo}/commits/{sha}?per_page={FILES_PER_PAGE}&page={page}")
+            detail = {**detail, "files": more.get("files", [])}
+    except (OSError, KeyError, TypeError) as e:  # network failure, HTTP error or malformed answer
+        raise Unverified(f"commit {sha[:10]}: {type(e).__name__}: {e}") from e
+    raise Unverified(f"commit {sha[:10]} does not list {path} among its files")
+
+
 def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_json,
                              ref: str | None = None, _depth: int = 0) -> datetime.date:
     """Date of the oldest commit touching `path` (on `ref`, a branch, tag or commit, when given). Commits come
     newest first, so the last page holds it. When that commit created the path by renaming or copying another
     one (the commit's file status says so), the search continues from its parent on the earlier path and the
-    earlier date wins. A copy that git does not report as one shows as a plain addition."""
+    earlier date wins. Anything that leaves the answer uncertain raises Unverified: the path missing from the
+    commit's file list, a failing commit lookup, or more than MAX_FOLLOW hops. A copy that git does not report
+    as one shows as a plain addition."""
     sha = f"sha={quote(ref, safe='')}&" if ref else ""
     data, headers = fetch(f"{API}/repos/{owner}/{repo}/commits?{sha}path={quote(path)}&per_page=100")
     last = re.search(r'<([^>]+)>;\s*rel="last"', headers.get("link", ""))
@@ -70,19 +100,22 @@ def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_jso
         raise ValueError(f"no commits touch {owner}/{repo}:{path}")
     found = min(_date(c["commit"][who]["date"]) for c in data for who in ("author", "committer"))
     oldest = data[-1]
-    if oldest.get("sha") and _depth < MAX_FOLLOW:
-        detail, _ = fetch(f"{API}/repos/{owner}/{repo}/commits/{oldest['sha']}")
-        parents = detail.get("parents") or oldest.get("parents") or []
-        for entry in detail.get("files", []):
-            if entry.get("filename") == path and entry.get("status") in ("renamed", "copied") \
-                    and entry.get("previous_filename") and parents:
-                try:
-                    earlier = github_path_first_commit(owner, repo, entry["previous_filename"], fetch,
-                                                       parents[0]["sha"], _depth + 1)
-                except ValueError:  # the earlier path has no history on the parent: nothing older to find
-                    break
-                return min(found, earlier)
-    return found
+    if not oldest.get("sha"):
+        return found
+    detail, entry = _commit_files(owner, repo, oldest["sha"], path, fetch)
+    if entry.get("status") not in ("renamed", "copied") or not entry.get("previous_filename"):
+        return found
+    if _depth >= MAX_FOLLOW:
+        raise Unverified(f"{path} was renamed or copied more than {MAX_FOLLOW} times")
+    parents = detail.get("parents") or oldest.get("parents") or []
+    if not parents:
+        raise Unverified(f"commit {oldest['sha'][:10]} renamed {path} but has no parent")
+    try:
+        earlier = github_path_first_commit(owner, repo, entry["previous_filename"], fetch,
+                                           parents[0]["sha"], _depth + 1)
+    except ValueError as e:  # the earlier path has no history on the parent
+        raise Unverified(str(e)) from e
+    return min(found, earlier)
 
 
 def published_date(url: str, fetch=urlopen_json) -> tuple[datetime.date, datetime.date | None] | None:
@@ -90,7 +123,7 @@ def published_date(url: str, fetch=urlopen_json) -> tuple[datetime.date, datetim
     its form is not recognised. A file URL `/owner/repo/blob/REF/PATH` is ambiguous when REF holds `/`: the
     longest-ref-first split that yields commits wins."""
     parsed = urlparse(url)
-    parts = [p for p in parsed.path.split("/") if p]
+    parts = [unquote(p) for p in parsed.path.split("/") if p]
     if parsed.hostname != "github.com" or len(parts) < 4:
         return None
     owner, repo, kind = parts[:3]
