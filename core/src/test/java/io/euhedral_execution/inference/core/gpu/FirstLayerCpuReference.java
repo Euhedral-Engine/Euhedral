@@ -47,9 +47,11 @@ final class FirstLayerCpuReference {
         short[] inputNorm = rmsNormUnitOffset(hiddenState, read(gpu, layer.inputNorm()), 1, hidden, epsilon);
         buffers.put(ExecutionPlan.Buffer.INPUT_NORMALIZED, inputNorm);
 
-        short[] queryKey = quantizedLinear(inputNorm, read(gpu, gdn.queryKey()), 1, hidden, queryKeyWidth, 4);
+        short[] queryKey =
+                quantizedLinear(inputNorm, read(gpu, gdn.queryKey()), 1, hidden, queryKeyWidth, bits(gdn.queryKey()));
         buffers.put(ExecutionPlan.Buffer.QK_PROJECTED, queryKey);
-        short[] valueZ = quantizedLinear(inputNorm, read(gpu, gdn.valueZ()), 1, hidden, valueWidth * 2, 5);
+        short[] valueZ =
+                quantizedLinear(inputNorm, read(gpu, gdn.valueZ()), 1, hidden, valueWidth * 2, bits(gdn.valueZ()));
         buffers.put(ExecutionPlan.Buffer.VALUE_Z_PROJECTED, valueZ);
 
         float[] a = bf16Linear(inputNorm, read(gpu, gdn.aProjection()), hidden, valueHeads);
@@ -94,7 +96,8 @@ final class FirstLayerCpuReference {
                 epsilon);
         buffers.put(ExecutionPlan.Buffer.GDN_NORMALIZED, gdnNormalized);
 
-        short[] mixerDelta = quantizedLinear(gdnNormalized, read(gpu, gdn.output()), 1, valueWidth, hidden, 3);
+        short[] mixerDelta =
+                quantizedLinear(gdnNormalized, read(gpu, gdn.output()), 1, valueWidth, hidden, bits(gdn.output()));
         buffers.put(ExecutionPlan.Buffer.MIXER_DELTA, mixerDelta);
         short[] mixerHidden = residualAdd(hiddenState, mixerDelta);
         buffers.put(ExecutionPlan.Buffer.MIXER_HIDDEN, mixerHidden);
@@ -103,11 +106,12 @@ final class FirstLayerCpuReference {
                 rmsNormUnitOffset(mixerHidden, read(gpu, layer.postAttentionNorm()), 1, hidden, epsilon);
         buffers.put(ExecutionPlan.Buffer.POST_MIXER_NORMALIZED, postMixerNormalized);
 
-        short[] gateUp = quantizedLinear(postMixerNormalized, read(gpu, ffn.gateUp()), 1, hidden, intermediate * 2, 3);
+        short[] gateUp = quantizedLinear(
+                postMixerNormalized, read(gpu, ffn.gateUp()), 1, hidden, intermediate * 2, bits(ffn.gateUp()));
         buffers.put(ExecutionPlan.Buffer.GATE_UP, gateUp);
         short[] swiglu = swiGlu(gateUp, intermediate);
         buffers.put(ExecutionPlan.Buffer.SWIGLU, swiglu);
-        short[] ffnDelta = quantizedLinear(swiglu, read(gpu, ffn.down()), 1, intermediate, hidden, 3);
+        short[] ffnDelta = quantizedLinear(swiglu, read(gpu, ffn.down()), 1, intermediate, hidden, bits(ffn.down()));
         buffers.put(ExecutionPlan.Buffer.FFN_DELTA, ffnDelta);
         buffers.put(ExecutionPlan.Buffer.FINAL_HIDDEN_STATE, residualAdd(mixerHidden, ffnDelta));
         return new Result(buffers, a, b, g, beta);
@@ -311,6 +315,16 @@ final class FirstLayerCpuReference {
         float[] output = new float[width];
         for (int i = 0; i < width; i++) output[i] = bf16ToFloat(values[offset + i]) * inverse;
         return output;
+    }
+
+    /// Bits per weight of a grouped (Q3/Q4/Q5) tensor, from its format.
+    static int bits(TensorHandle handle) {
+        return switch (handle.format()) {
+            case Q3_G64_FP16 -> 3;
+            case Q4_G64_FP16 -> 4;
+            case Q5_G64_FP16 -> 5;
+            default -> throw new IllegalArgumentException("not a grouped format: " + handle.format());
+        };
     }
 
     static byte[] read(ExecutionGpu gpu, TensorHandle handle) {
