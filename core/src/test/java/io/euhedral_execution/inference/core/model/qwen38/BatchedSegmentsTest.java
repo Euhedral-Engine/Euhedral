@@ -217,4 +217,152 @@ class BatchedSegmentsTest {
             execution.close();
         }
     }
+
+    /// Records the rows each device selection reads and where every norm writes.
+    private static final class RecordingSelectionGpu extends EngineExecutionFixture.SamplingGpu {
+        final List<Long> argmaxAddresses = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final List<Long> normOutputs = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        RecordingSelectionGpu() {
+            super(8);
+        }
+
+        @Override
+        public boolean argmaxBf16(long logitsAddress, int count, long resultAddress) {
+            this.argmaxAddresses.add(logitsAddress);
+            return true;
+        }
+
+        @Override
+        public void rmsNormUnitOffsetBf16(
+                long inputAddress, long weightAddress, long outputAddress, int rows, int width, float epsilon) {
+            this.normOutputs.add(outputAddress);
+        }
+
+        @Override
+        public void rmsNormBf16(
+                long inputAddress, long weightAddress, long outputAddress, int rows, int width, float epsilon) {
+            this.normOutputs.add(outputAddress);
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void eachPartReadsItsOwnLogitsRowsAndAnAcceptanceDrivesItsCommit() throws Exception {
+        var gpu = new RecordingSelectionGpu();
+        var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
+        var execution = new Execution(new PullingLattice(), plan, gpu);
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        var c = new Sequence(3);
+        var logitsA = new HostLogits(gpu, 8);
+        var logitsB = new HostLogits(gpu, 8);
+        var logitsC = new HostLogits(gpu, 8);
+        for (var logits : List.of(logitsA, logitsB, logitsC)) logits.selectOnDevice(true);
+        try {
+            // Rows [1, 2, 3] with selections [2, 0, 0]: one draft matches, so 2 of 3 rows commit.
+            var acceptA = new SpeculativeAcceptance(new int[] {1, 2, 3}, t -> false, 8);
+            var acceptC = new SpeculativeAcceptance(new int[] {4, 5}, t -> false, 8);
+            var parts = List.of(
+                    new Quantum.Part(a, 0, new int[] {1, 2, 3}).verifying(logitsA, acceptA, new FixedSelector(2, 0, 0)),
+                    new Quantum.Part(b, 0, new int[] {6, 7}).sampling(logitsB),
+                    new Quantum.Part(c, 0, new int[] {4, 5}).verifying(logitsC, acceptC, new FixedSelector(5, 1)));
+            var outcome = execution
+                    .submit(Quantum.batch(plan, Quantum.ExecutionKind.VERIFY, parts, LogitsRequirement.ALL_TOKENS))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(Quantum.Status.SUCCESS, outcome.status(), String.valueOf(outcome.failure()));
+            long row = 8L * Short.BYTES;
+            long base = gpu.argmaxAddresses.get(0);
+            // A: rows 0-2 from offset 0; B: its final row (1 of 2) at offset 3; C: rows 0-1 at offset 5.
+            assertEquals(
+                    List.of(base, base + row, base + 2 * row, base + 4 * row, base + 5 * row, base + 6 * row),
+                    gpu.argmaxAddresses);
+            assertEquals(2, a.currentTokenPosition());
+            assertEquals(2, b.currentTokenPosition());
+            assertEquals(2, c.currentTokenPosition());
+            var layers = plan.weights().config().layerTypes();
+            for (int l = 0; l < layers.length; l++) {
+                if (layers[l] == LayerType.GATED_DELTA_NET) {
+                    assertEquals(2, ((GdnStates) a.recurrentState()).forLayer(l).pendingReplayRows());
+                    assertEquals(0, ((GdnStates) b.recurrentState()).forLayer(l).pendingReplayRows());
+                    assertEquals(0, ((GdnStates) c.recurrentState()).forLayer(l).pendingReplayRows());
+                } else {
+                    assertEquals(
+                            2, ((AttentionStates) a.kvCacheState()).forLayer(l).length());
+                    assertEquals(
+                            2, ((AttentionStates) c.kvCacheState()).forLayer(l).length());
+                }
+            }
+        } finally {
+            a.complete();
+            b.complete();
+            c.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void seedingDraftOnABatchSeedsEveryPart() throws Exception {
+        var gpu = new RecordingSelectionGpu();
+        var plan = new ExecutionPlan(ExecutionFixtures.mtpCompactWeights(8));
+        var execution = new Execution(new PullingLattice(), plan, gpu);
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        try {
+            var quantum = Quantum.batch(
+                            plan,
+                            Quantum.ExecutionKind.VERIFY,
+                            List.of(new Quantum.Part(a, 0, new int[] {1, 2}), new Quantum.Part(b, 0, new int[] {3})),
+                            LogitsRequirement.NONE)
+                    .seedingDraft();
+            var outcome = execution.submit(quantum).get(10, TimeUnit.SECONDS);
+            assertEquals(Quantum.Status.SUCCESS, outcome.status(), String.valueOf(outcome.failure()));
+            assertTrue(gpu.normOutputs.contains(((AttentionStates) a.kvCacheState()).seedRows()));
+            assertTrue(gpu.normOutputs.contains(((AttentionStates) b.kvCacheState()).seedRows()));
+        } finally {
+            a.complete();
+            b.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aSequenceCancelledBeforeAdmissionEndsCancelledAndTheOthersSucceed() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
+        var execution = new Execution(new PullingLattice(), plan, new EngineExecutionFixture.SamplingGpu(8));
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        try {
+            var quantum = Quantum.batch(
+                    plan,
+                    Quantum.ExecutionKind.VERIFY,
+                    List.of(new Quantum.Part(a, 0, new int[] {1}), new Quantum.Part(b, 0, new int[] {2})),
+                    LogitsRequirement.NONE);
+            a.cancel();
+            var outcome = execution.submit(quantum).get(10, TimeUnit.SECONDS);
+            assertEquals(Quantum.Status.SUCCESS, outcome.status(), String.valueOf(outcome.failure()));
+            assertEquals(Quantum.Status.CANCELLED, quantum.conclusionFor(a).status());
+            assertEquals(Quantum.Status.SUCCESS, quantum.conclusionFor(b).status());
+            assertEquals(Sequence.TerminalState.CANCELLED, a.terminalState());
+            assertEquals(Sequence.TerminalState.ACTIVE, b.terminalState());
+            assertEquals(1, b.currentTokenPosition());
+        } finally {
+            a.complete();
+            b.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    void conclusionForRejectsASequenceOutsideTheBatch() {
+        var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
+        var quantum = Quantum.batch(
+                plan,
+                Quantum.ExecutionKind.VERIFY,
+                List.of(new Quantum.Part(new Sequence(1), 0, new int[] {1})),
+                LogitsRequirement.NONE);
+        assertThrows(IllegalArgumentException.class, () -> quantum.conclusionFor(new Sequence(9)));
+    }
 }

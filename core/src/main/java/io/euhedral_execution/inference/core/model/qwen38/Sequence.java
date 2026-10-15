@@ -154,8 +154,23 @@ public final class Sequence {
     /// leaves the frontiers where they are (a draft, a capture) admits `[submitted, submitted)`. Admissions
     /// come from one chain of work.
     public void admit(Work work, long start, long end) {
+        admit(work, start, end, false);
+    }
+
+    /// As [#admit(Work, long, long)] for one segment of a batched pass: a sequence whose cancellation was requested
+    /// after the pass formed is admitted anyway. Its rows run and commit like a cancellation during execution, and
+    /// its settlement then ends it CANCELLED, so the other segments of the pass are unaffected.
+    public void admitSegment(Work work, long start, long end) {
+        admit(work, start, end, true);
+    }
+
+    private void admit(Work work, long start, long end, boolean tolerateCancellation) {
         Objects.requireNonNull(work, "work");
-        requireAdmissible();
+        if (!tolerateCancellation) requireAdmissible();
+        else if (!this.cancellationRequested
+                ? terminalState() != TerminalState.ACTIVE
+                : terminalState() != TerminalState.ACTIVE && terminalState() != TerminalState.CANCELLED)
+            throw new IllegalStateException("Sequence is terminal: " + terminalState());
         long frontier = submittedFrontier();
         if (start != frontier) {
             throw new IllegalArgumentException("Execution starts at " + start + " but the sequence is at " + frontier);
@@ -163,7 +178,7 @@ public final class Sequence {
         if (end < start) {
             throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
         }
-        enter(work, end);
+        enter(work, end, tolerateCancellation);
     }
 
     /// Admits `work` that leaves the frontiers where they are (a draft) at the submitted frontier, and returns
@@ -172,7 +187,7 @@ public final class Sequence {
         Objects.requireNonNull(work, "work");
         requireAdmissible();
         long frontier = submittedFrontier();
-        enter(work, frontier);
+        enter(work, frontier, false);
         return frontier;
     }
 
@@ -190,17 +205,20 @@ public final class Sequence {
     /// the count, so either the admission sees the cancellation and backs out, or the cancellation sees the work
     /// in flight and leaves its settlement to end the sequence. Work refused here, or by the queue, settles at
     /// once.
-    private void enter(Work work, long end) {
+    private void enter(Work work, long end, boolean tolerateCancellation) {
         long previous = this.submitted;
         this.submitted = end;
         this.admitted = this.admitted + 1;
         VarHandle.fullFence();
         TerminalState state = terminalState();
-        if (this.cancellationRequested || state != TerminalState.ACTIVE) {
+        boolean denied = tolerateCancellation
+                ? !this.cancellationRequested && state != TerminalState.ACTIVE
+                : this.cancellationRequested || state != TerminalState.ACTIVE;
+        if (denied) {
             this.submitted = previous;
             settle();
             throw new IllegalStateException(
-                    this.cancellationRequested
+                    this.cancellationRequested && !tolerateCancellation
                             ? "Sequence cancellation was requested"
                             : "Sequence is terminal: " + state);
         }
