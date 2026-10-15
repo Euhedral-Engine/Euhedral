@@ -370,10 +370,17 @@ class CudaGpuOperationsIntegrationTest {
         return result;
     }
 
+    /// Each value within `tolerance`, or within one BF16 step of the expected value when that step is larger.
     static void assertBf16Equals(short[] expected, short[] actual, float tolerance) {
         for (int i = 0; i < expected.length; i++) {
-            float difference = Math.abs(bf16ToFloat(expected[i]) - bf16ToFloat(actual[i]));
-            assertTrue(difference <= tolerance, "index " + i + ": " + difference);
+            float want = bf16ToFloat(expected[i]);
+            float difference = Math.abs(want - bf16ToFloat(actual[i]));
+            // A BF16 step is 2^16 float steps: BF16 keeps the top 16 bits of the float.
+            float step = Math.ulp(Math.abs(want)) * 65536f;
+            assertTrue(
+                    difference <= Math.max(tolerance, step),
+                    "index " + i + ": " + difference + " (expected " + bf16ToFloat(expected[i]) + ", actual "
+                            + bf16ToFloat(actual[i]) + ")");
         }
     }
 

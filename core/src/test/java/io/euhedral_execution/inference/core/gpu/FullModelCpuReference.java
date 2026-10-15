@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.gpu;
 import static io.euhedral_execution.inference.core.gpu.CudaGpuOperationsIntegrationTest.bf16ToFloat;
 import static io.euhedral_execution.inference.core.gpu.CudaGpuOperationsIntegrationTest.floatToBf16;
 import static io.euhedral_execution.inference.core.gpu.FirstLayerCpuReference.bf16Linear;
+import static io.euhedral_execution.inference.core.gpu.FirstLayerCpuReference.bits;
 import static io.euhedral_execution.inference.core.gpu.FirstLayerCpuReference.convolution;
 import static io.euhedral_execution.inference.core.gpu.FirstLayerCpuReference.gatedRmsNorm;
 import static io.euhedral_execution.inference.core.gpu.FirstLayerCpuReference.quantizedLinear;
@@ -60,8 +61,10 @@ final class FullModelCpuReference {
                 int valueWidth = valueHeads * valueHeadDim;
                 int queryKeyWidth = 2 * keyHeads * keyHeadDim;
                 int convolutionWidth = queryKeyWidth + valueWidth;
-                short[] queryKey = quantizedLinear(inputNorm, read(gpu, gdn.queryKey()), 1, hidden, queryKeyWidth, 4);
-                short[] valueZ = quantizedLinear(inputNorm, read(gpu, gdn.valueZ()), 1, hidden, valueWidth * 2, 5);
+                short[] queryKey = quantizedLinear(
+                        inputNorm, read(gpu, gdn.queryKey()), 1, hidden, queryKeyWidth, bits(gdn.queryKey()));
+                short[] valueZ = quantizedLinear(
+                        inputNorm, read(gpu, gdn.valueZ()), 1, hidden, valueWidth * 2, bits(gdn.valueZ()));
                 float[] a = bf16Linear(inputNorm, read(gpu, gdn.aProjection()), hidden, valueHeads);
                 float[] b = bf16Linear(inputNorm, read(gpu, gdn.bProjection()), hidden, valueHeads);
                 float[] aLog = readFp32(gpu, gdn.aLog());
@@ -85,7 +88,8 @@ final class FullModelCpuReference {
                                 (1.0 / Math.sqrt(keyHeadDim)));
                 short[] normalized = gatedRmsNorm(
                         recurrent.output(), valueZ, read(gpu, gdn.norm()), valueHeads, valueHeadDim, epsilon);
-                mixerDelta = quantizedLinear(normalized, read(gpu, gdn.output()), 1, valueWidth, hidden, 3);
+                mixerDelta =
+                        quantizedLinear(normalized, read(gpu, gdn.output()), 1, valueWidth, hidden, bits(gdn.output()));
             } else if (layer.mixer() instanceof AttentionWeights attention) {
                 int queryHeads = weights.config().numAttentionHeads();
                 int keyValueHeads = weights.config().numKeyValueHeads();
@@ -93,10 +97,16 @@ final class FullModelCpuReference {
                 int queryWidth = queryHeads * headDim;
                 int valueWidth = keyValueHeads * headDim;
                 short[] gateValue = quantizedLinear(
-                        inputNorm, read(gpu, attention.gateValue()), 1, hidden, queryWidth + valueWidth, 5);
+                        inputNorm,
+                        read(gpu, attention.gateValue()),
+                        1,
+                        hidden,
+                        queryWidth + valueWidth,
+                        bits(attention.gateValue()));
                 // With one causal key, softmax is exactly one; Q/K and RoPE therefore cannot affect this value.
                 short[] context = singleTokenAttentionContext(gateValue, queryHeads, keyValueHeads, headDim);
-                mixerDelta = quantizedLinear(context, read(gpu, attention.output()), 1, queryWidth, hidden, 3);
+                mixerDelta = quantizedLinear(
+                        context, read(gpu, attention.output()), 1, queryWidth, hidden, bits(attention.output()));
             } else {
                 throw new IllegalArgumentException("unsupported mixer in compact CPU reference: " + layer.mixer());
             }
@@ -104,9 +114,11 @@ final class FullModelCpuReference {
             short[] mixerHidden = residualAdd(hiddenState, mixerDelta);
             short[] postNorm = rmsNormUnitOffset(mixerHidden, read(gpu, layer.postAttentionNorm()), 1, hidden, epsilon);
             DenseFfnWeights ffn = (DenseFfnWeights) layer.ffn();
-            short[] gateUp = quantizedLinear(postNorm, read(gpu, ffn.gateUp()), 1, hidden, intermediate * 2, 3);
+            short[] gateUp =
+                    quantizedLinear(postNorm, read(gpu, ffn.gateUp()), 1, hidden, intermediate * 2, bits(ffn.gateUp()));
             short[] swiglu = swiGlu(gateUp, intermediate);
-            short[] ffnDelta = quantizedLinear(swiglu, read(gpu, ffn.down()), 1, intermediate, hidden, 3);
+            short[] ffnDelta =
+                    quantizedLinear(swiglu, read(gpu, ffn.down()), 1, intermediate, hidden, bits(ffn.down()));
             hiddenState = residualAdd(mixerHidden, ffnDelta);
             layerOutputs.put(layerIndex, hiddenState);
         }
@@ -119,7 +131,7 @@ final class FullModelCpuReference {
                 1,
                 hidden,
                 weights.config().vocabSize(),
-                3);
+                bits(weights.lmHead()));
         return new Result(Map.copyOf(layerOutputs), finalNormalized, logits);
     }
 
