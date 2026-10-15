@@ -116,13 +116,117 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         }
     }
 
-    /// One sequence's rows in a batched quantum: `tokenIds` from `startPosition`.
-    public record Part(Sequence sequence, long startPosition, int[] tokenIds) {
+    /// One sequence's rows in a batched quantum: `tokenIds` from `startPosition`, with the options the rows run
+    /// under. `hostLogits` receives the rows' logits (a verification's selections, or a decode step's final row);
+    /// `acceptance` and `selector` resolve a verification; `seedsDraft` keeps the rows' hidden states as the draft
+    /// seed; `forcedCommittedRows` commits only that many rows (0: no force).
+    public record Part(
+            Sequence sequence,
+            long startPosition,
+            int[] tokenIds,
+            HostLogits hostLogits,
+            SpeculativeAcceptance acceptance,
+            SpeculativeAcceptance.Selector selector,
+            boolean seedsDraft,
+            int forcedCommittedRows) {
         public Part {
             Objects.requireNonNull(sequence, "sequence");
             Objects.requireNonNull(tokenIds, "tokenIds");
             if (startPosition < 0 || tokenIds.length == 0) throw new IllegalArgumentException("invalid token range");
+            tokenIds = tokenIds.clone();
+            if (acceptance != null) {
+                if (acceptance.verifiedRows() != tokenIds.length)
+                    throw new IllegalArgumentException("the acceptance verifies other rows than the part's");
+                if (hostLogits == null)
+                    throw new IllegalArgumentException("an acceptance needs host logits to read the selections from");
+            }
+            if ((acceptance == null) != (selector == null))
+                throw new IllegalArgumentException("a selector is required exactly when an acceptance is given");
+            if (forcedCommittedRows < 0 || forcedCommittedRows > tokenIds.length)
+                throw new IllegalArgumentException("invalid committed row count");
         }
+
+        public Part(Sequence sequence, long startPosition, int[] tokenIds) {
+            this(sequence, startPosition, tokenIds, null, null, null, false, 0);
+        }
+
+        /// This part as a decode step that selects its next token from `logits`.
+        public Part sampling(HostLogits logits) {
+            return new Part(
+                    this.sequence,
+                    this.startPosition,
+                    this.tokenIds,
+                    Objects.requireNonNull(logits, "logits"),
+                    this.acceptance,
+                    this.selector,
+                    this.seedsDraft,
+                    this.forcedCommittedRows);
+        }
+
+        /// This part as a verification resolved by `acceptance` from the rows `selector` reads out of `logits`.
+        public Part verifying(
+                HostLogits logits, SpeculativeAcceptance acceptance, SpeculativeAcceptance.Selector selector) {
+            return new Part(
+                    this.sequence,
+                    this.startPosition,
+                    this.tokenIds,
+                    Objects.requireNonNull(logits, "logits"),
+                    Objects.requireNonNull(acceptance, "acceptance"),
+                    Objects.requireNonNull(selector, "selector"),
+                    this.seedsDraft,
+                    this.forcedCommittedRows);
+        }
+
+        /// This part keeping its rows' hidden states as the sequence's draft seed.
+        public Part seedingDraft() {
+            return new Part(
+                    this.sequence,
+                    this.startPosition,
+                    this.tokenIds,
+                    this.hostLogits,
+                    this.acceptance,
+                    this.selector,
+                    true,
+                    this.forcedCommittedRows);
+        }
+
+        /// This part committing only its first `rows` rows regardless of the selections (state tests).
+        Part withCommittedRows(int rows) {
+            if (rows <= 0) throw new IllegalArgumentException("invalid committed row count");
+            return new Part(
+                    this.sequence,
+                    this.startPosition,
+                    this.tokenIds,
+                    this.hostLogits,
+                    this.acceptance,
+                    this.selector,
+                    this.seedsDraft,
+                    rows);
+        }
+
+        public boolean verifies() {
+            return this.acceptance != null || this.forcedCommittedRows > 0;
+        }
+
+        public int rows() {
+            return this.tokenIds.length;
+        }
+    }
+
+    /// The single quantum that runs `part` alone: a verification when it verifies or has several rows, else a
+    /// decode step. Its logits are every row's for a verification with host logits, the last row's for a sampling
+    /// decode, and none otherwise.
+    public static Quantum alone(ExecutionPlan plan, Part part) {
+        ExecutionKind kind = part.verifies() || part.rows() > 1 ? ExecutionKind.VERIFY : ExecutionKind.DECODE;
+        LogitsRequirement logits = part.hostLogits() == null
+                ? LogitsRequirement.NONE
+                : kind == ExecutionKind.VERIFY ? LogitsRequirement.ALL_TOKENS : LogitsRequirement.LAST_TOKEN;
+        Quantum quantum = new Quantum(
+                plan, part.sequence(), kind, part.startPosition(), part.tokenIds(), logits, part.hostLogits());
+        if (part.acceptance() != null) quantum.withAcceptance(part.acceptance(), part.selector());
+        if (part.forcedCommittedRows() > 0) quantum.withCommittedRows(part.forcedCommittedRows());
+        if (part.seedsDraft()) quantum.seedingDraft();
+        return quantum;
     }
 
     /// Segment `index` of a batched quantum: `rows` rows of `sequence` from `startPosition`, at row `rowOffset` of
@@ -485,12 +589,19 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
 
     /// The acceptance rule of a VERIFY quantum; null commits every row (tests may force a count).
     private SpeculativeAcceptance acceptance;
+    private SpeculativeAcceptance.Selector selector = SpeculativeAcceptance.Selector.GREEDY;
     private int forcedCommittedRows;
 
     /// Binds the acceptance of a VERIFY quantum before submission.
     public Quantum withAcceptance(SpeculativeAcceptance acceptance) {
+        return withAcceptance(acceptance, SpeculativeAcceptance.Selector.GREEDY);
+    }
+
+    /// Binds the acceptance of a VERIFY quantum and the selector that reads its rows' tokens from the host logits.
+    public Quantum withAcceptance(SpeculativeAcceptance acceptance, SpeculativeAcceptance.Selector selector) {
         if (this.kind != ExecutionKind.VERIFY) throw new IllegalStateException("only verification resolves acceptance");
         this.acceptance = Objects.requireNonNull(acceptance, "acceptance");
+        this.selector = Objects.requireNonNull(selector, "selector");
         return this;
     }
 
@@ -512,7 +623,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         if (drafting()) return this.draftCommittedRows;
         if (this.forcedCommittedRows > 0) return this.forcedCommittedRows;
         if (this.acceptance == null) return this.tokenIds.length;
-        if (!this.acceptance.resolved()) this.acceptance.resolve(this.hostLogits.selectedTokens());
+        if (!this.acceptance.resolved()) this.acceptance.resolve(this.selector.select(this.hostLogits));
         return this.acceptance.committedRows();
     }
 

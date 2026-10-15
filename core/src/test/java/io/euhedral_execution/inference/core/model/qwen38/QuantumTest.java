@@ -14,6 +14,7 @@ import io.euhedral_execution.inference.core.generation.LogitsRequirement;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu.UploadBuffer;
 import io.euhedral_execution.inference.core.gpu.GpuStream;
 import io.euhedral_execution.inference.core.gpu.InlineGpuStream;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeAcceptance;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -708,5 +709,35 @@ class QuantumTest {
                         List.of(new Quantum.Part(nvfp4, 0, new int[] {1}), new Quantum.Part(bf16, 0, new int[] {2})),
                         LogitsRequirement.NONE));
         assertEquals("a batched quantum's sequences keep their caches in one format", failure.getMessage());
+    }
+
+    @Test
+    void aPartRefusesAnAcceptanceOverOtherRows() {
+        var gpu = new ExecutionFixtures.RecordingGpu();
+        var logits = new HostLogits(gpu, 8);
+        var acceptance = new SpeculativeAcceptance(new int[] {1, 2}, t -> false, 4);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new Quantum.Part(new Sequence(1), 0, new int[] {1, 2, 3})
+                        .verifying(logits, acceptance, SpeculativeAcceptance.Selector.GREEDY));
+    }
+
+    @Test
+    void aloneRunsADecodeOrAVerification() {
+        var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
+        var logits = new HostLogits(new ExecutionFixtures.RecordingGpu(), 8);
+        var decode = Quantum.alone(plan, new Quantum.Part(new Sequence(1), 0, new int[] {3}).sampling(logits));
+        assertEquals(Quantum.ExecutionKind.DECODE, decode.kind());
+        assertEquals(LogitsRequirement.LAST_TOKEN, decode.logitsRequirement());
+        var acceptance = new SpeculativeAcceptance(new int[] {3, 4}, t -> false, 4);
+        var verify = Quantum.alone(
+                plan,
+                new Quantum.Part(new Sequence(2), 0, new int[] {3, 4})
+                        .verifying(logits, acceptance, SpeculativeAcceptance.Selector.GREEDY)
+                        .seedingDraft());
+        assertEquals(Quantum.ExecutionKind.VERIFY, verify.kind());
+        assertEquals(LogitsRequirement.ALL_TOKENS, verify.logitsRequirement());
+        assertSame(acceptance, verify.acceptance());
+        assertTrue(verify.seedsDraft());
     }
 }

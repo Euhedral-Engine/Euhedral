@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
+import io.euhedral_execution.inference.core.generation.HostLogits;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.function.IntPredicate;
@@ -15,6 +16,15 @@ import java.util.function.IntPredicate;
 /// Committed rows equal the output count: row 0 carries t₀ and rows 1..k−1 the first k−1 outputs, which
 /// one-row decode would have fed. The last output (the next t₀, or the end token) is not fed yet.
 public final class SpeculativeAcceptance {
+    /// Reads each verified row's selected token from the rows a verification copied to the host.
+    @FunctionalInterface
+    public interface Selector {
+        int[] select(HostLogits rows);
+
+        /// The device's greedy choice of each row (rows queued with [HostLogits#queueRowSelections]).
+        Selector GREEDY = HostLogits::selectedTokens;
+    }
+
     private final int[] rows;
     private final IntPredicate endOfGeneration;
     private final int maxOutputs;
