@@ -393,21 +393,51 @@ class BatchedSegmentsTest {
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    void aSequenceCancelledBeforeTheBatchFormedRefusesIt() throws Exception {
+    void aClosedSecondSequenceRefusesTheBatchWithoutTouchingTheFirst() throws Exception {
         var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
         var execution = new Execution(new PullingLattice(), plan, new EngineExecutionFixture.SamplingGpu(8));
         var a = new Sequence(1);
         var b = new Sequence(2);
         try {
-            a.cancel();
+            var quantum = Quantum.batch(
+                    plan,
+                    Quantum.ExecutionKind.VERIFY,
+                    List.of(new Quantum.Part(a, 0, new int[] {1}), new Quantum.Part(b, 0, new int[] {2})),
+                    LogitsRequirement.NONE);
+            b.cancel();
+            b.complete();
+            var outcome = execution.submit(quantum).get(10, TimeUnit.SECONDS);
+            assertEquals(Quantum.Status.FAILED, outcome.status());
+            assertEquals(Sequence.TerminalState.ACTIVE, a.terminalState());
+            assertEquals(0, a.currentTokenPosition());
+            assertFalse(a.inFlight());
+        } finally {
+            a.complete();
+            execution.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aSequenceCancelledBeforeTheBatchFormedCommitsAndEndsCancelled() throws Exception {
+        var plan = new ExecutionPlan(ExecutionFixtures.statefulCompactWeights(8));
+        var execution = new Execution(new PullingLattice(), plan, new EngineExecutionFixture.SamplingGpu(8));
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        try {
+            b.cancel();
             var quantum = Quantum.batch(
                     plan,
                     Quantum.ExecutionKind.VERIFY,
                     List.of(new Quantum.Part(a, 0, new int[] {1}), new Quantum.Part(b, 0, new int[] {2})),
                     LogitsRequirement.NONE);
             var outcome = execution.submit(quantum).get(10, TimeUnit.SECONDS);
-            assertEquals(Quantum.Status.FAILED, outcome.status());
-            assertEquals(0, b.currentTokenPosition());
+            assertEquals(Quantum.Status.SUCCESS, outcome.status(), String.valueOf(outcome.failure()));
+            assertEquals(Sequence.TerminalState.ACTIVE, a.terminalState());
+            assertEquals(1, a.currentTokenPosition());
+            assertEquals(Sequence.TerminalState.CANCELLED, b.terminalState());
+            assertEquals(1, b.currentTokenPosition());
+            assertEquals(Quantum.Status.CANCELLED, quantum.conclusionFor(b).status());
         } finally {
             a.complete();
             b.complete();

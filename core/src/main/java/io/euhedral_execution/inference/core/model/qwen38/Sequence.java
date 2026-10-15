@@ -160,10 +160,9 @@ public final class Sequence {
     }
 
     /// As [#admit(Work, long, long)] for one segment of a batched pass: a sequence whose cancellation was requested
-    /// after the pass formed is admitted anyway; a closed or failed one is refused. Its rows run and commit like a
-    /// cancellation during execution, and its settlement then ends it CANCELLED, so the other segments of the pass
-    /// are unaffected. The caller admits a sequence cancelled before the pass formed through
-    /// [#admit(Work, long, long)], which refuses it.
+    /// (before or after the pass formed) is admitted anyway; a closed or failed one is refused. Its rows run and
+    /// commit like a cancellation during execution, and its settlement then ends it CANCELLED, so the other
+    /// segments of the pass are unaffected.
     public void admitSegment(Work work, long start, long end) {
         admit(work, start, end, true);
     }
@@ -181,6 +180,13 @@ public final class Sequence {
             throw new IllegalArgumentException("Execution ends at " + end + " before its start " + start);
         }
         enter(work, end, tolerateCancellation);
+    }
+
+    /// Throws unless a segment of a batched pass can be admitted now: the sequence is not closed or failed. It
+    /// changes nothing, so a pass checks all its sequences before it admits any.
+    public void requireSegmentAdmissible() {
+        if (!admissibleForSegment(terminalState()))
+            throw new IllegalStateException("Sequence is terminal: " + terminalState());
     }
 
     /// Whether a segment is admitted in `state`: never once the sequence is closed or failed; active, or cancelled
@@ -287,10 +293,14 @@ public final class Sequence {
     /// Ends the sequence COMPLETED, unless it already ended, and closes its persistent state. Lifecycle: the
     /// session runs it after its generation ended. A failed close is reported and retried by the next call.
     public void complete() {
+        // Published before the in-flight count is read, as [#cancel()] does: a segment admission either sees the
+        // sequence closed or is seen in flight.
+        this.closed = true;
+        VarHandle.fullFence();
         if (inFlight()) {
+            this.closed = false;
             throw new IllegalStateException("Cannot complete a sequence during execution");
         }
-        this.closed = true;
         this.terminal.compareAndSet(ACTIVE, COMPLETED);
         this.cleanup.close(this.recurrentState, this.kvCacheState, terminalFailure());
     }
