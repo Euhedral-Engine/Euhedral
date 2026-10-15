@@ -186,6 +186,16 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
 
     /// Runs on a worker with the slot held; releasing the slot starts the next admission.
     private void start(Admission admission) {
+        boolean shuttingDown;
+        synchronized (this) {
+            shuttingDown = this.closed;
+        }
+        if (shuttingDown) {
+            this.metrics.request(admission.api, ServerMetrics.Outcome.REJECTED);
+            admission.result.setErrorResult(ApiException.unavailable("The server is shutting down."));
+            release(admission);
+            return;
+        }
         if (admission.abandoned || admission.result.isSetOrExpired()) {
             this.metrics.request(admission.api, ServerMetrics.Outcome.CANCELLED);
             release(admission);
@@ -206,41 +216,56 @@ public class GenerationService implements SmartLifecycle, DisposableBean {
             release(admission);
             return;
         }
-        Responder responder = admission.planned.responder();
-        CompletionSink sink;
-        Runnable clientGone;
-        if (plan.stream()) {
-            var emitter = new SseEmitter(this.requestTimeoutMillis);
-            sink = responder.stream(plan, emitter);
-            admission.streaming.set(true);
-            emitter.onCompletion(admission.link::close);
-            emitter.onTimeout(() -> {
-                admission.abandon();
-                sink.fail(ApiException.timeout());
-            });
-            emitter.onError(failure -> {
-                admission.abandon();
-                admission.link.close();
-            });
-            clientGone = () -> emitter.completeWithError(new java.io.IOException("the client closed the connection"));
-            // The stream's headers: no caching, and no proxy buffering (nginx), so events reach the client as
-            // they are produced.
-            admission.result.setResult(ResponseEntity.ok()
-                    .header("Cache-Control", "no-cache")
-                    .header("X-Accel-Buffering", "no")
-                    .body(emitter));
-        } else {
-            sink = responder.json(plan, admission.result);
-            clientGone = () -> admission.result.setErrorResult(ApiException.clientClosed());
+        ChatGeneration job;
+        try {
+            Responder responder = admission.planned.responder();
+            CompletionSink sink;
+            Runnable clientGone;
+            if (plan.stream()) {
+                var emitter = new SseEmitter(this.requestTimeoutMillis);
+                sink = responder.stream(plan, emitter);
+                admission.streaming.set(true);
+                emitter.onCompletion(admission.link::close);
+                emitter.onTimeout(() -> {
+                    admission.abandon();
+                    sink.fail(ApiException.timeout());
+                });
+                emitter.onError(failure -> {
+                    admission.abandon();
+                    admission.link.close();
+                });
+                clientGone =
+                        () -> emitter.completeWithError(new java.io.IOException("the client closed the connection"));
+                // The stream's headers: no caching, and no proxy buffering (nginx), so events reach the client as
+                // they are produced.
+                admission.result.setResult(ResponseEntity.ok()
+                        .header("Cache-Control", "no-cache")
+                        .header("X-Accel-Buffering", "no")
+                        .body(emitter));
+            } else {
+                sink = responder.json(plan, admission.result);
+                clientGone = () -> admission.result.setErrorResult(ApiException.clientClosed());
+            }
+            job = new ChatGeneration(
+                    plan,
+                    generation,
+                    sink,
+                    new SerialTasks(this.backend.workers()),
+                    () -> release(admission),
+                    new ChatGeneration.Client(admission.link, clientGone, this::probeWaiting),
+                    new ChatGeneration.Telemetry(this.metrics, admission.api, admission.arrivedNanos));
+        } catch (RuntimeException | Error failure) {
+            // Nothing runs the generation: give back its session and the slot, and answer the request.
+            generation.close();
+            this.metrics.request(admission.api, ServerMetrics.Outcome.FAILED);
+            try {
+                admission.result.setErrorResult(apiException(failure));
+            } catch (RuntimeException completed) {
+                // The container already ended the request.
+            }
+            release(admission);
+            return;
         }
-        var job = new ChatGeneration(
-                plan,
-                generation,
-                sink,
-                new SerialTasks(this.backend.workers()),
-                () -> release(admission),
-                new ChatGeneration.Client(admission.link, clientGone, this::probeWaiting),
-                new ChatGeneration.Telemetry(this.metrics, admission.api, admission.arrivedNanos));
         admission.generation = job;
         if (admission.abandoned) job.abandon();
         job.start();

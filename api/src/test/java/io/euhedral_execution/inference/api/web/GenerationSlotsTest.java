@@ -108,6 +108,18 @@ class GenerationSlotsTest {
         await(() -> active() == 0);
     }
 
+    /// The job cannot be built after the generation opened: the session closes, the request fails, the slot frees.
+    @Test
+    void aStartThatFailsAfterOpeningReleasesItsSlot() throws Exception {
+        this.backend.failNextStart = true;
+        try (var client = HttpClient.newHttpClient()) {
+            assertEquals(500, status(client, SHORT));
+            assertTrue(this.backend.only().closed.await(10, TimeUnit.SECONDS));
+            await(() -> active() == 0);
+            assertEquals(200, status(client, SHORT));
+        }
+    }
+
     @Test
     void completionsReleaseTheirSlots() throws Exception {
         try (var client = HttpClient.newHttpClient()) {

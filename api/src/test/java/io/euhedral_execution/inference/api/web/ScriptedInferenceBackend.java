@@ -42,6 +42,12 @@ final class ScriptedInferenceBackend implements InferenceBackend {
     volatile boolean emptyReasoning;
     /// Generations the service may run at once.
     volatile int maxActive = 1;
+    /// When set, the next generation opened finds `workers()` null once afterwards, so starting its job fails.
+    volatile boolean failNextStart;
+
+    private volatile boolean nullWorkersOnce;
+    /// While set, a task started by the service's `release` waits for this latch.
+    volatile CountDownLatch holdReleaseStarts;
 
     /// Behavior of the next generations. Implementations must honor `generation.isCancelled()`.
     @FunctionalInterface
@@ -154,6 +160,24 @@ final class ScriptedInferenceBackend implements InferenceBackend {
 
     @Override
     public Executor workers() {
+        if (this.nullWorkersOnce) {
+            this.nullWorkersOnce = false;
+            return null;
+        }
+        CountDownLatch hold = this.holdReleaseStarts;
+        if (hold != null
+                && StackWalker.getInstance()
+                        .walk(frames ->
+                                frames.anyMatch(frame -> frame.getMethodName().equals("release")))) {
+            return task -> this.workers.execute(() -> {
+                try {
+                    hold.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                task.run();
+            });
+        }
         return this.workers;
     }
 
@@ -194,6 +218,10 @@ final class ScriptedInferenceBackend implements InferenceBackend {
         generation.grammar = output.grammar();
         generation.output = output;
         this.generations.add(generation);
+        if (this.failNextStart) {
+            this.failNextStart = false;
+            this.nullWorkersOnce = true;
+        }
         return generation;
     }
 
