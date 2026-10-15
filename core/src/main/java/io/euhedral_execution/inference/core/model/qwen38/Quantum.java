@@ -98,6 +98,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private final Chunk[] chunks;
     /// A batched quantum's sequences and their rows ([#batch]); null for a quantum of one sequence.
     private final Segment[] segments;
+    /// Whether any part of a batched quantum receives host logits.
+    private final boolean batchedHostLogits;
     /// The reader of this quantum's disk-backed weights and its number there; null and -1 without disk uses.
     private io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader diskReader;
     private long diskTicket = -1;
@@ -231,7 +233,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
 
     /// Segment `index` of a batched quantum: `rows` rows of `sequence` from `startPosition`, at row `rowOffset` of
     /// the quantum's rows and position slot `index` of its input record.
-    public record Segment(int index, Sequence sequence, long startPosition, int rows, int rowOffset) {}
+    /// `part` carries the options the rows run under.
+    public record Segment(int index, Sequence sequence, long startPosition, int rows, int rowOffset, Part part) {}
 
     public Quantum(ExecutionPlan plan, Sequence sequence, ExecutionKind kind, long startPosition, int[] tokenIds) {
         this(plan, sequence, kind, startPosition, tokenIds, LogitsRequirement.ALL_TOKENS);
@@ -281,13 +284,16 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         this.tokenIds = tokenIds.clone();
         this.chunks = new Chunk[] {new Chunk(0, startPosition, tokenIds.length, 0, true)};
         this.segments = null;
+        this.batchedHostLogits = false;
     }
 
     /// A quantum of several sequences' rows (decode or verification), run as one graph: every linear reads its
     /// weights once for all of them, and each row is computed as in a quantum of its own sequence (bit for bit, for
     /// verification). The sequences keep their attention caches in one format. Each sequence must have nothing else
-    /// in flight when the quantum is admitted; it commits all its rows. Logits are every row's
-    /// ([LogitsRequirement#ALL_TOKENS], in part order) or none; it is never captured.
+    /// in flight when the quantum is admitted; it commits the rows its part accepts ([#committedRows]), by default
+    /// all. Logits are every row's ([LogitsRequirement#ALL_TOKENS], in part order) or none; a part with host
+    /// logits receives its own rows' (a verification's selections, or a decode step's final row). It is never
+    /// captured.
     public static Quantum batch(
             ExecutionPlan plan, ExecutionKind kind, java.util.List<Part> parts, LogitsRequirement logits) {
         return new Quantum(plan, kind, parts, logits);
@@ -307,21 +313,41 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         this.hostLogits = null;
         this.segments = new Segment[parts.size()];
         int rows = 0;
+        boolean anyHostLogits = false;
+        boolean anySeedsDraft = false;
         for (int index = 0; index < parts.size(); index++) {
             Part part = parts.get(index);
-            for (int other = 0; other < index; other++)
-                if (parts.get(other).sequence() == part.sequence())
+            for (int other = 0; other < index; other++) {
+                Part earlier = parts.get(other);
+                if (earlier.sequence() == part.sequence())
                     throw new IllegalArgumentException("a batched quantum takes each sequence once");
+                if (part.hostLogits() != null && earlier.hostLogits() == part.hostLogits())
+                    throw new IllegalArgumentException("a batched quantum's parts take host logits of their own");
+            }
+            if (part.hostLogits() != null) {
+                if (logits != LogitsRequirement.ALL_TOKENS)
+                    throw new IllegalArgumentException("a part's host logits need every row's logits");
+                if (part.hostLogits().vocabularySize()
+                        != plan.weights().config().vocabSize())
+                    throw new IllegalArgumentException("host logits do not match the model vocabulary");
+                anyHostLogits = true;
+            }
+            if (part.verifies() && kind != ExecutionKind.VERIFY)
+                throw new IllegalArgumentException(
+                        "only a verification quantum resolves acceptance or commits a prefix");
+            anySeedsDraft |= part.seedsDraft();
             if (part.sequence().kvFormat() != parts.get(0).sequence().kvFormat())
                 throw new IllegalArgumentException("a batched quantum's sequences keep their caches in one format");
             this.segments[index] =
-                    new Segment(index, part.sequence(), part.startPosition(), part.tokenIds().length, rows);
+                    new Segment(index, part.sequence(), part.startPosition(), part.tokenIds().length, rows, part);
             rows += part.tokenIds().length;
         }
+        this.batchedHostLogits = anyHostLogits;
+        this.seedsDraft = anySeedsDraft;
         this.tokenIds = new int[rows];
-        for (Part part : parts) {
-            Segment segment = this.segments[parts.indexOf(part)];
-            System.arraycopy(part.tokenIds(), 0, this.tokenIds, segment.rowOffset(), segment.rows());
+        for (int index = 0; index < this.segments.length; index++) {
+            Segment segment = this.segments[index];
+            System.arraycopy(segment.part().tokenIds(), 0, this.tokenIds, segment.rowOffset(), segment.rows());
         }
         this.shape = plan.forExecution(kind, rows);
         this.sequence = this.segments[0].sequence();
@@ -382,6 +408,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             this.chunks[index] = new Chunk(index, startPosition + offset, rows, offset, index == count - 1);
         }
         this.segments = null;
+        this.batchedHostLogits = false;
     }
 
     /// Takes `checkpoints` inside the prompt graph: after each chunk that ends at a checkpoint the cache reserved,
@@ -627,7 +654,52 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return this.acceptance.committedRows();
     }
 
+    /// Rows of segment `segment` whose state this quantum commits. An unbatched quantum has segment 0 only
+    /// ([#committedRowCount]). A batched quantum's segment commits its part's forced count, else the prefix its
+    /// acceptance resolves (once, from the part's host logits after the device work retired), else all its rows.
+    public int committedRows(int segment) {
+        if (this.segments == null) {
+            if (segment != 0) throw new IllegalArgumentException("an unbatched quantum has one segment");
+            return committedRowCount();
+        }
+        Segment current = this.segments[segment];
+        Part part = current.part();
+        if (part.forcedCommittedRows() > 0) return part.forcedCommittedRows();
+        SpeculativeAcceptance acceptance = part.acceptance();
+        if (acceptance == null) return current.rows();
+        if (!acceptance.resolved()) acceptance.resolve(part.selector().select(part.hostLogits()));
+        return acceptance.committedRows();
+    }
+
+    /// The outcome `sequence` sees: a batched success is CANCELLED for a sequence that requested cancellation
+    /// (its rows committed, then [Sequence] ended it), otherwise [#conclusion].
+    public Outcome conclusionFor(Sequence sequence) {
+        Outcome outcome = this.conclusion;
+        if (this.segments != null
+                && outcome != null
+                && outcome.status() == Status.SUCCESS
+                && sequence.cancellationRequested()) return new Outcome(Status.CANCELLED, null);
+        return outcome;
+    }
+
     public void logitsProduced(long address) {
+        if (this.segments != null) {
+            int vocabulary = this.plan.weights().config().vocabSize();
+            for (Segment segment : this.segments) {
+                Part part = segment.part();
+                if (part.hostLogits() == null) continue;
+                long rowAddress = address + (long) segment.rowOffset() * vocabulary * Short.BYTES;
+                if (!part.verifies()) part.hostLogits().queueFinalRow(rowAddress, segment.rows());
+                else if (part.hostLogits().selectsOnDevice())
+                    part.hostLogits().queueRowSelections(rowAddress, segment.rows());
+                else
+                    // TEMPORARY: a verification without device selection needs every row's host copy
+                    // (HostLogits.queueRows), which is not available yet.
+                    throw new UnsupportedOperationException(
+                            "a batched verification's host logits must select on device");
+            }
+            return;
+        }
         if (this.hostLogits == null) return;
         if (this.kind == ExecutionKind.VERIFY) this.hostLogits.queueRowSelections(address, logitsRowCount());
         else this.hostLogits.queueFinalRow(address, logitsRowCount());
@@ -912,7 +984,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 sequence.fail(this.failed);
                 sequence.abandon();
             } else if (this.commits && blocked == null) {
-                sequence.commit(this.segment.startPosition() + this.segment.rows());
+                sequence.commit(this.segment.startPosition() + committedRows(this.segment.index()));
             } else {
                 if (blocked != null) sequence.fail(blocked);
                 sequence.abandon();
@@ -1054,12 +1126,14 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         return owners;
     }
 
-    /// A quantum is cancelled through its sequence (any of a batched quantum's).
+    /// A quantum is cancelled through its sequence; a batched quantum only when every one of its sequences asked, so
+    /// the others' rows still commit. A cancelled sequence's segment commits too and the sequence then ends
+    /// CANCELLED.
     @Override
     protected boolean cancelRequested() {
         if (this.segments == null) return this.sequence.cancellationRequested();
-        for (Segment segment : this.segments) if (segment.sequence().cancellationRequested()) return true;
-        return false;
+        for (Segment segment : this.segments) if (!segment.sequence().cancellationRequested()) return false;
+        return true;
     }
 
     /// A quantum the sequence admitted concludes in the sequence's admission order: it marks itself ready and
@@ -1101,7 +1175,7 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// its workspace is still held.
     @Override
     protected void commit() {
-        if (this.hostLogits == null && this.proposal == null) retainLogits(this.gpu);
+        if (this.hostLogits == null && !this.batchedHostLogits && this.proposal == null) retainLogits(this.gpu);
         if (this.terminalConsumer != null) this.terminalConsumer.accept(this);
     }
 
@@ -1219,6 +1293,10 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         Outcome completed = failed != null
                 ? new Outcome(Status.FAILED, failed)
                 : cancelled ? new Outcome(Status.CANCELLED, null) : new Outcome(Status.SUCCESS, null);
+        // The rows were copied before the retirement boundary; only a successful quantum exposes them.
+        for (Segment segment : this.segments)
+            if (segment.part().hostLogits() != null)
+                segment.part().hostLogits().retired(completed.status() == Status.SUCCESS);
         if (completed.failure() != null) {
             failed = releaseLogits(failed);
             fail(completed.failure());

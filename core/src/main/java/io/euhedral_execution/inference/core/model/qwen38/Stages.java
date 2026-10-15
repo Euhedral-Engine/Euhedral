@@ -188,27 +188,44 @@ public final class Stages {
             return context.workspace().positionAddress(chunk(context));
         }
 
-        /// One sequence's rows of this stage: its sequence, first position and its device address, row count and
-        /// first row in the quantum's rows.
-        protected record Part(Sequence sequence, long position, long positionAddress, int rows, int rowOffset) {}
+        /// One sequence's rows of this stage: its index among the quantum's sequences, the sequence, first position
+        /// and its device address, row count and first row in the quantum's rows, and whether its rows seed
+        /// the draft.
+        protected record Part(
+                int index,
+                Sequence sequence,
+                long position,
+                long positionAddress,
+                int rows,
+                int rowOffset,
+                boolean seedsDraft) {}
 
         /// This stage's rows by sequence: the stage's chunk of the quantum's sequence, or each segment of a batched
         /// quantum.
         protected final Part[] parts(Quantum context) {
             if (!context.batched())
                 return new Part[] {
-                    new Part(context.sequenceState(), position(context), positionAddress(context), rows(context), 0)
+                    new Part(
+                            0,
+                            context.sequenceState(),
+                            position(context),
+                            positionAddress(context),
+                            rows(context),
+                            0,
+                            context.seedsDraft())
                 };
             Quantum.Segment[] segments = context.segments();
             Part[] parts = new Part[segments.length];
             for (int index = 0; index < parts.length; index++) {
                 Quantum.Segment segment = segments[index];
                 parts[index] = new Part(
+                        index,
                         segment.sequence(),
                         segment.startPosition(),
                         context.workspace().positionAddress(index),
                         segment.rows(),
-                        segment.rowOffset());
+                        segment.rowOffset(),
+                        segment.part().seedsDraft());
             }
             return parts;
         }
@@ -385,6 +402,7 @@ public final class Stages {
                 long source =
                         context.workspace().address(instruction.inputBuffers().getFirst());
                 for (Part part : parts(context)) {
+                    if (!part.seedsDraft()) continue;
                     var states = (AttentionStates) part.sequence().kvCacheState();
                     normalize(
                             instruction,
@@ -776,17 +794,17 @@ public final class Stages {
             state.setPendingReplayRows(0);
         }
 
-        /// A verification whose GDN state ran past its committed rows leaves a replay for the next quantum. A batched
-        /// quantum commits every row.
+        /// A verification whose GDN state ran past its committed rows leaves a replay for the next quantum, for each
+        /// sequence of a batched quantum by its own committed rows.
         @Override
         protected void commit() {
             GdnState[] speculative = this.pendingSpeculativeStates;
             if (speculative == null) return;
-            int committed = context().committedRowCount();
             for (int index = 0; index < speculative.length; index++) {
                 int rows = this.pendingSpeculativeRows[index];
-                if (speculative[index] != null)
-                    speculative[index].setPendingReplayRows(context().batched() || committed >= rows ? 0 : committed);
+                if (speculative[index] == null) continue;
+                int committed = context().committedRows(index);
+                speculative[index].setPendingReplayRows(committed >= rows ? 0 : committed);
             }
         }
 
@@ -952,8 +970,12 @@ public final class Stages {
             Quantum context = context();
             if (this.pendingAppendStates == null || !chunk(context).last()) return;
             if (context.batched()) {
-                for (int index = 0; index < this.pendingAppendStates.length; index++)
-                    this.pendingAppendStates[index].commitAppended(this.pendingAppendRows[index]);
+                for (int index = 0; index < this.pendingAppendStates.length; index++) {
+                    int rows = this.pendingAppendRows[index];
+                    int committed = context.committedRows(index);
+                    if (committed == rows) this.pendingAppendStates[index].commitAppended(rows);
+                    else this.pendingAppendStates[index].commitSubmitted(committed);
+                }
                 return;
             }
             AttentionKvState state = this.pendingAppendStates[0];
