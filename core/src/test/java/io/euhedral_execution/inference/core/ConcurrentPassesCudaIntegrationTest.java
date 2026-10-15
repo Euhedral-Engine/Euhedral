@@ -101,14 +101,16 @@ class ConcurrentPassesCudaIntegrationTest {
                         after.batchedQuanta() - before.batchedQuanta(),
                         after.segments() - before.segments(),
                         after.rows() - before.rows());
-                if (speculation) {
-                    assertTrue(
-                            after.batchedQuanta() - before.batchedQuanta() > 0,
-                            "concurrent speculative sessions formed no batched verification pass");
-                }
+                assertTrue(
+                        after.batchedQuanta() - before.batchedQuanta() > 0,
+                        "concurrent sessions formed no batched verification pass, speculation " + speculation);
+                assertTrue(
+                        after.segments() - before.segments() > after.quanta() - before.quanta(),
+                        "batched passes carried no more segments than quanta, speculation " + speculation);
             }
 
             long idle = engine.allocatedDeviceBytes();
+            long idleRetained = engine.retainedWorkspaceBytes();
             long opened;
             try (GenerationSession session =
                     engine.createGenerationSession(GenerationConfig.greedy(7L), new SessionOptions(true))) {
@@ -116,13 +118,17 @@ class ConcurrentPassesCudaIntegrationTest {
                         .get(10, TimeUnit.MINUTES);
                 opened = engine.allocatedDeviceBytes();
             }
+            long retained = engine.retainedWorkspaceBytes() - idleRetained;
+            long footprint = opened - idle - retained;
             var model = runtime.config();
-            long derived = SequenceFootprint.extraSequenceBytes(model, KvFormat.NVFP4, CONTEXT_TOKENS, 5, true)
-                    + ResidencyPlanner.kvBytes(model, CONTEXT_TOKENS, KvFormat.NVFP4);
+            KvFormat kv = runtime.kvFormat();
+            long derived = SequenceFootprint.extraSequenceBytes(
+                            model, kv, CONTEXT_TOKENS, 1 + runtime.profile().speculativeDepth(), true)
+                    + ResidencyPlanner.kvBytes(model, CONTEXT_TOKENS, kv);
             System.out.printf(
                     "CONCURRENT_PASSES footprint measured %d bytes (%.1f MiB), derived bound %d bytes (%.1f MiB)%n",
-                    opened - idle, (opened - idle) / 1048576.0, derived, derived / 1048576.0);
-            assertTrue(opened - idle <= derived, "one open sequence takes " + (opened - idle) + " > " + derived);
+                    footprint, footprint / 1048576.0, derived, derived / 1048576.0);
+            assertTrue(footprint <= derived, "one open sequence takes " + footprint + " > " + derived);
         }
     }
 
