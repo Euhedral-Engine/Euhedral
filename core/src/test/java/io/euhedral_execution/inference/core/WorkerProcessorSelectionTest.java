@@ -29,6 +29,13 @@ class WorkerProcessorSelectionTest {
     }
 
     @Test
+    void processorsOfCoresKeepsWholeCoresInOrder() {
+        assertEquals(ProcessorTopology.bits(0, 8, 1, 9), HYBRID.processorsOfCores(2));
+        assertEquals(HYBRID.availableProcessorIds(), HYBRID.processorsOfCores(64));
+        assertThrows(IllegalArgumentException.class, () -> HYBRID.processorsOfCores(0));
+    }
+
+    @Test
     void onePerPhysicalCoreKeepsTheLowestProcessorOfEachCore() {
         var perCore = HYBRID.onePerPhysicalCore();
         assertEquals(ProcessorTopology.bits(0, 1, 4, 12), perCore.processorIds());
