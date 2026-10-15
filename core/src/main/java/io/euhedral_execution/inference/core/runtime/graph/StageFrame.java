@@ -141,6 +141,19 @@ public abstract class StageFrame extends AbstractFrame implements Runnable {
     /// before the boundary that later graphs await.
     protected void abandoned(GpuStream home) {}
 
+    /// Called once per quantum when the stage's last incoming edge arrived, before it is published: true lets it
+    /// be published now; false holds it, and the stage then calls [#releaseGate] (from any thread that may publish
+    /// frames) once whatever it waits for exists. A held stage keeps the graph live. A stage gates on host-side
+    /// work its device work needs (a read of the artifact), so that no stream ever waits for the host.
+    protected boolean passGate() {
+        return true;
+    }
+
+    /// Publishes this stage, held by [#passGate], once.
+    protected final void releaseGate() {
+        this.graph.releaseGated(this);
+    }
+
     /// Runs once per quantum on the retiring worker for a stage that attempted submission, after
     /// the quantum's device work has retired. `committed` is true only when the whole quantum
     /// succeeded: publish externally visible state then, and release temporary resources either
