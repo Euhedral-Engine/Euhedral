@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
 import io.euhedral_execution.inference.core.generation.HostLogits;
+import io.euhedral_execution.inference.core.generation.LogitsSampler;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.function.IntPredicate;
@@ -23,6 +24,15 @@ public final class SpeculativeAcceptance {
 
         /// The device's greedy choice of each row (rows queued with [HostLogits#queueRowSelections]).
         Selector GREEDY = HostLogits::selectedTokens;
+
+        /// The sampler's token for each row, drawn at the position that token occupies: row j of a verification
+        /// whose first row sits at `firstPosition - 1` is selected at `firstPosition + j`. A draft is
+        /// accepted only when it equals that token, so the committed sequence is the one ordinary sampled
+        /// decode produces.
+        static Selector sampled(LogitsSampler sampler, long firstPosition) {
+            Objects.requireNonNull(sampler, "sampler");
+            return rows -> sampler.selectRows(rows, firstPosition);
+        }
     }
 
     private final int[] rows;

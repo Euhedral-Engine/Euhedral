@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionFixtures;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.SpeculativeAcceptance;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -236,6 +237,36 @@ class LogitsSamplerTest {
         for (int row = rows - 1; row >= 0; row--)
             assertEquals(selected[row], reverse.selectRow(logits, row, 100 + row), "row " + row);
         assertArrayEquals(selected, new LogitsSampler(config, 4).selectRows(logits, 100), "a fresh sampler agrees");
+    }
+
+    @Test
+    void aSampledVerificationCommitsTheTokensOrdinarySampledDecodeDrawsWhateverTheDrafts() {
+        int rows = 6;
+        var gpu = new RowsGpu();
+        gpu.peak = 1.0f;
+        var logits = new HostLogits(gpu, 4);
+        logits.queueRows(1 << 20, rows);
+        logits.retired(true);
+        var config = new GenerationConfig(1.0f, 0, 1.0f, 7L, false);
+        long firstPosition = 40;
+        // Ordinary decode: each token is drawn at the position it occupies.
+        int[] ordinary = new int[rows];
+        var reference = new LogitsSampler(config, 4);
+        for (int row = 0; row < rows; row++) ordinary[row] = reference.selectRow(logits, row, firstPosition + row);
+
+        var selector = SpeculativeAcceptance.Selector.sampled(new LogitsSampler(config, 4), firstPosition);
+        assertArrayEquals(ordinary, selector.select(logits));
+        // Drafts that match the draws up to a point, then diverge, or never match, or all match.
+        for (int matching = 0; matching < rows; matching++) {
+            int[] verified = new int[rows];
+            verified[0] = 3;
+            for (int j = 1; j < rows; j++) verified[j] = j <= matching ? ordinary[j - 1] : (ordinary[j - 1] + 1) % 4;
+            var acceptance = new SpeculativeAcceptance(verified, token -> false, 100);
+            acceptance.resolve(selector.select(logits));
+            assertEquals(Math.min(matching, rows - 1), acceptance.acceptedDrafts());
+            int[] outputs = acceptance.outputs();
+            assertArrayEquals(Arrays.copyOf(ordinary, outputs.length), outputs, "matching " + matching);
+        }
     }
 
     @Test

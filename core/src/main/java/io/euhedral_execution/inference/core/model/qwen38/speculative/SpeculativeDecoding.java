@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38.speculative;
 
 import io.euhedral_execution.core.frames.AbstractFrame;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
+import io.euhedral_execution.inference.core.generation.LogitsSampler;
 import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.Execution;
@@ -27,6 +28,17 @@ public interface SpeculativeDecoding extends AutoCloseable {
                 Sequence sequence,
                 IntPredicate endOfGeneration,
                 int prefillChunk);
+
+        /// Whether the strategy can decode a sampling request ([SpeculativeDecoding#sampleWith]).
+        default boolean samples() {
+            return false;
+        }
+    }
+
+    /// Makes the strategy select every token with `sampler`, at the position the token occupies. Strategies decode
+    /// greedily unless they override this.
+    default void sampleWith(LogitsSampler sampler) {
+        if (!sampler.greedy()) throw new UnsupportedOperationException("this strategy decodes greedily only");
     }
 
     /// What the prefix cache needs from a speculative prompt: a call after each prefill chunk it [#wants] a

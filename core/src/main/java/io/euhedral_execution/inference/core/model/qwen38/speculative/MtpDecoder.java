@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.generation.GenerationFrames;
 import io.euhedral_execution.inference.core.generation.GenerationTimingListener;
 import io.euhedral_execution.inference.core.generation.HostLogits;
 import io.euhedral_execution.inference.core.generation.LogitsRequirement;
+import io.euhedral_execution.inference.core.generation.LogitsSampler;
 import io.euhedral_execution.inference.core.generation.StepPort;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.qwen38.AttentionStates;
@@ -127,6 +128,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
     private final int prefillChunk;
     private final int hidden;
     private final HostLogits baseLogits;
+    /// Selects the base model's tokens; null decodes greedily on the device.
+    private LogitsSampler sampler;
     private final HostLogits draftLogits;
     private final int[] draftTokens;
     /// Whether each vocabulary token is in the draft head's shortlist.
@@ -145,8 +148,24 @@ public final class MtpDecoder implements SpeculativeDecoding {
     public static SpeculativeDecoding.Factory factory(DraftLength length) {
         if (length.most() > MAX_VERIFIED)
             throw new IllegalArgumentException("a verification checks at most " + MAX_VERIFIED + " drafts");
-        return (runtime, plan, gpu, sequence, endOfGeneration, prefillChunk) ->
-                new MtpDecoder(runtime, plan, gpu, sequence, endOfGeneration, length, prefillChunk, length.most());
+        return new SpeculativeDecoding.Factory() {
+            @Override
+            public SpeculativeDecoding open(
+                    Execution runtime,
+                    ExecutionPlan plan,
+                    ExecutionGpu gpu,
+                    Sequence sequence,
+                    IntPredicate endOfGeneration,
+                    int prefillChunk) {
+                return new MtpDecoder(
+                        runtime, plan, gpu, sequence, endOfGeneration, length, prefillChunk, length.most());
+            }
+
+            @Override
+            public boolean samples() {
+                return true;
+            }
+        };
     }
 
     public MtpDecoder(
@@ -193,6 +212,12 @@ public final class MtpDecoder implements SpeculativeDecoding {
         for (int token : this.draftTokens)
             if (token >= 0 && token < this.inShortlist.length) this.inShortlist[token] = true;
         this.checkpoint = new MtpCheckpoint(plan.weights().config(), sequence.kvFormat());
+    }
+
+    @Override
+    public void sampleWith(LogitsSampler sampler) {
+        this.sampler = sampler.greedy() ? null : sampler;
+        this.baseLogits.selectOnDevice(sampler.greedy());
     }
 
     /// MTP state in a checkpoint at `p`: the MTP cache's rows below `p - 1` and the base hidden row of `p - 1`.
@@ -543,7 +568,9 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 int[] next = new int[end - offset];
                 System.arraycopy(prompt, offset + 1, next, 0, end - offset - 1);
                 if (last) {
-                    first = baseLogits.selectedToken();
+                    first = sampler == null
+                            ? baseLogits.selectedToken()
+                            : sampler.selectToken(baseLogits, null, prompt.length);
                     if (timing != null) timing.firstTokenSelected(System.nanoTime(), first);
                     next[next.length - 1] = first;
                 } else next[next.length - 1] = prompt[end];
@@ -719,7 +746,12 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 started = System.nanoTime();
                 runtime.offer(
                         new Quantum.Part(sequence, position, rows)
-                                .verifying(baseLogits, acceptance, SpeculativeAcceptance.Selector.GREEDY)
+                                .verifying(
+                                        baseLogits,
+                                        acceptance,
+                                        sampler == null
+                                                ? SpeculativeAcceptance.Selector.GREEDY
+                                                : SpeculativeAcceptance.Selector.sampled(sampler, position + 1))
                                 .seedingDraft(),
                         select);
             }
