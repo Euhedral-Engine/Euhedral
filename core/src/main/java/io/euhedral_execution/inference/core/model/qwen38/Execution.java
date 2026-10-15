@@ -49,9 +49,8 @@ public final class Execution implements AutoCloseable {
 
     private static final Consumer<Quantum> NO_TERMINAL_CONSUMER = ignored -> {};
 
-    /// How long the device must leave the window's flags alone at shutdown, and the longest the release runs.
-    private static final long RELEASE_QUIET_NANOS = 100_000_000L;
-    private static final long RELEASE_BOUND_NANOS = 10_000_000_000L;
+    /// The longest close waits for the owner to conclude the offers still waiting for a pass.
+    private static final long CONCLUDE_BOUND_NANOS = 10_000_000_000L;
 
     private static final int COUNTERS = 6;
     private static final int QUANTA = 0;
@@ -672,7 +671,7 @@ public final class Execution implements AutoCloseable {
                     done.complete(null);
                 }
             });
-            done.get(RELEASE_BOUND_NANOS, TimeUnit.NANOSECONDS);
+            done.get(CONCLUDE_BOUND_NANOS, TimeUnit.NANOSECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         } catch (ExecutionException | TimeoutException | RuntimeException unfinished) {
@@ -723,16 +722,6 @@ public final class Execution implements AutoCloseable {
             } catch (RuntimeException closeFailure) {
                 if (failure == null) failure = closeFailure;
                 else failure.addSuppressed(closeFailure);
-            }
-        }
-        // Every quantum retired, so the device holds no flag wait; should one remain, the window's flags are raised
-        // until the device leaves them alone, so freeing the workspace never waits on a read that will not come.
-        if (this.diskReader != null && this.gpu.completionProven()) {
-            try {
-                this.diskReader.releaseDevice(RELEASE_QUIET_NANOS, RELEASE_BOUND_NANOS);
-            } catch (RuntimeException releaseFailure) {
-                if (failure == null) failure = releaseFailure;
-                else failure.addSuppressed(releaseFailure);
             }
         }
         // Every quantum retired: the workspace is idle. A poisoned GPU keeps it, as it keeps the graphs' storage.
