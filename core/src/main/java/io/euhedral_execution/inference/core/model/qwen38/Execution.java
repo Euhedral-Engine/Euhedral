@@ -358,6 +358,8 @@ public final class Execution implements AutoCloseable {
         List<DiskUse> uses = this.diskReader == null ? List.of() : diskUses(admitted);
         long ticket = uses.isEmpty() ? -1 : this.nextDiskTicket++;
         if (ticket >= 0) context.readsFromDisk(this.diskReader, ticket);
+        // Counted when its graph starts publishing, so before any outcome of the quantum can be observed.
+        context.onPublishing(() -> count(context, admitted));
         boolean[] began = new boolean[1];
         try {
             this.runtime.admit(
@@ -370,11 +372,9 @@ public final class Execution implements AutoCloseable {
             // Refused after its graph started publishing: the failure drains what its stages leave, so the
             // reader must read its uses. Refused before: no stage of it runs, and nothing may be read for it.
             if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
-            if (context.stagesPublished()) count(context, admitted);
             return refused;
         }
         if (ticket >= 0 && context.stagesPublished()) this.diskReader.enqueue(ticket, uses, context::fail);
-        count(context, admitted);
         return null;
     }
 

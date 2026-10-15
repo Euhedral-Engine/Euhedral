@@ -331,10 +331,22 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     }
 
     private volatile boolean stagesPublishing;
+    private Runnable onPublishing;
 
     @Override
     public void stagesPublishing() {
         this.stagesPublishing = true;
+        Runnable hook = this.onPublishing;
+        if (hook != null) {
+            this.onPublishing = null;
+            hook.run();
+        }
+    }
+
+    /// Runs `hook` once when the quantum's graph starts publishing its stages, before any of them can run; set at
+    /// admission.
+    void onPublishing(Runnable hook) {
+        this.onPublishing = hook;
     }
 
     /// Whether the quantum's graph started publishing its stages ([#stagesPublishing()]).
