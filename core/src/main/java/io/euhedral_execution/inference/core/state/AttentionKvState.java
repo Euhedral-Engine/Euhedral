@@ -248,6 +248,9 @@ public final class AttentionKvState implements AutoCloseable {
         } catch (Throwable error) {
             failure = combine(failure, error);
         }
+        // Freed in stream order on the calling thread's stream (the legacy default stream on a worker), which the
+        // lanes' streams
+        // are not ordered against: safe because every quantum that read this memory retired before the close.
         for (int i = this.pages.size() - 1; i >= 0; i--) {
             try {
                 this.gpu.freeAsync(this.pages.get(i));

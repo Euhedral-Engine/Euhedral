@@ -277,6 +277,9 @@ public final class HostLogits implements AutoCloseable {
             if (this.row != null) this.row.close();
             if (this.rows != null) this.rows.close();
             if (this.selection != null) this.selection.close();
+            // Freed in stream order on the calling thread's stream (the legacy default stream on a worker), which the
+            // lanes' streams
+            // are not ordered against: safe because every quantum that read this memory retired before the close.
             if (this.deviceSelection != 0) this.gpu.freeAsync(this.deviceSelection);
             if (this.rowSelections != null) this.rowSelections.close();
             if (this.deviceRowSelections != 0) this.gpu.freeAsync(this.deviceRowSelections);

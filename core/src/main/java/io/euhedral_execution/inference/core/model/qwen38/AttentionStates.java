@@ -70,6 +70,9 @@ public final class AttentionStates implements AutoCloseable {
         if (rows > this.draftSeedCapacity) {
             // Grown in stream order inside a stage: the outgrown rows' readers precede it, through the carried
             // seed-row edges or by retiring first.
+            // Freed in stream order on the calling thread's stream (the legacy default stream on a worker), which the
+            // lanes' streams
+            // are not ordered against: safe because every quantum that read this memory retired before the close.
             if (this.draftSeedRows != 0) this.gpu.freeAsync(this.draftSeedRows);
             this.draftSeedRows = 0;
             this.draftSeedCapacity = 0;
