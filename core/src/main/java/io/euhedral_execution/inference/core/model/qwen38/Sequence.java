@@ -295,10 +295,14 @@ public final class Sequence {
     public void complete() {
         // Published before the in-flight count is read, as [#cancel()] does: a segment admission either sees the
         // sequence closed or is seen in flight.
+        // A close that races a batched pass's admission fails the pass's earlier segments (caller misuse: the
+        // generation that ended must not offer again), and a refused close restores what it found, so a sequence
+        // closed by an earlier call stays closed.
+        boolean wasClosed = this.closed;
         this.closed = true;
         VarHandle.fullFence();
         if (inFlight()) {
-            this.closed = false;
+            this.closed = wasClosed;
             throw new IllegalStateException("Cannot complete a sequence during execution");
         }
         this.terminal.compareAndSet(ACTIVE, COMPLETED);
