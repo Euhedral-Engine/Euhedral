@@ -28,7 +28,7 @@ class AsyncReadsTest {
     Path directory;
 
     /// A completion that records what it saw when it ran.
-    private static final class Done extends AsyncReads.Read {
+    private static class Done extends AsyncReads.Read {
         boolean ran;
         java.io.IOException failure;
 
@@ -217,6 +217,8 @@ class AsyncReadsTest {
         Path file = this.directory.resolve("refused");
         Files.write(file, content);
         int[] calls = {0};
+        // The fake refuses before io_uring_submit publishes the ring's tail: the entry stays prepared in the ring,
+        // and the next real submission sends it.
         AsyncReads.Submitter refuseFirst =
                 ring -> calls[0]++ == 0 ? -16 : AsyncReads.NATIVE_SUBMIT.submit(ring); // EBUSY, then the kernel's
         try (AsyncReads reads = open(refuseFirst);
@@ -243,6 +245,83 @@ class AsyncReadsTest {
                 java.util.Arrays.fill(untouched, (byte) 0x5a);
                 assertArrayEquals(untouched, handedBack.toArray(ValueLayout.JAVA_BYTE));
                 assertEquals(0, reads.inFlight());
+            } finally {
+                reads.closeFile(fd);
+            }
+        }
+    }
+
+    /// A submission that throws gives the read's pending slot and its count in flight back before the exception
+    /// leaves, and its prepared entry is defused: the next read completes alone.
+    @Test
+    void aSubmissionThatThrowsGivesItsReadBack() throws Exception {
+        byte[] content = new byte[2 * 4096];
+        new SplittableRandom(11).nextBytes(content);
+        Path file = this.directory.resolve("throws");
+        Files.write(file, content);
+        int[] calls = {0};
+        AsyncReads.Submitter throwFirst = ring -> {
+            if (calls[0]++ == 0) throw new IllegalStateException("the submission broke");
+            return AsyncReads.NATIVE_SUBMIT.submit(ring);
+        };
+        try (AsyncReads reads = open(throwFirst);
+                Arena arena = Arena.ofConfined()) {
+            int fd = reads.openFile(file);
+            try {
+                MemorySegment first = arena.allocate(4096, 4096);
+                MemorySegment second = arena.allocate(4096, 4096);
+                Done broken = new Done(1);
+                Done taken = new Done(2);
+                IllegalStateException failure = org.junit.jupiter.api.Assertions.assertThrows(
+                        IllegalStateException.class, () -> reads.submit(fd, first.address(), 4096, 0, broken));
+                assertEquals("the submission broke", failure.getCause().getMessage());
+                assertEquals(0, reads.inFlight());
+                assertEquals(0, reads.pendingReads());
+                assertTrue(reads.submit(fd, second.address(), 4096, 4096, taken));
+                List<AbstractFrame> emitted = poll(reads, 1);
+                for (int i = 0; i < 100; i++) reads.getDelegate().pull(emitted::add, frame -> false, Long.MAX_VALUE);
+                assertEquals(List.of(taken), emitted);
+                assertNull(taken.failure);
+                assertEquals(0, reads.pendingReads());
+            } finally {
+                reads.closeFile(fd);
+            }
+        }
+    }
+
+    /// A short read's rest that cannot be submitted ends the read as failed: it still completes, once.
+    @Test
+    void aShortReadWhoseRestCannotBeSubmittedCompletesAsFailed() throws Exception {
+        byte[] content = new byte[4096 + 100];
+        new SplittableRandom(13).nextBytes(content);
+        Path file = this.directory.resolve("short");
+        Files.write(file, content);
+        int[] calls = {0};
+        AsyncReads.Submitter throwOnRest = ring -> {
+            if (calls[0]++ > 0) throw new IllegalStateException("the rest's submission broke");
+            return AsyncReads.NATIVE_SUBMIT.submit(ring);
+        };
+        try (AsyncReads reads = open(throwOnRest);
+                Arena arena = Arena.ofConfined()) {
+            int fd = reads.openFile(file);
+            try {
+                // Two blocks asked for, 4196 bytes there: the first completion is short, its rest is resubmitted.
+                MemorySegment destination = arena.allocate(2 * 4096, 4096);
+                int[] reaped = {0};
+                Done done = new Done(1) {
+                    @Override
+                    protected void reaped() {
+                        reaped[0]++;
+                    }
+                };
+                assertTrue(reads.submit(fd, destination.address(), 2 * 4096, 0, done));
+                List<AbstractFrame> emitted = poll(reads, 1);
+                assertEquals(List.of(done), emitted);
+                assertNotNull(done.failure, "the read whose rest could not be submitted failed");
+                assertEquals(1, reaped[0]);
+                assertEquals(2, calls[0], "the rest was submitted once");
+                assertEquals(0, reads.inFlight());
+                assertEquals(0, reads.pendingReads());
             } finally {
                 reads.closeFile(fd);
             }
