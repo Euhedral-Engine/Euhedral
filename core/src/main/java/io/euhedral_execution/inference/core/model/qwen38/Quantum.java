@@ -107,8 +107,6 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private long diskTicket = -1;
     /// A batched quantum's place in each segment's sequence order.
     private SegmentWork[] segmentWorks;
-    /// Which segments' sequences had requested cancellation when the batch formed: those are refused at admission.
-    private boolean[] cancelledAtFormation;
     /// A prompt's prefix checkpoints, and for each chunk the checkpoint copied after it (-1: none).
     private PromptCheckpoints checkpoints;
     private int[] checkpointOf;
@@ -347,9 +345,6 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                     new Segment(index, part.sequence(), part.startPosition(), part.tokenIds().length, rows, part);
             rows += part.tokenIds().length;
         }
-        this.cancelledAtFormation = new boolean[parts.size()];
-        for (int index = 0; index < this.cancelledAtFormation.length; index++)
-            this.cancelledAtFormation[index] = parts.get(index).sequence().cancellationRequested();
         this.batchedHostLogits = anyHostLogits;
         this.seedsDraft = anySeedsDraft;
         this.tokenIds = new int[rows];
@@ -953,13 +948,12 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             for (Segment segment : this.segments)
                 if (segment.sequence().inFlight())
                     throw new IllegalStateException("a batched quantum's sequences must have nothing else in flight");
+            // Refused as a whole, before any sequence is admitted: a closed or failed sequence never harms the others.
+            for (Segment segment : this.segments) segment.sequence().requireSegmentAdmissible();
             for (Segment segment : this.segments) {
                 SegmentWork work = new SegmentWork(segment);
                 long end = Math.addExact(segment.startPosition(), segment.rows());
-                // Only a cancellation that arrived after the batch formed is tolerated.
-                if (this.cancelledAtFormation[segment.index()])
-                    segment.sequence().admit(work, segment.startPosition(), end);
-                else segment.sequence().admitSegment(work, segment.startPosition(), end);
+                segment.sequence().admitSegment(work, segment.startPosition(), end);
                 this.segmentWorks[segment.index()] = work;
             }
             this.admitted = true;
