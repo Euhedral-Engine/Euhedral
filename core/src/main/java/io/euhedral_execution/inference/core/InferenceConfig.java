@@ -13,7 +13,8 @@ import java.util.Objects;
 /// host memory, chosen automatically. `prefixCacheBytes` is the pinned host memory that keeps the state of
 /// earlier prompts for reuse (0 turns the cache off) and `prefixCacheCheckpointTokens` the prompt tokens between
 /// stored checkpoints, a multiple of the prefill chunk. `kvCache` is the format sequences keep their attention
-/// caches in; null takes the artifact's.
+/// caches in; null takes the artifact's. `maxSequences` is the number of concurrent sequences device memory is
+/// sized for: 0 sizes for as many as fit, otherwise at least 1.
 public record InferenceConfig(
         Path artifactPath,
         Path tokenizerDirectory,
@@ -23,7 +24,8 @@ public record InferenceConfig(
         Duration shutdownTimeout,
         long prefixCacheBytes,
         int prefixCacheCheckpointTokens,
-        KvFormat kvCache) {
+        KvFormat kvCache,
+        int maxSequences) {
     /// Prompt tokens per prefill quantum, and the grain the prefix cache's checkpoints are aligned to.
     public static final int PREFILL_CHUNK_TOKENS = 512;
 
@@ -46,6 +48,31 @@ public record InferenceConfig(
         if (prefixCacheCheckpointTokens <= 0 || prefixCacheCheckpointTokens % PREFILL_CHUNK_TOKENS != 0)
             throw new IllegalArgumentException(
                     "prefixCacheCheckpointTokens must be a positive multiple of " + PREFILL_CHUNK_TOKENS);
+        if (maxSequences < 0) throw new IllegalArgumentException("maxSequences must not be negative");
+    }
+
+    /// One sequence.
+    public InferenceConfig(
+            Path artifactPath,
+            Path tokenizerDirectory,
+            Path cudaLibraryPath,
+            BitSet workerCpus,
+            int maxContextTokens,
+            Duration shutdownTimeout,
+            long prefixCacheBytes,
+            int prefixCacheCheckpointTokens,
+            KvFormat kvCache) {
+        this(
+                artifactPath,
+                tokenizerDirectory,
+                cudaLibraryPath,
+                workerCpus,
+                maxContextTokens,
+                shutdownTimeout,
+                prefixCacheBytes,
+                prefixCacheCheckpointTokens,
+                kvCache,
+                1);
     }
 
     /// The artifact's attention cache format.

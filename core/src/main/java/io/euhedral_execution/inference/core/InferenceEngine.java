@@ -16,6 +16,7 @@ import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.model.ModelArchitecture;
 import io.euhedral_execution.inference.core.model.ModelRuntime;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
+import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.model.qwen38.Session;
@@ -63,6 +64,7 @@ public final class InferenceEngine implements AutoCloseable {
     /// owns its GPU (Flash-Next).
     private final ExecutionGpu ownedGpu;
     private final InferenceConfig config;
+    private final int maxSequences;
     private final BitSet workerCoreIds;
     private final InferenceRunSnapshot.RuntimeIdentity runtimeIdentity;
     private final List<GenerationSession> sessions = new ArrayList<>();
@@ -77,6 +79,7 @@ public final class InferenceEngine implements AutoCloseable {
             ModelRuntime model,
             ExecutionGpu ownedGpu,
             InferenceConfig config,
+            int maxSequences,
             BitSet workerCoreIds,
             InferenceRunSnapshot.RuntimeIdentity runtimeIdentity) {
         this.bootstrap = bootstrap;
@@ -85,6 +88,7 @@ public final class InferenceEngine implements AutoCloseable {
         this.model = model;
         this.ownedGpu = ownedGpu;
         this.config = config;
+        this.maxSequences = maxSequences;
         this.workerCoreIds = workerCoreIds;
         this.runtimeIdentity = runtimeIdentity;
     }
@@ -114,13 +118,11 @@ public final class InferenceEngine implements AutoCloseable {
             Artifact artifact = bootstrap.readArtifact(config.artifactPath());
             gpu = bootstrap.openGpu(config.cudaLibraryPath());
             ArtifactProfile profile = artifact == null ? null : ArtifactProfile.of(artifact);
+            KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);
+            int sequences = bootstrap.resolveSequences(
+                    artifact, profile, gpu, config.maxContextTokens(), kvFormat, config.maxSequences());
             model = bootstrap.loadModel(
-                    config.artifactPath(),
-                    artifact,
-                    profile,
-                    gpu,
-                    config.maxContextTokens(),
-                    ArtifactProfile.kvFormat(config.kvCache(), profile));
+                    config.artifactPath(), artifact, profile, gpu, config.maxContextTokens(), kvFormat, sequences);
             lattice = bootstrap.createLattice(config);
             bootstrap.startLattice(lattice);
             Qwen38Runtime dense = Qwen38Runtime.open(config, tokenizer, gpu, model, artifact, profile, lattice);
@@ -131,6 +133,7 @@ public final class InferenceEngine implements AutoCloseable {
                     dense,
                     gpu,
                     config,
+                    sequences,
                     workerCoreIds,
                     runtimeIdentity(config.cudaLibraryPath()));
         } catch (IOException | RuntimeException | Error failure) {
@@ -174,6 +177,7 @@ public final class InferenceEngine implements AutoCloseable {
                     runtime,
                     null,
                     config,
+                    1,
                     workerCoreIds,
                     runtimeIdentity(config.cudaLibraryPath()));
         } catch (IOException | RuntimeException | Error failure) {
@@ -329,6 +333,12 @@ public final class InferenceEngine implements AutoCloseable {
     }
 
     /// Returns the configuration this engine was loaded with; its worker IDs are the engine's workers.
+    /// The number of concurrent sequences device memory was sized for: the configured count, or for automatic
+    /// sizing (0) the most that fit.
+    public int maxSequences() {
+        return this.maxSequences;
+    }
+
     public InferenceConfig config() {
         return this.config;
     }
@@ -517,6 +527,56 @@ public final class InferenceEngine implements AutoCloseable {
             return new CudaGpuMemory(path);
         }
 
+        /// The sequences to size device memory for: `requested` when it is at least 1, otherwise (0, automatic)
+        /// the largest count whose [ResidencyPlanner] plan fits. The count is at most the rows a shared pass
+        /// holds (`euhedral.batch.max-rows`, a prefill chunk by default) over a verification's rows.
+        int resolveSequences(
+                Artifact artifact,
+                ArtifactProfile profile,
+                ExecutionGpu gpu,
+                int maxContextTokens,
+                KvFormat kvFormat,
+                int requested)
+                throws IOException {
+            if (requested >= 1) return requested;
+            int rows = Execution.positiveProperty("euhedral.batch.max-rows", InferenceConfig.PREFILL_CHUNK_TOKENS);
+            int cap = Math.max(
+                    1,
+                    rows
+                            / (1
+                                    + (profile.speculation() == ArtifactProfile.Speculation.MTP
+                                            ? profile.draftLength().most()
+                                            : 0)));
+            long free = deviceBudget(gpu);
+            long host = hostBudget();
+            int low = 1;
+            int high = cap;
+            // Fitting is monotone in the count: search for the largest that fits.
+            while (low < high) {
+                int middle = (low + high + 1) >>> 1;
+                if (ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat, middle)
+                        .fits()) low = middle;
+                else high = middle - 1;
+            }
+            LOG.info("Sequences: {} of {} tokens each (auto)", low, maxContextTokens);
+            return low;
+        }
+
+        private long deviceBudget(ExecutionGpu gpu) {
+            // Tests pin residency with a device budget below the free memory, which other processes shift between
+            // loads.
+            return Math.min(
+                    memoryInfo(gpu).freeBytes(),
+                    Long.getLong("euhedral.residency.device-budget-bytes", Long.MAX_VALUE));
+        }
+
+        /// Pinned memory for host-backed weights and the disk window: the host budget, which tests state.
+        private long hostBudget() {
+            return Long.getLong(
+                    "euhedral.residency.host-budget-bytes",
+                    HostBudget.system(false).pinnedBytes());
+        }
+
         /// Loads the artifact's executed objects, its attention caches in `kvFormat`, moving off the
         /// device only as many weights as a context of `maxContextTokens` needs to fit in its free
         /// memory: into pinned host memory up to the host budget ([HostBudget],
@@ -527,37 +587,34 @@ public final class InferenceEngine implements AutoCloseable {
                 ArtifactProfile profile,
                 ExecutionGpu gpu,
                 int maxContextTokens,
-                KvFormat kvFormat)
+                KvFormat kvFormat,
+                int sequences)
                 throws IOException {
             int positions = artifact.config().maxPositionEmbeddings();
             if (maxContextTokens > positions)
                 throw new IllegalArgumentException("a context of " + maxContextTokens + " tokens is longer than the "
                         + positions + " positions the model supports; set a smaller max context");
-            // Tests pin residency with a device budget below the free memory, which other processes shift between
-            // loads.
-            long free = Math.min(
-                    memoryInfo(gpu).freeBytes(),
-                    Long.getLong("euhedral.residency.device-budget-bytes", Long.MAX_VALUE));
-            // Pinned memory for host-backed weights and the disk window: the host budget, which tests state.
-            HostBudget budget = HostBudget.system(false);
-            long host = Long.getLong("euhedral.residency.host-budget-bytes", budget.pinnedBytes());
-            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat);
+            long free = deviceBudget(gpu);
+            long host = hostBudget();
+            var plan = ResidencyPlanner.plan(artifact, profile, free, maxContextTokens, host, kvFormat, sequences);
             if (!plan.fits() && plan.hostArenaBytes() + plan.windowBytes() > host)
                 throw new IOException("the weights the GPU cannot hold need "
                         + ((plan.hostArenaBytes() + plan.windowBytes()) >> 20) + " MiB of host memory (the token "
                         + "embedding, the host-backed weights and the disk window), more than the " + (host >> 20)
                         + " MiB host budget; set " + HostBudget.ENVIRONMENT + " higher or a smaller max context");
             if (!plan.fits())
-                throw new IOException("a context of " + maxContextTokens + " tokens does not fit in the "
-                        + (free >> 20) + " MiB free on this GPU, even with the weights in host memory; set a "
-                        + "smaller max context");
+                throw new IOException((sequences == 1 ? "a context" : sequences + " sequences") + " of "
+                        + maxContextTokens + " tokens does not fit in the " + (free >> 20)
+                        + " MiB free on this GPU, even with the weights in host memory; set a smaller max context"
+                        + (sequences == 1 ? "" : " or fewer sequences"));
             long diskBytes = 0;
             for (var tensor : artifact.tensors())
                 if (plan.diskBacked().contains(tensor.name())) diskBytes += tensor.byteSize();
             LOG.info(
-                    "Context {} tokens: {} MiB of the {} MiB free on the GPU, {} MiB of weights in host memory, {} MiB"
+                    "Context {} tokens x {} sequences: {} MiB of the {} MiB free on the GPU, {} MiB of weights in host memory, {} MiB"
                             + " read from the artifact through a {} MiB window (host budget {} MiB)",
                     maxContextTokens,
+                    sequences,
                     plan.deviceBytes() >> 20,
                     free >> 20,
                     plan.hostArenaBytes() >> 20,

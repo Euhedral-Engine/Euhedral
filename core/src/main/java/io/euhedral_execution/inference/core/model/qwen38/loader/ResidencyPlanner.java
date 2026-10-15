@@ -17,7 +17,7 @@ import java.util.Set;
 /// selection goes to pinned host memory up to the host budget and the rest stays in the artifact file (disk).
 ///
 /// The device budget is the resident weights, the staging ring for host-backed projections, the KV pages
-/// of one sequence of `maxContextTokens` and a fixed reserve for the per-sequence GDN state, the
+/// of every sequence of `maxContextTokens`, a fixed reserve for the first sequence's GDN state, the
 /// execution workspaces, the shared scratch and the kernel modules loaded after the model.
 public final class ResidencyPlanner {
 
@@ -56,11 +56,7 @@ public final class ResidencyPlanner {
         return Math.multiplyExact(layers * pages, 2 * AttentionKvState.planePageBytes(width, format));
     }
 
-    /// Plans residency with at most `hostBytes` of pinned host memory and a KV cache in `kvFormat`. Objects leave
-    /// the device in [HostWeightSelection]'s order, as many as the device needs; they go to host memory in that
-    /// order while it holds them beside the disk window, and the rest stay in the artifact file. The plan does not
-    /// fit when the device cannot make room, or when host memory cannot hold the token embedding (a gather, read in
-    /// place) and the window.
+    /// Plans residency for one sequence; see the overload for several.
     public static Plan plan(
             Artifact artifact,
             ArtifactProfile profile,
@@ -68,7 +64,38 @@ public final class ResidencyPlanner {
             int maxContextTokens,
             long hostBytes,
             KvFormat kvFormat) {
-        long fixed = kvBytes(artifact.config(), maxContextTokens, kvFormat) + RESERVE_BYTES;
+        return plan(artifact, profile, freeBytes, maxContextTokens, hostBytes, kvFormat, 1);
+    }
+
+    /// Plans residency for `sequences` concurrent sequences of up to `maxContextTokens` each, with at most
+    /// `hostBytes` of pinned host memory and a KV cache in `kvFormat`. Each sequence holds its KV, and each one
+    /// beyond the first the state of [SequenceFootprint] on top of the reserve. Objects leave the device in
+    /// [HostWeightSelection]'s order, as many as the device needs; they go to host memory in that order while it
+    /// holds them beside the disk window, and the rest stay in the artifact file. The plan does not fit when the
+    /// device cannot make room, or when host memory cannot hold the token embedding (a gather, read in place) and
+    /// the window.
+    public static Plan plan(
+            Artifact artifact,
+            ArtifactProfile profile,
+            long freeBytes,
+            int maxContextTokens,
+            long hostBytes,
+            KvFormat kvFormat,
+            int sequences) {
+        if (sequences < 1) throw new IllegalArgumentException("sequences must be at least 1");
+        long extra = sequences == 1
+                ? 0
+                : SequenceFootprint.extraSequenceBytes(
+                        artifact.config(),
+                        kvFormat,
+                        maxContextTokens,
+                        1 + profile.speculativeDepth(),
+                        profile.speculation() == ArtifactProfile.Speculation.MTP);
+        long fixed = Math.addExact(
+                Math.addExact(
+                        Math.multiplyExact(sequences, kvBytes(artifact.config(), maxContextTokens, kvFormat)),
+                        RESERVE_BYTES),
+                Math.multiplyExact(sequences - 1L, extra));
         Plan resident = deviceNeed(artifact, profile, Set.of());
         if (resident.deviceBytes() + fixed <= freeBytes) return tiers(artifact, resident, fixed, hostBytes, true);
         long all = artifactBytes(artifact, profile);
