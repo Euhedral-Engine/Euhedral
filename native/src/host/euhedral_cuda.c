@@ -134,15 +134,33 @@ int euhedral_cuda_host_weights_device_pointer(const void* host_address, uint64_t
     return EUHEDRAL_CUDA_SUCCESS;
 }
 
+/// The CUDA memory type of `address` (cudaMemoryType: 0 unregistered, 1 host page-locked, 2 device, 3 managed),
+/// or the negated CUDA error.
+int euhedral_cuda_memory_type(const void* address) {
+    struct cudaPointerAttributes attributes;
+    cudaError_t status = cudaPointerGetAttributes(&attributes, address);
+    if (status != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -(int)status;
+    }
+    return (int)attributes.type;
+}
+
 int euhedral_cuda_host_weights_free(void* address) {
     if (address == NULL) return EUHEDRAL_CUDA_SUCCESS;
     cudaError_t status = cudaHostUnregister(address);
+    // Memory the driver still pins must not return to the allocator: a later allocation reusing the range could
+    // not be registered, and the driver would keep translating its old pages. Keep it; the caller retries.
+    if (status != cudaSuccess) {
+        (void)cudaGetLastError();
+        return (int)status;
+    }
 #ifdef _WIN32
     _aligned_free(address);
 #else
     free(address);
 #endif
-    return status == cudaSuccess ? EUHEDRAL_CUDA_SUCCESS : (int)status;
+    return EUHEDRAL_CUDA_SUCCESS;
 }
 
 int euhedral_cuda_device_memory_info(uint64_t* free_byte_size, uint64_t* total_byte_size) {
