@@ -81,6 +81,11 @@ public final class EngineInferenceBackend implements InferenceBackend, AutoClose
     }
 
     @Override
+    public int maxActiveGenerations() {
+        return this.engine.maxSequences();
+    }
+
+    @Override
     public Executor workers() {
         return this.workers;
     }

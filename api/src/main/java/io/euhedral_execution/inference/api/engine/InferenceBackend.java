@@ -37,6 +37,11 @@ public interface InferenceBackend {
         }
     }
 
+    /// How many generations may run at once: the sequences the engine holds. The service queues the rest.
+    default int maxActiveGenerations() {
+        return 1;
+    }
+
     /// Runs request work as tasks on the backend's workers (the lattice's frames). Every piece of a request's
     /// work runs there; a task may block, and the other workers take over the rest of the work meanwhile.
     Executor workers();

@@ -24,7 +24,7 @@ class InferencePropertiesTest {
         expected.set(2, 6);
         expected.set(8);
         assertEquals(expected, InferenceProperties.parseCpus(" 2-5, 8 ,"));
-        var config = new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048, null)
+        var config = new InferenceProperties(PATH, PATH, PATH, "3", 4096, Duration.ofSeconds(4), "m", 0, 2048, null, 1)
                 .toInferenceConfig();
         assertEquals(BitSet.valueOf(new long[] {1L << 3}), config.workerCpus());
         assertEquals(Duration.ofSeconds(4), config.shutdownTimeout());
@@ -38,10 +38,12 @@ class InferencePropertiesTest {
         assertThrows(IllegalArgumentException.class, () -> InferenceProperties.parseCpus(" , "));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceProperties(null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048, null));
+                () -> new InferenceProperties(
+                        null, PATH, PATH, "1", 4096, Duration.ofSeconds(1), "m", 0, 2048, null, 1));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new InferenceProperties(PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048, null));
+                () -> new InferenceProperties(
+                        PATH, PATH, PATH, "1", 4096, Duration.ofSeconds(1), " ", 0, 2048, null, 1));
     }
 
     private static InferenceProperties bind(Map<String, String> overrides) {
@@ -67,6 +69,17 @@ class InferencePropertiesTest {
                 bind(Map.of("euhedral.inference.max-context-tokens", "65536"))
                         .toInferenceConfig()
                         .maxContextTokens());
+    }
+
+    @Test
+    void maxSequencesDefaultsToOneAndBinds() {
+        assertEquals(1, bind(Map.of()).toInferenceConfig().maxSequences());
+        assertEquals(
+                0,
+                bind(Map.of("euhedral.inference.max-sequences", "0"))
+                        .toInferenceConfig()
+                        .maxSequences());
+        assertThrows(Exception.class, () -> bind(Map.of("euhedral.inference.max-sequences", "-1")));
     }
 
     @Test
