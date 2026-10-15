@@ -105,6 +105,22 @@ public final class ProcessorTopology {
                     + this.available + ")");
     }
 
+    /// Returns the available processors of the lowest `cores` available cores, with their SMT siblings; every
+    /// available processor when there are no more cores than that.
+    public BitSet processorsOfCores(int cores) {
+        if (cores <= 0) throw new IllegalArgumentException("cores must be positive");
+        BitSet kept = new BitSet();
+        BitSet chosen = new BitSet();
+        BitSet all = coreIds(this.available);
+        for (int core = all.nextSetBit(0); core >= 0 && chosen.cardinality() < cores; core = all.nextSetBit(core + 1)) {
+            chosen.set(core);
+        }
+        for (int cpu = this.available.nextSetBit(0); cpu >= 0; cpu = this.available.nextSetBit(cpu + 1)) {
+            if (chosen.get(coreOf(cpu))) kept.set(cpu);
+        }
+        return kept;
+    }
+
     /// Selects every available processor, including all SMT siblings.
     public WorkerProcessorSelection allProcessors() {
         return new WorkerProcessorSelection(this, this.available);

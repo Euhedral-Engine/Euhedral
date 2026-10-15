@@ -12,8 +12,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /// Engine inputs bound from `euhedral.inference.*` (or `EUHEDRAL_INFERENCE_*` environment variables).
 ///
 /// `workerCpus` lists processor IDs accepted by Euhedral, not a worker count: comma-separated IDs and
-/// inclusive ranges such as `2,3,8-11`; unset, every processor the process may run on, and Euhedral pins one worker
-/// per core. `modelId` is the public name clients send as `model`.
+/// inclusive ranges such as `2,3,8-11`; unset, the processors of as many cores as the process has CPU time for (all
+/// of them without a cgroup CPU quota), and Euhedral pins one worker per core. `modelId` is the public name clients
+/// send as `model`.
 /// `maxContextTokens` is the longest prompt plus completion a request may use (default 32768); the
 /// engine keeps device memory for that much context and holds back weights in pinned host memory when
 /// the GPU cannot fit both. `prefixCacheBytes` is the pinned host memory that keeps the state of earlier prompts,
@@ -70,11 +71,12 @@ public record InferenceProperties(
                 this.maxSequences);
     }
 
-    /// The selected processors: the configured ones, or every available one when none are configured.
+    /// The selected processors: the configured ones, or, when none are configured, the available processors of as
+    /// many cores as the CPU time the process may use (its cgroup quota, which the JVM reports as available
+    /// processors); without a quota that is every available processor.
     BitSet selectedCpus() {
-        return workerCpus == null || workerCpus.isBlank()
-                ? ProcessorTopology.system().availableProcessorIds()
-                : parseCpus(workerCpus);
+        if (workerCpus != null && !workerCpus.isBlank()) return parseCpus(workerCpus);
+        return ProcessorTopology.system().processorsOfCores(Runtime.getRuntime().availableProcessors());
     }
 
     static BitSet parseCpus(String specification) {
