@@ -36,6 +36,40 @@ class OverlapTest(unittest.TestCase):
     def test_cjk_has_shingles(self):
         self.assertTrue(overlap.shingles("今日は天気がとても良いので散歩に行きます", 13))
 
+    def test_hindi_tokenizes_to_words(self):
+        self.assertEqual(overlap._WORD.findall("हिन्दी भाषा"), ["हिन्दी", "भाषा"])
+        self.assertEqual(len(overlap.shingles("हिन्दी भाषा बहुत सुंदर है और लोग इसे बोलते हैं", 3)), 8)
+
+    def test_embedded_question_in_long_turn_is_flagged(self):
+        question = " ".join(f"gsm{i}" for i in range(30))
+        turn = " ".join(f"filler{i}" for i in range(400)) + " " + question + " " + \
+            " ".join(f"tail{i}" for i in range(400))
+        ref = overlap.Reference()
+        ref.add(question)
+        m = ref.measure(turn)
+        self.assertLess(m["fraction"], 0.05)
+        self.assertEqual(m["shared"], 18)
+        self.assertEqual(m["containment"], 1.0)
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            (store / "ref.jsonl").write_text(json.dumps({"question": question}))
+            row = {"id": "a", "domain": "conversation", "order": 0, "language": "en", "turns": [turn]}
+            (store / "conversations.jsonl").write_text(json.dumps(row))
+            self.assertEqual(overlap.main([str(store), "--against", str(store / "ref.jsonl")]), 1)
+
+    def test_tools_and_fixture_text_are_checked(self):
+        phrase = " ".join(f"word{i}" for i in range(40))
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            (store / "ref.txt").write_text(phrase)
+            (store / "fx.json").write_text(json.dumps({"tools": {"t": {"default": phrase}}}))
+            row = {"id": "a", "domain": "tool_use", "order": 0, "language": "en", "turns": ["hello there"],
+                   "tools": [{"type": "function", "function": {"name": "t", "description": phrase}}],
+                   "fixture": "fx.json"}
+            (store / "conversations.jsonl").write_text(json.dumps(row))
+            self.assertEqual(overlap.main([str(store), "--against", str(store / "ref.txt")]), 1)
+            self.assertGreaterEqual(json.loads((store / "checks" / "overlap.json").read_text())["items"]["a"]["shared"], 5)
+
     def test_main_writes_report_and_fails_over_limit(self):
         with tempfile.TemporaryDirectory() as d:
             store = Path(d)
@@ -46,8 +80,8 @@ class OverlapTest(unittest.TestCase):
             (store / "conversations.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
             self.assertEqual(overlap.main([str(store), "--against", str(ref)]), 1)
             report = json.loads((store / "checks" / "overlap.json").read_text())
-            self.assertEqual(report["a"], 1.0)
-            self.assertEqual(report["b"], 0.0)
+            self.assertEqual(report["items"]["a"]["fraction"], 1.0)
+            self.assertEqual(report["items"]["b"]["fraction"], 0.0)
             self.assertEqual(report["n"], 13)
             self.assertEqual(len(report["references"][0]["sha256"]), 64)
             (store / "conversations.jsonl").write_text(json.dumps(rows[1]))
