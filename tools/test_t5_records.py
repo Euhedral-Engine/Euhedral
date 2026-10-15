@@ -118,17 +118,40 @@ class RecordsTest(unittest.TestCase):
     def document(self, text=b"print(1)\n", **kw):
         (self.store / "d.py").write_bytes(text)
         fields = dict(id="d0", kind="code", language="python", path="d.py",
-                      sha256=hashlib.sha256(b"print(1)\n").hexdigest(), source=HUMAN)
+                      sha256=hashlib.sha256(b"print(1)\n").hexdigest(), source=HUMAN, order=0)
         fields.update(kw)
         return records.Document(**fields)
 
     def check_docs(self, docs):
-        prose = records.Document("p0", "prose", "en", "d.py", hashlib.sha256(b"print(1)\n").hexdigest(), HUMAN)
+        prose = records.Document("p0", "prose", "en", "d.py", hashlib.sha256(b"print(1)\n").hexdigest(), HUMAN, 0)
         return records.validate_documents(docs + [prose], self.store, self.excluded, chunks=DOC_CHUNKS,
                                           code_languages=CODE_LANGS)
 
     def test_document_valid(self):
         self.assertEqual(self.check_docs([self.document()]), [])
+
+    def test_document_order_must_be_unique_from_zero(self):
+        self.assertTrue(any("d0" in e and "order must be an integer" in e
+                            for e in self.check_docs([self.document(order=None)])))
+        errors = self.check_docs([self.document(), self.document(id="d1")])
+        self.assertTrue(any("documents code" in e and "order" in e for e in errors))
+        self.assertEqual(self.check_docs([self.document(), self.document(id="d1", order=1)]), [])
+        self.assertTrue(any("documents code" in e for e in self.check_docs([self.document(order=2)])))
+
+    def test_non_english_prose_is_capped_among_the_used(self):
+        def prose(i, language, order):
+            return records.Document(f"p{i}", "prose", language, "d.py", hashlib.sha256(b"print(1)\n").hexdigest(),
+                                    HUMAN, order)
+        (self.store / "d.py").write_bytes(b"print(1)\n")
+        chunks = {"prose": 3}
+        run = lambda docs: records.validate_documents(docs, self.store, self.excluded, chunks=chunks)
+        docs = [prose(0, "en", 0), prose(1, "zh", 1), prose(2, "es-MX", 2)]
+        self.assertEqual(run(docs), [])
+        docs = [prose(0, "zh", 0), prose(1, "zh", 1), prose(2, "es", 2)]
+        self.assertTrue(any("non-English" in e for e in run(docs)))
+        spare = [prose(0, "en", 0), prose(1, "en", 1), prose(2, "en", 2), prose(3, "zh", 3), prose(4, "ja", 4),
+                 prose(5, "es", 5)]
+        self.assertEqual(run(spare), [])
 
     def test_document_sha_mismatch_and_missing(self):
         errors = self.check_docs([self.document(text=b"changed\n")])

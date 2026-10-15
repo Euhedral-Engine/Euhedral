@@ -27,6 +27,7 @@ DOCUMENT_CHUNKS = {"prose": 16, "code": 16}
 SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}
 SAMPLED_DOMAINS = frozenset({"conversation", "coding", "multilingual"})
 LANGUAGES = frozenset({"es", "zh", "ja", "ar", "hi", "mixed"})
+MAX_NON_ENGLISH_PROSE = 2  # of the prose documents that selection uses (the first DOCUMENT_CHUNKS["prose"] by order)
 CODE_LANGUAGES = frozenset({"java", "rust", "python", "sql", "config", "data"})
 EXCLUDED_PATH = Path(__file__).with_name("excluded_sources.json")
 
@@ -69,6 +70,7 @@ class Document:
     path: str  # relative to the store
     sha256: str
     source: Source
+    order: int | None = None  # pre-declared selection order within the kind (spares last)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,7 +104,8 @@ def load_conversations(path: Path) -> list[Conversation]:
 
 
 def load_documents(path: Path) -> list[Document]:
-    return [Document(r["id"], r["kind"], r["language"], r["path"], r["sha256"], Source.from_json(r.get("source")))
+    return [Document(r["id"], r["kind"], r["language"], r["path"], r["sha256"], Source.from_json(r.get("source")),
+                     r.get("order"))
             for r in _lines(path)]
 
 
@@ -263,6 +266,8 @@ def validate_documents(documents: list[Document], store: Path, excluded: dict,
             errors.append(f"{d.id}: missing file {d.path}")
         elif hashlib.sha256(file.read_bytes()).hexdigest() != d.sha256:
             errors.append(f"{d.id}: sha256 mismatch for {d.path}")
+        if not isinstance(d.order, int) or isinstance(d.order, bool):
+            errors.append(f"{d.id}: order must be an integer")
         if d.source.kind != "human":
             errors.append(f"{d.id}: documents must be human-authored")
         _check_human(d.id, d.source, excluded, errors)
@@ -270,6 +275,17 @@ def validate_documents(documents: list[Document], store: Path, excluded: dict,
         have = sum(1 for d in documents if d.kind == kind)
         if have < count:
             errors.append(f"documents {kind}: {have}, need at least {count}")
+    for kind in chunks:
+        members = [d for d in documents if d.kind == kind and isinstance(d.order, int)]
+        if sorted(d.order for d in members) != list(range(len(members))):
+            errors.append(f"documents {kind}: order values are not unique 0..{len(members) - 1}")
+    if "prose" in chunks:
+        used = sorted((d for d in documents if d.kind == "prose" and isinstance(d.order, int)),
+                      key=lambda d: d.order)[:chunks["prose"]]
+        foreign = [d.id for d in used if d.language.split("-")[0].lower() != "en"]
+        if len(foreign) > MAX_NON_ENGLISH_PROSE:
+            errors.append(f"documents prose: {len(foreign)} non-English among the {len(used)} used "
+                          f"(at most {MAX_NON_ENGLISH_PROSE}): {foreign}")
     if "code" in chunks:
         covered = {d.language for d in documents if d.kind == "code"}
         if code_languages - covered:
