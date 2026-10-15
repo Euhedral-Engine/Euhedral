@@ -241,7 +241,7 @@ public final class GdnState implements AutoCloseable {
     private Throwable free(long address, Throwable priorFailure, boolean convolution) {
         if (address == 0) return priorFailure;
         try {
-            this.gpu.free(address);
+            this.gpu.freeAsync(address);
             if (convolution) this.convolutionStateAddress = 0;
             else this.recurrentStateAddress = 0;
             return priorFailure;

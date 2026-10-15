@@ -31,8 +31,8 @@ public final class DFlash2State implements AutoCloseable {
         this.ringValues = new long[config.layers()];
         try {
             for (int layer = 0; layer < config.layers(); layer++) {
-                this.ringKeys[layer] = gpu.allocate(ringBytes());
-                this.ringValues[layer] = gpu.allocate(ringBytes());
+                this.ringKeys[layer] = gpu.allocateAsync(ringBytes());
+                this.ringValues[layer] = gpu.allocateAsync(ringBytes());
             }
         } catch (RuntimeException | Error failure) {
             close();
@@ -98,7 +98,7 @@ public final class DFlash2State implements AutoCloseable {
         for (long[] ring : rings) {
             for (int layer = 0; layer < ring.length; layer++) {
                 try {
-                    if (ring[layer] != 0) this.gpu.free(ring[layer]);
+                    if (ring[layer] != 0) this.gpu.freeAsync(ring[layer]);
                     ring[layer] = 0;
                 } catch (Throwable cleanupFailure) {
                     if (failure == null) failure = cleanupFailure;
@@ -107,7 +107,7 @@ public final class DFlash2State implements AutoCloseable {
             }
         }
         try {
-            if (this.taps != 0) this.gpu.free(this.taps);
+            if (this.taps != 0) this.gpu.freeAsync(this.taps);
             this.taps = 0;
         } catch (Throwable cleanupFailure) {
             if (failure == null) failure = cleanupFailure;

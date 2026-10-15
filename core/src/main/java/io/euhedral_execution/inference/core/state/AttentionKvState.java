@@ -250,7 +250,7 @@ public final class AttentionKvState implements AutoCloseable {
         }
         for (int i = this.pages.size() - 1; i >= 0; i--) {
             try {
-                this.gpu.free(this.pages.get(i));
+                this.gpu.freeAsync(this.pages.get(i));
                 this.pages.remove(i);
             } catch (Throwable error) {
                 failure = combine(failure, error);
@@ -258,7 +258,7 @@ public final class AttentionKvState implements AutoCloseable {
         }
         if (this.table != 0) {
             try {
-                this.gpu.free(this.table);
+                this.gpu.freeAsync(this.table);
                 this.table = 0;
             } catch (Throwable error) {
                 failure = combine(failure, error);
@@ -266,7 +266,7 @@ public final class AttentionKvState implements AutoCloseable {
         }
         if (this.decodeScratch != 0) {
             try {
-                this.gpu.free(this.decodeScratch);
+                this.gpu.freeAsync(this.decodeScratch);
                 this.decodeScratch = 0;
             } catch (Throwable error) {
                 failure = combine(failure, error);
