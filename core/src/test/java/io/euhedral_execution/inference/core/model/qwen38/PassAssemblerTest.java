@@ -133,11 +133,13 @@ class PassAssemblerTest {
         a.offer(step("X", 1));
         Step b = step("B", 1);
         Step c = step("C", 1);
-        Step b2 = step("B", 1);
+        Step b2 = step("D", 1);
         a.offer(b);
         a.offer(c);
         a.offer(b2);
-        assertEquals(List.of(b, b2), a.withdraw(s -> s.sequence().equals("B")));
+        assertEquals(
+                List.of(b, b2),
+                a.withdraw(s -> s.sequence().equals("B") || s.sequence().equals("D")));
         assertEquals(1, a.pendingCount());
         a.retired(List.of());
         assertEquals(List.of("C"), names(passes.get(1)));
@@ -241,5 +243,58 @@ class PassAssemblerTest {
         a.offer(step("B", 1));
         assertEquals(2, seen.size());
         assertEquals(0, a.passesInFlight());
+    }
+
+    @Test
+    void aMemberThatLeavesBeforeItsPassRetiresIsNotAwaited() {
+        var a = assembler(8, 8);
+        a.offer(step("A", 1));
+        a.offer(step("B", 1));
+        a.leave("A");
+        a.retired(List.of("A"));
+        assertEquals(0, a.awaitingCount());
+        assertEquals(2, passes.size());
+        assertEquals(List.of("B"), names(passes.get(1)));
+    }
+
+    @Test
+    void aMemberThatOfferedBeforeItsPassRetiresIsNotAwaited() {
+        var a = assembler(8, 8);
+        a.offer(step("A", 1));
+        a.offer(step("A", 1));
+        a.retired(List.of("A"));
+        assertEquals(0, a.awaitingCount());
+        assertEquals(2, passes.size());
+    }
+
+    @Test
+    void aFailedRunLeavesTheGateConsistent() {
+        boolean[] fail = {true};
+        var a = new PassAssembler<String, Step>(Step::sequence, Step::rows, 4, 8, pass -> {
+            if (fail[0]) {
+                throw new RuntimeException("boom");
+            }
+            passes.add(List.copyOf(pass));
+            return 1;
+        });
+        assertThrows(IllegalStateException.class, () -> a.offer(step("A", 1)));
+        assertEquals(0, a.passesInFlight());
+        assertEquals(0, a.pendingCount());
+        fail[0] = false;
+        a.offer(step("A", 1));
+        assertEquals(1, passes.size());
+        assertThrows(
+                IllegalStateException.class,
+                () -> new PassAssembler<String, Step>(Step::sequence, Step::rows, 4, 8, pass -> -1)
+                        .offer(step("B", 1)));
+    }
+
+    @Test
+    void aSecondPendingOfferFromOneSequenceIsRefused() {
+        var a = assembler(8, 8);
+        a.offer(step("A", 1));
+        a.offer(step("B", 1));
+        assertThrows(IllegalStateException.class, () -> a.offer(step("B", 1)));
+        assertEquals(1, a.pendingCount());
     }
 }
