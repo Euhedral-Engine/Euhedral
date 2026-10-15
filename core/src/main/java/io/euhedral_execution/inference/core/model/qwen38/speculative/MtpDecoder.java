@@ -269,7 +269,13 @@ public final class MtpDecoder implements SpeculativeDecoding {
     /// generation frames on the lattice; the calling thread waits for them (tests and tools).
     public List<Integer> generate(int[] prompt, int maxNewTokens, IntConsumer onToken, GenerationTimingListener timing)
             throws InterruptedException, ExecutionException {
-        Generation generation = new Generation(new GenerationFrames(this.runtime.lake()));
+        Generation generation = new Generation(new GenerationFrames(this.runtime.lake())) {
+            /// The run ended, however it did: the sequence no longer holds back a shared pass.
+            @Override
+            protected void ended(List<Integer> tokens, Throwable failure) {
+                runtime.leave(sequence);
+            }
+        };
         StepPort first;
         try {
             first = start(prompt, maxNewTokens, onToken, timing, null, 0, generation::complete);
@@ -709,16 +715,9 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 int budget = maxNewTokens - output.size();
                 acceptance = new SpeculativeAcceptance(rows, endOfGeneration, everyPosition ? 1 : budget);
                 started = System.nanoTime();
-                runtime.admit(
-                        new Quantum(
-                                        plan,
-                                        sequence,
-                                        Quantum.ExecutionKind.VERIFY,
-                                        position,
-                                        rows,
-                                        LogitsRequirement.ALL_TOKENS,
-                                        baseLogits)
-                                .withAcceptance(acceptance)
+                runtime.offer(
+                        new Quantum.Part(sequence, position, rows)
+                                .verifying(baseLogits, acceptance, SpeculativeAcceptance.Selector.GREEDY)
                                 .seedingDraft(),
                         select);
             }
@@ -772,15 +771,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
             @Override
             public void admit(AbstractFrame select) {
                 started = System.nanoTime();
-                runtime.admit(
-                        new Quantum(
-                                plan,
-                                sequence,
-                                Quantum.ExecutionKind.DECODE,
-                                sequence.currentTokenPosition(),
-                                new int[] {finalToken},
-                                LogitsRequirement.NONE),
-                        select);
+                runtime.offer(
+                        new Quantum.Part(sequence, sequence.currentTokenPosition(), new int[] {finalToken}), select);
             }
 
             @Override
@@ -799,8 +791,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
     }
 
     /// A speculative step must succeed: anything else ends the run.
-    private static void succeeded(AbstractQuantum step) {
-        Quantum.Outcome outcome = ((Quantum) step).conclusion();
+    private void succeeded(AbstractQuantum step) {
+        Quantum.Outcome outcome = ((Quantum) step).conclusionFor(this.sequence);
         if (outcome.status() != Quantum.Status.SUCCESS)
             throw new IllegalStateException("speculative quantum " + outcome.status(), outcome.failure());
     }

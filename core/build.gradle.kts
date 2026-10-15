@@ -23,6 +23,7 @@ val latticeTestClasses = listOf(
     "**/runtime/EuhedralInferenceRuntimeLatticeTest.class",
     "**/model/qwen38/SessionTest.class",
     "**/model/qwen38/SessionPrefixCacheTest.class",
+    "**/model/qwen38/SessionPassesTest.class",
     "**/InferenceEngineTest.class",
     "**/model/qwen4/LatticeHostTest.class",
 )
