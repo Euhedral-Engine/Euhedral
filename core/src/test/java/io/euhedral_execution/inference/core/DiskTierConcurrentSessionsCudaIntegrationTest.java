@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import io.euhedral_execution.hardware_utils.topology.SystemInfo;
 import io.euhedral_execution.inference.core.generation.GenerationSession;
 import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
@@ -14,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -21,9 +21,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 /// Sessions that start together while weights are read from disk finish, and each produces the tokens it produces
-/// alone. Their prompts are admitted at once; the quanta that read the artifact run one after the other, because
-/// graphs submitting at once block every worker in full device streams while the device waits for reads that only a
-/// free worker reaps.
+/// alone. Their prompts are admitted at once on two workers, fewer than the sessions, so graphs submitting together
+/// fill the device streams and hold the workers in CUDA calls; the device never waits for a read, so the streams
+/// drain and the workers are released.
 // Own JVM: sets the global residency budget properties.
 @ModelGroup.OwnJvm
 class DiskTierConcurrentSessionsCudaIntegrationTest {
@@ -47,11 +47,13 @@ class DiskTierConcurrentSessionsCudaIntegrationTest {
         assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no NVFP4 artifact");
         String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
         assumeTrue(tokenizer != null, "no tokenizer directory");
+        BitSet workers = new BitSet();
+        workers.set(2, 4);
         var config = new InferenceConfig(
                 Path.of(artifact),
                 Path.of(tokenizer),
                 Path.of(library),
-                SystemInfo.getPCpuSet(),
+                workers,
                 CONTEXT_TOKENS,
                 Duration.ofSeconds(30),
                 0,
