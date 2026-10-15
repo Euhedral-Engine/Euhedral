@@ -225,7 +225,7 @@ public final class Stages {
                         context.workspace().positionAddress(index),
                         segment.rows(),
                         segment.rowOffset(),
-                        segment.part().seedsDraft());
+                        context.seedsDraft(index));
             }
             return parts;
         }

@@ -92,6 +92,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     private int draftCommittedRows;
     /// Base quanta of a speculative session also keep every row's post-final-norm hidden for drafting.
     private boolean seedsDraft;
+    /// Whether [#seedingDraft] was asked of a batched quantum as a whole: every part seeds.
+    private boolean seedsEveryPart;
     /// A DFlash2 block's host copy of its proposal, queued by its selector stage.
     private DFlash2Proposal proposal;
     /// The quantum's rows in chunks: a prompt's chunks, or one chunk of all its rows.
@@ -293,7 +295,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// in flight when the quantum is admitted; it commits the rows its part accepts ([#committedRows]), by default
     /// all. Logits are every row's ([LogitsRequirement#ALL_TOKENS], in part order) or none; a part with host
     /// logits receives its own rows' (a verification's selections, or a decode step's final row). It is never
-    /// captured.
+    /// captured. Parts without host logits get no logits: a batch may mix parts that receive theirs with parts that
+    /// do not (a feed whose next token is unknown, a decode with nothing further to sample).
     public static Quantum batch(
             ExecutionPlan plan, ExecutionKind kind, java.util.List<Part> parts, LogitsRequirement logits) {
         return new Quantum(plan, kind, parts, logits);
@@ -591,11 +594,19 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     public Quantum seedingDraft() {
         if (drafting()) throw new IllegalStateException("drafting does not seed itself");
         this.seedsDraft = true;
+        this.seedsEveryPart = this.segments != null;
         return this;
     }
 
     public boolean seedsDraft() {
         return this.seedsDraft;
+    }
+
+    /// Whether segment `segment` keeps its rows' hidden states as the draft seed: its part asks, or the batched
+    /// quantum as a whole does ([#seedingDraft]). An unbatched quantum has segment 0 only.
+    public boolean seedsDraft(int segment) {
+        if (this.segments == null) return this.seedsDraft;
+        return this.seedsEveryPart || this.segments[segment].part().seedsDraft();
     }
 
     /// Binds the host copy that a DFlash2 block quantum's proposal is queued into before it retires.
@@ -674,6 +685,11 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     /// The outcome `sequence` sees: a batched success is CANCELLED for a sequence that requested cancellation
     /// (its rows committed, then [Sequence] ended it), otherwise [#conclusion].
     public Outcome conclusionFor(Sequence sequence) {
+        if (this.segments != null) {
+            boolean member = false;
+            for (Segment segment : this.segments) member |= segment.sequence() == sequence;
+            if (!member) throw new IllegalArgumentException("the sequence is not in the batched quantum");
+        }
         Outcome outcome = this.conclusion;
         if (this.segments != null
                 && outcome != null
@@ -935,7 +951,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
             for (Segment segment : this.segments) {
                 SegmentWork work = new SegmentWork(segment);
                 segment.sequence()
-                        .admit(work, segment.startPosition(), Math.addExact(segment.startPosition(), segment.rows()));
+                        .admitSegment(
+                                work, segment.startPosition(), Math.addExact(segment.startPosition(), segment.rows()));
                 this.segmentWorks[segment.index()] = work;
             }
             this.admitted = true;
@@ -1171,7 +1188,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         conclusion.run();
     }
 
-    /// Keeps the final logits (when no host row takes them) and hands the quantum to the terminal consumer while
+    /// Keeps the final logits (when no host row takes them; a batched quantum keeps none once any part has host
+    /// logits, so its parts without host logits get no logits) and hands the quantum to the terminal consumer while
     /// its workspace is still held.
     @Override
     protected void commit() {
