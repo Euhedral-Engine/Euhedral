@@ -3,8 +3,9 @@
 Usage (from tools/): python3 -m t5.sources check STORE
 
 Re-derives the publication date of every human source with a github.com URL (an issue or pull request: its
-`created_at`; a file: the date of the oldest commit touching it on the linked ref, renames not followed, and the
-repository must itself have been created after the cutoff) and writes STORE/checks/dates.json. GITHUB_TOKEN,
+`created_at`; a file: the date of the oldest commit touching it on the linked ref, following renames and copies
+back through the history, so a file moved in after the cutoff from an earlier path carries the earlier date; the
+repository may be older than the cutoff, since the material itself is what must be new) and writes STORE/checks/dates.json. GITHUB_TOKEN,
 when set, is sent as a bearer token and never printed.
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ except ImportError:  # run as a script
     from t5 import records
 
 API = "https://api.github.com"
+MAX_FOLLOW = 10  # renames followed back through a path's history
 
 
 def urlopen_json(url: str):
@@ -54,10 +56,11 @@ def github_repo_created(owner: str, repo: str, fetch=urlopen_json) -> datetime.d
 
 
 def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_json,
-                             ref: str | None = None) -> datetime.date:
+                             ref: str | None = None, _depth: int = 0) -> datetime.date:
     """Date of the oldest commit touching `path` (on `ref`, a branch, tag or commit, when given). Commits come
-    newest first, so the last page holds it. Renames are not followed: a file moved from an older path shows only
-    its commits under the new one."""
+    newest first, so the last page holds it. When that commit created the path by renaming or copying another
+    one (the commit's file status says so), the search continues from its parent on the earlier path and the
+    earlier date wins. A copy that git does not report as one shows as a plain addition."""
     sha = f"sha={quote(ref, safe='')}&" if ref else ""
     data, headers = fetch(f"{API}/repos/{owner}/{repo}/commits?{sha}path={quote(path)}&per_page=100")
     last = re.search(r'<([^>]+)>;\s*rel="last"', headers.get("link", ""))
@@ -65,7 +68,21 @@ def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_jso
         data, _ = fetch(last.group(1))
     if not data:
         raise ValueError(f"no commits touch {owner}/{repo}:{path}")
-    return min(_date(c["commit"][who]["date"]) for c in data for who in ("author", "committer"))
+    found = min(_date(c["commit"][who]["date"]) for c in data for who in ("author", "committer"))
+    oldest = data[-1]
+    if oldest.get("sha") and _depth < MAX_FOLLOW:
+        detail, _ = fetch(f"{API}/repos/{owner}/{repo}/commits/{oldest['sha']}")
+        parents = detail.get("parents") or oldest.get("parents") or []
+        for entry in detail.get("files", []):
+            if entry.get("filename") == path and entry.get("status") in ("renamed", "copied") \
+                    and entry.get("previous_filename") and parents:
+                try:
+                    earlier = github_path_first_commit(owner, repo, entry["previous_filename"], fetch,
+                                                       parents[0]["sha"], _depth + 1)
+                except ValueError:  # the earlier path has no history on the parent: nothing older to find
+                    break
+                return min(found, earlier)
+    return found
 
 
 def published_date(url: str, fetch=urlopen_json) -> tuple[datetime.date, datetime.date | None] | None:
@@ -119,11 +136,8 @@ def check(store: Path, fetch=urlopen_json) -> tuple[dict, bool]:
                 entry["verified"] = str(found)
                 if created is not None:
                     entry["repository_created"] = str(created)
-                    entry["note"] = "oldest commit at the path; renames are not followed"
-                if created is not None and created <= records.CUTOFF:
-                    entry["error"] = "repository created on or before the cutoff"
-                    failed = True
-                elif found <= records.CUTOFF or found != source.published:
+                    entry["note"] = "oldest commit at the path, following renames and copies"
+                if found <= records.CUTOFF or found != source.published:
                     entry["error"] = "date is not after the cutoff" if found <= records.CUTOFF \
                         else "date differs from the record"
                     failed = True

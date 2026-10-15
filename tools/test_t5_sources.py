@@ -75,17 +75,63 @@ class SourcesTest(unittest.TestCase):
         sources.published_date("https://github.com/o/r/blob/a/b/c/f.py", fetch)
         self.assertIn("sha=a%2Fb%2Fc&path=f.py", seen[0])
 
-    def test_old_repository_fails_check(self):
+    def _file_store(self, d, fetch):
         row = {"id": "c", "domain": "coding", "order": 0, "language": "en", "turns": ["x"],
                "source": {"kind": "human", "url": "https://github.com/o/r/blob/main/a.py",
                           "published": "2026-10-05", "license": "MIT", "checked": "t"}}
-        fetch = lambda url: ({"created_at": "2026-01-01T00:00:00Z"}, {}) if url.endswith("/repos/o/r") \
-            else ([commit("2026-10-05T00:00:00Z")], {})  # noqa: E731
+        (Path(d) / "conversations.jsonl").write_text(json.dumps(row))
+        return sources.check(Path(d), fetch)
+
+    def test_file_added_after_the_cutoff_to_an_old_repository_passes(self):
+        def fetch(url):
+            if url.endswith("/repos/o/r"):
+                return {"created_at": "2026-01-01T00:00:00Z"}, {}
+            if "/commits/" in url:
+                return {"parents": [{"sha": "p"}], "files": [{"filename": "a.py", "status": "added"}]}, {}
+            return [{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {}
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "conversations.jsonl").write_text(json.dumps(row))
-            result, failed = sources.check(Path(d), fetch)
-        self.assertTrue(failed)
-        self.assertEqual(result["c"]["error"], "repository created on or before the cutoff")
+            result, failed = self._file_store(d, fetch)
+        self.assertFalse(failed)
+        self.assertNotIn("error", result["c"])
+        self.assertEqual(result["c"]["repository_created"], "2026-01-01")
+
+    def test_new_repository_passes(self):
+        def fetch(url):
+            if url.endswith("/repos/o/r"):
+                return {"created_at": "2026-09-30T00:00:00Z"}, {}
+            if "/commits/" in url:
+                return {"parents": [], "files": [{"filename": "a.py", "status": "added"}]}, {}
+            return [{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {}
+        with tempfile.TemporaryDirectory() as d:
+            _, failed = self._file_store(d, fetch)
+        self.assertFalse(failed)
+
+    def _renamed(self, status, old_date):
+        def fetch(url):
+            if url.endswith("/repos/o/r"):
+                return {"created_at": "2026-01-01T00:00:00Z"}, {}
+            if url.endswith("/commits/s1"):
+                return {"parents": [{"sha": "p1"}], "files": [
+                    {"filename": "a.py", "status": status, "previous_filename": "old/a.py"}]}, {}
+            if url.endswith("/commits/s0"):
+                return {"parents": [], "files": [{"filename": "old/a.py", "status": "added"}]}, {}
+            if "sha=p1&path=old/a.py" in url:
+                return [{"sha": "s0", **commit(old_date)}], {}
+            return [{"sha": "s1", **commit("2026-10-05T00:00:00Z")}], {}
+        return fetch
+
+    def test_file_renamed_after_the_cutoff_from_an_earlier_path_fails(self):
+        for status in ("renamed", "copied"):
+            with tempfile.TemporaryDirectory() as d:
+                result, failed = self._file_store(d, self._renamed(status, "2026-03-01T00:00:00Z"))
+            self.assertTrue(failed, status)
+            self.assertEqual(result["c"]["verified"], "2026-03-01")
+            self.assertEqual(result["c"]["error"], "date is not after the cutoff")
+
+    def test_rename_from_a_path_first_added_after_the_cutoff_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            result, failed = self._file_store(d, self._renamed("renamed", "2026-10-05T00:00:00Z"))
+        self.assertFalse(failed)
 
     def test_check_flags_mismatch_and_old_dates(self):
         rows = []
