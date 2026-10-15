@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
 import java.util.function.Supplier;
@@ -40,11 +41,21 @@ public final class Execution implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(Execution.class);
 
+    private static final Logger PASSES = LoggerFactory.getLogger(Execution.class.getName() + ".passes");
+
     private static final Consumer<Quantum> NO_TERMINAL_CONSUMER = ignored -> {};
 
     /// How long the device must leave the window's flags alone at shutdown, and the longest the release runs.
     private static final long RELEASE_QUIET_NANOS = 100_000_000L;
     private static final long RELEASE_BOUND_NANOS = 10_000_000_000L;
+
+    private static final int COUNTERS = 6;
+    private static final int QUANTA = 0;
+    private static final int BATCHED = 1;
+    private static final int SEGMENTS = 2;
+    private static final int ROWS = 3;
+    private static final int DISK = 4;
+    private static final int TRANSFER = 5;
 
     private final ExecutionPlan plan;
     private final ExecutionGpu gpu;
@@ -61,6 +72,8 @@ public final class Execution implements AutoCloseable {
     private final AsyncReads asyncReads;
     /// The number of the next admitted quantum with disk uses; confined to the workspace's owner.
     private long nextDiskTicket;
+    /// Per execution kind, [#COUNTERS] counts of the admitted quanta; read from other threads.
+    private final AtomicLongArray counters = new AtomicLongArray(Quantum.ExecutionKind.values().length * COUNTERS);
     private boolean closed;
 
     /// An execution whose lane pool has one lane per available processor.
@@ -156,6 +169,67 @@ public final class Execution implements AutoCloseable {
         List<DiskUse> uses = new ArrayList<>();
         for (int chunk = 0; chunk < chunked.chunks(); chunk++) uses.addAll(diskUses(chunked.template(chunk)));
         return uses;
+    }
+
+    /// The bytes the quantum that runs `shape` copies into the staging ring.
+    static long transferBytes(GraphShape shape) {
+        if (shape instanceof Shape view) return view.transferBytes();
+        if (shape instanceof CheckpointView checkpointed)
+            return checkpointed.view().transferBytes();
+        if (!(shape instanceof ChunkedShape chunked)) return 0;
+        long bytes = 0;
+        for (int chunk = 0; chunk < chunked.chunks(); chunk++) bytes += transferBytes(chunked.template(chunk));
+        return bytes;
+    }
+
+    /// The counts of the quanta of `kind` admitted so far.
+    public PassStatistics statistics(Quantum.ExecutionKind kind) {
+        int base = kind.ordinal() * COUNTERS;
+        return new PassStatistics(
+                this.counters.get(base + QUANTA),
+                this.counters.get(base + BATCHED),
+                this.counters.get(base + SEGMENTS),
+                this.counters.get(base + ROWS),
+                this.counters.get(base + DISK),
+                this.counters.get(base + TRANSFER));
+    }
+
+    /// What the admitted quanta of one kind did: `segments` counts a quantum of one sequence as one segment, `rows`
+    /// the input tokens, and the byte counts the disk reads and the staging transfers their graphs issue.
+    public record PassStatistics(
+            long quanta, long batchedQuanta, long segments, long rows, long diskReadBytes, long transferBytes) {
+
+        public double diskBytesPerQuantum() {
+            return this.quanta == 0 ? 0 : (double) this.diskReadBytes / this.quanta;
+        }
+
+        public double transferBytesPerQuantum() {
+            return this.quanta == 0 ? 0 : (double) this.transferBytes / this.quanta;
+        }
+    }
+
+    private void count(Quantum context, GraphShape admitted, List<DiskUse> uses) {
+        int base = context.kind().ordinal() * COUNTERS;
+        boolean batched = context.batched();
+        long segments = batched ? context.segments().length : 1;
+        long rows = context.inputTokenCount();
+        long disk = 0;
+        for (DiskUse use : uses) disk += use.readBytes();
+        long transfer = transferBytes(admitted);
+        this.counters.incrementAndGet(base + QUANTA);
+        if (batched) this.counters.incrementAndGet(base + BATCHED);
+        this.counters.addAndGet(base + SEGMENTS, segments);
+        this.counters.addAndGet(base + ROWS, rows);
+        this.counters.addAndGet(base + DISK, disk);
+        this.counters.addAndGet(base + TRANSFER, transfer);
+        if (PASSES.isDebugEnabled())
+            PASSES.debug(
+                    "{} segments={} rows={} disk={} MiB h2d={} MiB",
+                    context.kind(),
+                    segments,
+                    rows,
+                    disk >> 20,
+                    transfer >> 20);
     }
 
     /// The rows the workspace holds: the largest quantum it admits.
@@ -283,6 +357,7 @@ public final class Execution implements AutoCloseable {
                 context.chunkCount() > 1 || !context.checkpointChunks().isEmpty() ? this.prompts.shape(context) : view;
         // Its disk uses are registered once it started, in admission order: the order of each window slot's copies.
         List<DiskUse> uses = this.diskReader == null ? List.of() : diskUses(admitted);
+        count(context, admitted, uses);
         long ticket = uses.isEmpty() ? -1 : this.nextDiskTicket++;
         if (ticket >= 0) context.readsFromDisk(this.diskReader, ticket);
         boolean[] began = new boolean[1];

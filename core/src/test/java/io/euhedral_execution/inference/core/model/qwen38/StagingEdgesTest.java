@@ -24,7 +24,7 @@ class StagingEdgesTest {
 
     private static final int SLOTS = 3;
 
-    private static ExecutionPlan stagedPlan() {
+    static ExecutionPlan stagedPlan() {
         var weights = FullModelExecutionPlanTest.fullModelWeights(
                 name -> name.endsWith("/gdn/output") || name.endsWith("/mlp/down"));
         long largest = 5120L * 17408;
