@@ -13,6 +13,7 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Path;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -72,6 +73,8 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     private static final MethodHandle PREP_READ;
     private static final MethodHandle SET_DATA;
     private static final MethodHandle SUBMIT;
+    private static final MethodHandle SQ_READY;
+    private static final MethodHandle PREP_NOP;
     private static final MethodHandle PEEK_CQE;
     private static final MethodHandle CQE_SEEN;
     private static final MethodHandle OPEN;
@@ -86,6 +89,8 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                 prep = null,
                 data = null,
                 submit = null,
+                ready = null,
+                nop = null,
                 peek = null,
                 seen = null,
                 open = null,
@@ -116,6 +121,9 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                     "io_uring_sqe_set_data64",
                     FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
             submit = handle(uring, "io_uring_submit", FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+            ready = handle(
+                    uring, "io_uring_sq_ready", FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+            nop = handle(uring, "io_uring_prep_nop", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
             peek = handle(
                     uring,
                     "io_uring_peek_cqe",
@@ -146,6 +154,8 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         PREP_READ = prep;
         SET_DATA = data;
         SUBMIT = submit;
+        SQ_READY = ready;
+        PREP_NOP = nop;
         PEEK_CQE = peek;
         CQE_SEEN = seen;
         OPEN = open;
@@ -177,6 +187,20 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         }
     }
 
+    /// The tag of a prepared entry whose submission failed: a no-op the ring may still send, whose completion the
+    /// reaper drops.
+    private static final long DEFUSED = -1L;
+
+    /// The step that hands a ring's prepared entries to the kernel: `io_uring_submit`, or a test's stand-in.
+    @FunctionalInterface
+    interface Submitter {
+        /// The number of entries the kernel took, or a negated errno.
+        int submit(MemorySegment ring) throws Throwable;
+    }
+
+    static final Submitter NATIVE_SUBMIT = ring -> (int) SUBMIT.invokeExact(ring);
+
+    private final Submitter submitter;
     private final Arena arena = Arena.ofShared();
     private final AtomicReferenceArray<Ring> rings = new AtomicReferenceArray<>(MAX_RINGS);
     private final AtomicInteger ringCount = new AtomicInteger();
@@ -190,13 +214,22 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
     private final Delegate delegate = new Delegate();
     private volatile boolean closed;
 
-    private AsyncReads() {}
+    private AsyncReads(Submitter submitter) {
+        this.submitter = submitter;
+    }
 
     /// Asynchronous reads, or an exception naming why this machine has none (no io_uring, or no liburing).
     public static AsyncReads open() {
         if (UNAVAILABLE != null)
             throw new UnsupportedOperationException("asynchronous reads are unavailable", UNAVAILABLE);
-        AsyncReads reads = new AsyncReads();
+        return open(NATIVE_SUBMIT);
+    }
+
+    /// As [#open()], with `submitter` in place of `io_uring_submit` (tests).
+    static AsyncReads open(Submitter submitter) {
+        if (UNAVAILABLE != null)
+            throw new UnsupportedOperationException("asynchronous reads are unavailable", UNAVAILABLE);
+        AsyncReads reads = new AsyncReads(Objects.requireNonNull(submitter, "submitter"));
         // A ring proves the kernel allows io_uring before anything relies on it.
         reads.ring();
         return reads;
@@ -293,16 +326,38 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
         return true;
     }
 
-    /// Puts the read's next piece on `ring` and submits it.
-    private static boolean enqueue(Ring ring, Read read, int slot) {
+    /// Puts the read's next piece on `ring` and submits it. True when the kernel took every entry the ring had
+    /// prepared, this one included. Otherwise this entry, which the kernel takes in order and so has not taken, is
+    /// turned into a no-op tagged [#DEFUSED] before returning false: the ring's next submission may still send it,
+    /// and it then neither reads into memory its caller has moved on from nor completes a read it no longer owns.
+    private boolean enqueue(Ring ring, Read read, int slot) {
+        MemorySegment sqe;
         try {
-            MemorySegment sqe = (MemorySegment) GET_SQE.invokeExact(ring.ring);
-            if (sqe.address() == 0) return false;
+            sqe = (MemorySegment) GET_SQE.invokeExact(ring.ring);
+        } catch (Throwable failure) {
+            throw new IllegalStateException("io_uring submission failed", failure);
+        }
+        if (sqe.address() == 0) return false;
+        boolean taken = false;
+        try {
             int length = (int) Math.min(read.remaining, Integer.MAX_VALUE & ~4095L);
             PREP_READ.invokeExact(sqe, read.fd, MemorySegment.ofAddress(read.address), length, read.offset);
             SET_DATA.invokeExact(sqe, (long) slot);
-            int submitted = (int) SUBMIT.invokeExact(ring.ring);
-            return submitted >= 1;
+            int prepared = (int) SQ_READY.invokeExact(ring.ring);
+            int submitted = this.submitter.submit(ring.ring);
+            taken = submitted >= prepared;
+            return taken;
+        } catch (Throwable failure) {
+            throw new IllegalStateException("io_uring submission failed", failure);
+        } finally {
+            if (!taken) defuse(sqe);
+        }
+    }
+
+    private static void defuse(MemorySegment sqe) {
+        try {
+            PREP_NOP.invokeExact(sqe);
+            SET_DATA.invokeExact(sqe, DEFUSED);
         } catch (Throwable failure) {
             throw new IllegalStateException("io_uring submission failed", failure);
         }
@@ -324,13 +379,16 @@ public final class AsyncReads extends AbstractIngestSink implements AutoCloseabl
                 }
                 if (status != 0) break;
                 MemorySegment cqe = ring.cqe.get(ValueLayout.ADDRESS, 0).reinterpret(16);
-                int slot = (int) cqe.get(ValueLayout.JAVA_LONG, 0);
+                long tag = cqe.get(ValueLayout.JAVA_LONG, 0);
                 int result = cqe.get(ValueLayout.JAVA_INT, 8);
                 try {
                     CQE_SEEN.invokeExact(ring.ring, cqe);
                 } catch (Throwable failure) {
                     throw new IllegalStateException("io_uring completion failed", failure);
                 }
+                // A defused entry's no-op: its read was handed back when its submission failed.
+                if (tag == DEFUSED) continue;
+                int slot = (int) tag;
                 Read read = this.pending.get(slot);
                 if (result > 0 && result < read.remaining) {
                     // A short read: the rest is read on this thread's ring, under the same slot.

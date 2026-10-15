@@ -62,8 +62,12 @@ class AsyncReadsTest {
     }
 
     private static AsyncReads open() {
+        return open(AsyncReads.NATIVE_SUBMIT);
+    }
+
+    private static AsyncReads open(AsyncReads.Submitter submitter) {
         assumeTrue(AsyncReads.available(), "no io_uring on this machine");
-        AsyncReads reads = AsyncReads.open();
+        AsyncReads reads = AsyncReads.open(submitter);
         reads.getDelegate().addDownstream(new io.euhedral_execution.core.generics.LatticeReceiver() {
             @Override
             public void addUpstream(io.euhedral_execution.core.generics.LatticeSource upstream) {}
@@ -197,6 +201,48 @@ class AsyncReadsTest {
                 assertTrue(reads.submit(fd, destination.address(), 4096, 8192, done));
                 poll(reads, 1);
                 assertNotNull(done.failure, "no bytes where the read asked for them");
+            } finally {
+                reads.closeFile(fd);
+            }
+        }
+    }
+
+    /// A submission the kernel refuses after the entry was prepared hands the read back (false) and defuses the entry:
+    /// the ring's next submission sends it as a no-op, which neither reads into the handed-back destination nor
+    /// completes a read.
+    @Test
+    void aRefusedSubmissionLeavesNoEntryThatReadsOrCompletesLater() throws Exception {
+        byte[] content = new byte[2 * 4096];
+        new SplittableRandom(7).nextBytes(content);
+        Path file = this.directory.resolve("refused");
+        Files.write(file, content);
+        int[] calls = {0};
+        AsyncReads.Submitter refuseFirst =
+                ring -> calls[0]++ == 0 ? -16 : AsyncReads.NATIVE_SUBMIT.submit(ring); // EBUSY, then the kernel's
+        try (AsyncReads reads = open(refuseFirst);
+                Arena arena = Arena.ofConfined()) {
+            int fd = reads.openFile(file);
+            try {
+                MemorySegment handedBack = arena.allocate(4096, 4096);
+                handedBack.fill((byte) 0x5a);
+                MemorySegment second = arena.allocate(4096, 4096);
+                Done refused = new Done(1);
+                Done taken = new Done(2);
+                assertFalse(reads.submit(fd, handedBack.address(), 4096, 0, refused));
+                assertEquals(0, reads.inFlight());
+                assertTrue(reads.submit(fd, second.address(), 4096, 4096, taken));
+                List<AbstractFrame> emitted = poll(reads, 1);
+                // More polls find nothing: the defused entry completed as a no-op the reaper dropped.
+                for (int i = 0; i < 100; i++) reads.getDelegate().pull(emitted::add, frame -> false, Long.MAX_VALUE);
+                assertEquals(List.of(taken), emitted);
+                assertFalse(refused.ran);
+                assertNull(taken.failure);
+                assertArrayEquals(
+                        java.util.Arrays.copyOfRange(content, 4096, 2 * 4096), second.toArray(ValueLayout.JAVA_BYTE));
+                byte[] untouched = new byte[4096];
+                java.util.Arrays.fill(untouched, (byte) 0x5a);
+                assertArrayEquals(untouched, handedBack.toArray(ValueLayout.JAVA_BYTE));
+                assertEquals(0, reads.inFlight());
             } finally {
                 reads.closeFile(fd);
             }
