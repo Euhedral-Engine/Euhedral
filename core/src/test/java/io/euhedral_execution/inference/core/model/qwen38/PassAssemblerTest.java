@@ -325,7 +325,7 @@ class PassAssemblerTest {
         var a = assembler(8, 8);
         a.offer(step("A", 1));
         a.offer(step("B", 1));
-        assertThrows(IllegalStateException.class, () -> a.offer(step("B", 1)));
+        assertThrows(PassAssembler.Refused.class, () -> a.offer(step("B", 1)));
         assertEquals(1, a.pendingCount());
     }
 }

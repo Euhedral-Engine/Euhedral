@@ -361,7 +361,7 @@ public final class Execution implements AutoCloseable {
         try {
             this.pendingOffers.incrementAndGet();
             this.assembler.offer(offer);
-        } catch (RuntimeException refused) {
+        } catch (PassAssembler.Refused refused) {
             this.pendingOffers.decrementAndGet();
             // The assembler did not take the step (a duplicate for its sequence): it concludes failed.
             refuse(List.of(offer), refused);
@@ -500,15 +500,14 @@ public final class Execution implements AutoCloseable {
                             this.plan, offer.part().sequence(), Quantum.ExecutionKind.DECODE, 0, new int[] {0});
                 }
                 standIn.fail(cause);
-                // Retired here, not through a continuation: the select is published from this frame, one hop.
+                // Retired here, not through a continuation: the select is dispatched from this frame, one hop.
                 standIn.retire(null);
                 if (offer.select() instanceof AbstractQuantum.Continuation told) told.concluded(standIn);
-                dispatch(offer.select(), inline);
             } catch (RuntimeException | Error lost) {
                 LOG.error("a refused step could not be concluded; its select runs without a quantum", lost);
-                // Never lose a select: it fails its generation when it finds no concluded step.
-                dispatch(offer.select(), inline);
             }
+            // Exactly once, whatever happened above: it fails its generation when it finds no concluded step.
+            dispatch(offer.select(), inline);
         }
     }
 
@@ -523,7 +522,12 @@ public final class Execution implements AutoCloseable {
             select.doFinallyWithError(failed);
             return;
         }
-        select.doFinally();
+        try {
+            select.doFinally();
+        } catch (RuntimeException | Error ended) {
+            // As a worker does: a frame's end that fails is logged, never rethrown into its producer.
+            LOG.error("a select run in place failed at its end", ended);
+        }
     }
 
     /// Admits `context` ahead of a later quantum of its sequence whose continuation reads both: no frame follows
@@ -652,7 +656,8 @@ public final class Execution implements AutoCloseable {
 
     /// Concludes the offers still waiting for a pass, failed, so no generation waits on them for ever; skipped (and
     /// not waited for) when none waits. A lake that no longer takes frames runs the work inline off the owner
-    /// ([EuhedralInferenceRuntime#publishOnOwner]), which is safe because nothing else offers any more.
+    /// ([EuhedralInferenceRuntime#publishOnOwner]); the selects of passes still in flight may then offer
+    /// concurrently, which the assembler's owner confinement does not cover.
     private void concludePending() {
         if (this.pendingOffers.get() == 0) return;
         CompletableFuture<Void> done = new CompletableFuture<>();
