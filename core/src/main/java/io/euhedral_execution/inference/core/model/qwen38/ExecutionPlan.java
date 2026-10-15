@@ -232,6 +232,11 @@ public final class ExecutionPlan {
             return weightFormat(0);
         }
 
+        /// Whether the first weight is read in place from host memory over the bus.
+        public boolean weightHostMapped() {
+            return this.weights.getFirst().hostMapped();
+        }
+
         public WeightFormat weightFormat(int weightIndex) {
             return this.weights.get(weightIndex).format();
         }

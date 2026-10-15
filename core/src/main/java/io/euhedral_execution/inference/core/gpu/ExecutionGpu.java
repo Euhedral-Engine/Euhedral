@@ -374,6 +374,11 @@ public abstract class ExecutionGpu implements GpuMemory {
         throw new UnsupportedOperationException("host-backed weights are not implemented by this GPU");
     }
 
+    /// Most rows of an NVFP4 linear that stay off the tile kernels, whose TMA descriptors address device memory: the
+    /// native skinny route's limit, which streams weights with plain loads. Larger calls on host-mapped weights are
+    /// split into calls of at most this many rows.
+    public static final int NVFP4_PLAIN_LOAD_MAX_ROWS = 64;
+
     /// NVFP4 linear (Nvfp4Layout): `outFeatures` weight rows of `inFeatures` values on BF16 rows.
     public void linearNvfp4Bf16(
             long input, long weights, long output, int rows, int inFeatures, int outFeatures, long weightBytes) {

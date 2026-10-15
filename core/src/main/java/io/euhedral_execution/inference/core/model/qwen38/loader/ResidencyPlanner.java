@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.core.model.qwen38.loader;
 
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
@@ -31,6 +32,11 @@ public final class ResidencyPlanner {
 
     /// System property that maps the LM head with the first offloaded object instead of last.
     public static final String MAP_OUTPUT_HEAD = "euhedral.residency.map-output-head";
+
+    /// Most rows of one row-exact verification that an NVFP4 linear runs on the tensor-core decode kernels (8 rows
+    /// in 4 groups: `EUHEDRAL_DECODE_MAX_ROWS * DECODE_GROUPS_MAX` in `nvfp4_linear.c`); beyond it row-exact
+    /// verification runs the scalar reference, which sweeps the weights once per row.
+    static final int NVFP4_ROW_EXACT_MAX_ROWS = 32;
 
     private ResidencyPlanner() {}
 
@@ -125,6 +131,11 @@ public final class ResidencyPlanner {
                         Math.multiplyExact(sequences, kvBytes(artifact.config(), maxContextTokens, kvFormat)),
                         RESERVE_BYTES),
                 Math.multiplyExact(sequences - 1L, extra));
+        TensorDescriptor head = headOf(artifact);
+        // A mapped NVFP4 head is swept over the bus once per row when a verification outgrows the decode kernels.
+        boolean mappable = head != null
+                && !(head.format() == WeightFormat.NVFP4
+                        && (long) sequences * (1 + profile.speculativeDepth()) > NVFP4_ROW_EXACT_MAX_ROWS);
         Plan resident = deviceNeed(artifact, profile, Set.of());
         if (resident.deviceBytes() + fixed <= freeBytes) return tiers(artifact, resident, fixed, hostBytes, true);
         long all = artifactBytes(artifact, profile);
@@ -133,14 +144,14 @@ public final class ResidencyPlanner {
         long step = 64L << 20;
         for (long bytes = step; ; bytes += step) {
             Set<String> selection = HostWeightSelection.select(artifact, bytes);
-            Plan candidate =
-                    deviceNeed(artifact, profile, mapOutputHeadEarly ? withHead(artifact, selection) : selection);
+            Plan candidate = deviceNeed(
+                    artifact, profile, mapOutputHeadEarly && mappable ? withHead(head, selection) : selection);
             if (candidate.deviceBytes() + fixed <= freeBytes) return tiers(artifact, candidate, fixed, hostBytes, true);
             if (bytes > all) {
                 // Everything else offloadable is offloaded: the LM head goes last.
-                Set<String> mapped = withHead(artifact, selection);
-                if (mapped.size() == selection.size() || mapOutputHeadEarly)
-                    return tiers(artifact, candidate, fixed, hostBytes, false);
+                if (!mappable || mapOutputHeadEarly) return tiers(artifact, candidate, fixed, hostBytes, false);
+                Set<String> mapped = withHead(head, selection);
+                if (mapped.size() == selection.size()) return tiers(artifact, candidate, fixed, hostBytes, false);
                 Plan last = deviceNeed(artifact, profile, mapped);
                 return tiers(artifact, last, fixed, hostBytes, last.deviceBytes() + fixed <= freeBytes);
             }
@@ -173,11 +184,17 @@ public final class ResidencyPlanner {
         return low;
     }
 
-    /// `selection` followed by the LM head, when the artifact has one.
-    private static Set<String> withHead(Artifact artifact, Set<String> selection) {
-        Set<String> result = new java.util.LinkedHashSet<>(selection);
+    /// The LM head's descriptor, or null when the artifact has none.
+    private static TensorDescriptor headOf(Artifact artifact) {
         for (TensorDescriptor tensor : artifact.tensors())
-            if (tensor.name().equals(HostWeightSelection.OUTPUT_HEAD)) result.add(tensor.name());
+            if (tensor.name().equals(HostWeightSelection.OUTPUT_HEAD)) return tensor;
+        return null;
+    }
+
+    /// `selection` followed by the LM head `head`.
+    private static Set<String> withHead(TensorDescriptor head, Set<String> selection) {
+        Set<String> result = new java.util.LinkedHashSet<>(selection);
+        result.add(head.name());
         return result;
     }
 
@@ -198,7 +215,7 @@ public final class ResidencyPlanner {
     /// Splits `plan`'s offloaded objects (its `hostBacked`, in selection order) between host memory and the
     /// artifact file. The embedding and the LM head stay in host memory (read in place); then each object goes to
     /// host memory while the arena and the window that the remaining objects would need fit in `hostBytes`, and
-    /// the first that does not, every object goes to disk.
+    /// from the first that does not, every object goes to disk.
     private static Plan tiers(Artifact artifact, Plan plan, long fixed, long hostBytes, boolean deviceFits) {
         java.util.Map<String, TensorDescriptor> tensors = new java.util.HashMap<>();
         for (TensorDescriptor tensor : artifact.tensors()) tensors.put(tensor.name(), tensor);

@@ -146,8 +146,14 @@ device ring of `WeightStaging.SLOTS` = 4 slots on every use.
   staging slots or residency.
 - **Selection:** the token embedding first (it is a gather read in place over the bus, a few KiB per token). Then whole families
   smallest tensor first (GDN query_key, GDN output, attention output, ...); within the last family the layers are spread evenly, so
-  the ring holds the smallest possible slot. The LM head is never host-backed, and the MTP layer and draft head never are
-  (only `text/layers/N/...` projections).
+  the ring holds the smallest possible slot. The MTP layer and draft head are never host-backed (only `text/layers/N/...` projections are
+  staged). The LM head is the last object to leave the device: when everything else offloadable is offloaded and the plan still does not
+  fit (or from the first offload with `-Deuhedral.residency.map-output-head=true`, default false) it is mapped in the host arena and
+  read in place over the bus, like the embedding, never staged or disk-backed. The bus streams it once per pass whatever the sequence
+  count (2.54 GB BF16 about 60 ms, 0.67 GB NVFP4 about 15 ms at 40 GB/s). An NVFP4 head is mapped only when `maxSequences * (1 + draft
+  depth)` is at most 32: row-exact verification above 32 rows runs the scalar reference, a sweep of the head per row. Calls on a mapped
+  NVFP4 head are split into at most 64 rows so they never reach the TMA tile kernels. A mapped BF16 head is re-read once per 64-row
+  tile above 64 verify rows.
 - **Host memory:** one arena, allocated before any payload is read, 2 MiB-aligned, with `MADV_HUGEPAGE` and `MADV_COLLAPSE`, and
   pinned with `cudaHostRegister` (mapped, so the embedding is read in place).
 - **Execution:** each plan view gets a `WEIGHT_TRANSFER` stage per use, run on a lane reserved for copies. A transfer depends only
