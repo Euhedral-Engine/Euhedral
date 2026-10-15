@@ -6,12 +6,13 @@ import java.util.Arrays;
 import java.util.Objects;
 import java.util.function.IntPredicate;
 
-/// Greedy acceptance of one speculative verification (docs/MTP_CONTRACT.md §4).
+/// Exact-match acceptance of one speculative verification (docs/MTP_CONTRACT.md §4).
 ///
-/// The verified rows are `[t₀, d₁ .. d_n]`: the last committed token, then n drafts. Row j's greedy
-/// token g_j is base greedy decode's next token after rows 0..j. Drafts are accepted while
+/// The verified rows are `[t₀, d₁ .. d_n]`: the last committed token, then n drafts. Row j's selected
+/// token g_j (greedy, or sampled at its position) is base decode's next token after rows 0..j. Drafts are accepted
+/// while
 /// `d_{j+1} == g_j`. The outputs are the accepted drafts followed by the first g that no draft
-/// matched, which is exactly the tokens ordinary greedy decode produces. They are cut after the first
+/// matched, which is exactly the tokens ordinary decode produces. They are cut after the first
 /// end-of-generation token and at `maxOutputs`.
 ///
 /// Committed rows equal the output count: row 0 carries t₀ and rows 1..k−1 the first k−1 outputs, which
@@ -51,7 +52,7 @@ public final class SpeculativeAcceptance {
         this.maxOutputs = maxOutputs;
     }
 
-    /// Resolves the step from each row's greedy token. Idempotent for the same selections.
+    /// Resolves the step from each row's selected token. Idempotent for the same selections.
     public void resolve(int[] selected) {
         if (selected.length != this.rows.length) throw new IllegalArgumentException("one selection per verified row");
         int accepted = 0;
