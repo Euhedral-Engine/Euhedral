@@ -4,10 +4,8 @@ package io.euhedral_execution.inference.core.gpu;
 /// it; its declaration order must be the table's order.
 public interface TableKernel {
 
-    /// The table the kernel belongs to; the Flash-Next table unless the kernel says otherwise.
-    default KernelTable table() {
-        return KernelTable.QWEN4;
-    }
+    /// The table the kernel belongs to.
+    KernelTable table();
 
     /// The kernel's index in the native table.
     int index();

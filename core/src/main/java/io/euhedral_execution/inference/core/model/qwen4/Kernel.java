@@ -1,5 +1,6 @@
 package io.euhedral_execution.inference.core.model.qwen4;
 
+import io.euhedral_execution.inference.core.gpu.KernelTable;
 import io.euhedral_execution.inference.core.gpu.TableKernel;
 
 /// The Flash-Next (qwen4_exp) kernels behind `euhedral_cuda_qwen4_launch`. The declaration order is the native
@@ -46,6 +47,11 @@ public enum Kernel implements TableKernel {
 
     Kernel(String symbol) {
         this.symbol = symbol;
+    }
+
+    @Override
+    public KernelTable table() {
+        return KernelTable.QWEN4;
     }
 
     @Override

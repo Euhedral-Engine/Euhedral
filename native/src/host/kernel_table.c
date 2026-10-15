@@ -14,6 +14,12 @@ void euhedral_kernel_table_initialize(EuhedralKernelTable* table) {
     CUmodule* modules = calloc((size_t)count, sizeof(CUmodule));
     if (table->functions == NULL || table->parameter_count == NULL || table->parameter_size == NULL || modules == NULL) {
         free(modules);
+        free(table->functions);
+        free(table->parameter_count);
+        free(table->parameter_size);
+        table->functions = NULL;
+        table->parameter_count = NULL;
+        table->parameter_size = NULL;
         return;
     }
     int status = EUHEDRAL_CUDA_SUCCESS;
