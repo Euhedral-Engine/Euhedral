@@ -8,7 +8,15 @@ import java.util.List;
 /// assistant only called tools; `tool_calls` is omitted when it called none, and `reasoning_content` when the
 /// model produced no reasoning.
 public record ChatCompletionResponse(
-        String id, String object, long created, String model, List<Choice> choices, Usage usage) {
+        String id,
+        String object,
+        long created,
+        String model,
+        List<Choice> choices,
+        Usage usage,
+
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("prompt_token_ids")
+        List<Integer> promptTokenIds) {
 
     public static ChatCompletionResponse of(
             String id,
@@ -18,7 +26,9 @@ public record ChatCompletionResponse(
             String content,
             List<ToolCall> toolCalls,
             String finishReason,
-            Usage usage) {
+            Usage usage,
+            List<Integer> promptTokenIds,
+            List<Integer> tokenIds) {
         String reasoningContent = reasoning.isEmpty() ? null : reasoning;
         AssistantMessage message = toolCalls.isEmpty()
                 ? new AssistantMessage("assistant", content, reasoningContent, null, null)
@@ -29,7 +39,13 @@ public record ChatCompletionResponse(
                         null,
                         List.copyOf(toolCalls));
         return new ChatCompletionResponse(
-                id, "chat.completion", created, model, List.of(new Choice(0, message, null, finishReason)), usage);
+                id,
+                "chat.completion",
+                created,
+                model,
+                List.of(new Choice(0, message, null, finishReason, tokenIds)),
+                usage,
+                promptTokenIds);
     }
 
     @JsonInclude(JsonInclude.Include.ALWAYS)
@@ -37,7 +53,10 @@ public record ChatCompletionResponse(
             int index,
             AssistantMessage message,
             Object logprobs,
-            @JsonProperty("finish_reason") String finishReason) {}
+            @JsonProperty("finish_reason") String finishReason,
+
+            @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("token_ids")
+            List<Integer> tokenIds) {}
 
     @JsonInclude(JsonInclude.Include.ALWAYS)
     public record AssistantMessage(

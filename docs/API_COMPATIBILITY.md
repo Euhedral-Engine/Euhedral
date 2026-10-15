@@ -36,6 +36,7 @@ Nothing that changes generation is accepted and ignored.
 | `response_format` | supported | `text`, `json_object`, `json_schema` ([STRUCTURED_OUTPUT.md](STRUCTURED_OUTPUT.md)). |
 | `reasoning_effort` | supported | `none`, `low`, `medium`, `high` (`xhigh` too); `minimal` refused ([REASONING.md](REASONING.md)). |
 | `chat_template_kwargs` | supported | Not an OpenAI field: the template's `enable_thinking`, `reasoning_effort`, `preserve_thinking`. |
+| `return_token_ids` | supported | Not an OpenAI field; a vLLM-compatible extension. `true` adds `prompt_token_ids` (the prompt as the chat template renders and encodes it) and `choices[0].token_ids` (every token the model generated: reasoning, tool-call envelope, special tokens and the terminating token). Refused with `stream`. |
 | `n` | neutral | 1. One choice per request. |
 | `logprobs`, `top_logprobs` | neutral | `false`, `0`. Log probabilities are not returned. |
 | `frequency_penalty`, `presence_penalty` | neutral | 0. |

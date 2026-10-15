@@ -98,7 +98,8 @@ public class MessagesMapper {
                 sampling(request),
                 maxTokens,
                 "max_tokens",
-                stream);
+                stream,
+                false);
     }
 
     // Messages.

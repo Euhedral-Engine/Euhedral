@@ -29,6 +29,7 @@ public record ChatCompletionRequest(
         @JsonProperty("reasoning_effort") Object reasoningEffort,
         @JsonProperty("chat_template_kwargs") Object chatTemplateKwargs,
         @JsonProperty("response_format") Object responseFormat,
+        @JsonProperty("return_token_ids") Boolean returnTokenIds,
         @JsonAnySetter Map<String, Object> otherFields) {
 
     public ChatCompletionRequest {

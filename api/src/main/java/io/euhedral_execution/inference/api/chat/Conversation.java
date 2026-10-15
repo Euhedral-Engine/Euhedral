@@ -8,7 +8,8 @@ import java.util.Objects;
 ///
 /// Each surface maps its own request format into this; everything after it (rendering, grammar, encoding, the
 /// generation, prefix reuse) is shared. `reasoningBudget` caps reasoning tokens (`Integer.MAX_VALUE`: no cap); a
-/// null `maxTokens` takes the server's default, and `maxTokensParam` names the request field in errors.
+/// null `maxTokens` takes the server's default, `returnTokenIds` asks for the prompt's and the completion's token IDs,
+/// and `maxTokensParam` names the request field in errors.
 public record Conversation(
         List<QwenChatTemplate.Turn> turns,
         ToolCalling tools,
@@ -19,7 +20,8 @@ public record Conversation(
         GenerationConfig sampling,
         Integer maxTokens,
         String maxTokensParam,
-        boolean stream) {
+        boolean stream,
+        boolean returnTokenIds) {
 
     public Conversation {
         turns = List.copyOf(turns);
