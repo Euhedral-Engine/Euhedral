@@ -483,21 +483,6 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         this.onPublishing = hook;
     }
 
-    private volatile Runnable onConcluded;
-
-    /// Runs `hook` once when the quantum's outcome is published, before its continuation is thrown; set at admission.
-    void onConcluded(Runnable hook) {
-        this.onConcluded = hook;
-    }
-
-    @Override
-    protected void published() {
-        Runnable hook = this.onConcluded;
-        if (hook == null) return;
-        this.onConcluded = null;
-        hook.run();
-    }
-
     /// Whether the quantum's graph started publishing its stages ([#stagesPublishing()]).
     boolean stagesPublished() {
         return this.stagesPublishing;
