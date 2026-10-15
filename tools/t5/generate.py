@@ -1,7 +1,11 @@
 """Runs the scripted conversations against the server and writes STORE/generation/progress.json.
 
-Usage (from tools/): python3 -m t5.generate SERVER_URL STORE --model ID --base-seed N [--parallel N]
+Usage (from tools/): python3 -m t5.generate SERVER_URL STORE --model ID --base-seed N --parallel N
     [--domains D ...] [--limit N] [--max-tokens N] [--target-tokens N] [--artifact-manifest PATH]
+    [--allow-new-commit]
+
+Ctrl-C sets a stop flag that workers check before each request; an interrupted conversation is not recorded. A
+request already in flight is not abandoned: the process exits when it returns (a second Ctrl-C exits at once).
 
 A conversation's corpus sequence is its last request's `prompt_token_ids + token_ids`: the deployed rendering of
 the whole conversation, with reasoning replayed through `reasoning_content`. Each request also records whether its
@@ -43,6 +47,10 @@ except ImportError:  # run as a script
     from t5.progress import Progress
 
 
+class Interrupted(Exception):
+    """The run was stopped (Ctrl-C); the conversation in progress is dropped and not recorded."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Limits:
     max_tokens: int = 4096  # per request
@@ -61,7 +69,8 @@ def _first_mismatch(previous, prompt) -> int | None:
 
 
 def run_conversation(conversation: records.Conversation, decoding: records.Decoding, client: ChatClient,
-                     fixture: Fixture | None, limits: Limits) -> dict:
+                     fixture: Fixture | None, limits: Limits,
+                     stop: threading.Event | None = None) -> dict:
     messages = [{"role": "system", "content": conversation.system}] if conversation.system else []
     requests: list[dict] = []
     state = {"last": None, "error": None}
@@ -81,6 +90,8 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
         for turn in conversation.turns:
             messages.append({"role": "user", "content": turn})
             for _ in range(limits.max_tool_rounds + 1):
+                if stop is not None and stop.is_set():
+                    raise Interrupted()
                 result = client.complete(messages, list(conversation.tools), decoding, limits.max_tokens)
                 mismatch = _first_mismatch(previous, result.prompt_token_ids)
                 requests.append({"prompt_tokens": len(result.prompt_token_ids),
@@ -106,6 +117,8 @@ def run_conversation(conversation: records.Conversation, decoding: records.Decod
             if len(previous) >= limits.target_tokens:
                 return finish("target")
         return finish("turns")
+    except Interrupted:
+        raise
     except Exception as e:  # recorded, retried on resume; the other conversations continue
         state["error"] = f"{type(e).__name__}: {e}"
         return finish("error")
@@ -179,10 +192,14 @@ def main(argv: list[str] | None = None, validation: dict | None = None) -> int:
     totals = {"tokens": 0}
     lock = threading.Lock()
     started = time.monotonic()
+    stop = threading.Event()
 
     def work(conversation: records.Conversation) -> None:
         fixture = load_fixture(store / conversation.fixture) if conversation.fixture else None
-        record = run_conversation(conversation, plan[conversation.id], client, fixture, limits)
+        try:
+            record = run_conversation(conversation, plan[conversation.id], client, fixture, limits, stop)
+        except Interrupted:
+            return
         progress.record(conversation.id, record)
         with lock:
             totals["tokens"] += sum(r["completion_tokens"] for r in record["requests"])
@@ -199,6 +216,7 @@ def main(argv: list[str] | None = None, validation: dict | None = None) -> int:
                 failed += 1
                 print(f"{conversation.id} failed: {type(e).__name__}: {e}", flush=True)
     except KeyboardInterrupt:
+        stop.set()
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown()
