@@ -227,6 +227,23 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(generate._first_mismatch([1, 2, 3], [1, 9, 3]), 1)
         self.assertEqual(generate._first_mismatch([1, 2, 3], [1, 2]), 2)
 
+    def test_stop_event_interrupts_between_requests(self):
+        self.write([{**row("a"), "turns": ["one", "two"]}])
+        stop = threading.Event()
+        conversation = records.load_conversations(self.store / "conversations.jsonl")[0]
+        client = chat_client.ChatClient(self.server.url, "m")
+        original = client.complete
+
+        def complete(*args):
+            result = original(*args)
+            stop.set()
+            return result
+        client.complete = complete
+        with self.assertRaises(generate.Interrupted):
+            generate.run_conversation(conversation, records.Decoding("greedy", None), client, None,
+                                      generate.Limits(), stop)
+        self.assertEqual(len(self.server.bodies), 1)
+
     def test_error_is_recorded_and_retried_on_resume(self):
         self.write([row("a")])
         self.server.fail_first = 10 ** 6
