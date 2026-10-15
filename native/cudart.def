@@ -9,6 +9,7 @@ EXPORTS
     cudaFreeAsync
     cudaFreeHost
     cudaGetDevice
+    cudaGetLastError
     cudaGraphDestroy
     cudaGraphExecDestroy
     cudaGraphGetNodes
@@ -27,6 +28,7 @@ EXPORTS
     cudaMemcpyAsync
     cudaMemset
     cudaMemsetAsync
+    cudaPointerGetAttributes
     cudaSetDevice
     cudaStreamAddCallback
     cudaStreamBeginCapture
