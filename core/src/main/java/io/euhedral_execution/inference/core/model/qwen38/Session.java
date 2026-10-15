@@ -416,7 +416,7 @@ public final class Session implements GenerationSession {
         private int generated;
         private int decodeToken;
         private boolean anotherTokenAllowed;
-        /// The position the decode step in flight samples its token for.
+        /// The position the token sampled by the step in flight will occupy.
         private long samplePosition;
         private boolean endedNormally;
         /// Where this prompt's next checkpoint attaches: the deepest stored node of its prefix. Null unless the
@@ -574,6 +574,7 @@ public final class Session implements GenerationSession {
                 started = timing == null ? 0L : System.nanoTime();
                 samples = maxNewTokens > 0 && end == promptTokenIds.length;
                 int[] rows = Arrays.copyOfRange(promptTokenIds, offset, end);
+                samplePosition = sequence.currentTokenPosition() + rows.length;
                 LogitsRequirement logits = samples ? LogitsRequirement.LAST_TOKEN : LogitsRequirement.NONE;
                 Quantum quantum = rows.length > prefillChunkTokens || checkpoints != null
                         ? Quantum.prompt(
@@ -764,7 +765,7 @@ public final class Session implements GenerationSession {
                     return OptionalInt.empty();
                 }
                 // The quantum copied its final row into the host logits before it retired.
-                int selected = sampler.selectToken(hostLogits, this.constraint);
+                int selected = sampler.selectToken(hostLogits, this.constraint, samplePosition);
                 if (this.constraint != null) this.constraint.accept(selected);
                 if (this.timing != null)
                     reportQuantum(
