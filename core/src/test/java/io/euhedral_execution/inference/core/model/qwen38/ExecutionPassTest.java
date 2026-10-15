@@ -346,6 +346,34 @@ class ExecutionPassTest {
     }
 
     @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void aRefusedStepWhoseSelectFailsAtItsEndRunsItsSelectOnce() throws Exception {
+        var plan = plan();
+        var execution = execution(plan);
+        var a = new Sequence(1);
+        var b = new Sequence(2);
+        var runs = new java.util.concurrent.atomic.AtomicInteger();
+        var toldA = new Told();
+        var failing = new Told(q -> runs.incrementAndGet()) {
+            @Override
+            public void doFinally() {
+                throw new IllegalStateException("fails at its end");
+            }
+        };
+        try {
+            execution.runtime().publishOnOwner(() -> {
+                execution.offer(part(a, 0, 1), toldA);
+                execution.offer(part(b, 0, 5), failing);
+            });
+            toldA.seen.get(10, TimeUnit.SECONDS);
+        } finally {
+            // Closing refuses b's pending step, running its select in place.
+            execution.close();
+        }
+        assertEquals(1, runs.get());
+    }
+
+    @Test
     void aSecondCompleteKeepsTheSequenceClosed() {
         var sequence = new Sequence(1);
         sequence.complete();

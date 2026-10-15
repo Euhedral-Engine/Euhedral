@@ -13,9 +13,8 @@ import java.util.function.ToIntFunction;
 /// Forms passes from the ready steps of concurrent generations. Confined to the workspace's owner: every event is
 /// applied by an owner frame, and the record never waits. Rule: no pass forms while one is in flight, nor while a
 /// member of the last retired pass has not reported (offered its next step or left); a pass then takes the pending
-/// offers in arrival order, up to `maxRows` rows and `maxParts` offers; a step over `maxRows` forms a pass of its own.
-/// `Passes#run` returns how many retirements
-/// the pass will report (one per quantum it admitted).
+/// offers in arrival order, up to `maxRows` rows and `maxParts` offers; a step over `maxRows` forms a pass of its
+/// own. `Passes#run` returns how many retirements the pass will report (one per quantum it admitted).
 ///
 /// @param <S> the sequence a step belongs to
 /// @param <O> a ready step offered for a pass
@@ -27,6 +26,13 @@ public final class PassAssembler<S, O> {
         /// admitted: admission failures are reported through the admitted quantum's continuation. A throw is
         /// counted as no retirements and surfaces as an `IllegalStateException`.
         int run(List<O> pass);
+    }
+
+    /// An offer refused before it was queued: nothing of it remains in the assembler.
+    public static final class Refused extends IllegalArgumentException {
+        Refused(String message) {
+            super(message);
+        }
     }
 
     private final Function<O, S> sequenceOf;
@@ -67,10 +73,10 @@ public final class PassAssembler<S, O> {
         if (rows < 1) {
             // The refused offer is still the sequence's report: it must not hold back the others.
             if (awaiting.remove(sequence)) tryRun();
-            throw new IllegalArgumentException("a step of " + rows + " rows");
+            throw new Refused("a step of " + rows + " rows");
         }
         if (!pendingSequences.add(sequence)) {
-            throw new IllegalStateException("a sequence already has a pending step");
+            throw new Refused("a sequence already has a pending step");
         }
         awaiting.remove(sequence);
         pending.add(offer);
