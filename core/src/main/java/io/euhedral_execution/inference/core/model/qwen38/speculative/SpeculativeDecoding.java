@@ -40,6 +40,9 @@ public interface SpeculativeDecoding extends AutoCloseable {
         void afterChunk(int end, Consumer<Throwable> failed, AbstractFrame next);
     }
 
+    /// A generation that offers its steps ([Execution#offer]) must call [Execution#leave] for its sequence when it
+    /// ends, or every other sequence's passes stall.
+    ///
     /// The first step of a speculative generation: prefills `prompt` from `startPosition` (0 for a fresh
     /// sequence, or the position a prefix-cache restore left the sequence at, with this strategy's state restored
     /// too) and generates up to `maxNewTokens`, reporting each committed token to `onToken`; its last step hands

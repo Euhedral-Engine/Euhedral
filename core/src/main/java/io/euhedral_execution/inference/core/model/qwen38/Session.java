@@ -383,6 +383,8 @@ public final class Session implements GenerationSession {
     /// was active at close ends.
     private synchronized void completeClose() {
         this.sequence.complete();
+        // Backstop: a closed session never holds back another sequence's pass (a non-member is a no-op).
+        this.runtime.leave(this.sequence);
         // The sequence completes only once no quantum is in flight, and a quantum retires from the sequence
         // after its retirement boundary, so no copy into the host row can still be queued.
         this.hostLogits.close();

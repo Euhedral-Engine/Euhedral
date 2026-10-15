@@ -298,6 +298,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
     /// fresh one): its base state holds `[0, startPosition)`, its MTP cache `[0, startPosition - 1)`, and its draft
     /// seed buffer the hidden row of position `startPosition - 1`. `hooks`, when not null, is called after each
     /// prefill chunk and its MTP catch-up, before the next chunk overwrites the draft seed rows.
+    /// The generation offers its base-model steps to shared passes: it must call [Execution#leave] for its
+    /// sequence when it ends, or every other sequence's passes stall.
     @Override
     public StepPort start(
             int[] prompt,
@@ -807,6 +809,8 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
     @Override
     public void close() {
+        // Backstop: a closed decoder never holds back another sequence's pass (a non-member is a no-op).
+        this.runtime.leave(this.sequence);
         this.baseLogits.close();
         this.draftLogits.close();
     }

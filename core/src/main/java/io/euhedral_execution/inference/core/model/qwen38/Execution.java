@@ -349,7 +349,8 @@ public final class Execution implements AutoCloseable {
     }
 
     /// Offers a generation's next base-model step (a decode or verification) for the next pass; its quantum's
-    /// continuation is `select`. Owner frames only (a port's admit). DFlash2 plans run every step alone at once.
+    /// continuation is `select`. Owner frames only (a port's admit). A generation that offers must call
+    /// [#leave] when it ends, or every other sequence's passes stall. DFlash2 plans run every step alone at once.
     public void offer(Quantum.Part part, AbstractFrame select) {
         Objects.requireNonNull(part, "part");
         Objects.requireNonNull(select, "select");
