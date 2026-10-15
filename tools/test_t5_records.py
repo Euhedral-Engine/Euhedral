@@ -154,6 +154,21 @@ class RecordsTest(unittest.TestCase):
         (self.store / "fx.json").write_text('{"tools": {"lookup": {"rules": [{"match": []}]}}}')
         self.assertTrue(any("t0" in e and "rule 0" in e for e in self.check(self.valid())))
 
+    def test_any_domain_with_tools_needs_a_fixture(self):
+        tools = ({"type": "function", "function": {"name": "lookup"}},)
+        items = self.valid() + [conv("x0", "coding", 9, tools=tools)]
+        self.assertTrue(any("x0" in e and "missing fixture" in e for e in self.check(items)))
+
+    def test_malformed_tools_are_errors(self):
+        for tools in (({"function": None},), ("lookup",), ({"function": {"name": ""}},), ({},)):
+            items = [dataclasses.replace(c, tools=tools) if c.id == "t0" else c for c in self.valid()]
+            errors = self.check(items)
+            self.assertTrue(any("t0" in e and "function name" in e for e in errors), tools)
+
+    def test_unhashable_order_is_an_error(self):
+        items = [dataclasses.replace(c, order=[1]) if c.id == "c0" else c for c in self.valid()]
+        self.assertTrue(any("c0" in e and "order must be an integer" in e for e in self.check(items)))
+
     def test_order_type_and_regional_tags(self):
         items = [dataclasses.replace(c, order="1") if c.id == "c0" else c for c in self.valid()]
         self.assertTrue(any("c0" in e and "order" in e for e in self.check(items)))

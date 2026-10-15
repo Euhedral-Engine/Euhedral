@@ -1,0 +1,6 @@
+Copyright The Go Authors. All rights reserved. Use of this source code is governed by a BSD-style license that can be found in the LICENSE file.
+Use of this source code is governed by a BSD-style license that can be found in the LICENSE file.
+Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option. This file may not be copied, modified, or distributed except according to those terms.
+Licensed to the Python Software Foundation under a contributor agreement. Distributed under the terms of the Python Software Foundation License.
+SPDX-License-Identifier: MIT OR Apache-2.0
+All rights reserved. This source code is licensed under the license found in the LICENSE file in the root directory of this source tree.

@@ -1,5 +1,5 @@
 {
-  "note": "Sources the evaluation set must not reuse. repositories: tools/holdout/texts.py (T3 code: CPython, Go, serde_json, cJSON), tools/gptq/calibration.py (calibration code: the same four projects). datasets: tools/holdout/texts.py , tools/holdout/t4_prompts.py (T4: gsm8k, mbpp, hermes function calling), tools/gptq/calibration.py (calibration prompts: the same three plus UltraChat 200k).",
+  "note": "Sources the evaluation set must not reuse. repositories: tools/holdout/texts.py (T3 code: CPython, Go, serde_json, cJSON) and tools/gptq/calibration.py (calibration code: the same four projects). datasets: tools/holdout/texts.py (T2 is wikitext-2, the ggml-org/ci archive of Wikipedia text; Salesforce/wikitext is its original host), tools/holdout/t4_prompts.py (T4 and calibration prompts: gsm8k, mbpp, hermes function calling) and tools/gptq/calibration.py (calibration chat: ultrachat_200k). sites: wikipedia.org, matched as a host suffix, because wikitext-2 is Wikipedia text and any Wikipedia page may overlap it.",
   "repositories": [
     "python/cpython",
     "golang/go",

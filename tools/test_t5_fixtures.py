@@ -96,6 +96,11 @@ class FixtureTest(unittest.TestCase):
         f = fixtures.Fixture({"tools": {"t": {"rules": [{"match": {"n": 3}, "result": "three"}]}}})
         self.assertEqual(f.call("t", '{"n": 3.0}'), '"three"')
 
+    def test_non_finite_arguments(self):
+        f = fixtures.Fixture({"tools": {"t": {"rules": [{"match": {"n": 3}, "result": 1}], "default": 0}}})
+        for text in ('{"n": Infinity}', '{"n": -Infinity}', '{"n": NaN}', '{"n": [1e999]}'):
+            self.assertEqual(f.call("t", text), "0")
+
     def test_calculator_bounds(self):
         for expression in ("9**999", "(10**900)*(10**900)*(10**900)*(10**900)", "2**-100000", "10**10**3"):
             result = json.loads(fixtures.calculate(expression))

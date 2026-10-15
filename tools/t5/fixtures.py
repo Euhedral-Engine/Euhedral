@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import operator
 from pathlib import Path
 
@@ -68,7 +69,7 @@ def normalize_path(path: str) -> str:
 
 def _normal(value):
     """Integral floats compare as ints (3.0 matches 3)."""
-    if isinstance(value, float) and value == int(value):
+    if isinstance(value, float) and math.isfinite(value) and value == int(value):
         return int(value)
     if isinstance(value, dict):
         return {k: _normal(v) for k, v in value.items()}

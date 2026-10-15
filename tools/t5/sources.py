@@ -71,7 +71,7 @@ def github_path_first_commit(owner: str, repo: str, path: str, fetch=urlopen_jso
 def published_date(url: str, fetch=urlopen_json) -> tuple[datetime.date, datetime.date | None] | None:
     """(publication date, repository creation date for file sources else None) of a github.com URL, or None when
     its form is not recognised. A file URL `/owner/repo/blob/REF/PATH` is ambiguous when REF holds `/`: the
-    longest-first split that yields commits wins."""
+    longest-ref-first split that yields commits wins."""
     parsed = urlparse(url)
     parts = [p for p in parsed.path.split("/") if p]
     if parsed.hostname != "github.com" or len(parts) < 4:
@@ -81,7 +81,7 @@ def published_date(url: str, fetch=urlopen_json) -> tuple[datetime.date, datetim
         return github_issue_created(owner, repo, int(parts[3]), fetch), None
     if kind in ("blob", "tree") and len(parts) >= 5:
         rest = parts[3:]
-        for split in range(1, len(rest)):
+        for split in range(len(rest) - 1, 0, -1):
             try:
                 found = github_path_first_commit(owner, repo, "/".join(rest[split:]), fetch, "/".join(rest[:split]))
             except (ValueError, OSError):

@@ -195,28 +195,34 @@ def validate_conversations(conversations: list[Conversation], store: Path, exclu
             errors.append(f"{c.id}: order must be an integer")
         if not c.turns or not all(isinstance(t, str) and t.strip() for t in c.turns):
             errors.append(f"{c.id}: turns must be non-empty strings")
-        if c.domain == "tool_use":
-            if not c.tools:
-                errors.append(f"{c.id}: tool_use needs tools")
-            if not c.fixture or not _inside(store, c.fixture) or not (store / c.fixture).is_file():
+        if c.domain == "tool_use" and not c.tools:
+            errors.append(f"{c.id}: tool_use needs tools")
+        if c.tools or c.domain == "tool_use":
+            usable = c.fixture and _inside(store, c.fixture) and (store / c.fixture).is_file()
+            if not usable:
                 errors.append(f"{c.id}: missing fixture {c.fixture}")
-        if c.tools and c.fixture and _inside(store, c.fixture) and (store / c.fixture).is_file():
-            names = [t.get("function", {}).get("name") for t in c.tools]
-            try:
-                spec = json.loads((store / c.fixture).read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                errors.append(f"{c.id}: fixture is not valid JSON")
-            else:
-                for error in fixtures.validate_spec(spec, [n for n in names if n]):
-                    errors.append(f"{c.id}: fixture: {error}")
-            if not all(names):
-                errors.append(f"{c.id}: every tool needs a function name")
+            names = []
+            for tool in c.tools:
+                function = tool.get("function") if isinstance(tool, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                if isinstance(name, str) and name:
+                    names.append(name)
+                else:
+                    errors.append(f"{c.id}: every tool needs a function name")
+            if usable:
+                try:
+                    spec = json.loads((store / c.fixture).read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    errors.append(f"{c.id}: fixture is not valid JSON")
+                else:
+                    for error in fixtures.validate_spec(spec, names):
+                        errors.append(f"{c.id}: fixture: {error}")
         _check_human(c.id, c.source, excluded, errors)
     for domain, count in chunks.items():
         members = [c for c in conversations if c.domain == domain]
         if len(members) < count:
             errors.append(f"domain {domain}: {len(members)} conversations, need at least {count}")
-        orders = [c.order for c in members]
+        orders = [c.order for c in members if isinstance(c.order, int)]
         if len(set(orders)) != len(orders):
             errors.append(f"domain {domain}: order values are not unique")
     spoken = {c.language.split("-")[0].lower() for c in conversations if c.domain == "multilingual"}

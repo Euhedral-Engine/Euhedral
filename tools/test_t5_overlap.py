@@ -70,6 +70,25 @@ class OverlapTest(unittest.TestCase):
             self.assertEqual(overlap.main([str(store), "--against", str(store / "ref.txt")]), 1)
             self.assertGreaterEqual(json.loads((store / "checks" / "overlap.json").read_text())["items"]["a"]["shared"], 5)
 
+    def test_licence_boilerplate_is_not_overlap(self):
+        mit = (overlap.BOILERPLATE_DIR / "mit.txt").read_text()
+        go_header = ("// Copyright 2025 The Go Authors. All rights reserved.\n"
+                     "// Use of this source code is governed by a BSD-style\n"
+                     "// license that can be found in the LICENSE file.\n")
+        func_a = " ".join(f"alpha{i}" for i in range(30))
+        func_b = " ".join(f"beta{i}" for i in range(30))
+        reference = overlap.Reference()
+        reference.add("Copyright (c) 2020 Someone\n" + mit + "\n" + func_a)
+        reference.add("// Copyright 2019 The Go Authors. All rights reserved.\n" + go_header + func_a)
+        new_mit = reference.measure("Copyright (c) 2026 Someone Else\n\n" + mit + "\n" + func_b)
+        self.assertEqual(new_mit["shared"], 0)
+        self.assertEqual(new_mit["containment"], 0.0)
+        new_go = reference.measure(go_header + func_b)
+        self.assertEqual(new_go["shared"], 0)
+        copied = reference.measure(go_header + func_a)
+        self.assertGreaterEqual(copied["shared"], 18)
+        self.assertEqual(copied["containment"], 1.0)
+
     def test_main_writes_report_and_fails_over_limit(self):
         with tempfile.TemporaryDirectory() as d:
             store = Path(d)

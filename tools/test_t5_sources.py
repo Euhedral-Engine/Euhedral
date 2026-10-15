@@ -60,7 +60,20 @@ class SourcesTest(unittest.TestCase):
 
         got = sources.published_date("https://github.com/o/r/blob/feature/x/src/m.py", fetch)
         self.assertEqual(got, (datetime.date(2026, 10, 5), datetime.date(2026, 9, 30)))
-        self.assertTrue(any("sha=feature&path=x/src/m.py" in u for u in seen))
+        self.assertIn("sha=feature%2Fx%2Fsrc&path=m.py", seen[0])
+        self.assertTrue(any("sha=feature%2Fx&path=src/m.py" in u for u in seen))
+
+    def test_longest_ref_is_tried_first(self):
+        seen = []
+
+        def fetch(url):
+            seen.append(url)
+            if url.endswith("/repos/o/r"):
+                return {"created_at": "2026-09-30T00:00:00Z"}, {}
+            return [commit("2026-10-05T00:00:00Z")], {}
+
+        sources.published_date("https://github.com/o/r/blob/a/b/c/f.py", fetch)
+        self.assertIn("sha=a%2Fb%2Fc&path=f.py", seen[0])
 
     def test_old_repository_fails_check(self):
         row = {"id": "c", "domain": "coding", "order": 0, "language": "en", "turns": ["x"],

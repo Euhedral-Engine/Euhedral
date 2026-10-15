@@ -1,10 +1,30 @@
 """N-gram overlap between the evaluation set's prompts and documents and the data it must stay clear of.
 
-Usage (from tools/): python3 -m t5.overlap STORE --against FILE... [--n 13] [--limit 0.05]
+Usage (from tools/): python3 -m t5.overlap STORE --against FILE... [--n 13] [--limit 0.05] [--min-shared 5]
+                                            [--containment 0.5]
 
-Every conversation turn (and system prompt) and every document is compared with the union of the reference files;
-STORE/checks/overlap.json records the fraction of each item's n-word windows found among the references. Reference
-files ending in .jsonl contribute their string values, other files are read as text.
+Every conversation turn, system prompt, tool definition and fixture text, and every document, is compared with the
+union of the reference files. STORE/checks/overlap.json records, per item (under "items"), three measures over
+n-word windows (n = 13):
+- fraction: the share of the item's windows found in the references (--limit, flagged above it). A long turn
+  dilutes it, so it is not enough alone;
+- shared: the number of such windows (--min-shared, flagged at or above it);
+- containment: the largest share of one reference item (a JSONL string value, or a whole text file) found in the
+  item (--containment, flagged at or above it; reference items under 3 windows are ignored).
+The exit status is 1 when any item is flagged.
+
+Standard licence and header texts (tools/t5/boilerplate/*.txt: MIT, BSD, Apache, GPL notices, Go/Rust/Python
+headers) and copyright lines are removed from references and candidates before measuring, so shared boilerplate
+is not an overlap.
+
+Reference files (--against) to pass: the T1-T4 texts (t2.txt, t3.txt from tools/holdout/texts.py and the T1 text),
+the T4 prompts JSONL (tools/holdout/t4_prompts.py), and the calibration corpus text: write the GSM8K, MBPP and
+Hermes training-split prompts with `python -m gptq.calibration prompts OUT/prompts.jsonl T4_PROMPTS.jsonl --chat N`
+(with UltraChat), the model answers with `generate` (OUT/generations.jsonl), and the prose and code files `tokens`
+reads (wikitext-2 train and the calibration source files). Files ending in .jsonl contribute their string values,
+one item each; other files are one text. Memory: every distinct window of every reference stays in memory (about
+100 bytes each), so a multi-gigabyte reference needs a machine to match; split very large corpora and run the check
+once per part, any part flagging an item failing the set.
 """
 from __future__ import annotations
 
@@ -42,18 +62,36 @@ def overlap(candidate: str, reference: set[int], n: int = 13) -> float:
     return len(found & reference) / len(found) if found else 0.0
 
 
+_NOTICE = re.compile(r"(?im)^[\s/#*;-]*(?:copyright|\(c\)).*$")
+BOILERPLATE_DIR = Path(__file__).with_name("boilerplate")
+
+
+def _strip(text: str) -> str:
+    return _NOTICE.sub("", text)
+
+
+def load_boilerplate(n: int = 13) -> set[int]:
+    found: set[int] = set()
+    for file in sorted(BOILERPLATE_DIR.glob("*.txt")):
+        for line in _strip(file.read_text(encoding="utf-8")).splitlines():
+            found |= shingles(line, n)
+        found |= shingles(_strip(file.read_text(encoding="utf-8")), n)
+    return found
+
+
 class Reference:
     """The union of the reference files' windows, with each reference item (a JSONL string value or a whole text
     file) indexed so a candidate can be tested for containing most of one item."""
 
-    def __init__(self, n: int = 13) -> None:
+    def __init__(self, n: int = 13, boilerplate: set[int] | None = None) -> None:
         self.n = n
+        self.boilerplate = load_boilerplate(n) if boilerplate is None else boilerplate
         self.union: set[int] = set()
         self._sizes: list[int] = []
         self._index: dict[int, list[int]] = {}
 
     def add(self, text: str) -> None:
-        found = shingles(text, self.n)
+        found = shingles(_strip(text), self.n) - self.boilerplate
         self.union |= found
         if len(found) >= MIN_ITEM_SHINGLES:
             item = len(self._sizes)
@@ -64,7 +102,7 @@ class Reference:
     def measure(self, text: str) -> dict:
         """fraction: share of the text's windows in the references (diluted by long text); shared: number of such
         windows; containment: the largest share of one reference item's windows found in the text."""
-        found = shingles(text, self.n)
+        found = shingles(_strip(text), self.n) - self.boilerplate
         shared = found & self.union
         counts: dict[int, int] = {}
         for h in shared:
