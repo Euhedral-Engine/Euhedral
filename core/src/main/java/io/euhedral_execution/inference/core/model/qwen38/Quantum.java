@@ -708,17 +708,15 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
                 if (!part.verifies()) part.hostLogits().queueFinalRow(rowAddress, segment.rows());
                 else if (part.hostLogits().selectsOnDevice())
                     part.hostLogits().queueRowSelections(rowAddress, segment.rows());
-                else
-                    // TEMPORARY: a verification without device selection needs every row's host copy
-                    // (HostLogits.queueRows), which is not available yet.
-                    throw new UnsupportedOperationException(
-                            "a batched verification's host logits must select on device");
+                else part.hostLogits().queueRows(rowAddress, segment.rows());
             }
             return;
         }
         if (this.hostLogits == null) return;
-        if (this.kind == ExecutionKind.VERIFY) this.hostLogits.queueRowSelections(address, logitsRowCount());
-        else this.hostLogits.queueFinalRow(address, logitsRowCount());
+        if (this.kind == ExecutionKind.VERIFY) {
+            if (this.hostLogits.selectsOnDevice()) this.hostLogits.queueRowSelections(address, logitsRowCount());
+            else this.hostLogits.queueRows(address, logitsRowCount());
+        } else this.hostLogits.queueFinalRow(address, logitsRowCount());
     }
 
     @Override

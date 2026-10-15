@@ -257,4 +257,48 @@ class TokenSamplerTest {
 
         assertEquals(248_319, sampler.selectToken(logits));
     }
+
+    private static int[] keyedSequence(long seed, float[] logits, int length, long first) {
+        TokenSampler sampler = new TokenSampler(new GenerationConfig(1.0f, 0, 1.0f, seed, false), logits.length);
+        int[] sequence = new int[length];
+        for (int i = 0; i < length; i++) sequence[i] = sampler.selectToken(logits, first + i);
+        return sequence;
+    }
+
+    @Test
+    void keyedDrawsOfNeighbouringPositionsAreIndependent() {
+        float[] logits = {0.0f, 0.0f};
+        int[] sequence = keyedSequence(1234L, logits, 4001, 0);
+        int[][] pairs = new int[2][2];
+        for (int i = 0; i + 1 < sequence.length; i += 2) pairs[sequence[i]][sequence[i + 1]]++;
+        // 2000 pairs over four cells: each expects 500; a correlated stream would empty off-diagonal cells.
+        for (int[] row : pairs)
+            for (int count : row) assertTrue(count > 400 && count < 600, Arrays.deepToString(pairs));
+    }
+
+    @Test
+    void keyedDrawsDependOnTheSeed() {
+        float[] logits = {0.0f, 0.0f, 0.0f, 0.0f};
+        assertNotEquals(
+                Arrays.toString(keyedSequence(1234L, logits, 64, 0)),
+                Arrays.toString(keyedSequence(1235L, logits, 64, 0)));
+        assertEquals(
+                Arrays.toString(keyedSequence(1234L, logits, 64, 0)),
+                Arrays.toString(keyedSequence(1234L, logits, 64, 0)));
+    }
+
+    @Test
+    void keyedCallsIgnoreTheSequentialStreamAndCallOrder() {
+        float[] logits = {0.0f, 0.0f, 0.0f, 0.0f};
+        GenerationConfig config = new GenerationConfig(1.0f, 0, 1.0f, 1234L, false);
+        int[] expected = keyedSequence(1234L, logits, 64, 0);
+        TokenSampler interleaved = new TokenSampler(config, logits.length);
+        int[] actual = new int[64];
+        for (int i = 63; i >= 0; i--) {
+            interleaved.selectToken(logits);
+            actual[i] = interleaved.selectToken(logits, (long) i);
+            interleaved.selectToken(logits, token -> true);
+        }
+        assertEquals(Arrays.toString(expected), Arrays.toString(actual));
+    }
 }

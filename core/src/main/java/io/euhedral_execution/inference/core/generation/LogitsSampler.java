@@ -40,6 +40,36 @@ public final class LogitsSampler {
         return select(logits.row(), allowed);
     }
 
+    /// As [#selectToken(HostLogits, IntPredicate)], drawing with the sampler's draw for `position` (the position
+    /// the selected token occupies) instead of its sequential stream. A device selection is greedy and has no draw.
+    public int selectToken(HostLogits logits, IntPredicate allowed, long position) {
+        Objects.requireNonNull(logits, "logits");
+        requireVocabulary(logits.vocabularySize());
+        if (logits.hasSelection()) {
+            if (allowed != null || !greedy()) throw new IllegalStateException("device selection is greedy only");
+            return logits.selectedToken();
+        }
+        return select(logits.row(), allowed, position);
+    }
+
+    /// Selects row `row` of the verification copy ([HostLogits#queueRows]) at `position`.
+    public int selectRow(HostLogits logits, int row, long position) {
+        Objects.requireNonNull(logits, "logits");
+        requireVocabulary(logits.vocabularySize());
+        return select(logits.row(row), null, position);
+    }
+
+    /// Each verified row's selection: the device's greedy choices, or each row sampled at its own position
+    /// (`firstPosition` is the position the first row's token occupies).
+    public int[] selectRows(HostLogits logits, long firstPosition) {
+        Objects.requireNonNull(logits, "logits");
+        requireVocabulary(logits.vocabularySize());
+        if (logits.selectsOnDevice()) return logits.selectedTokens();
+        int[] tokens = new int[logits.rowCount()];
+        for (int row = 0; row < tokens.length; row++) tokens[row] = selectRow(logits, row, firstPosition + row);
+        return tokens;
+    }
+
     /// Whether this sampler selects the argmax, which a device selection reproduces exactly.
     public boolean greedy() {
         return this.sampler.greedy();
@@ -76,6 +106,14 @@ public final class LogitsSampler {
         float[] hostLogits = this.scratch;
         convertBf16(row, hostLogits);
         return allowed == null ? this.sampler.selectToken(hostLogits) : this.sampler.selectToken(hostLogits, allowed);
+    }
+
+    private int select(MemorySegment row, IntPredicate allowed, long position) {
+        float[] hostLogits = this.scratch;
+        convertBf16(row, hostLogits);
+        return allowed == null
+                ? this.sampler.selectToken(hostLogits, position)
+                : this.sampler.selectToken(hostLogits, allowed, position);
     }
 
     /// BF16 is the upper half of FP32, so each value converts exactly by a shift. The row is read two
