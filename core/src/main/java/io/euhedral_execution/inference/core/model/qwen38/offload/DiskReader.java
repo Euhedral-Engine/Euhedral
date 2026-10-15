@@ -34,13 +34,18 @@ import org.slf4j.LoggerFactory;
 /// window slot keeps its own queue of uses, in admission order and, within a quantum, in use order: the order its
 /// copies run on the device, which the staging ring's edges fix. A poll gives each slot whose flag the device lowered
 /// the next use of its queue: it submits the read ([AsyncReads], io_uring). The worker that reaps the read fails the
-/// use's quantum if the read failed, raises the flag and marks the read ended, and the next poll takes the slot back;
-/// neither the device nor the poll waits for the read's completion frame. Without asynchronous reads the poll reads
-/// positionally itself, one slot at a time.
+/// use's quantum if the read failed, raises the flag, hands the slot to the use's copy ([#claim]) and marks the read
+/// ended, and the next poll takes the slot back; neither the device nor the poll waits for the read's completion
+/// frame. Without asynchronous reads the poll reads positionally itself, one slot at a time.
+///
+/// The device never waits for the host: a copy from the window is queued only once its read is in the slot
+/// ([#claim]), so every stream drains on its own, and a worker that a CUDA call holds while a stream is full is
+/// released as the device runs. The device lowers the slot's flag after the copy, which frees the slot for its next
+/// read.
 ///
 /// A quantum that stops before its device work consumed every use is abandoned ([#abandon]): its uses not yet read
-/// raise their flags unread, so the device, which drains them in order, never waits on them and the next quantum's
-/// uses of each slot follow. A failed read fails its quantum and still raises the flag.
+/// are skipped, and a read of it no copy claimed is dropped by the slot's next claim. A failed read fails its quantum
+/// and is still handed to its copy.
 public final class DiskReader extends AbstractIngestSink implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(DiskReader.class);
@@ -74,9 +79,20 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
     // Touched by the poll only.
     private final ArrayDeque<Pending>[] queues;
     private final int[] state = new int[DiskWindow.SLOTS];
+    /// Each slot's hand-over between its reads and the device copies that consume them: null, a [Ready] read no copy
+    /// claimed yet, or a [Waiter] copy whose read has not arrived. Changed by compare-and-set from any thread.
+    private final java.util.concurrent.atomic.AtomicReferenceArray<Object> gates =
+            new java.util.concurrent.atomic.AtomicReferenceArray<>(DiskWindow.SLOTS);
+
+    /// A slot's read of quantum `ticket` arrived and no copy claimed it.
+    private record Ready(long ticket) {}
+
+    /// A copy of quantum `ticket` waits for its read of the slot; `release` queues it.
+    private record Waiter(long ticket, Runnable release) {}
+
     /// Each slot's routing seed for its reads' completion frames.
     private final long[] seeds = new long[DiskWindow.SLOTS];
-    /// Set by the worker that reaps a slot's read, after it raised the slot's flag; the poll takes it as the end of
+    /// Set by the worker that reaps a slot's read, before it hands the slot over; the poll takes it as the end of
     /// the read. The completion frame plays no part in the slot's turn, so a frame stranded behind a busy worker
     /// never holds the slot.
     private final java.util.concurrent.atomic.AtomicIntegerArray reaped =
@@ -143,8 +159,9 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         enqueue(quantum, uses, failure -> {});
     }
 
-    /// `quantum` stopped before its device work consumed all its uses: those not yet read are raised unread. Any
-    /// time, before or after its registration.
+    /// `quantum` stopped before its device work consumed all its uses: those not yet read are skipped, and a read of
+    /// it that no copy claims is dropped when the next copy of the slot claims. Any time, before or after its
+    /// registration.
     public void abandon(long quantum) {
         post(() -> {
             if (quantum > this.latestQuantum || this.remaining.containsKey(quantum)) this.abandoned.add(quantum);
@@ -179,10 +196,9 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         Pending next = this.queues[slot].peek();
         DiskUse use = next.use();
         if (this.abandoned.contains(next.quantum())) {
+            // No copy will consume it: the slot stays free for the next use.
             this.queues[slot].poll();
             given(next.quantum());
-            this.state[slot] = FILLED;
-            this.window.raise(slot);
             return;
         }
         if (this.reads == null) {
@@ -212,8 +228,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
             given(next.quantum());
             return;
         }
-        // This thread cannot submit (no ring of its own, or the submission failed): the use is read here, or
-        // fails its quantum; either way the flag rises, so the device never waits for a read that will not come.
+        // This thread cannot submit (no ring of its own, or the submission failed): the use is read here, or fails
+        // its quantum; either way its copy is handed the slot.
         this.inFlight.decrementAndGet();
         this.queues[slot].poll();
         given(next.quantum());
@@ -221,8 +237,8 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
     }
 
     /// Reads `next` into slot `slot` on this thread, or fails its quantum with `refusal` (the submission's failure)
-    /// when there is one. The slot rises whatever the read or the quantum's failure throws: a slot left down would
-    /// hold the device for good.
+    /// when there is one. The slot is handed to its copy whatever the read or the quantum's failure throws: a copy
+    /// left waiting would hold its graph for good.
     private void readHere(int slot, Pending next, Throwable refusal) {
         try {
             if (refusal != null) throw refusal;
@@ -231,7 +247,65 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
             failed(next, failure);
         } finally {
             this.state[slot] = FILLED;
-            this.window.raise(slot);
+            arrived(slot, next.quantum());
+        }
+    }
+
+    // ---------------------------------------------------------------- the hand-over
+
+    /// The copy of `ticket`'s next use of `slot` may be queued on the device once that use's read is in the slot:
+    /// true when it is in now; otherwise `release` runs, on the thread that completes the read, once it is. Called
+    /// once per use, when the copy's other inputs exist: for one slot, in the order the device consumes its uses
+    /// (the staging ring's edges order a staging slot's transfers, across quanta too). Any thread.
+    ///
+    /// A read of another quantum still in the slot belongs to an abandoned quantum (its own copies came first): it
+    /// is dropped, and the slot freed for this one's read.
+    public boolean claim(int slot, long ticket, Runnable release) {
+        Objects.requireNonNull(release, "release");
+        Waiter waiter = new Waiter(ticket, release);
+        while (true) {
+            Object gate = this.gates.get(slot);
+            if (gate == null) {
+                if (this.gates.compareAndSet(slot, null, waiter)) return false;
+            } else if (gate instanceof Ready ready) {
+                if (ready.ticket() == ticket) {
+                    if (this.gates.compareAndSet(slot, gate, null)) return true;
+                } else if (this.gates.compareAndSet(slot, gate, waiter)) {
+                    // No device work reads the dropped bytes: the poll may refill the slot.
+                    this.window.lower(slot);
+                    return false;
+                }
+            } else {
+                throw new IllegalStateException("window slot " + slot + " has two copies waiting");
+            }
+        }
+    }
+
+    /// `ticket`'s read is in `slot`: the slot rises and its copy is released, or the read waits for its claim. A read
+    /// of a quantum other than the waiting copy's belongs to an abandoned quantum and is dropped. Any thread; never
+    /// blocks.
+    private void arrived(int slot, long ticket) {
+        // Raised before a copy can be queued: the device lowers the flag after its copy, and the poll refills the
+        // slot only once it is down.
+        this.window.raise(slot);
+        while (true) {
+            Object gate = this.gates.get(slot);
+            if (gate == null) {
+                if (this.gates.compareAndSet(slot, null, new Ready(ticket))) return;
+            } else if (gate instanceof Waiter waiter) {
+                if (waiter.ticket() != ticket) {
+                    this.window.lower(slot);
+                    return;
+                }
+                if (this.gates.compareAndSet(slot, gate, null)) {
+                    waiter.release().run();
+                    return;
+                }
+            } else {
+                // A slot holds one read until its copy lowers the flag; this cannot happen.
+                LOG.error("window slot {} received a read while holding another", slot);
+                return;
+            }
         }
     }
 
@@ -273,10 +347,9 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         }
     }
 
-    /// Slot `slot`'s read of one use. The worker that reaps it ([#reaped]) fails the use's quantum when the read
-    /// failed, raises the flag and marks the read ended for the poll; the completion frame only logs a failure. The
-    /// device and the poll so never wait for the frame, which can queue behind a worker blocked in a CUDA call that
-    /// itself waits for the device to pass this slot.
+    /// Slot `slot`'s read of one use. The worker that reaps it ([#reaped]) fails the use's quantum when
+    /// the read failed, hands the slot to the use's copy and marks the read ended for the poll; the
+    /// completion frame only logs a failure, so neither the copy nor the poll waits for the frame.
     private final class SlotRead extends AsyncReads.Read {
         private final int slot;
         private final Pending pending;
@@ -287,19 +360,23 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
             this.pending = pending;
         }
 
-        /// A failed read fails its quantum before the flag rises, so the device's copy of the slot's stale
-        /// bytes belongs to a quantum that cannot commit. Failing a quantum is a compare-and-set: `onFailure`
-        /// must not block.
-        /// The slot rises whatever `onFailure` throws: a slot left down would hold the device for good.
+        /// A failed read fails its quantum before its copy is released, so the device's copy of the
+        /// slot's stale bytes belongs to a quantum that cannot commit. Failing a quantum is a
+        /// compare-and-set: `onFailure` must not block. The slot is handed over whatever `onFailure`
+        /// throws: a copy left waiting would hold its graph for good. The read is marked ended only
+        /// after the flag rose, so the poll never refills the slot before its copy ran.
         @Override
         protected void reaped() {
             try {
                 IOException failure = failure();
                 if (failure != null) failQuantum(this.pending, failure);
             } finally {
-                DiskReader.this.window.raise(this.slot);
-                DiskReader.this.reaped.set(this.slot, 1);
-                DiskReader.this.inFlight.decrementAndGet();
+                try {
+                    DiskReader.this.arrived(this.slot, this.pending.quantum());
+                } finally {
+                    DiskReader.this.reaped.set(this.slot, 1);
+                    DiskReader.this.inFlight.decrementAndGet();
+                }
             }
         }
 

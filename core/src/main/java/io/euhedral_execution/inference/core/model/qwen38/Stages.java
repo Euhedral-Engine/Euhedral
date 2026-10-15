@@ -351,18 +351,19 @@ public final class Stages {
         }
     }
 
-    /// Copies a disk-backed weight from its window slot into its staging slot on the transfer lane: a wait
-    /// until the slot's read raised its flag, the copy, and the write that lowers the flag, all in stream
-    /// order, so a captured graph repeats them. A quantum whose device work leaves it out still waits for and
-    /// lowers the flag on its home lane ([#abandoned]), so every later use of the slot finds its own bytes.
+    /// Copies a disk-backed weight from its window slot into its staging slot on the transfer lane, then
+    /// lowers the slot's flag in stream order, which frees the slot for its next read. The stage is
+    /// published only once its read is in the slot ([#passGate]): no stream ever waits for the host, so
+    /// every stream drains on its own and a worker held in a CUDA call by a full stream is always
+    /// released. A stage that claimed its read and then did not run (its quantum stopped) lowers the flag
+    /// on its quantum's home lane ([#abandoned]).
     public static final class DiskTransfer extends Stage {
         private final long source;
         private final long destination;
         private final long byteSize;
         private final int windowSlot;
-        /// The quantum whose wait, and whose write, this stage last queued.
-        private Object waited;
-        private Object written;
+        /// The quantum whose read of the slot this stage last claimed.
+        private Object claimed;
 
         DiskTransfer(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, stage, instruction, gpu);
@@ -379,31 +380,29 @@ public final class Stages {
         }
 
         @Override
+        protected boolean passGate() {
+            Quantum context = context();
+            var reader = context.diskReader();
+            if (reader == null) throw new IllegalStateException("a disk transfer's quantum reads from no disk");
+            this.claimed = context;
+            return reader.claim(this.windowSlot, context.diskTicket(), this::releaseGate);
+        }
+
+        @Override
         protected void perform(Quantum context, ExecutionPlan.Instruction instruction) {
             long flag = context.plan().window().flagDevice(this.windowSlot);
-            gpu().waitHostFlag(flag, 1);
-            this.waited = context;
             gpu().copyHostWeightsToDevice(this.destination, this.source, this.byteSize);
             gpu().writeHostFlag(flag, 0);
-            this.written = context;
         }
 
         @Override
         protected void abandoned(io.euhedral_execution.inference.core.gpu.GpuStream home) {
             Quantum context = context();
             context.abandonDiskReads();
+            if (this.claimed != context) return;
+            this.claimed = null;
             long flag = context.plan().window().flagDevice(this.windowSlot);
-            boolean wait = this.waited != context;
-            boolean write = this.written != context;
-            if (!wait && !write) return;
-            home.submit(
-                    () -> {
-                        if (wait) gpu().waitHostFlag(flag, 1);
-                        if (write) gpu().writeHostFlag(flag, 0);
-                    },
-                    false);
-            this.waited = context;
-            this.written = context;
+            home.submit(() -> gpu().writeHostFlag(flag, 0), false);
         }
     }
 

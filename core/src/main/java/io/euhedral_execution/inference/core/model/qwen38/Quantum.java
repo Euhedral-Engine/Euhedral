@@ -509,8 +509,18 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
         this.diskTicket = ticket;
     }
 
-    /// The quantum's device work does not consume all its disk uses: those not yet read are raised unread. Any
-    /// thread; a no-op without disk uses.
+    /// The reader of the quantum's disk uses, or null.
+    io.euhedral_execution.inference.core.model.qwen38.offload.DiskReader diskReader() {
+        return this.diskReader;
+    }
+
+    /// The quantum's number among those with disk uses, as the reader knows it.
+    long diskTicket() {
+        return this.diskTicket;
+    }
+
+    /// The quantum's device work does not consume all its disk uses: those not yet read are skipped. Any thread; a
+    /// no-op without disk uses.
     void abandonDiskReads() {
         var reader = this.diskReader;
         if (reader != null) reader.abandon(this.diskTicket);
@@ -767,6 +777,8 @@ public final class Quantum extends AbstractQuantum implements Sequence.Work {
     @Override
     public Object captureKey() {
         if (this.kind == ExecutionKind.PREFILL || this.tokenIds.length > MAX_CAPTURED_ROWS) return null;
+        // Its disk transfers are queued only as their reads arrive, which a captured graph cannot repeat.
+        if (this.diskReader != null) return null;
         if (this.segments != null) return null;
         if (this.workspace == null || this.gpu == null || this.gpu.exactNumerics()) return null;
         // Its seed rows are found only when its stage runs.

@@ -415,7 +415,7 @@ public final class StageGraph implements AutoCloseable {
         quantum.stagesPublishing();
         // Admission holds one count so that fast roots cannot retire the quantum before all publish.
         this.live.set(ready + 1 + count);
-        for (StageFrame root : this.roots) if (root.externalIn == 0) this.source.publish(root);
+        for (StageFrame root : this.roots) if (root.externalIn == 0 && root.passGate()) this.source.publish(root);
         for (int index = 0; index < count; index++) register(edges[index]);
         stageFinished();
     }
@@ -502,6 +502,11 @@ public final class StageGraph implements AutoCloseable {
             stage.doFinally();
             return;
         }
+        if (stage.passGate()) this.source.publish(stage);
+    }
+
+    /// Publishes `stage`, which [StageFrame#passGate] held; its live count was taken when it was held.
+    void releaseGated(StageFrame stage) {
         this.source.publish(stage);
     }
 

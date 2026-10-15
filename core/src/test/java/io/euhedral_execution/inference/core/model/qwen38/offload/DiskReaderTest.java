@@ -2,6 +2,7 @@ package io.euhedral_execution.inference.core.model.qwen38.offload;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -106,9 +107,17 @@ class DiskReaderTest {
         }
     }
 
-    /// The device's copy of `use`: waits for its slot, checks the payload, lowers the flag.
-    private void consume(DiskUse use) {
-        awaitRaised(use.slot());
+    /// The device's copy of quantum `ticket`'s `use`: claims the slot, pumps until the read is handed over, checks
+    /// the payload and lowers the flag, as the copy's stream write does.
+    private void consume(long ticket, DiskUse use) {
+        boolean[] released = {false};
+        if (this.reader.claim(use.slot(), ticket, () -> released[0] = true)) released[0] = true;
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (!released[0]) {
+            assertTrue(System.nanoTime() < deadline, use.name() + " was never handed over");
+            pump();
+        }
+        assertEquals(1, this.window.flag(use.slot()), "a handed-over slot is raised");
         assertPayload(use);
         this.window.lower(use.slot());
     }
@@ -145,8 +154,7 @@ class DiskReaderTest {
             awaitRaised(use.slot());
             // A raised slot is the device's until it lowers the flag: more polls never refill it.
             for (int poll = 0; poll < 50; poll++) pump();
-            assertPayload(use);
-            this.window.lower(use.slot());
+            consume(1, use);
         }
         for (int poll = 0; poll < 10; poll++) pump();
         for (int slot = 0; slot < DiskWindow.SLOTS; slot++) assertEquals(0, this.window.flag(slot));
@@ -169,7 +177,7 @@ class DiskReaderTest {
         assertEquals(4096, uses.get(1).alignedOffset());
         assertEquals(0, uses.get(2).lead());
         this.reader.enqueue(1, uses);
-        for (DiskUse use : uses) consume(use);
+        for (DiskUse use : uses) consume(1, use);
     }
 
     @ParameterizedTest
@@ -181,8 +189,8 @@ class DiskReaderTest {
         List<DiskUse> second = uses("q2", 9, 3, 400_000);
         this.reader.enqueue(1, first);
         this.reader.enqueue(2, second);
-        for (DiskUse use : first) consume(use);
-        for (DiskUse use : second) consume(use);
+        for (DiskUse use : first) consume(1, use);
+        for (DiskUse use : second) consume(2, use);
     }
 
     @ParameterizedTest
@@ -191,17 +199,14 @@ class DiskReaderTest {
         open(async);
         List<DiskUse> failed = uses("q1", 12, 0, 0);
         this.reader.enqueue(1, failed);
-        for (DiskUse use : failed.subList(0, 5)) consume(use);
+        for (DiskUse use : failed.subList(0, 5)) consume(1, use);
+        // Its later uses may be read already when it stops: no copy claims them.
+        for (int poll = 0; poll < 20; poll++) pump();
         this.reader.abandon(1);
         List<DiskUse> next = uses("q2", 3, 5, 600_000);
         this.reader.enqueue(2, next);
-        // The failed quantum's retirement drains its remaining uses on the device, in order, without reading them.
-        for (DiskUse use : failed.subList(5, 12)) {
-            awaitRaised(use.slot());
-            this.window.lower(use.slot());
-        }
-        // The next quantum's waits see its own bytes, never the failed quantum's.
-        for (DiskUse use : next) consume(use);
+        // The next quantum's copies drop the failed quantum's reads and get their own bytes.
+        for (DiskUse use : next) consume(2, use);
         for (int poll = 0; poll < 10; poll++) pump();
         assertEquals(0, this.reader.readsInFlight());
     }
@@ -216,14 +221,12 @@ class DiskReaderTest {
                 new DiskUse("beyond/0", 4L * FILE_BYTES, 4096, 0), new DiskUse("beyond/1", 5L * FILE_BYTES, 4096, 1));
         AtomicReference<Throwable> failure = new AtomicReference<>();
         this.reader.enqueue(1, abandoned, failure::set);
-        for (DiskUse use : abandoned) {
-            awaitRaised(use.slot());
-            this.window.lower(use.slot());
-        }
+        for (int poll = 0; poll < 20; poll++) pump();
+        for (DiskUse use : abandoned) assertEquals(0, this.window.flag(use.slot()), "an abandoned use is not read");
         assertEquals(null, failure.get());
         List<DiskUse> next = uses("q2", 4, 0, 0);
         this.reader.enqueue(2, next);
-        for (DiskUse use : next) consume(use);
+        for (DiskUse use : next) consume(2, use);
     }
 
     @ParameterizedTest
@@ -234,10 +237,11 @@ class DiskReaderTest {
         this.reader.enqueue(1, List.of(new DiskUse("beyond", 2L * FILE_BYTES, 4096, 0)), failure::set);
         awaitRaised(0);
         assertTrue(failure.get() != null, "the quantum heard of the failed read");
+        assertTrue(this.reader.claim(0, 1, () -> {}), "the read is in: its copy claims it at once");
         this.window.lower(0);
         List<DiskUse> next = uses("q2", 2, 0, 0);
         this.reader.enqueue(2, next);
-        for (DiskUse use : next) consume(use);
+        for (DiskUse use : next) consume(2, use);
     }
 
     @ParameterizedTest
@@ -294,10 +298,12 @@ class DiskReaderTest {
         awaitRaisedHolding(0, held);
         assertEquals(1, held.size(), "the first completion frame has not run");
         assertPayload(first);
+        assertTrue(this.reader.claim(0, 1, () -> {}), "the read is in: its copy claims it at once");
         this.window.lower(0);
         awaitRaisedHolding(0, held);
         assertEquals(2, held.size(), "neither completion frame has run");
         assertPayload(second);
+        assertTrue(this.reader.claim(0, 1, () -> {}), "the read is in: its copy claims it at once");
         this.window.lower(0);
         assertEquals(0, this.reader.readsInFlight());
         for (AbstractFrame frame : held) {
@@ -349,8 +355,9 @@ class DiskReaderTest {
         }
         assertEquals("failing the quantum threw", thrown == null ? null : thrown.getMessage());
         assertEquals(0, this.reader.readsInFlight());
+        assertTrue(this.reader.claim(3, 1, () -> {}), "the read is in: its copy claims it at once");
         this.window.lower(3);
-        consume(next);
+        consume(1, next);
     }
 
     /// The positional reads and a refused submission fail a quantum on the poll itself: the slot rises and serves its
@@ -376,7 +383,59 @@ class DiskReaderTest {
             }
         }
         assertEquals("failing the quantum threw", thrown == null ? null : thrown.getMessage());
+        assertTrue(this.reader.claim(4, 1, () -> {}), "the read is in: its copy claims it at once");
         this.window.lower(4);
-        consume(next);
+        consume(1, next);
+    }
+
+    /// A copy that claims its slot before the read arrives is released by whatever completes the read (the worker
+    /// that reaps it, even while its completion frame waits, or the poll that reads positionally), once, with the
+    /// slot raised and holding its bytes: the device never waits for the read.
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aCopyThatClaimsBeforeItsReadIsReleasedWhenTheReadIsIn(boolean async) throws Exception {
+        open(async);
+        DiskUse use = new DiskUse("q1/0", 8192, 9_000, 6);
+        int[] released = {0};
+        int[] flagWhenReleased = {-1};
+        assertFalse(this.reader.claim(6, 1, () -> {
+            released[0]++;
+            flagWhenReleased[0] = this.window.flag(6);
+        }));
+        this.reader.enqueue(1, List.of(use));
+        List<AbstractFrame> held = new ArrayList<>();
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (released[0] == 0) {
+            assertTrue(System.nanoTime() < deadline, "the waiting copy was never released");
+            if (async) pumpHolding(held);
+            else this.reader.poll();
+        }
+        assertEquals(1, flagWhenReleased[0], "the slot rose before its copy was released");
+        assertPayload(use);
+        if (async) assertEquals(1, held.size(), "released before its completion frame ran");
+        for (int poll = 0; poll < 10; poll++) pump();
+        assertEquals(1, released[0], "released once");
+    }
+
+    /// A read of a stopped quantum that no copy claimed is dropped by the next quantum's claim of the slot, which
+    /// then gets its own read.
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aStaleReadIsDroppedByTheNextQuantumsClaim(boolean async) throws Exception {
+        open(async);
+        this.reader.enqueue(1, List.of(new DiskUse("q1/0", 0, 9_000, 2)));
+        awaitRaised(2);
+        this.reader.abandon(1);
+        DiskUse own = new DiskUse("q2/0", 81_920, 9_000, 2);
+        this.reader.enqueue(2, List.of(own));
+        boolean[] released = {false};
+        assertFalse(this.reader.claim(2, 2, () -> released[0] = true), "the slot holds the stopped quantum's read");
+        assertEquals(0, this.window.flag(2), "the stale read is dropped");
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (!released[0]) {
+            assertTrue(System.nanoTime() < deadline, "the next quantum's read was never handed over");
+            pump();
+        }
+        assertPayload(own);
     }
 }
