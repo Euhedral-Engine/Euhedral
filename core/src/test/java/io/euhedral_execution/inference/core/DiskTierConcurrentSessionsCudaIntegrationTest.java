@@ -9,6 +9,7 @@ import io.euhedral_execution.inference.core.generation.SessionOptions;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Runtime;
 import io.euhedral_execution.inference.core.sampling.GenerationConfig;
 import io.euhedral_execution.inference.core.testing.ModelGroup;
+import io.euhedral_execution.inference.core.testing.WorkerCpus;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -22,8 +23,10 @@ import org.junit.jupiter.api.Timeout;
 
 /// Sessions that start together while weights are read from disk finish, and each produces the tokens it produces
 /// alone. Their prompts are admitted at once on two workers, fewer than the sessions, so graphs submitting together
-/// fill the device streams and hold the workers in CUDA calls; the device never waits for a read, so the streams
-/// drain and the workers are released.
+/// can fill the device streams and hold the workers in CUDA calls; the device never waits for a read, so the
+/// streams drain and the workers are released. This test was not run against the code before that, so it is not
+/// shown to fail there; [DiskTierManySequencesCudaIntegrationTest] reproduces the hang. The workers are
+/// `-Peuhedral.test.worker-cpus`, or else the first two performance CPUs ([WorkerCpus]).
 // Own JVM: sets the global residency budget properties.
 @ModelGroup.OwnJvm
 class DiskTierConcurrentSessionsCudaIntegrationTest {
@@ -47,8 +50,7 @@ class DiskTierConcurrentSessionsCudaIntegrationTest {
         assumeTrue(artifact != null && Files.isRegularFile(Path.of(artifact)), "no NVFP4 artifact");
         String tokenizer = System.getProperty("euhedral.qwen.tokenizer-dir");
         assumeTrue(tokenizer != null, "no tokenizer directory");
-        BitSet workers = new BitSet();
-        workers.set(2, 4);
+        BitSet workers = WorkerCpus.of(2);
         var config = new InferenceConfig(
                 Path.of(artifact),
                 Path.of(tokenizer),
