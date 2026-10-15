@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.core.sampling;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.SplittableRandom;
+import java.util.function.DoubleSupplier;
 import java.util.function.IntPredicate;
 
 /// Selects one token from a single vocabulary-logit row using a generation-local random stream.
@@ -40,6 +41,33 @@ public final class TokenSampler {
     }
 
     public int selectToken(float[] logits) {
+        return select(logits, this.random::nextDouble);
+    }
+
+    /// A uniform draw in [0, 1) that depends only on `seed` and `position`: the SplitMix64 finalizer applied to
+    /// `seed + gamma * (position + 1)`, so neighbouring positions give independent draws.
+    public static double unitDraw(long seed, long position) {
+        long z = seed + 0x9E3779B97F4A7C15L * (position + 1);
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        z ^= z >>> 31;
+        return (z >>> 11) * 0x1.0p-53;
+    }
+
+    /// As [#selectToken(float[])], drawing with [#unitDraw] of the seed and `position` instead of the
+    /// generation's random stream: the token a position samples does not depend on what was drawn before it.
+    public int selectToken(float[] logits, long position) {
+        long seed = this.config.seed();
+        return select(logits, () -> unitDraw(seed, position));
+    }
+
+    /// As [#selectToken(float[], IntPredicate)], drawing with [#unitDraw] of the seed and `position`.
+    public int selectToken(float[] logits, IntPredicate allowed, long position) {
+        long seed = this.config.seed();
+        return select(logits, allowed, () -> unitDraw(seed, position));
+    }
+
+    private int select(float[] logits, DoubleSupplier unit) {
         Objects.requireNonNull(logits, "logits");
         if (logits.length != this.vocabularySize) {
             throw new IllegalArgumentException(
@@ -58,7 +86,7 @@ public final class TokenSampler {
                 : scaleAll(logits, scaledScores, candidateIds);
         if (candidateCount == 0) throw new IllegalArgumentException("logit row has no selectable token");
 
-        return drawFrom(candidateIds, candidateCount, this.config.topP() < 1.0f);
+        return drawFrom(candidateIds, candidateCount, this.config.topP() < 1.0f, unit);
     }
 
     /// Selects as [#selectToken(float[])] would from the row with every token `allowed` rejects removed, testing
@@ -70,6 +98,10 @@ public final class TokenSampler {
     /// top-p at one the same candidates and probabilities are drawn in priority order rather than in the
     /// masked row's heap order, so a seed may select another token of the same distribution.
     public int selectToken(float[] logits, IntPredicate allowed) {
+        return select(logits, allowed, this.random::nextDouble);
+    }
+
+    private int select(float[] logits, IntPredicate allowed, DoubleSupplier unit) {
         Objects.requireNonNull(logits, "logits");
         Objects.requireNonNull(allowed, "allowed");
         if (logits.length != this.vocabularySize) {
@@ -95,14 +127,14 @@ public final class TokenSampler {
                             (double) logits[candidates[index]] / this.config.temperature();
                 // Ranked order is priority order, which a top-p sort keeps.
                 System.arraycopy(candidates, 0, this.candidateIds, 0, found);
-                return drawFrom(this.candidateIds, found, this.config.topP() < 1.0f);
+                return drawFrom(this.candidateIds, found, this.config.topP() < 1.0f, unit);
             }
         }
         if (allowed instanceof TokenFilter filter) filter.maskDisallowed(logits);
         else
             for (int tokenId = 0; tokenId < logits.length; tokenId++)
                 if (!allowed.test(tokenId)) logits[tokenId] = Float.NEGATIVE_INFINITY;
-        return selectToken(logits);
+        return select(logits, unit);
     }
 
     private void ensureScratch() {
@@ -114,7 +146,7 @@ public final class TokenSampler {
     }
 
     /// Normalizes the candidates' scaled scores, keeps the top-p prefix when `applyTopP`, and draws.
-    private int drawFrom(int[] candidateIds, int candidateCount, boolean applyTopP) {
+    private int drawFrom(int[] candidateIds, int candidateCount, boolean applyTopP, DoubleSupplier unit) {
         double[] scaledScores = this.scaledScores;
         // Top-p uses the normalized top-k distribution, and draw renormalizes the retained prefix.
         if (applyTopP) sortByPriority(candidateIds, candidateCount, scaledScores);
@@ -133,7 +165,7 @@ public final class TokenSampler {
             }
         }
 
-        return draw(candidateIds, probabilities, retainedCount);
+        return draw(candidateIds, probabilities, retainedCount, unit);
     }
 
     /// Writes the `limit` best selectable tokens to `ranked`, best first (higher logit, then lower token ID),
@@ -336,7 +368,7 @@ public final class TokenSampler {
         return probabilities;
     }
 
-    private int draw(int[] tokenIds, double[] probabilities, int retainedCount) {
+    private int draw(int[] tokenIds, double[] probabilities, int retainedCount, DoubleSupplier unit) {
         double retainedMass = 0.0;
         int lastPositiveProbability = -1;
         for (int i = 0; i < retainedCount; i++) {
@@ -347,7 +379,7 @@ public final class TokenSampler {
             throw new IllegalArgumentException("sampling filters removed all probability mass");
         }
 
-        double draw = this.random.nextDouble() * retainedMass;
+        double draw = unit.getAsDouble() * retainedMass;
         double cumulativeMass = 0.0;
         for (int i = 0; i < retainedCount; i++) {
             cumulativeMass += probabilities[i];
