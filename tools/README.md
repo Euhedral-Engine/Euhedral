@@ -146,7 +146,9 @@ The embedding, norms, convolutions, the GDN a/b projections and the draft-head s
 as for the other artifacts, and the MTP layer is BF16 when the checkpoint carries none. The LM head and the draft
 head are rounded by GPTQ in the calibration run (`calibrate --format trellis --draft-ids-from ARTIFACT`), which
 writes their codes to `OUT/heads`; pass that directory as `--codes-from`. The conversion refuses with "missing head
-codes" when a file is absent. `--output-head BF16` stores the LM head as BF16 instead (its codes are then unused).
+codes" when a file is absent. `--output-head BF16` stores the LM head as BF16 instead (its codes are then unused):
+to compare an artifact with the quantization module's own figures, which used an F16 LM head, calibrate with the
+default head and convert a second time with `--output-head BF16`; the draft head still needs its codes.
 
 ```bash
 (cd .. && ./gradlew :quantization:run --args="calibrate --model $CHECKPOINT --format trellis --bits 3.5 \

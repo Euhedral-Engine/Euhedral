@@ -115,4 +115,14 @@ class CalibrateTrellisHeadsTest {
                 }));
         assertEquals("--draft-ids-from is required", failure.getMessage());
     }
+
+    @Test
+    void theQuantizationTrellisNeedsTheTrellisFormat() {
+        var failure = assertThrows(
+                IllegalArgumentException.class,
+                () -> QuantizationMain.main(new String[] {
+                    "calibrate", "--model", "m", "--quantization", "trellis", "--tokens", "t.npy", "--out", "o"
+                }));
+        assertEquals("--quantization trellis needs --format trellis", failure.getMessage());
+    }
 }

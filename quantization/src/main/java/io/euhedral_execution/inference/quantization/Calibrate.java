@@ -395,7 +395,8 @@ public final class Calibrate {
     }
 
     /// The steps that end a trellis run, in the order they must happen: the heads are rounded before the final
-    /// files are written and before the resume point is dropped, so a stop during them resumes after the layers.
+    /// files are written and before the resume point is dropped, so a stop during them resumes from the last layer
+    /// checkpoint (at most a checkpoint interval of layers earlier) and runs them again.
     interface TrellisEnd {
         void roundHeads() throws IOException;
 
@@ -426,12 +427,13 @@ public final class Calibrate {
                     + " layers: no MTP layer and no final files");
             return CompletableFuture.completedFuture(null);
         }
-        // the resume point stays until the heads are rounded and the final files are written
+        // the resume point (the last layer checkpoint) stays until the heads are rounded and the final files are
+        // written
         return endTrellis(trellis.mtp(), new TrellisEnd() {
             @Override
             public void roundHeads() throws IOException {
-                trellis.close(); // its rounding scratch makes room for the head
                 device.select(device.stream);
+                trellis.close(); // its rounding scratch makes room for the head
                 trellisHeads(states, batchStates, sequences, length);
             }
 
@@ -453,18 +455,20 @@ public final class Calibrate {
         Files.createDirectories(codesDirectory());
         float eps = (float) checkpoint.config.eps();
         long finalNorm = uploadTensor("model.language_model.norm.weight");
-        long headHessian = zeroed(4L * hidden * hidden);
-        long normed = device.gpu.allocate(2L * settings.batch() * length * hidden);
+        long headHessian = 0, normed = 0;
         try {
+            headHessian = zeroed(4L * hidden * hidden);
+            normed = device.gpu.allocate(2L * settings.batch() * length * hidden);
+            long hessian = headHessian, rows = normed;
             batches(states, batchStates, sequences, length, false, count -> {
-                device.gpu.rmsNormUnitOffsetBf16(batchStates, finalNorm, normed, count * length, hidden, eps);
-                device.accumulateHessian(headHessian, normed, count * length, hidden);
+                device.gpu.rmsNormUnitOffsetBf16(batchStates, finalNorm, rows, count * length, hidden, eps);
+                device.accumulateHessian(hessian, rows, count * length, hidden);
             });
             roundHeads(headHessian, headHessian);
         } finally {
-            device.gpu.free(normed);
+            if (normed != 0) device.gpu.free(normed);
             device.gpu.free(finalNorm);
-            device.gpu.free(headHessian);
+            if (headHessian != 0) device.gpu.free(headHessian);
         }
     }
 
