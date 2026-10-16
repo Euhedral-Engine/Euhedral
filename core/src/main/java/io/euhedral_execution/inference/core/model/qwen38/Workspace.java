@@ -256,6 +256,15 @@ public final class Workspace implements AutoCloseable {
         return this.shared == null ? 0 : this.shared.scratchBytes();
     }
 
+    /// Scratch buffer `region`'s address, or 0 when there is none.
+    public long scratchAddress(int region) {
+        return this.shared == null ? 0 : this.shared.scratchAddress(region);
+    }
+
+    public long scratchBytes(int region) {
+        return this.shared == null ? 0 : this.shared.scratchBytes(region);
+    }
+
     private long acquire(int slot, long bytes) {
         if (this.shared != null && slot != TOKEN_IDS_SLOT && slot != LOGITS_SLOT)
             return this.shared.acquire(slot, bytes);

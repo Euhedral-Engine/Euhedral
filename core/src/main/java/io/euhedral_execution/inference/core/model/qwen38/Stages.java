@@ -119,6 +119,8 @@ public final class Stages {
         private final ExecutionGpu gpu;
         /// The scratch route its shape declared for it, or null ([Shape#scratchUse]).
         ScratchUse scratchUse;
+        /// The workspace scratch buffer it takes ([Shape#scratchRegion]).
+        int scratchRegion;
         /// The chunk of a prompt graph this stage belongs to; 0 in any other graph.
         int chunk;
         /// Whether the retirement now running commits the quantum ([#releaseTemporary] reads it).
@@ -146,8 +148,9 @@ public final class Stages {
             Quantum context = context();
             // A stage the shape declared as a scratch user takes the workspace's one scratch buffer, which the
             // shape's edges (and the workspace's, across graphs) give it alone.
-            long scratch = this.scratchUse != null ? context.workspace().scratchAddress() : 0;
-            if (scratch != 0) this.gpu.withScratch(scratch, context.workspace().scratchBytes(), () -> run(context));
+            long scratch = this.scratchUse != null ? context.workspace().scratchAddress(this.scratchRegion) : 0;
+            if (scratch != 0)
+                this.gpu.withScratch(scratch, context.workspace().scratchBytes(this.scratchRegion), () -> run(context));
             else run(context);
         }
 
@@ -478,11 +481,13 @@ public final class Stages {
 
         private final List<TensorHandle> weights;
         private final LinearFormat format;
+        private final int[] segmentEnds;
 
         Linear(StageGraph graph, int stage, ExecutionPlan.Instruction instruction, ExecutionGpu gpu) {
             super(graph, stage, instruction, gpu);
             this.weights = instruction.weights();
             this.format = LinearFormats.of(this.weights.getFirst());
+            this.segmentEnds = instruction.segmentEnds();
         }
 
         @Override
@@ -525,10 +530,11 @@ public final class Stages {
                             rows,
                             instruction.inputWidth(),
                             instruction.outputWidth(),
-                            scratch ? context.workspace().scratchAddress() : 0,
-                            scratch ? context.workspace().scratchBytes() : 0,
+                            scratch ? context.workspace().scratchAddress(this.scratchRegion) : 0,
+                            scratch ? context.workspace().scratchBytes(this.scratchRegion) : 0,
                             verify,
-                            instruction.weightHostMapped()));
+                            instruction.weightHostMapped(),
+                            this.segmentEnds));
         }
     }
 

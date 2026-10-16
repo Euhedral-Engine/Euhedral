@@ -142,34 +142,43 @@ public final class TrellisFormat implements LinearFormat {
                 mmaBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS));
     }
 
-    /// [object, suh, svh, segments] of rows `[first, first + rows)` as new device allocations named `name`, `name.suh`,
-    /// `name.svh` and `name.segments`. Both ends of the range must be segment boundaries (or 0 and n). The
-    /// payload's tile columns are copied per k-tile row; `svh`, the `suh` rows and the segment ends are cut and
-    /// rebased.
+    /// Trellis rows need the object's host-known segment ends; see the overload with `ends`.
     @Override
     public List<TensorHandle> rows(List<TensorHandle> object, long first, long rows, String name, GpuMemory gpu) {
+        throw new IllegalArgumentException("cutting trellis rows needs the object's segment ends");
+    }
+
+    /// The segment ends of the rows `[first, first + rows)` of an object of `ends`, rebased to the cut. Both ends of
+    /// the range must be segment boundaries (or 0 and n).
+    public static int[] cutEnds(int[] ends, long first, long rows, String name) {
+        long last = first + rows;
+        int start = first == 0 ? -1 : indexOf(ends, first), stop = indexOf(ends, last);
+        if ((first != 0 && start < 0) || stop < 0 || stop <= start)
+            throw new IllegalArgumentException(
+                    "rows " + first + ".." + last + " of " + name + " do not begin and end on segment boundaries");
+        int[] cut = new int[stop - start];
+        for (int index = 0; index < cut.length; index++) cut[index] = (int) (ends[start + 1 + index] - first);
+        return cut;
+    }
+
+    /// [object, suh, svh, segments] of rows `[first, first + rows)` as new device allocations named `name`, `name.suh`,
+    /// `name.svh` and `name.segments`. `ends` are the object's segment ends, known on the host from the artifact;
+    /// both ends of the range must be segment boundaries (or 0 and n). The payload's tile columns are copied per
+    /// k-tile row; `svh`, the `suh` rows and the segment ends are cut and rebased.
+    @Override
+    public List<TensorHandle> rows(
+            List<TensorHandle> object, long first, long rows, String name, GpuMemory gpu, int[] ends) {
         if (object.size() != 4) throw new IllegalArgumentException("a trellis object has 4 tensors: " + object.size());
         TensorHandle payload = object.get(0), suh = object.get(1), svh = object.get(2), segments = object.get(3);
         long[] nk = logical(payload.shape());
         long n = nk[0], k = nk[1];
         int w = (int) payload.shape()[2];
-        int[] ends;
-        try (Arena arena = Arena.ofConfined()) {
-            var host = arena.allocate(segments.byteSize());
-            gpu.copyDeviceToHost(host, segments.deviceAddress(), segments.byteSize());
-            ends = TrellisLayout.readEnds(host);
-        }
         long last = first + rows;
         if (first < 0 || rows <= 0 || last > n || first % 16 != 0 || rows % 16 != 0)
             throw new IllegalArgumentException("rows " + first + ".." + last + " are outside " + name);
-        int start = first == 0 ? -1 : indexOf(ends, first), stop = indexOf(ends, last);
-        if ((first != 0 && start < 0) || stop < 0 || stop <= start)
-            throw new IllegalArgumentException(
-                    "rows " + first + ".." + last + " of " + name + " do not begin and end on segment boundaries");
-        int lo = start + 1, count = stop - start;
-        int[] cut = new int[count];
-        for (int index = 0; index < count; index++) cut[index] = (int) (ends[lo + index] - first);
-
+        int[] cut = cutEnds(ends, first, rows, name);
+        int count = cut.length;
+        int lo = first == 0 ? 0 : indexOf(ends, first) + 1;
         long tileRows = payload.shape()[0], tilesFirst = first / 16, tilesCut = rows / 16;
         long rowWords = tilesCut * w, sourceRowWords = payload.shape()[1] * w;
         long payloadBytes = tileRows * rowWords * 2, suhBytes = (long) count * k * 2, svhBytes = rows * 2;
@@ -311,6 +320,14 @@ public final class TrellisFormat implements LinearFormat {
         return bytes;
     }
 
+    /// The tensor-core route's scratch alone: decode-type views never take the prefill route.
+    @Override
+    public long decodeScratchBytes(
+            ExecutionGpu gpu, ScratchUse use, int rows, int inFeatures, int outFeatures, List<TensorHandle> weights) {
+        return mmaBytes(
+                rows, inFeatures, outFeatures, Math.toIntExact(weights.get(1).shape()[0]));
+    }
+
     private long mmaBytes(long rows, long k, long n, int segments) {
         long activations = PayloadSizes.alignUp(
                 PayloadSizes.multiply(PayloadSizes.multiply(segments, rows), k * 2), SCRATCH_ALIGNMENT);
@@ -356,7 +373,7 @@ public final class TrellisFormat implements LinearFormat {
         run.segments = segments;
         if (gpu.exactNumerics()) run.reference();
         else if (launch.rowExact() || rows <= this.settings.mmaMaxRows()) run.tensorCore(this.settings.targetCtas());
-        else run.prefill(ends);
+        else run.prefill(launch.segmentEnds());
     }
 
     /// One launch's operands and its route chains.
@@ -474,14 +491,17 @@ public final class TrellisFormat implements LinearFormat {
                             .int32(this.n));
         }
 
-        void prefill(TensorHandle segmentEnds) {
+        void prefill(int[] bounds) {
+            if (bounds == null || bounds.length != this.segments)
+                throw new IllegalArgumentException(
+                        "a trellis prefill launch needs the host segment ends of its object");
+            TrellisLayout.validateSegments(bounds, this.n, this.segments);
             long activations = PayloadSizes.alignUp(
                     PayloadSizes.multiply(PayloadSizes.multiply(this.segments, this.rows), this.k * 2L),
                     SCRATCH_ALIGNMENT);
             long decodedBytes = PayloadSizes.alignUp(PayloadSizes.multiply(this.n, this.k * 2L), SCRATCH_ALIGNMENT);
             long rotatedBytes = PayloadSizes.alignUp(PayloadSizes.multiply(this.rows, this.n * 2L), SCRATCH_ALIGNMENT);
             requireScratch(PayloadSizes.add(PayloadSizes.add(activations, decodedBytes), rotatedBytes));
-            int[] bounds = segmentBounds(segmentEnds);
             long scratch = this.launch.scratch(), decoded = scratch + activations, rotated = decoded + decodedBytes;
             prepass(scratch, true);
             this.gpu.launchTableKernel(
@@ -529,17 +549,6 @@ public final class TrellisFormat implements LinearFormat {
                             .pointer(this.launch.output())
                             .int32(this.rows)
                             .int32(this.n));
-        }
-
-        /// The segment ends, which the prefill route's per-segment GEMMs need on the host.
-        int[] segmentBounds(TensorHandle segmentEnds) {
-            try (Arena arena = Arena.ofConfined()) {
-                var host = arena.allocate(segmentEnds.byteSize());
-                this.gpu.copyDeviceToHost(host, segmentEnds.deviceAddress(), segmentEnds.byteSize());
-                int[] bounds = TrellisLayout.readEnds(host);
-                TrellisLayout.validateSegments(bounds, this.n, this.segments);
-                return bounds;
-            }
         }
 
         void requireScratch(long needed) {

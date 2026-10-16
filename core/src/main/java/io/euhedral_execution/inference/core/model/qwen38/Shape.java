@@ -63,6 +63,8 @@ public final class Shape implements GraphShape {
     private volatile int[][] workspaceBuffers;
     /// The scratch route each stage takes, or null for a stage that takes none.
     private final ScratchUse[] scratchUses;
+    /// The scratch buffer each scratch stage takes (0 unless a decode-type view gives a second branch its own).
+    private final int[] scratchRegions;
 
     private final List<io.euhedral_execution.inference.core.model.qwen38.offload.DiskUse> diskUses;
     private final long diskReadBytes;
@@ -105,10 +107,13 @@ public final class Shape implements GraphShape {
                     .mapToInt(Integer::intValue)
                     .toArray();
         this.scratchUses = new ScratchUse[this.instructions.size()];
-        boolean[] scratch = new boolean[this.instructions.size()];
+        this.scratchRegions = new int[this.instructions.size()];
+        int[] scratch = new int[this.instructions.size()];
         for (ExecutionPlan.Instruction instruction : this.instructions) {
             this.scratchUses[instruction.id()] = scratchUse(instruction, view);
-            scratch[instruction.id()] = this.scratchUses[instruction.id()] != null;
+            this.scratchRegions[instruction.id()] = scratchRegion(instruction, view);
+            scratch[instruction.id()] =
+                    this.scratchUses[instruction.id()] != null ? this.scratchRegions[instruction.id()] : -1;
         }
         int[][] ordered = ExecutionPlan.withStorageHazards(this.instructions, dependencies, reuseStorage, scratch);
         ShapeBuilder<ExecutionPlan.Instruction> builder = new ShapeBuilder<>();
@@ -176,8 +181,9 @@ public final class Shape implements GraphShape {
         return SharedWorkspace.bufferCount(this.plan);
     }
 
-    /// The scratch route stage `stage` takes, or null: a gate/up region always (its gate/up rows), a quantized
-    /// linear in a view whose quanta have more than eight rows (its expansion or activations).
+    /// The scratch route stage `stage` declares, or null for a stage that takes none: a gate/up region always (its
+    /// gate/up rows), a trellis linear always, any other quantized linear in a view whose quanta have more than
+    /// eight rows (its expansion or activations).
     public ScratchUse scratchUse(int stage) {
         return this.scratchUses[stage];
     }
@@ -194,6 +200,32 @@ public final class Shape implements GraphShape {
             slots.add(SharedWorkspace.stagingBuffer(
                     this.plan, (int) ((address - staging.slotAddress(0)) / staging.slotBytes())));
         }
+    }
+
+    /// The scratch buffer stage `stage` takes: 0, or 1 for the value/z projection of a decode-type view, which runs
+    /// beside the query/key projection and so cannot share its buffer.
+    public int scratchRegion(int stage) {
+        return this.scratchRegions[stage];
+    }
+
+    int scratchRegionCount() {
+        int count = 1;
+        for (int stage = 0; stage < this.scratchRegions.length; stage++)
+            if (this.scratchUses[stage] != null) count = Math.max(count, this.scratchRegions[stage] + 1);
+        return count;
+    }
+
+    private static int scratchRegion(ExecutionPlan.Instruction instruction, View view) {
+        boolean decodeType =
+                switch (view) {
+                    case DECODE, DECODE_PRELOADED, MTP_DRAFT, VERIFY, VERIFY_PRELOADED -> true;
+                    default -> false;
+                };
+        return decodeType
+                        && instruction.kind() == ExecutionPlan.Kind.TRELLIS_LINEAR
+                        && instruction.outputBuffers().contains(ExecutionPlan.Buffer.VALUE_Z_PROJECTED)
+                ? 1
+                : 0;
     }
 
     private static ScratchUse scratchUse(ExecutionPlan.Instruction instruction, View view) {
@@ -242,7 +274,8 @@ public final class Shape implements GraphShape {
             for (ExecutionPlan.Buffer buffer : instruction.outputBuffers())
                 slots.add(owners.getOrDefault(buffer, buffer).ordinal());
             slots.remove(ExecutionPlan.Buffer.LOGITS.ordinal());
-            if (this.scratchUses[instruction.id()] != null) slots.add(SharedWorkspace.scratchBuffer(this.plan));
+            if (this.scratchUses[instruction.id()] != null)
+                slots.add(SharedWorkspace.scratchBuffer(this.plan, this.scratchRegions[instruction.id()]));
             addStagingSlots(instruction, slots);
             buffers[instruction.id()] =
                     slots.stream().mapToInt(Integer::intValue).toArray();
@@ -268,6 +301,7 @@ public final class Shape implements GraphShape {
     public StageFrame createStage(StageGraph graph, int stage, ExecutionGpu gpu) {
         Stages.Stage frame = Stages.create(graph, this.instructions.get(stage), gpu);
         frame.scratchUse = this.scratchUses[stage];
+        frame.scratchRegion = this.scratchRegions[stage];
         return frame;
     }
 

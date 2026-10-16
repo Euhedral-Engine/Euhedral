@@ -14,6 +14,8 @@ public final class LinearFormats {
     /// The Q3 grouped format, which an instruction with no weights routes as.
     private static final LinearFormat NO_WEIGHTS = new GroupedFormat(WeightFormat.Q3_G64_FP16);
 
+    private static final TrellisFormat TRELLIS = new TrellisFormat();
+
     private static final List<LinearFormat> ALL = List.of(
             NO_WEIGHTS,
             new GroupedFormat(WeightFormat.Q4_G64_FP16),
@@ -22,7 +24,7 @@ public final class LinearFormats {
             new Nvfp4Format(WeightLayout.ROW_SPLIT_K128_V1),
             new Nvfp4Format(WeightLayout.ROW_SPLIT_K128_SD4_V1),
             new Bf16Format(),
-            new TrellisFormat());
+            TRELLIS);
 
     private LinearFormats() {}
 
@@ -50,6 +52,11 @@ public final class LinearFormats {
     public static LinearFormat of(TensorHandle handle) {
         return find(handle.format(), handle.layout())
                 .orElseThrow(() -> unsupported(handle.format(), handle.layout(), handle.name()));
+    }
+
+    /// The knobs the registered trellis format runs with.
+    public static TrellisSettings trellisSettings() {
+        return TRELLIS.settings();
     }
 
     public static List<LinearFormat> all() {

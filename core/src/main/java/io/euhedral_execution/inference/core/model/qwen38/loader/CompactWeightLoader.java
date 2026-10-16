@@ -55,13 +55,13 @@ final class CompactWeightLoader {
         validateConfig(config);
         DFlash2Config dflash2 = DFlash2Inventory.read(artifactPath, descriptors);
         validateInventory(config, descriptors, dflash2);
-        validateTrellisSegments(artifactPath, descriptors);
+        Map<String, int[]> ends = new LinkedHashMap<>(validateTrellisSegments(artifactPath, descriptors));
         Map<String, TensorHandle> handles =
                 loadObjects(artifactPath, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked);
         try {
             // Only an MTP load prepares the MTP layer for execution.
-            if (speculation == ArtifactProfile.Speculation.MTP) splitMtpAttention(handles, gpuMemory);
-            Weights weights = assemble(config, handles);
+            if (speculation == ArtifactProfile.Speculation.MTP) splitMtpAttention(handles, gpuMemory, ends);
+            Weights weights = assemble(config, handles).withSegmentEnds(ends);
             if (speculation != ArtifactProfile.Speculation.DFLASH2) return weights;
             return new Weights(
                     weights.config(),
@@ -71,7 +71,8 @@ final class CompactWeightLoader {
                     weights.lmHead(),
                     null,
                     weights.runtimeObjects(),
-                    DFlash2Inventory.assemble(dflash2, handles));
+                    DFlash2Inventory.assemble(dflash2, handles),
+                    weights.segmentEnds());
         } catch (Throwable failure) {
             freeAll(handles.values(), gpuMemory, failure);
             freeArena(handles.values(), gpuMemory, failure);
@@ -289,7 +290,8 @@ final class CompactWeightLoader {
     /// their gate/value rows (gate, v) (tools/euhedral_artifacts). The NVFP4 pack is split here into those two
     /// tensors, each with its rows' codes and scales and the shared global scale, so the MTP layer executes as an
     /// ordinary attention layer (docs/MTP_CONTRACT.md §1).
-    private static void splitMtpAttention(Map<String, TensorHandle> handles, GpuMemory gpu) {
+    private static void splitMtpAttention(
+            Map<String, TensorHandle> handles, GpuMemory gpu, Map<String, int[]> segmentEnds) {
         TensorHandle packed = handles.get(MTP_ATTENTION);
         if (packed == null || packed.hostBacked() || packed.diskBacked()) return;
         LinearFormat format =
@@ -298,10 +300,11 @@ final class CompactWeightLoader {
         List<TensorHandle> object = group(handles, MTP_ATTENTION);
         // Rows are the first dimension of the grouped formats; a trellis payload is [k/16, n/16, w].
         long half = (packed.format() == WeightFormat.TRELLIS ? packed.shape()[1] * 16 : packed.shape()[0]) / 2;
-        List<TensorHandle> first = format.rows(object, 0, half, "mtp/layer/attention/query_key", gpu);
+        int[] packedEnds = segmentEnds.get(MTP_ATTENTION);
+        List<TensorHandle> first = format.rows(object, 0, half, "mtp/layer/attention/query_key", gpu, packedEnds);
         List<TensorHandle> second;
         try {
-            second = format.rows(object, half, half, "mtp/layer/attention/gate_value", gpu);
+            second = format.rows(object, half, half, "mtp/layer/attention/gate_value", gpu, packedEnds);
         } catch (RuntimeException | Error failure) {
             for (TensorHandle handle : first) gpu.free(handle.deviceAddress());
             throw failure;
@@ -311,6 +314,12 @@ final class CompactWeightLoader {
         for (TensorHandle handle : object) {
             handles.remove(handle.name());
             gpu.free(handle.deviceAddress());
+        }
+        if (packedEnds != null) {
+            segmentEnds.remove(MTP_ATTENTION);
+            segmentEnds.put("mtp/layer/attention/query_key", TrellisFormat.cutEnds(packedEnds, 0, half, MTP_ATTENTION));
+            segmentEnds.put(
+                    "mtp/layer/attention/gate_value", TrellisFormat.cutEnds(packedEnds, half, half, MTP_ATTENTION));
         }
     }
 
@@ -438,8 +447,9 @@ final class CompactWeightLoader {
     /// Reads each trellis object's `.segments` on the host and checks them against the object: strictly
     /// increasing multiples of 128, the last equal to n, one per `suh` row, at most 8; the packed MTP
     /// attention projection must also have n/2 as a boundary. Before any device allocation.
-    static void validateTrellisSegments(Path artifactPath, Map<String, TensorDescriptor> descriptors)
+    static Map<String, int[]> validateTrellisSegments(Path artifactPath, Map<String, TensorDescriptor> descriptors)
             throws IOException {
+        Map<String, int[]> read = new LinkedHashMap<>();
         try (Arena arena = Arena.ofConfined()) {
             for (TensorDescriptor descriptor : descriptors.values()) {
                 if (!trellis(descriptor)) continue;
@@ -453,12 +463,14 @@ final class CompactWeightLoader {
                     TrellisLayout.validateSegments(ends, n, suh.shape()[0]);
                     if (name.equals(MTP_ATTENTION) && Arrays.stream(ends).noneMatch(end -> end == n / 2))
                         throw new IllegalArgumentException("n/2=" + n / 2 + " is not a segment boundary");
+                    read.put(name, ends);
                 } catch (IllegalArgumentException invalid) {
                     throw new WeightLoadException(
                             "invalid trellis segments '" + segments.name() + "': " + invalid.getMessage());
                 }
             }
         }
+        return read;
     }
 
     /// The text inventory: every object, and no other.

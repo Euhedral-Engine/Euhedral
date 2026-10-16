@@ -1,10 +1,8 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
 import io.euhedral_execution.inference.core.artifact.WeightFormat;
-import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
-import io.euhedral_execution.inference.core.artifact.format.TrellisFormat;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
@@ -112,8 +110,7 @@ public final class Qwen38Model implements AutoCloseable {
         try {
             Weights weights = loader.load(allocations);
             if (weights.runtimeObjects().values().stream().anyMatch(handle -> handle.format() == WeightFormat.TRELLIS))
-                LinearFormats.find(WeightFormat.TRELLIS, WeightLayout.TRELLIS_TILE16_V1)
-                        .ifPresent(format -> LOG.info("trellis weights: {}", ((TrellisFormat) format).settings()));
+                LOG.info("trellis weights: {}", LinearFormats.trellisSettings());
             long largest = 0;
             for (var handle : weights.runtimeObjects().values())
                 if (handle.hostBacked() || handle.diskBacked()) largest = Math.max(largest, handle.byteSize());

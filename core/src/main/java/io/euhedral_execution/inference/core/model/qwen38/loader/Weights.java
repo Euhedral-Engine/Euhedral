@@ -12,7 +12,20 @@ public record Weights(
         TensorHandle lmHead,
         MtpWeights mtp,
         Map<String, TensorHandle> runtimeObjects,
-        DFlash2Weights dflash2) {
+        DFlash2Weights dflash2,
+        Map<String, int[]> segmentEnds) {
+
+    public Weights(
+            Qwen38Config config,
+            TensorHandle tokenEmbedding,
+            LayerWeights[] layers,
+            TensorHandle finalNorm,
+            TensorHandle lmHead,
+            MtpWeights mtp,
+            Map<String, TensorHandle> runtimeObjects,
+            DFlash2Weights dflash2) {
+        this(config, tokenEmbedding, layers, finalNorm, lmHead, mtp, runtimeObjects, dflash2, Map.of());
+    }
 
     public Weights(
             Qwen38Config config,
@@ -37,6 +50,12 @@ public record Weights(
 
     public Weights {
         runtimeObjects = runtimeObjects == null ? Map.of() : Map.copyOf(runtimeObjects);
+        segmentEnds = segmentEnds == null ? Map.of() : Map.copyOf(segmentEnds);
+    }
+
+    /// These weights with the host-known segment ends of their trellis objects, by object name.
+    public Weights withSegmentEnds(Map<String, int[]> ends) {
+        return new Weights(config, tokenEmbedding, layers, finalNorm, lmHead, mtp, runtimeObjects, dflash2, ends);
     }
 
     /// The disk-backed objects: those execution reads from the artifact file.

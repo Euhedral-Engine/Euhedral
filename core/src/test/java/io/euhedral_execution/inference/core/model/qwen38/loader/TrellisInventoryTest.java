@@ -542,7 +542,7 @@ class TrellisInventoryTest {
         for (int half = 0; half < 2; half++) {
             String name = half == 0 ? "mtp/layer/attention/query_key" : "mtp/layer/attention/gate_value";
             long first = half * 7168L;
-            List<TensorHandle> cut = format.rows(object, first, 7168, name, gpu);
+            List<TensorHandle> cut = format.rows(object, first, 7168, name, gpu, ends);
             assertEquals(
                     List.of(name, name + ".suh", name + ".svh", name + ".segments"),
                     cut.stream().map(TensorHandle::name).toList());
@@ -581,8 +581,8 @@ class TrellisInventoryTest {
                         "tile row " + row);
         }
         // A cut inside a segment is refused.
-        assertThrows(IllegalArgumentException.class, () -> format.rows(object, 0, 6400, "x", gpu));
-        assertDoesNotThrow(() -> format.rows(object, 0, 6144, "y", gpu));
+        assertThrows(IllegalArgumentException.class, () -> format.rows(object, 0, 6400, "x", gpu, ends));
+        assertDoesNotThrow(() -> format.rows(object, 0, 6144, "y", gpu, ends));
     }
 
     private static TensorHandle upload(
