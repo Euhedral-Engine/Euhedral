@@ -159,7 +159,8 @@ public final class Search {
 
     /// The candidates pool, attached now if it is not.
     private HostPool candidates() {
-        if (candidates == null) candidates = HostPool.start(s.hostSinks());
+        // Its few tasks run beside scoring: its sinks attach only while one is in flight.
+        if (candidates == null) candidates = HostPool.startAttachingOnDemand(s.hostSinks());
         return candidates;
     }
 

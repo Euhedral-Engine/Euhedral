@@ -70,10 +70,16 @@ public final class Scorer implements AutoCloseable {
 
     private final Device device;
     private final CalibrationLattice lattice;
+    /// The device's free bytes when the scorer opened, before any artifact: every artifact is planned against it.
+    /// What the first artifact leaves in use (kernel modules, the runtime's per-process state) stays for the
+    /// process and is what the residency planner's reserve stands for; planning against the free bytes left after
+    /// it would count it twice and push weights to host memory.
+    private final long freeAtOpen;
 
     private Scorer(Device device, CalibrationLattice lattice) {
         this.device = device;
         this.lattice = lattice;
+        this.freeAtOpen = device.gpu.deviceMemoryInfo().freeBytes();
     }
 
     /// One device and the calibration lattice with `workers` workers, for any number of artifacts to be scored.
@@ -165,7 +171,7 @@ public final class Scorer implements AutoCloseable {
                 device.gpu,
                 ArtifactProfile.Speculation.NONE,
                 Residency.hostBacked(
-                        artifact, ArtifactProfile.Speculation.NONE, device.gpu, hostBytes, batch, context))) {
+                        artifact, ArtifactProfile.Speculation.NONE, freeAtOpen, hostBytes, batch, context))) {
             var plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
             var runtime = execution(lattice, plan, device, artifactPath, artifact);
             try {
@@ -199,9 +205,9 @@ public final class Scorer implements AutoCloseable {
     private int autoBatch(Artifact artifact, long hostBytes, int rows, int context, int chunks) {
         int limit = rowLimit(artifact);
         if (hostBytes != Residency.PLANNED) return Math.max(1, Math.min(Math.min(4, limit / rows), chunks));
-        long[] figures = Residency.sequenceFigures(artifact, ArtifactProfile.Speculation.NONE, device.gpu, context);
+        long[] figures = Residency.sequenceFigures(artifact, ArtifactProfile.Speculation.NONE, freeAtOpen, context);
         if (figures[0] < 0) return 1;
-        int batch = maxBatch(freeDeviceBytes(), figures[0], figures[1], rows, limit, chunks);
+        int batch = maxBatch(freeAtOpen, figures[0], figures[1], rows, limit, chunks);
         System.out.printf(Locale.ROOT, "scorer: %d chunk(s) of %d rows together%n", batch, rows);
         return batch;
     }

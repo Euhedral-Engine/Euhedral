@@ -7,6 +7,7 @@ import io.euhedral_execution.core.generics.LatticeSource;
 import io.euhedral_execution.core.ingest.AbstractIngestSink;
 import io.euhedral_execution.inference.core.runtime.HostTasks;
 import io.euhedral_execution.inference.core.runtime.graph.FrameLake;
+import io.euhedral_execution.inference.core.runtime.graph.InferenceLake;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,12 +24,29 @@ import java.util.function.Supplier;
 public final class HostPool implements FrameLake, Ensemble.Frames, AutoCloseable {
 
     private final Sink[] sinks;
+    /// The lake a pool that attaches only while it has work publishes into (null for request-only sinks).
+    private final InferenceLake lake;
     private final HostTasks tasks;
 
     private HostPool(int sinks) {
         this.sinks = new Sink[sinks];
         for (int i = 0; i < sinks; i++) this.sinks[i] = new Sink();
+        this.lake = null;
         this.tasks = new HostTasks(this);
+    }
+
+    private HostPool(InferenceLake lake) {
+        this.sinks = null;
+        this.lake = lake;
+        this.tasks = new HostTasks(this);
+    }
+
+    /// A pool for occasional work beside the engine: `sinks` sinks of an [InferenceLake], which attaches them when a
+    /// task arrives and detaches them once none has run for its idle time, so between tasks the lattice's workers
+    /// have no idle sinks of this pool to cycle through.
+    public static HostPool startAttachingOnDemand(int sinks) {
+        if (sinks < 1) throw new IllegalArgumentException("a host pool needs a sink");
+        return new HostPool(new InferenceLake(ControlPlaneLattice.getOrCreate(), sinks, 1));
     }
 
     /// A pool of `sinks` sinks on the process's lattice.
@@ -48,6 +66,10 @@ public final class HostPool implements FrameLake, Ensemble.Frames, AutoCloseable
 
     @Override
     public void publish(AbstractFrame frame) {
+        if (lake != null) {
+            lake.publish(frame);
+            return;
+        }
         sinks[(int) Long.remainderUnsigned(frame.getRoutingHash(), sinks.length)].offer(frame);
     }
 
@@ -58,18 +80,27 @@ public final class HostPool implements FrameLake, Ensemble.Frames, AutoCloseable
 
     // HostTasks counts its own tasks and waits for them at close; the pool has nothing more to count.
     @Override
-    public void admit() {}
+    public void admit() {
+        if (lake != null) lake.admit();
+    }
 
     @Override
-    public void admitDuringDrain() {}
+    public void admitDuringDrain() {
+        if (lake != null) lake.admitDuringDrain();
+    }
 
     @Override
-    public void terminated() {}
+    public void terminated() {
+        if (lake != null) lake.terminated();
+    }
 
     @Override
     public void close() {
         tasks.close();
-        for (Sink sink : sinks) sink.complete();
+        if (lake != null) {
+            lake.completeGracefully();
+            lake.awaitTermination();
+        } else for (Sink sink : sinks) sink.complete();
     }
 
     /// A queue of frames handed to the lattice only against its requests.
