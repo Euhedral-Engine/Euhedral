@@ -123,8 +123,10 @@ public final class Search {
     private final Settings s;
     private final Scoring scoring;
     /// One pool per kind of host work, so none queues behind another: proposals (ensemble fits, RCO samples,
-    /// choosing a batch) and candidates (assembly and fit checks, the budget, the seeds).
-    private final HostPool proposing, candidates;
+    /// choosing a batch) and candidates (assembly and fit checks, the budget, the seeds). Each is attached to the
+    /// lattice only while its work runs (this thread opens and closes them): idle attached sinks slow every
+    /// worker's cycle, and with it the scorer's stage frames.
+    private volatile HostPool proposing, candidates;
     private final Space space;
     private final Priors priors;
     private SearchState state;
@@ -132,11 +134,9 @@ public final class Search {
     private long budget;
     private long seed;
 
-    private Search(Settings settings, Scoring scoring, HostPool proposing, HostPool candidates) {
+    private Search(Settings settings, Scoring scoring) {
         this.s = settings;
         this.scoring = scoring;
-        this.proposing = proposing;
-        this.candidates = candidates;
         List<Option> options = new ArrayList<>(s.sources().options());
         options.retainAll(s.priors().options());
         options.sort(Comparator.naturalOrder());
@@ -149,12 +149,42 @@ public final class Search {
         this.priors = s.priors().restrict(space.objects, options);
     }
 
+    /// The proposals pool, attached now if it is not.
+    private HostPool proposing() {
+        if (proposing == null) proposing = HostPool.start(s.hostSinks());
+        return proposing;
+    }
+
+    /// The candidates pool, attached now if it is not.
+    private HostPool candidates() {
+        if (candidates == null) candidates = HostPool.start(s.hostSinks());
+        return candidates;
+    }
+
+    /// Detaches the proposals pool once its work is done.
+    private void closeProposing() {
+        if (proposing != null) {
+            proposing.close();
+            proposing = null;
+        }
+    }
+
+    /// Detaches the candidates pool once its work is done.
+    private void closeCandidates() {
+        if (candidates != null) {
+            candidates.close();
+            candidates = null;
+        }
+    }
+
     /// Runs the search, resuming from `settings.state()` if it holds one.
     public static Outcome run(Settings settings, Scoring scoring) throws Exception {
-        try (HostPool proposing = HostPool.start(settings.hostSinks());
-                HostPool candidates = HostPool.start(settings.hostSinks())) {
-            Search search = new Search(settings, scoring, proposing, candidates);
+        Search search = new Search(settings, scoring);
+        try {
             return search.run();
+        } finally {
+            search.closeProposing();
+            search.closeCandidates();
         }
     }
 
@@ -164,7 +194,8 @@ public final class Search {
             state = opened;
             seed = state.seed();
             feasibility = s.feasibility().apply(state.freeBytes());
-            budget = candidates.submit(this::derive).get();
+            budget = candidates().submit(this::derive).get();
+            closeCandidates();
             System.out.printf(
                     Locale.ROOT,
                     "search: %d objects, %d options, projections %d..%d MiB, budget %d MiB, %d MiB free, %d measured%n",
@@ -179,7 +210,8 @@ public final class Search {
 
             CompletableFuture<Proposals> next = null;
             if (state.round() == 0) {
-                List<Candidate> seeds = candidates.submit(this::seedCandidates).get();
+                List<Candidate> seeds =
+                        candidates().submit(this::seedCandidates).get();
                 next = measure(seeds, 0);
                 state.round(1);
             }
@@ -195,10 +227,11 @@ public final class Search {
                 List<Measured> data = state.measured();
                 double share = state.explore();
                 List<Candidate> chosen = need > 0
-                        ? proposing
+                        ? proposing()
                                 .submit(() -> choose(proposals, data, share, need, round))
                                 .get()
                         : List.of();
+                closeProposing();
                 if (chosen.isEmpty() && need > 0)
                     System.out.printf(Locale.ROOT, "round %d: no candidate that was not measured%n", round);
                 next = measure(chosen, round);
@@ -313,6 +346,7 @@ public final class Search {
 
     /// An RCO sweep over the ensemble fitted to `data`: as futures on the proposals pool.
     private CompletableFuture<Proposals> propose(List<Measured> data, int round) {
+        proposing();
         return proposing
                 .submit(() -> Ensemble.fit(data, s.members(), seed * 31 + round, s.ridge(), priors, s.bands()))
                 .thenCompose(ensemble -> {
@@ -595,12 +629,13 @@ public final class Search {
         for (Candidate candidate : batch)
             if (!state.contains(candidate.allocation()) && listed.add(candidate.allocation())) todo.add(candidate);
         CompletableFuture<Proposals> next = null;
-        CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : candidates.submit(() -> prepare(todo.get(0)));
+        CompletableFuture<Prepared> prepared =
+                todo.isEmpty() ? null : candidates().submit(() -> prepare(todo.get(0)));
         for (int k = 0; k < todo.size(); k++) {
             Prepared ready = prepared.get();
             if (k + 1 < todo.size()) {
                 Candidate following = todo.get(k + 1);
-                prepared = candidates.submit(() -> prepare(following));
+                prepared = candidates().submit(() -> prepare(following));
             }
             if (k == todo.size() - 1 && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
             Scorer.Result result = scoring.score(s.sources().path(s.sources().base()), ready.artifact());
@@ -630,6 +665,7 @@ public final class Search {
                     measured.fits() ? "fits" : "does not fit");
         }
         if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
+        closeCandidates();
         return next;
     }
 
