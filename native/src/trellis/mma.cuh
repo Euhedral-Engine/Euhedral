@@ -99,7 +99,8 @@ __device__ __forceinline__ int acc_column(int p, int i) {
 template <int W, int P, bool Narrow, bool Staged = false>
 __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned short* __restrict__ act,
         const unsigned short* __restrict__ words, int rows, int row_base, int k, int n, int first, int last,
-        unsigned int (*ring)[kStages][kTrellisMaxWords], ChunkSlots* chunks = nullptr) {
+        unsigned int (*ring)[kStages][kTrellisMaxWords], ChunkSlots* chunks = nullptr, int splits = 1,
+        float (*sum)[128] = nullptr) {
     using R = Ring<W>;
     constexpr int nw = R::kWords32;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -145,6 +146,8 @@ __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned sh
     // tile `ti` are the 8 bytes at a + 16 * ti.
     const unsigned short* a_lane = act + (size_t)(row_base + grp) * k + 4 * q + (size_t)first * 16;
     int slot = 0;
+    // Staged: [first, last) is the whole K range and the sums of each of the `splits` ranges go to `sum` at its end.
+    int split = 0, split_end = (int)((long long)(last - first) / splits) + first;
     for (int ti = first; ti < last; ++ti) {
         copy_wait<kStages - 2>();
         __syncwarp();
@@ -203,6 +206,19 @@ __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned sh
             }
         }
         a_lane += 16;
+        if (Staged && ti + 1 == split_end) {
+            // Each lane adds to the sum elements only it touches, in split order, and the next split starts from zero.
+#pragma unroll
+            for (int p = 0; p < P; ++p)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float& at = sum[acc_row<false>(p, i)][acc_column<false>(p, i)];
+                    at = split == 0 ? acc[p][i] : at + acc[p][i];
+                    acc[p][i] = 0.0f;
+                }
+            ++split;
+            split_end = (int)((long long)(split + 1) * (last - first) / splits) + first;
+        }
     }
 }
 
@@ -289,30 +305,17 @@ __device__ __forceinline__ void rows(const unsigned short* __restrict__ act, con
     }
 }
 
-/// One row group with every split of the K range in order: split i accumulates from zero and its sums are added to
-/// `sum` (shared, [kSplitRows][128]) in order 0..S-1, as euhedral_trellis_epilogue adds the partials of the split
-/// kernel; then the epilogue in place, one 8-row slice of `sum` at a time. Wide tiles of `8 P` rows.
+/// One row group with every split of the K range in order, in one pass over K: split i accumulates from zero and its
+/// sums are added to `sum` (shared, [kSplitRows][128]) in order 0..S-1, as euhedral_trellis_epilogue adds the partials
+/// of the split kernel; then the epilogue in place, one 8-row slice of `sum` at a time. Wide tiles of `8 P` rows.
 template <int W, int P>
 __device__ __forceinline__ void group_splits(const unsigned short* __restrict__ act,
         const unsigned short* __restrict__ words, const unsigned short* __restrict__ svh,
         unsigned short* __restrict__ out, int rows, int row_base, int k, int n, int splits,
         unsigned int (*ring)[kStages][kTrellisMaxWords], float (*sum)[128], ChunkSlots* chunks) {
-    const int tiles = k >> 4;
-    for (int split = 0; split < splits; ++split) {
-        const int first = (int)(((long long)split * tiles) / splits);
-        const int last = (int)(((long long)(split + 1) * tiles) / splits);
-        float acc[P][4];
-        clear(acc);
-        accumulate<W, P, false, true>(acc, act, words, rows, row_base, k, n, first, last, ring, chunks);
-        // Each lane adds to the sum elements only it touches.
-#pragma unroll
-        for (int p = 0; p < P; ++p)
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                float& at = sum[acc_row<false>(p, i)][acc_column<false>(p, i)];
-                at = split == 0 ? acc[p][i] : at + acc[p][i];
-            }
-    }
+    float acc[P][4];
+    clear(acc);
+    accumulate<W, P, false, true>(acc, act, words, rows, row_base, k, n, 0, k >> 4, ring, chunks, splits, sum);
     const int column0 = blockIdx.x * 128;
     const int half_block = threadIdx.x >> 7, t = threadIdx.x & 127;
     const float scale = __half2float(__ushort_as_half(svh[column0 + t]));
