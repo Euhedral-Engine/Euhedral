@@ -35,11 +35,16 @@ public final class Residency {
     /// host-backed weights leave one sequence no room.
     static long[] sequenceFigures(
             Artifact artifact, ArtifactProfile.Speculation speculation, CudaGpuMemory gpu, int tokens) {
+        return sequenceFigures(artifact, speculation, gpu.deviceMemoryInfo().freeBytes(), tokens);
+    }
+
+    /// As above, for a device with `freeBytes` free.
+    static long[] sequenceFigures(
+            Artifact artifact, ArtifactProfile.Speculation speculation, long freeBytes, int tokens) {
         ArtifactProfile found = ArtifactProfile.of(artifact);
         var profile = new ArtifactProfile(found.quantization(), found.compressed(), speculation, found.draftDepth());
         KvFormat format = kvFormat(artifact);
-        var single = ResidencyPlanner.plan(
-                artifact, profile, gpu.deviceMemoryInfo().freeBytes(), tokens, Long.MAX_VALUE, format);
+        var single = ResidencyPlanner.plan(artifact, profile, freeBytes, tokens, Long.MAX_VALUE, format);
         return new long[] {
             single.fits() ? single.deviceBytes() : -1,
             ResidencyPlanner.kvBytes(artifact.config(), tokens, format) + SEQUENCE_BYTES
@@ -55,10 +60,22 @@ public final class Residency {
             long hostBytes,
             int sequences,
             int tokens) {
+        return hostBacked(artifact, speculation, gpu.deviceMemoryInfo().freeBytes(), hostBytes, sequences, tokens);
+    }
+
+    /// As above, for a device with `free` bytes free: a process that scores one artifact after another plans each
+    /// against what the device had before the first, since the memory the first left in use (kernel modules, the
+    /// runtime's per-process state) is what the planner's reserve already stands for.
+    public static Set<String> hostBacked(
+            Artifact artifact,
+            ArtifactProfile.Speculation speculation,
+            long free,
+            long hostBytes,
+            int sequences,
+            int tokens) {
         if (hostBytes != PLANNED) return HostWeightSelection.select(artifact, hostBytes);
         ArtifactProfile found = ArtifactProfile.of(artifact);
         var profile = new ArtifactProfile(found.quantization(), found.compressed(), speculation);
-        long free = gpu.deviceMemoryInfo().freeBytes();
         int context = Math.toIntExact(Math.min(Integer.MAX_VALUE, (long) sequences * tokens));
         var plan = ResidencyPlanner.plan(
                 artifact,
