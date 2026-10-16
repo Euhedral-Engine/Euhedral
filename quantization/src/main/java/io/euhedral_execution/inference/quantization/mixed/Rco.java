@@ -93,12 +93,16 @@ public final class Rco {
         private final Settings settings;
         private final Random random;
         private final int groups;
-        private final double[][] c, direction, alpha, m, v, gradient, score, hard;
+        private final double[][] c, direction, alpha, m, v, gradient;
         private final double target;
         private double worst;
         private double bestValue = Double.POSITIVE_INFINITY;
         private int[] bestChoice;
         private int step = 1, sample;
+        private final long seed;
+        private final double[] sampleValues;
+        private final int[][] sampleChoices;
+        private final double[][][] sampleGradients;
 
         /// @throws IllegalStateException when the budget is below the cheapest options
         public Run(
@@ -110,6 +114,9 @@ public final class Rco {
             this.settings = settings;
             this.groups = cost.length;
             this.random = new Random(seed * 1_000_003L + restart);
+            this.seed = seed * 1_000_003L + restart;
+            this.sampleValues = new double[settings.samples()];
+            this.sampleChoices = new int[settings.samples()][];
             c = new double[groups][];
             double minimum = 0, maximum = 0, ranges = 0;
             double[] low = new double[groups];
@@ -146,9 +153,9 @@ public final class Rco {
             m = zeros(c);
             v = zeros(c);
             gradient = zeros(c);
-            score = zeros(c);
-            hard = zeros(c);
             worst = manifoldError(alpha, c, target);
+            sampleGradients = new double[settings.samples()][][];
+            for (int s = 0; s < settings.samples(); s++) sampleGradients[s] = zeros(c);
         }
 
         private static double[][] zeros(double[][] shape) {
@@ -164,35 +171,59 @@ public final class Rco {
         }
 
         /// Draws the step's next sample, or, when every sample of the step is drawn, updates the logits. True once
-        /// every step is done.
+        /// every step is done. The same as running [#sample] for every index and then [#update].
         public boolean advance() {
             if (step > settings.steps()) return true;
-            double tau = tau();
             if (sample < settings.samples()) {
-                if (sample == 0) for (double[] row : gradient) Arrays.fill(row, 0);
-                for (int i = 0; i < groups; i++)
-                    for (int k = 0; k < c[i].length; k++)
-                        score[i][k] = (alpha[i][k] - Math.log(-Math.log(random.nextDouble() + 1e-300) + 1e-300)) / tau;
-                int[] choice = Knapsack.solve(score, cost, budget, unit);
-                for (int i = 0; i < groups; i++) {
-                    Arrays.fill(hard[i], 0);
-                    hard[i][choice[i]] = 1;
-                }
-                double sampled = objective.value(hard);
-                if (sampled < bestValue) {
-                    bestValue = sampled;
-                    bestChoice = choice;
-                }
-                double[][] toward = objective.gradient(hard);
-                for (int i = 0; i < groups; i++) {
-                    double[] y = softmax(score[i]);
-                    double dot = 0;
-                    for (int k = 0; k < y.length; k++) dot += y[k] * toward[i][k];
-                    for (int k = 0; k < y.length; k++)
-                        gradient[i][k] += y[k] * (toward[i][k] - dot) / tau / settings.samples();
-                }
-                sample++;
+                sample(sample++);
                 return false;
+            }
+            sample = 0;
+            return update();
+        }
+
+        /// The step's samples: each may be drawn by a frame of its own, in any order, before [#update].
+        public int samples() {
+            return settings.samples();
+        }
+
+        /// Draws sample `index` of the current step: Gumbel noise from its own stream (the run's seed, the step
+        /// and the index), the knapsack forward, and the objective's gradient through the softmax backward.
+        /// Samples of one step only read the logits, and each writes its own slots.
+        public void sample(int index) {
+            double tau = tau();
+            Random noise = new Random(seed ^ (0x9E3779B97F4A7C15L * ((long) step * settings.samples() + index + 1)));
+            double[][] perturbed = zeros(c);
+            for (int i = 0; i < groups; i++)
+                for (int k = 0; k < c[i].length; k++)
+                    perturbed[i][k] = (alpha[i][k] - Math.log(-Math.log(noise.nextDouble() + 1e-300) + 1e-300)) / tau;
+            int[] choice = Knapsack.solve(perturbed, cost, budget, unit);
+            double[][] onehot = zeros(c);
+            for (int i = 0; i < groups; i++) onehot[i][choice[i]] = 1;
+            sampleValues[index] = objective.value(onehot);
+            sampleChoices[index] = choice;
+            double[][] toward = objective.gradient(onehot);
+            double[][] into = sampleGradients[index];
+            for (int i = 0; i < groups; i++) {
+                double[] y = softmax(perturbed[i]);
+                double dot = 0;
+                for (int k = 0; k < y.length; k++) dot += y[k] * toward[i][k];
+                for (int k = 0; k < y.length; k++) into[i][k] = y[k] * (toward[i][k] - dot) / tau / settings.samples();
+            }
+        }
+
+        /// Ends the current step once all its samples are drawn: sums their gradients, then the tangent projection,
+        /// Adam, the retraction and the moment transport. True once every step is done.
+        public boolean update() {
+            if (step > settings.steps()) return true;
+            for (double[] row : gradient) Arrays.fill(row, 0);
+            for (int s = 0; s < settings.samples(); s++) {
+                if (sampleValues[s] < bestValue) {
+                    bestValue = sampleValues[s];
+                    bestChoice = sampleChoices[s];
+                }
+                for (int i = 0; i < groups; i++)
+                    for (int k = 0; k < c[i].length; k++) gradient[i][k] += sampleGradients[s][i][k];
             }
             double[][] normal = normal(alpha, c);
             project(gradient, normal);
@@ -213,7 +244,6 @@ public final class Rco {
             project(m, normal(alpha, c));
             worst = Math.max(worst, manifoldError(alpha, c, target));
             step++;
-            sample = 0;
             return step > settings.steps();
         }
 
