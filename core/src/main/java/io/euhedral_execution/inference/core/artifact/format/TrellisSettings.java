@@ -17,15 +17,16 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows) {
     /// Decode-type quanta (decode, draft) have up to eight rows and never take the prefill route.
     private static final int MIN_MMA_ROWS = 8;
 
-    /// Measured on an RTX 5070 Ti with Swift-1.5 at 3 bits: the tensor-core route prefills 512-row chunks at 614
+    /// Measured on an RTX 5070 Ti with Swift-1.5 at 3 bits: the tensor-core route prefills 512-row chunks at 996
     /// tokens/s, the prefill route at 490, so the tensor-core route serves every chunk the default workspace holds.
     private static final int DEFAULT_MMA_MAX_ROWS = 512;
-    /// Measured on an RTX 5070 Ti over the 3-bit model's object shapes: the trellis linears of one decode step take
-    /// 51.0 ms at 560 target blocks, the shortest of 140 to 1120.
+    /// Measured on an RTX 5070 Ti over the 3-bit model's object shapes, weights rotated past L2: the trellis linears
+    /// of one decode step take 14.41, 13.20, 13.01, 13.07 and 13.20 ms at 140, 280, 560, 840 and 1120 target
+    /// blocks.
     private static final int DEFAULT_TARGET_CTAS = 560;
     /// Measured on an RTX 5070 Ti over the 3-bit model's object shapes, the trellis linears of one step with split
-    /// partials and with whole-K blocks: 63.0 and 67.5 ms at 64 rows, 81.1 and 78.0 ms at 80, 137.8 and 126.1 ms
-    /// at 128, 724 and 471 ms at 512.
+    /// partials and with whole-K blocks: 64.5 and 67.8 ms at 64 rows, 83.0 and 78.6 ms at 80, 108.4 and 89.7 ms at
+    /// 96.
     private static final int DEFAULT_WHOLE_K_ROWS = 80;
 
     public TrellisSettings {
