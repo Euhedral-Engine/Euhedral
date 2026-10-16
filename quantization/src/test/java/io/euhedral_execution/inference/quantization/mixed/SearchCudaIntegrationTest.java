@@ -83,7 +83,7 @@ class SearchCudaIntegrationTest {
                     FidelityModel.DEFAULT_BANDS,
                     VERIFY_ROWS,
                     free,
-                    freeBytes -> Feasibility.planner(sources, freeBytes, 4096),
+                    freeBytes -> Feasibility.planner(sources, freeBytes, 4096, 4),
                     2,
                     3,
                     1e-3,

@@ -280,7 +280,7 @@ class SearchTest {
     void thePlannerFitsTinyArtifactsOnABigDeviceAndNotOnASmallOne() throws Exception {
         setUp();
         Allocation pure = new Allocation(Map.of());
-        assertTrue(Feasibility.planner(sources, 1L << 40, 4096).check(pure).fits());
-        assertFalse(Feasibility.planner(sources, 1, 4096).check(pure).fits());
+        assertTrue(Feasibility.planner(sources, 1L << 40, 4096, 4).check(pure).fits());
+        assertFalse(Feasibility.planner(sources, 1, 4096, 4).check(pure).fits());
     }
 }

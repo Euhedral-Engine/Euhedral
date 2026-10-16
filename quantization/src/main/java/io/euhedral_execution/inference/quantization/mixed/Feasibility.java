@@ -19,9 +19,10 @@ public interface Feasibility {
     Check check(Allocation allocation);
 
     /// The engine's planner ([ResidencyPlanner]) on the composite of `allocation`, for a device with
-    /// `freeBytes` free and sequences of up to `context` tokens. It fits when nothing is host-backed or
-    /// disk-backed.
-    static Feasibility planner(Sources sources, long freeBytes, int context) {
+    /// `freeBytes` free and sequences of up to `context` tokens, the composite drafting `draftDepth` tokens per
+    /// verification (a mixed artifact stores no depth until its finalist measurement). It fits when nothing is
+    /// host-backed or disk-backed.
+    static Feasibility planner(Sources sources, long freeBytes, int context, int draftDepth) {
         return new Feasibility() {
             @Override
             public long freeBytes() {
@@ -30,7 +31,7 @@ public interface Feasibility {
 
             @Override
             public Check check(Allocation allocation) {
-                Artifact composite = Assemble.view(sources, allocation, OptionalInt.empty());
+                Artifact composite = Assemble.view(sources, allocation, OptionalInt.of(draftDepth));
                 var plan = ResidencyPlanner.plan(
                         composite,
                         ArtifactProfile.of(composite),
