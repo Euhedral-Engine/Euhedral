@@ -1,5 +1,7 @@
 package io.euhedral_execution.inference.quantization.gpu;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -11,7 +13,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /// The CUDA driver API, NVRTC, cuBLAS and cuSOLVER for the module's own kernels and library calls, in the same
 /// primary context as the engine's library (which uses the runtime API on device 0). Streams are the engine's
@@ -232,7 +240,7 @@ public final class Cuda {
         }
     }
 
-    private final java.util.Map<String, List<Function>> compiled = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, List<Function>> compiled = new ConcurrentHashMap<>();
 
     /// Compiles a kernel source shipped with the module (resource `/cuda/NAME`), once per name and function list.
     public List<Function> compileResource(String name, List<String> functions) {
@@ -242,10 +250,34 @@ public final class Cuda {
     private List<Function> compileResourceNow(String name, List<String> functions) {
         try (var input = Cuda.class.getResourceAsStream("/cuda/" + name)) {
             if (input == null) throw new IllegalArgumentException("no kernel source " + name);
-            return compile(name, new String(input.readAllBytes(), StandardCharsets.UTF_8), functions);
-        } catch (java.io.IOException failure) {
-            throw new java.io.UncheckedIOException(failure);
+            String source = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+            return compile(name, expandIncludes(source, new HashSet<>()), functions);
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
         }
+    }
+
+    private static final Pattern INCLUDE =
+            Pattern.compile("^[ \\t]*#include[ \\t]+\"([^\"]+)\"[ \\t]*$", Pattern.MULTILINE);
+
+    /// Replaces every `#include "PATH"` whose resource `/cuda/PATH` exists by that resource's text, recursively and
+    /// once per path. Other includes are left to the compiler.
+    private static String expandIncludes(String source, Set<String> expanded) throws IOException {
+        Matcher matcher = INCLUDE.matcher(source);
+        StringBuilder result = new StringBuilder();
+        while (matcher.find()) {
+            String path = matcher.group(1);
+            String replacement = matcher.group();
+            try (var included = Cuda.class.getResourceAsStream("/cuda/" + path)) {
+                if (included != null)
+                    replacement = expanded.add(path)
+                            ? expandIncludes(new String(included.readAllBytes(), StandardCharsets.UTF_8), expanded)
+                            : "";
+            }
+            matcher.appendReplacement(result, Matcher.quoteReplacement(replacement));
+        }
+        matcher.appendTail(result);
+        return result.toString();
     }
 
     /// Kernel arguments, each a 64-bit device address, a 32-bit int or a 32-bit float, in order.

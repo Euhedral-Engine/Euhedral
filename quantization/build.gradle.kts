@@ -131,3 +131,12 @@ tasks.withType<Test>().matching { it.name.startsWith("cuda") }.configureEach {
         listOf(hostRuntimeDirectory, cudaMathDirectory.get().asFile.absolutePath, System.getenv("LD_LIBRARY_PATH") ?: "")
             .joinToString(File.pathSeparator))
 }
+
+// The trellis decode header is shared with the engine's kernels: it is compiled from the module's resources, where
+// Cuda.compileResource expands the include.
+tasks.named<ProcessResources>("processResources") {
+    from(rootProject.layout.projectDirectory.dir("native/src/trellis")) {
+        include("*.cuh")
+        into("cuda/trellis")
+    }
+}
