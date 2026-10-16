@@ -377,8 +377,8 @@ public final class QuantizationMain {
                     Integer.parseInt(options.getOrDefault("knapsack-steps", "4096")),
                     Integer.parseInt(options.getOrDefault("max-rounds", Integer.toString(Integer.MAX_VALUE))),
                     Long.parseLong(options.getOrDefault("seed", "1")),
-                    String.join("\n", references) + "\n" + costsFile + "\n" + priorsFile + "\nrows=" + scoreRows
-                            + " batch=" + scoreBatch);
+                    // Priors only steer proposals, never a measurement, so a search may change them and resume.
+                    String.join("\n", references) + "\n" + costsFile + "\nrows=" + scoreRows + " batch=" + scoreBatch);
             Search.run(
                     settings,
                     (path, artifact) -> scorer.score(path, artifact, referencePaths, scoreRows, scoreBatch, hostBytes));
