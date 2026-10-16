@@ -359,7 +359,11 @@ public final class QuantizationMain {
                     Integer.parseInt(options.getOrDefault("bands", Integer.toString(FidelityModel.DEFAULT_BANDS))),
                     Integer.parseInt(options.getOrDefault("verify-rows", "5")),
                     free,
-                    freeBytes -> Feasibility.planner(sources, freeBytes, context),
+                    freeBytes -> Feasibility.planner(
+                            sources,
+                            freeBytes,
+                            context,
+                            Integer.parseInt(options.getOrDefault("verify-rows", "5")) - 1),
                     Integer.parseInt(options.getOrDefault("host-sinks", Integer.toString(Math.max(1, workers / 2)))),
                     Integer.parseInt(options.getOrDefault("members", "8")),
                     Double.parseDouble(options.getOrDefault("ridge", "1e-3")),

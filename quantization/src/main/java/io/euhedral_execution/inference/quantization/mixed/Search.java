@@ -585,7 +585,7 @@ public final class Search {
 
     private Prepared prepare(Candidate candidate) {
         Allocation allocation = candidate.allocation();
-        Artifact artifact = Assemble.view(s.sources(), allocation, OptionalInt.empty());
+        Artifact artifact = Assemble.view(s.sources(), allocation, OptionalInt.of(s.verifyRows() - 1));
         long bytes = 0;
         for (var tensor : artifact.tensors()) bytes += tensor.byteSize();
         return new Prepared(
