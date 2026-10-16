@@ -131,6 +131,30 @@ python3 convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --compres
 `calibrate` holds the hidden states of all sequences in pinned host memory (5.4 GiB for 218 sequences of 2048
 tokens); `--sequences N` and `--layers N` make a short run.
 
+## Trellis
+
+`--quantization trellis --trellis-from DIR` packs the exllamav3 checkpoint `quantization calibrate --format trellis`
+wrote into an artifact. Each engine object that fuses several source linears (`attention/query_key`, `gdn/value_z`,
+`mlp/gate_up`, the MTP `query_key_gate_value`) becomes one TRELLIS object plus three companions: `<name>.suh` (one
+input-scale row per segment), `<name>.svh` and `<name>.segments` (the exclusive row ends of the runs of rows that
+share a source linear). The converter refuses a checkpoint whose `quantization_config` is not exl3 1.6.1 with the
+mul1 codebook and always-on output scales, a linear whose `.mul1` differs, a tile width that disagrees with
+`tensor_storage` or is not 1 to 8 bits in half steps, a shape that disagrees with the BF16 `--model`, an object whose
+pieces have different bit widths, and a piece that does not start and end on a multiple of 128 rows.
+
+The embedding, norms, convolutions, the GDN a/b projections and the draft-head shortlist are built from `--model`
+as for the other artifacts, and the MTP layer is BF16 when the checkpoint carries none. The LM head and the draft
+head are rounded by GPTQ in the calibration run (`calibrate --format trellis --draft-ids-from ARTIFACT`), which
+writes their codes to `OUT/heads`; pass that directory as `--codes-from`. The conversion refuses with "missing head
+codes" when a file is absent. `--output-head BF16` stores the LM head as BF16 instead (its codes are then unused).
+
+```bash
+(cd .. && ./gradlew :quantization:run --args="calibrate --model $CHECKPOINT --format trellis --bits 3.5 \
+    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $EXL3")
+python3 convert_checkpoint.py --model $CHECKPOINT --quantization trellis --trellis-from $EXL3 \
+    --codes-from $EXL3/heads --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $OUT/qwen3_8_27b_trellis.edrl
+```
+
 ## DFlash2
 
 `--dflash2 DIR` adds the DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`: `config.json`, `model.safetensors`) to a conversion, and
@@ -151,6 +175,7 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
   - `recipes.py`: what each of the four artifacts stores, per object.
   - `inventory.py`: the 785 objects of the checkpoint and their writers.
   - `pipeline.py`: checkpoint directory to artifact file.
+  - `trellis.py`: the EXL3 checkpoint reader and the object-to-pieces map of the trellis recipe.
   - `grouped.py`, `nvfp4.py`: the quantizers (Q3/Q4/Q5; NVFP4 and the table-scale NVFP4 layout of
     `docs/NVFP4_COMPRESSED.md`).
   - `q3_p2e2.py`: the lossless Q3 transcode (`docs/COMPRESSED_Q3.md`).

@@ -18,6 +18,7 @@ from euhedral_artifacts.nvfp4 import (nvfp4_offsets, nvfp4_sd4_offsets, quantize
 from euhedral_artifacts.q3_p2e2 import P2E2_LOWEST_CODE
 from euhedral_artifacts.recipes import (BF16_FORMAT, LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage,
                                        stays_row_split)
+from euhedral_artifacts.trellis import TrellisSource, require_head_codes
 from euhedral_artifacts.sources import (HIDDEN, VOCAB_SIZE, MatrixSource, SourceStore, bf16_to_float32,
                                         concat_matrix, gather_matrix, head_part, read_json, slice_matrix,
                                         source_matrix)
@@ -149,13 +150,30 @@ EDGE_DOWN_LAYERS = frozenset(range(6)) | frozenset(range(58, 64))
 
 
 def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
-                importance: ImportanceMatrix | None = None, codes_from: Path | None = None) -> list[ObjectPlan]:
+                importance: ImportanceMatrix | None = None, codes_from: Path | None = None,
+                trellis: TrellisSource | None = None) -> list[ObjectPlan]:
     """The 785 text and MTP objects. Formats written here are the q3 artifact's; `recipe` maps them to
     the artifact being built. With `importance`, quantized objects are rounded by calibrated scale search;
-    those `codes_from` holds state files for are written from them (add_quant)."""
+    those `codes_from` holds state files for are written from them (add_quant). The trellis recipe takes its
+    linears from the EXL3 checkpoint `trellis` (each object followed by its three companions), its two heads from
+    `codes_from`, and everything else from `store`."""
     plans: list[ObjectPlan] = []
+    if (recipe.quantization == "trellis") != (trellis is not None):
+        fail("the trellis recipe needs an EXL3 checkpoint, and only it takes one")
+    if trellis is not None:
+        require_head_codes(codes_from, recipe.output_head)
+    trellis_objects = 0
 
     def quant(name: str, matrix: MatrixSource, q3_format: str) -> None:
+        nonlocal trellis_objects
+        if trellis is not None:
+            if trellis.carries(name):
+                trellis.add_plans(plans, name)
+                trellis_objects += 1
+                return
+            if name.startswith("mtp/"):  # the EXL3 checkpoint has no MTP linears
+                add_quant(plans, Recipe("bf16"), name, matrix, q3_format)
+                return
         add_quant(plans, recipe, name, matrix, q3_format, importance, codes_from)
 
     quant("text/token_embedding", source_matrix(store, "model.language_model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)), "Q3G64_F16S")
@@ -215,8 +233,9 @@ def build_plans(store: SourceStore, selected: np.ndarray, recipe: Recipe,
         source_matrix(store, mtp + "mlp.up_proj.weight", (INTERMEDIATE, HIDDEN))), "NVFP4")
     quant("mtp/layer/mlp/down", source_matrix(store, mtp + "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE)), "NVFP4")
     add_direct(plans, "mtp/final_norm", (HIDDEN,), store, "mtp.norm.weight", (HIDDEN,))
-    if len(plans) != OBJECT_COUNT:
-        fail(f"inventory produced {len(plans)} objects, expected {OBJECT_COUNT}")
+    expected = OBJECT_COUNT + 3 * trellis_objects
+    if len(plans) != expected:
+        fail(f"inventory produced {len(plans)} objects, expected {expected}")
     return plans
 
 

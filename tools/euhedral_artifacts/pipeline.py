@@ -20,6 +20,7 @@ from euhedral_artifacts.importance import ImportanceMatrix
 from euhedral_artifacts.inventory import (VOCAB_SIZE, build_plans, draft_token_ids, encode_metadata, shortlist)
 from euhedral_artifacts.recipes import Recipe
 from euhedral_artifacts.sources import SourceStore, read_json
+from euhedral_artifacts.trellis import TrellisSource, require_head_codes
 
 # Objects are independent and their offsets fixed, so worker processes quantize them in parallel and
 # write their own regions; forked workers inherit the plans and the memory-mapped source.
@@ -67,13 +68,15 @@ def check_checkpoint(config: dict[str, Any]) -> None:
 
 def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recipe: Recipe, selected: np.ndarray,
                    jobs: int, draft: Path | None = None, draft_projections: str = "bf16",
-                   importance: ImportanceMatrix | None = None, codes_from: Path | None = None) -> None:
+                   importance: ImportanceMatrix | None = None, codes_from: Path | None = None,
+                   trellis: TrellisSource | None = None) -> None:
     """Quantizes the checkpoint into the artifact `recipe` names (stored as is: for compressed q3, the
     uncompressed form), at `output_path`, through a temporary file renamed into place. With `draft` the
     DFlash2 drafter checkpoint in that directory is added as `dflash2/` objects; with `importance` the
-    weights are rounded by calibrated scale search; objects `codes_from` holds codes for take them from there."""
+    weights are rounded by calibrated scale search; objects `codes_from` holds codes for take them from there;
+    with `trellis` the linears come from that EXL3 checkpoint."""
     with SourceStore(model) as store, contextlib.ExitStack() as drafts:
-        plans = build_plans(store, selected, recipe, importance, codes_from)
+        plans = build_plans(store, selected, recipe, importance, codes_from, trellis)
         if draft is not None:
             draft_store = drafts.enter_context(SourceStore(draft))
             plans += dflash2.build_plans(draft_store, dflash2.check_draft(read_json(draft / "config.json")),
@@ -110,20 +113,33 @@ def write_artifact(model: Path, config: dict[str, Any], output_path: Path, recip
 def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path | None = None,
             draft_ids_from: Path | None = None, jobs: int = 1, force: bool = False, draft: Path | None = None,
             draft_projections: str = "bf16", imatrix: Path | None = None,
-            codes_from: Path | None = None) -> dict[str, Any]:
+            codes_from: Path | None = None, trellis_from: Path | None = None) -> dict[str, Any]:
     """Converts the checkpoint directory `model` to the artifact `recipe` names. Exactly one of
     `ranking_path` (token frequency counts, to choose the draft-head shortlist) and `draft_ids_from`
     (an existing artifact whose shortlist is reused) is required. `draft` adds the DFlash2 drafter.
     `imatrix` (a llama.cpp importance matrix) selects calibrated rounding. `codes_from` (a directory of
-    pre-rounded codes, codes.py) supplies the objects it holds files for."""
+    pre-rounded codes, codes.py) supplies the objects it holds files for. `trellis_from` (an EXL3 checkpoint
+    directory) is required by the trellis recipe and refused by the others; the recipe's heads come from
+    `codes_from`."""
     if output_path.exists() and not force:
         fail(f"output already exists; pass --force: {output_path}")
+    if (recipe.quantization == "trellis") != (trellis_from is not None):
+        fail("--trellis-from is required with, and only valid for, --quantization trellis")
+    if recipe.quantization == "trellis" and imatrix is not None:
+        fail("--imatrix does not apply to --quantization trellis")
     if (ranking_path is None) == (draft_ids_from is None):
         fail("pass exactly one of --ranking and --draft-ids-from")
     config = read_json(model / "config.json")
     check_checkpoint(config)
     selected = shortlist(model, ranking_path) if ranking_path is not None else draft_token_ids(draft_ids_from)
     importance = ImportanceMatrix(imatrix) if imatrix is not None else None
+    trellis = None
+    if trellis_from is not None:
+        trellis = TrellisSource(trellis_from)
+        with SourceStore(model) as store:
+            trellis.check_sources(lambda name: store.ref(name).shape)
+        trellis.check_files()
+        require_head_codes(codes_from, recipe.output_head)
 
     # Compressed q3 is the q3 artifact transcoded: the q3 form is built beside the output and removed.
     transcode = recipe.quantization == "q3" and recipe.compressed
@@ -135,7 +151,9 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
     else:
         built = output_path
     try:
-        write_artifact(model, config, built, recipe, selected, jobs, draft, draft_projections, importance, codes_from)
+        extra = {"trellis": trellis} if trellis is not None else {}
+        write_artifact(model, config, built, recipe, selected, jobs, draft, draft_projections, importance, codes_from,
+                       **extra)
         stats = q3_p2e2.transcode(built, output_path, force=True) if transcode else {}
     finally:
         if transcode:
@@ -149,6 +167,9 @@ def convert(model: Path, output_path: Path, recipe: Recipe, ranking_path: Path |
         manifest.update({"imatrix": str(imatrix), "imatrix_sha256": sha256(imatrix)})
     if codes_from is not None:
         manifest.update({"codes_from": str(codes_from), "codes_from_objects": len(list(codes_from.glob("*.npz")))})
+    if trellis is not None:
+        manifest.update({"trellis_from": str(trellis_from), "trellis_bits": trellis.bits,
+                         "quantization_config": trellis.quantization_config})
     manifest.update(stats)
     with Path(f"{output_path}.manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)

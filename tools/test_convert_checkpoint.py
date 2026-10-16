@@ -142,7 +142,7 @@ class ArgumentHandlingTest(unittest.TestCase):
         self.assertEqual(options, {"--model", "--out", "--quantization", "--compressed", "--draft-ids-from",
                                    "--ranking", "--device", "--jobs", "--force", "--dflash2",
                                    "--dflash2-projections", "--extend", "--imatrix", "--codes-from",
-                                   "--output-head"})
+                                   "--output-head", "--trellis-from"})
         for word in ("p2e2", "sd4", "nvmtp", "profile", "mtp-format", "reference"):
             self.assertNotIn(word, out.lower())
 

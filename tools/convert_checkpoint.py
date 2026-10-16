@@ -7,6 +7,7 @@ Two choices select one of the four artifacts the engine ships:
   --quantization q3    --compressed Q3 weights, stored compressed   (lossless; same outputs as q3)
   --quantization nvfp4              NVFP4 weights
   --quantization nvfp4 --compressed NVFP4 weights, stored compressed (4.25 bits per weight)
+  --quantization trellis            trellis weights of an exllamav3 checkpoint (--trellis-from DIR)
 
 The draft head's token shortlist comes from --ranking (token frequency counts, int64 little endian,
 one per vocabulary entry) or from an existing artifact's shortlist (--draft-ids-from); pass one.
@@ -19,6 +20,12 @@ a calibration text). The formats and layouts are unchanged.
 --codes-from DIR writes the quantized objects DIR holds pre-rounded codes for (one file per object, written by
 euhedral_artifacts/fake_quant.py or a training tool) instead of rounding them; the other objects are rounded as
 usual. A file must match the object's format, layout and shape in the chosen artifact.
+
+--trellis-from DIR (required with, and only valid for, --quantization trellis) packs the linears of the EXL3
+checkpoint calibrate --format trellis wrote into DIR: the engine's objects, each with its input scales, output
+scales and segments. Everything else (embedding, norms, GDN a/b, the draft-head shortlist) is built from --model.
+The LM head and the draft head are not part of the checkpoint: --codes-from takes the codes calibrate wrote to
+DIR/heads, and the conversion refuses when one is missing.
 
 --dflash2 DIR adds the DFlash2 drafter checkpoint (z-lab/Qwen3.8-27B-DFlash2), so the artifact drafts with
 DFlash2 instead of MTP. With --extend ARTIFACT it is added to an existing artifact, whose objects are copied
@@ -76,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "column importance instead of from its largest value (needs PyTorch)")
     parser.add_argument("--codes-from", type=Path, metavar="DIR",
                         help="take the codes and scales of the objects DIR holds files for (see above)")
+    parser.add_argument("--trellis-from", type=Path, metavar="EXL3_DIR",
+                        help="exllamav3 checkpoint to take the linears from (with --quantization trellis)")
     parser.add_argument("--output-head", choices=HEAD_FORMATS, metavar="FORMAT",
                         help="the LM head's format in place of the recipe's (" + ", ".join(HEAD_FORMATS) + ")")
     parser.add_argument("--force", action="store_true", help="replace an existing artifact")
@@ -101,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--model and --quantization are required")
     if (args.ranking is None) == (args.draft_ids_from is None):
         parser.error("pass exactly one of --ranking and --draft-ids-from")
+    if (args.quantization == "trellis") != (args.trellis_from is not None):
+        parser.error("--trellis-from is required with, and only valid for, --quantization trellis")
     name = args.device or device.default_device()
     if name not in ("cpu", "cuda"):
         parser.error("--device must be cuda or cpu")
@@ -113,10 +124,11 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             parser.error("--imatrix needs PyTorch")
     device.set_device(name)
+    trellis = {"trellis_from": args.trellis_from} if args.trellis_from is not None else {}
     try:
         manifest = convert(args.model, args.out, Recipe(args.quantization, args.compressed, args.output_head), args.ranking,
                            args.draft_ids_from, jobs, args.force, args.dflash2, args.dflash2_projections,
-                           args.imatrix, args.codes_from)
+                           args.imatrix, args.codes_from, **trellis)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
