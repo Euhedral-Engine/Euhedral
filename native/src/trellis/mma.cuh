@@ -86,21 +86,26 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
             for (int i = 0; i < 4; ++i) acc[m][h][i] = 0.0f;
 
     // Each warp streams its tiles through its own ring of kStages slots with 16-byte asynchronous copies, kStages - 1
-    // tiles ahead of the one it decodes.
-    const unsigned short* source = words + (size_t)tj * W;
+    // tiles ahead of the one it decodes. The lanes of the 16-byte chunks of a tile copy them from `fetch`, which steps
+    // one k16 tile at a time.
     const size_t stride = (size_t)tiles_n * W;
-    constexpr int chunks = W / 8;
-    const auto fetch = [&](int ti, int slot) {
-        if (lane < chunks && ti < last) copy16(&ring[warp][slot][lane * 4], source + (size_t)ti * stride + lane * 8);
-        copy_commit();
-    };
+    const bool copies = lane < W / 8;
+    const unsigned short* fetch = words + (size_t)first * stride + (size_t)tj * W + lane * 8;
 #pragma unroll
-    for (int i = 0; i < kStages - 1; ++i) fetch(first + i, i);
+    for (int i = 0; i < kStages - 1; ++i) {
+        if (copies && first + i < last) copy16(&ring[warp][i][lane * 4], fetch);
+        copy_commit();
+        fetch += stride;
+    }
+    // This lane's A fragment elements of k16 tile `ti` are at a + 16 * ti plus a fixed offset per m-tile and half.
+    const unsigned short* a_lane = act + (size_t)(row_base + grp) * k + 2 * q + (size_t)first * 16;
     int slot = 0;
     for (int ti = first; ti < last; ++ti) {
         copy_wait<kStages - 2>();
         __syncwarp();
-        fetch(ti + kStages - 1, slot == 0 ? kStages - 1 : slot - 1);
+        if (copies && ti + kStages - 1 < last) copy16(&ring[warp][slot == 0 ? kStages - 1 : slot - 1][lane * 4], fetch);
+        copy_commit();
+        fetch += stride;
         const unsigned int* mine = ring[warp][slot];
         slot = slot + 1 == kStages ? 0 : slot + 1;
         // The lane's words shifted so its first window starts at bit 0 (MSB first).
@@ -121,15 +126,17 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
             const int row0 = row_base + m * 16 + grp, row1 = row0 + 8;
-            const int at = ti * 16 + 2 * q;
+            const unsigned short* a0 = a_lane + (size_t)(m * 16) * k;
+            const unsigned short* a1 = a0 + (size_t)8 * k;
             unsigned int a[4];
-            a[0] = row0 < rows ? *reinterpret_cast<const unsigned int*>(act + (size_t)row0 * k + at) : 0u;
-            a[1] = row1 < rows ? *reinterpret_cast<const unsigned int*>(act + (size_t)row1 * k + at) : 0u;
-            a[2] = row0 < rows ? *reinterpret_cast<const unsigned int*>(act + (size_t)row0 * k + at + 8) : 0u;
-            a[3] = row1 < rows ? *reinterpret_cast<const unsigned int*>(act + (size_t)row1 * k + at + 8) : 0u;
+            a[0] = row0 < rows ? *reinterpret_cast<const unsigned int*>(a0) : 0u;
+            a[1] = row1 < rows ? *reinterpret_cast<const unsigned int*>(a1) : 0u;
+            a[2] = row0 < rows ? *reinterpret_cast<const unsigned int*>(a0 + 8) : 0u;
+            a[3] = row1 < rows ? *reinterpret_cast<const unsigned int*>(a1 + 8) : 0u;
             mma_f16(acc[m][0], a, b[0][0], b[0][1]);
             mma_f16(acc[m][1], a, b[1][0], b[1][1]);
         }
+        a_lane += 16;
     }
 
     const int column0 = blockIdx.x * 128;
