@@ -394,8 +394,12 @@ class TrellisKernelTest(unittest.TestCase):
     def test_fp16_range_recorded_extremes(self):
         if not EXTREMES.is_file():
             return  # recorded from a running engine; the synthetic case above covers the shape until then
-        for case in json.loads(EXTREMES.read_text())["cases"]:
-            self.prepass_extreme(float(case["max_abs_x"]), float(case["max_abs_suh"]))
+        # Recorded by TrellisActivationRangeCudaIntegrationTest: the largest prepass output each linear met on real
+        # activations, which must fit FP16 with room to spare.
+        cases = json.loads(EXTREMES.read_text())["cases"]
+        self.assertTrue(cases)
+        for case in cases:
+            self.assertLess(float(case["max_abs_prepass"]), 65504.0 / 2, case["linear"])
 
     # -- table ----------------------------------------------------------------------------------------------
 
