@@ -5,7 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.WeightFormat;
+import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -96,5 +99,36 @@ class SourcesTest {
     void theBaseMustHaveASource() throws Exception {
         Map<Option, Path> artifacts = Map.of(Option.NVFP4, TinyArtifacts.write(directory.resolve("b.edrl"), 2, false));
         assertThrows(IllegalArgumentException.class, () -> Sources.open(artifacts, Option.TRELLIS_3_0));
+    }
+
+    @Test
+    void aTrellisAndARowSplitProjectionOfTheSameLinearHaveTheSameFeatures() {
+        // 64 inputs, 128 outputs: trellis tiles [k/16, n/16, w], NVFP4 rows [n, k].
+        var trellis = new TensorDescriptor(
+                "p",
+                new long[] {4, 8, 48},
+                TensorDataType.BF16,
+                WeightFormat.TRELLIS,
+                WeightLayout.TRELLIS_TILE16_V1,
+                0,
+                1);
+        var nvfp4 = new TensorDescriptor(
+                "p",
+                new long[] {128, 64},
+                TensorDataType.BF16,
+                WeightFormat.NVFP4,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                0,
+                1);
+        var transposed = new TensorDescriptor(
+                "p",
+                new long[] {64, 128},
+                TensorDataType.BF16,
+                WeightFormat.NVFP4,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                0,
+                1);
+        assertTrue(Sources.sameFeatures(trellis, nvfp4));
+        assertFalse(Sources.sameFeatures(trellis, transposed));
     }
 }
