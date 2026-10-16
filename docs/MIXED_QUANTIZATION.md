@@ -1,0 +1,106 @@
+# Mixed NVFP4 and trellis artifacts
+
+A mixed artifact stores each fused projection object of the text layers in its own format: NVFP4 (the GPTQ
+codes) or trellis at 2.5, 3.0, 3.5 or 4.0 bits per weight. The engine routes every object by its own format, so a
+mixed artifact runs the same kernels, row-exact verification, MTP, offload and prefix cache as a pure one; it
+stores the MTP draft depth it was measured with (`ArtifactProfile` names it `mixed` and refuses MTP without one).
+
+## Sources and assembly
+
+Every option comes from a pure artifact converted once from its calibration (trellis: `calibrate --format trellis
+--bits B`, one rate for every linear; NVFP4: the GPTQ artifact). `quantization assemble --allocation FILE --source
+OPTION=ARTIFACT... --base OPTION --out ARTIFACT` takes each projection the allocation names from its option's source,
+with its companions, and everything else from the base: the token embedding, the heads and the MTP drafter. The
+objects taken straight from the checkpoint must be bit for bit equal in every source; `assemble` refuses a source
+that differs. In process the same assembly is a composite view whose objects are read from their source files, which
+is how a search loads candidates without writing them. An allocation that names nothing assembles to a file byte for
+byte equal to its base.
+
+| Source | File |
+|---|---|
+| NVFP4 (GPTQ) | 14.51 GiB |
+| trellis 2.5 | 8.84 GiB |
+| trellis 3.0 | 10.26 GiB |
+| trellis 3.5 | 11.67 GiB |
+| trellis 4.0 | 13.09 GiB |
+
+Calibration of the trellis 2.5 and 4.0 sources took 66 and 33 minutes on the RTX 5070 Ti.
+
+## Cost model
+
+`quantization cost` times one launch of each option's real payload for every distinct projection shape on the
+device alone (the stream waits on a host flag while the launches queue, as in captured decode graphs), with the
+weights rotated past L2. Microseconds per launch at 1 row / per 512-row prefill chunk, at +150 MHz core,
++1500 MHz memory and 350 W:
+
+| Shape (in × out) | Objects | nvfp4 | trellis-2.5 | trellis-3.0 | trellis-3.5 | trellis-4.0 |
+|---|---|---|---|---|---|---|
+| 5120 × 4096 | GDN query/key | 16.2 / 71 | 16.4 / 324 | 16.3 / 323 | 17.9 / 324 | 18.7 / 326 |
+| 5120 × 12288 | GDN value/z | 43.0 / 201 | 35.6 / 794 | 37.1 / 793 | 42.4 / 795 | 46.0 / 801 |
+| 6144 × 5120 | GDN and attention output | 24.6 / 120 | 19.7 / 460 | 20.0 / 458 | 21.8 / 458 | 23.7 / 463 |
+| 5120 × 7168 | attention query/key and gate/value | 25.9 / 133 | 22.1 / 527 | 22.5 / 525 | 24.5 / 525 | 26.8 / 530 |
+| 5120 × 34816 | MLP gate/up | 117.1 / 521 | 85.2 / 2214 | 88.7 / 2214 | 100.0 / 2213 | 112.1 / 2231 |
+| 17408 × 5120 | MLP down | 63.6 / 339 | 45.0 / 1234 | 46.4 / 1224 | 51.4 / 1222 | 56.7 / 1236 |
+
+An allocation's prefill time per token is the sum of its projections' 512-row times over 512 plus 103.5 µs; its
+5-row verification step the sum of their 5-row times plus 5.45 ms; its one-row step the sum of their one-row times
+plus 2.74 ms. The fixed terms are the non-linear work measured end to end (prefill of 4096 tokens, decode and MTP
+verification) on the trellis 2.5, 3.0 and 3.5 sources; with them the model reproduces each source's measured
+prefill within 2%, its verification step within 1% and its one-row step within 3%.
+
+## Search reference
+
+Candidates are scored against BF16 logits the engine computes itself: `quantization reference` runs the BF16
+artifact (weights split over the device, pinned host memory and disk by the residency planner) over a text of 8
+chunks of 2560 tokens (wikitext-2 test text past the positions T2 scores, the model's own generations past the
+positions T4 scores, and Python and Go sources T3 does not hold) and writes the logits in llama.cpp's format. It
+took 1045 s. Scoring is deterministic: the trellis 3.0 source scores KL 0.0895 on it twice, bit for bit.
+
+## Family swaps
+
+Each family of projections moved together, across all 64 layers, from the trellis 3.0 base to another option, at a
+32,768-token context (Search KL against the reference above; bytes are the artifact's; prefill and step from the
+cost model):
+
+| Projections moved to | Option | Search KL | Bytes | Prefill µs/token | 5-row step ms |
+|---|---|---|---|---|---|
+| every projection | nvfp4 | 0.0536 | 14.49 GiB (does not fit) | 260 | 22.62 |
+| every projection | trellis-2.5 | 0.1564 | 8.84 GiB | 730 | 18.37 |
+| every projection | trellis-3.0 | 0.0895 | 10.26 GiB | 728 | 18.82 |
+| every projection | trellis-3.5 | 0.0571 | 11.67 GiB | 728 | 20.63 |
+| every projection | trellis-4.0 | 0.0446 | 13.09 GiB (does not fit) | 734 | 22.09 |
+| `attention/query_key` | nvfp4 | 0.0857 | 10.36 GiB | 716 | 18.90 |
+| `attention/query_key` | trellis-2.5 | 0.0916 | 10.22 GiB | 728 | 18.81 |
+| `attention/query_key` | trellis-3.5 | 0.0901 | 10.29 GiB | 728 | 18.86 |
+| `attention/query_key` | trellis-4.0 | 0.0853 | 10.32 GiB | 728 | 18.89 |
+| `attention/gate_value` | nvfp4 | 0.0896 | 10.36 GiB | 716 | 18.90 |
+| `attention/gate_value` | trellis-2.5 | 0.0985 | 10.22 GiB | 728 | 18.81 |
+| `attention/gate_value` | trellis-3.5 | 0.0930 | 10.29 GiB | 728 | 18.86 |
+| `attention/gate_value` | trellis-4.0 | 0.0889 | 10.32 GiB | 728 | 18.89 |
+| `attention/output` | nvfp4 | 0.0906 | 10.34 GiB | 717 | 18.90 |
+| `attention/output` | trellis-2.5 | 0.0921 | 10.23 GiB | 728 | 18.82 |
+| `attention/output` | trellis-3.5 | 0.0953 | 10.28 GiB | 728 | 18.85 |
+| `attention/output` | trellis-4.0 | 0.0893 | 10.31 GiB | 728 | 18.88 |
+| `gdn/query_key` | nvfp4 | 0.0910 | 10.43 GiB | 704 | 18.85 |
+| `gdn/query_key` | trellis-2.5 | 0.0960 | 10.20 GiB | 728 | 18.81 |
+| `gdn/query_key` | trellis-3.5 | 0.0874 | 10.31 GiB | 728 | 18.90 |
+| `gdn/query_key` | trellis-4.0 | 0.0910 | 10.37 GiB | 728 | 18.93 |
+| `gdn/value_z` | nvfp4 | 0.0815 | 10.78 GiB | 672 | 19.17 |
+| `gdn/value_z` | trellis-2.5 | 0.0919 | 10.08 GiB | 728 | 18.77 |
+| `gdn/value_z` | trellis-3.5 | 0.0911 | 10.43 GiB | 728 | 19.13 |
+| `gdn/value_z` | trellis-4.0 | 0.0873 | 10.61 GiB | 729 | 19.29 |
+| `gdn/output` | nvfp4 | 0.0898 | 10.52 GiB | 696 | 19.05 |
+| `gdn/output` | trellis-2.5 | 0.1004 | 10.17 GiB | 728 | 18.81 |
+| `gdn/output` | trellis-3.5 | 0.0862 | 10.34 GiB | 728 | 18.91 |
+| `gdn/output` | trellis-4.0 | 0.0856 | 10.43 GiB | 728 | 19.00 |
+| `mlp/gate_up` | nvfp4 | 0.0850 | 12.24 GiB | 516 | 20.61 |
+| `mlp/gate_up` | trellis-2.5 | 0.1169 | 9.59 GiB | 728 | 18.55 |
+| `mlp/gate_up` | trellis-3.5 | 0.0734 | 10.92 GiB | 728 | 19.74 |
+| `mlp/gate_up` | trellis-4.0 | 0.0696 | 11.58 GiB | 730 | 20.47 |
+| `mlp/down` | nvfp4 | 0.0848 | 11.25 GiB | 617 | 19.99 |
+| `mlp/down` | trellis-2.5 | 0.1147 | 9.92 GiB | 729 | 18.73 |
+| `mlp/down` | trellis-3.5 | 0.0877 | 10.59 GiB | 728 | 19.14 |
+| `mlp/down` | trellis-4.0 | 0.0858 | 10.92 GiB | 729 | 19.49 |
+
+Every allocation above but the pure NVFP4 and trellis 4.0 ones fits on the 16 GB card at that context with every
+weight resident.
