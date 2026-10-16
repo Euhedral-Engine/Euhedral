@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.euhedral_execution.inference.core.InferenceConfig;
 import io.euhedral_execution.inference.core.artifact.TensorDataType;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.artifact.TensorHandle;
@@ -455,12 +456,12 @@ class TrellisInventoryTest {
         Artifact artifact = new Artifact(null, config(), descriptors.values().toArray(new TensorDescriptor[0]));
         var profile =
                 new ArtifactProfile(ArtifactProfile.Quantization.TRELLIS, false, ArtifactProfile.Speculation.NONE);
-        long expected = LinearFormats.of(descriptors.get("text/layers/0/mlp/gate_up"))
-                .planScratchBytes(
-                        descriptors.get("text/layers/0/mlp/gate_up"),
-                        io.euhedral_execution.inference.core.InferenceConfig.PREFILL_CHUNK_TOKENS);
+        long expected = 0;
+        for (TensorDescriptor d : descriptors.values())
+            if (d.format() == WeightFormat.TRELLIS)
+                expected = Math.max(expected, LinearFormats.of(d).planScratchBytes(d, InferenceConfig.workspaceRows()));
         assertEquals(expected, ResidencyPlanner.trellisScratchBytes(artifact, profile));
-        assertTrue(expected > 34816L * 5120 * 2);
+        assertTrue(expected > 0);
 
         Map<String, TensorDescriptor> plain = new LinkedHashMap<>(descriptors);
         plain.values().removeIf(d -> d.format() == WeightFormat.TRELLIS);

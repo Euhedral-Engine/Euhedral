@@ -131,15 +131,16 @@ public final class TrellisFormat implements LinearFormat {
     }
 
     /// The scratch bytes an object of `descriptor` needs at `maxRows` rows when its segment count is unknown: the
-    /// larger of the prefill route (the rotated activations of at most [TrellisLayout#MAX_SEGMENTS] segments, the
-    /// whole object decoded to BF16 `[n, k]`, and the GEMM outputs `[rows, n]`, each region 256-aligned) and the
-    /// tensor-core route with that many segments.
+    /// tensor-core route with at most [TrellisLayout#MAX_SEGMENTS] segments, and, when `maxRows` exceeds
+    /// [TrellisSettings#mmaMaxRows], the larger prefill route (the rotated activations, the whole object decoded to
+    /// BF16 `[n, k]`, and the GEMM outputs `[rows, n]`, each region 256-aligned).
     @Override
     public long planScratchBytes(TensorDescriptor descriptor, int maxRows) {
         long[] nk = logical(descriptor.shape());
-        return Math.max(
-                prefillBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS),
-                mmaBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS));
+        long bytes = mmaBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS);
+        if (maxRows > this.settings.mmaMaxRows())
+            bytes = Math.max(bytes, prefillBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS));
+        return bytes;
     }
 
     /// Trellis rows need the object's host-known segment ends; see the overload with `ends`.

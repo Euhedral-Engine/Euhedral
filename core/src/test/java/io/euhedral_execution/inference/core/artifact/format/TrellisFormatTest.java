@@ -146,12 +146,16 @@ class TrellisFormatTest {
     void thePrefillScratchHoldsTheDecodedObjectTheRotatedActivationsAndTheOutputs() {
         long n = 34816, k = 5120, rows = 512;
         long expected = 8 * rows * k * 2 + n * k * 2 + rows * n * 2;
-        long aligned = FORMAT.planScratchBytes(descriptor(GATE_UP), 512);
+        // A row limit below the rows reserves the prefill route.
+        TrellisFormat prefill = new TrellisFormat(new TrellisSettings(64, 560));
+        long aligned = prefill.planScratchBytes(descriptor(GATE_UP), 512);
         // Every region is 256-aligned, and these are.
         assertEquals(expected, aligned);
-        assertTrue(FORMAT.planScratchBytes(descriptor(GATE_UP), 1024) > aligned);
-        long small = FORMAT.planScratchBytes(descriptor(new long[] {40, 8, 56}), 3);
-        assertTrue(small >= 128L * 640 * 2 + 3L * 128 * 2 + 8 * 3 * 640 * 2);
+        assertTrue(prefill.planScratchBytes(descriptor(GATE_UP), 1024) > aligned);
+        // At the default limit every 512-row chunk stays on the tensor-core route, which needs less.
+        assertTrue(FORMAT.planScratchBytes(descriptor(GATE_UP), 512) < aligned);
+        long small = prefill.planScratchBytes(descriptor(new long[] {40, 8, 56}), 100);
+        assertTrue(small >= 128L * 640 * 2 + 100L * 128 * 2 + 8 * 100 * 640 * 2);
         assertEquals(0, small % 256);
         assertEquals(
                 0,
