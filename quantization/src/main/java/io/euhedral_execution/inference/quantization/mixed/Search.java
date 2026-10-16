@@ -730,16 +730,13 @@ public final class Search {
 
     /// Scores the candidates of `batch` not measured yet: each is submitted as it is assembled and checked on the
     /// candidates pool (the next while the previous ones are scored), and recorded when its score is complete,
-    /// whatever order they complete in. When the last one starts scoring, the next round's proposals start on the
-    /// proposals pool (from what is measured by then), and are returned as a future. A scoring that scores one at a
-    /// time starts them before the last one's score.
+    /// whatever order they complete in. Once every one is recorded, the next round's proposals start on the
+    /// proposals pool, and are returned as a future.
     private CompletableFuture<Proposals> measure(List<Candidate> batch, int round) throws Exception {
         List<Candidate> todo = new ArrayList<>();
         Set<Allocation> listed = new HashSet<>();
         for (Candidate candidate : batch)
             if (!state.contains(candidate.allocation()) && listed.add(candidate.allocation())) todo.add(candidate);
-        CompletableFuture<Proposals> next = null;
-        CompletableFuture<Void> lastStarted = new CompletableFuture<>();
         List<Submitted> pending = new ArrayList<>();
         CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : prepare(candidates(), todo.get(0));
         for (int k = 0; k < todo.size(); k++) {
@@ -748,28 +745,17 @@ public final class Search {
                 Candidate following = todo.get(k + 1);
                 prepared = prepare(candidates(), following);
             }
-            boolean last = k == todo.size() - 1;
-            if (last && !scoring.concurrent() && round + 1 <= s.maxRounds())
-                next = propose(state.measured(), round + 1);
             pending.add(new Submitted(
-                    k,
-                    ready,
-                    scoring.submit(
-                            s.sources().path(s.sources().base()),
-                            ready.artifact(),
-                            last ? () -> lastStarted.complete(null) : () -> {})));
+                    k, ready, scoring.submit(s.sources().path(s.sources().base()), ready.artifact(), () -> {})));
             record(pending, todo.size(), round);
         }
         while (!pending.isEmpty()) {
             scoring.service();
             record(pending, todo.size(), round);
-            if (next == null && scoring.concurrent() && lastStarted.isDone() && round + 1 <= s.maxRounds())
-                next = propose(state.measured(), round + 1);
             if (pending.isEmpty()) break;
             List<CompletableFuture<?>> waiting = new ArrayList<>();
             for (Submitted submitted : pending) waiting.add(submitted.result());
             waiting.add(scoring.attention());
-            if (next == null && !lastStarted.isDone()) waiting.add(lastStarted);
             try {
                 CompletableFuture.anyOf(waiting.toArray(new CompletableFuture<?>[0]))
                         .get();
@@ -777,9 +763,10 @@ public final class Search {
                 // A failed score is found, and thrown, when the finished are recorded.
             }
         }
-        if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
         closeCandidates();
-        return next;
+        // The next round's proposals start only now: RCO beside scoring slowed the candidate it overlapped
+        // (81 s against 30 s) by more than the overlap saved.
+        return round + 1 <= s.maxRounds() ? propose(state.measured(), round + 1) : null;
     }
 
     /// Records, in the order they finished, the submitted candidates whose scores are complete; a failed one stops
