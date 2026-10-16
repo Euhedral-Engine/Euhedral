@@ -20,7 +20,7 @@ import java.util.function.Supplier;
 /// itself: it hands frames to the lattice only through requests, so whichever worker is free takes each. A search
 /// keeps one pool per kind of work, so no kind queues behind another. [#submit] returns the task's future;
 /// nothing waits. [#close] waits for the admitted tasks and detaches the sinks.
-public final class HostPool implements FrameLake, AutoCloseable {
+public final class HostPool implements FrameLake, Ensemble.Frames, AutoCloseable {
 
     private final Sink[] sinks;
     private final HostTasks tasks;
@@ -41,6 +41,7 @@ public final class HostPool implements FrameLake, AutoCloseable {
     }
 
     /// Runs `task` as one frame; the future ends with its result or its failure, on the worker that ran it.
+    @Override
     public <T> CompletableFuture<T> submit(Supplier<T> task) {
         return tasks.onWorker(task);
     }

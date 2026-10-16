@@ -4,6 +4,8 @@ import io.euhedral_execution.inference.quantization.mixed.SearchState.Measured;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /// Fidelity models fitted to bootstrap resamples of the measured candidates, each shrinking towards its own
 /// random point of the prior (see [FidelityModel#fit(List, double, Priors, int, long, double)]): their mean is
@@ -26,15 +28,46 @@ public final class Ensemble {
     }
 
     public static Ensemble fit(List<Measured> data, int members, long seed, double ridge, Priors priors, int bands) {
+        List<Supplier<FidelityModel>> fits = fits(data, members, seed, ridge, priors, bands);
+        List<FidelityModel> fitted = new ArrayList<>();
+        for (Supplier<FidelityModel> fit : fits) fitted.add(fit.get());
+        return new Ensemble(List.copyOf(fitted));
+    }
+
+    /// Where an ensemble's fits are run as small tasks: each call returns the future of one task.
+    public interface Frames {
+        <T> CompletableFuture<T> submit(Supplier<T> task);
+    }
+
+    /// As [#fit(List, int, long, double, Priors, int)], each member's fit a task of its own on `frames` and the
+    /// ensemble joined in one more. The resamples and the members' seeds are drawn in order before any task
+    /// runs, so the members are the sequential fit's, whichever order the tasks finish in.
+    public static CompletableFuture<Ensemble> fit(
+            List<Measured> data, int members, long seed, double ridge, Priors priors, int bands, Frames frames) {
+        List<Supplier<FidelityModel>> fits = fits(data, members, seed, ridge, priors, bands);
+        List<CompletableFuture<FidelityModel>> fitted = new ArrayList<>();
+        for (Supplier<FidelityModel> fit : fits) fitted.add(frames.submit(fit));
+        return CompletableFuture.allOf(fitted.toArray(CompletableFuture[]::new))
+                .thenCompose(done -> frames.submit(() -> {
+                    List<FidelityModel> models = new ArrayList<>();
+                    for (var future : fitted) models.add(future.join());
+                    return new Ensemble(List.copyOf(models));
+                }));
+    }
+
+    /// The fit of each member to its bootstrap resample, the resamples and seeds drawn from `seed` in member order.
+    private static List<Supplier<FidelityModel>> fits(
+            List<Measured> data, int members, long seed, double ridge, Priors priors, int bands) {
         if (members < 1) throw new IllegalArgumentException("an ensemble needs a member");
         Random random = new Random(seed);
-        List<FidelityModel> fitted = new ArrayList<>();
+        List<Supplier<FidelityModel>> fits = new ArrayList<>();
         for (int m = 0; m < members; m++) {
             List<Measured> resample = new ArrayList<>(data.size());
             for (int i = 0; i < data.size(); i++) resample.add(data.get(random.nextInt(data.size())));
-            fitted.add(FidelityModel.fit(resample, ridge, priors, bands, random.nextLong(), PERTURB));
+            long memberSeed = random.nextLong();
+            fits.add(() -> FidelityModel.fit(resample, ridge, priors, bands, memberSeed, PERTURB));
         }
-        return new Ensemble(List.copyOf(fitted));
+        return fits;
     }
 
     public List<FidelityModel> members() {

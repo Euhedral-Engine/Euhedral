@@ -1,6 +1,8 @@
 package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.core.InferenceConfig;
+import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
+import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.Execution;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
@@ -32,8 +34,9 @@ import java.util.concurrent.CompletableFuture;
 /// predicts the token the reference's record k does. Every row is scored on the device where the engine left it
 /// (`score.cu`), against the reference row a reader frame has already fetched into mapped host memory; nothing
 /// is copied. `batch` chunks run together, one sequence each, their verifications batched into one quantum (at
-/// most 32 rows), so each weight is read once per step group of all of them. The summary line per reference:
-/// name, mean NLL, perplexity, dNLL and its standard error, KL and its standard error, top-1 agreement, then KL
+/// most the workspace's 512 rows, 32 with an NVFP4 object when the batch is auto-sized), so each weight is read
+/// once per step group of all of them. The summary line per reference: name, mean NLL, perplexity, dNLL and its
+/// standard error, KL and its standard error, top-1 agreement, then KL
 /// median, p95, p99, maximum, the top-1 standard error and delta-p mean, RMS, p1 and p99.
 public final class Scorer implements AutoCloseable {
 
@@ -52,6 +55,18 @@ public final class Scorer implements AutoCloseable {
 
     private static final int RESULTS = 5; // nll, reference nll, kl, agree, delta-p
     private static final int THREADS = 256;
+
+    /// Most rows of one batched verification that an NVFP4 linear runs on its tensor-core decode kernels; beyond it
+    /// row-exact verification sweeps the weights once per row (`ResidencyPlanner.NVFP4_ROW_EXACT_MAX_ROWS`, 8 rows
+    /// in 4 groups in `nvfp4_linear.c`). Slower, not wrong: the auto-sized batch stays within it for an artifact
+    /// with an NVFP4 object, and `--score-batch` may go past it.
+    static final int NVFP4_TENSOR_CORE_ROWS = 32;
+    /// Most rows of one quantum: the rows the workspace is sized for at load, the longest prefill chunk
+    /// ([#execution] passes it as `maxRows`).
+    static final int WORKSPACE_ROWS = InferenceConfig.PREFILL_CHUNK_TOKENS;
+    /// Most rows of one sequence in a verification: the decode kernels' row-exact limit
+    /// (`ExecutionPlan.DECODE_MAX_ROWS`); a longer verification takes the prefill route, which is not row-exact.
+    static final int MAX_ROWS = 8;
 
     private final Device device;
     private final CalibrationLattice lattice;
@@ -72,6 +87,33 @@ public final class Scorer implements AutoCloseable {
         }
     }
 
+    /// The most rows one batched verification may have for `artifact`: the workspace's rows, and, when it has an
+    /// NVFP4 object, the rows its linears run on tensor cores.
+    static int rowLimit(Artifact artifact) {
+        for (TensorDescriptor tensor : artifact.tensors())
+            if (tensor.format() == WeightFormat.NVFP4) return NVFP4_TENSOR_CORE_ROWS;
+        return WORKSPACE_ROWS;
+    }
+
+    /// The chunks to force together, at most `chunks`, `rows` rows each, `rowLimit` rows in all: the sequences
+    /// the device holds, one needing `singleBytes` and each more `sequenceBytes` (their KV and state), of
+    /// `freeBytes`; 1 when not even a second fits.
+    static int maxBatch(long freeBytes, long singleBytes, long sequenceBytes, int rows, int rowLimit, int chunks) {
+        if (rows < 1 || rows > rowLimit)
+            throw new IllegalArgumentException("--rows must be at least 1 and at most " + rowLimit);
+        if (sequenceBytes < 1) throw new IllegalArgumentException("a sequence needs memory");
+        long memory = freeBytes <= singleBytes ? 1 : 1 + (freeBytes - singleBytes) / sequenceBytes;
+        return (int) Math.max(1, Math.min(Math.min(memory, rowLimit / rows), chunks));
+    }
+
+    /// `batch` when `rows` rows of each of its chunks are at most `rowLimit` together.
+    static int checkedBatch(int batch, int rows, int rowLimit) {
+        if (batch < 1 || (long) batch * rows > rowLimit)
+            throw new IllegalArgumentException("--batch times --rows must be at most " + rowLimit + " (the rows of a"
+                    + " verification the workspace holds)");
+        return batch;
+    }
+
     /// The bytes free on the device now.
     public long freeDeviceBytes() {
         return device.gpu.deviceMemoryInfo().freeBytes();
@@ -87,7 +129,8 @@ public final class Scorer implements AutoCloseable {
     }
 
     /// Loads `artifact` (read from `artifactPath`, each object from the file [Artifact#pathOf] names), scores it
-    /// against every reference and unloads it.
+    /// against every reference and unloads it. `batch` chunks are forced together; 0 or less sizes it to the
+    /// memory the device has left ([#maxBatch]).
     public Result score(
             Path artifactPath, Artifact artifact, List<Path> references, int rows, int batch, long hostBytes)
             throws Exception {
@@ -100,17 +143,21 @@ public final class Scorer implements AutoCloseable {
             Artifact artifact,
             List<Path> references,
             int rows,
-            int batch,
+            int requested,
             long hostBytes,
             Listener listener)
             throws Exception {
-        if (batch < 1 || rows < 1 || rows > 8 || batch * rows > 32)
-            throw new IllegalArgumentException("--rows (at most 8) times --batch must be at most 32");
-        int context = 0;
+        if (rows < 1 || rows > MAX_ROWS)
+            throw new IllegalArgumentException("--rows must be at least 1 and at most " + MAX_ROWS);
+        int context = 0, chunks = 0;
         for (Path path : references)
             try (Reference reference = Reference.open(path)) {
                 context = Math.max(context, reference.context);
+                chunks = Math.max(chunks, reference.chunks);
             }
+        int batch = requested <= 0
+                ? autoBatch(artifact, hostBytes, rows, context, chunks)
+                : checkedBatch(requested, rows, WORKSPACE_ROWS);
         List<Scored> all = new ArrayList<>();
         try (Qwen38Model model = Qwen38Model.load(
                 artifactPath,
@@ -144,6 +191,19 @@ public final class Scorer implements AutoCloseable {
             }
         }
         return all;
+    }
+
+    /// The batch the device allows for `chunks` chunks of `context` tokens at `rows` rows ([#maxBatch]). With
+    /// `hostBytes` given the weights' residency is not the planner's, so the memory left is unknown: the batch is
+    /// then 4 chunks at most.
+    private int autoBatch(Artifact artifact, long hostBytes, int rows, int context, int chunks) {
+        int limit = rowLimit(artifact);
+        if (hostBytes != Residency.PLANNED) return Math.max(1, Math.min(Math.min(4, limit / rows), chunks));
+        long[] figures = Residency.sequenceFigures(artifact, ArtifactProfile.Speculation.NONE, device.gpu, context);
+        if (figures[0] < 0) return 1;
+        int batch = maxBatch(freeDeviceBytes(), figures[0], figures[1], rows, limit, chunks);
+        System.out.printf(Locale.ROOT, "scorer: %d chunk(s) of %d rows together%n", batch, rows);
+        return batch;
     }
 
     /// The engine's execution of `plan` on `lattice`, reading disk-backed weights from the file each object of
