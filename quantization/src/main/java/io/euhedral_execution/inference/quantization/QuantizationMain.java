@@ -1,12 +1,18 @@
 package io.euhedral_execution.inference.quantization;
 
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
+import io.euhedral_execution.inference.quantization.mixed.Allocation;
+import io.euhedral_execution.inference.quantization.mixed.Assemble;
+import io.euhedral_execution.inference.quantization.mixed.Option;
+import io.euhedral_execution.inference.quantization.mixed.Sources;
 import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
 
 /// Command line of the quantization tools:
 ///
@@ -32,6 +38,8 @@ import java.util.Map;
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
 /// 4096]
 /// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
+/// [--copy-buffer-mib 64]
 /// rotate --model CHECKPOINT --out CHECKPOINT_DIR [--seed 1] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
@@ -47,7 +55,7 @@ public final class QuantizationMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0
-                || !List.of("calibrate", "score", "generate", "train-blocks", "train-model", "rotate")
+                || !List.of("calibrate", "score", "generate", "train-blocks", "train-model", "rotate", "assemble")
                         .contains(args[0])) {
             System.err.println(
                     "usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens T.npy "
@@ -63,10 +71,16 @@ public final class QuantizationMain {
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
                             + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library PATH]");
             System.err.println("       rotate --model CHECKPOINT --out DIR [--seed 1] [--library PATH]");
+            System.err.println(
+                    "       assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT "
+                            + "[--draft-depth D] [--copy-buffer-mib 64]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
-        List<String> references = new ArrayList<>(), names = new ArrayList<>(), prompts = new ArrayList<>();
+        List<String> references = new ArrayList<>(),
+                names = new ArrayList<>(),
+                prompts = new ArrayList<>(),
+                artifacts = new ArrayList<>();
         for (int i = 1; i < args.length; i++) {
             String key = args[i];
             if (!key.startsWith("--")) throw new IllegalArgumentException("unexpected " + key);
@@ -78,11 +92,32 @@ public final class QuantizationMain {
             if (key.equals("--reference")) references.add(value);
             else if (key.equals("--name")) names.add(value);
             else if (key.equals("--prompts")) prompts.add(value);
+            else if (key.equals("--source")) artifacts.add(value);
             else options.put(key.substring(2), value);
         }
         String library = options.getOrDefault(
                 "library",
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
+        if (args[0].equals("assemble")) {
+            Map<Option, Path> sources = new EnumMap<>(Option.class);
+            for (String source : artifacts) {
+                int equals = source.indexOf('=');
+                if (equals < 1) throw new IllegalArgumentException("--source is OPTION=ARTIFACT, not " + source);
+                if (sources.put(Option.of(source.substring(0, equals)), Path.of(source.substring(equals + 1))) != null)
+                    throw new IllegalArgumentException("two --source for " + source.substring(0, equals));
+            }
+            Assemble.write(
+                    Sources.open(sources, Option.of(required(options, "base"))),
+                    Allocation.read(Path.of(required(options, "allocation"))),
+                    options.containsKey("draft-depth")
+                            ? OptionalInt.of(Integer.parseInt(options.get("draft-depth")))
+                            : OptionalInt.empty(),
+                    Path.of(required(options, "out")),
+                    Long.parseLong(options.getOrDefault(
+                                    "copy-buffer-mib", Long.toString(Assemble.DEFAULT_COPY_BUFFER_MIB)))
+                            << 20);
+            return;
+        }
         if (args[0].equals("train-model")) {
             ModelTraining.run(
                     new ModelTraining.Settings(

@@ -82,6 +82,9 @@ subprojects {
             providers.gradleProperty("euhedral.qwen.artifact").orNull?.let { systemProperty("euhedral.qwen.artifact", it) }
             // Optional NVFP4 artifact (tools/convert_checkpoint.py --quantization nvfp4).
             providers.gradleProperty("euhedral.qwen.nvfp4-artifact").orNull?.let { systemProperty("euhedral.qwen.nvfp4-artifact", it) }
+            // Optional trellis artifact, and the llama.cpp logits file (kld) the mixed-artifact score test uses.
+            for (name in listOf("euhedral.qwen.trellis30-artifact", "euhedral.quantization.score-reference"))
+                providers.gradleProperty(name).orNull?.let { systemProperty(name, it) }
             // Optional unquantized artifact (tools/convert_checkpoint.py --quantization bf16), on local disk.
             providers.gradleProperty("euhedral.qwen.bf16-artifact").orNull?.let {
                 systemProperty("euhedral.qwen.bf16-artifact", it)

@@ -38,15 +38,40 @@ public final class CompactArtifactWriter {
     }
 
     public static void write(Path path, Artifact artifact, byte[][] tensorData) throws IOException {
-        if (path == null || artifact == null || artifact.header() == null || tensorData == null) {
+        if (tensorData == null) {
+            throw new ArtifactFormatException("compact writer arguments are incomplete");
+        }
+        TensorDescriptor[] tensors = artifact == null ? null : artifact.tensors();
+        if (tensors == null || tensorData.length != tensors.length) {
+            throw new ArtifactFormatException("compact payload count does not match descriptors");
+        }
+        for (int i = 0; i < tensors.length; i++) {
+            if (tensorData[i] == null || tensorData[i].length != tensors[i].byteSize()) {
+                throw new ArtifactFormatException("compact payload size mismatch: " + tensors[i].name());
+            }
+        }
+        try (FileChannel channel = writeLayout(path, artifact)) {
+            for (int i = 0; i < tensors.length; i++) {
+                if (tensorData[i].length != 0) {
+                    writeAt(channel, tensors[i].dataOffset(), ByteBuffer.wrap(tensorData[i]));
+                }
+            }
+        }
+    }
+
+    /// Creates `path` with `artifact`'s header, metadata and tensor table, and sized to hold every payload, which
+    /// the caller writes at the descriptors' offsets (a large payload in chunks: nothing here holds one). The file
+    /// is returned open for writing.
+    public static FileChannel writeLayout(Path path, Artifact artifact) throws IOException {
+        if (path == null || artifact == null || artifact.header() == null) {
             throw new ArtifactFormatException("compact writer arguments are incomplete");
         }
         if (artifact.header().version() != ArtifactHeader.COMPACT_VERSION) {
             throw new ArtifactFormatException("compact writer requires version 2 header");
         }
         TensorDescriptor[] tensors = artifact.tensors();
-        if (tensors == null || tensorData.length != tensors.length) {
-            throw new ArtifactFormatException("compact payload count does not match descriptors");
+        if (tensors == null) {
+            throw new ArtifactFormatException("compact descriptors are missing");
         }
         byte[] metadata = ArtifactCodec.encodeMetadata(artifact.config());
         byte[] table = ArtifactCodec.encodeTensorTable(tensors);
@@ -61,12 +86,7 @@ public final class CompactArtifactWriter {
         }
 
         long fileSize = artifact.header().tensorDataOffset();
-        for (int i = 0; i < tensors.length; i++) {
-            TensorDescriptor descriptor = tensors[i];
-            byte[] payload = tensorData[i];
-            if (payload == null || payload.length != descriptor.byteSize()) {
-                throw new ArtifactFormatException("compact payload size mismatch: " + descriptor.name());
-            }
+        for (TensorDescriptor descriptor : tensors) {
             if (descriptor.dataOffset() < artifact.header().tensorDataOffset()) {
                 throw new ArtifactFormatException("compact payload precedes data section");
             }
@@ -86,8 +106,9 @@ public final class CompactArtifactWriter {
         header.putLong(artifact.header().tensorDataOffset());
         header.flip();
 
-        try (FileChannel channel = FileChannel.open(
-                path, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+        FileChannel channel = FileChannel.open(
+                path, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+        try {
             if (fileSize > 0) {
                 channel.position(fileSize - 1);
                 channel.write(ByteBuffer.wrap(new byte[] {0}));
@@ -95,11 +116,10 @@ public final class CompactArtifactWriter {
             writeAt(channel, 0, header);
             writeAt(channel, artifact.header().metadataOffset(), ByteBuffer.wrap(metadata));
             writeAt(channel, artifact.header().tensorTableOffset(), ByteBuffer.wrap(table));
-            for (int i = 0; i < tensors.length; i++) {
-                if (tensorData[i].length != 0) {
-                    writeAt(channel, tensors[i].dataOffset(), ByteBuffer.wrap(tensorData[i]));
-                }
-            }
+            return channel;
+        } catch (IOException | RuntimeException failure) {
+            channel.close();
+            throw failure;
         }
     }
 
