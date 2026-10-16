@@ -23,10 +23,17 @@ are NVFP4, rounded by GPTQ in the calibration run (`--output-head BF16` makes a 
 
 Each trellis linear is a chain of `linear` table kernels inside the existing linear stage, in stream order:
 
-- **Decode, VERIFY, DRAFT:** prepass (BF16 activations times `suh`, 128-point Hadamard per block, FP16), then a
-  tensor-core `m16n8k16` GEMM that decodes the tiles in registers, then (when K is split) the epilogue that sums the
-  split partials in split order and applies the output Hadamard and `svh`. Each output row's reduction order is fixed by
-  the shape alone, so a batched VERIFY gives bitwise the result of one-row launches.
+- **Decode, VERIFY, DRAFT:** prepass (BF16 activations times `suh`, 128-point Hadamard per block, FP16 in the GEMM's
+  fragment order), then a tensor-core `m16n8k16` GEMM that decodes the tiles in registers, then (when K is split) the
+  epilogue that sums the split partials in split order and applies the output Hadamard and `svh`. Each output row's
+  reduction order is fixed by the shape alone, so a batched VERIFY gives bitwise the result of one-row launches.
+  Each warp streams its tiles through a four-slot ring of asynchronous copies and decodes a lane's eight weights from
+  three ring words at offsets fixed by the tile width. Launches of up to 8 rows take the decoded weights as the MMA's A
+  operand and the activations as B, one `m16n8k16` per k16 tile; larger launches take 16-row activation tiles as A.
+  Both orientations give the same bits.
+- **Many rows** (at least `euhedral.trellis.whole-k-rows`): the same GEMM, each block covering 32 rows of a 128-column
+  block and running every K split itself, adding the splits' sums in split order. The results are bitwise those of
+  the split launch, with no split partials.
 - **Prefill** (non-VERIFY launches above `euhedral.trellis.mma-max-rows` rows): the whole object decoded to BF16 in
   rotated space, one row-exact BF16 GEMM per segment, and the BF16 epilogue.
 - **Exact numerics:** the scalar FP32 reference.
@@ -70,16 +77,19 @@ iterations, every weight on the device:
 
 | Artifact | Prefill 512 tokens | Prefill 16384 tokens | Decode, MTP speculation | Decode, no speculation |
 |---|---|---|---|---|
-| trellis 3.0 | 616 tokens/s | 596 tokens/s (27.5 s) | 74.4 tokens/s | 17.7 tokens/s |
-| trellis 3.5 | 615 tokens/s | 595 tokens/s (27.6 s) | 73.8 tokens/s | 17.7 tokens/s |
+| trellis 3.0 | 996 tokens/s | 941 tokens/s (17.4 s) | 232.7 tokens/s | 65.7 tokens/s |
+| trellis 3.5 | 988 tokens/s | 941 tokens/s (17.4 s) | 212.9 tokens/s | 59.6 tokens/s |
 
 Decode is measured on `decode:32:256` (256 tokens after a 32-token prompt).
 
-The defaults of the two properties are measured on this card:
+The defaults of the three properties are measured on this card, over the 3-bit model's object shapes with the weights
+rotated past L2:
 
-- `euhedral.trellis.target-ctas` (560): the thread blocks the tensor-core route's K split aims for. Over the 3-bit model's
-  object shapes, the trellis linears of one decode step take 58.7 ms at 140, 51.9 ms at 280, 51.0 ms at 560 and 51.3 ms
-  at 1120.
+- `euhedral.trellis.target-ctas` (560): the thread blocks the tensor-core route's K split aims for. The trellis linears
+  of one decode step take 14.41 ms at 140, 13.20 ms at 280, 13.01 ms at 560, 13.07 ms at 840 and 13.20 ms at 1120.
+- `euhedral.trellis.whole-k-rows` (80): the fewest rows for which each block runs every K split itself. With split
+  partials and with whole-K blocks, one step takes 64.5 and 67.8 ms at 64 rows, 83.0 and 78.6 ms at 80, and 108.4 and
+  89.7 ms at 96.
 - `euhedral.trellis.mma-max-rows` (512): the most rows a launch other than a verification keeps on the tensor-core route.
-  The tensor-core route prefills 512-row chunks at 614 tokens/s and the prefill route at 490, so every chunk of the default
-  workspace stays on the tensor-core route and the residency plan reserves no prefill scratch.
+  The tensor-core route prefills 512-row chunks at 996 tokens/s and the prefill route at 490, so every chunk of the
+  default workspace stays on the tensor-core route and the residency plan reserves no prefill scratch.
