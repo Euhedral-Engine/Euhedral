@@ -119,13 +119,15 @@ public final class ConcurrentScoring implements Search.Scoring, AutoCloseable {
         this.cache = new WeightCache(new WeightCache.Backend() {
             @Override
             public TensorHandle load(Path file, TensorDescriptor descriptor) throws IOException {
-                device.bindOwnStream();
+                device.cuda.bindThread(); // the context only: a selected stream would stay on the worker and refuse its
+                // next submission
                 return ObjectLoader.OWNED.load(file, descriptor, device.gpu);
             }
 
             @Override
             public void free(TensorHandle handle) {
-                device.bindOwnStream();
+                device.cuda.bindThread(); // the context only: a selected stream would stay on the worker and refuse its
+                // next submission
                 device.gpu.free(handle.deviceAddress());
             }
         });
