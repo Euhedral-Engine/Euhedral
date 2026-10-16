@@ -157,6 +157,8 @@ public final class Search {
     /// lattice only while its work runs (this thread opens and closes them): idle attached sinks slow every
     /// worker's cycle, and with it the scorer's stage frames.
     private volatile HostPool proposing, candidates;
+    /// Candidates another search measured, recorded before a new search's seeds.
+    private List<Measured> imported = List.of();
     private final Space space;
     private final Priors priors;
     private SearchState state;
@@ -210,7 +212,15 @@ public final class Search {
 
     /// Runs the search, resuming from `settings.state()` if it holds one.
     public static Outcome run(Settings settings, Scoring scoring) throws Exception {
+        return run(settings, scoring, List.of());
+    }
+
+    /// As above; a new search first records `imported`, candidates another search measured, with their KL as
+    /// measured and their size, costs and fit recomputed for this one's budget and context (its scores are the
+    /// same bits: the reference and the scorer do not depend on them).
+    public static Outcome run(Settings settings, Scoring scoring, List<Measured> imported) throws Exception {
         Search search = new Search(settings, scoring);
+        search.imported = imported;
         try {
             return search.run();
         } finally {
@@ -240,6 +250,7 @@ public final class Search {
             if (Double.isNaN(state.explore())) state.explore(s.explore());
 
             CompletableFuture<Proposals> next = null;
+            if (state.round() == 0 && state.measured().isEmpty() && !imported.isEmpty()) importMeasured();
             if (state.round() == 0) {
                 List<Candidate> seeds =
                         candidates().submit(this::seedCandidates).get();
@@ -836,6 +847,34 @@ public final class Search {
                         prefill.join(),
                         decode.join(),
                         fits.join()));
+    }
+
+    // ------------------------------------------------------------------ import
+
+    /// Records the imported candidates: each one's measured KL, with size, costs and fit prepared for this search.
+    private void importMeasured() throws Exception {
+        List<CompletableFuture<Prepared>> preparing = new ArrayList<>();
+        for (Measured m : imported)
+            preparing.add(prepare(
+                    candidates(), new Candidate(space.normalize(m.a()), "import:" + m.origin(), Double.NaN, 0, 0, -1)));
+        int fitting = 0;
+        for (int i = 0; i < preparing.size(); i++) {
+            Prepared ready = preparing.get(i).get();
+            Measured m = imported.get(i);
+            if (state.add(new Measured(
+                            ready.candidate().allocation(),
+                            m.kl(),
+                            m.klSe(),
+                            ready.bytes(),
+                            ready.prefill(),
+                            ready.decode(),
+                            ready.fits(),
+                            0,
+                            ready.candidate().origin()))
+                    && ready.fits()) fitting++;
+        }
+        closeCandidates();
+        System.out.printf(Locale.ROOT, "imported %d measured candidates, %d fit%n", imported.size(), fitting);
     }
 
     // ---------------------------------------------------------------- finishing

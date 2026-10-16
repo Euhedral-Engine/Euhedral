@@ -85,4 +85,22 @@ class SearchStateTest {
                 assertThrows(IllegalStateException.class, () -> SearchState.open(file, "two", 1, 1));
         assertTrue(failure.getMessage().contains("different search"), failure.getMessage());
     }
+
+    @Test
+    void anotherSearchReadsWhatOneMeasuredWhateverItsFingerprint() throws Exception {
+        Path file = directory.resolve("other.resume");
+        try (SearchState state = SearchState.open(file, "a search at 32K", 3, 1L << 30)) {
+            state.add(measured(allocation(Option.NVFP4, Option.NVFP4), 0.1, 0));
+            state.add(measured(allocation(Option.TRELLIS_2_5, Option.TRELLIS_4_0), 0.2, 4));
+        }
+        var read = SearchState.read(file);
+        assertEquals(2, read.size());
+        assertEquals(0.2, read.get(1).kl(), 0);
+        assertEquals(
+                allocation(Option.TRELLIS_2_5, Option.TRELLIS_4_0), read.get(1).a());
+        // Reading does not take the file over: its own search still opens it.
+        try (SearchState state = SearchState.open(file, "a search at 32K", 3, 1L << 30)) {
+            assertEquals(2, state.measured().size());
+        }
+    }
 }
