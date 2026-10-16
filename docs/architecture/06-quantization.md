@@ -33,6 +33,8 @@ flowchart TD
     Artifact --> Score
     BF16[BF16 artifact, host- and disk-backed] --> Reference[reference: engine logits written as a llama.cpp logits file]
     Reference --> Score
+    Sources --> Cost[cost: device time of each option's linear per shape and row count]
+    Cost --> Table[Cost table: additive prefill and verification times]
 ```
 
 The loop is layerwise: collect statistics, round, substitute decoded weights and propagate the resulting activations. Hidden states live in pinned host storage and support resume checkpoints. Calibration work runs as lattice frames with CUDA streams; cuBLAS/cuSOLVER and quantization CUDA kernels supply the numerical work.
@@ -45,6 +47,8 @@ The loop is layerwise: collect statistics, round, substitute decoded weights and
 
 `reference` runs the BF16 artifact in the engine, its weights spread over device, pinned host memory and disk as the residency planner splits them, forces each chunk of a text as `score` does, and writes the logits at the scored positions in llama.cpp's format (logits clamped 16 below the largest, 16-bit codes), so `score` compares the engine with itself. `Scorer` loads, scores and unloads one artifact at a time on one device and lattice, for callers that score many.
 
+`cost` times one launch of each option's real payload for every distinct projection shape, at 1 to 6 rows (decode and verification) and a 512-row prefill chunk, built the way the engine builds the linear (kind, scratch and trellis segment ends from the format) and rotated over copies past the L2 cache. The stream waits on a host-mapped flag while the launches queue, so the time is the device's alone, as in the captured decode graphs. Summed over an allocation's projections plus fixed terms measured end to end, the table predicts its prefill and verification times.
+
 ## Allocation and RCO terminology
 
 The implemented bit allocation here is [trellis Allocation](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/Allocation.java), ported from exllamav3 and driven by an average bits-per-weight budget. The converter documentation also names external `GSQ-RCO-GGUF` repositories as sources of importance matrices. Those names do not establish a local RCO optimizer: no separate RCO allocation stage is shown because the inspected calibration and converter code does not expose one.
@@ -53,7 +57,7 @@ The implemented bit allocation here is [trellis Allocation](../../quantization/s
 
 - [QuantizationMain](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/QuantizationMain.java), [Calibrate](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Calibrate.java), [CalibrationLattice](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/CalibrationLattice.java) and [Recipe](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Recipe.java).
 - [GPTQ](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/gptq/Gptq.java), [TrellisQuantizer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/TrellisQuantizer.java) and [Exl3Writer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/Exl3Writer.java).
-- [Assemble](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Assemble.java), [Sources](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Sources.java), [ReferenceLogits](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/ReferenceLogits.java) and [Scorer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Scorer.java).
+- [Assemble](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Assemble.java), [Sources](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Sources.java), [Cost](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Cost.java), [CostTable](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/CostTable.java), [ReferenceLogits](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/ReferenceLogits.java) and [Scorer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Scorer.java).
 - [Converter entry point](../../tools/convert_checkpoint.py), [converter package](../../tools/euhedral_artifacts), [tools guide](../../tools/README.md) and [Score](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Score.java).
 
 This diagram omits training/rotation commands, individual quantizer kernels, format byte layouts and the separate Flash-Next converter path. It makes no quality or throughput claim.
