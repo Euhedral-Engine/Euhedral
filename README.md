@@ -21,6 +21,10 @@ An artifact is one `.edrl` file holding the quantized text model, its MTP draft 
 | `nvfp4` | NVFP4 | uncompressed | 14.52 GiB (15.59 GB) | |
 | `nvfp4-compressed` | NVFP4 | compressed | 13.77 GiB (14.79 GB) | 4.25 bits per weight (block scales drawn from a 16-entry table per tensor); not lossless, see [quality](#quality) |
 
+Two trellis artifacts store the decoder linears as QTIP-style trellis codes (exllamav3's EXL3 format, calibrated by the
+quantization module) with a Q3 token embedding and NVFP4 heads: `trellis` at 3.0 bits per weight, 10.26 GiB (11.01 GB),
+and at 3.5 bits per weight, 11.67 GiB (12.54 GB) ([docs/TRELLIS.md](docs/TRELLIS.md)).
+
 All four artifacts are converted from Swift-1.5 (`ukisai/Swift-1.5-Qwen3.8-27b`, UkisAI's fine-tune of Qwen3.8-27B); the
 converter takes either checkpoint.
 
@@ -112,6 +116,8 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | `q3-compressed` | 2.242 | 9.42 | +0.101 ± 0.017 | 0.106 | 84.0% |
 | `nvfp4` | 2.166 | 8.72 | +0.024 ± 0.008 | 0.028 | 90.9% |
 | `nvfp4-compressed` | 2.174 | 8.80 | +0.033 ± 0.007 | 0.028 | 90.3% |
+| `trellis` 3.0 bpw | 2.176 | 8.81 | +0.034 ± 0.010 | 0.050 | 88.7% |
+| `trellis` 3.5 bpw | 2.178 | 8.83 | +0.036 ± 0.008 | 0.032 | 89.6% |
 
 Over a 75-chunk holdout of prose, code and the model's own chat answers, and with each artifact's weights alone in llama.cpp,
 the same order holds ([docs/QUALITY.md](docs/QUALITY.md#holdout-texts)).
