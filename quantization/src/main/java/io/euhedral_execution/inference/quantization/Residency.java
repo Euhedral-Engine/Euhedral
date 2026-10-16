@@ -64,4 +64,44 @@ public final class Residency {
                 host >> 20);
         return plan.hostBacked();
     }
+
+    /// The residency of `artifact` with at most `hostBytes` of weights in host memory ([#PLANNED]: no limit):
+    /// the planner's host-backed objects, and, when they do not all fit in host memory, the objects left in the
+    /// artifact file and read from disk.
+    public static ResidencyPlanner.Plan plan(
+            Artifact artifact,
+            ArtifactProfile.Speculation speculation,
+            CudaGpuMemory gpu,
+            long hostBytes,
+            int sequences,
+            int tokens) {
+        ArtifactProfile found = ArtifactProfile.of(artifact);
+        var profile = new ArtifactProfile(found.quantization(), found.compressed(), speculation, found.draftDepth());
+        long free = gpu.deviceMemoryInfo().freeBytes();
+        int context = Math.toIntExact(Math.min(Integer.MAX_VALUE, (long) sequences * tokens));
+        var plan = ResidencyPlanner.plan(
+                artifact,
+                profile,
+                free - (sequences - 1) * SEQUENCE_BYTES,
+                context,
+                hostBytes == PLANNED ? Long.MAX_VALUE : hostBytes,
+                kvFormat(artifact));
+        if (!plan.fits())
+            throw new IllegalStateException(sequences + " sequences of " + tokens + " tokens do not fit in the "
+                    + (free >> 20) + " MiB free on the GPU; lower --batch");
+        long host = 0, disk = 0;
+        for (var tensor : artifact.tensors()) {
+            if (plan.hostBacked().contains(tensor.name())) host += tensor.byteSize();
+            if (plan.diskBacked().contains(tensor.name())) disk += tensor.byteSize();
+        }
+        System.out.printf(
+                Locale.ROOT,
+                "residency: %d MiB of the %d MiB free on the GPU, %d MiB of weights in host memory, %d MiB read from"
+                        + " disk%n",
+                plan.deviceBytes() >> 20,
+                free >> 20,
+                host >> 20,
+                disk >> 20);
+        return plan;
+    }
 }
