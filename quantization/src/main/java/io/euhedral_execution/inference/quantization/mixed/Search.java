@@ -577,13 +577,18 @@ public final class Search {
         Set<Allocation> listed = new HashSet<>();
         for (Candidate candidate : candidates)
             if (!state.contains(candidate.allocation()) && listed.add(candidate.allocation())) todo.add(candidate);
+        CompletableFuture<Proposals> next = null;
         CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : host.submit(() -> prepare(todo.get(0)));
+        // While the device scores, host work keeps to one sink: the pool's sinks share owner workers with the
+        // engine's, and a stage frame queued behind host work on its owner holds up the device.
+        host.narrow();
         for (int k = 0; k < todo.size(); k++) {
             Prepared ready = prepared.get();
             if (k + 1 < todo.size()) {
                 Candidate following = todo.get(k + 1);
                 prepared = host.submit(() -> prepare(following));
             }
+            if (k == todo.size() - 1 && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
             Scorer.Result result = scoring.score(s.sources().path(s.sources().base()), ready.artifact());
             Measured measured = new Measured(
                     ready.candidate().allocation(),
@@ -610,9 +615,9 @@ public final class Search {
                     measured.decode(),
                     measured.fits() ? "fits" : "does not fit");
         }
-        // Proposals only once the round is scored: the host pool's sinks share owner workers with the engine's,
-        // so RCO beside scoring would hold up the stage frames the device is waiting on.
-        return round + 1 <= s.maxRounds() ? propose(state.measured(), round + 1) : null;
+        host.widen();
+        if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
+        return next;
     }
 
     private Prepared prepare(Candidate candidate) {

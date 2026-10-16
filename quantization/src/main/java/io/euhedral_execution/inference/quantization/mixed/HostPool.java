@@ -11,7 +11,6 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -23,15 +22,16 @@ import java.util.function.Supplier;
 public final class HostPool implements AutoCloseable {
 
     /// One sink: a queue of tasks, the lattice's polls run them.
-    private static final class Work extends AbstractIngestSink {
-        private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
+    private final class Work extends AbstractIngestSink {
+        private final int index;
         private final Delegate delegate = new Delegate();
 
-        void offer(Runnable task) {
-            tasks.add(task);
+        Work(int index) {
+            this.index = index;
         }
 
         private void poll() {
+            if (index >= active) return;
             Runnable task = tasks.poll();
             if (task != null) task.run();
         }
@@ -67,17 +67,21 @@ public final class HostPool implements AutoCloseable {
     }
 
     private final List<Work> sinks = new ArrayList<>();
+    /// The tasks every sink takes from: whichever enabled sink polls next runs the oldest.
+    private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
+    /// The sinks that take tasks: the first `active` ones.
+    private volatile int active;
     private final ConcurrentLinkedQueue<CompletableFuture<?>> submitted = new ConcurrentLinkedQueue<>();
     private volatile boolean closed;
-    private final AtomicInteger next = new AtomicInteger();
 
     /// `sinks` sinks registered on the process's lattice.
     public static HostPool start(int sinks) {
         ControlPlaneLattice lattice = ControlPlaneLattice.getOrCreate();
         if (sinks < 1) throw new IllegalArgumentException("a host pool needs a sink");
         HostPool pool = new HostPool();
+        pool.active = sinks;
         for (int i = 0; i < sinks; i++) {
-            Work work = new Work();
+            Work work = pool.new Work(i);
             pool.sinks.add(work);
             lattice.addUpstream(work);
         }
@@ -91,8 +95,7 @@ public final class HostPool implements AutoCloseable {
     public <T> CompletableFuture<T> submit(Supplier<T> task) {
         CompletableFuture<T> future = new CompletableFuture<>();
         submitted.add(future);
-        Work work = sinks.get(Math.floorMod(next.getAndIncrement(), sinks.size()));
-        work.offer(() -> {
+        tasks.add(() -> {
             if (closed) {
                 future.cancel(false);
                 return;
@@ -104,6 +107,17 @@ public final class HostPool implements AutoCloseable {
             }
         });
         return future;
+    }
+
+    /// Only the first sink takes tasks: work beside the engine's frames keeps to one owner worker, so the
+    /// stage frames on every other worker run unhindered.
+    public void narrow() {
+        active = 1;
+    }
+
+    /// Every sink takes tasks again.
+    public void widen() {
+        active = sinks.size();
     }
 
     @Override
