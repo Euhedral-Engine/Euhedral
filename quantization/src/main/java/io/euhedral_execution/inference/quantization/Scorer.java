@@ -155,16 +155,11 @@ public final class Scorer implements AutoCloseable {
             throws Exception {
         if (rows < 1 || rows > MAX_ROWS)
             throw new IllegalArgumentException("--rows must be at least 1 and at most " + MAX_ROWS);
-        int context = 0, chunks = 0;
-        for (Path path : references)
-            try (Reference reference = Reference.open(path)) {
-                context = Math.max(context, reference.context);
-                chunks = Math.max(chunks, reference.chunks);
-            }
+        int[] dimensions = dimensions(references);
+        int context = dimensions[0], chunks = dimensions[1];
         int batch = requested <= 0
                 ? autoBatch(artifact, hostBytes, rows, context, chunks)
                 : checkedBatch(requested, rows, WORKSPACE_ROWS);
-        List<Scored> all = new ArrayList<>();
         try (Qwen38Model model = Qwen38Model.load(
                 artifactPath,
                 artifact,
@@ -172,37 +167,74 @@ public final class Scorer implements AutoCloseable {
                 ArtifactProfile.Speculation.NONE,
                 Residency.hostBacked(
                         artifact, ArtifactProfile.Speculation.NONE, freeAtOpen, hostBytes, batch, context))) {
-            var plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
-            var runtime = execution(lattice, plan, device, artifactPath, artifact);
+            Forced forced = force(model, artifactPath, artifact, references, rows, batch, listener);
             try {
-                // On the lattice's workers: the scorer's setup, then each reference in turn, each chunk group's
-                // verifications continuing the next. This thread only waits.
-                runtime.onWorker(() -> new Run(device, runtime, plan, Residency.kvFormat(artifact), rows, batch))
-                        .thenCompose(run -> {
-                            CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-                            for (int r = 0; r < references.size(); r++) {
-                                int index = r;
-                                Path path = references.get(r);
-                                chain = chain.thenCompose(
-                                        ignored -> run.reference(path).thenAccept(scored -> {
-                                            all.add(scored);
-                                            listener.scored(index, scored);
-                                        }));
-                            }
-                            return chain;
-                        })
-                        .get();
+                return forced.scored().get();
             } finally {
-                runtime.close();
+                forced.runtime().close();
             }
         }
-        return all;
+    }
+
+    /// A model's scoring under way: the execution to close once `scored` is done, and the results.
+    record Forced(Execution runtime, CompletableFuture<List<Scored>> scored) {}
+
+    /// Scores a loaded `model` against every reference, on the lattice's workers: the scorer's setup, then each
+    /// reference in turn, each chunk group's verifications continuing the next. The scoring completes with the
+    /// per-reference results; the caller closes the execution, then `model`. Nothing here waits.
+    Forced force(
+            Qwen38Model model,
+            Path artifactPath,
+            Artifact artifact,
+            List<Path> references,
+            int rows,
+            int batch,
+            Listener listener) {
+        List<Scored> all = new ArrayList<>();
+        ExecutionPlan plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
+        Execution runtime = execution(lattice, plan, device, artifactPath, artifact);
+        CompletableFuture<List<Scored>> results = runtime.onWorker(
+                        () -> new Run(device, runtime, plan, Residency.kvFormat(artifact), rows, batch))
+                .thenCompose(run -> {
+                    CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+                    for (int r = 0; r < references.size(); r++) {
+                        int index = r;
+                        Path path = references.get(r);
+                        chain = chain.thenCompose(ignored -> run.reference(path).thenAccept(scored -> {
+                            all.add(scored);
+                            listener.scored(index, scored);
+                        }));
+                    }
+                    return chain.thenApply(ignored -> all);
+                });
+        return new Forced(runtime, results);
+    }
+
+    /// The device the scorer scores on.
+    Device device() {
+        return device;
+    }
+
+    /// The device's free bytes when the scorer opened, which every artifact is planned against.
+    long freeAtOpen() {
+        return freeAtOpen;
+    }
+
+    /// The longest context and the most chunks over `references`.
+    static int[] dimensions(List<Path> references) throws IOException {
+        int context = 0, chunks = 0;
+        for (Path path : references)
+            try (Reference reference = Reference.open(path)) {
+                context = Math.max(context, reference.context);
+                chunks = Math.max(chunks, reference.chunks);
+            }
+        return new int[] {context, chunks};
     }
 
     /// The batch the device allows for `chunks` chunks of `context` tokens at `rows` rows ([#maxBatch]). With
     /// `hostBytes` given the weights' residency is not the planner's, so the memory left is unknown: the batch is
     /// then 4 chunks at most.
-    private int autoBatch(Artifact artifact, long hostBytes, int rows, int context, int chunks) {
+    int autoBatch(Artifact artifact, long hostBytes, int rows, int context, int chunks) {
         int limit = rowLimit(artifact);
         if (hostBytes != Residency.PLANNED) return Math.max(1, Math.min(Math.min(4, limit / rows), chunks));
         long[] figures = Residency.sequenceFigures(artifact, ArtifactProfile.Speculation.NONE, freeAtOpen, context);

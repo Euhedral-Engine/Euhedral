@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.artifact.WeightStaging;
 import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
+import io.euhedral_execution.inference.core.model.qwen38.loader.ObjectLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
@@ -66,9 +67,23 @@ public final class Qwen38Model implements AutoCloseable {
             Set<String> hostBacked,
             Set<String> diskBacked)
             throws IOException {
+        return load(path, artifact, gpu, speculation, hostBacked, diskBacked, ObjectLoader.OWNED);
+    }
+
+    /// As above, placing each device-resident object with `objects`: the model frees only what it allocated itself,
+    /// so objects `objects` hands out as borrowed outlive it and stay their owner's to free.
+    public static Qwen38Model load(
+            Path path,
+            Artifact artifact,
+            GpuMemory gpu,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked,
+            ObjectLoader objects)
+            throws IOException {
         return load(
                 gpu,
-                memory -> WeightLoader.load(path, artifact, memory, speculation, hostBacked, diskBacked),
+                memory -> WeightLoader.load(path, artifact, memory, speculation, hostBacked, diskBacked, objects),
                 hostBacked.isEmpty() && diskBacked.isEmpty() ? 0 : WeightStaging.SLOTS,
                 path);
     }

@@ -54,7 +54,8 @@ import java.util.OptionalInt;
 /// [--free-mib N] [--score-rows 8] [--score-batch 0 (the chunks the device holds)] [--members 8] [--ridge 1e-3]
 /// [--lambdas 0,0.002,0.005,0.01,0.02]
 /// [--budget-fractions 1.0,0.8] [--rco-steps 200] [--rco-lr 0.1] [--rco-samples 8] [--rco-restarts 4]
-/// [--knapsack-steps 512] [--max-rounds N] [--seed 1] [--host-sinks N] [--library LIBEUHEDRAL_CUDA]
+/// [--knapsack-steps 512] [--max-rounds N] [--seed 1] [--host-sinks N] [--max-concurrent 0 (as many as memory
+/// holds)] [--concurrent-margin-mib 512] [--library LIBEUHEDRAL_CUDA]
 /// cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows 1,2,3,4,5,6,512] [--repeats 50]
 /// [--rotate-mib 256] [--library LIBEUHEDRAL_CUDA]
 /// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
@@ -381,9 +382,27 @@ public final class QuantizationMain {
                     // Priors only steer proposals and the scoring batch only how many chunks run together (row-exact
                     // verification gives the same bits at any batch), so a search may change either and resume.
                     String.join("\n", references) + "\n" + costsFile);
-            Search.run(
-                    settings,
-                    (path, artifact) -> scorer.score(path, artifact, referencePaths, scoreRows, scoreBatch, hostBytes));
+            int maxConcurrent = Integer.parseInt(options.getOrDefault("max-concurrent", "0"));
+            long marginBytes = Long.parseLong(options.getOrDefault("concurrent-margin-mib", "512")) << 20;
+            // Candidates share one cache of device-resident objects and never host-back one beside another, so an
+            // explicit --host-mib, or a limit of one, scores them one at a time as before.
+            if (hostBytes != Residency.PLANNED || maxConcurrent == 1) {
+                Search.run(
+                        settings,
+                        (path, artifact) ->
+                                scorer.score(path, artifact, referencePaths, scoreRows, scoreBatch, hostBytes));
+                return;
+            }
+            try (ConcurrentScoring scoring = new ConcurrentScoring(
+                    scorer,
+                    referencePaths,
+                    scoreRows,
+                    scoreBatch,
+                    maxConcurrent,
+                    marginBytes,
+                    Integer.parseInt(options.getOrDefault("host-sinks", Integer.toString(workers))))) {
+                Search.run(settings, scoring);
+            }
         }
     }
 

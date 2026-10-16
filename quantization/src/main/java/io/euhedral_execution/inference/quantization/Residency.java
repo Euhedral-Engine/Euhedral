@@ -5,6 +5,7 @@ import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.HostWeightSelection;
 import io.euhedral_execution.inference.core.model.qwen38.loader.ResidencyPlanner;
+import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.Locale;
 import java.util.Set;
@@ -49,6 +50,39 @@ public final class Residency {
             single.fits() ? single.deviceBytes() : -1,
             ResidencyPlanner.kvBytes(artifact.config(), tokens, format) + SEQUENCE_BYTES
         };
+    }
+
+    /// The device bytes a candidate adds beyond its weights when all of them are resident: `sequences` sequences'
+    /// KV, the first one's state, the workspace and the reserve ([ResidencyPlanner]'s figures), and
+    /// [#SEQUENCE_BYTES] for each sequence beyond the first. The weights of the objects `speculation` loads are
+    /// counted by the caller, as the cache holds them.
+    static long otherBytes(Artifact artifact, ArtifactProfile.Speculation speculation, int sequences, int tokens) {
+        var plan = resident(artifact, speculation, 1L << 50, sequences, tokens);
+        long weights = 0;
+        for (var tensor : artifact.tensors())
+            if (WeightLoader.uploads(tensor.name(), speculation)) weights += tensor.byteSize();
+        return Math.max(0, plan.deviceBytes() - weights) + (sequences - 1L) * SEQUENCE_BYTES;
+    }
+
+    /// Whether `sequences` sequences of up to `tokens` tokens fit in `free` bytes with every weight resident.
+    static boolean fitsResident(
+            Artifact artifact, ArtifactProfile.Speculation speculation, long free, int sequences, int tokens) {
+        var plan = resident(artifact, speculation, free, sequences, tokens);
+        return plan.fits() && plan.hostBacked().isEmpty();
+    }
+
+    private static ResidencyPlanner.Plan resident(
+            Artifact artifact, ArtifactProfile.Speculation speculation, long free, int sequences, int tokens) {
+        ArtifactProfile found = ArtifactProfile.of(artifact);
+        var profile = new ArtifactProfile(found.quantization(), found.compressed(), speculation);
+        int context = Math.toIntExact(Math.min(Integer.MAX_VALUE, (long) sequences * tokens));
+        return ResidencyPlanner.plan(
+                artifact,
+                profile,
+                free - (sequences - 1L) * SEQUENCE_BYTES,
+                context,
+                Long.MAX_VALUE,
+                kvFormat(artifact));
     }
 
     /// The host-backed objects for `sequences` sequences of up to `tokens` tokens each, or the `hostBytes`
