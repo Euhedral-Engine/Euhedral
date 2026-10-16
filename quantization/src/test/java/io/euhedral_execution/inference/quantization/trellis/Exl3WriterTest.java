@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.euhedral_execution.inference.quantization.checkpoint.Qwen38Objects;
 import io.euhedral_execution.inference.quantization.checkpoint.Safetensors;
 import io.euhedral_execution.inference.quantization.checkpoint.SafetensorsWriter;
@@ -143,9 +144,10 @@ class Exl3WriterTest {
             }
             writer.mtp(results);
             assertEquals(fixtureLines("mtp.tensors.txt"), described(out.resolve("mtp.safetensors")));
-            var expected = (com.fasterxml.jackson.databind.node.ObjectNode) fixtureJson("quantization_config.json");
+            var expected = (ObjectNode) fixtureJson("quantization_config.json");
             expected.remove("tensor_storage");
             expected.remove("vision_bits"); // the vision tower is copied unquantized
+            expected.put("out_scales", "always"); // the writer always stores svh (exllamav3's run chose per linear)
             assertEquals(JSON.writeValueAsString(expected), JSON.writeValueAsString(writer.quantizationConfig()));
         }
     }
