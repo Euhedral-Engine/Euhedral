@@ -406,7 +406,7 @@ class TrellisKernelTest(unittest.TestCase):
     def test_every_table_entry_is_a_kernel_of_the_module(self):
         source = (ROOT / "native/src/host/linear_kernels.c").read_text()
         names = re.findall(r'\{"(euhedral_trellis_\w+)", \d+(?: \* \d+)?, "trellis/kernels.cu"\}', source)
-        self.assertEqual(6, len(names))
+        self.assertEqual(7, len(names))
         for name in names:
             function = C.c_void_p()
             self.assertEqual(0, self.gpu.function(C.byref(function), self.gpu.module, name.encode()), name)
