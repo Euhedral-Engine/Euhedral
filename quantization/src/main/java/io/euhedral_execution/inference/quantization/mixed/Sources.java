@@ -89,7 +89,7 @@ public final class Sources {
                         + firstDifference(comparedOf, compared));
             for (String name : projections) {
                 TensorDescriptor mine = descriptor(option, name), theirs = descriptor(base, name);
-                if (!Arrays.equals(mine.shape(), theirs.shape()))
+                if (!sameFeatures(mine, theirs))
                     throw new IllegalArgumentException(name + " has the shape " + Arrays.toString(mine.shape()) + " in "
                             + option.key() + " and " + Arrays.toString(theirs.shape()) + " in " + base.key());
             }
@@ -105,6 +105,12 @@ public final class Sources {
                             name + " differs between " + option.key() + " and " + base.key());
             }
         }
+    }
+
+    /// Whether two stored projections are the same linear: equal input and output features, whatever each format's
+    /// storage shape (a trellis object is `[k/16, n/16, w]`, a row-split one `[n, k]`).
+    static boolean sameFeatures(TensorDescriptor a, TensorDescriptor b) {
+        return Cost.shape(a).equals(Cost.shape(b));
     }
 
     /// The option the objects an allocation does not name come from.
