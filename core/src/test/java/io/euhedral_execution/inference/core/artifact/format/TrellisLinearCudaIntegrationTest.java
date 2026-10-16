@@ -17,6 +17,7 @@ import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
@@ -48,16 +49,18 @@ class TrellisLinearCudaIntegrationTest {
     }
 
     /// The device copies of one synthetic object.
-    private static final class Object implements AutoCloseable {
+    private static final class Synthetic implements AutoCloseable {
         final CudaGpuMemory gpu;
         final List<TensorHandle> weights = new ArrayList<>();
         final List<Long> allocations = new ArrayList<>();
         final int n, k;
+        final int[] ends;
 
-        Object(CudaGpuMemory gpu, Arena arena, Random random, int n, int k, int... ends) {
+        Synthetic(CudaGpuMemory gpu, Arena arena, Random random, int n, int k, int... ends) {
             this.gpu = gpu;
             this.n = n;
             this.k = k;
+            this.ends = ends;
             long[] shape = {k / 16, n / 16, W};
             long words = shape[0] * shape[1] * W;
             MemorySegment payload = arena.allocate(words * 2, 2);
@@ -128,7 +131,7 @@ class TrellisLinearCudaIntegrationTest {
             CudaGpuMemory gpu,
             Arena arena,
             TrellisFormat format,
-            Object object,
+            Synthetic object,
             MemorySegment x,
             int rows,
             boolean verify,
@@ -154,7 +157,8 @@ class TrellisLinearCudaIntegrationTest {
                                 scratch,
                                 scratchBytes,
                                 verify,
-                                false));
+                                false,
+                                object.ends));
             } finally {
                 gpu.selectExactNumerics(false);
             }
@@ -206,12 +210,12 @@ class TrellisLinearCudaIntegrationTest {
         try (CudaGpuMemory gpu = open();
                 Arena arena = Arena.ofConfined()) {
             // n/128 = 4 blocks: ceil(140 / 4) = 35 splits, capped at k/256 = 4.
-            try (Object split = new Object(gpu, arena, random, 512, 1024, 256, 512)) {
+            try (Synthetic split = new Synthetic(gpu, arena, random, 512, 1024, 128, 512)) {
                 assertEquals(4, TrellisFormat.splits(1024, 512, 140));
                 MemorySegment x = activations(arena, random, 40, 1024);
                 float[] reference = run(gpu, arena, format, split, x, 40, false, true);
                 float[] tensorCore = run(gpu, arena, format, split, x, 8, false, false);
-                assertClose(java.util.Arrays.copyOf(reference, 8 * 512), tensorCore, 512, 0.02, "tensor-core, K split");
+                assertClose(Arrays.copyOf(reference, 8 * 512), tensorCore, 512, 0.02, "tensor-core, K split");
                 // A verification of 40 rows, over the limit of 32, stays on the same route and equals one-row launches.
                 float[] verify = run(gpu, arena, format, split, x, 40, true, false);
                 assertClose(reference, verify, 512, 0.02, "verification");
@@ -219,15 +223,14 @@ class TrellisLinearCudaIntegrationTest {
                     MemorySegment single = arena.allocate(1024 * 2L, 2);
                     MemorySegment.copy(x, row * 1024L * 2, single, 0, 1024 * 2L);
                     float[] one = run(gpu, arena, format, split, single, 1, false, false);
-                    assertArrayEquals(
-                            one, java.util.Arrays.copyOfRange(verify, row * 512, (row + 1) * 512), "row " + row);
+                    assertArrayEquals(one, Arrays.copyOfRange(verify, row * 512, (row + 1) * 512), "row " + row);
                 }
                 // 40 rows, not a verification, above the limit: decode to BF16 and the row-exact GEMM.
                 float[] prefill = run(gpu, arena, format, split, x, 40, false, false);
                 assertClose(reference, prefill, 512, 0.04, "prefill");
             }
             // 140 blocks of 128: one split, the epilogue fused into the GEMM.
-            try (Object single = new Object(gpu, arena, random, 17920, 1024, 8960, 17920)) {
+            try (Synthetic single = new Synthetic(gpu, arena, random, 17920, 1024, 128, 17920)) {
                 assertEquals(1, TrellisFormat.splits(1024, 17920, 140));
                 MemorySegment x = activations(arena, random, 3, 1024);
                 float[] reference = run(gpu, arena, format, single, x, 3, false, true);

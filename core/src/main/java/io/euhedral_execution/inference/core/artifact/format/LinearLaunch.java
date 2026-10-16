@@ -17,4 +17,34 @@ public record LinearLaunch(
         long scratch,
         long scratchBytes,
         boolean rowExact,
-        boolean hostMapped) {}
+        boolean hostMapped,
+        int[] segmentEnds) {
+
+    /// A launch of a format whose objects have no host-known segments.
+    public LinearLaunch(
+            ExecutionPlan.Kind kind,
+            List<TensorHandle> weights,
+            long input,
+            long output,
+            int rows,
+            int inFeatures,
+            int outFeatures,
+            long scratch,
+            long scratchBytes,
+            boolean rowExact,
+            boolean hostMapped) {
+        this(
+                kind,
+                weights,
+                input,
+                output,
+                rows,
+                inFeatures,
+                outFeatures,
+                scratch,
+                scratchBytes,
+                rowExact,
+                hostMapped,
+                null);
+    }
+}

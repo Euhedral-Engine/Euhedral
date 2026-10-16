@@ -59,6 +59,12 @@ public interface LinearFormat {
         throw new UnsupportedOperationException();
     }
 
+    /// [#rows] for a format whose objects carry host-known segment `ends` (trellis); the others ignore them.
+    default List<TensorHandle> rows(
+            List<TensorHandle> object, long first, long rows, String name, GpuMemory gpu, int[] ends) {
+        return rows(object, first, rows, name, gpu);
+    }
+
     default long planScratchBytes(TensorDescriptor descriptor, int maxRows) {
         return 0;
     }
@@ -79,6 +85,12 @@ public interface LinearFormat {
 
     long scratchBytes(
             ExecutionGpu gpu, ScratchUse use, int rows, int inFeatures, int outFeatures, List<TensorHandle> weights);
+
+    /// The scratch of a launch that is never a prefill: at most the decode-type views' rows, or a verification.
+    default long decodeScratchBytes(
+            ExecutionGpu gpu, ScratchUse use, int rows, int inFeatures, int outFeatures, List<TensorHandle> weights) {
+        return scratchBytes(gpu, use, rows, inFeatures, outFeatures, weights);
+    }
 
     void linear(ExecutionGpu gpu, LinearLaunch launch);
 

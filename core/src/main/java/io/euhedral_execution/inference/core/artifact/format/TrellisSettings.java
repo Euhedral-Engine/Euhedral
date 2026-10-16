@@ -11,11 +11,16 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas) {
     public static final String MMA_MAX_ROWS = "euhedral.trellis.mma-max-rows";
     public static final String TARGET_CTAS = "euhedral.trellis.target-ctas";
 
+    /// Decode-type quanta (decode, draft) have up to eight rows and never take the prefill route.
+    private static final int MIN_MMA_ROWS = 8;
+
     private static final int DEFAULT_MMA_MAX_ROWS = 64;
     private static final int DEFAULT_TARGET_CTAS = 140;
 
     public TrellisSettings {
-        if (mmaMaxRows < 1) throw new IllegalArgumentException(MMA_MAX_ROWS + " must be positive: " + mmaMaxRows);
+        if (mmaMaxRows < MIN_MMA_ROWS)
+            throw new IllegalArgumentException(MMA_MAX_ROWS + " must be at least " + MIN_MMA_ROWS
+                    + ", the rows of a decode-type quantum: " + mmaMaxRows);
         if (targetCtas < 1) throw new IllegalArgumentException(TARGET_CTAS + " must be positive: " + targetCtas);
     }
 

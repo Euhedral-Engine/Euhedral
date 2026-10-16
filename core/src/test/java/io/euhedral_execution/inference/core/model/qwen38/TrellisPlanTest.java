@@ -27,12 +27,13 @@ import io.euhedral_execution.inference.core.model.qwen38.loader.AttentionWeights
 import io.euhedral_execution.inference.core.model.qwen38.loader.DenseFfnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.GdnWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.LayerWeights;
+import io.euhedral_execution.inference.core.model.qwen38.loader.MtpWeights;
 import io.euhedral_execution.inference.core.model.qwen38.loader.Weights;
 import io.euhedral_execution.inference.core.model.qwen38.offload.DiskWindow;
 import io.euhedral_execution.inference.core.runtime.graph.StageTopology;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -134,7 +135,43 @@ class TrellisPlanTest {
                 b.q3("text/output_head", VOCABULARY, hidden),
                 null,
                 objects);
-        return new Model(weights, objects);
+        return new Model(weights.withSegmentEnds(b.ends), objects);
+    }
+
+    /// Two layers (GDN, attention) of the smallest geometry with a trellis MTP layer and a draft head.
+    private static Model mtpModel() {
+        LayerType[] types = {LayerType.GATED_DELTA_NET, LayerType.FULL_ATTENTION};
+        Model base = model(types, 128, 128, 1, 1, 1, 1, n -> false, n -> false);
+        Builder b = new Builder(new LinkedHashMap<>(base.objects()), n -> false, n -> false);
+        b.ends.putAll(base.weights().segmentEnds());
+        int hidden = 128;
+        String prefix = "mtp/layer";
+        LayerWeights layer = new LayerWeights(
+                0,
+                b.direct(prefix + "/input_norm", WeightFormat.BF16, hidden),
+                b.direct(prefix + "/post_attention_norm", WeightFormat.BF16, hidden),
+                new AttentionWeights(
+                        b.trellis(prefix + "/attention/query_key", 512, hidden, 256, 512),
+                        b.trellis(prefix + "/attention/gate_value", 512, hidden, 256, 512),
+                        b.direct(prefix + "/attention/query_norm", WeightFormat.BF16, 256),
+                        b.direct(prefix + "/attention/key_norm", WeightFormat.BF16, 256),
+                        b.trellis(prefix + "/attention/output", hidden, 256, hidden)),
+                new DenseFfnWeights(
+                        b.trellis(prefix + "/mlp/gate_up", 256, hidden, 128, 256),
+                        b.trellis(prefix + "/mlp/down", hidden, 128, hidden)));
+        MtpWeights mtp = new MtpWeights(
+                b.direct("mtp/embedding_norm", WeightFormat.BF16, hidden),
+                b.direct("mtp/hidden_norm", WeightFormat.BF16, hidden),
+                b.trellis("mtp/input_projection", hidden, 2 * hidden, hidden),
+                layer,
+                b.direct("mtp/final_norm", WeightFormat.BF16, hidden));
+        b.q3(ExecutionPlan.DRAFT_HEAD, VOCABULARY, hidden);
+        b.direct("text/draft_head_token_ids", WeightFormat.FP32, VOCABULARY);
+        Weights w = base.weights();
+        Weights weights = new Weights(
+                        w.config(), w.tokenEmbedding(), w.layers(), w.finalNorm(), w.lmHead(), mtp, b.objects)
+                .withSegmentEnds(b.ends);
+        return new Model(weights, b.objects);
     }
 
     private static Model fullModel(Predicate<String> host, Predicate<String> disk) {
@@ -148,6 +185,7 @@ class TrellisPlanTest {
     private static final class Builder {
         final Map<String, TensorHandle> objects;
         final Predicate<String> host, disk;
+        final Map<String, int[]> ends = new LinkedHashMap<>();
 
         Builder(Map<String, TensorHandle> objects, Predicate<String> host, Predicate<String> disk) {
             this.objects = objects;
@@ -227,6 +265,7 @@ class TrellisPlanTest {
                         ADDRESSES.getAndAdd(1 << 12),
                         bytes);
             put(payload);
+            this.ends.put(name, ends);
             int s = ends.length;
             put(new TensorHandle(
                     name + ".suh",
@@ -389,12 +428,40 @@ class TrellisPlanTest {
                         assertEquals(ScratchUse.TRELLIS_LINEAR, shape.scratchUse(stage), shape.view() + " " + stage);
                 }
                 BitSet[] below = descendants(shape.topology());
+                // The users of one scratch buffer are totally ordered.
                 for (int i = 0; i < users.size(); i++)
                     for (int j = i + 1; j < users.size(); j++)
-                        assertTrue(
-                                below[users.get(i)].get(users.get(j)),
-                                shape.view() + ": scratch users " + users.get(i) + " and " + users.get(j)
-                                        + " may overlap");
+                        if (shape.scratchRegion(users.get(i)) == shape.scratchRegion(users.get(j)))
+                            assertTrue(
+                                    below[users.get(i)].get(users.get(j)),
+                                    shape.view() + ": scratch users " + users.get(i) + " and " + users.get(j)
+                                            + " may overlap");
+                boolean decodeType = shape.view() == Shape.View.DECODE
+                        || shape.view() == Shape.View.VERIFY
+                        || shape.view() == Shape.View.DECODE_PRELOADED
+                        || shape.view() == Shape.View.VERIFY_PRELOADED;
+                int branches = 0;
+                for (int stage : users) {
+                    ExecutionPlan.Instruction instruction = shape.instructions().get(stage);
+                    boolean second = instruction.kind() == Kind.TRELLIS_LINEAR
+                            && instruction.outputBuffers().contains(Buffer.VALUE_Z_PROJECTED);
+                    assertEquals(decodeType && second ? 1 : 0, shape.scratchRegion(stage), shape.view() + " " + stage);
+                    // In a decode-type view the query/key and value/z projections of a layer may run together.
+                    if (second
+                            && decodeType
+                            && instruction.weights().getFirst().name().contains("/gdn/")) {
+                        int queryKey = stage - 1;
+                        assertEquals(
+                                List.of(Buffer.QK_PROJECTED),
+                                shape.instructions().get(queryKey).outputBuffers());
+                        assertFalse(below[queryKey].get(stage), shape.view() + " layer branches are serialized");
+                        assertFalse(below[stage].get(queryKey));
+                        branches++;
+                    } else if (second && !decodeType) {
+                        assertEquals(0, shape.scratchRegion(stage));
+                    }
+                }
+                if (decodeType) assertEquals(48, branches, shape.view().toString());
             }
             for (Quantum.ExecutionKind kind : List.of(
                     Quantum.ExecutionKind.DECODE, Quantum.ExecutionKind.VERIFY, Quantum.ExecutionKind.PREFILL)) {
@@ -432,9 +499,76 @@ class TrellisPlanTest {
             }
         }
         assertTrue(expected > 0);
+        // The second buffer holds the tensor-core route of the value/z projections alone.
+        long decodeExpected = 0;
+        for (Shape shape : plan.shapes())
+            for (ExecutionPlan.Instruction instruction : trellisLinears(shape)) {
+                if (shape.scratchRegion(instruction.id()) != 1) continue;
+                long k = instruction.inputWidth(), n = instruction.outputWidth();
+                long s = instruction.weights().get(1).shape()[0];
+                int splits = TrellisFormat.splits((int) k, (int) n, settings.targetCtas());
+                decodeExpected = Math.max(
+                        decodeExpected, align(s * rows * k * 2) + (splits > 1 ? (long) splits * rows * n * 4 : 0));
+            }
+        assertTrue(decodeExpected > 0 && decodeExpected < expected);
         try (var workspace = new SharedWorkspace(new ExecutionFixtures.RecordingGpu(), plan, rows)) {
             assertEquals(expected, workspace.scratchBytes());
+            assertEquals(expected, workspace.scratchBytes(0));
+            assertEquals(decodeExpected, workspace.scratchBytes(1));
         }
+    }
+
+    @Test
+    void theMtpLayerAndTheDraftRunTrellisOnTheTensorCoreRoute() {
+        Model model = mtpModel();
+        ExecutionPlan plan = new ExecutionPlan(model.weights());
+        Shape draft = plan.forExecution(Quantum.ExecutionKind.DRAFT, 4);
+        assertEquals(Shape.View.MTP_DRAFT, draft.view());
+        List<ExecutionPlan.Instruction> linears = trellisLinears(draft);
+        // Projection, then the layer's query/key, gate/value, output, gate/up and down.
+        assertEquals(6, linears.size());
+        for (ExecutionPlan.Instruction instruction : linears) {
+            String name = instruction.weights().getFirst().name();
+            assertTrue(name.startsWith("mtp/"), name);
+            assertEquals(
+                    List.of(name, name + ".suh", name + ".svh", name + ".segments"),
+                    instruction.weights().stream().map(TensorHandle::name).toList());
+            assertArrayEquals(model.weights().segmentEnds().get(name), instruction.segmentEnds(), name);
+        }
+        assertTrue(
+                linears.stream().anyMatch(i -> i.weights().getFirst().name().equals("mtp/layer/attention/query_key")));
+        assertTrue(
+                linears.stream().anyMatch(i -> i.weights().getFirst().name().equals("mtp/layer/attention/gate_value")));
+        // A draft of four rows is below the limit; a catch-up above it would not be, but is not a decode-type view.
+        LaunchLog gpu = new LaunchLog();
+        ExecutionPlan.Instruction projection = linears.getFirst();
+        FORMAT.linear(
+                gpu,
+                new LinearLaunch(
+                        projection.kind(),
+                        projection.weights(),
+                        0x1000,
+                        0x2000,
+                        4,
+                        projection.inputWidth(),
+                        projection.outputWidth(),
+                        1L << 36,
+                        1L << 30,
+                        false,
+                        false,
+                        projection.segmentEnds()));
+        assertEquals(
+                List.of(LinearKernel.TRELLIS_PREPASS.symbol(), LinearKernel.TRELLIS_MMA.symbol()),
+                gpu.names().subList(0, 2));
+        assertFalse(gpu.names().contains(LinearKernel.TRELLIS_DECODE_BF16.symbol()));
+    }
+
+    @Test
+    void anObjectWithoutHostSegmentEndsIsRefusedAtPlanTime() {
+        Model model = fullModel(n -> false, n -> false);
+        Weights w = model.weights();
+        Weights bare = w.withSegmentEnds(Map.of());
+        assertThrows(IllegalArgumentException.class, () -> new ExecutionPlan(bare));
     }
 
     @Test
@@ -473,7 +607,6 @@ class TrellisPlanTest {
     /// Logs the table launches and answers a host read of a segments companion with its ends.
     private static final class LaunchLog extends ExecutionFixtures.RecordingGpu {
         final List<Launch> launches = new ArrayList<>();
-        final Map<Long, int[]> segments = new LinkedHashMap<>();
         boolean exact;
 
         @Override
@@ -497,16 +630,14 @@ class TrellisPlanTest {
                     new int[] {gridX, gridY, gridZ},
                     new int[] {blockX, blockY, blockZ},
                     sharedBytes,
-                    java.util.Arrays.copyOf(arguments.words(), arguments.count()),
-                    java.util.Arrays.copyOf(arguments.sizes(), arguments.count())));
+                    Arrays.copyOf(arguments.words(), arguments.count()),
+                    Arrays.copyOf(arguments.sizes(), arguments.count())));
         }
 
+        /// A launch never reads the device on the host.
         @Override
         public void copyDeviceToHost(MemorySegment destination, long source, long byteSize) {
-            int[] ends = this.segments.get(source);
-            if (ends == null) throw new IllegalStateException("unexpected host read at " + source);
-            for (int index = 0; index < ends.length; index++)
-                destination.set(ValueLayout.JAVA_INT_UNALIGNED, (long) index * 4, ends[index]);
+            throw new IllegalStateException("a launch read the device on the host");
         }
 
         List<String> names() {
@@ -514,7 +645,7 @@ class TrellisPlanTest {
         }
     }
 
-    private static final int[] PTR_PTR = {8, 8};
+    private static final Map<Long, int[]> ENDS = new java.util.concurrent.ConcurrentHashMap<>();
 
     /// An object of `n` by `k` with `ends`, its handles at addresses recorded in `gpu`.
     private static List<TensorHandle> object(LaunchLog gpu, int n, int k, int... ends) {
@@ -522,14 +653,25 @@ class TrellisPlanTest {
         TensorHandle payload = b.trellis("object", n, k, ends);
         List<TensorHandle> weights = new ArrayList<>(List.of(payload));
         for (String companion : List.of(".suh", ".svh", ".segments")) weights.add(b.objects.get("object" + companion));
-        gpu.segments.put(weights.get(3).deviceAddress(), ends);
+        ENDS.put(weights.get(3).deviceAddress(), ends);
         return weights;
     }
 
     private static LinearLaunch launch(
             List<TensorHandle> weights, int rows, int k, int n, long scratch, long scratchBytes, boolean verify) {
         return new LinearLaunch(
-                Kind.TRELLIS_LINEAR, weights, 0x1000, 0x2000, rows, k, n, scratch, scratchBytes, verify, false);
+                Kind.TRELLIS_LINEAR,
+                weights,
+                0x1000,
+                0x2000,
+                rows,
+                k,
+                n,
+                scratch,
+                scratchBytes,
+                verify,
+                false,
+                ENDS.get(weights.get(3).deviceAddress()));
     }
 
     private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140));
@@ -545,7 +687,7 @@ class TrellisPlanTest {
     void aDecodeRowRunsPrepassAndTheTensorCoreGemm() {
         LaunchLog gpu = new LaunchLog();
         // gate_up: k 5120, n 34816, two segments; one K split.
-        var weights = object(gpu, 34816, 5120, 17408, 34816);
+        var weights = object(gpu, 34816, 5120, 12288, 34816);
         long scratch = 1L << 36;
         FORMAT.linear(gpu, launch(weights, 1, 5120, 34816, scratch, 1L << 30, false));
         assertEquals(List.of(LinearKernel.TRELLIS_PREPASS.symbol(), LinearKernel.TRELLIS_MMA.symbol()), gpu.names());
@@ -640,7 +782,7 @@ class TrellisPlanTest {
     @Test
     void rowsAboveTheLimitDecodeToBf16AndMultiplyPerSegment() {
         LaunchLog gpu = new LaunchLog();
-        var weights = object(gpu, 34816, 5120, 17408, 34816);
+        var weights = object(gpu, 34816, 5120, 12288, 34816);
         int rows = 33;
         long scratch = 1L << 36;
         long activations = align(2L * rows * 5120 * 2), decodedBytes = align(34816L * 5120 * 2);
@@ -667,15 +809,15 @@ class TrellisPlanTest {
         assertEquals(256, decode.block()[0]);
         long decoded = scratch + activations, rotated = decoded + decodedBytes;
         Launch first = gpu.launches.get(2), second = gpu.launches.get(3);
-        assertArrayEquals(new long[] {scratch, decoded, rotated, rows, 5120, 17408}, first.words());
+        assertArrayEquals(new long[] {scratch, decoded, rotated, rows, 5120, 12288}, first.words());
         assertArrayEquals(
                 new long[] {
                     scratch + (long) rows * 5120 * 2,
-                    decoded + 17408L * 5120 * 2,
-                    rotated + (long) rows * 17408 * 2,
+                    decoded + 12288L * 5120 * 2,
+                    rotated + (long) rows * 12288 * 2,
                     rows,
                     5120,
-                    17408
+                    22528
                 },
                 second.words());
         Launch epilogue = gpu.launches.get(4);
@@ -707,7 +849,7 @@ class TrellisPlanTest {
     void exactNumericsRunOnlyTheReference() {
         LaunchLog gpu = new LaunchLog();
         gpu.exact = true;
-        var weights = object(gpu, 34816, 5120, 17408, 34816);
+        var weights = object(gpu, 34816, 5120, 12288, 34816);
         // The reference needs no scratch, whatever the rows.
         FORMAT.linear(gpu, launch(weights, 100, 5120, 34816, 0, 0, false));
         assertEquals(List.of(LinearKernel.TRELLIS_REFERENCE.symbol()), gpu.names());
@@ -758,7 +900,7 @@ class TrellisPlanTest {
     @Test
     void scratchBytesFollowTheRoutes() {
         LaunchLog gpu = new LaunchLog();
-        var weights = object(gpu, 34816, 5120, 17408, 34816);
+        var weights = object(gpu, 34816, 5120, 12288, 34816);
         long activations = align(2L * 32 * 5120 * 2);
         // At most the limit: the tensor-core route alone (one split here, no partials).
         assertEquals(activations, FORMAT.scratchBytes(gpu, ScratchUse.TRELLIS_LINEAR, 32, 5120, 34816, weights));

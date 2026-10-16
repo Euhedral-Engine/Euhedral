@@ -155,9 +155,11 @@ public final class ExecutionPlan {
             int inputWidth,
             int outputWidth,
             int outputBufferIndex,
-            int layerIndex) {
+            int layerIndex,
+            int[] segmentEnds) {
         public Instruction {
             Objects.requireNonNull(kind, "kind");
+            segmentEnds = segmentEnds == null ? null : segmentEnds.clone();
             dependencies = List.copyOf(dependencies);
             weights = weights.stream().map(ExecutionPlan::copyHandle).toList();
             inputBuffers = List.copyOf(inputBuffers);
@@ -165,6 +167,31 @@ public final class ExecutionPlan {
             if (id < 0 || inputWidth < 0 || outputWidth < 0 || outputBufferIndex < -1 || layerIndex < -1) {
                 throw new IllegalArgumentException("invalid instruction dimensions");
             }
+        }
+
+        public Instruction(
+                int id,
+                Kind kind,
+                List<Integer> dependencies,
+                List<TensorHandle> weights,
+                List<Buffer> inputBuffers,
+                List<Buffer> outputBuffers,
+                int inputWidth,
+                int outputWidth,
+                int outputBufferIndex,
+                int layerIndex) {
+            this(
+                    id,
+                    kind,
+                    dependencies,
+                    weights,
+                    inputBuffers,
+                    outputBuffers,
+                    inputWidth,
+                    outputWidth,
+                    outputBufferIndex,
+                    layerIndex,
+                    null);
         }
 
         public Instruction(
@@ -202,6 +229,12 @@ public final class ExecutionPlan {
                     outputWidth,
                     -1,
                     -1);
+        }
+
+        /// The host-known segment ends of a trellis linear's object; null for every other instruction.
+        @Override
+        public int[] segmentEnds() {
+            return this.segmentEnds == null ? null : this.segmentEnds.clone();
         }
 
         @Override
@@ -346,12 +379,23 @@ public final class ExecutionPlan {
     /// they take it one after another.
     static int[][] withStorageHazards(
             List<Instruction> instructions, int[][] dependencies, boolean reuseStorage, boolean[] scratch) {
+        int[] regions = new int[scratch.length];
+        for (int stage = 0; stage < regions.length; stage++) regions[stage] = scratch[stage] ? 0 : -1;
+        return withStorageHazards(instructions, dependencies, reuseStorage, regions);
+    }
+
+    /// As above, with one more storage per scratch region, which each stage of `scratchRegions` (its region, or -1
+    /// for none) writes: the stages of one region take it one after another, the regions are independent.
+    static int[][] withStorageHazards(
+            List<Instruction> instructions, int[][] dependencies, boolean reuseStorage, int[] scratchRegions) {
         int count = instructions.size();
         Map<Buffer, Buffer> owners = new EnumMap<>(Buffer.class);
         if (reuseStorage)
             for (Map.Entry<Buffer, Buffer> pair : REGION_STORAGE) owners.put(pair.getKey(), pair.getValue());
         int scratchStorage = Buffer.values().length;
-        int storages = scratchStorage + 1;
+        int storages = scratchStorage
+                + 1
+                + java.util.Arrays.stream(scratchRegions).max().orElse(0);
         int[] lastWriter = new int[storages];
         java.util.Arrays.fill(lastWriter, -1);
         List<List<Integer>> readers = new ArrayList<>(storages);
@@ -377,7 +421,9 @@ public final class ExecutionPlan {
                 if (lastWriter[storage] >= 0) required.add(lastWriter[storage]);
                 required.addAll(readers.get(storage));
             }
-            if (scratch[stage] && lastWriter[scratchStorage] >= 0) required.add(lastWriter[scratchStorage]);
+            int region = scratchRegions[stage];
+            if (region >= 0 && lastWriter[scratchStorage + region] >= 0)
+                required.add(lastWriter[scratchStorage + region]);
             // Latest first: an earlier requirement is often already an ancestor of a later one.
             for (int producer : required.descendingSet()) {
                 if (producer == stage || reach.get(producer)) continue;
@@ -394,7 +440,7 @@ public final class ExecutionPlan {
                 lastWriter[storage] = stage;
                 readers.get(storage).clear();
             }
-            if (scratch[stage]) lastWriter[scratchStorage] = stage;
+            if (region >= 0) lastWriter[scratchStorage + region] = stage;
         }
         return ordered;
     }
@@ -429,6 +475,20 @@ public final class ExecutionPlan {
                 new PlanData(data.instructions(), data.projectionWidths(), data.bufferSpecs(), data.firstLayer()),
                 null,
                 null);
+    }
+
+    private int scratchRegions;
+
+    /// The scratch buffers the plan's workspace holds: two when a decode-type view runs two trellis branches at once,
+    /// else one.
+    int scratchRegions() {
+        int regions = this.scratchRegions;
+        if (regions == 0) {
+            regions = 1;
+            for (Shape shape : shapes()) regions = Math.max(regions, shape.scratchRegionCount());
+            this.scratchRegions = regions;
+        }
+        return regions;
     }
 
     /// The staging ring of this plan family, or null when no weight is host-backed.
@@ -540,13 +600,14 @@ public final class ExecutionPlan {
                 c.attentionOutputGate(),
                 0);
         Weights single = new Weights(
-                one,
-                weights.tokenEmbedding(),
-                new LayerWeights[] {mtp.layer()},
-                mtp.finalNorm(),
-                head,
-                null,
-                weights.runtimeObjects());
+                        one,
+                        weights.tokenEmbedding(),
+                        new LayerWeights[] {mtp.layer()},
+                        mtp.finalNorm(),
+                        head,
+                        null,
+                        weights.runtimeObjects())
+                .withSegmentEnds(weights.segmentEnds());
         PlanData layer = fullModel(single, validateEmbedding(weights.tokenEmbedding(), c.vocabSize(), hidden));
         TensorHandle projection = validateQuantized(mtp.projection(), hidden, 2 * hidden, WeightFormat.Q3_G64_FP16);
         TensorHandle embeddingNorm = validateNorm(mtp.embeddingNorm(), hidden);
@@ -591,12 +652,14 @@ public final class ExecutionPlan {
                     next.inputWidth(),
                     next.outputWidth(),
                     next.outputBufferIndex(),
-                    next.layerIndex() == 0 ? mtpLayer : next.layerIndex()));
+                    next.layerIndex() == 0 ? mtpLayer : next.layerIndex(),
+                    next.segmentEnds));
         }
         List<BufferSpec> buffers = new ArrayList<>(layer.bufferSpecs());
         buffers.add(new BufferSpec(Buffer.MTP_NORMED, hidden, ElementType.BF16));
         buffers.add(new BufferSpec(Buffer.MTP_PACKED, 2 * hidden, ElementType.BF16));
-        return new PlanData(List.copyOf(nodes), layer.projectionWidths(), List.copyOf(buffers), true, false);
+        return new PlanData(
+                withSegmentEnds(weights, nodes), layer.projectionWidths(), List.copyOf(buffers), true, false);
     }
 
     /// Builds an embedding-only plan for callers that intentionally validate only token lookup.
@@ -962,7 +1025,8 @@ public final class ExecutionPlan {
                     instruction.inputWidth(),
                     instruction.outputWidth(),
                     instruction.outputBufferIndex(),
-                    instruction.layerIndex()));
+                    instruction.layerIndex(),
+                    instruction.segmentEnds));
             for (int staged = first; staged < use; staged++) {
                 if (staged + slots < useWeights.size()) emitTransfer.accept(staged + slots);
             }
@@ -1097,7 +1161,8 @@ public final class ExecutionPlan {
                     first.inputWidth(),
                     first.outputWidth(),
                     first.outputBufferIndex(),
-                    first.layerIndex()));
+                    first.layerIndex(),
+                    first.segmentEnds));
         }
         boolean needsGateUp = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.GATE_UP));
         boolean needsSwiGlu = result.stream().anyMatch(i -> i.outputBuffers().contains(Buffer.SWIGLU));
@@ -1476,7 +1541,7 @@ public final class ExecutionPlan {
                 spec(Buffer.GATE_UP, 2 * intermediate, ElementType.BF16),
                 spec(Buffer.SWIGLU, intermediate, ElementType.BF16),
                 spec(Buffer.FFN_DELTA, hidden, ElementType.BF16));
-        return new PlanData(List.copyOf(nodes), List.of(), buffers, true);
+        return new PlanData(withSegmentEnds(weights, nodes), List.of(), buffers, true);
     }
 
     /// The DFlash2 tap slot of target layer `layer`'s output, or -1.
@@ -2202,7 +2267,7 @@ public final class ExecutionPlan {
                 config.vocabSize());
 
         return new PlanData(
-                List.copyOf(nodes),
+                withSegmentEnds(weights, nodes),
                 List.of(),
                 fullBufferSpecs(
                         hidden,
@@ -2311,7 +2376,7 @@ public final class ExecutionPlan {
                 .filter(instruction -> grouped(instruction.kind()) || instruction.kind() == Kind.BF16_PROJECTION)
                 .map(Instruction::outputWidth)
                 .toList();
-        return new PlanData(List.copyOf(nodes), widths, List.of(), false);
+        return new PlanData(withSegmentEnds(weights, nodes), widths, List.of(), false);
     }
 
     private static Instruction node(
@@ -2408,6 +2473,34 @@ public final class ExecutionPlan {
             all.add(copyHandle(companion));
         }
         return List.copyOf(all);
+    }
+
+    /// `nodes` with the host-known segment ends of `weights` attached to each trellis linear, which the prefill route
+    /// needs on the host without reading the device.
+    private static List<Instruction> withSegmentEnds(Weights weights, List<Instruction> nodes) {
+        List<Instruction> result = new ArrayList<>(nodes.size());
+        for (Instruction node : nodes) {
+            if (node.kind() != Kind.TRELLIS_LINEAR || node.segmentEnds != null) {
+                result.add(node);
+                continue;
+            }
+            String name = node.weights.getFirst().name();
+            int[] ends = weights.segmentEnds().get(name);
+            if (ends == null) throw new IllegalArgumentException("no segment ends for trellis object '" + name + "'");
+            result.add(new Instruction(
+                    node.id(),
+                    node.kind(),
+                    node.dependencies(),
+                    node.weights,
+                    node.inputBuffers(),
+                    node.outputBuffers(),
+                    node.inputWidth(),
+                    node.outputWidth(),
+                    node.outputBufferIndex(),
+                    node.layerIndex(),
+                    ends));
+        }
+        return List.copyOf(result);
     }
 
     private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat roleFormat) {
