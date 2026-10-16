@@ -99,4 +99,29 @@ class FidelityModelTest {
                 Map.copyOf(world.objects.stream().collect(Collectors.toMap(o -> o, o -> Option.TRELLIS_2_5))));
         assertTrue(model.predict(best) < model.predict(worst));
     }
+
+    @Test
+    void fewNoisyMeasurementsNeverGiveAnAllocationANearZeroPrediction() {
+        // Few measurements with noise: an unconstrained fit gives some allocations a non-positive linear part (a
+        // predicted KL of nothing, with no gradient), which RCO would seek out.
+        Synthetic world = new Synthetic(16, 4, 1.0, 1.0, 13);
+        Random random = new Random(5);
+        List<Measured> data = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            Allocation allocation = world.random(random);
+            double noisy = world.truth(allocation) * Math.exp(0.5 * random.nextGaussian());
+            data.add(new Measured(allocation, noisy, 0, 0, 0, 0, true, 1, "noisy"));
+        }
+        FidelityModel model = FidelityModel.fit(data, 1e-6, world.priors, 4);
+        for (int family = 0; family < Synthetic.FAMILIES.size(); family++)
+            for (int band = 0; band < 4; band++)
+                assertTrue(model.weight(family, band) >= 0, "weight " + family + "/" + band);
+        double least = Double.POSITIVE_INFINITY;
+        for (Measured m : data) least = Math.min(least, m.kl());
+        Random other = new Random(17);
+        for (int i = 0; i < 200; i++) {
+            double predicted = model.predict(world.random(other));
+            assertTrue(predicted > 1e-3 * least, "prediction " + i + " = " + predicted);
+        }
+    }
 }

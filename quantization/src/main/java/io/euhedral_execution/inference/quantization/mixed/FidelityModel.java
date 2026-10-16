@@ -26,8 +26,9 @@ import java.util.Random;
 /// - `chi[f]`, the sum over bands `b` of `phi[f,b] * phi[f,b+1]`: adjacent bands of one family.
 ///
 /// `gamma` is the monotone bend, `s` its scale. The weights are fitted by ridge regression of `kl^(1/gamma)`
-/// on the features, each column scaled to unit RMS, shrinking the linear weights towards one common weight and
-/// the pair weights towards zero; `gamma` is the value on a grid whose fit has the least RMS error of `log
+/// on the features, each column scaled to unit RMS, every weight non-negative (an error anywhere can only add KL),
+/// shrinking the linear weights towards one common weight and the pair weights towards zero; `gamma` is the value on a
+/// grid whose fit has the least RMS error of `log
 /// kl`, and `s` the geometric-mean correction of that fit. The prediction is differentiable in `p`:
 /// [#gradient] is exact.
 public final class FidelityModel {
@@ -37,6 +38,9 @@ public final class FidelityModel {
 
     private static final double FLOOR = 1e-12;
     private static final double MINIMUM_KL = 1e-9;
+    /// The coordinate-descent sweeps of [#ridgeSolve] at most, and the relative change that ends it sooner.
+    private static final int SOLVE_SWEEPS = 2000;
+    private static final double SOLVE_TOLERANCE = 1e-10;
     private static final double[] GAMMAS = {0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2.0};
 
     private final Layout layout;
@@ -215,7 +219,7 @@ public final class FidelityModel {
             for (int j = 0; j < layout.columns; j++)
                 prior[j] = j < layout.pairBase
                         ? common * Math.exp(perturb * noise[j])
-                        : perturb * targetRms / Math.sqrt(layout.columns) * noise[j];
+                        : perturb * targetRms / Math.sqrt(layout.columns) * Math.abs(noise[j]);
             double[] theta = ridgeSolve(scaled, target, ridge, prior);
             double[] weights = new double[layout.columns];
             for (int j = 0; j < weights.length; j++) weights[j] = theta[j] / rms[j];
@@ -248,7 +252,11 @@ public final class FidelityModel {
         return sorted;
     }
 
-    /// Solves `(X'X + ridge I) theta = X't + ridge prior` by Cholesky.
+    /// Minimizes `|X theta - t|^2 + ridge' |theta - prior|^2` over `theta >= 0` (`ridge'` is `ridge` times the
+    /// rows), by coordinate descent on the normal equations, each coordinate clipped at zero. The features are sums
+    /// of non-negative prior errors, so non-negative weights keep every prediction's linear part non-negative: an
+    /// unconstrained fit could give an allocation a part at or below zero, a predicted KL of nothing with no
+    /// gradient, which RCO then seeks out.
     private static double[] ridgeSolve(double[][] x, double[] t, double ridge, double[] prior) {
         int n = prior.length, rows = x.length;
         double[][] a = new double[n][n];
@@ -258,7 +266,7 @@ public final class FidelityModel {
             for (int i = 0; i < n; i++) {
                 if (row[i] == 0) continue;
                 b[i] += row[i] * t[r];
-                for (int j = 0; j <= i; j++) a[i][j] += row[i] * row[j];
+                for (int j = 0; j < n; j++) a[i][j] += row[i] * row[j];
             }
         }
         double lambda = Math.max(ridge, 1e-12) * Math.max(1, rows);
@@ -266,28 +274,19 @@ public final class FidelityModel {
             a[i][i] += lambda;
             b[i] += lambda * prior[i];
         }
-        for (int j = 0; j < n; j++) {
-            double diagonal = a[j][j];
-            for (int k = 0; k < j; k++) diagonal -= a[j][k] * a[j][k];
-            diagonal = Math.sqrt(Math.max(diagonal, 1e-300));
-            a[j][j] = diagonal;
-            for (int i = j + 1; i < n; i++) {
-                double value = a[i][j];
-                for (int k = 0; k < j; k++) value -= a[i][k] * a[j][k];
-                a[i][j] = value / diagonal;
-            }
-        }
-        double[] y = new double[n];
-        for (int i = 0; i < n; i++) {
-            double value = b[i];
-            for (int k = 0; k < i; k++) value -= a[i][k] * y[k];
-            y[i] = value / a[i][i];
-        }
         double[] theta = new double[n];
-        for (int i = n - 1; i >= 0; i--) {
-            double value = y[i];
-            for (int k = i + 1; k < n; k++) value -= a[k][i] * theta[k];
-            theta[i] = value / a[i][i];
+        for (int i = 0; i < n; i++) theta[i] = Math.max(0, prior[i]);
+        for (int sweep = 0; sweep < SOLVE_SWEEPS; sweep++) {
+            double change = 0, size = 0;
+            for (int i = 0; i < n; i++) {
+                double rest = b[i];
+                for (int j = 0; j < n; j++) if (j != i) rest -= a[i][j] * theta[j];
+                double next = Math.max(0, rest / a[i][i]);
+                change = Math.max(change, Math.abs(next - theta[i]));
+                size = Math.max(size, Math.abs(next));
+                theta[i] = next;
+            }
+            if (change <= SOLVE_TOLERANCE * Math.max(size, 1e-300)) break;
         }
         return theta;
     }
