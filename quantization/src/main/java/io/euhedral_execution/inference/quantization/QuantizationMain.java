@@ -40,6 +40,8 @@ import java.util.OptionalInt;
 /// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
 /// [--copy-buffer-mib 64]
+/// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
+/// [--parse-special] [--rows 8] [--batch 4] [--host-mib N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// rotate --model CHECKPOINT --out CHECKPOINT_DIR [--seed 1] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
@@ -55,7 +57,15 @@ public final class QuantizationMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0
-                || !List.of("calibrate", "score", "generate", "train-blocks", "train-model", "rotate", "assemble")
+                || !List.of(
+                                "calibrate",
+                                "score",
+                                "generate",
+                                "train-blocks",
+                                "train-model",
+                                "rotate",
+                                "assemble",
+                                "reference")
                         .contains(args[0])) {
             System.err.println(
                     "usage: calibrate --model DIR --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens T.npy "
@@ -70,6 +80,9 @@ public final class QuantizationMain {
             System.err.println(
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
                             + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library PATH]");
+            System.err.println("       reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld "
+                    + "[--context 2560] [--chunks N] [--parse-special] [--rows 8] [--batch 4] "
+                    + "[--host-mib N] [--workers 6] [--library PATH]");
             System.err.println("       rotate --model CHECKPOINT --out DIR [--seed 1] [--library PATH]");
             System.err.println(
                     "       assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT "
@@ -87,7 +100,8 @@ public final class QuantizationMain {
             boolean flag = key.equals("--compressed")
                     || key.equals("--act-order")
                     || key.equals("--skip-mtp")
-                    || key.equals("--fp32");
+                    || key.equals("--fp32")
+                    || key.equals("--parse-special");
             String value = flag ? "true" : args[++i];
             if (key.equals("--reference")) references.add(value);
             else if (key.equals("--name")) names.add(value);
@@ -177,6 +191,22 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("workers", "6")),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Path.of(library)));
+            return;
+        }
+        if (args[0].equals("reference")) {
+            ReferenceLogits.run(new ReferenceLogits.Settings(
+                    Path.of(required(options, "artifact")),
+                    Path.of(required(options, "tokenizer")),
+                    Path.of(required(options, "text")),
+                    Path.of(required(options, "out")),
+                    Integer.parseInt(options.getOrDefault("context", "2560")),
+                    Integer.parseInt(options.getOrDefault("chunks", "0")),
+                    options.containsKey("parse-special"),
+                    Integer.parseInt(options.getOrDefault("rows", "8")),
+                    Integer.parseInt(options.getOrDefault("batch", "4")),
+                    hostBytes(options),
+                    Integer.parseInt(options.getOrDefault("workers", "6")),
+                    Path.of(library)));
             return;
         }
         if (args[0].equals("rotate")) {
