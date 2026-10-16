@@ -62,7 +62,7 @@ public final class Stages {
             case WEIGHT_TRANSFER -> new WeightTransfer(graph, stage, instruction, gpu);
             case DISK_TRANSFER -> new DiskTransfer(graph, stage, instruction, gpu);
             case RMS_NORM, RMS_NORM_UNIT_OFFSET -> new RmsNorm(graph, stage, instruction, gpu);
-            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR, BF16_PROJECTION ->
+            case Q3_LINEAR, Q4_LINEAR, Q5_LINEAR, BF16_LINEAR, BF16_PROJECTION, TRELLIS_LINEAR ->
                 new Linear(graph, stage, instruction, gpu);
             case Q3_GATE_UP_SWIGLU -> new GateUpSwiGlu(graph, stage, instruction, gpu);
             case RESIDUAL_RMS_NORM -> new ResidualNorm(graph, stage, instruction, gpu);

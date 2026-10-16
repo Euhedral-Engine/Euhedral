@@ -75,7 +75,10 @@ public final class ExecutionPlan {
         /// The target's output head over the block's proposal rows (every row but the anchor).
         DFLASH_LM_HEAD,
         DFLASH_TOPK,
-        DFLASH_SELECT
+        DFLASH_SELECT,
+        /// A trellis (EXL3) linear: prepass, tensor-core or decoded-BF16 GEMM and epilogue launches in one stage. Its
+        /// weights are the payload, then `.suh`, `.svh` and `.segments`.
+        TRELLIS_LINEAR
     }
 
     public enum Buffer {
@@ -537,7 +540,13 @@ public final class ExecutionPlan {
                 c.attentionOutputGate(),
                 0);
         Weights single = new Weights(
-                one, weights.tokenEmbedding(), new LayerWeights[] {mtp.layer()}, mtp.finalNorm(), head, null);
+                one,
+                weights.tokenEmbedding(),
+                new LayerWeights[] {mtp.layer()},
+                mtp.finalNorm(),
+                head,
+                null,
+                weights.runtimeObjects());
         PlanData layer = fullModel(single, validateEmbedding(weights.tokenEmbedding(), c.vocabSize(), hidden));
         TensorHandle projection = validateQuantized(mtp.projection(), hidden, 2 * hidden, WeightFormat.Q3_G64_FP16);
         TensorHandle embeddingNorm = validateNorm(mtp.embeddingNorm(), hidden);
@@ -563,7 +572,7 @@ public final class ExecutionPlan {
                 2,
                 linearKind(projection, Kind.Q3_LINEAR),
                 List.of(1),
-                List.of(projection),
+                linearWeights(weights, projection),
                 List.of(Buffer.MTP_PACKED),
                 List.of(Buffer.HIDDEN_STATE),
                 2 * hidden,
@@ -1105,6 +1114,7 @@ public final class ExecutionPlan {
         return kind == Kind.Q3_LINEAR
                 || kind == Kind.Q4_LINEAR
                 || kind == Kind.Q5_LINEAR
+                || kind == Kind.TRELLIS_LINEAR
                 || kind == Kind.BF16_PROJECTION;
     }
 
@@ -1315,7 +1325,7 @@ public final class ExecutionPlan {
                 2,
                 linearKind(queryKey, Kind.Q4_LINEAR),
                 List.of(1),
-                List.of(queryKey),
+                linearWeights(weights, queryKey),
                 List.of(Buffer.INPUT_NORMALIZED),
                 List.of(Buffer.QK_PROJECTED),
                 hidden,
@@ -1324,7 +1334,7 @@ public final class ExecutionPlan {
                 3,
                 linearKind(valueZ, Kind.Q5_LINEAR),
                 List.of(1),
-                List.of(valueZ),
+                linearWeights(weights, valueZ),
                 List.of(Buffer.INPUT_NORMALIZED),
                 List.of(Buffer.VALUE_Z_PROJECTED),
                 hidden,
@@ -1387,7 +1397,7 @@ public final class ExecutionPlan {
                 10,
                 linearKind(gdnOutput, Kind.Q3_LINEAR),
                 List.of(9),
-                List.of(gdnOutput),
+                linearWeights(weights, gdnOutput),
                 List.of(Buffer.GDN_NORMALIZED),
                 List.of(Buffer.MIXER_DELTA),
                 valueProjected,
@@ -1414,7 +1424,7 @@ public final class ExecutionPlan {
                 13,
                 linearKind(gateUp, Kind.Q3_LINEAR),
                 List.of(12),
-                List.of(gateUp),
+                linearWeights(weights, gateUp),
                 List.of(Buffer.POST_MIXER_NORMALIZED),
                 List.of(Buffer.GATE_UP),
                 hidden,
@@ -1432,7 +1442,7 @@ public final class ExecutionPlan {
                 15,
                 linearKind(down, Kind.Q3_LINEAR),
                 List.of(14),
-                List.of(down),
+                linearWeights(weights, down),
                 List.of(Buffer.SWIGLU),
                 List.of(Buffer.FFN_DELTA),
                 intermediate,
@@ -1942,7 +1952,7 @@ public final class ExecutionPlan {
                         linearKind(queryKey, Kind.Q4_LINEAR),
                         layerIndex,
                         List.of(normId),
-                        List.of(queryKey),
+                        linearWeights(weights, queryKey),
                         List.of(Buffer.INPUT_NORMALIZED),
                         List.of(Buffer.QK_PROJECTED),
                         hidden,
@@ -1952,7 +1962,7 @@ public final class ExecutionPlan {
                         linearKind(valueZ, Kind.Q5_LINEAR),
                         layerIndex,
                         List.of(normId),
-                        List.of(valueZ),
+                        linearWeights(weights, valueZ),
                         List.of(Buffer.INPUT_NORMALIZED),
                         List.of(Buffer.VALUE_Z_PROJECTED),
                         hidden,
@@ -2022,7 +2032,7 @@ public final class ExecutionPlan {
                         linearKind(gdnOutput, Kind.Q3_LINEAR),
                         layerIndex,
                         List.of(gatedNormId),
-                        List.of(gdnOutput),
+                        linearWeights(weights, gdnOutput),
                         List.of(Buffer.GDN_NORMALIZED),
                         List.of(Buffer.MIXER_DELTA),
                         gdnValueWidth,
@@ -2046,7 +2056,7 @@ public final class ExecutionPlan {
                         linearKind(queryKey, Kind.Q4_LINEAR),
                         layerIndex,
                         List.of(normId),
-                        List.of(queryKey),
+                        linearWeights(weights, queryKey),
                         List.of(Buffer.INPUT_NORMALIZED),
                         List.of(Buffer.QK_PROJECTED),
                         hidden,
@@ -2056,7 +2066,7 @@ public final class ExecutionPlan {
                         linearKind(gateValue, Kind.Q5_LINEAR),
                         layerIndex,
                         List.of(normId),
-                        List.of(gateValue),
+                        linearWeights(weights, gateValue),
                         List.of(Buffer.INPUT_NORMALIZED),
                         List.of(Buffer.VALUE_Z_PROJECTED),
                         hidden,
@@ -2096,7 +2106,7 @@ public final class ExecutionPlan {
                         linearKind(attentionOutput, Kind.Q3_LINEAR),
                         layerIndex,
                         List.of(attentionId),
-                        List.of(attentionOutput),
+                        linearWeights(weights, attentionOutput),
                         List.of(Buffer.ATTENTION_CONTEXT),
                         List.of(Buffer.MIXER_DELTA),
                         attentionQueryWidth,
@@ -2133,7 +2143,7 @@ public final class ExecutionPlan {
                     linearKind(gateUp, Kind.Q3_LINEAR),
                     layerIndex,
                     List.of(postNormId),
-                    List.of(gateUp),
+                    linearWeights(weights, gateUp),
                     List.of(Buffer.POST_MIXER_NORMALIZED),
                     List.of(Buffer.GATE_UP),
                     hidden,
@@ -2153,7 +2163,7 @@ public final class ExecutionPlan {
                     linearKind(down, Kind.Q3_LINEAR),
                     layerIndex,
                     List.of(swigluId),
-                    List.of(down),
+                    linearWeights(weights, down),
                     List.of(Buffer.SWIGLU),
                     List.of(Buffer.FFN_DELTA),
                     intermediate,
@@ -2185,7 +2195,7 @@ public final class ExecutionPlan {
                 linearKind(outputHead, Kind.Q3_LINEAR),
                 -1,
                 List.of(finalNormId),
-                List.of(outputHead),
+                linearWeights(weights, outputHead),
                 List.of(Buffer.FINAL_NORMALIZED),
                 List.of(Buffer.LOGITS),
                 hidden,
@@ -2288,7 +2298,8 @@ public final class ExecutionPlan {
                         nodes.size(),
                         linearKind(projection, Kind.Q3_LINEAR),
                         List.of(1),
-                        List.of(validateQuantized(projection, shape[0], hiddenSize, WeightFormat.Q3_G64_FP16)),
+                        linearWeights(
+                                weights, validateQuantized(projection, shape[0], hiddenSize, WeightFormat.Q3_G64_FP16)),
                         List.of(Buffer.INPUT_NORMALIZED),
                         List.of(Buffer.SLICE_PROJECTION),
                         hiddenSize,
@@ -2381,6 +2392,22 @@ public final class ExecutionPlan {
         return LinearFormats.find(weight.format(), weight.layout())
                 .map(format -> format.kind(role))
                 .orElse(role);
+    }
+
+    /// The weights of a linear instruction over `object`: the object, then the companion tensors its format lists
+    /// (a trellis object's `suh`, `svh` and `segments`), found among the model's runtime objects. Companions are
+    /// device-resident, so staging never gives them a slot.
+    private static List<TensorHandle> linearWeights(Weights weights, TensorHandle object) {
+        List<String> companions = LinearFormats.of(object).companions(object.name());
+        if (companions.isEmpty()) return List.of(object);
+        List<TensorHandle> all = new ArrayList<>(List.of(object));
+        for (String name : companions) {
+            TensorHandle companion = weights.runtimeObjects().get(name);
+            if (companion == null)
+                throw new IllegalArgumentException("no companion '" + name + "' of '" + object.name() + "'");
+            all.add(copyHandle(companion));
+        }
+        return List.copyOf(all);
     }
 
     private static TensorHandle validateQuantized(TensorHandle handle, long rows, int width, WeightFormat roleFormat) {

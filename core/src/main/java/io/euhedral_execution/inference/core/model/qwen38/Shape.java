@@ -203,6 +203,7 @@ public final class Shape implements GraphShape {
                     Q4_LINEAR,
                     Q5_LINEAR,
                     BF16_PROJECTION,
+                    TRELLIS_LINEAR,
                     DFLASH_LINEAR,
                     DFLASH_LM_HEAD -> {}
             default -> {
