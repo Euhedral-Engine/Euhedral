@@ -51,6 +51,10 @@ public final class CalibrationLattice implements AutoCloseable {
                 cpu = efficiency.nextSetBit(cpu + 1)) {
             if (allowed.get(cpu)) cpus.set(cpu);
         }
+        // Then the performance cores' second threads, and any CPU the topology does not class.
+        for (int cpu = allowed.nextSetBit(0);
+                cpu >= 0 && cpus.cardinality() < workers;
+                cpu = allowed.nextSetBit(cpu + 1)) cpus.set(cpu);
         FragmentConfig defaults = FragmentConfig.ofDefaults();
         FragmentConfig fixed = new FragmentConfig(
                 defaults.cloneConfig(),
@@ -74,6 +78,11 @@ public final class CalibrationLattice implements AutoCloseable {
     /// The lattice itself, for an engine [io.euhedral_execution.inference.core.model.qwen38.Execution] of its own.
     public ControlPlaneLattice terminal() {
         return lattice;
+    }
+
+    /// How many CPUs the process may run on: the default worker count, every one of them.
+    public static int allowedCpuCount() {
+        return allowedCpus().cardinality();
     }
 
     /// The CPUs the process may run on (Linux: `Cpus_allowed_list` of /proc/self/status); every CPU elsewhere.

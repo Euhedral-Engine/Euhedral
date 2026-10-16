@@ -42,22 +42,22 @@ import java.util.OptionalInt;
 /// [--library
 /// LIBEUHEDRAL_CUDA]
 /// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
-/// [--host-mib N] [--batch 4] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// [--host-mib N] [--batch 4] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
 /// 4096]
-/// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// [--batch 12] [--host-mib N] [--limit N] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
 /// [--copy-buffer-mib 64]
 /// allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json
 /// --reference R.kld... --context 32768 --state SEARCH.resume --out DIR [--seed-file F] [--batch 8]
-/// [--explore 0.3] [--patience 3] [--random 16] [--bands 8] [--verify-rows 5] [--workers 6] [--host-mib N]
+/// [--explore 0.3] [--patience 3] [--random 16] [--bands 8] [--verify-rows 5] [--workers N] [--host-mib N]
 /// [--free-mib N] [--score-rows 8] [--score-batch 4] [--members 8] [--ridge 1e-3] [--lambdas 0,0.002,0.005,0.01,0.02]
 /// [--budget-fractions 1.0,0.8] [--rco-steps 200] [--rco-lr 0.1] [--rco-samples 8] [--rco-restarts 4]
 /// [--knapsack-steps 4096] [--max-rounds N] [--seed 1] [--host-sinks N] [--library LIBEUHEDRAL_CUDA]
 /// cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows 1,2,3,4,5,6,512] [--repeats 50]
 /// [--rotate-mib 256] [--library LIBEUHEDRAL_CUDA]
 /// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
-/// [--parse-special] [--rows 8] [--batch 4] [--host-mib N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
+/// [--parse-special] [--rows 8] [--batch 4] [--host-mib N] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// rotate --model CHECKPOINT --out CHECKPOINT_DIR [--seed 1] [--library LIBEUHEDRAL_CUDA]
 /// ```
 public final class QuantizationMain {
@@ -94,13 +94,13 @@ public final class QuantizationMain {
                     + "[--rounding-lanes N] [--viterbi-scratch-mib 256] "
                     + "[--memory-reserve-mib 1024] [--write-buffer-mib 16] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
-                    + "[--rows 8] [--host-mib N] [--batch 4] [--workers 6] [--library PATH]");
+                    + "[--rows 8] [--host-mib N] [--batch 4] [--workers N] [--library PATH]");
             System.err.println(
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
-                            + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library PATH]");
+                            + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers N] [--library PATH]");
             System.err.println("       reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld "
                     + "[--context 2560] [--chunks N] [--parse-special] [--rows 8] [--batch 4] "
-                    + "[--host-mib N] [--workers 6] [--library PATH]");
+                    + "[--host-mib N] [--workers N] [--library PATH]");
             System.err.println("       rotate --model CHECKPOINT --out DIR [--seed 1] [--library PATH]");
             System.err.println(
                     "       assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT "
@@ -108,7 +108,7 @@ public final class QuantizationMain {
             System.err.println("       allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json "
                     + "--priors PRIORS.json --reference R.kld... --context 32768 --state SEARCH.resume --out DIR "
                     + "[--seed-file F] [--batch 8] [--explore 0.3] [--patience 3] [--random 16] [--bands 8] "
-                    + "[--verify-rows 5] [--workers 6] [--library PATH]");
+                    + "[--verify-rows 5] [--workers N] [--library PATH]");
             System.err.println("       cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json "
                     + "[--rows 1,2,3,4,5,6,512] [--repeats 50] [--rotate-mib 256] [--library PATH]");
             System.exit(2);
@@ -224,7 +224,7 @@ public final class QuantizationMain {
                             Integer.parseInt(options.getOrDefault("max-tokens", "4096")),
                             Integer.parseInt(options.getOrDefault("batch", "12")),
                             hostBytes(options),
-                            Integer.parseInt(options.getOrDefault("workers", "6")),
+                            workers(options),
                             Integer.parseInt(options.getOrDefault("limit", "0")),
                             Path.of(library)));
             return;
@@ -241,7 +241,7 @@ public final class QuantizationMain {
                     Integer.parseInt(options.getOrDefault("rows", "8")),
                     Integer.parseInt(options.getOrDefault("batch", "4")),
                     hostBytes(options),
-                    Integer.parseInt(options.getOrDefault("workers", "6")),
+                    workers(options),
                     Path.of(library)));
             return;
         }
@@ -265,7 +265,7 @@ public final class QuantizationMain {
                     Integer.parseInt(options.getOrDefault("rows", "8")),
                     hostBytes(options),
                     Integer.parseInt(options.getOrDefault("batch", "4")),
-                    Integer.parseInt(options.getOrDefault("workers", "6")),
+                    workers(options),
                     Path.of(library)));
             return;
         }
@@ -336,7 +336,7 @@ public final class QuantizationMain {
         if (referencePaths.isEmpty()) throw new IllegalArgumentException("--reference is required");
         Path costsFile = Path.of(required(options, "costs")), priorsFile = Path.of(required(options, "priors"));
         int context = Integer.parseInt(options.getOrDefault("context", "32768"));
-        int workers = Integer.parseInt(options.getOrDefault("workers", "6"));
+        int workers = workers(options);
         int scoreRows = Integer.parseInt(options.getOrDefault("score-rows", "8"));
         int scoreBatch = Integer.parseInt(options.getOrDefault("score-batch", "4"));
         long hostBytes = hostBytes(options);
@@ -364,7 +364,7 @@ public final class QuantizationMain {
                             freeBytes,
                             context,
                             Integer.parseInt(options.getOrDefault("verify-rows", "5")) - 1),
-                    Integer.parseInt(options.getOrDefault("host-sinks", Integer.toString(Math.max(1, workers / 2)))),
+                    Integer.parseInt(options.getOrDefault("host-sinks", Integer.toString(workers))),
                     Integer.parseInt(options.getOrDefault("members", "8")),
                     Double.parseDouble(options.getOrDefault("ridge", "1e-3")),
                     numbers(options.getOrDefault("lambdas", "0,0.002,0.005,0.01,0.02")),
@@ -388,6 +388,13 @@ public final class QuantizationMain {
     /// `--host-mib` in bytes, or [Residency#PLANNED] when it is not given.
     private static long hostBytes(Map<String, String> options) {
         return options.containsKey("host-mib") ? Long.parseLong(options.get("host-mib")) << 20 : Residency.PLANNED;
+    }
+
+    /// `--workers`, by default every CPU the process may run on.
+    private static int workers(Map<String, String> options) {
+        return options.containsKey("workers")
+                ? Integer.parseInt(options.get("workers"))
+                : CalibrationLattice.allowedCpuCount();
     }
 
     private static String required(Map<String, String> options, String key) {
