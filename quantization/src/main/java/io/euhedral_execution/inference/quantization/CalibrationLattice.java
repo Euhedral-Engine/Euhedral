@@ -61,7 +61,8 @@ public final class CalibrationLattice implements AutoCloseable {
                 defaults.cacheConfig(),
                 defaults.observer(),
                 defaults.maxBatchSize(),
-                defaults.smtEnabled(),
+                // Every hardware thread runs a worker: the module's host work is many small frames.
+                true,
                 new IdlePolicy(IdlePolicy.DEFAULT_IDLE_PARK_NS, IdlePolicy.DEFAULT_CONTENTION_HALF_LIFE_NANOS),
                 defaults.benchmarkMode(),
                 defaults.metricPrefix(),
