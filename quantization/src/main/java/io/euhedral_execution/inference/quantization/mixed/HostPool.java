@@ -15,23 +15,19 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
-/// Host work for the search to run beside the GPU: ingest sinks registered on the lattice, each running one
-/// queued task per poll on whichever worker polls it (the lattice polls a source one thread at a time).
+/// One kind of host work for the search to run beside the GPU: ingest sinks registered on the lattice, sharing
+/// one queue, each running one queued task per poll on whichever worker polls it (the lattice polls a source one
+/// thread at a time). A search keeps one pool per kind of work, so no kind queues behind another; as many sinks
+/// as workers lets every worker take the pool's work.
 /// [#submit] queues a task and returns its future; nothing waits. [#close] stops the sinks taking tasks, lets
 /// the running ones end, and removes the sinks from the lattice.
 public final class HostPool implements AutoCloseable {
 
-    /// One sink: a queue of tasks, the lattice's polls run them.
+    /// One sink: the lattice's polls run the pool's queued tasks.
     private final class Work extends AbstractIngestSink {
-        private final int index;
         private final Delegate delegate = new Delegate();
 
-        Work(int index) {
-            this.index = index;
-        }
-
         private void poll() {
-            if (index >= active) return;
             Runnable task = tasks.poll();
             if (task != null) task.run();
         }
@@ -69,8 +65,6 @@ public final class HostPool implements AutoCloseable {
     private final List<Work> sinks = new ArrayList<>();
     /// The tasks every sink takes from: whichever enabled sink polls next runs the oldest.
     private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
-    /// The sinks that take tasks: the first `active` ones.
-    private volatile int active;
     private final ConcurrentLinkedQueue<CompletableFuture<?>> submitted = new ConcurrentLinkedQueue<>();
     private volatile boolean closed;
 
@@ -79,9 +73,8 @@ public final class HostPool implements AutoCloseable {
         ControlPlaneLattice lattice = ControlPlaneLattice.getOrCreate();
         if (sinks < 1) throw new IllegalArgumentException("a host pool needs a sink");
         HostPool pool = new HostPool();
-        pool.active = sinks;
         for (int i = 0; i < sinks; i++) {
-            Work work = pool.new Work(i);
+            Work work = pool.new Work();
             pool.sinks.add(work);
             lattice.addUpstream(work);
         }
@@ -107,17 +100,6 @@ public final class HostPool implements AutoCloseable {
             }
         });
         return future;
-    }
-
-    /// Only the first sink takes tasks: work beside the engine's frames keeps to one owner worker, so the
-    /// stage frames on every other worker run unhindered.
-    public void narrow() {
-        active = 1;
-    }
-
-    /// Every sink takes tasks again.
-    public void widen() {
-        active = sinks.size();
     }
 
     @Override
