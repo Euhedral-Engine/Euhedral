@@ -53,7 +53,7 @@ import java.util.OptionalInt;
 /// [--explore 0.3] [--patience 3] [--random 16] [--bands 8] [--verify-rows 5] [--workers N] [--host-mib N]
 /// [--free-mib N] [--score-rows 8] [--score-batch 4] [--members 8] [--ridge 1e-3] [--lambdas 0,0.002,0.005,0.01,0.02]
 /// [--budget-fractions 1.0,0.8] [--rco-steps 200] [--rco-lr 0.1] [--rco-samples 8] [--rco-restarts 4]
-/// [--knapsack-steps 4096] [--max-rounds N] [--seed 1] [--host-sinks N] [--library LIBEUHEDRAL_CUDA]
+/// [--knapsack-steps 512] [--max-rounds N] [--seed 1] [--host-sinks N] [--library LIBEUHEDRAL_CUDA]
 /// cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows 1,2,3,4,5,6,512] [--repeats 50]
 /// [--rotate-mib 256] [--library LIBEUHEDRAL_CUDA]
 /// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
@@ -374,7 +374,7 @@ public final class QuantizationMain {
                             Double.parseDouble(options.getOrDefault("rco-lr", "0.1")),
                             Integer.parseInt(options.getOrDefault("rco-samples", "8")),
                             Integer.parseInt(options.getOrDefault("rco-restarts", "4"))),
-                    Integer.parseInt(options.getOrDefault("knapsack-steps", "4096")),
+                    Integer.parseInt(options.getOrDefault("knapsack-steps", "512")),
                     Integer.parseInt(options.getOrDefault("max-rounds", Integer.toString(Integer.MAX_VALUE))),
                     Long.parseLong(options.getOrDefault("seed", "1")),
                     // Priors only steer proposals, never a measurement, so a search may change them and resume.
