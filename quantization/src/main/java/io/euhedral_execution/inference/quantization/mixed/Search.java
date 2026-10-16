@@ -23,6 +23,7 @@ import java.util.OptionalInt;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.function.LongFunction;
 
 /// The search for the allocations on the quality and speed front of a set of calibrated sources, each candidate
@@ -43,10 +44,37 @@ import java.util.function.LongFunction;
 /// without scoring a candidate twice.
 public final class Search {
 
-    /// Scores one assembled candidate: the file its objects without a source of their own are read from, and
-    /// the composite.
+    /// Scores assembled candidates: the file their objects without a source of their own are read from, and the
+    /// composite. A scoring that scores one candidate at a time implements [#score] alone; one that scores
+    /// several at once ([#concurrent]) implements [#submit] too.
     public interface Scoring {
         Scorer.Result score(Path artifactPath, Artifact artifact) throws Exception;
+
+        /// Starts scoring one candidate and returns its future. `started` is run once the candidate's scoring
+        /// has begun (a candidate waiting for device memory has not begun). This default scores it before
+        /// returning, on the calling thread.
+        default CompletableFuture<Scorer.Result> submit(Path artifactPath, Artifact artifact, Runnable started) {
+            started.run();
+            try {
+                return CompletableFuture.completedFuture(score(artifactPath, artifact));
+            } catch (Exception failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+        }
+
+        /// Whether [#submit] returns before the candidate is scored.
+        default boolean concurrent() {
+            return false;
+        }
+
+        /// Runs the work a concurrent scoring leaves to the thread that waits (it starts and ends executions
+        /// there, never on a lattice worker); nothing to do by default.
+        default void service() throws Exception {}
+
+        /// A future that completes when [#service] has work, replaced by each call of [#service].
+        default CompletableFuture<Void> attention() {
+            return new CompletableFuture<>();
+        }
     }
 
     /// Everything a search is told.
@@ -697,15 +725,22 @@ public final class Search {
 
     // --------------------------------------------------------------- measuring
 
-    /// Scores the candidates of `batch` not measured yet, in order. While one is scored the next is assembled and
-    /// checked on the candidates pool. When the last one starts scoring, the next round's proposals start on the
-    /// proposals pool (from what is measured before it), and are returned as a future.
+    /// A candidate submitted for scoring.
+    private record Submitted(int index, Prepared prepared, CompletableFuture<Scorer.Result> result) {}
+
+    /// Scores the candidates of `batch` not measured yet: each is submitted as it is assembled and checked on the
+    /// candidates pool (the next while the previous ones are scored), and recorded when its score is complete,
+    /// whatever order they complete in. When the last one starts scoring, the next round's proposals start on the
+    /// proposals pool (from what is measured by then), and are returned as a future. A scoring that scores one at a
+    /// time starts them before the last one's score.
     private CompletableFuture<Proposals> measure(List<Candidate> batch, int round) throws Exception {
         List<Candidate> todo = new ArrayList<>();
         Set<Allocation> listed = new HashSet<>();
         for (Candidate candidate : batch)
             if (!state.contains(candidate.allocation()) && listed.add(candidate.allocation())) todo.add(candidate);
         CompletableFuture<Proposals> next = null;
+        CompletableFuture<Void> lastStarted = new CompletableFuture<>();
+        List<Submitted> pending = new ArrayList<>();
         CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : prepare(candidates(), todo.get(0));
         for (int k = 0; k < todo.size(); k++) {
             Prepared ready = prepared.get();
@@ -713,8 +748,57 @@ public final class Search {
                 Candidate following = todo.get(k + 1);
                 prepared = prepare(candidates(), following);
             }
-            if (k == todo.size() - 1 && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
-            Scorer.Result result = scoring.score(s.sources().path(s.sources().base()), ready.artifact());
+            boolean last = k == todo.size() - 1;
+            if (last && !scoring.concurrent() && round + 1 <= s.maxRounds())
+                next = propose(state.measured(), round + 1);
+            pending.add(new Submitted(
+                    k,
+                    ready,
+                    scoring.submit(
+                            s.sources().path(s.sources().base()),
+                            ready.artifact(),
+                            last ? () -> lastStarted.complete(null) : () -> {})));
+            record(pending, todo.size(), round);
+        }
+        while (!pending.isEmpty()) {
+            scoring.service();
+            record(pending, todo.size(), round);
+            if (next == null && scoring.concurrent() && lastStarted.isDone() && round + 1 <= s.maxRounds())
+                next = propose(state.measured(), round + 1);
+            if (pending.isEmpty()) break;
+            List<CompletableFuture<?>> waiting = new ArrayList<>();
+            for (Submitted submitted : pending) waiting.add(submitted.result());
+            waiting.add(scoring.attention());
+            if (next == null && !lastStarted.isDone()) waiting.add(lastStarted);
+            try {
+                CompletableFuture.anyOf(waiting.toArray(new CompletableFuture<?>[0]))
+                        .get();
+            } catch (ExecutionException failed) {
+                // A failed score is found, and thrown, when the finished are recorded.
+            }
+        }
+        if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
+        closeCandidates();
+        return next;
+    }
+
+    /// Records, in the order they finished, the submitted candidates whose scores are complete; a failed one stops
+    /// the search with its failure.
+    private void record(List<Submitted> pending, int total, int round) throws Exception {
+        for (var it = pending.iterator(); it.hasNext(); ) {
+            Submitted done = it.next();
+            if (!done.result().isDone()) continue;
+            it.remove();
+            Scorer.Result result;
+            try {
+                result = done.result().get();
+            } catch (ExecutionException failure) {
+                Throwable cause = failure.getCause();
+                if (cause instanceof Exception exception) throw exception;
+                if (cause instanceof Error error) throw error;
+                throw failure;
+            }
+            Prepared ready = done.prepared();
             Measured measured = new Measured(
                     ready.candidate().allocation(),
                     result.meanKl(),
@@ -730,8 +814,8 @@ public final class Search {
                     Locale.ROOT,
                     "round %d, %d/%d: %s kl %.5f +- %.5f, %d MiB, prefill %.2f us/token, verify %.1f us, %s%n",
                     round,
-                    k + 1,
-                    todo.size(),
+                    done.index() + 1,
+                    total,
                     measured.origin(),
                     measured.kl(),
                     measured.klSe(),
@@ -740,9 +824,6 @@ public final class Search {
                     measured.decode(),
                     measured.fits() ? "fits" : "does not fit");
         }
-        if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
-        closeCandidates();
-        return next;
     }
 
     /// A candidate assembled and checked, in frames of their own: its composite view (and the bytes of its

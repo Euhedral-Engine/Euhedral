@@ -52,6 +52,27 @@ final class CompactWeightLoader {
             Set<String> hostBacked,
             Set<String> diskBacked)
             throws IOException {
+        return load(
+                artifactPath,
+                artifact,
+                gpuMemory,
+                descriptors,
+                speculation,
+                hostBacked,
+                diskBacked,
+                ObjectLoader.OWNED);
+    }
+
+    static Weights load(
+            Path artifactPath,
+            Artifact artifact,
+            GpuMemory gpuMemory,
+            Map<String, TensorDescriptor> descriptors,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked,
+            ObjectLoader objects)
+            throws IOException {
         Qwen38Config config = artifact.config();
         validateConfig(config);
         Function<TensorDescriptor, Path> paths = descriptor -> artifact.pathOf(artifactPath, descriptor);
@@ -59,7 +80,7 @@ final class CompactWeightLoader {
         validateInventory(config, descriptors, dflash2);
         Map<String, int[]> ends = new LinkedHashMap<>(validateTrellisSegments(paths, descriptors));
         Map<String, TensorHandle> handles =
-                loadObjects(paths, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked);
+                loadObjects(paths, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked, objects);
         try {
             // Only an MTP load prepares the MTP layer for execution.
             if (speculation == ArtifactProfile.Speculation.MTP) splitMtpAttention(handles, gpuMemory, ends);
@@ -76,7 +97,7 @@ final class CompactWeightLoader {
                     DFlash2Inventory.assemble(dflash2, handles),
                     weights.segmentEnds());
         } catch (Throwable failure) {
-            freeAll(handles.values(), gpuMemory, failure);
+            freeAll(handles.values(), gpuMemory, failure, objects);
             freeArena(handles.values(), gpuMemory, failure);
             return propagate(failure);
         }
@@ -94,7 +115,14 @@ final class CompactWeightLoader {
             Set<String> hostBacked,
             Set<String> diskBacked)
             throws IOException {
-        return loadObjects(descriptor -> artifactPath, descriptors, gpuMemory, speculation, hostBacked, diskBacked);
+        return loadObjects(
+                descriptor -> artifactPath,
+                descriptors,
+                gpuMemory,
+                speculation,
+                hostBacked,
+                diskBacked,
+                ObjectLoader.OWNED);
     }
 
     /// As above, reading each object from the file `paths` gives for its descriptor.
@@ -105,6 +133,20 @@ final class CompactWeightLoader {
             ArtifactProfile.Speculation speculation,
             Set<String> hostBacked,
             Set<String> diskBacked)
+            throws IOException {
+        return loadObjects(paths, descriptors, gpuMemory, speculation, hostBacked, diskBacked, ObjectLoader.OWNED);
+    }
+
+    /// As above, placing each device-resident object with `objects`; a handle it [ObjectLoader#borrowed] is never
+    /// freed here.
+    static Map<String, TensorHandle> loadObjects(
+            Function<TensorDescriptor, Path> paths,
+            Collection<TensorDescriptor> descriptors,
+            GpuMemory gpuMemory,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked,
+            ObjectLoader objects)
             throws IOException {
         // The DFlash2 selector's codebooks are always read in place from mapped host memory.
         Set<String> mapped = new HashSet<>();
@@ -146,12 +188,11 @@ final class CompactWeightLoader {
                         loaded = mapped(loaded, gpuMemory.hostWeightsDeviceAddress(loaded.hostAddress()));
                     handles.put(descriptor.name(), loaded);
                     hostOffset += hostSlot(descriptor.byteSize());
-                } else
-                    handles.put(descriptor.name(), TensorLoader.load(paths.apply(descriptor), descriptor, gpuMemory));
+                } else handles.put(descriptor.name(), objects.load(paths.apply(descriptor), descriptor, gpuMemory));
             }
             return handles;
         } catch (Throwable failure) {
-            freeAll(handles.values(), gpuMemory, failure);
+            freeAll(handles.values(), gpuMemory, failure, objects);
             if (hostArena != 0) {
                 try {
                     gpuMemory.freeHostWeights(hostArena);
@@ -765,9 +806,14 @@ final class CompactWeightLoader {
     }
 
     private static void freeAll(Iterable<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
+        freeAll(handles, gpuMemory, failure, ObjectLoader.OWNED);
+    }
+
+    private static void freeAll(
+            Iterable<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure, ObjectLoader objects) {
         for (TensorHandle handle : handles) {
-            // In the host arena, or in the file.
-            if (handle.hostAddress() != 0 || handle.diskBacked()) continue;
+            // In the host arena, or in the file, or someone else's.
+            if (handle.hostAddress() != 0 || handle.diskBacked() || objects.borrowed(handle)) continue;
             try {
                 gpuMemory.free(handle.deviceAddress());
             } catch (Throwable cleanupFailure) {

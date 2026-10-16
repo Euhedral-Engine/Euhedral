@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -199,6 +200,93 @@ class SearchTest {
         for (Measured m : outcome.measured()) assertTrue(distinct.add(m.a()), "no duplicate entry");
         assertEquals(scored.size(), outcome.measured().size());
         assertTrue(outcome.measured().size() > 3);
+    }
+
+    /// A scorer that scores several at once: it holds what is submitted and completes it, last submitted first, when
+    /// the waiting thread services it; the `stopAt`th completion fails instead (never when 0).
+    private final class OutOfOrder implements Search.Scoring {
+        final Map<Allocation, Integer> scored = new HashMap<>();
+        final List<Runnable> held = new ArrayList<>();
+        int completions;
+        final int stopAt;
+
+        OutOfOrder(int stopAt) {
+            this.stopAt = stopAt;
+        }
+
+        @Override
+        public Scorer.Result score(Path path, Artifact artifact) {
+            throw new AssertionError("scored one at a time");
+        }
+
+        @Override
+        public boolean concurrent() {
+            return true;
+        }
+
+        @Override
+        public CompletableFuture<Scorer.Result> submit(Path path, Artifact artifact, Runnable started) {
+            CompletableFuture<Scorer.Result> result = new CompletableFuture<>();
+            started.run();
+            held.add(() -> {
+                if (++completions == stopAt) {
+                    result.completeExceptionally(new IllegalStateException("stopped"));
+                    return;
+                }
+                scored.merge(allocationOf(artifact), 1, Integer::sum);
+                result.complete(new Scorer.Result(kl(artifact), 0.001, 0.9, 0, 0, new double[0]));
+            });
+            return result;
+        }
+
+        @Override
+        public void service() {
+            List<Runnable> now = new ArrayList<>(held);
+            held.clear();
+            for (int i = now.size() - 1; i >= 0; i--) now.get(i).run();
+        }
+
+        @Override
+        public CompletableFuture<Void> attention() {
+            return held.isEmpty() ? new CompletableFuture<>() : CompletableFuture.completedFuture(null);
+        }
+    }
+
+    @Test
+    void aBatchScoredAtOnceThatCompletesOutOfOrderRecordsEveryCandidateOnce() throws Exception {
+        setUp();
+        OutOfOrder scoring = new OutOfOrder(0);
+        Search.Outcome outcome = Search.run(settings(directory.resolve("search.resume")), scoring);
+        assertTrue(scoring.scored.values().stream().allMatch(count -> count == 1), scoring.scored.toString());
+        assertEquals(scoring.scored.size(), outcome.measured().size());
+        assertTrue(outcome.measured().size() > 5);
+        Set<Allocation> distinct = new HashSet<>();
+        for (Measured m : outcome.measured()) assertTrue(distinct.add(m.a()), "no duplicate entry");
+        assertFalse(outcome.front().isEmpty());
+        // The resume file holds exactly what the run measured.
+        Search.Outcome resumed = Search.run(settings(directory.resolve("search.resume")), scoring);
+        assertEquals(outcome.measured().size(), resumed.measured().size());
+    }
+
+    @Test
+    void aSearchStoppedBetweenCompletionsResumesWithoutScoringOrRecordingAnythingTwice() throws Exception {
+        setUp();
+        Path state = directory.resolve("search.resume");
+        OutOfOrder stopping = new OutOfOrder(4);
+        IllegalStateException stop =
+                assertThrows(IllegalStateException.class, () -> Search.run(settings(state), stopping));
+        assertEquals("stopped", stop.getMessage());
+        // Only completed scores were recorded: the ones that completed before the stop, each once.
+        assertTrue(stopping.scored.values().stream().allMatch(count -> count == 1));
+        OutOfOrder resuming = new OutOfOrder(0);
+        Search.Outcome outcome = Search.run(settings(state), resuming);
+        Map<Allocation, Integer> all = new HashMap<>(stopping.scored);
+        resuming.scored.forEach((allocation, count) -> all.merge(allocation, count, Integer::sum));
+        // A candidate that completed before the stop but was not recorded may be scored again; none is recorded twice.
+        Set<Allocation> distinct = new HashSet<>();
+        for (Measured m : outcome.measured()) assertTrue(distinct.add(m.a()), "no duplicate entry");
+        assertTrue(outcome.measured().size() > 3);
+        for (Measured m : outcome.measured()) assertTrue(all.containsKey(m.a()), "every record was scored");
     }
 
     @Test

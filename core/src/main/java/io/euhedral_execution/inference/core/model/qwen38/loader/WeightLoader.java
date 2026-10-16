@@ -44,6 +44,21 @@ public final class WeightLoader {
             Set<String> hostBacked,
             Set<String> diskBacked)
             throws IOException {
+        return load(artifactPath, artifact, gpuMemory, speculation, hostBacked, diskBacked, ObjectLoader.OWNED);
+    }
+
+    /// As above, placing each device-resident object with `objects` (see [ObjectLoader]): a caller that shares
+    /// objects between models passes borrowed handles, which no load ever frees.
+    public static Weights load(
+            Path artifactPath,
+            Artifact artifact,
+            GpuMemory gpuMemory,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked,
+            ObjectLoader objects)
+            throws IOException {
+        Objects.requireNonNull(objects, "objects");
         Objects.requireNonNull(artifactPath, "artifactPath");
         Objects.requireNonNull(artifact, "artifact");
         Objects.requireNonNull(gpuMemory, "gpuMemory");
@@ -56,7 +71,14 @@ public final class WeightLoader {
                 indexDescriptors(requireDescriptors(artifact)),
                 speculation,
                 hostBacked,
-                diskBacked);
+                diskBacked,
+                objects);
+    }
+
+    /// Whether a load with `speculation` places the object `name` on the device (or in host memory): the MTP layer
+    /// and draft head only for MTP, the DFlash2 drafter only for DFlash2.
+    public static boolean uploads(String name, ArtifactProfile.Speculation speculation) {
+        return CompactWeightLoader.uploads(name, speculation);
     }
 
     /// Loads the actual embedding and model-declared GDN layer zero without uploading later layers.
