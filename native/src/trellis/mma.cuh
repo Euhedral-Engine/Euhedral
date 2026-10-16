@@ -18,30 +18,50 @@ __device__ __forceinline__ void mma_f16(float* c, const unsigned int* a, unsigne
 
 __device__ __forceinline__ unsigned int pack_half2(half2 value) { return *reinterpret_cast<unsigned int*>(&value); }
 
-/// `MT` m16 row tiles starting at row `row_base` over the k16 tiles [first, last) of one 128-column block. Warp `warp`
-/// owns the 16-column tile blockIdx.x * 8 + warp. The same instruction sequence runs for every m-tile, rows past
-/// `rows` are zero, and k16 tiles are accumulated in increasing order, so a row's bits depend on nothing but its own
-/// data and the K range.
-template <int MT>
+/// The tile ring of `W` uint16 words as each lane decodes it. A lane's eight positions lane * 8 + j are contiguous, so
+/// their windows lie in `kWords` consecutive ring words from the lane's first window, and window j starts kOffset(j)
+/// bits after window 0 whatever the lane: lane * 8 is 0 or 8 mod 16 and the half step mask sets only odd bits.
+template <int W>
+struct Ring {
+    static constexpr int kWords32 = W / 2, kBits = W / 16;
+    static constexpr bool kHalf = (W & 15) == 8;
+    __host__ __device__ static constexpr int kOffset(int j) { return kBits * j + (kHalf ? (j + 1) / 2 : 0); }
+    // The last window ends kOffset(7) + 16 bits after the first, which starts up to 31 bits into the first word.
+    static constexpr int kWords = (31 + kOffset(7) + 16 + 31) / 32;
+};
+
+/// Window j of a lane's normalized words (see Ring): the 16 bits starting kOffset(j) bits into u, MSB first.
+template <int W>
+__device__ __forceinline__ unsigned int window(const unsigned int* u, int j) {
+    const int offset = Ring<W>::kOffset(j);
+    const int i = offset >> 5, o = offset & 31;
+    if (o <= 16) return (u[i] >> (16 - o)) & 0xFFFFu;
+    return __funnelshift_l(u[i + 1], u[i], o) >> 16;
+}
+
+/// `MT` m16 row tiles starting at row `row_base` over the k16 tiles [first, last) of one 128-column block, for tiles of
+/// `W` words. Warp `warp` owns the 16-column tile blockIdx.x * 8 + warp. The same instruction sequence runs for every
+/// m-tile, rows past `rows` are zero, and k16 tiles are accumulated in increasing order, so a row's bits depend on
+/// nothing but its own data and the K range.
+template <int W, int MT>
 __device__ __forceinline__ void group(const unsigned short* __restrict__ act, const unsigned short* __restrict__ words,
         const unsigned short* __restrict__ svh, float* __restrict__ partials, unsigned short* __restrict__ out,
-        int rows, int row_base, int k, int n, int w, int splits, int split, int first, int last,
+        int rows, int row_base, int k, int n, int splits, int split, int first, int last,
         unsigned int (*ring)[kTrellisMaxWords], float (*tile)[128]) {
+    using R = Ring<W>;
+    constexpr int nw = R::kWords32;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int grp = lane >> 2, q = lane & 3;
-    const int nw = w >> 1, ka = w >> 4;
-    const unsigned int mask = (w & 15) == 8 ? 0xAAAAu : 0u;
     const int tiles_n = n >> 4;
     const int tj = blockIdx.x * 8 + warp;
 
-    // The ring window of each of this lane's eight positions is the same for every k16 tile.
-    int start[8];
+    // This lane's ring words and the bit where its first window starts in the first of them, the same for every tile.
+    int at = frac_s(lane * 8, W >> 4, R::kHalf ? 0xAAAAu : 0u, W) - 16;
+    if (at < 0) at += nw * 32;
+    const int shift = at & 31;
+    int word[R::kWords];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        int at = frac_s(lane * 8 + j, ka, mask, w) - 16;
-        if (at < 0) at += nw * 32;
-        start[j] = at;
-    }
+    for (int i = 0; i < R::kWords; ++i) word[i] = ((at >> 5) + i) % nw;
 
     float acc[MT][2][4];
 #pragma unroll
@@ -62,20 +82,27 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
     unsigned int* mine = ring[warp];
     for (int ti = first; ti < last; ++ti) {
         mine[lane] = next0;
-        mine[lane + 32] = next1;
+        if (nw > 32) mine[lane + 32] = next1;
         __syncwarp();
         if (ti + 1 < last) {
             const unsigned int* from = source + (size_t)(ti + 1) * stride;
             next0 = lane < nw ? from[lane] : 0u;
             next1 = lane + 32 < nw ? from[lane + 32] : 0u;
         }
+        // The lane's words shifted so its first window starts at bit 0 (MSB first).
+        unsigned int u[R::kWords];
+#pragma unroll
+        for (int i = 0; i < R::kWords; ++i) u[i] = mine[word[i]];
+#pragma unroll
+        for (int i = 0; i + 1 < R::kWords; ++i) u[i] = __funnelshift_l(u[i + 1], u[i], shift);
+        u[R::kWords - 1] <<= shift;
         unsigned int b[2][2];
 #pragma unroll
         for (int h = 0; h < 2; ++h)
 #pragma unroll
             for (int half_index = 0; half_index < 2; ++half_index) {
                 const int j = h * 4 + half_index * 2;
-                b[h][half_index] = pack_half2(decode_mul1_2(frac_window(mine, nw, start[j]), frac_window(mine, nw, start[j + 1])));
+                b[h][half_index] = pack_half2(decode_mul1_2(window<W>(u, j), window<W>(u, j + 1)));
             }
         __syncwarp();
 #pragma unroll
@@ -133,6 +160,23 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
     }
 }
 
+/// All rows in groups of up to 64 (four m16 tiles).
+template <int W>
+__device__ __forceinline__ void rows(const unsigned short* __restrict__ act, const unsigned short* __restrict__ words,
+        const unsigned short* __restrict__ svh, float* __restrict__ partials, unsigned short* __restrict__ out,
+        int rows, int k, int n, int splits, int first, int last, unsigned int (*ring)[kTrellisMaxWords],
+        float (*tile)[128]) {
+    for (int row_base = 0; row_base < rows; row_base += 64) {
+        const int remaining = (rows - row_base + 15) >> 4;
+        if (remaining >= 3)
+            group<W, 4>(act, words, svh, partials, out, rows, row_base, k, n, splits, blockIdx.y, first, last, ring, tile);
+        else if (remaining == 2)
+            group<W, 2>(act, words, svh, partials, out, rows, row_base, k, n, splits, blockIdx.y, first, last, ring, tile);
+        else
+            group<W, 1>(act, words, svh, partials, out, rows, row_base, k, n, splits, blockIdx.y, first, last, ring, tile);
+    }
+}
+
 }  // namespace trellis_mma
 
 // act f16 [s][rows][k]; words the payload [k/16][n/16][w]; ends the exclusive segment row ends; svh f16 [n]. With
@@ -154,14 +198,17 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_trellis_mma(
     const int tiles = k >> 4;
     const int first = (int)(((long long)blockIdx.y * tiles) / splits);
     const int last = (int)(((long long)(blockIdx.y + 1) * tiles) / splits);
-    for (int row_base = 0; row_base < rows; row_base += 64) {
-        const int remaining = (rows - row_base + 15) >> 4;
-        if (remaining >= 3)
-            trellis_mma::group<4>(segment, words, svh, partials, out, rows, row_base, k, n, w, splits, blockIdx.y, first, last, ring, tile);
-        else if (remaining == 2)
-            trellis_mma::group<2>(segment, words, svh, partials, out, rows, row_base, k, n, w, splits, blockIdx.y, first, last, ring, tile);
-        else
-            trellis_mma::group<1>(segment, words, svh, partials, out, rows, row_base, k, n, w, splits, blockIdx.y, first, last, ring, tile);
+    switch (w) {
+#define EUHEDRAL_TRELLIS_MMA_WIDTH(W) \
+    case W: \
+        trellis_mma::rows<W>(segment, words, svh, partials, out, rows, k, n, splits, first, last, ring, tile); \
+        break;
+        EUHEDRAL_TRELLIS_MMA_WIDTH(16) EUHEDRAL_TRELLIS_MMA_WIDTH(24) EUHEDRAL_TRELLIS_MMA_WIDTH(32)
+        EUHEDRAL_TRELLIS_MMA_WIDTH(40) EUHEDRAL_TRELLIS_MMA_WIDTH(48) EUHEDRAL_TRELLIS_MMA_WIDTH(56)
+        EUHEDRAL_TRELLIS_MMA_WIDTH(64) EUHEDRAL_TRELLIS_MMA_WIDTH(72) EUHEDRAL_TRELLIS_MMA_WIDTH(80)
+        EUHEDRAL_TRELLIS_MMA_WIDTH(88) EUHEDRAL_TRELLIS_MMA_WIDTH(96) EUHEDRAL_TRELLIS_MMA_WIDTH(104)
+        EUHEDRAL_TRELLIS_MMA_WIDTH(112) EUHEDRAL_TRELLIS_MMA_WIDTH(120) EUHEDRAL_TRELLIS_MMA_WIDTH(128)
+#undef EUHEDRAL_TRELLIS_MMA_WIDTH
     }
 }
 
