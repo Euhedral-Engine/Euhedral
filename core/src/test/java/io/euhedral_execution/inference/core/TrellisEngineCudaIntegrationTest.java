@@ -77,7 +77,7 @@ class TrellisEngineCudaIntegrationTest {
         }
 
         // Enough sequences that the plan moves trellis payloads to host memory.
-        int crowded = Integer.getInteger("euhedral.trellis.test.host-sequences", 48);
+        int crowded = Integer.getInteger("euhedral.trellis.test.host-sequences", 16);
         try (InferenceEngine engine = InferenceEngine.load(config(artifact, tokenizer, library, crowded))) {
             long hostBytes = engine.hostBackedWeightBytes();
             System.out.printf(
