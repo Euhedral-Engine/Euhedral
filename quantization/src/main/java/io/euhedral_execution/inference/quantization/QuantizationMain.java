@@ -15,7 +15,8 @@ import java.util.Map;
 /// --draft-ids-from ARTIFACT
 /// --out CODES_DIR [--act-order] [--damp 0.01] [--batch 8] [--sequences N] [--layers N] [--skip-mtp]
 /// [--nvfp4-above 2] [--nvfp4-scale-max 448] [--library LIBEUHEDRAL_CUDA]
-/// calibrate --model CHECKPOINT --format trellis --bits 2.5|3.0|3.5 --tokens TOKENS.npy --out CHECKPOINT_DIR
+/// calibrate --model CHECKPOINT --format trellis --bits 2.5|3.0|3.5 --tokens TOKENS.npy --draft-ids-from ARTIFACT
+/// --out CHECKPOINT_DIR [--output-head FORMAT]
 /// [--batch 8] [--sequences N] [--layers N] [--rounding-lanes N] [--viterbi-scratch-mib 256]
 /// [--memory-reserve-mib 1024] [--write-buffer-mib 16] [--library LIBEUHEDRAL_CUDA]
 /// train-blocks --model CHECKPOINT --codes CODES_DIR --tokens TOKENS.npy --out CODES_DIR --train-layers 10,11|all
@@ -38,16 +39,8 @@ public final class QuantizationMain {
     private QuantizationMain() {}
 
     /// Calibrate flags that only the GPTQ path reads; a trellis run rejects them.
-    private static final List<String> GPTQ_ONLY_FLAGS = List.of(
-            "skip-mtp",
-            "act-order",
-            "damp",
-            "quantization",
-            "compressed",
-            "output-head",
-            "draft-ids-from",
-            "nvfp4-above",
-            "nvfp4-scale-max");
+    private static final List<String> GPTQ_ONLY_FLAGS =
+            List.of("skip-mtp", "act-order", "damp", "quantization", "compressed", "nvfp4-above", "nvfp4-scale-max");
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0
@@ -58,7 +51,8 @@ public final class QuantizationMain {
                             + "--draft-ids-from ARTIFACT --out DIR [--act-order] [--damp D] [--batch B] [--sequences N] "
                             + "[--layers N] [--skip-mtp] [--library PATH]");
             System.err.println("       calibrate --model DIR --format trellis --bits 2.5|3.0|3.5 --tokens T.npy "
-                    + "--out DIR [--batch B] [--sequences N] [--layers N] [--rounding-lanes N] [--viterbi-scratch-mib 256] "
+                    + "--draft-ids-from ARTIFACT --out DIR [--output-head FORMAT] [--batch B] [--sequences N] [--layers N] "
+                    + "[--rounding-lanes N] [--viterbi-scratch-mib 256] "
                     + "[--memory-reserve-mib 1024] [--write-buffer-mib 16] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
                     + "[--rows 8] [--host-mib N] [--batch 4] [--workers 6] [--library PATH]");
@@ -179,17 +173,16 @@ public final class QuantizationMain {
                 if (options.containsKey(flag))
                     throw new IllegalArgumentException("--" + flag + " applies to --format gptq, not trellis");
         }
+        if (trellis) required(options, "draft-ids-from"); // the heads are rounded in a trellis run
         Double bits = trellis ? Double.valueOf(required(options, "bits")) : null;
         var settings = new Calibrate.Settings(
                 Path.of(required(options, "model")),
-                trellis
-                        ? null
-                        : new Recipe(
-                                required(options, "quantization"),
-                                options.containsKey("compressed"),
-                                options.get("output-head")),
+                new Recipe(
+                        trellis ? "trellis" : required(options, "quantization"),
+                        options.containsKey("compressed"),
+                        options.get("output-head")),
                 Path.of(required(options, "tokens")),
-                trellis ? null : Path.of(required(options, "draft-ids-from")),
+                Path.of(required(options, "draft-ids-from")),
                 Path.of(required(options, "out")),
                 options.containsKey("act-order"),
                 Float.parseFloat(options.getOrDefault("damp", "0.01")),
