@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -42,6 +43,11 @@ public final class Cost {
 
     /// BF16 0.0078125, the value the input rows are filled with; the timing does not depend on the contents.
     private static final short INPUT_VALUE = 0x3C00;
+
+    /// The two host-mapped 32-bit flags of a timed run: start, then done.
+    private static final long FLAG_BYTES = 4096;
+
+    private static final VarHandle FLAG = ValueLayout.JAVA_INT.varHandle();
 
     private static final ValueLayout.OfShort SHORT =
             ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -162,10 +168,7 @@ public final class Cost {
                             ends));
                 for (LinearLaunch launch : launches) format.linear(gpu, launch); // warmup: every copy once
                 device.synchronize();
-                long start = System.nanoTime();
-                for (int repeat = 0; repeat < repeats; repeat++) format.linear(gpu, launches.get(repeat % copies));
-                device.synchronize();
-                result.put(count, (System.nanoTime() - start) / 1e3 / repeats);
+                result.put(count, gpuMicros(device, gpu, format, launches, repeats));
                 if (scratch != 0) {
                     gpu.free(scratch);
                     buffers.remove(scratch);
@@ -176,6 +179,33 @@ public final class Cost {
             for (long address : buffers) gpu.free(address);
             for (List<TensorHandle> handles : weights)
                 for (TensorHandle handle : handles) gpu.free(handle.deviceAddress());
+        }
+    }
+
+    /// The device time of one launch, `repeats` launches round-robin over `launches`: the stream first waits on a
+    /// host-mapped flag while every launch is queued, then runs them back to back and raises a second flag, so the
+    /// time between releasing the first and seeing the second is the device's alone. The engine runs decode steps
+    /// as captured graphs, which launch with no host cost between kernels; wall clock around the launch calls would
+    /// add the host's per-launch cost instead.
+    private static double gpuMicros(
+            Device device, CudaGpuMemory gpu, LinearFormat format, List<LinearLaunch> launches, int repeats) {
+        long flags = gpu.allocateHostWeights(FLAG_BYTES);
+        try {
+            MemorySegment host = MemorySegment.ofAddress(flags).reinterpret(FLAG_BYTES);
+            FLAG.setVolatile(host, 0L, 0);
+            FLAG.setVolatile(host, (long) Integer.BYTES, 0);
+            long device0 = gpu.hostWeightsDeviceAddress(flags);
+            gpu.waitHostFlag(device0, 1);
+            for (int repeat = 0; repeat < repeats; repeat++) format.linear(gpu, launches.get(repeat % launches.size()));
+            gpu.writeHostFlag(device0 + Integer.BYTES, 1);
+            long start = System.nanoTime();
+            FLAG.setVolatile(host, 0L, 1);
+            while ((int) FLAG.getVolatile(host, (long) Integer.BYTES) != 1) Thread.onSpinWait();
+            long elapsed = System.nanoTime() - start;
+            device.synchronize();
+            return elapsed / 1e3 / repeats;
+        } finally {
+            gpu.freeHostWeights(flags);
         }
     }
 
