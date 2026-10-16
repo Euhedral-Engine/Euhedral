@@ -158,9 +158,9 @@ codebook, signed 128-point Hadamard rotations of both sides, LDLQ error feedback
 row and column scales refit in the Hessian metric), with rates from 2 to 6 bits and half-bit steps allocated per linear
 to the average. The Hessians come from the Swift calibration trace (218 sequences of 2048 tokens) run through the
 BF16 layers one at a time; the LM head is stored as F16 (BF16 source), the MTP layer is rounded at 4 bits without a
-Hessian, the vision tower is copied. The engine does not run this format yet; the numbers below were scored with
-exllamav3 against the same Swift-1.5 BF16 references as above (`dNLL ± chunk-level SE / mean KL / top-1`; exllamav3's
-scores carry no standard errors).
+Hessian, the vision tower is copied. The rows below were scored with exllamav3 against the same Swift-1.5 BF16
+references as above (`dNLL ± chunk-level SE / mean KL / top-1`; exllamav3's scores carry no standard errors), and the
+engine's trellis artifacts (docs/TRELLIS.md) with `score`.
 
 | Quantizer | T1 | T2 wikitext | T3 code | T4 own generations |
 |---|---|---|---|---|
@@ -168,6 +168,8 @@ scores carry no standard errors).
 | exllamav3 converter, Swift trace, 3.0 bpw | +0.0466 ± — / 0.0444 / 88.6% | +0.0222 ± — / 0.0485 / 92.2% | +0.0691 ± — / 0.1140 / 95.3% | +0.1217 ± — / 0.1906 / 92.7% |
 | exllamav3 converter, Swift trace, 2.5 bpw | +0.0779 ± — / 0.1009 / 84.4% | +0.0213 ± — / 0.0889 / 88.4% | +0.1398 ± — / 0.2041 / 93.2% | +0.1390 ± — / 0.2982 / 90.5% |
 | `quantization calibrate --format trellis`, Swift trace, 3.5 bpw | +0.0290 ± 0.0070 / 0.0226 / 92.0% | -0.0017 ± 0.0047 / 0.0258 / 94.5% | +0.0392 ± 0.0056 / 0.0608 / 96.8% | +0.0821 ± 0.0241 / 0.1231 / 94.0% |
+| Engine artifact `trellis` 3.0 bpw (Q3 embedding, NVFP4 heads, NVFP4 caches) | +0.0344 ± 0.0100 / 0.0500 / 88.7% | +0.0366 ± 0.0098 / 0.0559 / 91.0% | +0.0785 ± 0.0097 / 0.1190 / 95.2% | +0.1496 ± 0.0334 / 0.2206 / 92.2% |
+| Engine artifact `trellis` 3.5 bpw (Q3 embedding, NVFP4 heads, NVFP4 caches) | +0.0360 ± 0.0085 / 0.0321 / 89.6% | -0.0014 ± 0.0054 / 0.0386 / 92.7% | +0.0507 ± 0.0070 / 0.0731 / 96.4% | +0.1084 ± 0.0318 / 0.1719 / 93.2% |
 
 The module converted at 3.5 bits per weight in 3267 s on a 16 GB RTX 50-series card with 2 rounding lanes: per layer
 about 6.5 s of Hessian capture, 39.6 s of rounding and 4.3 s of propagation. Over the 192 linears of that run, the
