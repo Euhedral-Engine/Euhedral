@@ -106,6 +106,16 @@ def reconstruct_f64(trellis, suh, svh):
     return linear_f64(np.eye(k), trellis, suh, svh, [trellis.shape[1] * 16]).T
 
 
+def fragment_order(values):
+    """The FP16 prepass layout of the last axis: in each group of 16, elements 2q, 2q + 1, 2q + 8, 2q + 9 at 4q."""
+    e = np.arange(16)
+    position = 4 * ((e & 7) >> 1) + 2 * (e >> 3) + (e & 1)
+    groups = np.asarray(values).reshape(*np.shape(values)[:-1], -1, 16)
+    out = np.empty_like(groups)
+    out[..., position] = groups
+    return out.reshape(np.shape(values))
+
+
 def splits(k, n, target_ctas):
     return max(1, min(-(-target_ctas // (n // 128)), k // 256))
 

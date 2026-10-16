@@ -250,7 +250,7 @@ class TrellisKernelTest(unittest.TestCase):
                 for g in range(s):
                     product = ref.bf16_values(x) * suh[g].astype(np.float32)
                     rotated = ref.hadamard128_f32(product)
-                    wanted = ref.bf16_bits(rotated) if bf16 else rotated.astype(np.float16).view("<u2")
+                    wanted = ref.bf16_bits(rotated) if bf16 else ref.fragment_order(rotated.astype(np.float16).view("<u2"))
                     np.testing.assert_array_equal(got[g], wanted, err_msg=f"s={s} segment {g} bf16={bf16}")
 
     # -- the tensor-core route ------------------------------------------------------------------------------
