@@ -10,6 +10,9 @@ public enum LinearKernel implements TableKernel {
     TRELLIS_PREPASS("euhedral_trellis_prepass"),
     /// Tensor-core GEMM decoding trellis tiles in registers; fused epilogue when S == 1. Grid (n/128, S), block 256.
     TRELLIS_MMA("euhedral_trellis_mma"),
+    /// The same GEMM with every K split in one CTA and the epilogue fused, bitwise the split launch's result.
+    /// Grid (n/128, ceil(rows/32)), block 256.
+    TRELLIS_MMA_ROWS("euhedral_trellis_mma_rows"),
     /// Sums the K-split partials in order, Hadamard, svh, BF16. Grid (n/128, rows), block 128.
     TRELLIS_EPILOGUE("euhedral_trellis_epilogue"),
     /// The payload as a BF16 [n][k] rotated weight. Grid (k/16)*(n/16), block 256.

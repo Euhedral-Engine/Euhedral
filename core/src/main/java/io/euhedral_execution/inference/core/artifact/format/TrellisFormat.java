@@ -41,6 +41,9 @@ public final class TrellisFormat implements LinearFormat {
     /// The most rows the launch grids' Y extent holds.
     private static final int MAX_GRID_ROWS = 65535;
 
+    /// Rows per block of [LinearKernel#TRELLIS_MMA_ROWS] (`kSplitRows`, native/src/trellis/mma.cuh).
+    private static final int WHOLE_K_ROW_BLOCK = 32;
+
     private final TrellisSettings settings;
 
     TrellisFormat() {
@@ -329,12 +332,15 @@ public final class TrellisFormat implements LinearFormat {
                 rows, inFeatures, outFeatures, Math.toIntExact(weights.get(1).shape()[0]));
     }
 
+    /// The tensor-core route's scratch for launches of up to `rows` rows: the activations, and the split partials of
+    /// the most rows below [TrellisSettings#wholeKRows].
     private long mmaBytes(long rows, long k, long n, int segments) {
         long activations = PayloadSizes.alignUp(
                 PayloadSizes.multiply(PayloadSizes.multiply(segments, rows), k * 2), SCRATCH_ALIGNMENT);
         int splits = splits(Math.toIntExact(k), Math.toIntExact(n), this.settings.targetCtas());
-        if (splits == 1) return activations;
-        return PayloadSizes.add(activations, PayloadSizes.multiply(PayloadSizes.multiply(splits, rows), n * 4));
+        long splitRows = Math.min(rows, this.settings.wholeKRows() - 1L);
+        if (splits == 1 || splitRows == 0) return activations;
+        return PayloadSizes.add(activations, PayloadSizes.multiply(PayloadSizes.multiply(splits, splitRows), n * 4));
     }
 
     private static long prefillBytes(long rows, long k, long n, int segments) {
@@ -373,7 +379,7 @@ public final class TrellisFormat implements LinearFormat {
         run.w = w;
         run.segments = segments;
         if (gpu.exactNumerics()) run.reference();
-        else if (launch.rowExact() || rows <= this.settings.mmaMaxRows()) run.tensorCore(this.settings.targetCtas());
+        else if (launch.rowExact() || rows <= this.settings.mmaMaxRows()) run.tensorCore(this.settings);
         else run.prefill(launch.segmentEnds());
     }
 
@@ -441,11 +447,38 @@ public final class TrellisFormat implements LinearFormat {
                             .int32(bf16 ? 1 : 0));
         }
 
-        void tensorCore(int targetCtas) {
-            int splits = splits(this.k, this.n, targetCtas);
+        void tensorCore(TrellisSettings settings) {
+            int splits = splits(this.k, this.n, settings.targetCtas());
             long activations = PayloadSizes.alignUp(
                     PayloadSizes.multiply(PayloadSizes.multiply(this.segments, this.rows), this.k * 2L),
                     SCRATCH_ALIGNMENT);
+            if (this.rows >= settings.wholeKRows()) {
+                requireScratch(activations);
+                long scratch = this.launch.scratch();
+                prepass(scratch, false);
+                this.gpu.launchTableKernel(
+                        LinearKernel.TRELLIS_MMA_ROWS,
+                        this.n / TrellisLayout.BLOCK,
+                        Math.ceilDiv(this.rows, WHOLE_K_ROW_BLOCK),
+                        1,
+                        256,
+                        1,
+                        1,
+                        0,
+                        arguments()
+                                .pointer(scratch)
+                                .pointer(this.words)
+                                .pointer(this.ends)
+                                .pointer(this.svh)
+                                .pointer(this.launch.output())
+                                .int32(this.rows)
+                                .int32(this.k)
+                                .int32(this.n)
+                                .int32(this.w)
+                                .int32(splits)
+                                .int32(this.segments));
+                return;
+            }
             long partials =
                     splits == 1 ? 0 : PayloadSizes.multiply(PayloadSizes.multiply(splits, this.rows), this.n * 4L);
             requireScratch(PayloadSizes.add(activations, partials));
