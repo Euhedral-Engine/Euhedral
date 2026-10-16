@@ -3,7 +3,6 @@ package io.euhedral_execution.inference.quantization.mixed;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.euhedral_execution.core.control_plane.ControlPlaneLattice;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.quantization.Scorer;
 import io.euhedral_execution.inference.quantization.mixed.SearchState.Measured;
@@ -149,7 +148,7 @@ public final class Search {
 
     /// Runs the search, resuming from `settings.state()` if it holds one.
     public static Outcome run(Settings settings, Scoring scoring) throws Exception {
-        try (HostPool host = HostPool.start(ControlPlaneLattice.getOrCreate(), settings.hostSinks())) {
+        try (HostPool host = HostPool.start(settings.hostSinks())) {
             Search search = new Search(settings, scoring, host);
             return search.run();
         }
@@ -312,7 +311,7 @@ public final class Search {
         return host.submit(() -> Ensemble.fit(data, s.members(), seed * 31 + round, s.ridge(), priors, s.bands()))
                 .thenCompose(ensemble -> {
                     List<CompletableFuture<List<Candidate>>> runs = new ArrayList<>();
-                    for (int lambda = 0; lambda < s.lambdas().size(); lambda++)
+                    for (int lambda = 0; lambda < lambdaCells(); lambda++)
                         for (int fraction = 0; fraction < s.budgetFractions().size(); fraction++)
                             for (int restart = 0; restart < s.rco().restarts(); restart++) {
                                 int l = lambda, f = fraction, r = restart;
@@ -330,13 +329,20 @@ public final class Search {
                 });
     }
 
+    /// The sweep's lambda cells: every pair (prefill, decode) of the lambda list.
+    private int lambdaCells() {
+        return s.lambdas().size() * s.lambdas().size();
+    }
+
     /// One RCO run of the sweep, its assignment made to fit the device.
     private List<Candidate> sweepCell(Ensemble ensemble, int round, int lambdaIndex, int fractionIndex, int restart) {
-        double lambda = s.lambdas().get(lambdaIndex);
+        // The prefill and decode weights are swept independently: a cell is one pair of the lambda list.
+        double lambdaPrefill = s.lambdas().get(lambdaIndex / s.lambdas().size());
+        double lambdaDecode = s.lambdas().get(lambdaIndex % s.lambdas().size());
         long minimum = space.minimumBytes();
         long cellBudget = minimum + (long) (s.budgetFractions().get(fractionIndex) * Math.max(0, budget - minimum));
         long unit = Math.max(1, cellBudget / s.knapsackSteps());
-        Rco.Objective objective = new Objective(ensemble, space, lambda, lambda);
+        Rco.Objective objective = new Objective(ensemble, space, lambdaPrefill, lambdaDecode);
         long cellSeed = seed
                 + 1_000_003L * round
                 + 7919L * (lambdaIndex * s.budgetFractions().size() + fractionIndex);
@@ -364,8 +370,9 @@ public final class Search {
                 allocation,
                 String.format(
                         Locale.ROOT,
-                        "rco:lambda=%g,budget=%g",
-                        lambda,
+                        "rco:prefill=%g,decode=%g,budget=%g",
+                        lambdaPrefill,
+                        lambdaDecode,
                         s.budgetFractions().get(fractionIndex)),
                 ensemble.mean(allocation),
                 ensemble.spread(allocation),
@@ -443,7 +450,7 @@ public final class Search {
         List<Candidate> chosen = new ArrayList<>();
 
         List<List<Candidate>> byLambda = new ArrayList<>();
-        for (int l = 0; l < s.lambdas().size(); l++) byLambda.add(new ArrayList<>());
+        for (int l = 0; l < lambdaCells(); l++) byLambda.add(new ArrayList<>());
         for (Candidate c : proposals.candidates()) byLambda.get(c.cell()).add(c);
         for (var list : byLambda) list.sort(Comparator.comparingDouble(Candidate::value));
         int[] at = new int[byLambda.size()];

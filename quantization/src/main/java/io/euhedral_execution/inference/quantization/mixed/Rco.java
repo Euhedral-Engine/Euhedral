@@ -15,18 +15,19 @@ import java.util.Random;
 ///
 /// 1. the normal of the manifold is `(grad C)[i][k] = p[i][k] * (c[i][k] - E_{p_i}[c_i])`;
 /// 2. a gradient of the objective is estimated by Gumbel straight-through sampling: for each of `samples`
-/// draws of    Gumbel noise `G`, the forward pass is the knapsack optimum (exact within the byte budget) of
-/// the scores    `(alpha + G) / tau`, the objective's gradient is taken at that hard assignment, and the
-/// backward pass goes    through `softmax((alpha + G) / tau)`; `tau` falls exponentially from 1.0 to 0.01 over
-/// the steps;
+///    draws of Gumbel noise `G`, the forward pass is the knapsack optimum (exact within the byte budget) of the
+///    scores `(alpha + G) / tau`, the objective's gradient is taken at that hard assignment, and the backward
+///    pass goes through `softmax((alpha + G) / tau)`; `tau` falls exponentially from 1.0 to 0.01 over the steps;
 /// 3. the gradient is projected onto the tangent space (the plane orthogonal to the normal);
 /// 4. Adam turns the projected gradient into a direction, which is projected onto the tangent space again;
 /// 5. `alpha` takes a step of `lr` against the direction;
 /// 6. the retraction puts `alpha` back on the manifold by adding `t` times the cost vector, `t` found by
-/// bisection on    `[-50, 50]` to 1e-8 (the expected bytes grow with `t`);
+///    bisection on `[-50, 50]` (the expected bytes grow with `t`);
 /// 7. Adam's first moment is transported to the new tangent space by projecting it there.
 ///
-/// The final assignment is the knapsack optimum of `log p`.
+/// The final assignment is the knapsack optimum of `log p`, as in the paper, unless a hard assignment one of the
+/// samples drew scored better on the objective; that one is returned instead (a departure from the paper: on
+/// small separable problems with known optima it reached the optimum where the decoded `log p` did not).
 public final class Rco {
 
     /// The default of `--rco-steps`.

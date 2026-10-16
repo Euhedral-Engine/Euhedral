@@ -71,8 +71,9 @@ public final class HostPool implements AutoCloseable {
     private volatile boolean closed;
     private final AtomicInteger next = new AtomicInteger();
 
-    /// `sinks` sinks registered on `lattice`.
-    public static HostPool start(ControlPlaneLattice lattice, int sinks) {
+    /// `sinks` sinks registered on the process's lattice.
+    public static HostPool start(int sinks) {
+        ControlPlaneLattice lattice = ControlPlaneLattice.getOrCreate();
         if (sinks < 1) throw new IllegalArgumentException("a host pool needs a sink");
         HostPool pool = new HostPool();
         for (int i = 0; i < sinks; i++) {
