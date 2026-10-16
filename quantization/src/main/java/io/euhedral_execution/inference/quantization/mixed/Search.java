@@ -113,6 +113,8 @@ public final class Search {
 
     private record Proposals(Ensemble ensemble, List<Candidate> candidates) {}
 
+    private record Assembled(Artifact artifact, long bytes) {}
+
     private record Prepared(
             Candidate candidate, Artifact artifact, long bytes, double prefill, double decode, boolean fits) {}
 
@@ -227,8 +229,7 @@ public final class Search {
                 List<Measured> data = state.measured();
                 double share = state.explore();
                 List<Candidate> chosen = need > 0
-                        ? proposing()
-                                .submit(() -> choose(proposals, data, share, need, round))
+                        ? choose(proposing(), proposals, data, share, need, round)
                                 .get()
                         : List.of();
                 closeProposing();
@@ -347,8 +348,8 @@ public final class Search {
     /// An RCO sweep over the ensemble fitted to `data`: as futures on the proposals pool.
     private CompletableFuture<Proposals> propose(List<Measured> data, int round) {
         proposing();
-        return proposing
-                .submit(() -> Ensemble.fit(data, s.members(), seed * 31 + round, s.ridge(), priors, s.bands()))
+        // Each member's fit is a frame of its own, then one frame joins them.
+        return Ensemble.fit(data, s.members(), seed * 31 + round, s.ridge(), priors, s.bands(), proposing)
                 .thenCompose(ensemble -> {
                     List<CompletableFuture<List<Candidate>>> runs = new ArrayList<>();
                     for (int lambda = 0; lambda < lambdaCells(); lambda++)
@@ -525,8 +526,56 @@ public final class Search {
 
     /// The batch: `1 - share` of it the best the ensemble predicts for each weight in turn, the rest
     /// alternately the feasible RCO results with the largest ensemble spread and the feasible single and
-    /// double moves around the front with the largest spread. Nothing measured, nothing twice.
-    private List<Candidate> choose(Proposals proposals, List<Measured> data, double share, int need, int round) {
+    /// double moves around the front with the largest spread. Nothing measured, nothing twice. The sorting of
+    /// the proposals is one frame; each pick that needs the ensemble or the planner is frames of its own (a move
+    /// tries each of its neighbours in a frame), and the picks follow one another, as the draws of one random
+    /// stream do.
+    private CompletableFuture<List<Candidate>> choose(
+            HostPool pool, Proposals proposals, List<Measured> data, double share, int need, int round) {
+        return pool.submit(() -> exploiting(proposals, data, share, need, round))
+                .thenCompose(choosing -> exploring(pool, proposals, choosing, 0));
+    }
+
+    /// What the choice has so far.
+    private static final class Choosing {
+        final Set<Allocation> taken = new HashSet<>();
+        final List<Candidate> chosen = new ArrayList<>();
+        final List<Candidate> bySpread;
+        final List<Measured> anchors;
+        final Random random;
+        final int exploiting, exploring, need;
+        int spreadAt;
+
+        Choosing(
+                List<Candidate> bySpread,
+                List<Measured> anchors,
+                Random random,
+                int exploiting,
+                int exploring,
+                int need) {
+            this.bySpread = bySpread;
+            this.anchors = anchors;
+            this.random = random;
+            this.exploiting = exploiting;
+            this.exploring = exploring;
+            this.need = need;
+        }
+
+        /// The next candidate by spread that is not taken, relabelled; null when there is none.
+        Candidate bySpread() {
+            while (spreadAt < bySpread.size()
+                    && taken.contains(bySpread.get(spreadAt).allocation())) spreadAt++;
+            return spreadAt < bySpread.size() ? relabel(bySpread.get(spreadAt++), "explore") : null;
+        }
+
+        void add(Candidate pick) {
+            taken.add(pick.allocation());
+            chosen.add(pick);
+        }
+    }
+
+    /// The exploiting picks, and the ordering the exploring ones draw from.
+    private Choosing exploiting(Proposals proposals, List<Measured> data, double share, int need, int round) {
         Set<Allocation> taken = new HashSet<>();
         for (Measured m : data) taken.add(m.a());
         int exploring = (int) Math.round(share * need);
@@ -553,34 +602,36 @@ public final class Search {
 
         List<Candidate> bySpread = new ArrayList<>(proposals.candidates());
         bySpread.sort(Comparator.comparingDouble(Candidate::spread).reversed());
-        int spreadAt = 0;
-        Random random = new Random(seed * 17 + round);
-        List<Measured> anchors = anchors(data);
-        for (int e = 0; chosen.size() < exploiting + exploring; e++) {
-            Candidate pick = null;
-            if (e % 2 == 0) {
-                while (spreadAt < bySpread.size()
-                        && taken.contains(bySpread.get(spreadAt).allocation())) spreadAt++;
-                if (spreadAt < bySpread.size()) pick = relabel(bySpread.get(spreadAt++), "explore");
-            }
-            if (pick == null) pick = move(proposals.ensemble(), anchors, taken, random);
-            if (pick == null && e % 2 == 1) {
-                while (spreadAt < bySpread.size()
-                        && taken.contains(bySpread.get(spreadAt).allocation())) spreadAt++;
-                if (spreadAt < bySpread.size()) pick = relabel(bySpread.get(spreadAt++), "explore");
-            }
-            if (pick == null) break;
-            taken.add(pick.allocation());
-            chosen.add(pick);
-        }
-        // Short of candidates (a small space, or most of it measured): moves around the front make up the rest.
-        while (chosen.size() < need) {
-            Candidate pick = move(proposals.ensemble(), anchors, taken, random);
-            if (pick == null) break;
-            taken.add(pick.allocation());
-            chosen.add(pick);
-        }
-        return chosen;
+        Choosing choosing =
+                new Choosing(bySpread, anchors(data), new Random(seed * 17 + round), exploiting, exploring, need);
+        choosing.taken.addAll(taken);
+        choosing.chosen.addAll(chosen);
+        return choosing;
+    }
+
+    /// The exploring picks from iteration `e`, then, short of candidates (a small space, or most of it
+    /// measured), moves around the front for the rest.
+    private CompletableFuture<List<Candidate>> exploring(HostPool pool, Proposals proposals, Choosing choosing, int e) {
+        if (choosing.chosen.size() >= choosing.exploiting + choosing.exploring)
+            return filling(pool, proposals, choosing);
+        Candidate first = e % 2 == 0 ? choosing.bySpread() : null;
+        CompletableFuture<Candidate> picked =
+                first != null ? CompletableFuture.completedFuture(first) : move(pool, proposals.ensemble(), choosing);
+        return picked.thenCompose(pick -> {
+            if (pick == null && e % 2 == 1) pick = choosing.bySpread();
+            if (pick == null) return filling(pool, proposals, choosing);
+            choosing.add(pick);
+            return exploring(pool, proposals, choosing, e + 1);
+        });
+    }
+
+    private CompletableFuture<List<Candidate>> filling(HostPool pool, Proposals proposals, Choosing choosing) {
+        if (choosing.chosen.size() >= choosing.need) return CompletableFuture.completedFuture(choosing.chosen);
+        return move(pool, proposals.ensemble(), choosing).thenCompose(pick -> {
+            if (pick == null) return CompletableFuture.completedFuture(choosing.chosen);
+            choosing.add(pick);
+            return filling(pool, proposals, choosing);
+        });
     }
 
     private static Candidate relabel(Candidate c, String kind) {
@@ -596,26 +647,51 @@ public final class Search {
     }
 
     /// The feasible single or double move around a random anchor with the largest ensemble spread, among
-    /// [#MOVES_TRIED] tried; null if none is new.
-    private Candidate move(Ensemble ensemble, List<Measured> anchors, Set<Allocation> taken, Random random) {
-        if (anchors.isEmpty()) return null;
-        Candidate best = null;
-        for (int tried = 0; tried < MOVES_TRIED; tried++) {
-            int[] choice =
-                    space.choice(anchors.get(random.nextInt(anchors.size())).a());
-            int changes = 1 + random.nextInt(2);
-            for (int c = 0; c < changes; c++) {
-                int i = random.nextInt(choice.length);
-                int other = random.nextInt(space.options.size() - 1);
-                choice[i] = other >= choice[i] ? other + 1 : other;
-            }
-            Allocation allocation = space.allocation(choice);
-            if (taken.contains(allocation) || !feasibility.check(allocation).fits()) continue;
-            double spread = ensemble.spread(allocation);
-            if (best == null || spread > best.spread())
-                best = new Candidate(allocation, "explore:move", ensemble.mean(allocation), spread, 0, -1);
-        }
-        return best;
+    /// [#MOVES_TRIED] tried; null if none is new. One frame draws the moves, one frame per move checks it
+    /// against the planner and the ensemble, and the best is taken in the order they were drawn.
+    private CompletableFuture<Candidate> move(HostPool pool, Ensemble ensemble, Choosing choosing) {
+        if (choosing.anchors.isEmpty()) return CompletableFuture.completedFuture(null);
+        return pool.submit(() -> {
+                    List<int[]> moves = new ArrayList<>();
+                    for (int tried = 0; tried < MOVES_TRIED; tried++) {
+                        int[] choice = space.choice(choosing.anchors
+                                .get(choosing.random.nextInt(choosing.anchors.size()))
+                                .a());
+                        int changes = 1 + choosing.random.nextInt(2);
+                        for (int c = 0; c < changes; c++) {
+                            int i = choosing.random.nextInt(choice.length);
+                            int other = choosing.random.nextInt(space.options.size() - 1);
+                            choice[i] = other >= choice[i] ? other + 1 : other;
+                        }
+                        moves.add(choice);
+                    }
+                    return moves;
+                })
+                .thenCompose(moves -> {
+                    List<CompletableFuture<Candidate>> tries = new ArrayList<>();
+                    for (int[] choice : moves)
+                        tries.add(pool.submit(() -> {
+                            Allocation allocation = space.allocation(choice);
+                            if (choosing.taken.contains(allocation)
+                                    || !feasibility.check(allocation).fits()) return null;
+                            return new Candidate(
+                                    allocation,
+                                    "explore:move",
+                                    ensemble.mean(allocation),
+                                    ensemble.spread(allocation),
+                                    0,
+                                    -1);
+                        }));
+                    return CompletableFuture.allOf(tries.toArray(CompletableFuture[]::new))
+                            .thenApply(done -> {
+                                Candidate best = null;
+                                for (var future : tries) {
+                                    Candidate found = future.join();
+                                    if (found != null && (best == null || found.spread() > best.spread())) best = found;
+                                }
+                                return best;
+                            });
+                });
     }
 
     // --------------------------------------------------------------- measuring
@@ -629,13 +705,12 @@ public final class Search {
         for (Candidate candidate : batch)
             if (!state.contains(candidate.allocation()) && listed.add(candidate.allocation())) todo.add(candidate);
         CompletableFuture<Proposals> next = null;
-        CompletableFuture<Prepared> prepared =
-                todo.isEmpty() ? null : candidates().submit(() -> prepare(todo.get(0)));
+        CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : prepare(candidates(), todo.get(0));
         for (int k = 0; k < todo.size(); k++) {
             Prepared ready = prepared.get();
             if (k + 1 < todo.size()) {
                 Candidate following = todo.get(k + 1);
-                prepared = candidates().submit(() -> prepare(following));
+                prepared = prepare(candidates(), following);
             }
             if (k == todo.size() - 1 && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
             Scorer.Result result = scoring.score(s.sources().path(s.sources().base()), ready.artifact());
@@ -669,18 +744,29 @@ public final class Search {
         return next;
     }
 
-    private Prepared prepare(Candidate candidate) {
+    /// A candidate assembled and checked, in frames of their own: its composite view (and the bytes of its
+    /// tensors), the residency planner's verdict, and the cost table's two predictions.
+    private CompletableFuture<Prepared> prepare(HostPool pool, Candidate candidate) {
         Allocation allocation = candidate.allocation();
-        Artifact artifact = Assemble.view(s.sources(), allocation, OptionalInt.of(s.verifyRows() - 1));
-        long bytes = 0;
-        for (var tensor : artifact.tensors()) bytes += tensor.byteSize();
-        return new Prepared(
-                candidate,
-                artifact,
-                bytes,
-                s.costs().prefillMicrosPerToken(s.sources(), allocation),
-                s.costs().verifyMicros(s.sources(), allocation, s.verifyRows()),
-                feasibility.check(allocation).fits());
+        CompletableFuture<Assembled> view = pool.submit(() -> {
+            Artifact artifact = Assemble.view(s.sources(), allocation, OptionalInt.of(s.verifyRows() - 1));
+            long bytes = 0;
+            for (var tensor : artifact.tensors()) bytes += tensor.byteSize();
+            return new Assembled(artifact, bytes);
+        });
+        CompletableFuture<Boolean> fits =
+                pool.submit(() -> feasibility.check(allocation).fits());
+        CompletableFuture<Double> prefill = pool.submit(() -> s.costs().prefillMicrosPerToken(s.sources(), allocation));
+        CompletableFuture<Double> decode =
+                pool.submit(() -> s.costs().verifyMicros(s.sources(), allocation, s.verifyRows()));
+        return CompletableFuture.allOf(view, fits, prefill, decode)
+                .thenApply(done -> new Prepared(
+                        candidate,
+                        view.join().artifact(),
+                        view.join().bytes(),
+                        prefill.join(),
+                        decode.join(),
+                        fits.join()));
     }
 
     // ---------------------------------------------------------------- finishing

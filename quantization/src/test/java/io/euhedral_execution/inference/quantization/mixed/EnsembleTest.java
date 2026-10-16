@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
 class EnsembleTest {
@@ -64,5 +66,47 @@ class EnsembleTest {
                 Ensemble.fit(data, 4, 5, 1e-3, world.priors, 4).mean(probe),
                 Ensemble.fit(data, 4, 5, 1e-3, world.priors, 4).mean(probe),
                 0.0);
+    }
+
+    @Test
+    void fittingByMembersGivesTheSequentialEnsemble() throws Exception {
+        Synthetic world = new Synthetic(8, 4, 1.2, 3.0, 3);
+        Random random = new Random(3);
+        List<Measured> data = new ArrayList<>();
+        for (int i = 0; i < 60; i++) data.add(world.measured(world.random(random), 1));
+        Ensemble sequential = Ensemble.fit(data, 5, 11, 1e-3, world.priors, 4);
+        int[] frames = {0};
+        // Each member is its own task, and they finish in the reverse of the order they were submitted.
+        List<Runnable> pending = new ArrayList<>();
+        List<CompletableFuture<?>> futures = new ArrayList<>();
+        Ensemble.Frames deferred = new Ensemble.Frames() {
+            @Override
+            public <T> CompletableFuture<T> submit(Supplier<T> task) {
+                frames[0]++;
+                CompletableFuture<T> future = new CompletableFuture<>();
+                futures.add(future);
+                pending.add(() -> future.complete(task.get()));
+                return future;
+            }
+        };
+        CompletableFuture<Ensemble> split = Ensemble.fit(data, 5, 11, 1e-3, world.priors, 4, deferred);
+        while (!pending.isEmpty()) pending.remove(pending.size() - 1).run();
+        Ensemble byMembers = split.get();
+        // One task per member, then the join.
+        assertEquals(5 + 1, frames[0]);
+        assertEquals(sequential.members().size(), byMembers.members().size());
+        for (int m = 0; m < sequential.members().size(); m++) {
+            FidelityModel a = sequential.members().get(m),
+                    b = byMembers.members().get(m);
+            assertEquals(a.gamma(), b.gamma(), 0.0);
+            assertEquals(a.scale(), b.scale(), 0.0);
+            for (int family = 0; family < a.families().size(); family++)
+                for (int band = 0; band < 4; band++) assertEquals(a.weight(family, band), b.weight(family, band), 0.0);
+        }
+        for (int i = 0; i < 10; i++) {
+            Allocation probe = world.random(random);
+            assertEquals(sequential.mean(probe), byMembers.mean(probe), 0.0);
+            assertEquals(sequential.spread(probe), byMembers.spread(probe), 0.0);
+        }
     }
 }

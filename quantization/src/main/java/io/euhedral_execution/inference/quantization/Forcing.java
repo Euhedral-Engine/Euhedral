@@ -17,9 +17,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// Teacher forcing of token chunks through a loaded model, shared by the scorer and the reference writer. Each
 /// chunk of N tokens is forced on a fresh sequence: a prefill of N / 2 + 1 tokens, then verifications of `rows`
 /// forced tokens, so that step k's logits row (k = 0 .. N - 2 - N / 2) predicts the token at position N / 2 + 1 + k.
-/// `batch` chunks run together, one sequence each, their verifications batched into one quantum (at most 32
-/// rows), so each weight is read once per step group of all of them. What is done with a step's logits row, and
-/// what is fetched ahead for it, is the [Sink]'s.
+/// `batch` chunks run together, one sequence each, their verifications batched into one quantum (at most the
+/// workspace's rows), so each weight is read once per step group of all of them. What is done with a step's logits
+/// row, and what is fetched ahead for it, is the [Sink]'s.
 final class Forcing {
 
     private Forcing() {}

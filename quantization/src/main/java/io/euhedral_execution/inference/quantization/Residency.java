@@ -30,6 +30,22 @@ public final class Residency {
         return ArtifactProfile.kvFormat(null, ArtifactProfile.of(artifact));
     }
 
+    /// The device bytes the plan for one sequence of `tokens` tokens needs, and what each sequence beyond the first
+    /// adds (its KV and [#SEQUENCE_BYTES]), when the device has `gpu`'s free bytes; the first is -1 when even
+    /// host-backed weights leave one sequence no room.
+    static long[] sequenceFigures(
+            Artifact artifact, ArtifactProfile.Speculation speculation, CudaGpuMemory gpu, int tokens) {
+        ArtifactProfile found = ArtifactProfile.of(artifact);
+        var profile = new ArtifactProfile(found.quantization(), found.compressed(), speculation, found.draftDepth());
+        KvFormat format = kvFormat(artifact);
+        var single = ResidencyPlanner.plan(
+                artifact, profile, gpu.deviceMemoryInfo().freeBytes(), tokens, Long.MAX_VALUE, format);
+        return new long[] {
+            single.fits() ? single.deviceBytes() : -1,
+            ResidencyPlanner.kvBytes(artifact.config(), tokens, format) + SEQUENCE_BYTES
+        };
+    }
+
     /// The host-backed objects for `sequences` sequences of up to `tokens` tokens each, or the `hostBytes`
     /// given.
     public static Set<String> hostBacked(

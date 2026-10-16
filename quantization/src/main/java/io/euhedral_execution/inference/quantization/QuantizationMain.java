@@ -51,7 +51,8 @@ import java.util.OptionalInt;
 /// allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json
 /// --reference R.kld... --context 32768 --state SEARCH.resume --out DIR [--seed-file F] [--batch 8]
 /// [--explore 0.3] [--patience 3] [--random 16] [--bands 8] [--verify-rows 5] [--workers N] [--host-mib N]
-/// [--free-mib N] [--score-rows 8] [--score-batch 4] [--members 8] [--ridge 1e-3] [--lambdas 0,0.002,0.005,0.01,0.02]
+/// [--free-mib N] [--score-rows 8] [--score-batch 0 (the chunks the device holds)] [--members 8] [--ridge 1e-3]
+/// [--lambdas 0,0.002,0.005,0.01,0.02]
 /// [--budget-fractions 1.0,0.8] [--rco-steps 200] [--rco-lr 0.1] [--rco-samples 8] [--rco-restarts 4]
 /// [--knapsack-steps 512] [--max-rounds N] [--seed 1] [--host-sinks N] [--library LIBEUHEDRAL_CUDA]
 /// cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows 1,2,3,4,5,6,512] [--repeats 50]
@@ -338,7 +339,7 @@ public final class QuantizationMain {
         int context = Integer.parseInt(options.getOrDefault("context", "32768"));
         int workers = workers(options);
         int scoreRows = Integer.parseInt(options.getOrDefault("score-rows", "8"));
-        int scoreBatch = Integer.parseInt(options.getOrDefault("score-batch", "4"));
+        int scoreBatch = Integer.parseInt(options.getOrDefault("score-batch", "0"));
         long hostBytes = hostBytes(options);
         try (Scorer scorer = Scorer.open(Path.of(library), workers)) {
             long free = options.containsKey("free-mib")
