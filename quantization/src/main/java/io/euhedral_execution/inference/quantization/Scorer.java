@@ -119,7 +119,7 @@ public final class Scorer implements AutoCloseable {
                 ArtifactProfile.Speculation.NONE,
                 Residency.hostBacked(
                         artifact, ArtifactProfile.Speculation.NONE, device.gpu, hostBytes, batch, context))) {
-            var plan = new ExecutionPlan(model.weights(), model.staging());
+            var plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
             var runtime = execution(lattice, plan, device, artifactPath, artifact);
             try {
                 // On the lattice's workers: the scorer's setup, then each reference in turn, each chunk group's

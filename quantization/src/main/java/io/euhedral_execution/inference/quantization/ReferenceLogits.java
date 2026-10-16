@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.quantization;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
+import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.core.tokenizer.TokenKind;
@@ -46,6 +47,25 @@ public final class ReferenceLogits {
     /// `text` as consecutive chunks of `context` tokens, at most `limit` of them when `limit` is positive. Control
     /// tokens in the text are single tokens, as the engine tokenizes them; without `parseSpecial` a text holding
     /// one is refused (llama.cpp reads their spelling as plain text).
+    /// The model with the residency a reference over the BF16 artifact needs: as much in host memory as
+    /// `--host-mib` allows, the rest read from disk.
+    private static Qwen38Model load(Settings settings, Artifact artifact, Device device) throws IOException {
+        var plan = Residency.plan(
+                artifact,
+                ArtifactProfile.Speculation.NONE,
+                device.gpu,
+                settings.hostBytes(),
+                settings.batch(),
+                settings.context());
+        return Qwen38Model.load(
+                settings.artifact(),
+                artifact,
+                device.gpu,
+                ArtifactProfile.Speculation.NONE,
+                plan.hostBacked(),
+                plan.diskBacked());
+    }
+
     static int[][] chunks(QwenTokenizer tokenizer, String text, int context, int limit, boolean parseSpecial) {
         int[] tokens = tokenizer.encodeText(text);
         if (!parseSpecial)
@@ -83,20 +103,9 @@ public final class ReferenceLogits {
         System.out.printf(Locale.ROOT, "%d chunks of %d tokens%n", chunks.length, settings.context());
         var artifact = ArtifactReader.read(settings.artifact());
         try (Device device = new Device(settings.library());
-                Qwen38Model model = Qwen38Model.load(
-                        settings.artifact(),
-                        artifact,
-                        device.gpu,
-                        ArtifactProfile.Speculation.NONE,
-                        Residency.hostBacked(
-                                artifact,
-                                ArtifactProfile.Speculation.NONE,
-                                device.gpu,
-                                settings.hostBytes(),
-                                settings.batch(),
-                                settings.context()));
+                Qwen38Model model = load(settings, artifact, device);
                 var lattice = CalibrationLattice.start(settings.workers())) {
-            var plan = new ExecutionPlan(model.weights(), model.staging());
+            var plan = new ExecutionPlan(model.weights(), model.staging(), model.window());
             int vocabulary = plan.weights().config().vocabSize();
             try (ReferenceWriter writer =
                     ReferenceWriter.open(settings.out(), settings.context(), vocabulary, chunks)) {
