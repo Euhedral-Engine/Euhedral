@@ -35,6 +35,14 @@ flowchart TD
     Reference --> Score
     Sources --> Cost[cost: device time of each option's linear per shape and row count]
     Cost --> Table[Cost table: additive prefill and verification times]
+    Priors[Per-object priors from the calibration logs] --> Fit[Fidelity ensemble fitted to measured KL]
+    Table --> RCO[RCO under the device-fit byte budget]
+    Fit --> RCO
+    RCO --> Propose[Proposals: best predicted plus most uncertain]
+    Propose --> Check[Residency plan at the target context: every object on device]
+    Check --> Composite
+    Score --> Fit
+    Score --> Front[Pareto front over KL, prefill and decode]
 ```
 
 The loop is layerwise: collect statistics, round, substitute decoded weights and propagate the resulting activations. Hidden states live in pinned host storage and support resume checkpoints. Calibration work runs as lattice frames with CUDA streams; cuBLAS/cuSOLVER and quantization CUDA kernels supply the numerical work.
@@ -49,15 +57,17 @@ The loop is layerwise: collect statistics, round, substitute decoded weights and
 
 `cost` times one launch of each option's real payload for every distinct projection shape, at 1 to 6 rows (decode and verification) and a 512-row prefill chunk, built the way the engine builds the linear (kind, scratch and trellis segment ends from the format) and rotated over copies past the L2 cache. The stream waits on a host-mapped flag while the launches queue, so the time is the device's alone, as in the captured decode graphs. Summed over an allocation's projections plus fixed terms measured end to end, the table predicts its prefill and verification times.
 
-## Allocation and RCO terminology
+## Allocation
 
-The implemented bit allocation here is [trellis Allocation](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/Allocation.java), ported from exllamav3 and driven by an average bits-per-weight budget. The converter documentation also names external `GSQ-RCO-GGUF` repositories as sources of importance matrices. Those names do not establish a local RCO optimizer: no separate RCO allocation stage is shown because the inspected calibration and converter code does not expose one.
+Within one calibration run, [trellis Allocation](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/Allocation.java), ported from exllamav3, assigns rates to linears under an average bits-per-weight budget.
+
+Across formats, `allocate` searches for mixed artifacts on the Pareto front of KL, prefill and decode time among those that fit on the device at a target context. Each round fits a bootstrap ensemble of a fidelity model (per-object prior errors weighted per family and layer band, pairwise terms within a layer and between neighbouring bands, a fitted bend for compounding) to the KL the engine measured, then runs Riemannian Constrained Optimization (RCO; Helcig and Alistarh, [arXiv:2605.00649](https://arxiv.org/abs/2605.00649), [IST-DASLab/RCO](https://github.com/IST-DASLab/RCO)) on the ensemble's mean plus weighted prefill and decode times, under the byte budget that keeps the composite on the device. Part of every batch goes to the feasible proposals the ensemble disagrees on most, so the search does not keep exploiting a region where the model is wrong. Every proposal is assembled as a composite view, checked by the residency planner and scored by the engine; the measured results, kept in one resume file, refit the ensemble and form the front. The search's host work (assembly, fit checks, ensemble fits, RCO) runs as ingest sinks on the process's lattice while the device scores.
 
 ## Implementation anchors
 
 - [QuantizationMain](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/QuantizationMain.java), [Calibrate](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Calibrate.java), [CalibrationLattice](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/CalibrationLattice.java) and [Recipe](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Recipe.java).
 - [GPTQ](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/gptq/Gptq.java), [TrellisQuantizer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/TrellisQuantizer.java) and [Exl3Writer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/trellis/Exl3Writer.java).
-- [Assemble](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Assemble.java), [Sources](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Sources.java), [Cost](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Cost.java), [CostTable](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/CostTable.java), [ReferenceLogits](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/ReferenceLogits.java) and [Scorer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Scorer.java).
+- [Assemble](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Assemble.java), [Sources](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Sources.java), [Search](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Search.java), [Rco](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Rco.java), [FidelityModel](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/FidelityModel.java), [Cost](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/Cost.java), [CostTable](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/CostTable.java), [ReferenceLogits](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/ReferenceLogits.java) and [Scorer](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Scorer.java).
 - [Converter entry point](../../tools/convert_checkpoint.py), [converter package](../../tools/euhedral_artifacts), [tools guide](../../tools/README.md) and [Score](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/Score.java).
 
 This diagram omits training/rotation commands, individual quantizer kernels, format byte layouts and the separate Flash-Next converter path. It makes no quality or throughput claim.

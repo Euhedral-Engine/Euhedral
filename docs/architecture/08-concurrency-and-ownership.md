@@ -39,6 +39,8 @@ A sink routes frames by hash. The default lake uses eight sinks with one produce
 
 Stages satisfy submission edges after successful device submission. Deferred stages can instead satisfy their edges when asynchronous work completes. Failures are recorded on the quantum and conclude through its continuation, including rejection handling; they must not strand a generation or leak its admitted lake unit.
 
+Offline tools follow the same rule. The quantization module's search registers a few ingest sinks of its own on the process's lattice (`ControlPlaneLattice.getOrCreate()`), each running one queued host task per poll, beside the lake the engine uses for scoring; it completes them when the search ends. No tool starts threads of its own.
+
 The lake counts admitted units such as generations, quanta and host tasks. Graceful completion closes admission and completes its sources after all units terminate. During normal idle periods it can detach its sinks and watch, then attach a fresh set for later work. Engine shutdown closes tracked sessions, stops the model's execution, closes the lattice, and releases model/GPU resources in the engine's shutdown order.
 
 ## Implementation anchors
@@ -47,6 +49,7 @@ The lake counts admitted units such as generations, quanta and host tasks. Grace
 - [InferenceLake](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/InferenceLake.java): sinks, admitted-unit counts and idle detach.
 - [WorkspaceOwner](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/WorkspaceOwner.java), [SequenceOwner](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/SequenceOwner.java) and [StageFrame](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageFrame.java).
 - [Generation](../../core/src/main/java/io/euhedral_execution/inference/core/generation/Generation.java), [Admit](../../core/src/main/java/io/euhedral_execution/inference/core/generation/Admit.java) and [Quantum](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Quantum.java).
+- [HostPool](../../quantization/src/main/java/io/euhedral_execution/inference/quantization/mixed/HostPool.java): the search's ingest sinks.
 - [GPU buffer contracts](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/ExecutionGpu.java) and [frame model](../FRAME_MODEL.md).
 
 This diagram omits the external Euhedral-Execution library's internal routing implementation and Flash-Next expert-cache ownership details. It documents the contracts used by this repository.
