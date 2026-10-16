@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.quantization.gpu.Cuda;
 import io.euhedral_execution.inference.quantization.gpu.Device;
 import java.io.IOException;
@@ -64,9 +65,11 @@ public final class Score {
     private final Cuda.Function kernel;
     private final AtomicLong sequenceIds = new AtomicLong(1);
     private final long scoreStream;
+    private final KvFormat kvFormat;
 
-    private Score(Settings settings, Device device, Execution runtime, ExecutionPlan plan) {
+    private Score(Settings settings, Device device, Execution runtime, ExecutionPlan plan, KvFormat kvFormat) {
         this.settings = settings;
+        this.kvFormat = kvFormat;
         this.device = device;
         this.runtime = runtime;
         this.plan = plan;
@@ -107,7 +110,7 @@ public final class Score {
             try {
                 // On the lattice's workers: the scorer's setup, then each reference in turn, each chunk group's
                 // verifications continuing the next. This thread only waits.
-                runtime.onWorker(() -> new Score(settings, device, runtime, plan))
+                runtime.onWorker(() -> new Score(settings, device, runtime, plan, Residency.kvFormat(data)))
                         .thenCompose(score -> {
                             CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
                             for (int r = 0; r < settings.references().size(); r++) {
@@ -232,6 +235,7 @@ public final class Score {
                         .reinterpret(4L * steps)
                         .copyFrom(MemorySegment.ofArray(Arrays.copyOfRange(tokens, prefix, prefix + steps)));
                 sequences[k] = new Sequence(sequenceIds.getAndIncrement());
+                sequences[k].useKvFormat(kvFormat);
             }
             // A group's reference rows are read while the quantum before it runs: block g % 2 was last scored by
             // group g - 2, finished by then.
