@@ -704,6 +704,7 @@ public final class Calibrate {
 
     private void roundHeads(long headHessian, long draftHessian) throws IOException {
         var head = checkpoint.object("text/output_head");
+        log("device memory free before head rounding: " + device.cuda.freeMemory() / (1L << 20) + " MiB");
         long headWeights = uploadObject(head);
         try {
             device.gpu.free(
