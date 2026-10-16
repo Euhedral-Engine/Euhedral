@@ -418,6 +418,44 @@ class FakeStore:
         return SourceRef("none", 0, shape if shape is not None else ())
 
 
+SWIFT_CONFIG = {"text_config": {
+    "vocab_size": 248320, "hidden_size": 5120, "num_hidden_layers": 64, "num_attention_heads": 24,
+    "num_key_value_heads": 4, "head_dim": 256, "intermediate_size": 17408, "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48, "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 10000000.0},
+    "partial_rotary_factor": 0.25, "max_position_embeddings": 262144, "hidden_act": "silu"}}
+FIXTURE = Path(__file__).resolve().parent.parent / "core/src/test/resources/trellis-artifact-fixture.bin"
+
+
+def sized_add_quant(plans, recipe, name, matrix, q3_format, *_):
+    """add_quant with the right byte sizes and no payload: the descriptors of what the recipe stores."""
+    format_name, layout = recipes.storage(recipe, name, q3_format)
+    if format_name == "BF16":
+        size = 2 * matrix.shape[0] * matrix.shape[1]
+    else:
+        size = inventory.payload_size(matrix.shape, format_name)
+    plans.append(ObjectPlan(name, matrix.shape, "BF16", format_name, layout, size, lambda *_: None))
+
+
+def fixture_bytes(plans: list[ObjectPlan]) -> bytes:
+    """The EDRL header, metadata and tensor table of `plans` at real offsets, then the bytes of every `.segments`
+    region as (offset >q, length >i, bytes) records after the file's size (>q). The payloads are left out: the file is too large to keep."""
+    metadata = inventory.encode_metadata(SWIFT_CONFIG)
+    data_base = edrl.HEADER_SIZE + len(metadata) + len(edrl.encode_table(plans))
+    edrl.assign_offsets(plans, data_base)
+    table = edrl.encode_table(plans)
+    header = struct.pack(edrl.HEADER_FORMAT, edrl.MAGIC, edrl.VERSION, edrl.HEADER_SIZE, len(metadata),
+                         edrl.HEADER_SIZE + len(metadata), len(plans), 0, data_base)
+    out = bytearray(header + metadata + table)
+    out += struct.pack(">q", max(plan.offset + plan.byte_size for plan in plans))  # the file's size
+    for plan in plans:
+        if plan.name.endswith(".segments"):
+            buffer = io.BytesIO()
+            plan.writer(buffer, 0)
+            out += struct.pack(">qi", plan.offset, plan.byte_size) + buffer.getvalue()
+    return bytes(out)
+
+
 class InventoryTest(unittest.TestCase):
     """The Swift-1.5 inventory over a header-only EXL3 checkpoint (no payload bytes, never read)."""
 
@@ -437,11 +475,7 @@ class InventoryTest(unittest.TestCase):
             source.has_mtp = False
             source.layouts = {name: layout for name, layout in source.layouts.items() if not name.startswith("mtp/")}
 
-        def add_quant(plans, recipe, name, matrix, q3_format, *_):
-            format_name, layout = recipes.storage(recipe, name, q3_format)
-            plans.append(ObjectPlan(name, matrix.shape, "BF16", format_name, layout, 0, lambda *_: None))
-
-        with tempfile.TemporaryDirectory() as heads, mock.patch.object(inventory, "add_quant", add_quant):
+        with tempfile.TemporaryDirectory() as heads, mock.patch.object(inventory, "add_quant", sized_add_quant):
             for name in trellis.HEAD_NAMES:
                 (Path(heads) / (name.replace("/", ".") + ".npz")).write_bytes(b"")
             return inventory.build_plans(FakeStore(), np.arange(inventory.DRAFT_ROWS, dtype=np.int64),
@@ -488,6 +522,28 @@ class InventoryTest(unittest.TestCase):
             inventory.build_plans(FakeStore(), np.arange(inventory.DRAFT_ROWS), recipes.Recipe("trellis"))
         with self.assertRaisesRegex(ValueError, "needs an EXL3 checkpoint"):
             inventory.build_plans(FakeStore(), np.arange(inventory.DRAFT_ROWS), recipes.Recipe("q3"), trellis=source)
+
+    def test_the_committed_loader_fixture_is_what_the_code_produces(self):
+        self.assertEqual(FIXTURE.read_bytes(), fixture_bytes(self.plans()), "regenerate: python test_trellis_convert.py "
+                         "--write-fixture")
+
+    def test_a_draft_head_is_built_from_its_nvfp4_codes_under_the_trellis_recipe(self):
+        from euhedral_artifacts.codes import QuantState, state_file, state_size
+        from euhedral_artifacts.sources import MatrixSource
+        shape = (128, 256)
+        state = QuantState("NVFP4", "row-split-k128-v1", shape, RNG.integers(0, 16, shape, dtype=np.uint8),
+                           RNG.integers(0, 256, (128, 16), dtype=np.uint8), np.float32(0.5))
+        with tempfile.TemporaryDirectory() as tmp:
+            state.save(state_file(Path(tmp), "text/draft_head"))
+            plans: list[ObjectPlan] = []
+            inventory.add_quant(plans, recipes.Recipe("trellis"), "text/draft_head",
+                                MatrixSource(shape, lambda b, e: None), "Q3G64_F16S", None, Path(tmp))
+            (plan,) = plans
+            self.assertEqual((plan.format_name, plan.layout, plan.byte_size),
+                             ("NVFP4", "row-split-k128-v1", state_size(state)))
+            buffer = io.BytesIO()
+            plan.writer(buffer, 0)
+            self.assertEqual(len(buffer.getvalue()), plan.byte_size)
 
     def test_plans_fit_one_table(self):
         plans = self.plans()
@@ -561,4 +617,11 @@ class PipelineTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:] == ["--write-fixture"]:
+        InventoryTest.setUpClass()
+        try:
+            FIXTURE.write_bytes(fixture_bytes(InventoryTest().plans()))
+        finally:
+            InventoryTest.tearDownClass()
+    else:
+        unittest.main()

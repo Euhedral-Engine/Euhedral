@@ -38,6 +38,9 @@ public final class QuantizationMain {
 
     private QuantizationMain() {}
 
+    /// Decoder layers of Swift-1.5, the default of `--layers`.
+    private static final int TEXT_LAYERS = 64;
+
     /// Calibrate flags that only the GPTQ path reads; a trellis run rejects them.
     private static final List<String> GPTQ_ONLY_FLAGS =
             List.of("skip-mtp", "act-order", "damp", "quantization", "compressed", "nvfp4-above", "nvfp4-scale-max");
@@ -173,7 +176,11 @@ public final class QuantizationMain {
                 if (options.containsKey(flag))
                     throw new IllegalArgumentException("--" + flag + " applies to --format gptq, not trellis");
         }
-        if (trellis) required(options, "draft-ids-from"); // the heads are rounded in a trellis run
+        if (!trellis && options.getOrDefault("quantization", "").equals("trellis"))
+            throw new IllegalArgumentException("--quantization trellis needs --format trellis");
+        // a trellis run over the whole model rounds the heads; a partial one (--layers N) writes layers only
+        boolean heads = !trellis || Integer.parseInt(options.getOrDefault("layers", "64")) >= TEXT_LAYERS;
+        if (trellis && heads) required(options, "draft-ids-from");
         Double bits = trellis ? Double.valueOf(required(options, "bits")) : null;
         var settings = new Calibrate.Settings(
                 Path.of(required(options, "model")),
@@ -182,7 +189,7 @@ public final class QuantizationMain {
                         options.containsKey("compressed"),
                         options.get("output-head")),
                 Path.of(required(options, "tokens")),
-                Path.of(required(options, "draft-ids-from")),
+                heads ? Path.of(required(options, "draft-ids-from")) : null,
                 Path.of(required(options, "out")),
                 options.containsKey("act-order"),
                 Float.parseFloat(options.getOrDefault("damp", "0.01")),

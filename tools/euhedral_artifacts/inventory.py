@@ -18,10 +18,10 @@ from euhedral_artifacts.nvfp4 import (nvfp4_offsets, nvfp4_sd4_offsets, quantize
 from euhedral_artifacts.q3_p2e2 import P2E2_LOWEST_CODE
 from euhedral_artifacts.recipes import (BF16_FORMAT, LAYOUT_SD4, NVFP4_FORMAT, Q3_FORMAT, Recipe, storage,
                                        stays_row_split)
-from euhedral_artifacts.trellis import TrellisSource, require_head_codes
 from euhedral_artifacts.sources import (HIDDEN, VOCAB_SIZE, MatrixSource, SourceStore, bf16_to_float32,
                                         concat_matrix, gather_matrix, head_part, read_json, slice_matrix,
                                         source_matrix)
+from euhedral_artifacts.trellis import TrellisSource, require_head_codes
 
 FULL_ATTENTION_LAYERS = frozenset(range(3, 64, 4))
 TOKENIZER_VOCAB_SIZE = 248077
