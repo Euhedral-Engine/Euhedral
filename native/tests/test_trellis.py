@@ -107,7 +107,7 @@ class DeviceLinear:
                              ptr(d_out), i32(rows), i32(self.k), i32(self.n), i32(self.w), i32(self.splits),
                              i32(self.s)], block=256)
             if self.splits > 1:
-                self.gpu.launch("euhedral_trellis_epilogue", (self.n // 128, rows),
+                self.gpu.launch("euhedral_trellis_epilogue", ((self.n + 511) // 512, rows),
                                 [ptr(d_partials), i32(self.splits), ptr(self.d_svh), ptr(d_out), i32(rows),
                                  i32(self.n)], block=128)
             out = buffers.get(d_out, "<u2", (rows, self.n))
