@@ -79,64 +79,97 @@ public final class Rco {
     /// @throws IllegalStateException when the budget is below the cheapest options
     public static Result run(
             Objective objective, long[][] cost, long budget, long unit, Settings settings, long seed, int restart) {
-        int groups = cost.length;
-        Random random = new Random(seed * 1_000_003L + restart);
-        double[][] c = new double[groups][];
-        double minimum = 0, maximum = 0, ranges = 0;
-        double[] low = new double[groups];
-        for (int i = 0; i < groups; i++) {
-            c[i] = new double[cost[i].length];
-            double lo = Double.MAX_VALUE, hi = 0;
-            for (int k = 0; k < c[i].length; k++) {
-                c[i][k] = cost[i][k];
-                lo = Math.min(lo, c[i][k]);
-                hi = Math.max(hi, c[i][k]);
+        Run run = new Run(objective, cost, budget, unit, settings, seed, restart);
+        while (!run.advance()) {}
+        return run.result();
+    }
+
+    /// A run taken a little at a time: each [#advance] draws one Gumbel sample, or ends a step once its samples
+    /// are drawn, so a caller polling host work never holds its thread for a whole run.
+    public static final class Run {
+        private final Objective objective;
+        private final long[][] cost;
+        private final long budget, unit;
+        private final Settings settings;
+        private final Random random;
+        private final int groups;
+        private final double[][] c, direction, alpha, m, v, gradient, score, hard;
+        private final double target;
+        private double worst;
+        private double bestValue = Double.POSITIVE_INFINITY;
+        private int[] bestChoice;
+        private int step = 1, sample;
+
+        /// @throws IllegalStateException when the budget is below the cheapest options
+        public Run(
+                Objective objective, long[][] cost, long budget, long unit, Settings settings, long seed, int restart) {
+            this.objective = objective;
+            this.cost = cost;
+            this.budget = budget;
+            this.unit = unit;
+            this.settings = settings;
+            this.groups = cost.length;
+            this.random = new Random(seed * 1_000_003L + restart);
+            c = new double[groups][];
+            double minimum = 0, maximum = 0, ranges = 0;
+            double[] low = new double[groups];
+            for (int i = 0; i < groups; i++) {
+                c[i] = new double[cost[i].length];
+                double lo = Double.MAX_VALUE, hi = 0;
+                for (int k = 0; k < c[i].length; k++) {
+                    c[i][k] = cost[i][k];
+                    lo = Math.min(lo, c[i][k]);
+                    hi = Math.max(hi, c[i][k]);
+                }
+                low[i] = lo;
+                minimum += lo;
+                maximum += hi;
+                ranges += hi - lo;
             }
-            low[i] = lo;
-            minimum += lo;
-            maximum += hi;
-            ranges += hi - lo;
-        }
-        if (budget < minimum)
-            throw new IllegalStateException("the budget of " + budget + " bytes is below the cheapest choices");
-        // The manifold must lie strictly between the cheapest and the dearest expectation to be reachable.
-        double margin = 1e-4 * (maximum - minimum);
-        double target = Math.min(Math.max(budget, minimum + margin), maximum - margin);
-        double meanRange = Math.max(ranges / groups, 1);
-        double[][] direction = new double[groups][];
-        for (int i = 0; i < groups; i++) {
-            direction[i] = new double[c[i].length];
-            for (int k = 0; k < c[i].length; k++) direction[i][k] = (c[i][k] - low[i]) / meanRange;
+            if (budget < minimum)
+                throw new IllegalStateException("the budget of " + budget + " bytes is below the cheapest choices");
+            // The manifold must lie strictly between the cheapest and the dearest expectation to be reachable.
+            double margin = 1e-4 * (maximum - minimum);
+            target = Math.min(Math.max(budget, minimum + margin), maximum - margin);
+            double meanRange = Math.max(ranges / groups, 1);
+            direction = new double[groups][];
+            for (int i = 0; i < groups; i++) {
+                direction[i] = new double[c[i].length];
+                for (int k = 0; k < c[i].length; k++) direction[i][k] = (c[i][k] - low[i]) / meanRange;
+            }
+            alpha = new double[groups][];
+            for (int i = 0; i < groups; i++) {
+                alpha[i] = new double[c[i].length];
+                for (int k = 0; k < alpha[i].length; k++) alpha[i][k] = INITIAL_SPREAD * random.nextGaussian();
+            }
+            retract(alpha, c, direction, target);
+            m = zeros(c);
+            v = zeros(c);
+            gradient = zeros(c);
+            score = zeros(c);
+            hard = zeros(c);
+            worst = manifoldError(alpha, c, target);
         }
 
-        double[][] alpha = new double[groups][];
-        for (int i = 0; i < groups; i++) {
-            alpha[i] = new double[c[i].length];
-            for (int k = 0; k < alpha[i].length; k++) alpha[i][k] = INITIAL_SPREAD * random.nextGaussian();
+        private static double[][] zeros(double[][] shape) {
+            double[][] z = new double[shape.length][];
+            for (int i = 0; i < shape.length; i++) z[i] = new double[shape[i].length];
+            return z;
         }
-        retract(alpha, c, direction, target);
-        double[][] m = new double[groups][], v = new double[groups][];
-        for (int i = 0; i < groups; i++) {
-            m[i] = new double[c[i].length];
-            v[i] = new double[c[i].length];
-        }
-        double worst = manifoldError(alpha, c, target);
-        double bestValue = Double.POSITIVE_INFINITY;
-        int[] bestChoice = null;
 
-        double[][] gradient = new double[groups][];
-        for (int i = 0; i < groups; i++) gradient[i] = new double[c[i].length];
-        double[][] score = new double[groups][];
-        for (int i = 0; i < groups; i++) score[i] = new double[c[i].length];
-        double[][] hard = new double[groups][];
-        for (int i = 0; i < groups; i++) hard[i] = new double[c[i].length];
-
-        for (int step = 1; step <= settings.steps(); step++) {
-            double tau = settings.steps() == 1
+        private double tau() {
+            return settings.steps() == 1
                     ? TAU_START
                     : TAU_START * Math.pow(TAU_END / TAU_START, (step - 1.0) / (settings.steps() - 1));
-            for (double[] row : gradient) Arrays.fill(row, 0);
-            for (int sample = 0; sample < settings.samples(); sample++) {
+        }
+
+        /// Draws the step's next sample, or, when every sample of the step is drawn, updates the logits. True once
+        /// every step is done.
+        public boolean advance() {
+            if (step > settings.steps()) return true;
+            double tau = tau();
+            if (sample < settings.samples()) {
+                if (sample == 0) for (double[] row : gradient) Arrays.fill(row, 0);
                 for (int i = 0; i < groups; i++)
                     for (int k = 0; k < c[i].length; k++)
                         score[i][k] = (alpha[i][k] - Math.log(-Math.log(random.nextDouble() + 1e-300) + 1e-300)) / tau;
@@ -158,6 +191,8 @@ public final class Rco {
                     for (int k = 0; k < y.length; k++)
                         gradient[i][k] += y[k] * (toward[i][k] - dot) / tau / settings.samples();
                 }
+                sample++;
+                return false;
             }
             double[][] normal = normal(alpha, c);
             project(gradient, normal);
@@ -177,25 +212,29 @@ public final class Rco {
             retract(alpha, c, direction, target);
             project(m, normal(alpha, c));
             worst = Math.max(worst, manifoldError(alpha, c, target));
+            step++;
+            sample = 0;
+            return step > settings.steps();
         }
 
-        double[][] p = new double[groups][];
-        double[][] logP = new double[groups][];
-        for (int i = 0; i < groups; i++) {
-            p[i] = softmax(alpha[i]);
-            logP[i] = new double[p[i].length];
-            for (int k = 0; k < p[i].length; k++) logP[i][k] = Math.log(Math.max(p[i][k], 1e-300));
+        /// The run's assignment once [#advance] has returned true.
+        public Result result() {
+            if (step <= settings.steps()) throw new IllegalStateException("the run has steps left");
+            double[][] p = new double[groups][];
+            double[][] logP = new double[groups][];
+            for (int i = 0; i < groups; i++) {
+                p[i] = softmax(alpha[i]);
+                logP[i] = new double[p[i].length];
+                for (int k = 0; k < p[i].length; k++) logP[i][k] = Math.log(Math.max(p[i][k], 1e-300));
+            }
+            int[] choice = Knapsack.solve(logP, cost, budget, unit);
+            double[][] last = zeros(c);
+            for (int i = 0; i < groups; i++) last[i][choice[i]] = 1;
+            double value = objective.value(last);
+            // The best assignment any sample produced is kept as well: the run has evaluated the objective at it.
+            if (bestValue < value) return new Result(bestChoice, p, bestValue, worst);
+            return new Result(choice, p, value, worst);
         }
-        int[] choice = Knapsack.solve(logP, cost, budget, unit);
-        double[][] last = new double[groups][];
-        for (int i = 0; i < groups; i++) {
-            last[i] = new double[c[i].length];
-            last[i][choice[i]] = 1;
-        }
-        double value = objective.value(last);
-        // The best assignment any sample produced is kept as well: the run has evaluated the objective at it.
-        if (bestValue < value) return new Result(bestChoice, p, bestValue, worst);
-        return new Result(choice, p, value, worst);
     }
 
     private static double[] softmax(double[] logits) {
