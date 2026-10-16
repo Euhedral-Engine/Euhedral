@@ -10,6 +10,7 @@ import io.euhedral_execution.inference.core.runtime.graph.AsyncReads;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
@@ -151,7 +152,7 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
     private record Source(long size, int directFd, int bufferedFd, FileChannel channel) {
 
         static Source open(AsyncReads reads, Path file) throws IOException {
-            long size = java.nio.file.Files.size(file);
+            long size = Files.size(file);
             if (reads == null) return new Source(size, -1, -1, FileChannel.open(file, StandardOpenOption.READ));
             int direct;
             try {

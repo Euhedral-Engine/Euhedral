@@ -108,8 +108,7 @@ public record ArtifactProfile(
     /// The projections are every object under `text/layers/` with a registered linear format, but for the norms and
     /// small vectors outside the registry and the trellis companions. The BF16 ones are ignored when any other
     /// quantization is present (the small GDN projections stay BF16 in every quantized artifact). The embedding,
-    /// the
-    /// heads and the MTP layer do not decide the profile: a Q3 artifact keeps its MTP layer in NVFP4. When the
+    /// the heads and the MTP layer do not decide the profile: a Q3 artifact keeps its MTP layer in NVFP4. When the
     /// projections are of one quantization, a text layer's FFN gate-up projection gives its layout (compressed q3
     /// keeps its down projections row-split); when they are of several, the artifact is [Quantization#MIXED],
     /// uncompressed. The artifact's draft depth, when it stores one, is the profile's.
