@@ -97,8 +97,9 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
         copy_commit();
         fetch += stride;
     }
-    // This lane's A fragment elements of k16 tile `ti` are at a + 16 * ti plus a fixed offset per m-tile and half.
-    const unsigned short* a_lane = act + (size_t)(row_base + grp) * k + 2 * q + (size_t)first * 16;
+    // The activations are in fragment order (euhedral_trellis_prepass): this lane's four A elements of a row in k16
+    // tile `ti` are the 8 bytes at a + 16 * ti.
+    const unsigned short* a_lane = act + (size_t)(row_base + grp) * k + 4 * q + (size_t)first * 16;
     int slot = 0;
     for (int ti = first; ti < last; ++ti) {
         copy_wait<kStages - 2>();
@@ -129,10 +130,12 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
             const unsigned short* a0 = a_lane + (size_t)(m * 16) * k;
             const unsigned short* a1 = a0 + (size_t)8 * k;
             unsigned int a[4];
-            a[0] = row0 < rows ? *reinterpret_cast<const unsigned int*>(a0) : 0u;
-            a[1] = row1 < rows ? *reinterpret_cast<const unsigned int*>(a1) : 0u;
-            a[2] = row0 < rows ? *reinterpret_cast<const unsigned int*>(a0 + 8) : 0u;
-            a[3] = row1 < rows ? *reinterpret_cast<const unsigned int*>(a1 + 8) : 0u;
+            const uint2 low = row0 < rows ? *reinterpret_cast<const uint2*>(a0) : make_uint2(0u, 0u);
+            const uint2 high = row1 < rows ? *reinterpret_cast<const uint2*>(a1) : make_uint2(0u, 0u);
+            a[0] = low.x;
+            a[1] = high.x;
+            a[2] = low.y;
+            a[3] = high.y;
             mma_f16(acc[m][0], a, b[0][0], b[0][1]);
             mma_f16(acc[m][1], a, b[1][0], b[1][1]);
         }
