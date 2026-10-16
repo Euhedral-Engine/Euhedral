@@ -30,11 +30,13 @@ Each trellis linear is a chain of `linear` table kernels inside the existing lin
   Each warp streams its tiles through a four-slot ring of asynchronous copies and decodes a lane's eight weights from
   three ring words at offsets fixed by the tile width. Launches of up to 8 rows take the decoded weights as the MMA's A
   operand and the activations as B, one `m16n8k16` per k16 tile; larger launches take 16-row activation tiles as A.
-  Both orientations give the same bits.
+  Both orientations give the same bits. The prepass and the epilogue run each 128-column block's Hadamard in one
+  warp's registers, the same additions as the shared-memory butterfly of the scalar reference.
 - **Many rows** (at least `euhedral.trellis.whole-k-rows`): the same GEMM, each block covering 32 rows of a 128-column
   block and streaming the whole K range once, adding each split's sums in split order at the split's end. The block
-  stages its activation rows in shared memory four k16 tiles at a time, so its warps share one copy. The results are
-  bitwise those of the split launch, with no split partials.
+  stages its activation rows in shared memory four k16 tiles at a time, so its warps share one copy, and finishes
+  each row's Hadamard in one warp's registers. The results are bitwise those of the split launch, with no split
+  partials.
 - **Prefill** (non-VERIFY launches above `euhedral.trellis.mma-max-rows` rows): the whole object decoded to BF16 in
   rotated space, one row-exact BF16 GEMM per segment, and the BF16 epilogue.
 - **Exact numerics:** the scalar FP32 reference.
@@ -78,8 +80,8 @@ iterations, every weight on the device:
 
 | Artifact | Prefill 512 tokens | Prefill 16384 tokens | Decode, MTP speculation | Decode, no speculation |
 |---|---|---|---|---|
-| trellis 3.0 | 1178 tokens/s | 1105 tokens/s (14.8 s) | 232.7 tokens/s | 65.7 tokens/s |
-| trellis 3.5 | 1118 tokens/s | 1119 tokens/s (14.7 s) | 212.9 tokens/s | 59.6 tokens/s |
+| trellis 3.0 | 1262 tokens/s | 1173 tokens/s (14.0 s) | 232.7 tokens/s | 65.7 tokens/s |
+| trellis 3.5 | 1254 tokens/s | 1169 tokens/s (14.1 s) | 212.9 tokens/s | 59.6 tokens/s |
 
 Decode is measured on `decode:32:256` (256 tokens after a 32-token prompt).
 
@@ -91,5 +93,5 @@ rotated past L2:
 - `euhedral.trellis.whole-k-rows` (80): the fewest rows for which each block runs every K split itself. With split
   partials and with whole-K blocks, one step takes 66.2 and 65.2 ms at 64 rows and 85.6 and 78.0 ms at 80.
 - `euhedral.trellis.mma-max-rows` (512): the most rows a launch other than a verification keeps on the tensor-core route.
-  The tensor-core route prefills 512-row chunks at 1178 tokens/s and the prefill route at 490, so every chunk of the
+  The tensor-core route prefills 512-row chunks at 1262 tokens/s and the prefill route at 490, so every chunk of the
   default workspace stays on the tensor-core route and the residency plan reserves no prefill scratch.
