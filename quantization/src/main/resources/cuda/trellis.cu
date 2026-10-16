@@ -15,33 +15,13 @@ typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 typedef long long int64_t;
 
+#include "trellis/codebook.cuh"
+
 #define H_INF __ushort_as_half(0x7c00)
 
 namespace {
 
 constexpr int kTile = 256;
-
-/// Two mul1 codebook entries from the precomputed products x0 = state0 * 0x83DCD12D, x1 = state1 * 0x83DCD12D.
-__device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1) {
-    const uint32_t acc = 0x6400u;
-    uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
-    uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
-    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
-    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
-    half h0 = __ushort_as_half((uint16_t)sum0);
-    half h1 = __ushort_as_half((uint16_t)sum1);
-    return __hfma2(__halves2half2(h0, h1), k_inv_h2, k_bias_h2);
-}
-
-__device__ inline half2 decode_mul1_2(uint32_t x0, uint32_t x1) {
-    return decode_mul1_product_2(x0 * 0x83DCD12Du, x1 * 0x83DCD12Du);
-}
-
-__device__ inline half decode_mul1(uint32_t x) {
-    x *= 0x83DCD12Du;
-    uint32_t sum = __dp4a(x, 0x01010101u, 0x6400u);
-    return __hfma(__ushort_as_half((uint16_t)sum), __ushort_as_half(0x1eee), __ushort_as_half(0xc931));
-}
 
 __device__ __forceinline__ uint32_t warp_min(uint32_t value) {
     return __reduce_min_sync(0xffffffff, value);
@@ -462,25 +442,6 @@ __device__ __forceinline__ void pack_body(uint16_t* __restrict__ g_packed, const
 
 constexpr int kFracMaxWords = 64;
 
-__device__ __forceinline__ int frac_d(int i, int ka, uint32_t mask) { return ka + ((mask >> (i & 15)) & 1); }
-
-/// Ring position where window i ends.
-__device__ __forceinline__ int frac_s(int i, int ka, uint32_t mask, int bpb) {
-    int s = (i >> 4) * bpb;
-    for (int j = 0; j <= (i & 15); ++j) s += frac_d(j, ka, mask);
-    return s;
-}
-
-/// 16-bit window starting at ring bit `start`, from MSB-first 32-bit words.
-__device__ __forceinline__ uint32_t frac_window(const uint32_t* words, int nw, int start) {
-    const int R = nw * 32;
-    start %= R;
-    if (start < 0) start += R;
-    const int wi = start >> 5, o = start & 31;
-    const uint64_t v = ((uint64_t)words[wi] << 32) | (uint64_t)words[(wi + 1) % nw];
-    return (uint32_t)((v >> (48 - o)) & 0xFFFFu);
-}
-
 /// Fractional packing, one thread per tile (frac.cu); `bpb` is the uint16 words per tile.
 __device__ __forceinline__ void pack_frac_tile(
         uint16_t* __restrict__ g_packed, const uint16_t* __restrict__ g_unpacked, int tile, int ka, uint32_t mask,
@@ -517,16 +478,6 @@ __device__ __forceinline__ float decode_tile_value(
 __device__ __forceinline__ void decode_tile(
         const uint16_t* __restrict__ g_packed, float* __restrict__ g_decoded, int ka, uint32_t mask, int bpb) {
     g_decoded[(size_t)blockIdx.x * 256 + threadIdx.x] = decode_tile_value(g_packed, blockIdx.x, ka, mask, bpb);
-}
-
-/// Row-major element (r * 16 + c) of a 16x16 tile at tensor-core position `pos`: for t = pos / 8, r0 = (t % 4) * 2 and
-/// c0 = t / 4, the eight positions of t are rows r0, r0 + 1, r0 + 8, r0 + 9 at columns c0, then c0 + 8.
-__device__ __forceinline__ int tensor_core_element(int pos) {
-    const int t = pos >> 3, j = pos & 7;
-    const int r0 = (t & 3) * 2;
-    const int row = r0 + ((j & 3) >> 1) * 8 + (j & 1);
-    const int col = (t >> 2) + (j >> 2) * 8;
-    return row * 16 + col;
 }
 
 /// Decodes tile (blockIdx.x) of a `[k / 16, n / 16]` grid into the row-major float32 matrix `w` `[k, n]`.
@@ -657,17 +608,8 @@ extern "C" __global__ __launch_bounds__(128) void hadamard128_columns(float* x, 
     float* base = x + (size_t)blockIdx.y * cols + (size_t)blockIdx.x * 128;
     const int t = threadIdx.x;
     s[t] = base[t];
-    __syncthreads();
-    for (int h = 1; h < 128; h <<= 1) {
-        if (t < 64) {
-            const int i = ((t / h) * 2 * h) + (t % h);
-            const float a = s[i], b = s[i + h];
-            s[i] = a + b;
-            s[i + h] = a - b;
-        }
-        __syncthreads();
-    }
-    base[t] = s[t] * kInvSqrt128;
+    trellis_hadamard128(s, t);
+    base[t] = s[t];
 }
 
 /// Gathers the 16-row strip of `w` `[k, n]` starting at `first_row` into n / 16 tiles of 256 values in tensor-core
