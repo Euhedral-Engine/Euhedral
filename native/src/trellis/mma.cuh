@@ -27,6 +27,21 @@ __device__ __forceinline__ void copy16(void* shared, const void* global) {
 
 __device__ __forceinline__ void copy_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 
+/// A 16-byte copy of the first `bytes` (0 or 16) of `global`, zero-filling the rest.
+__device__ __forceinline__ void copy16_fill(void* shared, const void* global, int bytes) {
+    const unsigned int address = (unsigned int)__cvta_generic_to_shared(shared);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(address), "l"(global), "r"(bytes));
+}
+
+/// Rows of one CTA of euhedral_trellis_mma_rows.
+constexpr int kSplitRows = 32;
+/// k16 tiles per activation chunk the CTAs of euhedral_trellis_mma_rows stage in shared memory: 64 FP16 elements, eight
+/// 16-byte segments per row.
+constexpr int kChunkTiles = 4;
+/// Two chunk slots of kSplitRows rows; segment s of row r is stored at s ^ (r % 8), so the eight rows a warp's lanes
+/// read at once fall in different banks.
+typedef uint4 ChunkSlots[2][kSplitRows][8];
+
 template <int N>
 __device__ __forceinline__ void copy_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 
@@ -57,6 +72,9 @@ __device__ __forceinline__ unsigned int window(const unsigned int* u, int j) {
     return __funnelshift_l(u[i + 1], u[i], o) >> 16;
 }
 
+/// A row of the activations to address: `row`, or the last row for rows past the launch (their copies read nothing).
+__device__ __forceinline__ int chunk_live_row(int row, int rows) { return row < rows ? row : rows - 1; }
+
 /// Where acc[p][i] of a lane lands: row (from the group's first row) and column (in the 128-column block). Narrow
 /// tiles take the decoded weights as the m16n8k16 A operand (16 output columns by k16) and 8 activation rows as B, so
 /// acc[p] holds columns g and g + 8 of the warp's 16 for rows 8p + 2q and + 1 (g = lane / 4, q = lane % 4). Wide tiles
@@ -78,10 +96,10 @@ __device__ __forceinline__ int acc_column(int p, int i) {
 /// for tiles of `W` words, in Narrow or wide tiles (acc_row; wide needs an even P). Warp `warp` owns the 16-column tile
 /// blockIdx.x * 8 + warp. The same instruction sequence runs for every row tile, rows past `rows` are zero, and k16
 /// tiles are accumulated in increasing order, so a row's bits depend on nothing but its own data and the K range.
-template <int W, int P, bool Narrow>
+template <int W, int P, bool Narrow, bool Staged = false>
 __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned short* __restrict__ act,
         const unsigned short* __restrict__ words, int rows, int row_base, int k, int n, int first, int last,
-        unsigned int (*ring)[kStages][kTrellisMaxWords]) {
+        unsigned int (*ring)[kStages][kTrellisMaxWords], ChunkSlots* chunks = nullptr) {
     using R = Ring<W>;
     constexpr int nw = R::kWords32;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -103,9 +121,23 @@ __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned sh
     const size_t stride = (size_t)tiles_n * W;
     const bool copies = lane < W / 8;
     const unsigned short* fetch = words + (size_t)first * stride + (size_t)tj * W + lane * 8;
+    // Staged (wide tiles of kSplitRows rows): the CTA copies the activation chunk that starts at a tile together with
+    // that tile's weights, one 16-byte segment per thread, rows past `rows` and tiles past `last` zero.
+    const int chunk_row = threadIdx.x >> 3, chunk_segment = threadIdx.x & 7;
+    const bool chunk_row_live = row_base + chunk_row < rows;
+    const unsigned short* chunk_source = act + (size_t)(chunk_live_row(row_base + chunk_row, rows)) * k
+            + (size_t)first * 16 + chunk_segment * 8;
+    const auto stage = [&](int tile) {
+        if (!Staged || (tile - first) % kChunkTiles != 0 || tile >= last) return;
+        const int chunk = (tile - first) / kChunkTiles;
+        const bool live = chunk_row_live && tile + (chunk_segment >> 1) < last;
+        copy16_fill(&(*chunks)[chunk & 1][chunk_row][chunk_segment ^ (chunk_row & 7)],
+                chunk_source + (size_t)chunk * kChunkTiles * 16, live ? 16 : 0);
+    };
 #pragma unroll
     for (int i = 0; i < kStages - 1; ++i) {
         if (copies && first + i < last) copy16(&ring[warp][i][lane * 4], fetch);
+        stage(first + i);
         copy_commit();
         fetch += stride;
     }
@@ -117,7 +149,11 @@ __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned sh
         copy_wait<kStages - 2>();
         __syncwarp();
         if (copies && ti + kStages - 1 < last) copy16(&ring[warp][slot == 0 ? kStages - 1 : slot - 1][lane * 4], fetch);
+        stage(ti + kStages - 1);
         copy_commit();
+        // A chunk is complete in every thread's groups once the tile it starts at is: one barrier makes it visible.
+        // Chunk c + 2 reuses c's slot from tile 4c + 5 on, after every warp passed tile 4c + 4's barrier.
+        if (Staged && (ti - first) % kChunkTiles == 0) __syncthreads();
         fetch += stride;
         const unsigned int* mine = ring[warp][slot];
         slot = slot + 1 == kStages ? 0 : slot + 1;
@@ -150,10 +186,17 @@ __device__ __forceinline__ void accumulate(float (&acc)[P][4], const unsigned sh
 #pragma unroll
             for (int m = 0; m < P / 2; ++m) {
                 const int row0 = row_base + m * 16 + grp, row1 = row0 + 8;
-                const unsigned short* a0 = a_lane + (size_t)(m * 16) * k;
-                const uint2 low = row0 < rows ? *reinterpret_cast<const uint2*>(a0) : make_uint2(0u, 0u);
-                const uint2 high =
-                        row1 < rows ? *reinterpret_cast<const uint2*>(a0 + (size_t)8 * k) : make_uint2(0u, 0u);
+                uint2 low, high;
+                if (Staged) {
+                    const int chunk = (ti - first) / kChunkTiles, tile = (ti - first) % kChunkTiles;
+                    const int segment = (2 * tile + (q >> 1)) ^ grp;
+                    low = reinterpret_cast<const uint2*>(&(*chunks)[chunk & 1][m * 16 + grp][segment])[q & 1];
+                    high = reinterpret_cast<const uint2*>(&(*chunks)[chunk & 1][m * 16 + grp + 8][segment])[q & 1];
+                } else {
+                    const unsigned short* a0 = a_lane + (size_t)(m * 16) * k;
+                    low = row0 < rows ? *reinterpret_cast<const uint2*>(a0) : make_uint2(0u, 0u);
+                    high = row1 < rows ? *reinterpret_cast<const uint2*>(a0 + (size_t)8 * k) : make_uint2(0u, 0u);
+                }
                 const unsigned int a[4] = {low.x, high.x, low.y, high.y};
                 mma_f16(acc[2 * m], a, d[0], d[2]);
                 mma_f16(acc[2 * m + 1], a, d[1], d[3]);
@@ -246,9 +289,6 @@ __device__ __forceinline__ void rows(const unsigned short* __restrict__ act, con
     }
 }
 
-/// Rows of one CTA of euhedral_trellis_mma_rows.
-constexpr int kSplitRows = 32;
-
 /// One row group with every split of the K range in order: split i accumulates from zero and its sums are added to
 /// `sum` (shared, [kSplitRows][128]) in order 0..S-1, as euhedral_trellis_epilogue adds the partials of the split
 /// kernel; then the epilogue in place, one 8-row slice of `sum` at a time. Wide tiles of `8 P` rows.
@@ -256,14 +296,14 @@ template <int W, int P>
 __device__ __forceinline__ void group_splits(const unsigned short* __restrict__ act,
         const unsigned short* __restrict__ words, const unsigned short* __restrict__ svh,
         unsigned short* __restrict__ out, int rows, int row_base, int k, int n, int splits,
-        unsigned int (*ring)[kStages][kTrellisMaxWords], float (*sum)[128]) {
+        unsigned int (*ring)[kStages][kTrellisMaxWords], float (*sum)[128], ChunkSlots* chunks) {
     const int tiles = k >> 4;
     for (int split = 0; split < splits; ++split) {
         const int first = (int)(((long long)split * tiles) / splits);
         const int last = (int)(((long long)(split + 1) * tiles) / splits);
         float acc[P][4];
         clear(acc);
-        accumulate<W, P, false>(acc, act, words, rows, row_base, k, n, first, last, ring);
+        accumulate<W, P, false, true>(acc, act, words, rows, row_base, k, n, first, last, ring, chunks);
         // Each lane adds to the sum elements only it touches.
 #pragma unroll
         for (int p = 0; p < P; ++p)
@@ -289,10 +329,10 @@ template <int W>
 __device__ __forceinline__ void row_group(const unsigned short* __restrict__ act,
         const unsigned short* __restrict__ words, const unsigned short* __restrict__ svh,
         unsigned short* __restrict__ out, int rows, int row_base, int k, int n, int splits,
-        unsigned int (*ring)[kStages][kTrellisMaxWords], float (*sum)[128]) {
+        unsigned int (*ring)[kStages][kTrellisMaxWords], float (*sum)[128], ChunkSlots* chunks) {
     // Wide tiles: 16 or 32 rows.
-    if (rows - row_base > 16) group_splits<W, 4>(act, words, svh, out, rows, row_base, k, n, splits, ring, sum);
-    else group_splits<W, 2>(act, words, svh, out, rows, row_base, k, n, splits, ring, sum);
+    if (rows - row_base > 16) group_splits<W, 4>(act, words, svh, out, rows, row_base, k, n, splits, ring, sum, chunks);
+    else group_splits<W, 2>(act, words, svh, out, rows, row_base, k, n, splits, ring, sum, chunks);
 }
 
 }  // namespace trellis_mma
@@ -337,6 +377,7 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_trellis_mma_rows(
         int splits, int s) {
     __shared__ __align__(16) unsigned int ring[8][trellis_mma::kStages][kTrellisMaxWords];
     __shared__ float sum[trellis_mma::kSplitRows][128];
+    __shared__ trellis_mma::ChunkSlots chunks;
     const int column0 = blockIdx.x * 128;
     int g = 0;
     while (g + 1 < s && column0 >= ends[g]) ++g;
@@ -345,7 +386,7 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_trellis_mma_rows(
     switch (w) {
 #define EUHEDRAL_TRELLIS_MMA_WIDTH(W) \
     case W: \
-        trellis_mma::row_group<W>(segment, words, svh, out, rows, row_base, k, n, splits, ring, sum); \
+        trellis_mma::row_group<W>(segment, words, svh, out, rows, row_base, k, n, splits, ring, sum, &chunks); \
         break;
         EUHEDRAL_TRELLIS_WIDTHS(EUHEDRAL_TRELLIS_MMA_WIDTH)
 #undef EUHEDRAL_TRELLIS_MMA_WIDTH
