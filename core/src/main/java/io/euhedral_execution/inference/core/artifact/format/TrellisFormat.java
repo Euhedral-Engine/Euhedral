@@ -11,6 +11,8 @@ import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
 import java.lang.foreign.Arena;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -175,8 +177,7 @@ public final class TrellisFormat implements LinearFormat {
                 var host = arena.allocate(segmentBytes);
                 for (int index = 0; index < count; index++)
                     host.set(
-                            java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(
-                                    java.nio.ByteOrder.LITTLE_ENDIAN),
+                            ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN),
                             (long) index * Integer.BYTES,
                             cut[index]);
                 gpu.copyHostToDevice(segmentsAddress, host, segmentBytes);
