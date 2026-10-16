@@ -315,7 +315,7 @@ public final class Search {
                         for (int fraction = 0; fraction < s.budgetFractions().size(); fraction++)
                             for (int restart = 0; restart < s.rco().restarts(); restart++) {
                                 int l = lambda, f = fraction, r = restart;
-                                runs.add(host.submit(() -> sweepCell(ensemble, round, l, f, r)));
+                                runs.add(sweepCell(ensemble, round, l, f, r));
                             }
                     return CompletableFuture.allOf(runs.toArray(CompletableFuture[]::new))
                             .thenApply(done -> {
@@ -335,7 +335,8 @@ public final class Search {
     }
 
     /// One RCO run of the sweep, its assignment made to fit the device.
-    private List<Candidate> sweepCell(Ensemble ensemble, int round, int lambdaIndex, int fractionIndex, int restart) {
+    private CompletableFuture<List<Candidate>> sweepCell(
+            Ensemble ensemble, int round, int lambdaIndex, int fractionIndex, int restart) {
         // The prefill and decode weights are swept independently: a cell is one pair of the lambda list.
         double lambdaPrefill = s.lambdas().get(lambdaIndex / s.lambdas().size());
         double lambdaDecode = s.lambdas().get(lambdaIndex % s.lambdas().size());
@@ -346,8 +347,40 @@ public final class Search {
         long cellSeed = seed
                 + 1_000_003L * round
                 + 7919L * (lambdaIndex * s.budgetFractions().size() + fractionIndex);
-        Rco.Result result = Rco.run(objective, space.bytes, cellBudget, unit, s.rco(), cellSeed, restart);
+        // One sample per host task: a lattice worker polling the pool never holds a whole run, so the engine's
+        // frames on the same workers keep moving while the device scores.
+        return host.submit(() -> new Rco.Run(objective, space.bytes, cellBudget, unit, s.rco(), cellSeed, restart))
+                .thenCompose(this::advance)
+                .thenCompose(result -> host.submit(() -> repaired(
+                        ensemble,
+                        objective,
+                        result,
+                        cellBudget,
+                        unit,
+                        minimum,
+                        lambdaPrefill,
+                        lambdaDecode,
+                        fractionIndex,
+                        lambdaIndex)));
+    }
 
+    /// `run` advanced to its end, one sample per host task.
+    private CompletableFuture<Rco.Result> advance(Rco.Run run) {
+        return host.submit(run::advance).thenCompose(done -> done ? host.submit(run::result) : advance(run));
+    }
+
+    /// The assignment of `result` made to fit the device, as a candidate (none when it cannot be made to fit).
+    private List<Candidate> repaired(
+            Ensemble ensemble,
+            Rco.Objective objective,
+            Rco.Result result,
+            long cellBudget,
+            long unit,
+            long minimum,
+            double lambdaPrefill,
+            double lambdaDecode,
+            int fractionIndex,
+            int lambdaIndex) {
         int[] choice = result.choice();
         Feasibility.Check check = feasibility.check(space.allocation(choice));
         double[][] logP = new double[result.p().length][];
@@ -552,7 +585,7 @@ public final class Search {
                 Candidate following = todo.get(k + 1);
                 prepared = host.submit(() -> prepare(following));
             }
-            if (k == todo.size() - 1) next = propose(state.measured(), round + 1);
+            if (k == todo.size() - 1 && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
             Scorer.Result result = scoring.score(s.sources().path(s.sources().base()), ready.artifact());
             Measured measured = new Measured(
                     ready.candidate().allocation(),
@@ -579,7 +612,7 @@ public final class Search {
                     measured.decode(),
                     measured.fits() ? "fits" : "does not fit");
         }
-        if (next == null) next = propose(state.measured(), round + 1);
+        if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
         return next;
     }
 
