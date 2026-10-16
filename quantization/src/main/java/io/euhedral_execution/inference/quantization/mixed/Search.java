@@ -353,8 +353,7 @@ public final class Search {
         long cellSeed = seed
                 + 1_000_003L * round
                 + 7919L * (lambdaIndex * s.budgetFractions().size() + fractionIndex);
-        // One sample per host task: a lattice worker polling the pool never holds a whole run, so the engine's
-        // frames on the same workers keep moving while the device scores.
+        // Every sample of a step is a frame of its own: the pool holds many small frames for free workers.
         return proposing
                 .submit(() -> new Rco.Run(objective, space.bytes, cellBudget, unit, s.rco(), cellSeed, restart))
                 .thenCompose(this::advance)
@@ -371,9 +370,20 @@ public final class Search {
                         lambdaIndex)));
     }
 
-    /// `run` advanced to its end, one sample per host task.
+    /// `run` advanced to its end: each step's samples as frames of their own, all available at once, then the
+    /// step's update as one more.
     private CompletableFuture<Rco.Result> advance(Rco.Run run) {
-        return proposing.submit(run::advance).thenCompose(done -> done ? proposing.submit(run::result) : advance(run));
+        CompletableFuture<?>[] samples = new CompletableFuture<?>[run.samples()];
+        for (int i = 0; i < samples.length; i++) {
+            int index = i;
+            samples[i] = proposing.submit(() -> {
+                run.sample(index);
+                return null;
+            });
+        }
+        return CompletableFuture.allOf(samples)
+                .thenCompose(drawn -> proposing.submit(run::update))
+                .thenCompose(done -> done ? proposing.submit(run::result) : advance(run));
     }
 
     /// The assignment of `result` made to fit the device, as a candidate (none when it cannot be made to fit).
