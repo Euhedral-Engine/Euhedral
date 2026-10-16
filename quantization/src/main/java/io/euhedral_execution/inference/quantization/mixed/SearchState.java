@@ -86,6 +86,19 @@ public final class SearchState implements AutoCloseable {
         }
     }
 
+    /// The measured candidates of the search in `path`, whatever search it is: for a new search to start from what
+    /// another measured (KL does not depend on the context or the budget a search fits to).
+    public static List<Measured> read(Path path) throws IOException {
+        try (ResumeFile file = new ResumeFile(path)) {
+            Properties header = file.header();
+            if (!"mixed-search".equals(header.getProperty("kind")))
+                throw new IllegalArgumentException(path + " is not a mixed-allocation search state");
+            SearchState state = new SearchState(file, header);
+            state.load();
+            return List.copyOf(state.measured);
+        }
+    }
+
     private void load() throws IOException {
         int count = Integer.parseInt(header.getProperty("count"));
         long recorded = Long.parseLong(header.getProperty("end"));

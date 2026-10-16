@@ -11,6 +11,7 @@ import io.euhedral_execution.inference.quantization.mixed.Option;
 import io.euhedral_execution.inference.quantization.mixed.Priors;
 import io.euhedral_execution.inference.quantization.mixed.Rco;
 import io.euhedral_execution.inference.quantization.mixed.Search;
+import io.euhedral_execution.inference.quantization.mixed.SearchState;
 import io.euhedral_execution.inference.quantization.mixed.Seeds;
 import io.euhedral_execution.inference.quantization.mixed.Sources;
 import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
@@ -49,7 +50,8 @@ import java.util.OptionalInt;
 /// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
 /// [--copy-buffer-mib 64]
 /// allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json
-/// --reference R.kld... --context 32768 --state SEARCH.resume --out DIR [--seed-file F] [--batch 8]
+/// --reference R.kld... --context 32768 --state SEARCH.resume --out DIR [--seed-file F] [--import-state OLD.resume]
+/// [--batch 8]
 /// [--explore 0.3] [--patience 3] [--random 16] [--bands 8] [--verify-rows 5] [--workers N] [--host-mib N]
 /// [--free-mib N] [--score-rows 8] [--score-batch 0 (the chunks the device holds)] [--members 8] [--ridge 1e-3]
 /// [--lambdas 0,0.002,0.005,0.01,0.02]
@@ -109,7 +111,7 @@ public final class QuantizationMain {
                             + "[--draft-depth D] [--copy-buffer-mib 64]");
             System.err.println("       allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json "
                     + "--priors PRIORS.json --reference R.kld... --context 32768 --state SEARCH.resume --out DIR "
-                    + "[--seed-file F] [--batch 8] [--explore 0.3] [--patience 3] [--random 16] [--bands 8] "
+                    + "[--seed-file F] [--import-state OLD.resume] [--batch 8] [--explore 0.3] [--patience 3] [--random 16] [--bands 8] "
                     + "[--verify-rows 5] [--workers N] [--library PATH]");
             System.err.println("       cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json "
                     + "[--rows 1,2,3,4,5,6,512] [--repeats 50] [--rotate-mib 256] [--library PATH]");
@@ -346,6 +348,9 @@ public final class QuantizationMain {
             long free = options.containsKey("free-mib")
                     ? Long.parseLong(options.get("free-mib")) << 20
                     : scorer.freeDeviceBytes();
+            List<SearchState.Measured> imported = options.containsKey("import-state")
+                    ? SearchState.read(Path.of(options.get("import-state")))
+                    : List.of();
             var settings = new Search.Settings(
                     sources,
                     Priors.read(priorsFile),
@@ -390,7 +395,8 @@ public final class QuantizationMain {
                 Search.run(
                         settings,
                         (path, artifact) ->
-                                scorer.score(path, artifact, referencePaths, scoreRows, scoreBatch, hostBytes));
+                                scorer.score(path, artifact, referencePaths, scoreRows, scoreBatch, hostBytes),
+                        imported);
                 return;
             }
             try (ConcurrentScoring scoring = new ConcurrentScoring(
@@ -401,7 +407,7 @@ public final class QuantizationMain {
                     maxConcurrent,
                     marginBytes,
                     Integer.parseInt(options.getOrDefault("host-sinks", Integer.toString(workers))))) {
-                Search.run(settings, scoring);
+                Search.run(settings, scoring, imported);
             }
         }
     }
