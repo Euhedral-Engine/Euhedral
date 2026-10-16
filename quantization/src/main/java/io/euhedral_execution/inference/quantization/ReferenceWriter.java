@@ -15,11 +15,12 @@ import java.nio.file.StandardOpenOption;
 /// chunk the records of its second half (`context - 1 - context / 2` of them), each `width` uint16: scale and
 /// minimum as FP32, a code per vocabulary entry, padded to an even count.
 ///
-/// A record is llama.cpp's `log_softmax` quantization of one row of logits: with `lse = ln(sum exp(logit - max))`
-/// and `lp[i] = logit[i] - max - lse`, the minimum is `max(min lp, -16)`, the scale `(-lse - minimum) / 65535` (the
-/// largest log-probability is `-lse`), and `code[i] = max(0, rint((lp[i] - minimum) / scale))`. The inverse is
-/// `lp[i] = scale * code[i] + minimum` in float64, which `score.cu` applies ([#decode] is its host twin); entries
-/// at the floor decode to -16 and are left out of the KL sum.
+/// A record is llama.cpp's `log_softmax` quantization of one row of logits (`tools/perplexity/perplexity.cpp`):
+/// the logits are clamped below at `low = max(min, max - 16)`; with `lse = ln(sum exp(logit - max))` the record holds
+/// `scale = (max - low) / 65535`, `minimum = low - max - lse` and `code[i] = rint((max(logit[i], low) - low) / scale)`.
+/// The inverse is `lp[i] = scale * code[i] + minimum` in float64, which `score.cu` applies ([#decode] is its host
+/// twin); clamped entries decode to `minimum`, at most -16, and `score.cu` leaves them out of the KL sum. Records of
+/// files llama.cpp wrote all span exactly 16 (`scale * 65535`) with their minimum at `-16 - lse`.
 ///
 /// The file is written as `OUT.partial` of the final size plus an 8-byte count of the chunks complete, past the
 /// end. A writer opened on an existing partial file continues after the last complete chunk, the count and the
@@ -153,15 +154,17 @@ final class ReferenceWriter implements AutoCloseable {
             max = Math.max(max, value);
             min = Math.min(min, value);
         }
+        float low = Math.max(min, max + FLOOR);
         double sum = 0;
-        for (float value : logits) sum += (float) Math.exp(value - max);
+        for (float value : logits) sum += Math.exp(value - max);
         float logSumExp = (float) Math.log(sum);
-        float minimum = Math.max(min - max - logSumExp, FLOOR);
-        float scale = (-logSumExp - minimum) / 65535f;
+        float scale = (max - low) / 65535f;
+        float minimum = low - max - logSumExp;
         ByteBuffer record = ByteBuffer.allocate(2 * width(n)).order(ByteOrder.LITTLE_ENDIAN);
         record.putFloat(scale).putFloat(minimum);
+        float inverse = scale > 0 ? 1 / scale : 0;
         for (float value : logits) {
-            int code = scale > 0 ? (int) Math.rint((value - max - logSumExp - minimum) / scale) : 0;
+            int code = (int) Math.rint(inverse * (Math.max(value, low) - low));
             record.putShort((short) Math.min(65535, Math.max(0, code)));
         }
         return record.array();

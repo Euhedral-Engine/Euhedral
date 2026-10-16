@@ -10,6 +10,8 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
@@ -42,13 +44,13 @@ class ReferenceWriterTest {
         double sum = 0;
         for (float value : row) sum += Math.exp(value - max);
         double logZ = max + Math.log(sum);
-        float scale = java.nio.ByteBuffer.wrap(record)
-                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .getFloat(0);
+        float scale = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN).getFloat(0);
+        double minimum = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN).getFloat(4);
         for (int i = 0; i < vocabulary; i++) {
             double expected = row[i] - logZ;
-            if (expected > -16) assertEquals(expected, decoded[i], scale * 0.51 + 1e-5, "entry " + i);
-            else assertEquals(-16, decoded[i], scale * 0.51 + 1e-5, "floored entry " + i);
+            // llama.cpp clamps logits 16 below the largest; those entries decode to the minimum.
+            if (row[i] >= max - 16) assertEquals(expected, decoded[i], scale * 0.51 + 1e-5, "entry " + i);
+            else assertEquals(minimum, decoded[i], 1e-9, "clamped entry " + i);
         }
         // The distribution sums to one within the step.
         double mass = 0;
@@ -57,13 +59,20 @@ class ReferenceWriterTest {
     }
 
     @Test
-    void theLowestLogProbabilityIsFlooredAtMinusSixteen() {
+    void aWideRowSpansSixteenWithItsMinimumSixteenBelowTheLargestLogProbability() {
+        // As every record of a file llama.cpp wrote: scale * 65535 = 16 and minimum = -16 - lse.
         float[] row = new float[8];
         row[0] = 30;
+        row[1] = 29;
         byte[] record = ReferenceWriter.encode(row);
+        ByteBuffer buffer = ByteBuffer.wrap(record).order(ByteOrder.LITTLE_ENDIAN);
+        double logSumExp = Math.log(1 + Math.exp(-1) + 6 * Math.exp(-30));
+        assertEquals(16, buffer.getFloat(0) * 65535, 1e-4);
+        assertEquals(-16 - logSumExp, buffer.getFloat(4), 1e-5);
         double[] decoded = ReferenceWriter.decode(record, 8);
-        for (int i = 1; i < 8; i++) assertEquals(-16, decoded[i], 1e-5);
-        assertEquals(0, decoded[0], 1e-3);
+        assertEquals(-logSumExp, decoded[0], 1e-3);
+        assertEquals(-1 - logSumExp, decoded[1], 1e-3);
+        for (int i = 2; i < 8; i++) assertEquals(-16 - logSumExp, decoded[i], 1e-5);
     }
 
     @Test
