@@ -103,8 +103,7 @@ public final class Assemble {
 
     /// Writes the composite as a standalone artifact file at `out`: header, metadata and tensor table, then each
     /// payload copied exactly from its source file in chunks of at most `copyBufferBytes`, so no payload is ever
-    /// held
-    /// in memory. The file appears at `out` once complete.
+    /// held in memory. The file appears at `out` once complete.
     public static void write(
             Sources sources, Allocation allocation, OptionalInt draftDepth, Path out, long copyBufferBytes)
             throws IOException {
