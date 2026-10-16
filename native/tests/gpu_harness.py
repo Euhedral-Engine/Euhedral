@@ -169,10 +169,10 @@ class Gpu:
         if shared > 48 * 1024:  # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
             _check(self.set_attribute(function, 8, shared), name + " shared size")
         params = (P * len(arguments))(*[C.cast(C.pointer(value), P) for value in arguments])
-        grid_x, grid_y = grid if isinstance(grid, tuple) else (grid, 1)
+        grid_x, grid_y, grid_z = (tuple(grid) + (1, 1))[:3] if isinstance(grid, tuple) else (grid, 1, 1)
         if block is None:
             block = 128 if name != "probe_stripe_codes" and name != "probe_pair_codes" else 32
-        _check(self.launch_kernel(function, grid_x, grid_y, 1, block, 1, 1, shared, None, params, None), name)
+        _check(self.launch_kernel(function, grid_x, grid_y, grid_z, block, 1, 1, shared, None, params, None), name)
         if synchronize:
             _check(self.sync(), name)
 

@@ -1,7 +1,11 @@
 // Trellis (EXL3) linear kernels: the module root the host loads for the entries of the shared linear table
-// (native/src/host/linear_kernels.c) that name trellis/kernels.cu.
-
-// A launch of the table writes this value, which a test reads back.
-extern "C" __global__ void euhedral_trellis_probe(int* out) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) *out = 0x7e11150;
-}
+// (native/src/host/linear_kernels.c) that name trellis/kernels.cu. The decode math is trellis/codebook.cuh, which the
+// quantization module compiles as well.
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include "trellis/codebook.cuh"
+#include "trellis/decode.cuh"
+#include "trellis/prepass.cuh"
+#include "trellis/mma.cuh"
+#include "trellis/epilogue.cuh"
+#include "reference/trellis.cuh"
