@@ -72,6 +72,11 @@ public final class Scorer implements AutoCloseable {
         }
     }
 
+    /// The bytes free on the device now.
+    public long freeDeviceBytes() {
+        return device.gpu.deviceMemoryInfo().freeBytes();
+    }
+
     @Override
     public void close() {
         try {

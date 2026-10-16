@@ -4,7 +4,14 @@ import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import io.euhedral_execution.inference.quantization.mixed.Allocation;
 import io.euhedral_execution.inference.quantization.mixed.Assemble;
 import io.euhedral_execution.inference.quantization.mixed.Cost;
+import io.euhedral_execution.inference.quantization.mixed.CostTable;
+import io.euhedral_execution.inference.quantization.mixed.Feasibility;
+import io.euhedral_execution.inference.quantization.mixed.FidelityModel;
 import io.euhedral_execution.inference.quantization.mixed.Option;
+import io.euhedral_execution.inference.quantization.mixed.Priors;
+import io.euhedral_execution.inference.quantization.mixed.Rco;
+import io.euhedral_execution.inference.quantization.mixed.Search;
+import io.euhedral_execution.inference.quantization.mixed.Seeds;
 import io.euhedral_execution.inference.quantization.mixed.Sources;
 import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
 import java.nio.file.Path;
@@ -41,6 +48,12 @@ import java.util.OptionalInt;
 /// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
 /// [--copy-buffer-mib 64]
+/// allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json
+/// --reference R.kld... --context 32768 --state SEARCH.resume --out DIR [--seed-file F] [--batch 8]
+/// [--explore 0.3] [--patience 3] [--random 16] [--bands 8] [--verify-rows 5] [--workers 6] [--host-mib N]
+/// [--free-mib N] [--score-rows 8] [--score-batch 4] [--members 8] [--ridge 1e-3] [--lambdas 0,0.002,0.005,0.01,0.02]
+/// [--budget-fractions 1.0,0.8] [--rco-steps 200] [--rco-lr 0.1] [--rco-samples 8] [--rco-restarts 4]
+/// [--knapsack-steps 4096] [--max-rounds N] [--seed 1] [--host-sinks N] [--library LIBEUHEDRAL_CUDA]
 /// cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows 1,2,3,4,5,6,512] [--repeats 50]
 /// [--rotate-mib 256] [--library LIBEUHEDRAL_CUDA]
 /// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
@@ -69,6 +82,7 @@ public final class QuantizationMain {
                                 "rotate",
                                 "assemble",
                                 "cost",
+                                "allocate",
                                 "reference")
                         .contains(args[0])) {
             System.err.println(
@@ -91,6 +105,10 @@ public final class QuantizationMain {
             System.err.println(
                     "       assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT "
                             + "[--draft-depth D] [--copy-buffer-mib 64]");
+            System.err.println("       allocate --source OPTION=ARTIFACT... --base OPTION --costs COSTS.json "
+                    + "--priors PRIORS.json --reference R.kld... --context 32768 --state SEARCH.resume --out DIR "
+                    + "[--seed-file F] [--batch 8] [--explore 0.3] [--patience 3] [--random 16] [--bands 8] "
+                    + "[--verify-rows 5] [--workers 6] [--library PATH]");
             System.err.println("       cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json "
                     + "[--rows 1,2,3,4,5,6,512] [--repeats 50] [--rotate-mib 256] [--library PATH]");
             System.exit(2);
@@ -118,14 +136,12 @@ public final class QuantizationMain {
         String library = options.getOrDefault(
                 "library",
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
+        if (args[0].equals("allocate")) {
+            allocate(options, references, artifacts, library);
+            return;
+        }
         if (args[0].equals("assemble") || args[0].equals("cost")) {
-            Map<Option, Path> sources = new EnumMap<>(Option.class);
-            for (String source : artifacts) {
-                int equals = source.indexOf('=');
-                if (equals < 1) throw new IllegalArgumentException("--source is OPTION=ARTIFACT, not " + source);
-                if (sources.put(Option.of(source.substring(0, equals)), Path.of(source.substring(equals + 1))) != null)
-                    throw new IllegalArgumentException("two --source for " + source.substring(0, equals));
-            }
+            Map<Option, Path> sources = sourcesOf(artifacts);
             if (args[0].equals("cost")) {
                 List<Integer> rows = new ArrayList<>();
                 for (String count :
@@ -292,6 +308,77 @@ public final class QuantizationMain {
                 Long.parseLong(options.getOrDefault("memory-reserve-mib", "1024")),
                 Long.parseLong(options.getOrDefault("write-buffer-mib", "16")));
         Calibrate.run(settings, Path.of(library));
+    }
+
+    private static Map<Option, Path> sourcesOf(List<String> artifacts) {
+        Map<Option, Path> sources = new EnumMap<>(Option.class);
+        for (String source : artifacts) {
+            int equals = source.indexOf('=');
+            if (equals < 1) throw new IllegalArgumentException("--source is OPTION=ARTIFACT, not " + source);
+            if (sources.put(Option.of(source.substring(0, equals)), Path.of(source.substring(equals + 1))) != null)
+                throw new IllegalArgumentException("two --source for " + source.substring(0, equals));
+        }
+        return sources;
+    }
+
+    private static List<Double> numbers(String list) {
+        List<Double> numbers = new ArrayList<>();
+        for (String number : list.split(",")) numbers.add(Double.parseDouble(number.trim()));
+        return numbers;
+    }
+
+    /// The search over allocations: the free device memory is measured once, here, after the device is open.
+    private static void allocate(
+            Map<String, String> options, List<String> references, List<String> artifacts, String library)
+            throws Exception {
+        Sources sources = Sources.open(sourcesOf(artifacts), Option.of(required(options, "base")));
+        List<Path> referencePaths = references.stream().map(Path::of).toList();
+        if (referencePaths.isEmpty()) throw new IllegalArgumentException("--reference is required");
+        Path costsFile = Path.of(required(options, "costs")), priorsFile = Path.of(required(options, "priors"));
+        int context = Integer.parseInt(options.getOrDefault("context", "32768"));
+        int workers = Integer.parseInt(options.getOrDefault("workers", "6"));
+        int scoreRows = Integer.parseInt(options.getOrDefault("score-rows", "8"));
+        int scoreBatch = Integer.parseInt(options.getOrDefault("score-batch", "4"));
+        long hostBytes = hostBytes(options);
+        try (Scorer scorer = Scorer.open(Path.of(library), workers)) {
+            long free = options.containsKey("free-mib")
+                    ? Long.parseLong(options.get("free-mib")) << 20
+                    : scorer.freeDeviceBytes();
+            var settings = new Search.Settings(
+                    sources,
+                    Priors.read(priorsFile),
+                    CostTable.read(costsFile),
+                    context,
+                    Path.of(required(options, "state")),
+                    Path.of(required(options, "out")),
+                    options.containsKey("seed-file") ? Seeds.read(Path.of(options.get("seed-file"))) : List.of(),
+                    Integer.parseInt(options.getOrDefault("batch", "8")),
+                    Double.parseDouble(options.getOrDefault("explore", "0.3")),
+                    Integer.parseInt(options.getOrDefault("patience", "3")),
+                    Integer.parseInt(options.getOrDefault("random", "16")),
+                    Integer.parseInt(options.getOrDefault("bands", Integer.toString(FidelityModel.DEFAULT_BANDS))),
+                    Integer.parseInt(options.getOrDefault("verify-rows", "5")),
+                    free,
+                    freeBytes -> Feasibility.planner(sources, freeBytes, context),
+                    Integer.parseInt(options.getOrDefault("host-sinks", Integer.toString(Math.max(1, workers / 2)))),
+                    Integer.parseInt(options.getOrDefault("members", "8")),
+                    Double.parseDouble(options.getOrDefault("ridge", "1e-3")),
+                    numbers(options.getOrDefault("lambdas", "0,0.002,0.005,0.01,0.02")),
+                    numbers(options.getOrDefault("budget-fractions", "1.0,0.8")),
+                    new Rco.Settings(
+                            Integer.parseInt(options.getOrDefault("rco-steps", Integer.toString(Rco.DEFAULT_STEPS))),
+                            Double.parseDouble(options.getOrDefault("rco-lr", "0.1")),
+                            Integer.parseInt(options.getOrDefault("rco-samples", "8")),
+                            Integer.parseInt(options.getOrDefault("rco-restarts", "4"))),
+                    Integer.parseInt(options.getOrDefault("knapsack-steps", "4096")),
+                    Integer.parseInt(options.getOrDefault("max-rounds", Integer.toString(Integer.MAX_VALUE))),
+                    Long.parseLong(options.getOrDefault("seed", "1")),
+                    String.join("\n", references) + "\n" + costsFile + "\n" + priorsFile + "\nrows=" + scoreRows
+                            + " batch=" + scoreBatch);
+            Search.run(
+                    settings,
+                    (path, artifact) -> scorer.score(path, artifact, referencePaths, scoreRows, scoreBatch, hostBytes));
+        }
     }
 
     /// `--host-mib` in bytes, or [Residency#PLANNED] when it is not given.
