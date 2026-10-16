@@ -3,6 +3,7 @@ package io.euhedral_execution.inference.quantization;
 import io.euhedral_execution.inference.quantization.gptq.Gptq;
 import io.euhedral_execution.inference.quantization.mixed.Allocation;
 import io.euhedral_execution.inference.quantization.mixed.Assemble;
+import io.euhedral_execution.inference.quantization.mixed.Cost;
 import io.euhedral_execution.inference.quantization.mixed.Option;
 import io.euhedral_execution.inference.quantization.mixed.Sources;
 import io.euhedral_execution.inference.quantization.trellis.TrellisQuantizer;
@@ -40,6 +41,8 @@ import java.util.OptionalInt;
 /// [--batch 12] [--host-mib N] [--limit N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth D]
 /// [--copy-buffer-mib 64]
+/// cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows 1,2,3,4,5,6,512] [--repeats 50]
+/// [--rotate-mib 256] [--library LIBEUHEDRAL_CUDA]
 /// reference --artifact ARTIFACT --tokenizer CHECKPOINT --text FILE --out OUT.kld [--context 2560] [--chunks N]
 /// [--parse-special] [--rows 8] [--batch 4] [--host-mib N] [--workers 6] [--library LIBEUHEDRAL_CUDA]
 /// rotate --model CHECKPOINT --out CHECKPOINT_DIR [--seed 1] [--library LIBEUHEDRAL_CUDA]
@@ -65,6 +68,7 @@ public final class QuantizationMain {
                                 "train-model",
                                 "rotate",
                                 "assemble",
+                                "cost",
                                 "reference")
                         .contains(args[0])) {
             System.err.println(
@@ -87,6 +91,8 @@ public final class QuantizationMain {
             System.err.println(
                     "       assemble --allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT "
                             + "[--draft-depth D] [--copy-buffer-mib 64]");
+            System.err.println("       cost --source OPTION=ARTIFACT... --base OPTION --out COSTS.json "
+                    + "[--rows 1,2,3,4,5,6,512] [--repeats 50] [--rotate-mib 256] [--library PATH]");
             System.exit(2);
         }
         Map<String, String> options = new HashMap<>();
@@ -112,13 +118,27 @@ public final class QuantizationMain {
         String library = options.getOrDefault(
                 "library",
                 System.getProperty("euhedral.cuda.library", "build/native/linux-x64/lib/libeuhedral_cuda.so"));
-        if (args[0].equals("assemble")) {
+        if (args[0].equals("assemble") || args[0].equals("cost")) {
             Map<Option, Path> sources = new EnumMap<>(Option.class);
             for (String source : artifacts) {
                 int equals = source.indexOf('=');
                 if (equals < 1) throw new IllegalArgumentException("--source is OPTION=ARTIFACT, not " + source);
                 if (sources.put(Option.of(source.substring(0, equals)), Path.of(source.substring(equals + 1))) != null)
                     throw new IllegalArgumentException("two --source for " + source.substring(0, equals));
+            }
+            if (args[0].equals("cost")) {
+                List<Integer> rows = new ArrayList<>();
+                for (String count :
+                        options.getOrDefault("rows", "1,2,3,4,5,6,512").split(","))
+                    rows.add(Integer.parseInt(count.trim()));
+                Cost.run(
+                        Path.of(library),
+                        Sources.open(sources, Option.of(required(options, "base"))),
+                        rows,
+                        Path.of(required(options, "out")),
+                        Integer.parseInt(options.getOrDefault("repeats", "50")),
+                        Long.parseLong(options.getOrDefault("rotate-mib", "256")) << 20);
+                return;
             }
             Assemble.write(
                     Sources.open(sources, Option.of(required(options, "base"))),
