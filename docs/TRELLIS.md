@@ -81,8 +81,8 @@ iterations, every weight on the device:
 
 | Artifact | Prefill 512 tokens | Prefill 16384 tokens | Decode, MTP speculation | Decode, no speculation |
 |---|---|---|---|---|
-| trellis 3.0 | 1262 tokens/s | 1173 tokens/s (14.0 s) | 232.7 tokens/s | 65.7 tokens/s |
-| trellis 3.5 | 1254 tokens/s | 1169 tokens/s (14.1 s) | 212.9 tokens/s | 59.6 tokens/s |
+| trellis 3.0 | 1372 tokens/s | 1329 tokens/s (12.3 s) | 232.7 tokens/s | 65.7 tokens/s |
+| trellis 3.5 | 1339 tokens/s | 1224 tokens/s (13.4 s) | 212.9 tokens/s | 59.6 tokens/s |
 
 Decode is measured on `decode:32:256` (256 tokens after a 32-token prompt).
 
@@ -98,5 +98,5 @@ rotated past L2:
   and of 64 rows, one step takes 74.4 and 77.6 ms at 80 rows, 77.6 and 83.7 ms at 96, 102.9 and 101.7 ms at 128, and
   364.2 and 319.1 ms at 512.
 - `euhedral.trellis.mma-max-rows` (512): the most rows a launch other than a verification keeps on the tensor-core route.
-  The tensor-core route prefills 512-row chunks at 1262 tokens/s and the prefill route at 490, so every chunk of the
+  The tensor-core route prefills 512-row chunks at 1372 tokens/s and the prefill route at 490, so every chunk of the
   default workspace stays on the tensor-core route and the residency plan reserves no prefill scratch.
