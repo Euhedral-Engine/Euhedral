@@ -69,7 +69,11 @@ public final class WeightLoader {
         Objects.requireNonNull(gpuMemory, "gpuMemory");
         requireCompact(artifact);
         return CompactWeightLoader.loadFirstLayer(
-                artifactPath, requireConfig(artifact), gpuMemory, indexDescriptors(requireDescriptors(artifact)));
+                artifactPath,
+                artifact,
+                requireConfig(artifact),
+                gpuMemory,
+                indexDescriptors(requireDescriptors(artifact)));
     }
 
     private static void requireCompact(Artifact artifact) throws WeightLoadException {
