@@ -316,15 +316,26 @@ __device__ __forceinline__ void group_splits(const unsigned short* __restrict__ 
     float acc[P][4];
     clear(acc);
     accumulate<W, P, false, true>(acc, act, words, rows, row_base, k, n, 0, k >> 4, ring, chunks, splits, sum);
-    const int column0 = blockIdx.x * 128;
-    const int half_block = threadIdx.x >> 7, t = threadIdx.x & 127;
-    const float scale = __half2float(__ushort_as_half(svh[column0 + t]));
-    for (int i = 0; i < P * 4; ++i) {
-        const int r = i * 2 + half_block;
-        trellis_hadamard128(sum[r], t);
+    // The epilogue, one row per warp at a time: the Hadamard in registers, then svh and BF16, 8 bytes per lane.
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int column = blockIdx.x * 128 + lane * 4;
+    const uint2 scales = *reinterpret_cast<const uint2*>(svh + column);
+    const float scale[4] = {__half2float(__ushort_as_half((unsigned short)scales.x)),
+            __half2float(__ushort_as_half((unsigned short)(scales.x >> 16))),
+            __half2float(__ushort_as_half((unsigned short)scales.y)),
+            __half2float(__ushort_as_half((unsigned short)(scales.y >> 16)))};
+    for (int r = warp; r < P * 8; r += 8) {
         const int row = row_base + r;
-        if (row < rows)
-            out[(size_t)row * n + column0 + t] = __bfloat16_as_ushort(__float2bfloat16_rn(scale * sum[r][t]));
+        if (row >= rows) break;
+        const float4 loaded = *reinterpret_cast<const float4*>(&sum[r][lane * 4]);
+        float v[4] = {loaded.x, loaded.y, loaded.z, loaded.w};
+        trellis_hadamard128_warp(v, lane);
+        unsigned short bits[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) bits[j] = __bfloat16_as_ushort(__float2bfloat16_rn(scale[j] * v[j]));
+        *reinterpret_cast<uint2*>(out + (size_t)row * n + column) =
+                make_uint2(bits[0] | (unsigned int)bits[1] << 16, bits[2] | (unsigned int)bits[3] << 16);
     }
 }
 
