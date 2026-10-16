@@ -44,6 +44,9 @@ public final class TrellisFormat implements LinearFormat {
     /// Columns per block of [LinearKernel#TRELLIS_PREPASS]: one 128-column block per warp, four warps.
     private static final int PREPASS_BLOCK_COLUMNS = 512;
 
+    /// Columns per block of [LinearKernel#TRELLIS_EPILOGUE]: one 128-column block per warp, four warps.
+    private static final int EPILOGUE_BLOCK_COLUMNS = 512;
+
     /// Rows per block of [LinearKernel#TRELLIS_MMA_ROWS] (`kSplitRows`, native/src/trellis/mma.cuh).
     private static final int WHOLE_K_ROW_BLOCK = 32;
 
@@ -512,7 +515,7 @@ public final class TrellisFormat implements LinearFormat {
             if (splits == 1) return;
             this.gpu.launchTableKernel(
                     LinearKernel.TRELLIS_EPILOGUE,
-                    this.n / TrellisLayout.BLOCK,
+                    Math.ceilDiv(this.n, EPILOGUE_BLOCK_COLUMNS),
                     this.rows,
                     1,
                     128,

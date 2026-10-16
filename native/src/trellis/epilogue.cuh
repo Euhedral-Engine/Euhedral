@@ -7,20 +7,37 @@
 #include <cuda_fp16.h>
 #include "trellis/codebook.cuh"
 
-// partials f32 [S][rows][n]; the splits are summed in order 0..S-1.
-//   grid (n / 128, rows), block 128.
+// partials f32 [S][rows][n]; the splits are summed in order 0..S-1. Each warp finishes one 128-column block of one
+// row in registers (trellis_hadamard128_warp), four per block.
+//   grid (ceil(n / 512), rows), block 128.
 extern "C" __global__ __launch_bounds__(128) void euhedral_trellis_epilogue(
         const float* __restrict__ partials, int splits, const unsigned short* __restrict__ svh,
         unsigned short* __restrict__ out, int rows, int n) {
-    __shared__ float v[128];
-    const int t = threadIdx.x, r = blockIdx.y;
-    const size_t column = (size_t)blockIdx.x * 128 + t;
-    float sum = partials[(size_t)r * n + column];
-    for (int i = 1; i < splits; ++i) sum += partials[((size_t)i * rows + r) * n + column];
-    v[t] = sum;
-    trellis_hadamard128(v, t);
-    out[(size_t)r * n + column] =
-            __bfloat16_as_ushort(__float2bfloat16_rn(__half2float(__ushort_as_half(svh[column])) * v[t]));
+    const int lane = threadIdx.x & 31, r = blockIdx.y;
+    const int block = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (block * 128 >= n) return;
+    const size_t column = (size_t)block * 128 + lane * 4;
+    float4 sum = *reinterpret_cast<const float4*>(partials + (size_t)r * n + column);
+#pragma unroll 4
+    for (int i = 1; i < splits; ++i) {
+        const float4 part = *reinterpret_cast<const float4*>(partials + ((size_t)i * rows + r) * n + column);
+        sum.x += part.x;
+        sum.y += part.y;
+        sum.z += part.z;
+        sum.w += part.w;
+    }
+    float v[4] = {sum.x, sum.y, sum.z, sum.w};
+    trellis_hadamard128_warp(v, lane);
+    const uint2 scales = *reinterpret_cast<const uint2*>(svh + column);
+    const unsigned int sw[2] = {scales.x, scales.y};
+    unsigned short bits[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float scale = __half2float(__ushort_as_half((unsigned short)(sw[j >> 1] >> (16 * (j & 1)))));
+        bits[j] = __bfloat16_as_ushort(__float2bfloat16_rn(scale * v[j]));
+    }
+    *reinterpret_cast<uint2*>(out + (size_t)r * n + column) =
+            make_uint2(bits[0] | (unsigned int)bits[1] << 16, bits[2] | (unsigned int)bits[3] << 16);
 }
 
 // rotated bf16: the product of segment g starts at element rows * start_g with row stride n_g (start_g, n_g from the

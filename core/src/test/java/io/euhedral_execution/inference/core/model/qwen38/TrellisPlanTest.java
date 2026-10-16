@@ -759,7 +759,7 @@ class TrellisPlanTest {
         assertArrayEquals(new int[] {40, 4, 1}, mma.grid());
         assertEquals(4, mma.words()[10]);
         assertEquals(partials, mma.words()[4]);
-        assertArrayEquals(new int[] {40, 1, 1}, epilogue.grid());
+        assertArrayEquals(new int[] {10, 1, 1}, epilogue.grid());
         assertEquals(128, epilogue.block()[0]);
         assertWords(
                 epilogue, new long[] {partials, 4, weights.get(2).deviceAddress(), 0x2000, 1, 5120}, 8, 4, 8, 8, 4, 4);
