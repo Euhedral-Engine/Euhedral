@@ -19,6 +19,7 @@ import io.euhedral_execution.inference.core.model.qwen38.Quantum;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Model;
 import io.euhedral_execution.inference.core.model.qwen38.Sequence;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.ArtifactReader;
+import io.euhedral_execution.inference.core.state.KvFormat;
 import io.euhedral_execution.inference.core.tokenizer.QwenTokenizer;
 import io.euhedral_execution.inference.quantization.CalibrationLattice;
 import io.euhedral_execution.inference.quantization.Residency;
@@ -80,11 +81,19 @@ public final class Generate {
     private final int hidden, vocabulary;
     private final Set<Integer> stops;
     private final AtomicLong sequenceIds = new AtomicLong(1);
+    private final KvFormat kvFormat;
     /// Mapped host memory the argmax kernel writes: one int per lane for prefills, one per row for the step.
     private final long prefillChoices, stepChoices;
 
-    private Generate(Settings settings, Device device, Execution runtime, ExecutionPlan plan, Set<Integer> stops) {
+    private Generate(
+            Settings settings,
+            Device device,
+            Execution runtime,
+            ExecutionPlan plan,
+            Set<Integer> stops,
+            KvFormat kvFormat) {
         this.settings = settings;
+        this.kvFormat = kvFormat;
         this.device = device;
         this.runtime = runtime;
         this.plan = plan;
@@ -125,7 +134,7 @@ public final class Generate {
             try {
                 // On the lattice: the prompts rendered and the generator set up, then the generation's frames. This
                 // thread only waits.
-                runtime.onWorker(() -> start(settings, device, runtime, plan, lattice))
+                runtime.onWorker(() -> start(settings, device, runtime, plan, lattice, Residency.kvFormat(data)))
                         .thenCompose(generation -> generation.finished.whenComplete((ignored, failure) -> {
                             generation.complete();
                             try {
@@ -143,7 +152,12 @@ public final class Generate {
 
     /// Renders the prompts not yet answered and attaches a generation of them to the lattice.
     private static Generation start(
-            Settings settings, Device device, Execution runtime, ExecutionPlan plan, CalibrationLattice lattice) {
+            Settings settings,
+            Device device,
+            Execution runtime,
+            ExecutionPlan plan,
+            CalibrationLattice lattice,
+            KvFormat kvFormat) {
         try {
             // The worker's thread compiles the generator's kernels; no stream stays selected on it, since the engine's
             // quanta select their own on the same workers.
@@ -164,7 +178,7 @@ public final class Generate {
             }
             Corpus.Writer writer =
                     Corpus.Writer.open(settings.out(), plan.weights().config().hiddenSize());
-            var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds());
+            var generate = new Generate(settings, device, runtime, plan, tokenizer.generationEosTokenIds(), kvFormat);
             var generation = generate.new Generation(prompts, writer);
             lattice.attach(generation);
             return generation;
@@ -197,13 +211,19 @@ public final class Generate {
         }
     }
 
+    private Sequence sequence() {
+        Sequence sequence = new Sequence(sequenceIds.getAndIncrement());
+        sequence.useKvFormat(kvFormat);
+        return sequence;
+    }
+
     /// One sequence being answered: its tokens so far, and the hidden row of each token the base model ran, in
     /// host memory sized for the longest answer.
     private final class Slot implements AutoCloseable {
         final Prompt prompt;
         /// Its place in the prefill choices.
         final int lane;
-        final Sequence sequence = new Sequence(sequenceIds.getAndIncrement());
+        final Sequence sequence = sequence();
         final Arena arena = Arena.ofShared();
         final MemorySegment rows;
         int[] tokens;
