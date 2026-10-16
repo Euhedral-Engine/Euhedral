@@ -188,7 +188,7 @@ public final class ResidencyPlanner {
         return low;
     }
 
-    /// The scratch the prefill route of the largest trellis object needs at a prefill chunk of rows (decoded weight,
+    /// The scratch the prefill route of the largest trellis object needs at the workspace's rows (decoded weight,
     /// rotated activations and outputs); 0 for an artifact with no trellis object.
     static long trellisScratchBytes(Artifact artifact, ArtifactProfile profile) {
         long largest = 0;
@@ -196,7 +196,7 @@ public final class ResidencyPlanner {
             if (tensor.format() != WeightFormat.TRELLIS
                     || !CompactWeightLoader.uploads(tensor.name(), profile.speculation())) continue;
             largest = Math.max(
-                    largest, LinearFormats.of(tensor).planScratchBytes(tensor, InferenceConfig.PREFILL_CHUNK_TOKENS));
+                    largest, LinearFormats.of(tensor).planScratchBytes(tensor, InferenceConfig.workspaceRows()));
         }
         return largest;
     }

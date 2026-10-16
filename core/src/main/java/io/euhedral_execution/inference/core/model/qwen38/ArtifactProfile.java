@@ -102,8 +102,8 @@ public record ArtifactProfile(Quantization quantization, boolean compressed, Spe
                     case BF16 -> Quantization.BF16;
                     case TRELLIS -> Quantization.TRELLIS;
                     default ->
-                        throw new IllegalArgumentException(
-                                "unsupported projection format " + probe.format() + "; expected Q3, NVFP4 or BF16");
+                        throw new IllegalArgumentException("unsupported projection format " + probe.format()
+                                + "; expected Q3, NVFP4, BF16 or TRELLIS");
                 };
         WeightLayout layout = probe.layout();
         LinearFormat format = LinearFormats.find(probe.format(), layout)

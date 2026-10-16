@@ -86,7 +86,7 @@ public final class Qwen38Runtime implements ModelRuntime {
                 gpu,
                 EuhedralInferenceRuntime.laneCount(),
                 EuhedralInferenceRuntime.CAPTURE_GRAPHS,
-                Integer.getInteger("euhedral.workspace.rows", InferenceConfig.PREFILL_CHUNK_TOKENS),
+                InferenceConfig.workspaceRows(),
                 model.artifactPath());
         var identity = identity(config.artifactPath(), artifact, model);
         KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);

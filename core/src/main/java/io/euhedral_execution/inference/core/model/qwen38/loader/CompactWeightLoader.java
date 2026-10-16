@@ -183,6 +183,9 @@ final class CompactWeightLoader {
         if (config.layerTypes()[0] != LayerType.GATED_DELTA_NET) {
             throw new WeightLoadException("actual layer zero is not a compact GDN layer");
         }
+        if (descriptors.values().stream().anyMatch(CompactWeightLoader::trellis)) {
+            throw new WeightLoadException("the first-layer load does not carry trellis companions");
+        }
 
         String prefix = "text/layers/0";
         String[] selectedNames = {
@@ -388,6 +391,8 @@ final class CompactWeightLoader {
         for (TensorDescriptor descriptor : descriptors.values()) {
             if (!trellis(descriptor)) continue;
             String name = descriptor.name();
+            if (descriptor.shape().length != 3)
+                throw new WeightLoadException("trellis object '" + name + "' is not [k/16, n/16, w]");
             long n = descriptor.shape()[1] * 16, k = descriptor.shape()[0] * 16;
             TensorDescriptor suh = companion(descriptors, name, TrellisFormat.SUH, WeightFormat.FP16);
             TensorDescriptor svh = companion(descriptors, name, TrellisFormat.SVH, WeightFormat.FP16);
@@ -530,6 +535,10 @@ final class CompactWeightLoader {
         }
     }
 
+    /// Objects read by row or mapped in place, which have no trellis route.
+    private static final Set<String> TRELLIS_REFUSED =
+            Set.of("text/token_embedding", "text/output_head", "text/draft_head");
+
     private static void validateExpectedDescriptor(TensorDescriptor descriptor) throws WeightLoadException {
         String name = descriptor.name();
         if (descriptor.layout() == null) {
@@ -544,6 +553,10 @@ final class CompactWeightLoader {
                 && !LinearFormats.quantized(descriptor.format())
                 && descriptor.layout() != WeightLayout.CONTIGUOUS_LE_V1) {
             throw new WeightLoadException("direct runtime object has unsupported layout: " + name);
+        }
+        if (descriptor.format() == WeightFormat.TRELLIS && TRELLIS_REFUSED.contains(name)) {
+            throw new WeightLoadException(
+                    "'" + name + "' cannot be trellis: the token embedding and the heads are" + " Q3, NVFP4 or BF16");
         }
         Expected expected = expectedDescriptor(name);
         if (expected != null && !accepts(expected, descriptor)) {
