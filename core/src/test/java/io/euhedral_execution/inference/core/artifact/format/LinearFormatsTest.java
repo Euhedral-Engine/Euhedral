@@ -75,7 +75,7 @@ class LinearFormatsTest {
     }
 
     @Test
-    void theRegistryHoldsExactlyTheSevenKeys() {
+    void theRegistryHoldsExactlyItsKeys() {
         // The seven rows below and the trellis format, whose row is checked on its own.
         assertEquals(ROWS.size() + 1, LinearFormats.all().size());
         for (Row row : ROWS) {
@@ -281,7 +281,7 @@ class LinearFormatsTest {
             assertEquals(row.compressed(), profile.compressed(), row.label());
         }
         assertEquals(
-                "unsupported projection format FP16; expected Q3, NVFP4 or BF16",
+                "unsupported projection format FP16; expected Q3, NVFP4, BF16 or TRELLIS",
                 assertThrows(
                                 IllegalArgumentException.class,
                                 () -> ArtifactProfile.of(new Artifact(null, null, new TensorDescriptor[] {

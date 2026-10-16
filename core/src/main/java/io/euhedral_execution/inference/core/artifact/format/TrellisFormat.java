@@ -137,7 +137,7 @@ public final class TrellisFormat implements LinearFormat {
         long[] nk = logical(payload.shape());
         long n = nk[0], k = nk[1];
         int w = (int) payload.shape()[2];
-        int[] ends = new int[(int) segments.shape()[0]];
+        int[] ends;
         try (Arena arena = Arena.ofConfined()) {
             var host = arena.allocate(segments.byteSize());
             gpu.copyDeviceToHost(host, segments.deviceAddress(), segments.byteSize());

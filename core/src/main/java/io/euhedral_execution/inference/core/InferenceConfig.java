@@ -30,6 +30,12 @@ public record InferenceConfig(
     /// Prompt tokens per prefill quantum, and the grain the prefix cache's checkpoints are aligned to.
     public static final int PREFILL_CHUNK_TOKENS = 512;
 
+    /// The rows a qwen38 workspace holds per quantum, the longest prefill chunk it runs:
+    /// `euhedral.workspace.rows`, by default one prefill chunk.
+    public static int workspaceRows() {
+        return Integer.getInteger("euhedral.workspace.rows", PREFILL_CHUNK_TOKENS);
+    }
+
     public static final int DEFAULT_MAX_CONTEXT_TOKENS = 32768;
     public static final long DEFAULT_PREFIX_CACHE_BYTES = 4L << 30;
     public static final int DEFAULT_PREFIX_CACHE_CHECKPOINT_TOKENS = 2048;

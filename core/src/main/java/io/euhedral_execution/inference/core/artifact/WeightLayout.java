@@ -19,7 +19,7 @@ public enum WeightLayout {
     /// ([io.euhedral_execution.inference.core.model.qwen4.loader.NgramLayout]).
     ROW_INTERLEAVED_NVFP4_V1,
     /// Trellis tiles: `[k/16, n/16, w]` int16 words, one 16x16 tile of `w` words per (k tile, n tile), the tile
-    /// at index `ti * (n/16) + tj` starting at word `that * w`
+    /// at index `ti * (n/16) + tj` starting at word `(ti * (n/16) + tj) * w`
     /// ([io.euhedral_execution.inference.core.artifact.format.TrellisLayout]).
     TRELLIS_TILE16_V1
 }

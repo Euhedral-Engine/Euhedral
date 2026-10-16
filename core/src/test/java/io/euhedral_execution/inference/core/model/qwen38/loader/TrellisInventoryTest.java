@@ -299,6 +299,26 @@ class TrellisInventoryTest {
     }
 
     @Test
+    void theEmbeddingAndHeadsCannotBeTrellis() {
+        for (String name : List.of("text/token_embedding", "text/output_head")) {
+            Map<String, TensorDescriptor> descriptors = inventory();
+            TensorDescriptor original = descriptors.get(name);
+            long[] shape = {5120 / 16, original.shape()[0] / 16, 48};
+            descriptors.put(
+                    name,
+                    new TensorDescriptor(
+                            name,
+                            shape,
+                            TensorDataType.BF16,
+                            WeightFormat.TRELLIS,
+                            WeightLayout.TRELLIS_TILE16_V1,
+                            original.dataOffset(),
+                            shape[0] * shape[1] * shape[2] * 2));
+            assertRefused(descriptors, name);
+        }
+    }
+
+    @Test
     void aMissingCompanionIsRefusedByName() {
         for (String suffix : List.of(".suh", ".svh", ".segments")) {
             Map<String, TensorDescriptor> descriptors = inventory();
