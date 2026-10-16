@@ -12,5 +12,7 @@ public enum ScratchUse {
     /// An NVFP4 linear on the native route, from nine rows.
     NVFP4_LINEAR,
     /// An NVFP4 gate/up region: its gate/up rows below 64, the native route's activations from nine.
-    NVFP4_GATE_UP
+    NVFP4_GATE_UP,
+    /// A trellis linear: its activations, K-split partials, or decoded BF16 weight; the format sizes it.
+    TRELLIS_LINEAR
 }

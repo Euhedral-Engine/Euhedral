@@ -1,6 +1,10 @@
 package io.euhedral_execution.inference.core.model.qwen38;
 
+import io.euhedral_execution.inference.core.artifact.WeightFormat;
+import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.artifact.WeightStaging;
+import io.euhedral_execution.inference.core.artifact.format.LinearFormats;
+import io.euhedral_execution.inference.core.artifact.format.TrellisFormat;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.loader.WeightLoader;
@@ -12,10 +16,14 @@ import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /// Owns the device allocations made by model loading.
 /// The GPU is borrowed and must outlive this model. Close only after all model executions stop.
 public final class Qwen38Model implements AutoCloseable {
+    private static final Logger LOG = LoggerFactory.getLogger(Qwen38Model.class);
+
     private final Allocations allocations;
     private final Weights weights;
     private final WeightStaging staging;
@@ -103,6 +111,9 @@ public final class Qwen38Model implements AutoCloseable {
         var allocations = new Allocations(Objects.requireNonNull(memory));
         try {
             Weights weights = loader.load(allocations);
+            if (weights.runtimeObjects().values().stream().anyMatch(handle -> handle.format() == WeightFormat.TRELLIS))
+                LinearFormats.find(WeightFormat.TRELLIS, WeightLayout.TRELLIS_TILE16_V1)
+                        .ifPresent(format -> LOG.info("trellis weights: {}", ((TrellisFormat) format).settings()));
             long largest = 0;
             for (var handle : weights.runtimeObjects().values())
                 if (handle.hostBacked() || handle.diskBacked()) largest = Math.max(largest, handle.byteSize());

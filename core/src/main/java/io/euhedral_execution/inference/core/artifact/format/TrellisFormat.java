@@ -7,6 +7,7 @@ import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.gpu.ExecutionGpu;
 import io.euhedral_execution.inference.core.gpu.GpuMemory;
+import io.euhedral_execution.inference.core.gpu.KernelArguments;
 import io.euhedral_execution.inference.core.gpu.ScratchUse;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ExecutionPlan;
@@ -16,6 +17,7 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 /// Trellis (EXL3) weights: `[k/16, n/16, w]` int16 tile words ([TrellisLayout]) and three companions that stay on the
 /// device (`<name>.suh` `[s, k]`, `<name>.svh` `[n]`, `<name>.segments` `[s]`). An object keeps its engine name and
@@ -34,7 +36,24 @@ public final class TrellisFormat implements LinearFormat {
 
     private static final long SCRATCH_ALIGNMENT = 256;
 
-    TrellisFormat() {}
+    private static final ThreadLocal<KernelArguments> ARGUMENTS = ThreadLocal.withInitial(KernelArguments::new);
+
+    /// The most rows the launch grids' Y extent holds.
+    private static final int MAX_GRID_ROWS = 65535;
+
+    private final TrellisSettings settings;
+
+    TrellisFormat() {
+        this(TrellisSettings.fromProperties());
+    }
+
+    public TrellisFormat(TrellisSettings settings) {
+        this.settings = Objects.requireNonNull(settings, "settings");
+    }
+
+    public TrellisSettings settings() {
+        return this.settings;
+    }
 
     @Override
     public WeightFormat format() {
@@ -111,21 +130,16 @@ public final class TrellisFormat implements LinearFormat {
         return true;
     }
 
-    /// The prefill route's bytes for an object of `descriptor` at `maxRows` rows: the rotated activations of at most
-    /// [TrellisLayout#MAX_SEGMENTS] segments, the whole object decoded to BF16 `[n, k]`, and the GEMM outputs
-    /// `[rows, n]`, each region 256-aligned.
+    /// The scratch bytes an object of `descriptor` needs at `maxRows` rows when its segment count is unknown: the
+    /// larger of the prefill route (the rotated activations of at most [TrellisLayout#MAX_SEGMENTS] segments, the
+    /// whole object decoded to BF16 `[n, k]`, and the GEMM outputs `[rows, n]`, each region 256-aligned) and the
+    /// tensor-core route with that many segments.
     @Override
     public long planScratchBytes(TensorDescriptor descriptor, int maxRows) {
         long[] nk = logical(descriptor.shape());
-        long n = nk[0], k = nk[1], rows = maxRows;
-        long activations = PayloadSizes.multiply(PayloadSizes.multiply(SCRATCH_SEGMENTS, rows), k * 2);
-        long decoded = PayloadSizes.multiply(n, k * 2);
-        long outputs = PayloadSizes.multiply(rows, n * 2);
-        return PayloadSizes.add(
-                PayloadSizes.add(
-                        PayloadSizes.alignUp(activations, SCRATCH_ALIGNMENT),
-                        PayloadSizes.alignUp(decoded, SCRATCH_ALIGNMENT)),
-                PayloadSizes.alignUp(outputs, SCRATCH_ALIGNMENT));
+        return Math.max(
+                prefillBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS),
+                mmaBytes(maxRows, nk[1], nk[0], SCRATCH_SEGMENTS));
     }
 
     /// [object, suh, svh, segments] of rows `[first, first + rows)` as new device allocations named `name`, `name.suh`,
@@ -238,36 +252,300 @@ public final class TrellisFormat implements LinearFormat {
         return -1;
     }
 
-    // execution: the engine wiring follows the storage half
+    // execution
+
+    /// The K splits of the tensor-core route for an object of `k` inputs and `n` outputs: enough to fill `targetCtas`
+    /// blocks, at most one per 256 inputs. It depends on the shape and the target alone, never on the rows.
+    public static int splits(int k, int n, int targetCtas) {
+        int blocks = n / TrellisLayout.BLOCK;
+        int wanted = (targetCtas + blocks - 1) / blocks;
+        return Math.max(1, Math.min(wanted, k / 256));
+    }
 
     @Override
     public ExecutionPlan.Kind kind(ExecutionPlan.Kind role) {
-        throw new UnsupportedOperationException("trellis execution is not wired yet");
+        return ExecutionPlan.Kind.TRELLIS_LINEAR;
     }
 
     @Override
     public TensorHandle validateHandle(TensorHandle handle, long rows, int width, WeightFormat roleFormat) {
-        throw new UnsupportedOperationException("trellis execution is not wired yet");
+        Objects.requireNonNull(handle, "weight");
+        long[] nk;
+        try {
+            nk = logical(handle.shape());
+        } catch (IllegalArgumentException refused) {
+            throw new IllegalArgumentException("unsupported trellis layout or dimensions: " + handle.name(), refused);
+        }
+        if (nk[0] != rows
+                || nk[1] != width
+                || handle.deviceAddress() == 0 && !handle.hostBacked() && !handle.diskBacked()
+                || handle.dataType() != TensorDataType.BF16
+                || handle.layout() != WeightLayout.TRELLIS_TILE16_V1
+                || handle.byteSize() != byteSize(handle.shape(), handle.dataType()))
+            throw new IllegalArgumentException("unsupported trellis layout or dimensions: " + handle.name());
+        return handle;
     }
 
+    /// A multi-row launch computes every row as a one-row launch does: the tensor-core route's results do not depend
+    /// on the row count, and a verification never leaves it.
     @Override
     public boolean rowExact(ExecutionGpu gpu, ExecutionPlan.Kind kind) {
-        throw new UnsupportedOperationException("trellis execution is not wired yet");
+        return true;
     }
 
     @Override
     public ScratchUse scratchUse(ExecutionPlan.Kind kind, boolean multiRow) {
-        throw new UnsupportedOperationException("trellis execution is not wired yet");
+        return ScratchUse.TRELLIS_LINEAR;
     }
 
+    /// The scratch of a launch of up to `rows` rows over an object with `weights` ([object, suh, svh, segments]): the
+    /// larger of the tensor-core route at `rows` (a verification may reach every row) and, when `rows` exceeds the
+    /// tensor-core row limit, the prefill route.
     @Override
     public long scratchBytes(
             ExecutionGpu gpu, ScratchUse use, int rows, int inFeatures, int outFeatures, List<TensorHandle> weights) {
-        throw new UnsupportedOperationException("trellis execution is not wired yet");
+        int segments = Math.toIntExact(weights.get(1).shape()[0]);
+        long bytes = mmaBytes(rows, inFeatures, outFeatures, segments);
+        if (rows > this.settings.mmaMaxRows())
+            bytes = Math.max(bytes, prefillBytes(rows, inFeatures, outFeatures, segments));
+        return bytes;
     }
 
+    private long mmaBytes(long rows, long k, long n, int segments) {
+        long activations = PayloadSizes.alignUp(
+                PayloadSizes.multiply(PayloadSizes.multiply(segments, rows), k * 2), SCRATCH_ALIGNMENT);
+        int splits = splits(Math.toIntExact(k), Math.toIntExact(n), this.settings.targetCtas());
+        if (splits == 1) return activations;
+        return PayloadSizes.add(activations, PayloadSizes.multiply(PayloadSizes.multiply(splits, rows), n * 4));
+    }
+
+    private static long prefillBytes(long rows, long k, long n, int segments) {
+        return PayloadSizes.add(
+                PayloadSizes.add(
+                        PayloadSizes.alignUp(
+                                PayloadSizes.multiply(PayloadSizes.multiply(segments, rows), k * 2), SCRATCH_ALIGNMENT),
+                        PayloadSizes.alignUp(PayloadSizes.multiply(n, k * 2), SCRATCH_ALIGNMENT)),
+                PayloadSizes.alignUp(PayloadSizes.multiply(rows, n * 2), SCRATCH_ALIGNMENT));
+    }
+
+    /// Queues the launches of one trellis linear in stream order. Exact numerics run the scalar reference alone. A
+    /// verification, or at most [TrellisSettings#mmaMaxRows] rows, runs prepass, tensor-core GEMM and (with a K
+    /// split) the epilogue; more rows decode the object to BF16 in rotated space and multiply it per segment on the
+    /// row-exact BF16 GEMM.
     @Override
     public void linear(ExecutionGpu gpu, LinearLaunch launch) {
-        throw new UnsupportedOperationException("trellis execution is not wired yet");
+        List<TensorHandle> weights = launch.weights();
+        if (weights.size() != 4)
+            throw new IllegalArgumentException(
+                    "a trellis linear takes [object, suh, svh, segments]: " + weights.size() + " tensors");
+        TensorHandle payload = weights.get(0), suh = weights.get(1), svh = weights.get(2), ends = weights.get(3);
+        int rows = launch.rows(), k = launch.inFeatures(), n = launch.outFeatures();
+        long[] nk = logical(payload.shape());
+        if (nk[0] != n || nk[1] != k)
+            throw new IllegalArgumentException("trellis object " + payload.name() + " is not " + n + " x " + k);
+        if (rows <= 0 || rows > MAX_GRID_ROWS)
+            throw new IllegalArgumentException("a trellis launch takes 1.." + MAX_GRID_ROWS + " rows: " + rows);
+        int w = (int) payload.shape()[2];
+        int segments = Math.toIntExact(suh.shape()[0]);
+        Launch run = new Launch(
+                gpu, launch, payload.deviceAddress(), suh.deviceAddress(), svh.deviceAddress(), ends.deviceAddress());
+        run.rows = rows;
+        run.k = k;
+        run.n = n;
+        run.w = w;
+        run.segments = segments;
+        if (gpu.exactNumerics()) run.reference();
+        else if (launch.rowExact() || rows <= this.settings.mmaMaxRows()) run.tensorCore(this.settings.targetCtas());
+        else run.prefill(ends);
+    }
+
+    /// One launch's operands and its route chains.
+    private static final class Launch {
+        final ExecutionGpu gpu;
+        final LinearLaunch launch;
+        final long words, suh, svh, ends;
+        int rows, k, n, w, segments;
+
+        Launch(ExecutionGpu gpu, LinearLaunch launch, long words, long suh, long svh, long ends) {
+            this.gpu = gpu;
+            this.launch = launch;
+            this.words = words;
+            this.suh = suh;
+            this.svh = svh;
+            this.ends = ends;
+        }
+
+        KernelArguments arguments() {
+            return ARGUMENTS.get().clear();
+        }
+
+        void reference() {
+            this.gpu.launchTableKernel(
+                    LinearKernel.TRELLIS_REFERENCE,
+                    Math.multiplyExact(this.rows, this.n),
+                    1,
+                    1,
+                    128,
+                    1,
+                    1,
+                    Math.multiplyExact(4, this.k),
+                    arguments()
+                            .pointer(this.launch.input())
+                            .pointer(this.words)
+                            .pointer(this.suh)
+                            .pointer(this.svh)
+                            .pointer(this.ends)
+                            .int32(this.segments)
+                            .pointer(this.launch.output())
+                            .int32(this.rows)
+                            .int32(this.k)
+                            .int32(this.n)
+                            .int32(this.w));
+        }
+
+        void prepass(long activations, boolean bf16) {
+            this.gpu.launchTableKernel(
+                    LinearKernel.TRELLIS_PREPASS,
+                    this.k / TrellisLayout.BLOCK,
+                    this.rows,
+                    this.segments,
+                    128,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(this.launch.input())
+                            .pointer(this.suh)
+                            .pointer(activations)
+                            .int32(this.rows)
+                            .int32(this.k)
+                            .int32(this.segments)
+                            .int32(bf16 ? 1 : 0));
+        }
+
+        void tensorCore(int targetCtas) {
+            int splits = splits(this.k, this.n, targetCtas);
+            long activations = PayloadSizes.alignUp(
+                    PayloadSizes.multiply(PayloadSizes.multiply(this.segments, this.rows), this.k * 2L),
+                    SCRATCH_ALIGNMENT);
+            long partials =
+                    splits == 1 ? 0 : PayloadSizes.multiply(PayloadSizes.multiply(splits, this.rows), this.n * 4L);
+            requireScratch(PayloadSizes.add(activations, partials));
+            long scratch = this.launch.scratch();
+            prepass(scratch, false);
+            this.gpu.launchTableKernel(
+                    LinearKernel.TRELLIS_MMA,
+                    this.n / TrellisLayout.BLOCK,
+                    splits,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(scratch)
+                            .pointer(this.words)
+                            .pointer(this.ends)
+                            .pointer(this.svh)
+                            .pointer(scratch + activations)
+                            .pointer(this.launch.output())
+                            .int32(this.rows)
+                            .int32(this.k)
+                            .int32(this.n)
+                            .int32(this.w)
+                            .int32(splits)
+                            .int32(this.segments));
+            if (splits == 1) return;
+            this.gpu.launchTableKernel(
+                    LinearKernel.TRELLIS_EPILOGUE,
+                    this.n / TrellisLayout.BLOCK,
+                    this.rows,
+                    1,
+                    128,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(scratch + activations)
+                            .int32(splits)
+                            .pointer(this.svh)
+                            .pointer(this.launch.output())
+                            .int32(this.rows)
+                            .int32(this.n));
+        }
+
+        void prefill(TensorHandle segmentEnds) {
+            long activations = PayloadSizes.alignUp(
+                    PayloadSizes.multiply(PayloadSizes.multiply(this.segments, this.rows), this.k * 2L),
+                    SCRATCH_ALIGNMENT);
+            long decodedBytes = PayloadSizes.alignUp(PayloadSizes.multiply(this.n, this.k * 2L), SCRATCH_ALIGNMENT);
+            long rotatedBytes = PayloadSizes.alignUp(PayloadSizes.multiply(this.rows, this.n * 2L), SCRATCH_ALIGNMENT);
+            requireScratch(PayloadSizes.add(PayloadSizes.add(activations, decodedBytes), rotatedBytes));
+            int[] bounds = segmentBounds(segmentEnds);
+            long scratch = this.launch.scratch(), decoded = scratch + activations, rotated = decoded + decodedBytes;
+            prepass(scratch, true);
+            this.gpu.launchTableKernel(
+                    LinearKernel.TRELLIS_DECODE_BF16,
+                    (this.k / 16) * (this.n / 16),
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(this.words)
+                            .pointer(decoded)
+                            .int32(this.k)
+                            .int32(this.n)
+                            .int32(this.w));
+            int start = 0;
+            for (int segment = 0; segment < bounds.length; segment++) {
+                int width = bounds[segment] - start;
+                RowExactBf16.linear(
+                        this.gpu,
+                        scratch + (long) segment * this.rows * this.k * 2,
+                        decoded + (long) start * this.k * 2,
+                        rotated + (long) this.rows * start * 2,
+                        this.rows,
+                        this.k,
+                        width);
+                start = bounds[segment];
+            }
+            this.gpu.launchTableKernel(
+                    LinearKernel.TRELLIS_EPILOGUE_BF16,
+                    this.n / TrellisLayout.BLOCK,
+                    this.rows,
+                    1,
+                    128,
+                    1,
+                    1,
+                    0,
+                    arguments()
+                            .pointer(rotated)
+                            .pointer(this.ends)
+                            .int32(this.segments)
+                            .pointer(this.svh)
+                            .pointer(this.launch.output())
+                            .int32(this.rows)
+                            .int32(this.n));
+        }
+
+        /// The segment ends, which the prefill route's per-segment GEMMs need on the host.
+        int[] segmentBounds(TensorHandle segmentEnds) {
+            try (Arena arena = Arena.ofConfined()) {
+                var host = arena.allocate(segmentEnds.byteSize());
+                this.gpu.copyDeviceToHost(host, segmentEnds.deviceAddress(), segmentEnds.byteSize());
+                int[] bounds = TrellisLayout.readEnds(host);
+                TrellisLayout.validateSegments(bounds, this.n, this.segments);
+                return bounds;
+            }
+        }
+
+        void requireScratch(long needed) {
+            if (this.launch.scratch() == 0 || this.launch.scratchBytes() < needed)
+                throw new IllegalStateException("a trellis linear of " + this.rows + " rows needs " + needed
+                        + " bytes of scratch; the bound region holds " + this.launch.scratchBytes());
+        }
     }
 }

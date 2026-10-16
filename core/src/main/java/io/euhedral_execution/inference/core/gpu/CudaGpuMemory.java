@@ -1896,6 +1896,8 @@ public final class CudaGpuMemory extends ExecutionGpu implements AutoCloseable {
             case NVFP4_LINEAR -> rows >= NVFP4_NATIVE_MIN_ROWS ? nvfp4Activations(rows, inFeatures, outFeatures) : 0;
             case NVFP4_GATE_UP ->
                 Math.max((long) rows * outFeatures * Short.BYTES, nvfp4Activations(rows, inFeatures, outFeatures));
+            // The trellis format sizes its own scratch (TrellisFormat#scratchBytes).
+            case TRELLIS_LINEAR -> 0;
         };
     }
 
