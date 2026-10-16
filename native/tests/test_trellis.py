@@ -273,7 +273,7 @@ class TrellisKernelTest(unittest.TestCase):
             self.check_mma(17408, 128, [128], bits, [1, ref.splits(17408, 128, TARGET_CTAS)])
 
     def test_mma_with_segments_against_float64(self):
-        for bits in (2.5, 3.5):
+        for bits in BITS:
             self.check_mma(5120, 7168, [6144, 7168], bits, [1, ref.splits(5120, 7168, TARGET_CTAS)])
 
     def test_mma_one_row_wide(self):
@@ -293,6 +293,21 @@ class TrellisKernelTest(unittest.TestCase):
                 singles = np.concatenate([linear.mma(x[r:r + 1]) for r in range(max(counts))])
                 for rows in counts:
                     np.testing.assert_array_equal(linear.mma(x[:rows]), singles[:rows], err_msg=f"rows={rows} S={splits}")
+            finally:
+                linear.close()
+
+    def test_rows_of_mixed_magnitudes_are_bitwise_independent(self):
+        # Every m16 tile mixes rows from 1e-3 to 3e3: a row's bits must not depend on the other rows of its tile.
+        k, n, w = 5120, 256, 48
+        trellis, suh, svh = random_object(self.rng, k, n, w)
+        rows = 32
+        scale = np.geomspace(1e-3, 3e3, rows)[self.rng.permutation(rows)]
+        x = ref.bf16_bits((self.rng.standard_normal((rows, k)) * scale[:, None]).astype(np.float32))
+        for splits in (1, ref.splits(k, n, TARGET_CTAS)):
+            linear = DeviceLinear(self.gpu, trellis, suh, svh, [n], splits)
+            try:
+                singles = np.concatenate([linear.mma(x[r:r + 1]) for r in range(rows)])
+                np.testing.assert_array_equal(linear.mma(x), singles, err_msg=f"S={splits}")
             finally:
                 linear.close()
 
@@ -368,6 +383,13 @@ class TrellisKernelTest(unittest.TestCase):
 
     def test_fp16_range_synthetic_worst_case(self):
         self.prepass_extreme(4096.0, 1.0)  # 4096 in every channel with suh = 1: 11.31 * 4096 = 46341
+
+    def test_fp16_range_cliff(self):
+        # A block of equal-signed inputs reaches sqrt(128) * max|x|: finite below 65504 / sqrt(128), inf above.
+        limit = 65504.0 / np.sqrt(128.0)
+        self.prepass_extreme(limit * 0.99, 1.0)
+        with self.assertRaises(AssertionError):
+            self.prepass_extreme(limit * 1.02, 1.0)
 
     def test_fp16_range_recorded_extremes(self):
         if not EXTREMES.is_file():
