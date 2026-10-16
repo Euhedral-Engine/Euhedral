@@ -7,6 +7,7 @@
 static const EuhedralKernelEntry kernels[] = {
     {"euhedral_trellis_prepass", 0, "trellis/kernels.cu"},
     {"euhedral_trellis_mma", 0, "trellis/kernels.cu"},
+    {"euhedral_trellis_mma_rows", 0, "trellis/kernels.cu"},
     {"euhedral_trellis_epilogue", 0, "trellis/kernels.cu"},
     {"euhedral_trellis_decode_bf16", 0, "trellis/kernels.cu"},
     {"euhedral_trellis_epilogue_bf16", 0, "trellis/kernels.cu"},

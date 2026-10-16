@@ -493,7 +493,9 @@ class TrellisPlanTest {
                 long s = instruction.weights().get(1).shape()[0];
                 long activations = align(s * rows * k * 2);
                 int splits = TrellisFormat.splits((int) k, (int) n, settings.targetCtas());
-                long mma = activations + (splits > 1 ? (long) splits * rows * n * 4 : 0);
+                // Launches from the whole-K rows keep no split partials.
+                long splitRows = Math.min(rows, settings.wholeKRows() - 1);
+                long mma = activations + (splits > 1 ? splits * splitRows * n * 4 : 0);
                 long prefill = activations + align(n * k * 2) + align(rows * n * 2);
                 expected = Math.max(expected, rows > settings.mmaMaxRows() ? Math.max(mma, prefill) : mma);
             }
@@ -507,8 +509,9 @@ class TrellisPlanTest {
                 long k = instruction.inputWidth(), n = instruction.outputWidth();
                 long s = instruction.weights().get(1).shape()[0];
                 int splits = TrellisFormat.splits((int) k, (int) n, settings.targetCtas());
+                long splitRows = Math.min(rows, settings.wholeKRows() - 1);
                 decodeExpected = Math.max(
-                        decodeExpected, align(s * rows * k * 2) + (splits > 1 ? (long) splits * rows * n * 4 : 0));
+                        decodeExpected, align(s * rows * k * 2) + (splits > 1 ? splits * splitRows * n * 4 : 0));
             }
         assertTrue(decodeExpected > 0 && decodeExpected < expected);
         try (var workspace = new SharedWorkspace(new ExecutionFixtures.RecordingGpu(), plan, rows)) {
@@ -674,7 +677,7 @@ class TrellisPlanTest {
                 ENDS.get(weights.get(3).deviceAddress()));
     }
 
-    private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140));
+    private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140, 128));
 
     private static void assertWords(Launch launch, long[] words, int... sizes) {
         assertArrayEquals(words, launch.words(), launch.name());
@@ -777,6 +780,46 @@ class TrellisPlanTest {
         assertArrayEquals(new int[] {136, 40, 1}, gpu.launches.get(0).grid());
         assertEquals(0, gpu.launches.get(0).words()[6], "FP16 activations");
         assertTrue(FORMAT.rowExact(gpu, Kind.TRELLIS_LINEAR));
+    }
+
+    @Test
+    void aLaunchFromTheWholeKRowsRunsEverySplitInOneBlockWithoutPartials() {
+        LaunchLog gpu = new LaunchLog();
+        // down: k 17408, n 5120, 4 splits; a verification of 128 rows, the whole-K rows.
+        var weights = object(gpu, 5120, 17408, 5120);
+        long scratch = 1L << 36;
+        FORMAT.linear(gpu, launch(weights, 128, 17408, 5120, scratch, 1L << 30, true));
+        assertEquals(
+                List.of(LinearKernel.TRELLIS_PREPASS.symbol(), LinearKernel.TRELLIS_MMA_ROWS.symbol()), gpu.names());
+        Launch mma = gpu.launches.get(1);
+        assertArrayEquals(new int[] {40, 4, 1}, mma.grid());
+        assertEquals(256, mma.block()[0]);
+        assertWords(
+                mma,
+                new long[] {
+                    scratch,
+                    weights.get(0).deviceAddress(),
+                    weights.get(3).deviceAddress(),
+                    weights.get(2).deviceAddress(),
+                    0x2000,
+                    128,
+                    17408,
+                    5120,
+                    W,
+                    4,
+                    1
+                },
+                8,
+                8,
+                8,
+                8,
+                8,
+                4,
+                4,
+                4,
+                4,
+                4,
+                4);
     }
 
     @Test
