@@ -6,7 +6,7 @@ import io.euhedral_execution.inference.core.gpu.TableKernel;
 /// The kernels of the shared linear table (`euhedral_cuda_linear_launch`, native/src/host/linear_kernels.c). The
 /// declaration order is the native table's order, which is its ABI; a test compares the names.
 public enum LinearKernel implements TableKernel {
-    /// out[g][r] = round(H128(x[r] * suh[g])), FP16 or BF16. Grid (k/128, rows, s), block 128.
+    /// out[g][r] = round(H128(x[r] * suh[g])), FP16 or BF16. Grid (ceil(k/512), rows, s), block 128.
     TRELLIS_PREPASS("euhedral_trellis_prepass"),
     /// Tensor-core GEMM decoding trellis tiles in registers; fused epilogue when S == 1. Grid (n/128, S), block 256.
     TRELLIS_MMA("euhedral_trellis_mma"),

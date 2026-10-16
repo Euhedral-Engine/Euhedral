@@ -695,7 +695,7 @@ class TrellisPlanTest {
         FORMAT.linear(gpu, launch(weights, 1, 5120, 34816, scratch, 1L << 30, false));
         assertEquals(List.of(LinearKernel.TRELLIS_PREPASS.symbol(), LinearKernel.TRELLIS_MMA.symbol()), gpu.names());
         Launch prepass = gpu.launches.get(0), mma = gpu.launches.get(1);
-        assertArrayEquals(new int[] {40, 1, 2}, prepass.grid());
+        assertArrayEquals(new int[] {10, 1, 2}, prepass.grid());
         assertEquals(128, prepass.block()[0]);
         assertWords(
                 prepass,
@@ -777,7 +777,7 @@ class TrellisPlanTest {
                         LinearKernel.TRELLIS_MMA.symbol(),
                         LinearKernel.TRELLIS_EPILOGUE.symbol()),
                 gpu.names());
-        assertArrayEquals(new int[] {136, 40, 1}, gpu.launches.get(0).grid());
+        assertArrayEquals(new int[] {34, 40, 1}, gpu.launches.get(0).grid());
         assertEquals(0, gpu.launches.get(0).words()[6], "FP16 activations");
         assertTrue(FORMAT.rowExact(gpu, Kind.TRELLIS_LINEAR));
     }

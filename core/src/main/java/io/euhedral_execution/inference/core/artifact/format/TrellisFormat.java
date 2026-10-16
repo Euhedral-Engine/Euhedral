@@ -41,6 +41,9 @@ public final class TrellisFormat implements LinearFormat {
     /// The most rows the launch grids' Y extent holds.
     private static final int MAX_GRID_ROWS = 65535;
 
+    /// Columns per block of [LinearKernel#TRELLIS_PREPASS]: one 128-column block per warp, four warps.
+    private static final int PREPASS_BLOCK_COLUMNS = 512;
+
     /// Rows per block of [LinearKernel#TRELLIS_MMA_ROWS] (`kSplitRows`, native/src/trellis/mma.cuh).
     private static final int WHOLE_K_ROW_BLOCK = 32;
 
@@ -430,7 +433,7 @@ public final class TrellisFormat implements LinearFormat {
         void prepass(long activations, boolean bf16) {
             this.gpu.launchTableKernel(
                     LinearKernel.TRELLIS_PREPASS,
-                    this.k / TrellisLayout.BLOCK,
+                    Math.ceilDiv(this.k, PREPASS_BLOCK_COLUMNS),
                     this.rows,
                     this.segments,
                     128,

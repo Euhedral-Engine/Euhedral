@@ -90,7 +90,7 @@ class DeviceLinear:
 
     def prepass(self, buffers, d_x, rows, bf16):
         d_act = buffers.empty(self.s * rows * self.k * 2)
-        self.gpu.launch("euhedral_trellis_prepass", (self.k // 128, rows, self.s),
+        self.gpu.launch("euhedral_trellis_prepass", ((self.k + 511) // 512, rows, self.s),
                         [ptr(d_x), ptr(self.d_suh), ptr(d_act), i32(rows), i32(self.k), i32(self.s), i32(bf16)],
                         block=128)
         return d_act
@@ -243,7 +243,7 @@ class TrellisKernelTest(unittest.TestCase):
             for bf16 in (0, 1):
                 with Buffers(self.gpu) as buffers:
                     d_out = buffers.empty(s * rows * k * 2)
-                    self.gpu.launch("euhedral_trellis_prepass", (k // 128, rows, s),
+                    self.gpu.launch("euhedral_trellis_prepass", ((k + 511) // 512, rows, s),
                                     [ptr(buffers.put(x)), ptr(buffers.put(suh)), ptr(d_out), i32(rows), i32(k),
                                      i32(s), i32(bf16)], block=128)
                     got = buffers.get(d_out, "<u2", (s, rows, k))
@@ -374,7 +374,7 @@ class TrellisKernelTest(unittest.TestCase):
         suh = np.full((1, k), max_suh, dtype=np.float16)
         with Buffers(self.gpu) as buffers:
             d_out = buffers.empty(rows * k * 2)
-            self.gpu.launch("euhedral_trellis_prepass", (k // 128, rows, 1),
+            self.gpu.launch("euhedral_trellis_prepass", ((k + 511) // 512, rows, 1),
                             [ptr(buffers.put(x)), ptr(buffers.put(suh)), ptr(d_out), i32(rows), i32(k), i32(1), i32(0)],
                             block=128)
             out = buffers.get(d_out, "<u2", (rows, k)).view(np.float16)
