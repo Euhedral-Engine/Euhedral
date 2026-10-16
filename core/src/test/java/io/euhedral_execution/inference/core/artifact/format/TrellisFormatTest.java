@@ -147,7 +147,7 @@ class TrellisFormatTest {
         long n = 34816, k = 5120, rows = 512;
         long expected = 8 * rows * k * 2 + n * k * 2 + rows * n * 2;
         // A row limit below the rows reserves the prefill route.
-        TrellisFormat prefill = new TrellisFormat(new TrellisSettings(64, 560, 128));
+        TrellisFormat prefill = new TrellisFormat(new TrellisSettings(64, 560, 128, 128));
         long aligned = prefill.planScratchBytes(descriptor(GATE_UP), 512);
         // Every region is 256-aligned, and these are.
         assertEquals(expected, aligned);
@@ -168,7 +168,7 @@ class TrellisFormatTest {
     void launchesFromTheWholeKRowsKeepNoSplitPartials() {
         // gate_up: k = 5120, n = 34816, three K splits at 560 target blocks.
         long k = 5120, n = 34816, splits = 3;
-        TrellisFormat format = new TrellisFormat(new TrellisSettings(512, 560, 128));
+        TrellisFormat format = new TrellisFormat(new TrellisSettings(512, 560, 128, 128));
         assertEquals(8 * 127 * k * 2 + splits * 127 * n * 4, format.planScratchBytes(descriptor(GATE_UP), 127));
         assertEquals(8 * 512 * k * 2 + splits * 127 * n * 4, format.planScratchBytes(descriptor(GATE_UP), 512));
         assertEquals(8 * 16 * k * 2 + splits * 16 * n * 4, format.planScratchBytes(descriptor(GATE_UP), 16));
