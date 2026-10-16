@@ -19,9 +19,12 @@ import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import java.io.IOException;
+import java.lang.foreign.Arena;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -82,16 +85,16 @@ final class CompactWeightLoader {
     /// ([HostWeightSelection#stageable]).
     static Map<String, TensorHandle> loadObjects(
             Path artifactPath,
-            java.util.Collection<TensorDescriptor> descriptors,
+            Collection<TensorDescriptor> descriptors,
             GpuMemory gpuMemory,
             ArtifactProfile.Speculation speculation,
             Set<String> hostBacked,
             Set<String> diskBacked)
             throws IOException {
         // The DFlash2 selector's codebooks are always read in place from mapped host memory.
-        Set<String> mapped = new java.util.HashSet<>();
+        Set<String> mapped = new HashSet<>();
         if (speculation == ArtifactProfile.Speculation.DFLASH2) mapped.addAll(DFlash2Inventory.MAPPED);
-        Set<String> host = new java.util.HashSet<>(hostBacked);
+        Set<String> host = new HashSet<>(hostBacked);
         host.addAll(mapped);
         // A trellis companion is a few KB that every launch of its object reads: it never leaves the device.
         Set<String> companions = trellisCompanions(descriptors);
@@ -144,7 +147,7 @@ final class CompactWeightLoader {
     }
 
     /// Frees the host arena of `handles`: the lowest host address among them, where the arena starts.
-    private static void freeArena(java.util.Collection<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
+    private static void freeArena(Collection<TensorHandle> handles, GpuMemory gpuMemory, Throwable failure) {
         long arena = 0;
         for (TensorHandle handle : handles)
             if (handle.hostAddress() != 0 && (arena == 0 || Long.compareUnsigned(handle.hostAddress(), arena) < 0))
@@ -373,7 +376,7 @@ final class CompactWeightLoader {
         return trellisCompanions(descriptors.values());
     }
 
-    static Set<String> trellisCompanions(java.util.Collection<TensorDescriptor> descriptors) {
+    static Set<String> trellisCompanions(Collection<TensorDescriptor> descriptors) {
         Set<String> names = new LinkedHashSet<>();
         for (TensorDescriptor descriptor : descriptors)
             if (trellis(descriptor)) names.addAll(LinearFormats.of(descriptor).companions(descriptor.name()));
@@ -437,7 +440,7 @@ final class CompactWeightLoader {
     /// attention projection must also have n/2 as a boundary. Before any device allocation.
     static void validateTrellisSegments(Path artifactPath, Map<String, TensorDescriptor> descriptors)
             throws IOException {
-        try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+        try (Arena arena = Arena.ofConfined()) {
             for (TensorDescriptor descriptor : descriptors.values()) {
                 if (!trellis(descriptor)) continue;
                 String name = descriptor.name();
@@ -574,7 +577,7 @@ final class CompactWeightLoader {
                 new ExpectedTensor(expected.shape(), expected.dataType(), expected.format(), expected.layout());
         return LinearFormats.find(descriptor.format(), descriptor.layout())
                 .map(format -> format.accepts(descriptor, registered))
-                .orElseGet(() -> java.util.Arrays.equals(expected.shape(), descriptor.shape())
+                .orElseGet(() -> Arrays.equals(expected.shape(), descriptor.shape())
                         && expected.dataType() == descriptor.dataType()
                         && expected.format() == descriptor.format()
                         && expected.layout() == descriptor.layout());

@@ -1,5 +1,9 @@
 package io.euhedral_execution.inference.core.artifact.format;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
+
 /// The arithmetic of a trellis object's payload and its `.segments` companion: which tile widths exist, what they
 /// mean in bits, and which segment ends a linear may carry.
 ///
@@ -54,12 +58,11 @@ public final class TrellisLayout {
     }
 
     /// The segment ends in the little-endian int32 payload `bytes`.
-    public static int[] readEnds(java.lang.foreign.MemorySegment payload) {
+    public static int[] readEnds(MemorySegment payload) {
         int[] ends = new int[Math.toIntExact(payload.byteSize() / Integer.BYTES)];
         for (int index = 0; index < ends.length; index++)
             ends[index] = payload.get(
-                    java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN),
-                    (long) index * Integer.BYTES);
+                    ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN), (long) index * Integer.BYTES);
         return ends;
     }
 }
