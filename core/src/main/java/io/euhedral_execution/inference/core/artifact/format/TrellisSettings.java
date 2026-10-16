@@ -8,11 +8,14 @@ package io.euhedral_execution.inference.core.artifact.format;
 ///     (`euhedral.trellis.target-ctas`)
 /// @param wholeKRows the fewest rows for which each block of the tensor-core route runs every K split of its columns
 ///     itself, with no split partials (`euhedral.trellis.whole-k-rows`); the results are bitwise the same
-public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows) {
+/// @param wholeKWideRows the fewest rows for which those launches use blocks of 64 rows instead of 32
+///     (`euhedral.trellis.whole-k-wide-rows`); the results are bitwise the same
+public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows, int wholeKWideRows) {
 
     public static final String MMA_MAX_ROWS = "euhedral.trellis.mma-max-rows";
     public static final String TARGET_CTAS = "euhedral.trellis.target-ctas";
     public static final String WHOLE_K_ROWS = "euhedral.trellis.whole-k-rows";
+    public static final String WHOLE_K_WIDE_ROWS = "euhedral.trellis.whole-k-wide-rows";
 
     /// Decode-type quanta (decode, draft) have up to eight rows and never take the prefill route.
     private static final int MIN_MMA_ROWS = 8;
@@ -25,8 +28,12 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows) {
     /// blocks.
     private static final int DEFAULT_TARGET_CTAS = 560;
     /// Measured on an RTX 5070 Ti over the 3-bit model's object shapes, the trellis linears of one step with split
-    /// partials and with whole-K blocks: 66.2 and 65.2 ms at 64 rows, 85.6 and 78.0 ms at 80.
-    private static final int DEFAULT_WHOLE_K_ROWS = 80;
+    /// partials and with whole-K blocks of 32 rows: 48.6 and 59.4 ms at 48 rows, 56.5 and 64.9 ms at 56, 64.4 and
+    /// 60.4 ms at 64.
+    private static final int DEFAULT_WHOLE_K_ROWS = 64;
+    /// Measured on the same card and shapes, whole-K blocks of 32 and of 64 rows: 74.4 and 77.6 ms at 80 rows, 77.6
+    /// and 83.7 ms at 96, 102.9 and 101.7 ms at 128, 364.2 and 319.1 ms at 512.
+    private static final int DEFAULT_WHOLE_K_WIDE_ROWS = 128;
 
     public TrellisSettings {
         if (mmaMaxRows < MIN_MMA_ROWS)
@@ -34,6 +41,8 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows) {
                     + ", the rows of a decode-type quantum: " + mmaMaxRows);
         if (targetCtas < 1) throw new IllegalArgumentException(TARGET_CTAS + " must be positive: " + targetCtas);
         if (wholeKRows < 1) throw new IllegalArgumentException(WHOLE_K_ROWS + " must be positive: " + wholeKRows);
+        if (wholeKWideRows < 1)
+            throw new IllegalArgumentException(WHOLE_K_WIDE_ROWS + " must be positive: " + wholeKWideRows);
     }
 
     /// The settings the system properties name, or the machine defaults.
@@ -41,6 +50,7 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows) {
         return new TrellisSettings(
                 Integer.getInteger(MMA_MAX_ROWS, DEFAULT_MMA_MAX_ROWS),
                 Integer.getInteger(TARGET_CTAS, DEFAULT_TARGET_CTAS),
-                Integer.getInteger(WHOLE_K_ROWS, DEFAULT_WHOLE_K_ROWS));
+                Integer.getInteger(WHOLE_K_ROWS, DEFAULT_WHOLE_K_ROWS),
+                Integer.getInteger(WHOLE_K_WIDE_ROWS, DEFAULT_WHOLE_K_WIDE_ROWS));
     }
 }

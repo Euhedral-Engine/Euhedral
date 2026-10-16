@@ -677,7 +677,7 @@ class TrellisPlanTest {
                 ENDS.get(weights.get(3).deviceAddress()));
     }
 
-    private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140, 128));
+    private static final TrellisFormat FORMAT = new TrellisFormat(new TrellisSettings(32, 140, 128, 1024));
 
     private static void assertWords(Launch launch, long[] words, int... sizes) {
         assertArrayEquals(words, launch.words(), launch.name());
@@ -780,6 +780,17 @@ class TrellisPlanTest {
         assertArrayEquals(new int[] {34, 40, 1}, gpu.launches.get(0).grid());
         assertEquals(0, gpu.launches.get(0).words()[6], "FP16 activations");
         assertTrue(FORMAT.rowExact(gpu, Kind.TRELLIS_LINEAR));
+    }
+
+    @Test
+    void aLaunchFromTheWideRowsTakesBlocksOfSixtyFourRows() {
+        LaunchLog gpu = new LaunchLog();
+        var weights = object(gpu, 5120, 17408, 5120);
+        TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 128, 128));
+        wide.linear(gpu, launch(weights, 200, 17408, 5120, 1L << 36, 1L << 30, true));
+        assertEquals(
+                List.of(LinearKernel.TRELLIS_PREPASS.symbol(), LinearKernel.TRELLIS_MMA_ROWS64.symbol()), gpu.names());
+        assertArrayEquals(new int[] {40, 4, 1}, gpu.launches.get(1).grid());
     }
 
     @Test

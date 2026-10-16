@@ -50,6 +50,9 @@ public final class TrellisFormat implements LinearFormat {
     /// Rows per block of [LinearKernel#TRELLIS_MMA_ROWS] (`kSplitRows`, native/src/trellis/mma.cuh).
     private static final int WHOLE_K_ROW_BLOCK = 32;
 
+    /// Rows per block of [LinearKernel#TRELLIS_MMA_ROWS64] (`kSplitRows64`, native/src/trellis/mma.cuh).
+    private static final int WIDE_WHOLE_K_ROW_BLOCK = 64;
+
     private final TrellisSettings settings;
 
     TrellisFormat() {
@@ -462,10 +465,11 @@ public final class TrellisFormat implements LinearFormat {
                 requireScratch(activations);
                 long scratch = this.launch.scratch();
                 prepass(scratch, false);
+                boolean wide = this.rows >= settings.wholeKWideRows();
                 this.gpu.launchTableKernel(
-                        LinearKernel.TRELLIS_MMA_ROWS,
+                        wide ? LinearKernel.TRELLIS_MMA_ROWS64 : LinearKernel.TRELLIS_MMA_ROWS,
                         this.n / TrellisLayout.BLOCK,
-                        Math.ceilDiv(this.rows, WHOLE_K_ROW_BLOCK),
+                        Math.ceilDiv(this.rows, wide ? WIDE_WHOLE_K_ROW_BLOCK : WHOLE_K_ROW_BLOCK),
                         1,
                         256,
                         1,

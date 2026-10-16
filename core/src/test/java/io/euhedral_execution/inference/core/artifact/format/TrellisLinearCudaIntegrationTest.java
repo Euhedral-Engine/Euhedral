@@ -205,7 +205,7 @@ class TrellisLinearCudaIntegrationTest {
 
     @Test
     void everyRouteAgreesWithTheScalarReference() {
-        TrellisFormat format = new TrellisFormat(new TrellisSettings(32, 140, 128));
+        TrellisFormat format = new TrellisFormat(new TrellisSettings(32, 140, 128, 1024));
         Random random = new Random(7);
         try (CudaGpuMemory gpu = open();
                 Arena arena = Arena.ofConfined()) {
@@ -220,8 +220,10 @@ class TrellisLinearCudaIntegrationTest {
                 float[] verify = run(gpu, arena, format, split, x, 40, true, false);
                 assertClose(reference, verify, 512, 0.02, "verification");
                 // From the whole-K rows each block runs every split itself: the same bits.
-                TrellisFormat wholeK = new TrellisFormat(new TrellisSettings(32, 140, 16));
+                TrellisFormat wholeK = new TrellisFormat(new TrellisSettings(32, 140, 16, 1024));
                 assertArrayEquals(verify, run(gpu, arena, wholeK, split, x, 40, true, false), "whole-K rows");
+                TrellisFormat wide = new TrellisFormat(new TrellisSettings(32, 140, 16, 16));
+                assertArrayEquals(verify, run(gpu, arena, wide, split, x, 40, true, false), "64-row whole-K blocks");
                 for (int row : new int[] {0, 17, 39}) {
                     MemorySegment single = arena.allocate(1024 * 2L, 2);
                     MemorySegment.copy(x, row * 1024L * 2, single, 0, 1024 * 2L);
