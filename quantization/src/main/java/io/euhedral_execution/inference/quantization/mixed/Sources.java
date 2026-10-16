@@ -62,9 +62,8 @@ public final class Sources {
     /// Opens `artifacts` (an artifact file for each option that can be chosen) and checks them against each other.
     ///
     /// @throws IllegalArgumentException naming the object when a source lacks one the base has among the
-    /// projections or
-    ///     the objects compared, when their shapes or formats differ where they must agree, or when a compared
-    ///     object's bytes differ
+    ///     projections or the objects compared, when their shapes or formats differ where they must agree, or when
+    ///     a compared object's bytes differ
     public static Sources open(Map<Option, Path> artifacts, Option base) throws IOException {
         if (!artifacts.containsKey(base)) throw new IllegalArgumentException("no source for the base " + base.key());
         Map<Option, Artifact> read = new EnumMap<>(Option.class);
