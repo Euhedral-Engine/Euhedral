@@ -40,7 +40,7 @@ Options: `--act-order` (columns by decreasing diag H), `--damp` (0.01), `--batch
 
 ```bash
 ./gradlew :quantization:run --args="calibrate --format trellis --bits 3.5 --model /path/to/checkpoint \
-    --tokens tokens.npy --out exl3/"
+    --tokens tokens.npy --draft-ids-from artifact.edrl --out exl3/"
 ```
 
 Writes the checkpoint in exllamav3's EXL3 trellis format instead of GPTQ codes. `--bits B` is the average bits per
@@ -53,6 +53,13 @@ Output (`--out`, loadable by exllamav3): one `model.language_model.layers.<i>.sa
 `model.visual.safetensors` (vision tower copied unquantized), `model.safetensors.index.json`, `config.json` with the
 `quantization_config` block and `quantization_config.json`.
 
+A run over the whole model also rounds the two heads by GPTQ, after the MTP linears and before the final files are
+written: the LM head and the draft head (the shortlist of `--draft-ids-from`, which is required) in NVFP4 row-split
+(`--output-head FORMAT` changes the LM head's format), both under the Hessian of the final norm's output over the
+final hidden states. Their codes go to `exl3/heads/`, the `--codes-from` directory of the converter's
+`--quantization trellis --trellis-from`. The resume point is dropped only after the heads are rounded and the final
+files are written.
+
 Resource flags:
 
 - `--rounding-lanes N`: linears rounded at once (default: sized from the device memory free at each layer, less the
@@ -63,8 +70,8 @@ Resource flags:
 - `--write-buffer-mib N` (16): the buffer each output file is copied through.
 - `--batch`, `--sequences`, `--layers`, `--library` as above.
 
-The GPTQ-only flags (`--skip-mtp`, `--act-order`, `--damp`, `--quantization`, `--compressed`, `--output-head`,
-`--draft-ids-from`, `--nvfp4-above`, `--nvfp4-scale-max`) are rejected with `--format trellis`. `--bits` and every
+The GPTQ-only flags (`--skip-mtp`, `--act-order`, `--damp`, `--quantization`, `--compressed`, `--nvfp4-above`,
+`--nvfp4-scale-max`) are rejected with `--format trellis`. `--bits` and every
 allocated rate are validated before any GPU work.
 
 Resuming: the hidden states are checkpointed every 8 layers into one `hidden.bin` (a `ResumeFile`, overwritten in
