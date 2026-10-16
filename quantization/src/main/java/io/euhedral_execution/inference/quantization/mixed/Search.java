@@ -66,7 +66,7 @@ public final class Search {
     /// @param verifyRows the rows of the verification step whose time is on the front
     /// @param freeBytes the device's free bytes, measured once at the start (a resumed search keeps its first)
     /// @param feasibility the fit check for those free bytes
-    /// @param hostSinks sinks of the host pool
+    /// @param hostSinks sinks of each host pool (one pool per kind of host work)
     /// @param members models in the ensemble
     /// @param ridge the fidelity model's ridge
     /// @param lambdas weights of the normalized prefill and verification costs, in KL
@@ -122,7 +122,9 @@ public final class Search {
 
     private final Settings s;
     private final Scoring scoring;
-    private final HostPool host;
+    /// One pool per kind of host work, so none queues behind another: proposals (ensemble fits, RCO samples,
+    /// choosing a batch) and candidates (assembly and fit checks, the budget, the seeds).
+    private final HostPool proposing, candidates;
     private final Space space;
     private final Priors priors;
     private SearchState state;
@@ -130,10 +132,11 @@ public final class Search {
     private long budget;
     private long seed;
 
-    private Search(Settings settings, Scoring scoring, HostPool host) {
+    private Search(Settings settings, Scoring scoring, HostPool proposing, HostPool candidates) {
         this.s = settings;
         this.scoring = scoring;
-        this.host = host;
+        this.proposing = proposing;
+        this.candidates = candidates;
         List<Option> options = new ArrayList<>(s.sources().options());
         options.retainAll(s.priors().options());
         options.sort(Comparator.naturalOrder());
@@ -148,8 +151,9 @@ public final class Search {
 
     /// Runs the search, resuming from `settings.state()` if it holds one.
     public static Outcome run(Settings settings, Scoring scoring) throws Exception {
-        try (HostPool host = HostPool.start(settings.hostSinks())) {
-            Search search = new Search(settings, scoring, host);
+        try (HostPool proposing = HostPool.start(settings.hostSinks());
+                HostPool candidates = HostPool.start(settings.hostSinks())) {
+            Search search = new Search(settings, scoring, proposing, candidates);
             return search.run();
         }
     }
@@ -160,7 +164,7 @@ public final class Search {
             state = opened;
             seed = state.seed();
             feasibility = s.feasibility().apply(state.freeBytes());
-            budget = host.submit(this::derive).get();
+            budget = candidates.submit(this::derive).get();
             System.out.printf(
                     Locale.ROOT,
                     "search: %d objects, %d options, projections %d..%d MiB, budget %d MiB, %d MiB free, %d measured%n",
@@ -175,7 +179,7 @@ public final class Search {
 
             CompletableFuture<Proposals> next = null;
             if (state.round() == 0) {
-                List<Candidate> seeds = host.submit(this::seedCandidates).get();
+                List<Candidate> seeds = candidates.submit(this::seedCandidates).get();
                 next = measure(seeds, 0);
                 state.round(1);
             }
@@ -191,7 +195,8 @@ public final class Search {
                 List<Measured> data = state.measured();
                 double share = state.explore();
                 List<Candidate> chosen = need > 0
-                        ? host.submit(() -> choose(proposals, data, share, need, round))
+                        ? proposing
+                                .submit(() -> choose(proposals, data, share, need, round))
                                 .get()
                         : List.of();
                 if (chosen.isEmpty() && need > 0)
@@ -306,9 +311,10 @@ public final class Search {
 
     // --------------------------------------------------------------- proposing
 
-    /// An RCO sweep over the ensemble fitted to `data`: as futures on the host pool.
+    /// An RCO sweep over the ensemble fitted to `data`: as futures on the proposals pool.
     private CompletableFuture<Proposals> propose(List<Measured> data, int round) {
-        return host.submit(() -> Ensemble.fit(data, s.members(), seed * 31 + round, s.ridge(), priors, s.bands()))
+        return proposing
+                .submit(() -> Ensemble.fit(data, s.members(), seed * 31 + round, s.ridge(), priors, s.bands()))
                 .thenCompose(ensemble -> {
                     List<CompletableFuture<List<Candidate>>> runs = new ArrayList<>();
                     for (int lambda = 0; lambda < lambdaCells(); lambda++)
@@ -349,9 +355,10 @@ public final class Search {
                 + 7919L * (lambdaIndex * s.budgetFractions().size() + fractionIndex);
         // One sample per host task: a lattice worker polling the pool never holds a whole run, so the engine's
         // frames on the same workers keep moving while the device scores.
-        return host.submit(() -> new Rco.Run(objective, space.bytes, cellBudget, unit, s.rco(), cellSeed, restart))
+        return proposing
+                .submit(() -> new Rco.Run(objective, space.bytes, cellBudget, unit, s.rco(), cellSeed, restart))
                 .thenCompose(this::advance)
-                .thenCompose(result -> host.submit(() -> repaired(
+                .thenCompose(result -> proposing.submit(() -> repaired(
                         ensemble,
                         objective,
                         result,
@@ -366,7 +373,7 @@ public final class Search {
 
     /// `run` advanced to its end, one sample per host task.
     private CompletableFuture<Rco.Result> advance(Rco.Run run) {
-        return host.submit(run::advance).thenCompose(done -> done ? host.submit(run::result) : advance(run));
+        return proposing.submit(run::advance).thenCompose(done -> done ? proposing.submit(run::result) : advance(run));
     }
 
     /// The assignment of `result` made to fit the device, as a candidate (none when it cannot be made to fit).
@@ -569,24 +576,21 @@ public final class Search {
 
     // --------------------------------------------------------------- measuring
 
-    /// Scores `candidates` not measured yet, in order. While one is scored the next is assembled and checked
-    /// on the host pool. When the last one starts scoring, the next round's proposals start on the pool (from
-    /// what is measured before it), and are returned as a future.
-    private CompletableFuture<Proposals> measure(List<Candidate> candidates, int round) throws Exception {
+    /// Scores the candidates of `batch` not measured yet, in order. While one is scored the next is assembled and
+    /// checked on the candidates pool. When the last one starts scoring, the next round's proposals start on the
+    /// proposals pool (from what is measured before it), and are returned as a future.
+    private CompletableFuture<Proposals> measure(List<Candidate> batch, int round) throws Exception {
         List<Candidate> todo = new ArrayList<>();
         Set<Allocation> listed = new HashSet<>();
-        for (Candidate candidate : candidates)
+        for (Candidate candidate : batch)
             if (!state.contains(candidate.allocation()) && listed.add(candidate.allocation())) todo.add(candidate);
         CompletableFuture<Proposals> next = null;
-        CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : host.submit(() -> prepare(todo.get(0)));
-        // While the device scores, host work keeps to one sink: the pool's sinks share owner workers with the
-        // engine's, and a stage frame queued behind host work on its owner holds up the device.
-        host.narrow();
+        CompletableFuture<Prepared> prepared = todo.isEmpty() ? null : candidates.submit(() -> prepare(todo.get(0)));
         for (int k = 0; k < todo.size(); k++) {
             Prepared ready = prepared.get();
             if (k + 1 < todo.size()) {
                 Candidate following = todo.get(k + 1);
-                prepared = host.submit(() -> prepare(following));
+                prepared = candidates.submit(() -> prepare(following));
             }
             if (k == todo.size() - 1 && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
             Scorer.Result result = scoring.score(s.sources().path(s.sources().base()), ready.artifact());
@@ -615,7 +619,6 @@ public final class Search {
                     measured.decode(),
                     measured.fits() ? "fits" : "does not fit");
         }
-        host.widen();
         if (next == null && round + 1 <= s.maxRounds()) next = propose(state.measured(), round + 1);
         return next;
     }
