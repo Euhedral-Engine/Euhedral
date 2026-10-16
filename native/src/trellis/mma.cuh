@@ -16,6 +16,20 @@ __device__ __forceinline__ void mma_f16(float* c, const unsigned int* a, unsigne
             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// Ring slots per warp. Over the 3.0 bpw model shapes, 3 or 4 slots keep the most bytes in flight; deeper rings cost
+// occupancy.
+constexpr int kStages = 4;
+
+__device__ __forceinline__ void copy16(void* shared, const void* global) {
+    const unsigned int address = (unsigned int)__cvta_generic_to_shared(shared);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(address), "l"(global));
+}
+
+__device__ __forceinline__ void copy_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+
+template <int N>
+__device__ __forceinline__ void copy_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
 __device__ __forceinline__ unsigned int pack_half2(half2 value) { return *reinterpret_cast<unsigned int*>(&value); }
 
 /// The tile ring of `W` uint16 words as each lane decodes it. A lane's eight positions lane * 8 + j are contiguous, so
@@ -47,7 +61,7 @@ template <int W, int MT>
 __device__ __forceinline__ void group(const unsigned short* __restrict__ act, const unsigned short* __restrict__ words,
         const unsigned short* __restrict__ svh, float* __restrict__ partials, unsigned short* __restrict__ out,
         int rows, int row_base, int k, int n, int splits, int split, int first, int last,
-        unsigned int (*ring)[kTrellisMaxWords], float (*tile)[128]) {
+        unsigned int (*ring)[kStages][kTrellisMaxWords], float (*tile)[128]) {
     using R = Ring<W>;
     constexpr int nw = R::kWords32;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -71,24 +85,24 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
 #pragma unroll
             for (int i = 0; i < 4; ++i) acc[m][h][i] = 0.0f;
 
-    const unsigned int* source = reinterpret_cast<const unsigned int*>(words) + (size_t)tj * nw;
-    const size_t stride = (size_t)tiles_n * nw;
-    unsigned int next0 = 0, next1 = 0;
-    if (first < last) {
-        const unsigned int* from = source + (size_t)first * stride;
-        next0 = lane < nw ? from[lane] : 0u;
-        next1 = lane + 32 < nw ? from[lane + 32] : 0u;
-    }
-    unsigned int* mine = ring[warp];
+    // Each warp streams its tiles through its own ring of kStages slots with 16-byte asynchronous copies, kStages - 1
+    // tiles ahead of the one it decodes.
+    const unsigned short* source = words + (size_t)tj * W;
+    const size_t stride = (size_t)tiles_n * W;
+    constexpr int chunks = W / 8;
+    const auto fetch = [&](int ti, int slot) {
+        if (lane < chunks && ti < last) copy16(&ring[warp][slot][lane * 4], source + (size_t)ti * stride + lane * 8);
+        copy_commit();
+    };
+#pragma unroll
+    for (int i = 0; i < kStages - 1; ++i) fetch(first + i, i);
+    int slot = 0;
     for (int ti = first; ti < last; ++ti) {
-        mine[lane] = next0;
-        if (nw > 32) mine[lane + 32] = next1;
+        copy_wait<kStages - 2>();
         __syncwarp();
-        if (ti + 1 < last) {
-            const unsigned int* from = source + (size_t)(ti + 1) * stride;
-            next0 = lane < nw ? from[lane] : 0u;
-            next1 = lane + 32 < nw ? from[lane + 32] : 0u;
-        }
+        fetch(ti + kStages - 1, slot == 0 ? kStages - 1 : slot - 1);
+        const unsigned int* mine = ring[warp][slot];
+        slot = slot + 1 == kStages ? 0 : slot + 1;
         // The lane's words shifted so its first window starts at bit 0 (MSB first).
         unsigned int u[R::kWords];
 #pragma unroll
@@ -104,7 +118,6 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
                 const int j = h * 4 + half_index * 2;
                 b[h][half_index] = pack_half2(decode_mul1_2(window<W>(u, j), window<W>(u, j + 1)));
             }
-        __syncwarp();
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
             const int row0 = row_base + m * 16 + grp, row1 = row0 + 8;
@@ -164,7 +177,7 @@ __device__ __forceinline__ void group(const unsigned short* __restrict__ act, co
 template <int W>
 __device__ __forceinline__ void rows(const unsigned short* __restrict__ act, const unsigned short* __restrict__ words,
         const unsigned short* __restrict__ svh, float* __restrict__ partials, unsigned short* __restrict__ out,
-        int rows, int k, int n, int splits, int first, int last, unsigned int (*ring)[kTrellisMaxWords],
+        int rows, int k, int n, int splits, int first, int last, unsigned int (*ring)[kStages][kTrellisMaxWords],
         float (*tile)[128]) {
     for (int row_base = 0; row_base < rows; row_base += 64) {
         const int remaining = (rows - row_base + 15) >> 4;
@@ -189,7 +202,7 @@ extern "C" __global__ __launch_bounds__(256) void euhedral_trellis_mma(
         const unsigned short* __restrict__ act, const unsigned short* __restrict__ words, const int* __restrict__ ends,
         const unsigned short* __restrict__ svh, float* __restrict__ partials, unsigned short* __restrict__ out,
         int rows, int k, int n, int w, int splits, int s) {
-    __shared__ unsigned int ring[8][kTrellisMaxWords];
+    __shared__ __align__(16) unsigned int ring[8][trellis_mma::kStages][kTrellisMaxWords];
     __shared__ float tile[16][128];
     const int column0 = blockIdx.x * 128;
     int g = 0;
