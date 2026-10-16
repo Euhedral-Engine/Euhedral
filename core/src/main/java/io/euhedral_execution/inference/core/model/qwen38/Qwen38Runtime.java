@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
@@ -87,7 +88,8 @@ public final class Qwen38Runtime implements ModelRuntime {
                 EuhedralInferenceRuntime.laneCount(),
                 EuhedralInferenceRuntime.CAPTURE_GRAPHS,
                 InferenceConfig.workspaceRows(),
-                model.artifactPath());
+                model.artifactPath(),
+                artifact == null ? Map.of() : artifact.sources());
         var identity = identity(config.artifactPath(), artifact, model);
         KvFormat kvFormat = ArtifactProfile.kvFormat(config.kvCache(), profile);
         // Last, so nothing that can fail follows the pinned arena.

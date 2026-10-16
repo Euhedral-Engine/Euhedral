@@ -15,6 +15,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /// The DFlash2 drafter's objects in an artifact (`dflash2/`, tools/euhedral_artifacts/dflash2.py): which there are,
 /// their shapes, and how they assemble into [DFlash2Weights]. The matrices that feed DFlash2 linears (each layer's five
@@ -34,13 +35,14 @@ public final class DFlash2Inventory {
     record Entry(long[] shape, boolean projection) {}
 
     /// The drafter configuration the artifact records, or null when it holds no drafter.
-    static DFlash2Config read(Path artifactPath, Map<String, TensorDescriptor> descriptors) throws IOException {
+    static DFlash2Config read(Function<TensorDescriptor, Path> paths, Map<String, TensorDescriptor> descriptors)
+            throws IOException {
         TensorDescriptor descriptor = descriptors.get(CONFIG);
         if (descriptor == null) return null;
         if (descriptor.format() != WeightFormat.I32 || descriptor.shape().length != 1)
             throw new WeightLoadException("dflash2/config must be an I32 vector");
         try (Arena arena = Arena.ofConfined()) {
-            int[] words = TensorDataReader.read(artifactPath, descriptor, arena)
+            int[] words = TensorDataReader.read(paths.apply(descriptor), descriptor, arena)
                     .asSlice(0, descriptor.shape()[0] * Integer.BYTES)
                     .toArray(ValueLayout.JAVA_INT_UNALIGNED);
             try {

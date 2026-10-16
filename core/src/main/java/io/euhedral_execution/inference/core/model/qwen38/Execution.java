@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -124,6 +125,19 @@ public final class Execution implements AutoCloseable {
             boolean captureGraphs,
             int maxRows,
             Path artifact) {
+        this(lattice, plan, gpu, laneCount, captureGraphs, maxRows, artifact, Map.of());
+    }
+
+    /// As above, reading the disk-backed weights named in `sources` from the file each names instead of `artifact`.
+    public Execution(
+            LatticeTerminal lattice,
+            ExecutionPlan plan,
+            ExecutionGpu gpu,
+            int laneCount,
+            boolean captureGraphs,
+            int maxRows,
+            Path artifact,
+            Map<String, Path> sources) {
         this.plan = Objects.requireNonNull(plan, "plan");
         this.gpu = Objects.requireNonNull(gpu, "gpu");
         if (laneCount < 1 || laneCount > LanePool.MAX_LANES)
@@ -152,7 +166,7 @@ public final class Execution implements AutoCloseable {
         if (artifact == null) throw new IllegalArgumentException("disk-backed weights need their artifact");
         AsyncReads reads = openAsyncReads();
         try {
-            this.diskReader = new DiskReader(this.plan.window(), reads, artifact);
+            this.diskReader = new DiskReader(this.plan.window(), reads, artifact, sources);
         } catch (IOException | RuntimeException failure) {
             if (reads != null) reads.close();
             this.runtime.close();

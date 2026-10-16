@@ -6,6 +6,7 @@ import io.euhedral_execution.inference.core.artifact.CompactTensorLayout;
 import io.euhedral_execution.inference.core.artifact.TensorDescriptor;
 import io.euhedral_execution.inference.core.model.qwen38.LayerType;
 import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
+import io.euhedral_execution.inference.core.model.qwen38.speculative.MtpDecoder;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -15,12 +16,14 @@ import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.OptionalInt;
 
 /// Metadata and tensor-table codec of the compact version 2 container.
 ///
 /// Metadata is encoded in the same order as `Qwen38Config`: int32 scalar fields, IEEE 754 binary64
 /// floating-point fields, a length-prefixed UTF-8 activation name, a counted sequence of layer-type
-/// ordinals, the remaining int32 fields, two boolean bytes, and the MTP layer count.
+/// ordinals, the remaining int32 fields, two boolean bytes, the MTP layer count and, when the artifact stores one,
+/// the MTP draft depth.
 /// `DataOutputStream` and `ByteBuffer` both use the explicit big-endian order selected here.
 final class ArtifactCodec {
 
@@ -64,6 +67,9 @@ final class ArtifactCodec {
             output.writeByte(config.tieWordEmbeddings() ? 1 : 0);
             output.writeByte(config.attentionOutputGate() ? 1 : 0);
             output.writeInt(config.mtpLayerCount());
+            // Written only when the artifact stores one, so every artifact without a depth encodes as before.
+            if (config.draftDepth().isPresent())
+                output.writeInt(config.draftDepth().getAsInt());
         } catch (IOException exception) {
             throw new AssertionError("Byte array metadata encoding failed", exception);
         }
@@ -104,6 +110,13 @@ final class ArtifactCodec {
         boolean tieWordEmbeddings = readBoolean(input, "tie word embeddings");
         boolean attentionOutputGate = readBoolean(input, "attention output gate");
         int mtpLayerCount = readInt(input, "MTP layer count");
+        OptionalInt draftDepth = OptionalInt.empty();
+        if (input.hasRemaining()) {
+            int depth = readInt(input, "MTP draft depth");
+            if (depth < 1 || depth > MtpDecoder.MAX_DRAFTS)
+                throw invalid("MTP draft depth is outside the supported range");
+            draftDepth = OptionalInt.of(depth);
+        }
 
         if (input.hasRemaining()) {
             throw invalid("metadata contains trailing bytes");
@@ -134,7 +147,8 @@ final class ArtifactCodec {
                 sharedExpertIntermediateSize,
                 tieWordEmbeddings,
                 attentionOutputGate,
-                mtpLayerCount);
+                mtpLayerCount,
+                draftDepth);
         validateConfig(config);
         return config;
     }

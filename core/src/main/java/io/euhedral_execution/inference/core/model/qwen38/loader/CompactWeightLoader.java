@@ -30,6 +30,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /// Assembles the canonical Qwen model view from NInfer-compatible compact runtime objects.
 ///
@@ -53,11 +54,12 @@ final class CompactWeightLoader {
             throws IOException {
         Qwen38Config config = artifact.config();
         validateConfig(config);
-        DFlash2Config dflash2 = DFlash2Inventory.read(artifactPath, descriptors);
+        Function<TensorDescriptor, Path> paths = descriptor -> artifact.pathOf(artifactPath, descriptor);
+        DFlash2Config dflash2 = DFlash2Inventory.read(paths, descriptors);
         validateInventory(config, descriptors, dflash2);
-        Map<String, int[]> ends = new LinkedHashMap<>(validateTrellisSegments(artifactPath, descriptors));
+        Map<String, int[]> ends = new LinkedHashMap<>(validateTrellisSegments(paths, descriptors));
         Map<String, TensorHandle> handles =
-                loadObjects(artifactPath, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked);
+                loadObjects(paths, descriptors.values(), gpuMemory, speculation, hostBacked, diskBacked);
         try {
             // Only an MTP load prepares the MTP layer for execution.
             if (speculation == ArtifactProfile.Speculation.MTP) splitMtpAttention(handles, gpuMemory, ends);
@@ -86,6 +88,18 @@ final class CompactWeightLoader {
     /// ([HostWeightSelection#stageable]).
     static Map<String, TensorHandle> loadObjects(
             Path artifactPath,
+            Collection<TensorDescriptor> descriptors,
+            GpuMemory gpuMemory,
+            ArtifactProfile.Speculation speculation,
+            Set<String> hostBacked,
+            Set<String> diskBacked)
+            throws IOException {
+        return loadObjects(descriptor -> artifactPath, descriptors, gpuMemory, speculation, hostBacked, diskBacked);
+    }
+
+    /// As above, reading each object from the file `paths` gives for its descriptor.
+    static Map<String, TensorHandle> loadObjects(
+            Function<TensorDescriptor, Path> paths,
             Collection<TensorDescriptor> descriptors,
             GpuMemory gpuMemory,
             ArtifactProfile.Speculation speculation,
@@ -124,14 +138,16 @@ final class CompactWeightLoader {
                 if (diskBacked.contains(descriptor.name())) {
                     handles.put(descriptor.name(), TensorHandle.disk(descriptor));
                 } else if (host.contains(descriptor.name())) {
-                    TensorHandle loaded = TensorLoader.loadToHost(artifactPath, descriptor, hostArena + hostOffset);
+                    TensorHandle loaded =
+                            TensorLoader.loadToHost(paths.apply(descriptor), descriptor, hostArena + hostOffset);
                     // The embedding and the codebooks are gathers, and the output head a streamed matrix: kernels
                     // read them in place over the bus instead of staging them.
                     if (HostWeightSelection.mapped(descriptor.name()) || mapped.contains(descriptor.name()))
                         loaded = mapped(loaded, gpuMemory.hostWeightsDeviceAddress(loaded.hostAddress()));
                     handles.put(descriptor.name(), loaded);
                     hostOffset += hostSlot(descriptor.byteSize());
-                } else handles.put(descriptor.name(), TensorLoader.load(artifactPath, descriptor, gpuMemory));
+                } else
+                    handles.put(descriptor.name(), TensorLoader.load(paths.apply(descriptor), descriptor, gpuMemory));
             }
             return handles;
         } catch (Throwable failure) {
@@ -180,10 +196,17 @@ final class CompactWeightLoader {
     }
 
     static Weights loadFirstLayer(
-            Path artifactPath, Qwen38Config config, GpuMemory gpuMemory, Map<String, TensorDescriptor> descriptors)
+            Path artifactPath,
+            Artifact artifact,
+            Qwen38Config config,
+            GpuMemory gpuMemory,
+            Map<String, TensorDescriptor> descriptors)
             throws IOException {
         validateConfig(config);
-        validateInventory(config, descriptors, DFlash2Inventory.read(artifactPath, descriptors));
+        validateInventory(
+                config,
+                descriptors,
+                DFlash2Inventory.read(descriptor -> artifact.pathOf(artifactPath, descriptor), descriptors));
         if (config.layerTypes()[0] != LayerType.GATED_DELTA_NET) {
             throw new WeightLoadException("actual layer zero is not a compact GDN layer");
         }
@@ -216,7 +239,7 @@ final class CompactWeightLoader {
                 if (descriptor == null) {
                     throw new WeightLoadException("compact artifact is missing runtime object '" + name + "'");
                 }
-                handles.put(name, TensorLoader.load(artifactPath, descriptor, gpuMemory));
+                handles.put(name, TensorLoader.load(artifact.pathOf(artifactPath, descriptor), descriptor, gpuMemory));
             }
 
             LayerWeights layer = new LayerWeights(
@@ -449,6 +472,12 @@ final class CompactWeightLoader {
     /// attention projection must also have n/2 as a boundary. Before any device allocation.
     static Map<String, int[]> validateTrellisSegments(Path artifactPath, Map<String, TensorDescriptor> descriptors)
             throws IOException {
+        return validateTrellisSegments(descriptor -> artifactPath, descriptors);
+    }
+
+    /// As above, reading each `.segments` from the file `paths` gives for its descriptor.
+    static Map<String, int[]> validateTrellisSegments(
+            Function<TensorDescriptor, Path> paths, Map<String, TensorDescriptor> descriptors) throws IOException {
         Map<String, int[]> read = new LinkedHashMap<>();
         try (Arena arena = Arena.ofConfined()) {
             for (TensorDescriptor descriptor : descriptors.values()) {
@@ -459,7 +488,7 @@ final class CompactWeightLoader {
                 if (suh == null || segments == null) continue;
                 long n = descriptor.shape()[1] * 16;
                 try {
-                    int[] ends = TrellisLayout.readEnds(TensorDataReader.read(artifactPath, segments, arena));
+                    int[] ends = TrellisLayout.readEnds(TensorDataReader.read(paths.apply(segments), segments, arena));
                     TrellisLayout.validateSegments(ends, n, suh.shape()[0]);
                     if (name.equals(MTP_ATTENTION) && Arrays.stream(ends).noneMatch(end -> end == n / 2))
                         throw new IllegalArgumentException("n/2=" + n / 2 + " is not a segment boundary");

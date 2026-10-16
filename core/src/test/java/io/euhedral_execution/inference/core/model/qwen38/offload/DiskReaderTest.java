@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -159,6 +160,43 @@ class DiskReaderTest {
         for (int poll = 0; poll < 10; poll++) pump();
         for (int slot = 0; slot < DiskWindow.SLOTS; slot++) assertEquals(0, this.window.flag(slot));
         assertEquals(0, this.reader.readsInFlight());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void anObjectWithItsOwnSourceIsReadFromThatFile(boolean async) throws Exception {
+        open(async);
+        this.reader.close();
+        byte[] otherContents = new byte[FILE_BYTES];
+        for (int index = 0; index < FILE_BYTES; index++) otherContents[index] = (byte) (index * 17 + 5);
+        Path other = this.directory.resolve("other.edrl");
+        Files.write(other, otherContents);
+        this.reader = new DiskReader(this.window, this.reads, this.file, Map.of("from-other", other));
+        List<DiskUse> uses = List.of(
+                new DiskUse("from-main", 4096 + 128, 9_000, 0),
+                new DiskUse("from-other", 4096 + 128, 9_000, 1),
+                new DiskUse("from-main-again", 20_000, 5_000, 2));
+        this.reader.enqueue(1, uses);
+        for (DiskUse use : uses) {
+            byte[] expected = use.name().equals("from-other") ? otherContents : this.contents;
+            boolean[] released = {false};
+            if (this.reader.claim(use.slot(), 1, () -> released[0] = true)) released[0] = true;
+            long deadline = System.nanoTime() + 10_000_000_000L;
+            while (!released[0]) {
+                assertTrue(System.nanoTime() < deadline, use.name() + " was never handed over");
+                pump();
+            }
+            byte[] slot = MemorySegment.ofAddress(this.window.slotHost(use.slot()))
+                    .reinterpret(SLOT_BYTES)
+                    .asSlice(use.lead(), use.byteSize())
+                    .toArray(ValueLayout.JAVA_BYTE);
+            assertArrayEquals(
+                    java.util.Arrays.copyOfRange(
+                            expected, (int) use.fileOffset(), (int) (use.fileOffset() + use.byteSize())),
+                    slot,
+                    use.name());
+            this.window.lower(use.slot());
+        }
     }
 
     @ParameterizedTest

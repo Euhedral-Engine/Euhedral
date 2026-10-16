@@ -11,11 +11,14 @@ import io.euhedral_execution.inference.core.artifact.WeightFormat;
 import io.euhedral_execution.inference.core.artifact.WeightLayout;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile;
 import io.euhedral_execution.inference.core.model.qwen38.ArtifactProfile.Quantization;
+import io.euhedral_execution.inference.core.model.qwen38.LayerType;
+import io.euhedral_execution.inference.core.model.qwen38.Qwen38Config;
 import io.euhedral_execution.inference.core.model.qwen38.artifact.Artifact;
 import io.euhedral_execution.inference.core.model.qwen38.speculative.DraftLength;
 import io.euhedral_execution.inference.core.state.KvFormat;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalInt;
 import org.junit.jupiter.api.Test;
 
 class ArtifactProfileTest {
@@ -120,5 +123,158 @@ class ArtifactProfileTest {
         assertEquals(KvFormat.NVFP4, ArtifactProfile.kvFormat(null, null));
         assertEquals(KvFormat.BF16, ArtifactProfile.kvFormat(KvFormat.BF16, profile));
         assertEquals(KvFormat.BF16, ArtifactProfile.kvFormat(KvFormat.BF16, null));
+    }
+
+    private static final WeightFormat TRELLIS = WeightFormat.TRELLIS;
+    private static final WeightLayout TILE = WeightLayout.TRELLIS_TILE16_V1;
+
+    /// A text layer's projections in the given formats, the way the stored artifacts hold them: the norms and the
+    /// small GDN objects stay BF16, the embedding and heads have their own formats, and the MTP layer is NVFP4
+    /// whatever the text layers are.
+    private static Artifact layers(
+            WeightFormat gateUp,
+            WeightLayout gateUpLayout,
+            WeightFormat down,
+            WeightLayout downLayout,
+            OptionalInt draftDepth) {
+        List<TensorDescriptor> tensors = new ArrayList<>();
+        tensors.add(tensor("text/token_embedding", WeightFormat.Q3_G64_FP16, WeightLayout.ROW_SPLIT_K128_V1));
+        tensors.add(tensor("text/output_head", WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1));
+        tensors.add(tensor("text/draft_head", WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1));
+        for (int layer = 0; layer < 2; layer++) {
+            String prefix = "text/layers/" + layer;
+            tensors.add(tensor(prefix + "/input_norm", WeightFormat.BF16, WeightLayout.CONTIGUOUS_LE_V1));
+            tensors.add(tensor(prefix + "/gdn/a_projection", WeightFormat.BF16, WeightLayout.CONTIGUOUS_LE_V1));
+            tensors.add(tensor(prefix + "/gdn/a_log", WeightFormat.FP32, WeightLayout.CONTIGUOUS_LE_V1));
+            tensors.add(tensor(prefix + "/mlp/gate_up", gateUp, gateUpLayout));
+            tensors.add(tensor(prefix + "/mlp/down", down, downLayout));
+            if (gateUp == TRELLIS || down == TRELLIS) {
+                tensors.add(tensor(prefix + "/mlp/down.suh", WeightFormat.FP16, WeightLayout.CONTIGUOUS_LE_V1));
+            }
+        }
+        tensors.add(tensor("mtp/input_projection", WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1));
+        tensors.add(tensor("mtp/layer/mlp/gate_up", WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1));
+        Qwen38Config config = draftDepth.isPresent() ? config().withDraftDepth(draftDepth.getAsInt()) : config();
+        return new Artifact(null, config, tensors.toArray(TensorDescriptor[]::new));
+    }
+
+    private static Qwen38Config config() {
+        return new Qwen38Config(
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1.0e-6,
+                1.0,
+                1.0,
+                1,
+                "silu",
+                new LayerType[] {LayerType.FULL_ATTENTION},
+                0,
+                0,
+                0,
+                0,
+                false,
+                false,
+                1);
+    }
+
+    private static Artifact pure(WeightFormat format, WeightLayout layout) {
+        return layers(format, layout, format, layout, OptionalInt.empty());
+    }
+
+    @Test
+    void oneQuantizationAcrossTheProjectionsIsTheProfileItWasBefore() {
+        assertEquals(
+                new ArtifactProfile(Quantization.NVFP4, false, true),
+                ArtifactProfile.of(pure(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1)));
+        assertEquals(new ArtifactProfile(Quantization.TRELLIS, false, true), ArtifactProfile.of(pure(TRELLIS, TILE)));
+        var sd4 = ArtifactProfile.of(pure(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_SD4_V1));
+        assertEquals(Quantization.NVFP4, sd4.quantization());
+        assertTrue(sd4.compressed());
+        assertEquals("nvfp4-compressed", sd4.artifactName());
+        // Compressed Q3 keeps its down projections row-split; Q4 and Q5 widths are still Q3.
+        var q3c = ArtifactProfile.of(layers(
+                WeightFormat.Q3_G64_FP16,
+                WeightLayout.ROW_SPLIT_P2E2_V1,
+                WeightFormat.Q4_G64_FP16,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                OptionalInt.empty()));
+        assertEquals(new ArtifactProfile(Quantization.Q3, true, true), q3c);
+    }
+
+    @Test
+    void theHeadsTheEmbeddingTheSmallObjectsAndTheMtpLayerDoNotDecideTheProfile() {
+        // Trellis projections beside NVFP4 heads, a Q3 embedding, BF16 small projections and an NVFP4 MTP layer.
+        var profile = ArtifactProfile.of(pure(TRELLIS, TILE));
+        assertEquals(Quantization.TRELLIS, profile.quantization());
+        assertFalse(profile.compressed());
+        assertEquals(ArtifactProfile.Speculation.MTP, profile.speculation());
+    }
+
+    @Test
+    void trellisBesideNvfp4ProjectionsIsMixed() {
+        var profile = ArtifactProfile.of(
+                layers(TRELLIS, TILE, WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1, OptionalInt.empty()));
+        assertEquals(Quantization.MIXED, profile.quantization());
+        assertFalse(profile.compressed());
+        assertEquals("mixed", profile.artifactName());
+        assertEquals(KvFormat.NVFP4, profile.kvFormat());
+        assertEquals(ArtifactProfile.Speculation.MTP, profile.speculation());
+    }
+
+    @Test
+    void aMixedArtifactWithAnSd4ProjectionIsNotCompressed() {
+        var profile = ArtifactProfile.of(
+                layers(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_SD4_V1, TRELLIS, TILE, OptionalInt.empty()));
+        assertEquals(Quantization.MIXED, profile.quantization());
+        assertFalse(profile.compressed());
+    }
+
+    @Test
+    void aStoredDraftDepthIsTheDraftLength() {
+        var mixed = ArtifactProfile.of(
+                layers(TRELLIS, TILE, WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1, OptionalInt.of(3)));
+        assertEquals(DraftLength.fixed(3), mixed.draftLength());
+        assertEquals(3, mixed.speculativeDepth());
+        // A pure artifact that stores one drafts that deep, whatever the policy would have chosen.
+        var q3 = ArtifactProfile.of(layers(
+                WeightFormat.Q3_G64_FP16,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                WeightFormat.Q3_G64_FP16,
+                WeightLayout.ROW_SPLIT_K128_V1,
+                OptionalInt.of(5)));
+        assertEquals(DraftLength.fixed(5), q3.draftLength());
+    }
+
+    @Test
+    void aMixedArtifactWithoutADraftDepthIsRefusedForMtp() {
+        var mixed = ArtifactProfile.of(
+                layers(TRELLIS, TILE, WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1, OptionalInt.empty()));
+        var failure = assertThrows(IllegalStateException.class, mixed::draftLength);
+        assertEquals("mixed artifact stores no MTP draft depth", failure.getMessage());
+        assertThrows(IllegalStateException.class, mixed::speculativeDepth);
+    }
+
+    @Test
+    void aPureArtifactWithoutADraftDepthKeepsThePolicy() {
+        assertEquals(
+                DraftLength.fixed(2),
+                ArtifactProfile.of(pure(WeightFormat.Q3_G64_FP16, WeightLayout.ROW_SPLIT_K128_V1))
+                        .draftLength());
+        assertEquals(
+                DraftLength.fixed(4),
+                ArtifactProfile.of(pure(WeightFormat.NVFP4, WeightLayout.ROW_SPLIT_K128_V1))
+                        .draftLength());
+        assertEquals(
+                DraftLength.fixed(4), ArtifactProfile.of(pure(TRELLIS, TILE)).draftLength());
     }
 }

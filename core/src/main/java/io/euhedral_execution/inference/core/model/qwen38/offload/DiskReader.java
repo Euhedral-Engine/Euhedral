@@ -13,6 +13,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -65,12 +66,12 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
 
     private final DiskWindow window;
     private final AsyncReads reads;
-    private final long fileSize;
-    /// A descriptor past the page cache (-1 when the file system has none) and one through it; -1 without reads.
-    private final int directFd;
-    private final int bufferedFd;
-    /// The positional reads' channel when the machine has no asynchronous reads.
-    private final FileChannel channel;
+    /// The artifact file, which every object without a source of its own is read from.
+    private final Source artifact;
+    /// The objects that have a source of their own, by name.
+    private final Map<String, Source> sourceOf;
+    /// Every file opened, once each, to close.
+    private final List<Source> files;
     private final MpscQueue<Record> records = new MpscQueue<>(1024, 4);
     private final AtomicInteger inFlight = new AtomicInteger();
     private final Delegate delegate = new Delegate();
@@ -104,38 +105,85 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
     private long latestQuantum = Long.MIN_VALUE;
 
     /// A reader of `artifact` into `window`; `reads` null reads positionally on the poll.
-    @SuppressWarnings("unchecked")
     public DiskReader(DiskWindow window, AsyncReads reads, Path artifact) throws IOException {
+        this(window, reads, artifact, Map.of());
+    }
+
+    /// As above, reading the objects named in `sources` from the file each names instead of `artifact`.
+    @SuppressWarnings("unchecked")
+    public DiskReader(DiskWindow window, AsyncReads reads, Path artifact, Map<String, Path> sources)
+            throws IOException {
         this.window = Objects.requireNonNull(window, "window");
         this.reads = reads;
-        this.fileSize = java.nio.file.Files.size(artifact);
-        if (reads != null) {
-            int direct;
-            try {
-                direct = reads.openFile(artifact, true);
-            } catch (IOException unsupported) {
-                // The file system has no direct reads (tmpfs): every read goes through the page cache.
-                direct = -1;
-            }
-            this.directFd = direct;
-            try {
-                this.bufferedFd = reads.openFile(artifact, false);
-            } catch (IOException failure) {
-                if (direct >= 0) reads.closeFile(direct);
-                throw failure;
-            }
-            this.channel = null;
-        } else {
-            this.directFd = -1;
-            this.bufferedFd = -1;
-            this.channel = FileChannel.open(artifact, StandardOpenOption.READ);
+        Map<Path, Source> opened = new HashMap<>();
+        List<Source> files = new ArrayList<>();
+        try {
+            this.artifact = open(artifact, opened, files);
+            Map<String, Source> byName = new HashMap<>();
+            for (Map.Entry<String, Path> source : sources.entrySet())
+                byName.put(source.getKey(), open(source.getValue(), opened, files));
+            this.sourceOf = byName;
+        } catch (IOException | RuntimeException failure) {
+            for (Source file : files) file.close(reads);
+            throw failure;
         }
+        this.files = files;
         this.queues = new ArrayDeque[DiskWindow.SLOTS];
         long seed = HasherApi.mix(0xd15c_0000L);
         for (int slot = 0; slot < DiskWindow.SLOTS; slot++) {
             this.queues[slot] = new ArrayDeque<>();
             this.seeds[slot] = seed + 64L * slot;
         }
+    }
+
+    /// `file`, opened once however many objects name it.
+    private Source open(Path file, Map<Path, Source> opened, List<Source> files) throws IOException {
+        Source known = opened.get(file);
+        if (known != null) return known;
+        Source source = Source.open(this.reads, file);
+        opened.put(file, source);
+        files.add(source);
+        return source;
+    }
+
+    /// A file payloads are read from: its size, a descriptor past the page cache (-1 when the file system has none)
+    /// and one through it (-1 without asynchronous reads), or the positional reads' channel without them.
+    private record Source(long size, int directFd, int bufferedFd, FileChannel channel) {
+
+        static Source open(AsyncReads reads, Path file) throws IOException {
+            long size = java.nio.file.Files.size(file);
+            if (reads == null) return new Source(size, -1, -1, FileChannel.open(file, StandardOpenOption.READ));
+            int direct;
+            try {
+                direct = reads.openFile(file, true);
+            } catch (IOException unsupported) {
+                // The file system has no direct reads (tmpfs): every read goes through the page cache.
+                direct = -1;
+            }
+            try {
+                return new Source(size, direct, reads.openFile(file, false), null);
+            } catch (IOException failure) {
+                if (direct >= 0) reads.closeFile(direct);
+                throw failure;
+            }
+        }
+
+        void close(AsyncReads reads) {
+            if (this.channel != null) {
+                try {
+                    this.channel.close();
+                } catch (IOException failure) {
+                    LOG.warn("closing the artifact failed", failure);
+                }
+            } else {
+                if (this.directFd >= 0) reads.closeFile(this.directFd);
+                reads.closeFile(this.bufferedFd);
+            }
+        }
+    }
+
+    private Source sourceOf(String name) {
+        return this.sourceOf.getOrDefault(name, this.artifact);
     }
 
     // ---------------------------------------------------------------- any thread
@@ -208,8 +256,9 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
             return;
         }
         // Whole blocks past the page cache, unless they would run past the end of the file.
-        boolean direct = this.directFd >= 0 && use.alignedOffset() + use.readBytes() <= this.fileSize;
-        int fd = direct ? this.directFd : this.bufferedFd;
+        Source source = sourceOf(use.name());
+        boolean direct = source.directFd() >= 0 && use.alignedOffset() + use.readBytes() <= source.size();
+        int fd = direct ? source.directFd() : source.bufferedFd();
         long length = direct ? use.readBytes() : use.lead() + use.byteSize();
         // A read of its own: the frame of the slot's last read may still wait in a queue.
         SlotRead read = new SlotRead(slot, this.seeds[slot], next);
@@ -324,15 +373,16 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
 
     private void readPositionally(int slot, DiskUse use) throws IOException {
         long length = use.lead() + use.byteSize();
-        if (this.channel == null) {
+        Source source = sourceOf(use.name());
+        if (source.channel() == null) {
             // io_uring is there but this thread cannot submit to it: a blocking read of the buffered descriptor.
-            AsyncReads.readBlocking(this.bufferedFd, this.window.slotHost(slot), length, use.alignedOffset());
+            AsyncReads.readBlocking(source.bufferedFd(), this.window.slotHost(slot), length, use.alignedOffset());
             return;
         }
         ByteBuffer target = this.window.slotSegment(slot).asSlice(0, length).asByteBuffer();
         long position = use.alignedOffset();
         while (target.hasRemaining()) {
-            int read = this.channel.read(target, position);
+            int read = source.channel().read(target, position);
             if (read < 0) throw new IOException("the artifact ends before byte " + (use.alignedOffset() + length));
             position += read;
         }
@@ -430,16 +480,7 @@ public final class DiskReader extends AbstractIngestSink implements AutoCloseabl
         while (this.inFlight.get() > 0 && System.nanoTime() < deadline) LockSupport.parkNanos(100_000L);
         if (this.inFlight.get() > 0)
             throw new IllegalStateException(this.inFlight.get() + " artifact reads are still in flight");
-        if (this.channel != null) {
-            try {
-                this.channel.close();
-            } catch (IOException failure) {
-                LOG.warn("closing the artifact failed", failure);
-            }
-        } else {
-            if (this.directFd >= 0) this.reads.closeFile(this.directFd);
-            this.reads.closeFile(this.bufferedFd);
-        }
+        for (Source file : this.files) file.close(this.reads);
     }
 
     private final class Delegate extends AbstractIngestSink.Delegate {
