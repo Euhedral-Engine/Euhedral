@@ -24,9 +24,8 @@ public record TrellisSettings(int mmaMaxRows, int targetCtas, int wholeKRows) {
     /// 51.0 ms at 560 target blocks, the shortest of 140 to 1120.
     private static final int DEFAULT_TARGET_CTAS = 560;
     /// Measured on an RTX 5070 Ti over the 3-bit model's object shapes, the trellis linears of one step with split
-    /// partials and with whole-K blocks: 63.0 and 67.5 ms at 64 rows, 81.1 and 78.0 ms at 80, 137.8 and 126.1 ms at
-    128,
-    /// 724 and 471 ms at 512.
+    /// partials and with whole-K blocks: 63.0 and 67.5 ms at 64 rows, 81.1 and 78.0 ms at 80, 137.8 and 126.1 ms
+    /// at 128, 724 and 471 ms at 512.
     private static final int DEFAULT_WHOLE_K_ROWS = 80;
 
     public TrellisSettings {
