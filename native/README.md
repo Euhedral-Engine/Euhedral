@@ -49,12 +49,12 @@ root the host loads; its headers are that module's leaves and strategies:
 | `q3_mx/` | Prefill on block-scaled MXFP8 tensor cores for Q3, Q4 and Q5 linears and the paired gate/up SwiGLU region (`sm_12xa`). |
 | `nvfp4/` | NVFP4 weights (plain and SD4 scale tables): scale-table helpers, the tensor-core decode kernels for 1 to 8 rows. |
 | `nvfp4_native/` | Native FP4 tensor-core route: activation quantization, the 128x128 linear, the paired gate/up SwiGLU tile and the skinny kernels up to 64 rows (`sm_12xa`). |
-| `reference/` | Scalar references (Q3, Q4/Q5, NVFP4 plain and SD4). |
+| `reference/` | Scalar references (Q3, Q4/Q5, NVFP4 plain and SD4; `trellis.cuh`, included by the trellis module). |
 | `gdn/` | Gated DeltaNet control, projections, convolution, recurrence and gated RMSNorm. |
 | `attention/` | NVFP4 KV append, QK norm/RoPE, per-head and GQA decode attention with row twins, the 32-row prefill tile and the producer-warp FA2 prefill kernel, and the exact twins and single-warp controls used as test oracles. |
 | `sampling/` | Greedy token selection on the device (argmax over the final logits row). |
 | `qwen4/` | The Flash-Next (`qwen4_exp`) operators: BF16 linear, embedding gather, grouped RMSNorm, the hyper-connection mix and injection, the per-layer embedding (n-gram record expansion, gate, dilated convolution) and the rows of its convolution history, and (with the model's other blocks) the GDN control and gated norm, the router and the shared expert's SwiGLU. [docs/FLASH_NEXT_EXECUTION.md](../docs/FLASH_NEXT_EXECUTION.md). |
-| `trellis/` | Trellis (EXL3) linear kernels, module root `trellis/kernels.cu`: the entries of the `linear` table that name it. |
+| `trellis/` | Trellis (EXL3) linear kernels, module root `trellis/kernels.cu`, the entries of the `linear` table: the input prepass (`suh`, 128-point Hadamard), the row-exact FP16 tensor-core GEMM that decodes trellis tiles in registers (fused epilogue, or K-split partials and `epilogue.cuh`), decode to BF16 for prefill and the epilogue of the BF16 route. `codebook.cuh` is the one decode source (mul1 codebook, ring window, tensor-core order, Hadamard butterfly); the quantization module compiles it too. `reference/trellis.cuh` is the scalar reference, compiled into this module. |
 | `dflash/` | The DFlash2 drafter: BF16 tensor-core linear (rows independent of the row count), Qwen3 RMSNorm, grouped dynamic convolution, Q/K norm and RoPE, the context ring append, sliding-window block attention on tensor cores (key splits and a merge), SwiGLU, top-16 and the candidate selector, each rounding where the published PyTorch model rounds. |
 
 Includes within a folder are relative; includes across folders name the path from the tree root
@@ -94,6 +94,7 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 | `test_q3_conversion.py` | The device-level Q3 scale-conversion contract. |
 | `test_q3_mx.py` | The MXFP8 route: activation quantizer, Q3/Q4/Q5 linears, split-K and the gate/up kernel against FP64 (`sm_12x`). |
 | `test_q3_p2e2.py` | P2E2 decode, expansion and embedding bit for bit against the row-split routes. |
+| `test_trellis.py` | The NumPy decoder against the golden tiles, device decode bit for bit, the prepass bit for bit, the tensor-core route and the prefill route against float64, n rows bitwise equal to n one-row launches, the scalar reference, and the FP16 range of the prepass (`trellis_reference.py` is the oracle). |
 | `test_nvfp4.py` | NVFP4 decode at both tiles (rows bitwise one-row), the scalar reference, and the SD4 kernels against the plain kernels. |
 | `test_nvfp4_native.py` | The native FP4 route: quantizer, linear, paired gate/up and skinny kernels against FP64, determinism, SD4 (`sm_12x`). |
 | `test_attention_nvfp4.py` | NVFP4 KV format and attention against a mathematical oracle, the GQA decode kernel and the row twins bit for bit. |

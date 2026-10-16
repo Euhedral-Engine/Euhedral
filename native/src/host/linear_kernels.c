@@ -1,11 +1,19 @@
 #include "kernel_table.h"
 
 /* The shared linear kernel table: the weight formats' own launches behind one launcher (kernel_table.c). Entries name
- * their module root, so the table spans modules (trellis/kernels.cu, reference/kernels.cu). The order of `kernels` is
+ * their module root, so the table may span modules. The order of `kernels` is
  * the ABI: artifact.format.LinearKernel on the Java side lists the same names in the same order and a test compares
  * them. */
 static const EuhedralKernelEntry kernels[] = {
-    {"euhedral_trellis_probe", 0, "trellis/kernels.cu"},
+    {"euhedral_trellis_prepass", 0, "trellis/kernels.cu"},
+    {"euhedral_trellis_mma", 0, "trellis/kernels.cu"},
+    {"euhedral_trellis_epilogue", 0, "trellis/kernels.cu"},
+    {"euhedral_trellis_decode_bf16", 0, "trellis/kernels.cu"},
+    {"euhedral_trellis_epilogue_bf16", 0, "trellis/kernels.cu"},
+    /* One CTA per output element holds the rotated input (4 bytes per input feature) in dynamic shared memory: room
+     * for 17408 features, the widest linear input, rounded to 1 KiB. It lives in the trellis module so the table
+     * loads one module for all of its entries. */
+    {"euhedral_trellis_reference", 4 * 17408, "trellis/kernels.cu"},
 };
 
 static EuhedralKernelTable table = EUHEDRAL_KERNEL_TABLE_INIT(kernels);

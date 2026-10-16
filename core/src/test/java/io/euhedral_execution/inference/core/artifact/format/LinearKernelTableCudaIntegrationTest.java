@@ -44,16 +44,41 @@ class LinearKernelTableCudaIntegrationTest {
     }
 
     @Test
-    void aProbeLaunchWritesItsValue() {
+    void aPrepassLaunchTransformsARow() {
         try (CudaGpuMemory gpu = open();
                 Arena arena = Arena.ofConfined()) {
-            long out = gpu.allocate(16);
+            int k = 128;
+            MemorySegment host = arena.allocate(2L * k, 2);
+            for (int i = 0; i < k; i++) host.set(ValueLayout.JAVA_SHORT, 2L * i, (short) 0x3f80); // bf16 1.0
+            long x = gpu.allocate(2L * k), suh = gpu.allocate(2L * k), out = gpu.allocate(2L * k);
             try {
-                gpu.launchTableKernel(LinearKernel.PROBE, 1, 1, 1, 32, 1, 1, 0, new KernelArguments().pointer(out));
-                MemorySegment host = arena.allocate(4, 4);
-                gpu.copyDeviceToHost(host, out, 4);
-                assertEquals(0x7e11150, host.get(ValueLayout.JAVA_INT, 0));
+                gpu.copyHostToDevice(x, host, 2L * k);
+                for (int i = 0; i < k; i++) host.set(ValueLayout.JAVA_SHORT, 2L * i, (short) 0x3c00); // fp16 1.0
+                gpu.copyHostToDevice(suh, host, 2L * k);
+                gpu.launchTableKernel(
+                        LinearKernel.TRELLIS_PREPASS,
+                        1,
+                        1,
+                        1,
+                        128,
+                        1,
+                        1,
+                        0,
+                        new KernelArguments()
+                                .pointer(x)
+                                .pointer(suh)
+                                .pointer(out)
+                                .int32(1)
+                                .int32(k)
+                                .int32(1)
+                                .int32(0));
+                gpu.copyDeviceToHost(host, out, 2L * k);
+                // H128 of ones is 128 / sqrt(128) = 11.3137 in element 0 (fp16 0x49a8) and 0 elsewhere.
+                assertEquals((short) 0x49a8, host.get(ValueLayout.JAVA_SHORT, 0));
+                assertEquals((short) 0, host.get(ValueLayout.JAVA_SHORT, 2));
             } finally {
+                gpu.free(x);
+                gpu.free(suh);
                 gpu.free(out);
             }
         }
@@ -62,26 +87,42 @@ class LinearKernelTableCudaIntegrationTest {
     @Test
     void theLauncherRejectsArgumentsThatDisagreeWithTheKernel() {
         try (CudaGpuMemory gpu = open()) {
-            // euhedral_trellis_probe takes one pointer: none, two, and a 4-byte one all fail.
-            assertThrows(
-                    GpuMemoryException.class,
-                    () -> gpu.launchTableKernel(LinearKernel.PROBE, 1, 1, 1, 32, 1, 1, 0, new KernelArguments()));
+            // euhedral_trellis_prepass takes three pointers and four ints: none, too few, and a 4-byte pointer fail.
             assertThrows(
                     GpuMemoryException.class,
                     () -> gpu.launchTableKernel(
-                            LinearKernel.PROBE,
+                            LinearKernel.TRELLIS_PREPASS, 1, 1, 1, 128, 1, 1, 0, new KernelArguments()));
+            assertThrows(
+                    GpuMemoryException.class,
+                    () -> gpu.launchTableKernel(
+                            LinearKernel.TRELLIS_PREPASS,
                             1,
                             1,
                             1,
-                            32,
+                            128,
                             1,
                             1,
                             0,
-                            new KernelArguments().pointer(1).pointer(1)));
+                            new KernelArguments().pointer(1).pointer(1).pointer(1)));
             assertThrows(
                     GpuMemoryException.class,
                     () -> gpu.launchTableKernel(
-                            LinearKernel.PROBE, 1, 1, 1, 32, 1, 1, 0, new KernelArguments().int32(1)));
+                            LinearKernel.TRELLIS_PREPASS,
+                            1,
+                            1,
+                            1,
+                            128,
+                            1,
+                            1,
+                            0,
+                            new KernelArguments()
+                                    .int32(1)
+                                    .pointer(1)
+                                    .pointer(1)
+                                    .int32(1)
+                                    .int32(1)
+                                    .int32(1)
+                                    .int32(0)));
         }
     }
 }
