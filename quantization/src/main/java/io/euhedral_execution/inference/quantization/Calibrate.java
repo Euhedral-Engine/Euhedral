@@ -55,8 +55,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class Calibrate {
 
     /// Command-line settings. `trellisBits` (average bits per weight) selects the trellis format, written as an
-    /// exllamav3 checkpoint, and then `recipe` and `draftIdsFrom` are unused and may be null; on the GPTQ path
-    /// (`trellisBits` null) both are required. `roundingLanes` fixes the number of concurrent trellis rounding
+    /// exllamav3 checkpoint; its `recipe` (quantization `trellis`) and `draftIdsFrom` serve the two heads, which a
+    /// run over the whole model rounds by GPTQ into `OUT/heads` (a partial run may leave both null). On the GPTQ
+    /// path (`trellisBits` null) both are required. `roundingLanes` fixes the number of concurrent trellis rounding
     /// frames (null: sized from the free device memory per layer), `viterbiScratchMib` is each quantizer's Viterbi
     /// scratch, `memoryReserveMib` the device memory the lane sizing leaves free and `writeBufferMib` the buffer
     /// each output file is copied through.
@@ -130,7 +131,7 @@ public final class Calibrate {
         this.device = device;
         this.lattice = lattice;
         this.checkpoint = checkpoint;
-        this.gptq = settings.trellisBits() == null
+        this.gptq = settings.trellisBits() == null || settings.recipe() != null
                 ? new Gptq(device.cuda, device.gpu, device.stream, settings.nvfp4())
                 : null;
         this.gatherRows =
@@ -149,6 +150,7 @@ public final class Calibrate {
                 Device device = new Device(library);
                 CalibrationLattice lattice = CalibrationLattice.start(WORKERS)) {
             var checkpoint = new Qwen38Objects(store, settings.model());
+            if (settings.trellisBits() != null) requireHeadInputs(settings, checkpoint.config.layers());
             lattice.submit(() -> {
                         try {
                             Files.createDirectories(settings.out());
@@ -163,6 +165,15 @@ public final class Calibrate {
         } catch (InterruptedException | java.util.concurrent.ExecutionException failure) {
             throw new IOException(failure);
         }
+    }
+
+    /// A trellis run over the whole model rounds the heads, which needs the draft ids and the trellis recipe.
+    static void requireHeadInputs(Settings settings, int modelLayers) {
+        if (settings.layers() < modelLayers) return;
+        if (settings.draftIdsFrom() == null)
+            throw new IllegalArgumentException("a trellis run rounds the draft head and needs --draft-ids-from");
+        if (settings.recipe() == null || !settings.recipe().quantization().equals("trellis"))
+            throw new IllegalArgumentException("a trellis run rounds the heads with the trellis recipe");
     }
 
     private void log(String message) {
@@ -218,7 +229,7 @@ public final class Calibrate {
                             log("stopped after " + stop + " layers");
                             return CompletableFuture.<Void>completedFuture(null);
                         }
-                        if (trellis != null) return finishTrellis();
+                        if (trellis != null) return finishTrellis(states, batchStates, sequences, length);
                         dropCheckpoint();
                         return heads(tokens, forward, states, batchStates, sequences, length);
                     } catch (IOException failure) {
@@ -383,22 +394,83 @@ public final class Calibrate {
                 settings.memoryReserveMib());
     }
 
-    /// After the last layer: the MTP linears (when the run covers the whole model), then the remaining files.
-    private CompletableFuture<Void> finishTrellis() throws IOException {
+    /// The steps that end a trellis run, in the order they must happen: the heads are rounded before the final
+    /// files are written and before the resume point is dropped, so a stop during them resumes after the layers.
+    interface TrellisEnd {
+        void roundHeads() throws IOException;
+
+        void finish() throws IOException;
+
+        void dropCheckpoint() throws IOException;
+    }
+
+    /// Runs `end` after `mtp` completes.
+    static CompletableFuture<Void> endTrellis(CompletableFuture<Void> mtp, TrellisEnd end) {
+        return mtp.thenRun(() -> {
+            try {
+                end.roundHeads();
+                end.finish();
+                end.dropCheckpoint();
+            } catch (IOException failure) {
+                throw new UncheckedIOException(failure);
+            }
+        });
+    }
+
+    /// After the last layer: the MTP linears (when the run covers the whole model), then the heads under the final
+    /// hidden states, then the remaining files.
+    private CompletableFuture<Void> finishTrellis(MemorySegment states, long batchStates, int sequences, int length)
+            throws IOException {
         if (settings.layers() < checkpoint.config.layers()) {
             log("partial run of " + settings.layers() + " of " + checkpoint.config.layers()
                     + " layers: no MTP layer and no final files");
             return CompletableFuture.completedFuture(null);
         }
-        // the resume point stays until the final files are written
-        return trellis.mtp().thenRun(() -> {
-            try {
+        // the resume point stays until the heads are rounded and the final files are written
+        return endTrellis(trellis.mtp(), new TrellisEnd() {
+            @Override
+            public void roundHeads() throws IOException {
+                trellis.close(); // its rounding scratch makes room for the head
+                device.select(device.stream);
+                trellisHeads(states, batchStates, sequences, length);
+            }
+
+            @Override
+            public void finish() throws IOException {
                 writer.finish(allocation);
-                dropCheckpoint();
-            } catch (IOException failure) {
-                throw new UncheckedIOException(failure);
+            }
+
+            @Override
+            public void dropCheckpoint() throws IOException {
+                Calibrate.this.dropCheckpoint();
             }
         });
+    }
+
+    /// Rounds the LM head and the draft head by GPTQ under the LM head's Hessian of the final hidden states (the
+    /// draft head reads the MTP output, which a trellis run does not compute) into `OUT/heads`.
+    private void trellisHeads(MemorySegment states, long batchStates, int sequences, int length) throws IOException {
+        Files.createDirectories(codesDirectory());
+        float eps = (float) checkpoint.config.eps();
+        long finalNorm = uploadTensor("model.language_model.norm.weight");
+        long headHessian = zeroed(4L * hidden * hidden);
+        long normed = device.gpu.allocate(2L * settings.batch() * length * hidden);
+        try {
+            batches(states, batchStates, sequences, length, false, count -> {
+                device.gpu.rmsNormUnitOffsetBf16(batchStates, finalNorm, normed, count * length, hidden, eps);
+                device.accumulateHessian(headHessian, normed, count * length, hidden);
+            });
+            roundHeads(headHessian, headHessian);
+        } finally {
+            device.gpu.free(normed);
+            device.gpu.free(finalNorm);
+            device.gpu.free(headHessian);
+        }
+    }
+
+    /// Where the rounded objects' state files go: OUT for GPTQ, OUT/heads beside the exllamav3 checkpoint.
+    private Path codesDirectory() {
+        return settings.trellisBits() != null ? settings.out().resolve("heads") : settings.out();
     }
 
     /// Rounds every quantized object of `layer` under its Hessian, saves its state and swaps in its decoded
@@ -499,7 +571,7 @@ public final class Calibrate {
                 }
             }
             new QuantState(format.name(), last.layout(), rows, k, codes, scales, last.globalScale(), last.table())
-                    .save(QuantState.stateFile(settings.out(), name));
+                    .save(QuantState.stateFile(codesDirectory(), name));
             log(name + " " + format.name() + "/" + last.layout());
         } finally {
             device.gpu.free(factor.upper());

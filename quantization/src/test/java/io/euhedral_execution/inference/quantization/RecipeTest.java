@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.quantization;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -31,6 +32,36 @@ class RecipeTest {
                 }
             }
         }
+    }
+
+    @Test
+    void trellisRoundsTheHeadsAsNvfp4RowSplit() {
+        var recipe = new Recipe("trellis", false);
+        for (String head : new String[] {"text/output_head", "text/draft_head"}) {
+            var format = recipe.format(head);
+            assertEquals("NVFP4", format.name(), head);
+            assertEquals(Recipe.ROW_SPLIT, format.layout(), head);
+        }
+    }
+
+    @Test
+    void trellisOutputHeadFormatOverridesTheLmHeadOnly() {
+        var recipe = new Recipe("trellis", false, "Q4G64_F16S");
+        assertEquals("Q4G64_F16S", recipe.format("text/output_head").name());
+        assertEquals("NVFP4", recipe.format("text/draft_head").name());
+    }
+
+    @Test
+    void trellisHasNoFormatForALayerObject() {
+        var recipe = new Recipe("trellis", false);
+        assertThrows(IllegalArgumentException.class, () -> recipe.format("text/layers/3/mlp/down"));
+        assertThrows(IllegalArgumentException.class, () -> recipe.format("mtp/input_projection"));
+        assertThrows(IllegalArgumentException.class, () -> recipe.format("text/token_embedding"));
+    }
+
+    @Test
+    void trellisHasNoCompressedForm() {
+        assertThrows(IllegalArgumentException.class, () -> new Recipe("trellis", true));
     }
 
     private static int defaultMin(String format) {

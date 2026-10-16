@@ -6,7 +6,8 @@ import java.util.regex.Pattern;
 
 /// How each quantized object is stored in an artifact (tools/euhedral_artifacts/recipes.py and inventory.py):
 /// the q3 artifact's format per object, mapped to the recipe being built, and compressed q3's code limit.
-/// `outputHead`, when set, is the LM head's format (row-split) in place of the recipe's.
+/// `outputHead`, when set, is the LM head's format (row-split) in place of the recipe's. The trellis recipe stores
+/// only the two heads through this class (NVFP4 row-split); its other objects are exllamav3 checkpoint linears.
 public record Recipe(String quantization, boolean compressed, String outputHead) {
 
     public static final String ROW_SPLIT = "row-split-k128-v1";
@@ -14,9 +15,11 @@ public record Recipe(String quantization, boolean compressed, String outputHead)
     private static final Pattern LAYER = Pattern.compile("text/layers/(\\d+)/(.+)");
 
     public Recipe {
-        if (!quantization.equals("q3") && !quantization.equals("nvfp4")) {
-            throw new IllegalArgumentException("quantization is q3 or nvfp4, not " + quantization);
+        if (!quantization.equals("q3") && !quantization.equals("nvfp4") && !quantization.equals("trellis")) {
+            throw new IllegalArgumentException("quantization is q3, nvfp4 or trellis, not " + quantization);
         }
+        if (quantization.equals("trellis") && compressed)
+            throw new IllegalArgumentException("the trellis recipe has no compressed form");
         if (outputHead != null
                 && !java.util.List.of("NVFP4", "Q3G64_F16S", "Q4G64_F16S", "Q5G64_F16S")
                         .contains(outputHead))
@@ -28,6 +31,13 @@ public record Recipe(String quantization, boolean compressed, String outputHead)
     }
 
     public Gptq.Format format(String name) {
+        if (quantization.equals("trellis")) {
+            if (name.equals("text/output_head") && outputHead != null)
+                return Gptq.Format.of(outputHead, ROW_SPLIT, null);
+            if (name.equals("text/output_head") || name.equals("text/draft_head"))
+                return Gptq.Format.of("NVFP4", ROW_SPLIT, null);
+            throw new IllegalArgumentException("the trellis recipe rounds only the LM and draft heads, not " + name);
+        }
         if (name.equals("text/output_head") && outputHead != null) return Gptq.Format.of(outputHead, ROW_SPLIT, null);
         String q3 = q3Format(name);
         String format, layout;
