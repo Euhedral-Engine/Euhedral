@@ -88,4 +88,28 @@ __device__ __forceinline__ void trellis_hadamard128(float* s, int t) {
     __syncthreads();
 }
 
+/// The same Hadamard as trellis_hadamard128 on 128 floats held by one warp, four consecutive per lane (element
+/// 4 * lane + j in v[j]), in registers: every stage forms the same a + b and a - b, so the results are bitwise those of
+/// trellis_hadamard128. No block synchronization.
+__device__ __forceinline__ void trellis_hadamard128_warp(float (&v)[4], int lane) {
+    // h = 1 and 2 pair elements within a lane.
+    float t0 = v[0] + v[1], t1 = v[0] - v[1], t2 = v[2] + v[3], t3 = v[2] - v[3];
+    v[0] = t0 + t2;
+    v[1] = t1 + t3;
+    v[2] = t0 - t2;
+    v[3] = t1 - t3;
+    // h = 4 .. 64 pair lane l with l ^ (h / 4); the lower lane holds a, the upper b.
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        const bool upper = (lane & h) != 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float other = __shfl_xor_sync(0xFFFFFFFFu, v[j], h);
+            v[j] = upper ? other - v[j] : v[j] + other;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = v[j] * kTrellisInvSqrt128;
+}
+
 #endif
