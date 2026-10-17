@@ -160,13 +160,17 @@ public final class Scorer implements AutoCloseable {
         int batch = requested <= 0
                 ? autoBatch(artifact, hostBytes, rows, context, chunks)
                 : checkedBatch(requested, rows, WORKSPACE_ROWS);
+        // At most `hostBytes` of weights in host memory (no limit when planned), the rest read from disk, so an
+        // artifact larger than the device and host budget together (BF16) is scored as `reference` runs it.
+        var residency =
+                Residency.plan(artifact, ArtifactProfile.Speculation.NONE, freeAtOpen, hostBytes, batch, context);
         try (Qwen38Model model = Qwen38Model.load(
                 artifactPath,
                 artifact,
                 device.gpu,
                 ArtifactProfile.Speculation.NONE,
-                Residency.hostBacked(
-                        artifact, ArtifactProfile.Speculation.NONE, freeAtOpen, hostBytes, batch, context))) {
+                residency.hostBacked(),
+                residency.diskBacked())) {
             Forced forced = force(model, artifactPath, artifact, references, rows, batch, listener);
             try {
                 return forced.scored().get();
