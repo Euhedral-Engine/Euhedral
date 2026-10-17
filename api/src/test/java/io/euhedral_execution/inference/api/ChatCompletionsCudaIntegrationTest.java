@@ -287,6 +287,32 @@ class ChatCompletionsCudaIntegrationTest {
 
     @Test
     @Order(6)
+    void cancellingASpeculatingGenerationEndsItCleanly() throws Exception {
+        DeviceBytes before = deviceBytes();
+        // A stop sequence cancels the speculative run while its drafts are in flight.
+        var stopped = post("{\"model\":\"" + MODEL + "\",\"temperature\":0,\"max_tokens\":256,\"stop\":[\"5\"],"
+                + "\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":"
+                + "\"Count from 1 to 20, one number per line, nothing else.\"}]}");
+        assertEquals(200, stopped.statusCode(), stopped.body());
+        JsonNode completion = JSON.readTree(stopped.body());
+        assertEquals("stop", completion.at("/choices/0/finish_reason").asString(), completion.toString());
+        assertFalse(completion.at("/choices/0/message/content").asString().contains("5"), completion.toString());
+        // One call allowed: decoding is cancelled once the first call is complete.
+        var single = post(
+                "{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"none\",\"temperature\":0,"
+                        + "\"max_tokens\":512,\"parallel_tool_calls\":false,\"tools\":[{\"type\":\"function\",\"function\":"
+                        + "{\"name\":\"get_weather\",\"description\":\"Current weather for a city.\",\"parameters\":{\"type\":"
+                        + "\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}],"
+                        + "\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Oslo, Bergen and Tromso?\"}]}");
+        assertEquals(200, single.statusCode(), single.body());
+        JsonNode call = JSON.readTree(single.body());
+        assertEquals(1, call.at("/choices/0/message/tool_calls").size(), call.toString());
+        assertEquals("tool_calls", call.at("/choices/0/finish_reason").asString(), call.toString());
+        assertSessionsReleased(before);
+    }
+
+    @Test
+    @Order(6)
     void anAutomaticToolCallAndItsResultInTheNativeFormat() throws Exception {
         DeviceBytes before = deviceBytes();
         String tools = "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":"
