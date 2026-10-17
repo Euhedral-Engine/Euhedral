@@ -234,7 +234,8 @@ public class ChatRequestMapper {
             throw ApiException.invalidRequest("Tool call 'arguments' must encode a JSON object.", path);
         for (Object key : object.keySet()) {
             if (!ToolCalling.isParameterName((String) key))
-                throw ApiException.invalidRequest("Argument names must be non-empty.", path);
+                throw ApiException.invalidRequest(
+                        "Argument names must be non-empty and free of '<', '>' and line breaks.", path);
         }
         return (Map<String, Object>) object;
     }

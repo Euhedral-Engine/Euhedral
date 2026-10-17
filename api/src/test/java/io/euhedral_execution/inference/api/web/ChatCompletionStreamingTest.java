@@ -152,19 +152,19 @@ class ChatCompletionStreamingTest {
         assertEquals(1, generation.closeCount.get());
     }
 
-    /// Text streams as it is decoded; JSON tool calls arrive complete in `delta.tool_calls` chunks.
+    /// Text streams as it is decoded; tool calls arrive complete in `delta.tool_calls` chunks.
     @Test
     void streamDeliversTextThenToolCallDeltasThenToolCallsFinish() throws Exception {
         var textSeen = new CountDownLatch(1);
-        String call = "{\"tool_calls\":[{\"name\":\"f\",\"arguments\":{\"n\":7}},"
-                + "{\"name\":\"g\",\"arguments\":{\"n\":7}}]}";
+        String call = "<tool_call>\n<function=f>\n<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>\n"
+                + "<tool_call>\n<function=g>\n<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>";
         this.backend.script = (generation, max, output) -> {
             generation.emit(output, "Checking.");
             // The call cannot begin until the client holds the text: tool mode must not buffer content.
             if (!textSeen.await(10, TimeUnit.SECONDS))
                 throw new ExecutionException(new AssertionError("text was not delivered while generating"));
-            generation.emit(output, "\n\n{\"tool_");
-            generation.emit(output, call.substring("{\"tool_".length()));
+            generation.emit(output, "\n\n<tool_");
+            generation.emit(output, call.substring("<tool_".length()));
             return new InferenceBackend.Result(4, true);
         };
         String tools = "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\","
@@ -221,7 +221,7 @@ class ChatCompletionStreamingTest {
     @Test
     void streamReleasesHeldBackTextBeforeTheToolCall() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(
-                List.of("Answer ST", "{\"tool_calls\":[{\"name\":\"f\",\"arguments\":{}}]}"), true);
+                List.of("Answer ST", "<tool_call>\n<function=f>\n</function>\n</tool_call>"), true);
         List<String> data = streamEvents(
                 "{\"model\":\"" + MODEL
                         + "\",\"reasoning_effort\":\"none\",\"stream\":true,\"stop\":[\"STOP\"],\"tools\":[{\"type\":\"function\","

@@ -79,14 +79,7 @@ public class ConversationPlanner {
     private String render(Conversation conversation) {
         ToolCalling tools = conversation.tools();
         try {
-            return (tools.parsesOutput()
-                            ? this.chatTemplate.renderJsonTools(
-                                    conversation.turns(),
-                                    tools,
-                                    conversation.format().json(),
-                                    conversation.thinking())
-                            : this.chatTemplate.render(
-                                    conversation.turns(), tools.promptTools(), conversation.thinking()))
+            return this.chatTemplate.render(conversation.turns(), tools.promptTools(), conversation.thinking())
                     + tools.generationPrefix();
         } catch (QwenChatTemplate.InvalidConversationException invalid) {
             throw ApiException.invalidRequest(invalid.getMessage(), "messages");
@@ -100,10 +93,15 @@ public class ConversationPlanner {
         boolean reasoning = conversation.thinking().enabled();
         if (format.kind() == ResponseFormat.Kind.JSON_SCHEMA) checkSchema(format.schema(), format.schemaParam());
         String grammar;
-        if (tools.parsesOutput()) {
-            for (FunctionTool tool : tools.callable())
-                if (tool.strict()) checkSchema(tool.parametersOrEmpty(), tool.parametersParam());
-            grammar = OutputGrammar.tools(tools, format.answerSchema(), reasoning);
+        // Free text under auto, which the parser splits; a call is forced by a required or named choice, and a JSON
+        // answer beside auto calls is constrained as a whole.
+        boolean auto = tools.choice() == ToolCalling.Choice.AUTO;
+        for (FunctionTool tool : tools.callable())
+            if (tool.strict()) checkSchema(tool.parametersOrEmpty(), tool.parametersParam());
+        if (tools.parsesOutput() && (!auto || format.json())) {
+            grammar = OutputGrammar.tools(tools, auto ? format.answerSchema() : null, reasoning);
+        } else if (tools.parsesOutput()) {
+            return null;
         } else if (format.json()) {
             grammar = OutputGrammar.json(format.answerSchema(), reasoning);
         } else return null;

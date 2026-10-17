@@ -58,8 +58,7 @@ class MetricsTest {
                         "/v1/chat/completions",
                         "{\"model\":\"" + MODEL + "\",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":"
                                 + "{\"name\":\"x\",\"schema\":{\"not\":{}}}}" + hello + "}"));
-        this.backend.script =
-                ScriptedInferenceBackend.tokens(List.of("{\"tool_calls\":[{\"name\":\"f\",\"arguments\":"), true);
+        this.backend.script = ScriptedInferenceBackend.tokens(List.of("<tool_call>\n<function=f>\n<parameter="), true);
         assertEquals(
                 500,
                 post(

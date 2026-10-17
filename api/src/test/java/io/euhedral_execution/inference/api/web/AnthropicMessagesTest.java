@@ -124,7 +124,9 @@ class AnthropicMessagesTest {
     @Test
     void aToolUseAndItsResultContinueTheConversation() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(
-                List.of("{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}]}"), true);
+                List.of(
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"),
+                true);
         JsonNode message =
                 post(200, "/v1/messages", "{\"model\":\"" + MODEL + "\",\"max_tokens\":64," + WEATHER + "," + HI + "}");
         assertEquals("tool_use", message.get("stop_reason").asString());
@@ -133,10 +135,10 @@ class AnthropicMessagesTest {
         assertTrue(use.get("id").asString().startsWith("toolu_"));
         assertEquals("get_weather", use.get("name").asString());
         assertEquals("Oslo", use.at("/input/city").asString());
-        assertTrue(this.backend.only().grammar != null);
+        assertEquals(null, this.backend.only().grammar, "under auto the model generates freely");
 
         this.backend.generations.clear();
-        this.backend.script = ScriptedInferenceBackend.tokens(List.of("{\"content\":\"It is cold.\"}"), true);
+        this.backend.script = ScriptedInferenceBackend.tokens(List.of("It is cold."), true);
         String id = use.get("id").asString();
         JsonNode next = post(
                 200,
@@ -150,23 +152,27 @@ class AnthropicMessagesTest {
         assertEquals("end_turn", next.get("stop_reason").asString());
         String prompt = this.backend.only().prompt;
         assertTrue(
-                prompt.contains("{\"tool_calls\": [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}]}"),
+                prompt.contains(
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"
+                                + "<|im_end|>"),
                 prompt);
-        assertTrue(prompt.contains("{\"tool_results\": [\"-3C\"]}"), prompt);
+        assertTrue(prompt.contains("<tool_response>\n-3C\n</tool_response><|im_end|>"), prompt);
     }
 
     @Test
     void parallelToolUseCanBeDisabledAndAnyRequiresACall() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(
-                List.of("{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"A\"}}]}"), true);
+                List.of(
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nA\n</parameter>\n</function>\n</tool_call>"),
+                true);
         post(
                 200,
                 "/v1/messages",
                 "{\"model\":\"" + MODEL + "\",\"max_tokens\":64," + WEATHER
                         + ",\"tool_choice\":{\"type\":\"any\",\"disable_parallel_tool_use\":true}," + HI + "}");
         String grammar = this.backend.only().grammar;
-        assertTrue(grammar.contains("body: calls\n"), "any requires a call");
-        assertFalse(grammar.contains("(\",\" call)*"), "parallel tool use is disabled");
+        assertTrue(grammar.contains("<function=get_weather>") && !grammar.contains("answer:"), "any requires a call");
+        assertFalse(grammar.contains("(\"\\n\" call)*"), "parallel tool use is disabled");
     }
 
     @Test
@@ -196,7 +202,7 @@ class AnthropicMessagesTest {
                         "Plan.",
                         "</think>",
                         "\n\n",
-                        "{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":" + "{\"city\":\"Oslo\"}}]}"),
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"),
                 true);
         List<String[]> events = stream(
                 "{\"model\":\"" + MODEL + "\",\"max_tokens\":2048,\"stream\":true,\"thinking\":{\"type\":\"enabled\","

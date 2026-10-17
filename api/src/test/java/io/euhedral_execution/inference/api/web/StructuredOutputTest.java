@@ -141,26 +141,44 @@ class StructuredOutputTest {
 
     @Test
     void besideToolsADirectAnswerIsTheDocument() throws Exception {
-        this.backend.script =
-                ScriptedInferenceBackend.tokens(List.of("{\"content\":{\"name\":\"Ann\",\"age\":42}}"), true);
-        JsonNode response = json(
-                200,
-                request(",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}],"
-                        + "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"p\",\"schema\":"
-                        + PERSON
-                        + "}}"));
+        this.backend.script = ScriptedInferenceBackend.tokens(List.of("{\"name\":\"Ann\",", "\"age\":42}"), true);
+        String extra = ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}],"
+                + "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"p\",\"schema\":"
+                + PERSON
+                + "}}";
+        JsonNode response = json(200, request(extra));
         assertEquals(
                 "{\"name\":\"Ann\",\"age\":42}",
                 response.at("/choices/0/message/content").asString());
-        String prompt = this.backend.only().prompt;
-        assertTrue(prompt.contains("{\"content\":RESPONSE}"), prompt);
-        assertTrue(this.backend.only().grammar.contains("content_value: %json {\"x-guidance\":"));
+        assertEquals("stop", response.at("/choices/0/finish_reason").asString());
+        String grammar = this.backend.only().grammar;
+        assertTrue(grammar.contains("start: (calls | answer)"), grammar);
+        assertTrue(grammar.contains("answer: %json {\"x-guidance\":"), grammar);
+
+        // The same request may be answered with a call instead.
+        this.backend.reset();
+        this.backend.script = ScriptedInferenceBackend.tokens(
+                List.of("<tool_call>\n<function=lookup>\n</function>\n</tool_call>"), true);
+        response = json(200, request(extra));
+        assertEquals(
+                "lookup",
+                response.at("/choices/0/message/tool_calls/0/function/name").asString());
+        assertEquals("tool_calls", response.at("/choices/0/finish_reason").asString());
+
+        // A finished direct answer that is not JSON is never returned.
+        this.backend.reset();
+        this.backend.script = ScriptedInferenceBackend.tokens(List.of("{\"name\":"), true);
+        assertEquals(
+                "invalid_structured_output",
+                json(500, request(extra)).at("/error/code").asString());
     }
 
     @Test
     void strictToolsCompileTheirSchemas() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(
-                List.of("{\"tool_calls\":[{\"name\":\"save\",\"arguments\":{\"name\":\"Ann\",\"age\":42}}]}"), true);
+                List.of("<tool_call>\n<function=save>\n<parameter=name>\nAnn\n</parameter>\n"
+                        + "<parameter=age>\n42\n</parameter>\n</function>\n</tool_call>"),
+                true);
         JsonNode response = json(
                 200,
                 request(",\"tool_choice\":\"required\",\"tools\":[{\"type\":\"function\","
@@ -168,8 +186,11 @@ class StructuredOutputTest {
         assertEquals(
                 "save",
                 response.at("/choices/0/message/tool_calls/0/function/name").asString());
+        assertEquals(
+                "{\"name\":\"Ann\",\"age\":42}",
+                response.at("/choices/0/message/tool_calls/0/function/arguments")
+                        .asString());
         String grammar = this.backend.only().grammar;
-        assertTrue(grammar.contains("arguments_0: %json {\"x-guidance\":"), grammar);
         assertTrue(grammar.contains("\"minimum\":0"), "a strict tool's arguments follow its schema");
     }
 
