@@ -44,6 +44,11 @@ Frozen 2026-10-17. 112 chunks of 2,560 tokens (286,720 tokens); the second half 
   `LLAMA_PERPLEXITY_PARSE_SPECIAL=1 llama-perplexity -m Swift-1.5-Qwen3.8-27B-BF16.gguf -f text.txt -c 2560 -b 2560
   -ub 2560 --chunks 112 -ngl 0 --kl-divergence-base reference.kld` (BF16 perplexity 1.8696 on the scored halves).
 
+**Cross-check**: the engine's BF16 artifact (the one that wrote the text; 13.9 GB on the device, 21.8 GB in host memory,
+18.9 GB read from disk) scored against the references once: mean KL 0.0029 ± 0.0011, top-1 agreement 98.6%, KL median
+0.00004, p95 0.0020, p99 0.0081, dNLL +0.017 ± 0.004 (on T1: KL 0.00057, top-1 97.3%). The median and tail percentiles
+are at the kernel noise floor; the mean and dNLL are raised by a few positions (largest KL 24.7). 14,331 s.
+
 The set lives outside the repository. Its manifest (`frozen/manifest.json`, written by `tools/t5/freeze.py`) records
 the sha256 and size of every file the test depends on: the corpus, the references, the BF16 model file, the tokenizer
 and chat template, the generation record and settings, the prompt, document, fixture and check files, and the
