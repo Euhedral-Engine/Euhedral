@@ -321,7 +321,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
                 Quantum.Outcome outcome = ((Quantum) step).conclusion();
                 if (outcome.status() != Quantum.Status.SUCCESS && first != null && first != outcome.failure())
                     throw new IllegalStateException("a prompt chunk failed", first);
-                succeeded(step);
+                if (cancelled(step)) return end();
                 DFlash2State state = state();
                 if (sequence.committedFrontier() != aheadEnd || state == null || state.contextLength() != aheadEnd)
                     throw new IllegalStateException("the prompt's chunks stopped short of " + aheadEnd);
@@ -349,9 +349,15 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
             @Override
             public StepPort retired(AbstractQuantum step) {
                 if (sequence.inFlight()) return this;
+                if (sequence.cancellationRequested()) return done();
                 throw new IllegalStateException("a speculative quantum was refused", drainFailure);
             }
         };
+
+        /// A cancelled generation ends with the tokens committed so far, after the quanta still in flight.
+        private StepPort end() {
+            return sequence.inFlight() ? drain : done();
+        }
 
         /// Prompt: a prefill chunk that taps its rows; its context quantum follows.
         private final StepPort prefill = new StepPort() {
@@ -376,7 +382,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 long executed = System.nanoTime();
                 statistics.prefillNanos += executed - started;
                 if (timing != null) timing.prefillQuantum(started, executed, end - offset);
@@ -409,7 +415,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 long contextDone = System.nanoTime();
                 if (context == Context.PROMPT) {
                     statistics.promptContextNanos += contextDone - contextStarted;
@@ -482,7 +488,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 long draftedAt = System.nanoTime();
                 long drafted = draftedAt - drafting;
                 if (timing != null) timing.draftQuantum("block", drafting, draftedAt);
@@ -518,7 +524,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 Statistics statistics = DFlash2Decoder.this.statistics;
                 long executed = System.nanoTime();
                 statistics.verifyNanos += executed - started;
@@ -572,7 +578,7 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 long executed = System.nanoTime();
                 if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
                 return done();
@@ -585,11 +591,14 @@ public final class DFlash2Decoder implements SpeculativeDecoding {
         }
     }
 
-    /// A speculative step must succeed: anything else ends the run.
-    private static void succeeded(AbstractQuantum step) {
+    /// Whether a speculative step was cancelled with its generation (stop sequence, disconnect, a call limit): the run
+    /// then ends with what it committed. Any other outcome but success fails the run.
+    private static boolean cancelled(AbstractQuantum step) {
         Quantum.Outcome outcome = ((Quantum) step).conclusion();
+        if (outcome.status() == Quantum.Status.CANCELLED) return true;
         if (outcome.status() != Quantum.Status.SUCCESS)
             throw new IllegalStateException("speculative quantum " + outcome.status(), outcome.failure());
+        return false;
     }
 
     private DFlash2State state() {
