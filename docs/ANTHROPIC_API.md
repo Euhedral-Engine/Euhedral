@@ -26,7 +26,7 @@ renders to the same prompt, so the two share cached prefixes.
 | `max_tokens` | Required; reasoning and answer together, within the context. |
 | `system` | A string or text blocks (concatenated). |
 | `messages` | `user` and `assistant` turns of a string or blocks: `text`, `tool_use`, `tool_result` (string or text blocks; `is_error` accepted and not rendered), `thinking` (replayed as the turn's reasoning; the `signature` is not checked). |
-| `tools` | Custom tools: `name` (`[a-zA-Z0-9_-]{1,128}`), `description`, `input_schema`, `strict` ([TOOL_CALLING.md](TOOL_CALLING.md)). |
+| `tools` | Custom tools: `name` (`[a-zA-Z0-9_-]{1,128}`), `description`, `input_schema`, `strict` (enforced under `any` or `tool`, [TOOL_CALLING.md](TOOL_CALLING.md)). |
 | `tool_choice` | `auto`, `any` (a call is required), `tool` with `name`, `none`; `disable_parallel_tool_use` allows one call. |
 | `thinking` | Omitted or `disabled`: no thinking. `adaptive`: thinking, the model decides how long. `enabled` with `budget_tokens`: thinking, ended by `</think>` after at most `budget_tokens` tokens; must be below `max_tokens`. |
 | `output_config.effort` | With thinking: `low` and `medium` select the template's levels, `high` and `max` its highest ([REASONING.md](REASONING.md)). Without thinking it is refused. |

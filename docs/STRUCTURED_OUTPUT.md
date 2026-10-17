@@ -1,7 +1,7 @@
 # Structured output
 
-`response_format` makes the answer a JSON document, and `strict` tools make call arguments follow their schemas
-([TOOL_CALLING.md](TOOL_CALLING.md)). Both are enforced while sampling, by [llguidance](https://github.com/guidance-ai/llguidance):
+`response_format` makes the answer a JSON document, and a `required` or named `strict` tool makes call arguments follow
+their schemas ([TOOL_CALLING.md](TOOL_CALLING.md)). Both are enforced while sampling, by [llguidance](https://github.com/guidance-ai/llguidance):
 at every step only tokens that keep the text a prefix of a valid document can be selected, and a generation
 terminator only once the document is complete. Nothing is generated freely and repaired afterwards.
 
@@ -25,7 +25,9 @@ The prompt is not changed: tell the model in your messages what the document sho
 asked for JSON still produces valid JSON, but its content suffers.
 
 With thinking on ([REASONING.md](REASONING.md)) the reasoning is free text and the document follows `</think>`. With
-`tools` and `tool_choice: "auto"`, a direct answer is the document, returned as the message `content`.
+`tools` and `tool_choice: "auto"`, the output is either native tool calls or the document, as one grammar
+(`start: GAP? (calls | answer)`), and a direct answer is the document, returned as the message `content`. Without a
+JSON format, `auto` leaves sampling free.
 
 `stop` cannot be combined with a JSON format: a stop string inside the document would end it invalid. A generation
 that runs out of `max_tokens` ends with `finish_reason: "length"` and the unfinished document, as OpenAI does.
@@ -65,7 +67,6 @@ requests (and free reasoning before a constrained answer is still constrained in
 
 ## Rejected
 
-- A hand-written byte-level JSON Schema recognizer, generalizing the earlier tool-call envelope automaton. llguidance
-  covers far more of JSON Schema, is used by llama.cpp, vLLM and SGLang, and computes masks in microseconds.
+- A hand-written byte-level JSON Schema recognizer. llguidance covers far more of JSON Schema, is used by llama.cpp, vLLM and SGLang, and computes masks in microseconds.
 - llguidance's default features: they add a Rayon thread pool; the library is built without it, so mask computation
   runs on the engine's worker that selects the token.

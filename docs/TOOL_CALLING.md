@@ -8,50 +8,80 @@ The other APIs spell the same controls their own way and generate calls the same
 
 ## How a call is generated
 
-When functions are offered, sampling is constrained by an llguidance grammar
-([STRUCTURED_OUTPUT.md](STRUCTURED_OUTPUT.md)) to one JSON envelope, spelled exactly:
+The prompt carries the checkpoint template's own tool section: the definitions in `# Tools ... <tools>`, followed by the
+template's instructions for the call format. The model writes a call as the template renders one, and earlier calls in
+the conversation replay in the same form:
 
 ```text
-{"tool_calls":[{"name":"get_weather","arguments":{...}}, ...]}      a call (or several)
-{"content":"..."}                                                  a direct answer (auto only)
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+<parameter=days>
+3
+</parameter>
+</function>
+</tool_call>
 ```
 
-`required` and a named function allow only the first form (a named function only that name);
-`parallel_tool_calls: false` allows exactly one call, and decoding stops once it is complete. A direct answer is
-returned as ordinary assistant text, not as JSON on the wire. The server parses the finished envelope before
-returning OpenAI-style `tool_calls` and `finish_reason: "tool_calls"`; a malformed call fails rather than being
-returned as a successful one.
+A string argument is written verbatim and any other value as JSON. Consecutive calls are separated by a newline.
 
-The envelope is JSON rather than the checkpoint template's `<tool_call>` XML because JSON strings carry any argument
-text unambiguously; the template's XML parameters cannot hold their own closing tags. Prompts still render the
-template's tool definitions (`# Tools ... <tools>`), followed by instructions for the JSON form.
+- **`auto`**: sampling is free. The server splits the output into text and complete calls as it streams, types each
+  argument by the function's schema, and returns OpenAI-style `tool_calls` with `finish_reason: "tool_calls"`. A call
+  that names a function that was not offered, or whose parameters do not parse, fails the request with
+  `invalid_tool_call`; it is never returned as text or as a call the model did not make. After a call is parsed its
+  arguments are checked: top-level types, required names and `additionalProperties: false`.
+- **`required` and a named function**: an llguidance grammar ([STRUCTURED_OUTPUT.md](STRUCTURED_OUTPUT.md)) forces the
+  output to be one call, or one or more calls separated by `\n` (a named function allows only that name). After
+  reasoning, up to eight whitespace bytes may precede it.
+- **`auto` with a JSON `response_format`**: the grammar allows calls or the response document, so a direct answer is
+  the JSON document itself, returned as the message content.
+- **`parallel_tool_calls: false`**: decoding stops once the first call is complete, and the grammar of a constrained
+  choice allows exactly one call.
+- **`none`**: the definitions are left out of the prompt, as if no tools were sent, and the output is plain text.
+
+### The closing tag
+
+The format cannot represent a string argument that contains `</parameter>`: the parser ends a value at the first
+`</parameter>` that is followed by another parameter or `</function>`. A constrained call enforces this in the grammar,
+where a string value is any text that does not contain `</parameter>` (`<`, `</paramete` and every other text are
+admitted). Free generation under `auto` is not constrained, so such a value is cut or the call fails as malformed.
+Parameter names cannot contain `<`, `>` or line breaks (400).
 
 ## Arguments
 
-- **`strict: true`**: the arguments are generated under the function's `parameters` schema. Every JSON Schema keyword
-  llguidance enforces is enforced (types, `properties`, `required`, `additionalProperties`, `enum`, `const`, nested
-  objects and arrays, `anyOf`, disjoint `oneOf`, `allOf`, `$ref`/`$defs`, string `pattern`/`format`/lengths, numeric
-  bounds, `multipleOf`, item and property counts). A schema with a keyword it cannot enforce, or one no value can
-  satisfy, is refused with 400 and the reason, naming `tools[i].function.parameters`. A strict function without
-  `parameters` takes exactly `{}`.
-- **Not strict** (the default, except in Responses, where `strict` defaults to true as that API defines it): the
-  arguments are any JSON object. After generation the server still checks
-  top-level argument types, required names, and `additionalProperties: false`, and fails the request when they do not
-  hold.
+- **`strict: true`**: under a constrained choice the call follows the function's `parameters` schema. The
+  parameters are the schema's `properties` in the schema's order; required ones are present and optional ones may be
+  omitted. A property typed as a string is any text (an `enum` or `const` of strings, exactly those texts); a property
+  of another type is a JSON value of its schema, with the function's `$defs`, so `$ref`s resolve; an untyped property,
+  or a type that includes `string` beside others, is any text. A name outside `properties` is generated only when the
+  schema does not set `additionalProperties: false` (or for a required name it does not declare). Every JSON Schema
+  keyword llguidance enforces is enforced for values that are not strings (types, `enum`, `const`, nested objects
+  and arrays, `anyOf`, disjoint `oneOf`, `allOf`, `$ref`/`$defs`, numeric bounds, `multipleOf`, item and property
+  counts, and a string's `pattern`, `format` and lengths inside a JSON value). A schema with a keyword it cannot
+  enforce, or one no value can satisfy, is refused with 400 and the reason, naming `tools[i].function.parameters`; so
+  is a string parameter that uses `pattern`, `format`, `minLength` or `maxLength` where the call is constrained, since
+  a text value is not a JSON string. A strict function without `parameters` takes no parameters.
+- **Not strict** (the default, except in Responses, where `strict` defaults to true as that API defines it): under a
+  constrained choice the parameter names are any `[a-zA-Z0-9_-]+` and the values any text without `</parameter>`.
+  After generation the server checks top-level argument types, required names, and `additionalProperties: false`, and
+  fails the request when they do not hold.
 
-Each strict function's arguments are their own grammar rule, so a schema's `$ref`s resolve against its own root.
+Under `auto` the output is not constrained, so a strict function's arguments get the same checks as a non-strict one's.
 
 ## Streaming
 
-With callable tools, SSE emits tool calls and direct answers only after their JSON envelopes are complete, so
-direct-answer text may be buffered until generation ends. Without callable tools, plain text streams incrementally.
-With thinking on, the reasoning streams first, unconstrained, and the envelope follows `</think>`
+Text streams as it is decoded; only a possible start of `<tool_call>`, and whitespace that could precede one, is held
+back until the next chunk decides it. A call is emitted once its closing tag has arrived, with its complete
+arguments. With thinking on, the reasoning streams first, unconstrained, and the answer follows `</think>`
 ([REASONING.md](REASONING.md)).
 
 ## Results
 
-Pass each returned call ID back in a `role: "tool"` message with its result, then send the next request. Tool
-results are JSON-quoted in the model prompt, in call order; the server never executes anything.
+Pass each returned call ID back in a `role: "tool"` message with its result, then send the next request. Results
+render as `<tool_response>` blocks in call order, and consecutive results share one user turn; the server never
+executes anything.
 
 ## MCP
 

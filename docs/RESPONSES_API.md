@@ -25,7 +25,7 @@ has no effect (nothing is stored, and responses cannot be retrieved later).
 | `model` | Must be the served model ID. |
 | `input` | A string (one user message) or items: `message` (`user`, `assistant`, and leading `system`/`developer`; content a string or `input_text`/`output_text` parts), `function_call`, `function_call_output`, `reasoning`. |
 | `instructions` | The system message; leading `system`/`developer` messages are appended to it. |
-| `tools` | `function` tools: `name`, `description`, `parameters`, `strict`. As this API defines it, `strict` defaults to **true**: arguments follow the schema ([TOOL_CALLING.md](TOOL_CALLING.md)), and a schema that cannot be enforced is refused unless the tool sets `strict: false`. |
+| `tools` | `function` tools: `name`, `description`, `parameters`, `strict`. As this API defines it, `strict` defaults to **true**: under `required` or a named function arguments follow the schema ([TOOL_CALLING.md](TOOL_CALLING.md)), and a schema that cannot be enforced is refused unless the tool sets `strict: false`. |
 | `tool_choice`, `parallel_tool_calls` | `auto`, `none`, `required`, `{"type": "function", "name": ...}`. |
 | `text.format` | `text`, `json_object`, `json_schema` (`name`, `schema`, `strict`) ([STRUCTURED_OUTPUT.md](STRUCTURED_OUTPUT.md)). |
 | `reasoning.effort` | `none`, `low`, `medium`, `high`/`xhigh`; omitted, the template's default (thinking at `xhigh`) ([REASONING.md](REASONING.md)). |
