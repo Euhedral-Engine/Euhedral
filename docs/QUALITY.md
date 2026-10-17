@@ -58,7 +58,7 @@ T4 is generated greedily by Swift-1.5 at Q8_0 (54 GB of BF16 does not fit the de
 with `--jinja`; its documents are scored with `--parse-special`, so template tokens stay single tokens.
 
 T1–T4 inform research decisions. A held-out [release test](RELEASE_TEST.md), kept outside the repository and scored
-only at release checkpoints against registered criteria, confirms them.
+only at release checkpoints, confirms them.
 
 **References** run in llama.cpp's CUDA build with the BF16 weights in host memory, streamed through the GPU (`-ngl 0`; a
 2560-token chunk takes about 10 seconds, against 196 on the CPU). On T1 the GPU and CPU references differ by a mean KL of

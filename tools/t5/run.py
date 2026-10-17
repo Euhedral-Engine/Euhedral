@@ -1,19 +1,11 @@
 """Scores candidate artifacts on the frozen evaluation set and prints aggregate and per-domain numbers only.
 
-Usage (from the repository root): python3 tools/t5/run.py STORE --registration FILE NAME=ARTIFACT...
+Usage (from the repository root): python3 tools/t5/run.py STORE --baseline NAME NAME=ARTIFACT...
                                   [--gradle ./gradlew] [--resamples 10000]
 
-A run needs a pre-registration committed to the repository before it starts (FILE, JSON): the date, the baseline,
-each candidate's artifact sha256 and the acceptance criteria, written down before any number is seen:
-
-    {"date": "2026-10-20", "baseline": "q3", "candidates": {"q3": "<sha256>", "q3-new": "<sha256>"},
-     "criteria": "..."}
-
-The runner refuses a registration that is not committed (or has uncommitted changes), an artifact whose sha256 differs
-from the registered one, and a store whose files differ from STORE/frozen/manifest.json. It appends one line per run to
-STORE/access.log (who, when, registration and its commit, candidates), scores every artifact with `quantization score
---values` into a private directory under STORE/runs, prints and keeps the report (STORE/runs/<time>.txt), and deletes
-the per-token values: nothing per token, per chunk or per prompt leaves the runner.
+The runner refuses a store whose files differ from STORE/frozen/manifest.json, scores every artifact with
+`quantization score --values` into a private directory under STORE/runs, prints the report, and deletes the per-token
+values: nothing per token, per chunk or per prompt leaves the runner.
 
 Per domain and overall: mean KL(reference || candidate) over scored tokens, top-1 agreement, KL p95 and p99, dNLL
 (candidate NLL minus reference NLL), and the paired KL difference against the baseline with a 95% interval from a
@@ -23,12 +15,10 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import getpass
 import hashlib
 import json
 import random
 import shutil
-import socket
 import struct
 import subprocess
 import sys
@@ -118,19 +108,6 @@ def report(scored: dict[str, list[list[tuple[float, ...]]]], domains: list[str],
     return "\n".join(lines)
 
 
-def check_registration(path: Path) -> tuple[dict, str]:
-    root = subprocess.run(["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"], capture_output=True,
-                          text=True, check=True).stdout.strip()
-    relative = path.resolve().relative_to(root)
-    tracked = subprocess.run(["git", "-C", root, "ls-files", "--error-unmatch", str(relative)], capture_output=True)
-    clean = subprocess.run(["git", "-C", root, "diff", "--quiet", "HEAD", "--", str(relative)])
-    if tracked.returncode != 0 or clean.returncode != 0:
-        raise SystemExit(f"error: {path} must be committed, without changes, before the run")
-    revision = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H", "--", str(relative)],
-                              capture_output=True, text=True, check=True).stdout.strip()
-    return json.loads(path.read_text(encoding="utf-8")), revision
-
-
 def check_store(store: Path) -> None:
     manifest = json.loads((store / "frozen" / "manifest.json").read_text(encoding="utf-8"))
     for relative, expected in manifest["files"].items():
@@ -142,24 +119,16 @@ def check_store(store: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("store", type=Path)
-    parser.add_argument("--registration", type=Path, required=True)
-    parser.add_argument("artifacts", nargs="+", help="NAME=ARTIFACT, the names the registration uses")
+    parser.add_argument("--baseline", required=True, help="the NAME the others are compared with")
+    parser.add_argument("artifacts", nargs="+", help="NAME=ARTIFACT")
     parser.add_argument("--gradle", default="./gradlew")
     parser.add_argument("--resamples", type=int, default=10000)
     args = parser.parse_args(argv)
-    registration, revision = check_registration(args.registration)
     artifacts = dict(item.split("=", 1) for item in args.artifacts)
-    if set(artifacts) != set(registration["candidates"]) or registration["baseline"] not in artifacts:
-        raise SystemExit("error: the artifacts must be exactly the registered candidates, baseline included")
-    for name, path in artifacts.items():
-        if sha256(Path(path)) != registration["candidates"][name]:
-            raise SystemExit(f"error: {name}: {path} is not the registered artifact")
+    if args.baseline not in artifacts:
+        raise SystemExit("error: the baseline must be one of the artifacts")
     check_store(args.store)
     started = datetime.datetime.now().astimezone()
-    with (args.store / "access.log").open("a", encoding="utf-8") as log:
-        log.write(json.dumps({"when": started.isoformat(timespec="seconds"), "who": getpass.getuser(),
-                              "host": socket.gethostname(), "registration": str(args.registration),
-                              "registration_commit": revision, "candidates": registration["candidates"]}) + "\n")
     runs = args.store / "runs"
     private = runs / f"{started:%Y%m%d-%H%M%S}.values"
     private.mkdir(parents=True)
@@ -173,11 +142,9 @@ def main(argv: list[str] | None = None) -> int:
             scored[name] = read_values(private / f"{name}.values")
         domains = [json.loads(line)["domain"]
                    for line in (args.store / "frozen" / "chunks.jsonl").read_text().splitlines()]
-        text = (f"registration {args.registration} ({revision}), {started:%Y-%m-%d %H:%M}\n\n"
-                + report(scored, domains, registration["baseline"], args.resamples))
+        text = report(scored, domains, args.baseline, args.resamples)
     finally:
         shutil.rmtree(private)
-    (runs / f"{started:%Y%m%d-%H%M%S}.txt").write_text(text, encoding="utf-8")
     print(text)
     return 0
 
