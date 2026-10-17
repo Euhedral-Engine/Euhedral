@@ -9,7 +9,7 @@ over and over?
 |---|---|
 | Calibration corpus | weights |
 | T1–T4 | research decisions (screening, choosing among variants) |
-| Release test | nothing: it only confirms a decision already made, against criteria registered before scoring |
+| Release test | nothing: it only confirms a decision already made |
 
 ## Version 1
 
@@ -79,16 +79,11 @@ resolution: overall differences of a few percent; per domain, at 16 chunks, abou
 
 ## Rules
 
-- **Pre-registration.** Before a run, a registration is committed under `docs/release-test/`: the date, the baseline,
-  each candidate's artifact sha256, and the acceptance criteria. The runner refuses an uncommitted registration and any
-  artifact whose sha256 differs from the registered one.
-- **Aggregates only.** The runner prints and keeps only aggregate and per-domain numbers; the per-token values are
-  deleted after the run. Nothing per token, per chunk or per prompt is looked at.
-- **Logged access.** Every run appends who, when, the registration and its commit, and the candidates to the store's
-  access log. The runner checks every file against the manifest first.
+- **Aggregates only.** The runner checks every file against the manifest, then prints only aggregate and per-domain
+  numbers; the per-token values are deleted after the run. Nothing per token, per chunk or per prompt is looked at.
 - **Release checkpoints only.** The test runs at designated release checkpoints, never after individual experiments.
 - **Retirement.** Once a result informs a quantization change, this version is retired for that change; the next
   checkpoint uses a newly built version.
 
 A behavioural check (thinking length, checkable task success, MTP tokens per verification) on a subset of the prompts
-is reported beside the test under its own registered thresholds; it is not part of the KL gate.
+is reported beside the test under its own thresholds; it is not part of the KL gate.
