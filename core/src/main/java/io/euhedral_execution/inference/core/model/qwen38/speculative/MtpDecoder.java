@@ -506,7 +506,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
                 Quantum.Outcome outcome = ((Quantum) step).conclusion();
                 if (outcome.status() != Quantum.Status.SUCCESS && first != null && first != outcome.failure())
                     throw new IllegalStateException("a prompt chunk failed", first);
-                succeeded(step);
+                if (cancelled(step)) return end();
                 if (sequence.committedFrontier() != aheadEnd || mtpCache().length() != aheadEnd)
                     throw new IllegalStateException("the prompt's chunks stopped short of " + aheadEnd);
                 long executed = System.nanoTime();
@@ -535,9 +535,15 @@ public final class MtpDecoder implements SpeculativeDecoding {
             @Override
             public StepPort retired(AbstractQuantum step) {
                 if (sequence.inFlight()) return this;
+                if (sequence.cancellationRequested()) return done();
                 throw new IllegalStateException("a speculative quantum was refused", drainFailure);
             }
         };
+
+        /// A cancelled generation ends with the tokens committed so far, after the quanta still in flight.
+        private StepPort end() {
+            return sequence.inFlight() ? drain : done();
+        }
 
         /// Prompt: a prefill chunk that seeds drafting; its MTP catch-up follows.
         private final StepPort prefill = new StepPort() {
@@ -561,7 +567,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 long executed = System.nanoTime();
                 statistics.prefillNanos += executed - started;
                 if (timing != null) timing.prefillQuantum(started, executed, end - offset);
@@ -619,7 +625,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 catchUpFirst += catchUpCount;
                 return catchUpFirst < catchUpTokens.length ? this : caughtUp();
             }
@@ -664,7 +670,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 recursionDrafts[recursionIndex] = draftTokens[draftRow()];
                 recursionLogProbabilities[recursionIndex] = draftLogProbability;
                 recursionScore += draftLogProbability;
@@ -758,7 +764,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 Statistics statistics = MtpDecoder.this.statistics;
                 long executed = System.nanoTime();
                 statistics.verifyNanos += executed - started;
@@ -811,7 +817,7 @@ public final class MtpDecoder implements SpeculativeDecoding {
 
             @Override
             public StepPort retired(AbstractQuantum step) {
-                succeeded(step);
+                if (cancelled(step)) return end();
                 long executed = System.nanoTime();
                 if (timing != null) timing.decodeQuantum(started, executed, executed, false, -1);
                 return done();
@@ -824,11 +830,14 @@ public final class MtpDecoder implements SpeculativeDecoding {
         }
     }
 
-    /// A speculative step must succeed: anything else ends the run.
-    private void succeeded(AbstractQuantum step) {
+    /// Whether a speculative step was cancelled with its generation (stop sequence, disconnect, a call limit): the run
+    /// then ends with what it committed. Any other outcome but success fails the run.
+    private boolean cancelled(AbstractQuantum step) {
         Quantum.Outcome outcome = ((Quantum) step).conclusionFor(this.sequence);
+        if (outcome.status() == Quantum.Status.CANCELLED) return true;
         if (outcome.status() != Quantum.Status.SUCCESS)
             throw new IllegalStateException("speculative quantum " + outcome.status(), outcome.failure());
+        return false;
     }
 
     private AttentionStates states() {

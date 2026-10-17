@@ -59,6 +59,12 @@ class ToolCallParserTest {
                 arguments(schema, "sn", "\"quoted\"", "free", "\"q\""));
         // Untyped values take the JSON reading when it parses.
         assertEquals("{\"free\":[1,2]}", arguments(schema, "free", "[1, 2]"));
+        // Python literals for booleans read as booleans; anything else of the wrong type names the value.
+        assertEquals("{\"b\":true}", arguments(schema, "b", "True"));
+        assertEquals("{\"b\":false}", arguments(schema, "b", " FALSE "));
+        var refused =
+                assertThrows(ToolCallParser.MalformedToolCallException.class, () -> arguments(schema, "b", "yes"));
+        assertEquals("parameter b of f is not valid JSON of type [boolean]: 'yes'", refused.getMessage());
     }
 
     @Test

@@ -226,7 +226,13 @@ final class ToolCallParser {
             parsed = JSON.readValue(raw, Object.class);
         } catch (JacksonException notJson) {
             if (types.isEmpty() || types.contains("string")) return raw;
-            throw malformed("parameter " + key + " of " + tool.name() + " is not valid JSON of type " + types);
+            // Qwen writes Python literals at times; the reference parsers read them for these types.
+            String literal = raw.strip();
+            if (types.contains("boolean") && literal.equalsIgnoreCase("true")) return Boolean.TRUE;
+            if (types.contains("boolean") && literal.equalsIgnoreCase("false")) return Boolean.FALSE;
+            if (types.contains("null") && literal.equals("None")) return null;
+            throw malformed("parameter " + key + " of " + tool.name() + " is not valid JSON of type " + types + ": "
+                    + excerpt(raw));
         }
         // Out-of-range literals parse as infinities, which no JSON arguments string can carry.
         if (!isFinite(parsed))
@@ -237,7 +243,12 @@ final class ToolCallParser {
         if (types.isEmpty() || types.contains(type) || (type.equals("integer") && types.contains("number")))
             return parsed;
         if (types.contains("string")) return raw;
-        throw malformed("parameter " + key + " of " + tool.name() + " is not of type " + types);
+        throw malformed("parameter " + key + " of " + tool.name() + " is not of type " + types + ": " + excerpt(raw));
+    }
+
+    /// The start of a value, for an error message.
+    private static String excerpt(String raw) {
+        return raw.length() <= 80 ? "'" + raw + "'" : "'" + raw.substring(0, 80) + "...'";
     }
 
     private static boolean isFinite(Object value) {
