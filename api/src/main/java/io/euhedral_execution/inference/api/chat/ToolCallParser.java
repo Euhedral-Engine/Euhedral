@@ -49,6 +49,8 @@ final class ToolCallParser {
 
     private final Map<String, FunctionTool> callable;
     private final boolean parallel;
+    // A required or named choice: the grammar forces a call, so an answer without one is malformed.
+    private final boolean requiresCall;
     private final StringBuilder buffer = new StringBuilder();
     private State state = State.CONTENT;
     private int calls;
@@ -58,6 +60,8 @@ final class ToolCallParser {
         this.callable = new LinkedHashMap<>();
         for (FunctionTool tool : tools.callable()) this.callable.put(tool.name(), tool);
         this.parallel = tools.parallel();
+        this.requiresCall =
+                tools.choice() == ToolCalling.Choice.REQUIRED || tools.choice() == ToolCalling.Choice.FUNCTION;
         this.buffer.append(tools.generationPrefix());
     }
 
@@ -75,6 +79,8 @@ final class ToolCallParser {
     void finish(boolean stopTokenReached, Output output) throws MalformedToolCallException {
         drain(output);
         if (this.state == State.CONTENT) {
+            if (this.requiresCall && this.calls == 0 && stopTokenReached)
+                throw malformed("the model did not make the required function call");
             if (!this.buffer.isEmpty()) output.content(this.buffer.toString());
         } else if (stopTokenReached && (this.state == State.CALL || !this.buffer.isEmpty())) {
             throw malformed("generation ended inside a tool call");

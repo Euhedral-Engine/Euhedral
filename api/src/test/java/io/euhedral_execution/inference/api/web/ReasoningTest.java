@@ -2,7 +2,6 @@ package io.euhedral_execution.inference.api.web;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -195,7 +194,7 @@ class ReasoningTest {
                 List.of(
                         "Need the weather.",
                         "\n</think>\n\n",
-                        "{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}]}"),
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"),
                 true);
         JsonNode response = json(
                 200,
@@ -212,10 +211,24 @@ class ReasoningTest {
         assertEquals("tool_calls", response.at("/choices/0/finish_reason").asString());
         var generation = this.backend.only();
         assertTrue(generation.output.reasoning());
-        assertNotNull(generation.grammar, "the answer after the reasoning is constrained");
-        assertTrue(generation.grammar.startsWith("start: GAP? body"), "the answer may follow a blank line");
+        assertNull(generation.grammar, "under auto the answer after the reasoning is free");
         assertTrue(generation.prompt.startsWith("<|im_start|>system\n" + XHIGH), generation.prompt);
         assertTrue(generation.prompt.contains("in the final answer.\n\n# Tools"), generation.prompt);
+    }
+
+    @Test
+    void aRequiredCallMayFollowTheBlankLineAfterReasoning() throws Exception {
+        this.backend.script = ScriptedInferenceBackend.tokens(
+                List.of(
+                        "Need the weather.",
+                        "\n</think>\n\n",
+                        "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"),
+                true);
+        json(
+                200,
+                "{\"model\":\"" + MODEL + "\",\"tool_choice\":\"required\",\"tools\":[{\"type\":\"function\","
+                        + "\"function\":{\"name\":\"get_weather\"}}]," + HELLO + "}");
+        assertTrue(this.backend.only().grammar.startsWith("start: GAP? calls"), "the call may follow a blank line");
     }
 
     @Test

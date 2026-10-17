@@ -10,10 +10,11 @@ import java.util.regex.Pattern;
 /// The functions one request offers and how the model may call them, validated at admission.
 ///
 /// `NONE` omits the definitions from the prompt, as if no tools were sent, so the model is never told it
-/// can call and its output is plain text. `AUTO` constrains sampling to a JSON call or a JSON answer,
-/// `REQUIRED` and `FUNCTION` to a call ([OutputGrammar#tools]); the parser rejects a malformed or incomplete
-/// envelope. `FUNCTION` also restricts every call in the response to `function`. Without `parallel`,
-/// decoding ends once the first call is complete.
+/// can call and its output is plain text. `AUTO` leaves sampling free, and [ToolCallParser] splits the checkpoint's
+/// native `<tool_call>` blocks from the text (a JSON response format constrains it to a call or a JSON answer).
+/// `REQUIRED` and `FUNCTION` constrain sampling to native calls ([OutputGrammar#tools]); the parser rejects a
+/// malformed or incomplete call. `FUNCTION` also restricts every call in the response to `function`. Without
+/// `parallel`, decoding ends once the first call is complete.
 public record ToolCalling(List<FunctionTool> tools, Choice choice, String function, boolean parallel) {
     static final ToolCalling DISABLED = new ToolCalling(List.of(), Choice.NONE, null, true);
     private static final Pattern FUNCTION_NAME = Pattern.compile("[a-zA-Z0-9_-]{1,64}");
@@ -139,10 +140,11 @@ public record ToolCalling(List<FunctionTool> tools, Choice choice, String functi
         if (properties != null) {
             if (!(properties instanceof Map<?, ?> named))
                 throw ApiException.invalidRequest("'properties' must be an object.", path + ".properties");
-            // JSON object keys may contain delimiter-looking text; they do not use XML parameters.
             for (Object name : named.keySet()) {
                 if (!isParameterName((String) name))
-                    throw ApiException.invalidRequest("Parameter names must be non-empty.", path + ".properties");
+                    throw ApiException.invalidRequest(
+                            "Parameter names must be non-empty and free of '<', '>' and line breaks.",
+                            path + ".properties");
             }
         }
         Object required = schema.get("required");
@@ -154,7 +156,9 @@ public record ToolCalling(List<FunctionTool> tools, Choice choice, String functi
                 String name = (String) entry;
                 if (!isParameterName(name) || !names.add(name))
                     throw ApiException.invalidRequest(
-                            "Required parameter names must be unique and non-empty.", path + ".required");
+                            "Required parameter names must be unique, non-empty and free of '<', '>' and line"
+                                    + " breaks.",
+                            path + ".required");
                 if (Boolean.FALSE.equals(schema.get("additionalProperties"))
                         && (!(properties instanceof Map<?, ?> declared) || !declared.containsKey(name)))
                     throw ApiException.invalidRequest(
@@ -170,8 +174,9 @@ public record ToolCalling(List<FunctionTool> tools, Choice choice, String functi
         return FUNCTION_NAME.matcher(name).matches();
     }
 
+    /// A parameter is written as `<parameter=NAME>`, so its name cannot hold the tag's delimiters.
     public static boolean isParameterName(String name) {
-        return !name.isEmpty();
+        return !name.isEmpty() && name.chars().noneMatch(c -> c == '<' || c == '>' || c == '\n' || c == '\r');
     }
 
     private static void checkKeys(Map<?, ?> object, Set<String> known, String path) {
@@ -194,7 +199,7 @@ public record ToolCalling(List<FunctionTool> tools, Choice choice, String functi
                 .toList();
     }
 
-    /// Do not prefill an incomplete JSON object: the checkpoint may stop before closing it.
+    /// Text the generation begins with after the prompt: none, so the model opens the call or the answer itself.
     String generationPrefix() {
         return "";
     }

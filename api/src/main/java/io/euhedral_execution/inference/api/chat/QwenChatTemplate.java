@@ -3,8 +3,6 @@ package io.euhedral_execution.inference.api.chat;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -54,18 +52,6 @@ public final class QwenChatTemplate {
             + " consistency, and clarity in the final answer.";
     private static final String LOW_INSTRUCTIONS = "Reasoning effort is set to low. Keep your thinking brief and"
             + " focused, moving directly to the conclusion without unnecessary elaboration.";
-    private static final String JSON_TOOL_INSTRUCTIONS = "\n\nIf a function is needed, reply ONLY with one JSON object"
-            + " in this exact form: {\"tool_calls\":[{\"name\":\"function_name\",\"arguments\":{\"parameter\":\"value\"}}]}."
-            + " Use valid JSON with arguments as an object, function names from the tools above. Tool results"
-            + " arrive as a JSON tool_results array in call order."
-            + " If no function is needed, reply ONLY with {\"content\":\"answer\"}, putting the full answer"
-            + " in the JSON string. Never emit markdown, XML, or text outside the JSON object.";
-    /// The same, when a direct answer must be a JSON document of the response format.
-    private static final String JSON_TOOL_INSTRUCTIONS_STRUCTURED = JSON_TOOL_INSTRUCTIONS.replace(
-            "{\"content\":\"answer\"}, putting the full answer in the JSON string",
-            "{\"content\":RESPONSE}, where RESPONSE is your full answer as the JSON value the response format"
-                    + " requires");
-
     /// Exact Jinja source fragments whose behavior `render` reproduces. `\n` is the Jinja escape.
     private static final List<String> REQUIRED_FRAGMENTS = List.of(
             "{%- if tools and tools is iterable and tools is not mapping %}",
@@ -239,36 +225,6 @@ public final class QwenChatTemplate {
     /// Renders the conversation with tool definitions, each a JSON object serialized as the template's
     /// `tool | tojson`. An empty list renders exactly as the template does without tools.
     public String render(List<Turn> turns, List<Map<String, Object>> tools, Thinking thinking) {
-        return render(turns, tools, thinking, 0, "");
-    }
-
-    /// Uses JSON tool-call envelopes instead of unescaped XML parameter values. With `structuredAnswer` a direct
-    /// answer is a JSON document rather than a JSON string.
-    public String renderJsonTools(List<Turn> turns, ToolCalling calling, boolean structuredAnswer, Thinking thinking) {
-        List<Map<String, Object>> tools = calling.promptTools();
-        if (tools.isEmpty()) throw new IllegalArgumentException("JSON tool rendering requires offered tools");
-        String constraint =
-                switch (calling.choice()) {
-                    case REQUIRED ->
-                        " For this turn you MUST call one of the offered functions; do not answer directly.";
-                    case FUNCTION -> " For this turn you must call " + calling.function() + "; do not answer directly.";
-                    case AUTO -> "";
-                    case NONE -> throw new IllegalArgumentException("none cannot call functions");
-                };
-        String callCount = calling.parallel()
-                ? " Multiple calls belong in the same array."
-                : " At most one function call is allowed in tool_calls.";
-        return render(turns, tools, thinking, structuredAnswer ? 2 : 1, callCount + constraint);
-    }
-
-    public String renderJsonTools(List<Turn> turns, ToolCalling calling, Thinking thinking) {
-        return renderJsonTools(turns, calling, false, thinking);
-    }
-
-    /// `jsonMode` 0 renders the template's XML calls, 1 JSON envelopes, 2 envelopes with a JSON-document answer.
-    private String render(
-            List<Turn> turns, List<Map<String, Object>> tools, Thinking thinking, int jsonMode, String constraint) {
-        boolean jsonTools = jsonMode > 0;
         Objects.requireNonNull(turns, "turns");
         Objects.requireNonNull(tools, "tools");
         Objects.requireNonNull(thinking, "thinking");
@@ -284,11 +240,8 @@ public final class QwenChatTemplate {
             for (Map<String, Object> tool : tools)
                 prompt.append('\n').append(escapeControlTokens(PythonJson.dumps(tool)));
             prompt.append("\n</tools>");
-            if (!jsonTools) prompt.append(TOOL_INSTRUCTIONS);
+            prompt.append(TOOL_INSTRUCTIONS);
             if (!system.isEmpty()) prompt.append("\n\n").append(system);
-            if (jsonTools)
-                prompt.append(jsonMode == 2 ? JSON_TOOL_INSTRUCTIONS_STRUCTURED : JSON_TOOL_INSTRUCTIONS)
-                        .append(constraint);
             prompt.append(IM_END).append('\n');
         } else if (!system.isEmpty() || !instructions.isEmpty()) {
             prompt.append(IM_START).append("system\n").append(instructions);
@@ -322,31 +275,21 @@ public final class QwenChatTemplate {
                                 .append(THINK_END)
                                 .append("\n\n");
                     prompt.append(escapeControlTokens(content));
-                    if (jsonTools) appendJsonToolCalls(turn.toolCalls(), !content.isEmpty(), prompt);
-                    else appendToolCalls(turn.toolCalls(), !content.isEmpty(), prompt);
+                    appendToolCalls(turn.toolCalls(), !content.isEmpty(), prompt);
                     prompt.append(IM_END).append('\n');
                 }
                 // Consecutive tool results share one user turn; the template opens it only after a non-tool turn.
                 case TOOL -> {
-                    if (jsonTools) {
-                        if (index > 0 && turns.get(index - 1).role() != Role.TOOL)
-                            prompt.append(IM_START).append("user\n{\"tool_results\": [");
-                        else prompt.append(", ");
-                        prompt.append(escapeControlTokens(PythonJson.dumps(content)));
-                        if (index == turns.size() - 1 || turns.get(index + 1).role() != Role.TOOL)
-                            prompt.append("]}").append(IM_END).append('\n');
-                    } else {
-                        if (index > 0 && turns.get(index - 1).role() != Role.TOOL)
-                            prompt.append(IM_START).append("user");
-                        prompt.append('\n')
-                                .append(TOOL_RESPONSE_START)
-                                .append('\n')
-                                .append(escapeControlTokens(content))
-                                .append('\n')
-                                .append(TOOL_RESPONSE_END);
-                        if (index == turns.size() - 1 || turns.get(index + 1).role() != Role.TOOL)
-                            prompt.append(IM_END).append('\n');
-                    }
+                    if (index > 0 && turns.get(index - 1).role() != Role.TOOL)
+                        prompt.append(IM_START).append("user");
+                    prompt.append('\n')
+                            .append(TOOL_RESPONSE_START)
+                            .append('\n')
+                            .append(escapeControlTokens(content))
+                            .append('\n')
+                            .append(TOOL_RESPONSE_END);
+                    if (index == turns.size() - 1 || turns.get(index + 1).role() != Role.TOOL)
+                        prompt.append(IM_END).append('\n');
                 }
             }
         }
@@ -374,19 +317,6 @@ public final class QwenChatTemplate {
             }
             prompt.append("</function>\n").append(TOOL_CALL_END);
         }
-    }
-
-    private static void appendJsonToolCalls(List<ToolCall> calls, boolean afterContent, StringBuilder prompt) {
-        if (calls.isEmpty()) return;
-        if (afterContent) prompt.append("\n\n");
-        List<Map<String, Object>> entries = new ArrayList<>(calls.size());
-        for (ToolCall call : calls) {
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("name", call.name());
-            entry.put("arguments", call.arguments());
-            entries.add(entry);
-        }
-        prompt.append(escapeControlTokens(PythonJson.dumps(Map.of("tool_calls", entries))));
     }
 
     /// Protect untrusted text from checkpoint control-token recognition without changing ordinary

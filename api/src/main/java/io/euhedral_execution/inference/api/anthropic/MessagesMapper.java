@@ -274,7 +274,8 @@ public class MessagesMapper {
     private static Map<String, Object> stringKeys(Map<?, ?> input, String path) {
         for (Object key : input.keySet())
             if (!ToolCalling.isParameterName((String) key))
-                throw ApiException.invalidRequest(path + ": argument names must be non-empty", path);
+                throw ApiException.invalidRequest(
+                        path + ": argument names must be non-empty and free of '<', '>' and line breaks", path);
         return (Map<String, Object>) input;
     }
 

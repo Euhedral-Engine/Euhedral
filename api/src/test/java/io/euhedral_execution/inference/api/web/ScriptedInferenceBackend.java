@@ -202,12 +202,17 @@ final class ScriptedInferenceBackend implements InferenceBackend {
                 this.workers);
     }
 
-    /// Real llguidance over a byte vocabulary: whether a grammar or schema compiles does not depend on the
-    /// vocabulary, so requests are refused as the engine refuses them.
+    /// Real llguidance over a byte vocabulary and the tool-call control tokens a grammar names: whether a grammar or
+    /// schema compiles does not depend on the rest of the vocabulary, so requests are refused as the engine
+    /// refuses them.
+    private static final String[] CONTROL_TOKENS = {"<eos>", "<tool_call>", "</tool_call>"};
+
     private static final GrammarCompiler GRAMMARS = new GrammarCompiler(
             Llguidance.load(Path.of(System.getProperty("euhedral.llguidance.library"))),
-            257,
-            id -> id < 256 ? new byte[] {(byte) id} : new byte[] {(byte) 0xff, '<', 'e', 'o', 's', '>'},
+            256 + CONTROL_TOKENS.length,
+            id -> id < 256
+                    ? new byte[] {(byte) id}
+                    : ("\u00ff" + CONTROL_TOKENS[id - 256]).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1),
             new int[] {256});
 
     @Override

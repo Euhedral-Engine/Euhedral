@@ -46,8 +46,8 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     // Null when the output does not open in the think block.
     private final ReasoningSplitter reasoning;
     // Null when the request offers no callable tools: output is then plain text, byte for byte.
-    private final JsonToolCallParser toolParser;
-    // The answer of a JSON response format without tools, checked once whole.
+    private final ToolCallParser toolParser;
+    // The answer of a JSON response format, checked once whole when it made no calls.
     private final StringBuilder jsonAnswer;
     // Set by container threads and failed writes; read everywhere.
     private final AtomicBoolean abandoned = new AtomicBoolean();
@@ -78,10 +78,8 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
         this.finished = finished;
         this.stopFilter = new StopSequenceFilter(plan.stops());
         this.reasoning = plan.reasoning() ? new ReasoningSplitter() : null;
-        this.toolParser = plan.tools().parsesOutput()
-                ? new JsonToolCallParser(plan.tools(), plan.format().json())
-                : null;
-        this.jsonAnswer = plan.format().json() && this.toolParser == null ? new StringBuilder() : null;
+        this.toolParser = plan.tools().parsesOutput() ? new ToolCallParser(plan.tools()) : null;
+        this.jsonAnswer = plan.format().json() ? new StringBuilder() : null;
     }
 
     /// The client's connection, probed as the generation progresses: `gone` completes the request when the probe
@@ -176,8 +174,12 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
                 deliverFailure(ApiException.unavailable("Generation was interrupted by engine shutdown."));
                 return;
             }
-            // The grammar admits only valid documents; a finished one that does not parse is never returned.
-            if (this.jsonAnswer != null && result.stopTokenReached() && !isJson(this.jsonAnswer.toString())) {
+            // The grammar admits only valid documents; a finished one that does not parse is never returned. An
+            // answer that made calls is their text, which the calls' grammar does not constrain to JSON.
+            if (this.jsonAnswer != null
+                    && result.stopTokenReached()
+                    && (this.toolParser == null || this.toolParser.calls() == 0)
+                    && !isJson(this.jsonAnswer.toString())) {
                 LOG.error("Generation {} produced invalid JSON under its response format", this.plan.id());
                 deliverFailure(ApiException.invalidStructuredOutput());
                 return;
@@ -251,7 +253,7 @@ final class ChatGeneration implements ToolCallParser.Output, ReasoningSplitter.O
     public void answer(String text) {
         if (this.malformedToolCall != null || this.stopFilter.matched()) return;
         try {
-            // Match stops on raw output before parsing a JSON tool-call envelope.
+            // Match stops on raw output before parsing tool calls.
             String visible = this.stopFilter.accept(text);
             if (this.stopFilter.matched()) this.generation.cancel();
             if (this.toolParser == null) content(visible);

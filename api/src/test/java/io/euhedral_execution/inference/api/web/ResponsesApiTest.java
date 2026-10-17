@@ -104,7 +104,9 @@ class ResponsesApiTest {
     @Test
     void functionCallsAndOutputsContinueTheConversation() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(
-                List.of("{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}]}"), true);
+                List.of(
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"),
+                true);
         JsonNode response = post(
                 200,
                 "{\"model\":\"" + MODEL + "\",\"reasoning\":{\"effort\":\"none\"},\"input\":\"Weather?\"," + WEATHER
@@ -114,12 +116,10 @@ class ResponsesApiTest {
         assertEquals("get_weather", call.get("name").asString());
         assertEquals("{\"city\":\"Oslo\"}", call.get("arguments").asString());
         assertTrue(call.get("call_id").asString().startsWith("call_"));
-        String grammar = this.backend.only().grammar;
-        assertTrue(grammar.contains("arguments_0: %json {\"x-guidance\""), grammar);
-        assertTrue(grammar.contains("\"additionalProperties\":false"), "function tools are strict by default");
+        assertEquals(null, this.backend.only().grammar, "under auto the model generates freely");
 
         this.backend.generations.clear();
-        this.backend.script = ScriptedInferenceBackend.tokens(List.of("{\"content\":\"Cold.\"}"), true);
+        this.backend.script = ScriptedInferenceBackend.tokens(List.of("Cold."), true);
         JsonNode next = post(
                 200,
                 "{\"model\":\"" + MODEL + "\",\"reasoning\":{\"effort\":\"none\"}," + WEATHER + ",\"input\":["
@@ -128,7 +128,7 @@ class ResponsesApiTest {
                         + call.get("call_id").asString()
                         + "\",\"output\":\"-3C\"}]}");
         assertEquals("Cold.", next.at("/output/0/content/0/text").asString());
-        assertTrue(this.backend.only().prompt.contains("{\"tool_results\": [\"-3C\"]}"));
+        assertTrue(this.backend.only().prompt.contains("<tool_response>\n-3C\n</tool_response>"));
         post(
                 400,
                 "{\"model\":\"" + MODEL + "\"," + WEATHER + ",\"input\":[{\"role\":\"user\",\"content\":\"Weather?\"},"
@@ -138,12 +138,29 @@ class ResponsesApiTest {
     @Test
     void aNonStrictToolTakesAnyObject() throws Exception {
         this.backend.emptyReasoning = true;
+        this.backend.script =
+                ScriptedInferenceBackend.tokens(List.of("<tool_call>\n<function=f>\n</function>\n</tool_call>"), true);
         post(
                 200,
                 "{\"model\":\"" + MODEL + "\",\"input\":\"x\",\"tools\":[{\"type\":\"function\",\"name\":\"f\","
-                        + "\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"a\":{\"not\":{}}}}}]}");
-        assertTrue(this.backend.only().grammar.contains("arguments_0: %json {\"x-guidance\":{\"whitespace_pattern\""));
-        assertTrue(this.backend.only().grammar.contains("\"type\":\"object\"}"));
+                        + "\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"a\":{\"not\":{}}}}}],"
+                        + "\"tool_choice\":\"required\"}");
+        String grammar = this.backend.only().grammar;
+        assertTrue(grammar.contains("parameter_0: \"<parameter=\" KEY"), grammar);
+        assertTrue(!grammar.contains("%json"), "a non-strict function takes any parameters");
+    }
+
+    @Test
+    void functionToolsAreStrictByDefault() throws Exception {
+        this.backend.emptyReasoning = true;
+        this.backend.script = ScriptedInferenceBackend.tokens(
+                List.of(
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"),
+                true);
+        post(200, "{\"model\":\"" + MODEL + "\",\"input\":\"x\"," + WEATHER + ",\"tool_choice\":\"required\"}");
+        String grammar = this.backend.only().grammar;
+        assertTrue(grammar.contains("\"city\""), grammar);
+        assertTrue(!grammar.contains("KEY \">"), "a strict function takes only its declared parameters");
     }
 
     @Test
@@ -209,7 +226,9 @@ class ResponsesApiTest {
     @Test
     void aStreamedFunctionCallCarriesItsArguments() throws Exception {
         this.backend.script = ScriptedInferenceBackend.tokens(
-                List.of("{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}]}"), true);
+                List.of(
+                        "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"),
+                true);
         List<JsonNode> events = stream("{\"model\":\"" + MODEL
                 + "\",\"reasoning\":{\"effort\":\"none\"},\"input\":\"x\",\"stream\":true," + WEATHER + "}");
         List<String> types = new ArrayList<>();

@@ -1,6 +1,7 @@
 package io.euhedral_execution.inference.api.chat;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -35,43 +36,121 @@ class OutputGrammarTest {
                 Llguidance.load(Path.of(System.getProperty("euhedral.llguidance.library"))), tokenizer, 248320);
     }
 
+    private static final String OSLO = "<parameter=city>\nOslo\n</parameter>\n";
+
     @Test
-    void autoToolsAllowACallOrADirectAnswerAndNothingElse() {
-        String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.AUTO, true, false), null, false);
-        assertTrue(
-                finishes(grammar, "{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}]}"));
-        assertTrue(finishes(grammar, "{\"content\":\"It is cold.\"}"));
-        assertFalse(finishes(grammar, "{\"tool_calls\":[{\"name\":\"get_time\",\"arguments\":{}}]}"));
+    void autoWithAJsonAnswerAllowsACallOrTheDocumentAndNothingElse() {
+        Map<String, Object> answer = schema("{\"type\":\"object\",\"properties\":"
+                + "{\"answer\":{\"type\":\"integer\"}},\"required\":[\"answer\"]}");
+        String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.AUTO, true, false), answer, false);
+        compiler.check(grammar);
+        assertTrue(finishes(grammar, call("get_weather", OSLO)));
+        assertTrue(finishes(grammar, "{\"answer\":42}"));
+        assertFalse(finishes(grammar, "{\"answer\":\"42\"}"));
         assertFalse(finishes(grammar, "It is cold."));
-        assertFalse(finishes(grammar, "<tool_call>"));
-        assertFalse(finishes(grammar, " {\"content\":\"x\"}"), "without reasoning the answer starts at once");
-        assertTrue(
-                finishes(
-                        grammar,
-                        "{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\": 1, \"x\": []}}]}"),
-                "a non-strict function takes any object");
+        assertFalse(finishes(grammar, call("get_time", "")), "only offered functions");
+        assertFalse(finishes(grammar, " {\"answer\":42}"), "without reasoning the answer starts at once");
+        String reasoning = OutputGrammar.tools(calling(ToolCalling.Choice.AUTO, true, false), answer, true);
+        assertTrue(finishes(reasoning, "\n\n" + call("get_weather", OSLO)));
+        assertTrue(finishes(reasoning, "\n\n{\"answer\":1}"));
     }
 
     @Test
-    void strictArgumentsFollowTheSchema() {
+    void aRequiredCallOffersNoAnswer() {
+        String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, true, false), null, false);
+        compiler.check(grammar);
+        assertTrue(finishes(grammar, call("get_weather", OSLO)));
+        assertFalse(finishes(grammar, "It is cold."));
+        assertFalse(finishes(grammar, ""));
+    }
+
+    @Test
+    void aNonStrictFunctionTakesAnyNamesAndTextValues() {
+        String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, true, false), null, false);
+        assertTrue(finishes(grammar, call("get_weather", "")));
+        assertTrue(finishes(grammar, call("get_weather", OSLO + "<parameter=x-1>\n[1, 2]\n</parameter>\n")));
+        assertTrue(finishes(grammar, call("get_weather", "<parameter=a>\n\n</parameter>\n")));
+        assertTrue(finishes(grammar, call("get_weather", "<parameter=a>\nline\nline two\n</parameter>\n")));
+        assertFalse(finishes(grammar, call("get_weather", "<parameter=a b>\nx\n</parameter>\n")), "key characters");
+        assertFalse(finishes(grammar, "<tool_call>\n<function=get_weather>\n</function>"), "unclosed call");
+    }
+
+    @Test
+    void aStringValueCannotContainTheClosingTag() {
+        String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, true, false), null, false);
+        assertFalse(finishes(grammar, call("get_weather", "<parameter=a>\nx</parameter>y\n</parameter>\n")));
+        assertFalse(finishes(grammar, call("get_weather", "<parameter=a>\nx</parameter>\ny\n</parameter>\n")));
+        assertTrue(finishes(grammar, call("get_weather", "<parameter=a>\nx</paramete\n</parameter>\n")));
+        assertTrue(finishes(grammar, call("get_weather", "<parameter=a>\nif a < b && c</d> then\n</parameter>\n")));
+        assertTrue(finishes(grammar, call("get_weather", "<parameter=a>\n</parameter\n</parameter>\n")));
+        String strict = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, true, true), null, false);
+        assertFalse(finishes(strict, call("get_weather", "<parameter=city>\nOs</parameter>lo\n</parameter>\n")));
+        assertTrue(finishes(strict, call("get_weather", "<parameter=city>\nOs</paramete lo<\n</parameter>\n")));
+    }
+
+    @Test
+    void strictParametersFollowTheSchemaInOrder() {
         String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, true, true), null, false);
-        assertTrue(finishes(grammar, call("{\"city\":\"Oslo\",\"units\":\"metric\"}")));
-        assertTrue(finishes(grammar, call("{\"city\": \"Oslo\"}")));
-        assertFalse(finishes(grammar, call("{\"units\":\"metric\"}")), "required property missing");
-        assertFalse(finishes(grammar, call("{\"city\":\"Oslo\",\"units\":\"kelvin\"}")), "enum");
-        assertFalse(finishes(grammar, call("{\"city\":\"Oslo\",\"wind\":true}")), "additional property");
-        assertFalse(finishes(grammar, call("{\"city\":7}")), "type");
-        assertFalse(finishes(grammar, "{\"content\":\"x\"}"), "a required call offers no answer");
+        compiler.check(grammar);
+        String units = "<parameter=units>\nmetric\n</parameter>\n";
+        assertTrue(finishes(grammar, call("get_weather", OSLO + units)));
+        assertTrue(finishes(grammar, call("get_weather", OSLO)));
+        assertFalse(finishes(grammar, call("get_weather", units)), "required property missing");
+        assertFalse(finishes(grammar, call("get_weather", units + OSLO)), "schema order");
+        assertFalse(finishes(grammar, call("get_weather", OSLO + "<parameter=units>\nkelvin\n</parameter>\n")), "enum");
+        assertFalse(finishes(grammar, call("get_weather", OSLO + "<parameter=wind>\n1\n</parameter>\n")), "extra");
+        assertFalse(finishes(grammar, call("get_weather", OSLO + OSLO)), "repeated");
     }
 
     @Test
-    void aSingleCallLimitEndsTheArrayAfterOneCall() {
-        String grammar = OutputGrammar.tools(calling(ToolCalling.Choice.AUTO, false, false), null, false);
-        String one = "{\"name\":\"get_weather\",\"arguments\":{}}";
-        assertTrue(finishes(grammar, "{\"tool_calls\":[" + one + "]}"));
-        assertFalse(finishes(grammar, "{\"tool_calls\":[" + one + "," + one + "]}"));
-        String parallel = OutputGrammar.tools(calling(ToolCalling.Choice.AUTO, true, false), null, false);
-        assertTrue(finishes(parallel, "{\"tool_calls\":[" + one + "," + one + "]}"));
+    void strictNonStringParametersAreJsonOfTheirSchema() {
+        Map<String, Object> schema = schema("""
+                {"type":"object","properties":{"count":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"}},
+                 "note":{"type":["string","null"]},"free":{},"mode":{"$ref":"#/$defs/mode"}},
+                 "required":["count","mode"],"additionalProperties":false,
+                 "$defs":{"mode":{"type":"integer","enum":[1,2]}}}""");
+        var tool = new FunctionTool("record", null, schema, true);
+        String grammar = OutputGrammar.tools(
+                new ToolCalling(List.of(tool), ToolCalling.Choice.FUNCTION, "record", true), null, false);
+        compiler.check(grammar);
+        String mode = "<parameter=mode>\n2\n</parameter>\n";
+        String count = "<parameter=count>\n3\n</parameter>\n";
+        assertTrue(finishes(grammar, call("record", count + mode)));
+        assertTrue(finishes(
+                grammar,
+                call(
+                        "record",
+                        count + "<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n"
+                                + "<parameter=note>\nfree text\n</parameter>\n<parameter=free>\nx y\n</parameter>\n"
+                                + mode)));
+        assertFalse(finishes(grammar, call("record", "<parameter=count>\nthree\n</parameter>\n" + mode)));
+        assertFalse(finishes(grammar, call("record", count + "<parameter=mode>\n5\n</parameter>\n")), "$ref enum");
+        assertFalse(finishes(grammar, call("record", count)), "required property missing");
+    }
+
+    @Test
+    void aNamedFunctionIsTheOnlyChoice() {
+        var weather = new FunctionTool("get_weather", null, WEATHER, true);
+        var time = new FunctionTool("get_time", null, null, false);
+        String grammar = OutputGrammar.tools(
+                new ToolCalling(List.of(weather, time), ToolCalling.Choice.FUNCTION, "get_time", true), null, false);
+        assertTrue(finishes(grammar, call("get_time", "")));
+        assertFalse(finishes(grammar, call("get_weather", OSLO)));
+        String either = OutputGrammar.tools(
+                new ToolCalling(List.of(weather, time), ToolCalling.Choice.REQUIRED, null, true), null, false);
+        assertTrue(finishes(either, call("get_weather", OSLO)));
+        assertTrue(finishes(either, call("get_time", "")));
+    }
+
+    @Test
+    void parallelCallsAreSeparatedByANewline() {
+        String one = call("get_weather", OSLO);
+        String single = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, false, true), null, false);
+        assertTrue(finishes(single, one));
+        assertFalse(finishes(single, one + "\n" + one));
+        String parallel = OutputGrammar.tools(calling(ToolCalling.Choice.REQUIRED, true, true), null, false);
+        assertTrue(finishes(parallel, one + "\n" + one));
+        assertFalse(finishes(parallel, one + one));
     }
 
     @Test
@@ -84,23 +163,17 @@ class OutputGrammarTest {
         String grammar = OutputGrammar.tools(
                 new ToolCalling(List.of(tool), ToolCalling.Choice.REQUIRED, null, true), null, false);
         compiler.check(grammar);
-        assertTrue(finishes(
-                grammar,
-                "{\"tool_calls\":[{\"name\":\"walk\",\"arguments\":" + "{\"head\":{\"v\":1,\"next\":{\"v\":2}}}}]}"));
-        assertFalse(finishes(
-                grammar,
-                "{\"tool_calls\":[{\"name\":\"walk\",\"arguments\":" + "{\"head\":{\"v\":1,\"next\":{\"w\":2}}}}]}"));
+        assertTrue(finishes(grammar, call("walk", "<parameter=head>\n{\"v\":1,\"next\":{\"v\":2}}\n</parameter>\n")));
+        assertFalse(finishes(grammar, call("walk", "<parameter=head>\n{\"v\":1,\"next\":{\"w\":2}}\n</parameter>\n")));
     }
 
     @Test
-    void aStructuredAnswerBesideToolsIsADocumentOfTheResponseSchema() {
-        String grammar = OutputGrammar.tools(
-                calling(ToolCalling.Choice.AUTO, true, false),
-                schema("{\"type\":\"object\",\"properties\":"
-                        + "{\"answer\":{\"type\":\"integer\"}},\"required\":[\"answer\"]}"),
-                false);
-        assertTrue(finishes(grammar, "{\"content\":{\"answer\":42}}"));
-        assertFalse(finishes(grammar, "{\"content\":\"42\"}"));
+    void aStringKeywordTheGrammarCannotEnforceIsRefused() {
+        Map<String, Object> schema = schema("""
+                {"type":"object","properties":{"id":{"type":"string","pattern":"^a+$"}},"required":["id"]}""");
+        var tool = new FunctionTool("lookup", null, schema, true);
+        var calling = new ToolCalling(List.of(tool), ToolCalling.Choice.REQUIRED, null, true);
+        assertThrows(ApiException.class, () -> OutputGrammar.tools(calling, null, false));
     }
 
     @Test
@@ -114,8 +187,8 @@ class OutputGrammarTest {
         assertFalse(finishes(plain, "[1," + " ".repeat(41) + "2]"), "whitespace runs are bounded");
     }
 
-    private static String call(String arguments) {
-        return "{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":" + arguments + "}]}";
+    private static String call(String name, String parameters) {
+        return "<tool_call>\n<function=" + name + ">\n" + parameters + "</function>\n</tool_call>";
     }
 
     private static ToolCalling calling(ToolCalling.Choice choice, boolean parallel, boolean strict) {

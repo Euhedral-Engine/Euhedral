@@ -93,6 +93,44 @@ class ToolCallParserTest {
         }
     }
 
+    @Test
+    void aRequiredChoiceWithoutACallIsMalformedOnceTheModelStops() throws Exception {
+        var tools =
+                new ToolCalling(List.of(new FunctionTool("f", null, null)), ToolCalling.Choice.REQUIRED, null, true);
+        var parser = new ToolCallParser(tools);
+        parser.accept("No call.", new RecordingOutput());
+        assertThrows(ToolCallParser.MalformedToolCallException.class, () -> parser.finish(true, new RecordingOutput()));
+        var truncated = new ToolCallParser(tools);
+        truncated.accept("No call.", new RecordingOutput());
+        truncated.finish(false, new RecordingOutput());
+    }
+
+    @Test
+    void answerTextStreamsAsItArrivesAndOnlyATagPrefixIsHeldBack() throws Exception {
+        var tools = new ToolCalling(List.of(new FunctionTool("f", null, null)), ToolCalling.Choice.AUTO, null, true);
+        var parser = new ToolCallParser(tools);
+        var output = new RecordingOutput();
+        parser.accept("It is", output);
+        parser.accept(" cold <tool", output);
+        assertEquals(List.of("It is", " cold"), output.content);
+        parser.accept("_call>\n<function=f>\n</function>\n</tool_call>", output);
+        parser.finish(true, output);
+        assertEquals(List.of("It is", " cold"), output.content);
+        assertEquals(List.of("{}"), output.arguments);
+    }
+
+    @Test
+    void withoutParallelCallsTextAfterTheFirstCallIsDiscarded() throws Exception {
+        var tools = new ToolCalling(List.of(new FunctionTool("f", null, null)), ToolCalling.Choice.AUTO, null, false);
+        var parser = new ToolCallParser(tools);
+        var output = new RecordingOutput();
+        String call = "<tool_call>\n<function=f>\n</function>\n</tool_call>";
+        parser.accept(call + "\n" + call + " more", output);
+        parser.finish(true, output);
+        assertEquals(List.of("{}"), output.arguments);
+        assertEquals(List.of(), output.content);
+    }
+
     private static String arguments(String parametersJson, String... keyValues) throws Exception {
         @SuppressWarnings("unchecked")
         Map<String, Object> parameters = JsonMapper.shared().readValue(parametersJson, Map.class);
