@@ -104,3 +104,69 @@ cost model):
 
 Every allocation above but the pure NVFP4 and trellis 4.0 ones fits on the 16 GB card at that context with every
 weight resident.
+
+## Search
+
+`quantization allocate` searches for allocations on the Pareto front of search KL, prefill time and 5-row
+verification time, among those whose every weight stays on the device at a target context (`--context`; the
+residency planner decides). Each round:
+
+1. fits a bootstrap ensemble of a fidelity model to the KL measured so far: per-object prior errors (the trellis
+   proxy error, NVFP4's weighted rounding error) weighted per family and layer band, pairwise terms within a layer and
+   between neighbouring bands, and a bend `kl = s·x^γ` for compounding, with non-negative weights;
+2. runs Riemannian Constrained Optimization (RCO; Helcig and Alistarh, [arXiv:2605.00649](https://arxiv.org/abs/2605.00649),
+   [IST-DASLab/RCO](https://github.com/IST-DASLab/RCO)) on the ensemble mean plus `--lambdas`-weighted prefill and
+   verification times, under the byte budget, once per weight pair and budget fraction;
+3. gives part of the batch (`explore`) to feasible proposals the ensemble members disagree on most, and to single
+   moves of the front's points;
+4. assembles each proposal as a composite view, checks it with the residency planner and scores it in the engine
+   against the search reference (row-exact verification, several candidates on the device at once over one cache of
+   their shared weights).
+
+Every measurement goes into one resume file; a stopped search resumes from it, and `--import-state` starts a search
+from another's measurements, refitted to its own budget and context. Held-out error is the mean absolute log ratio of
+the ensemble's predicted KL to the KL measured for the round's proposals, before they are fitted (0.06: predictions
+about 6% off).
+
+| Context | Rounds | Measured | Front | Held-out error, last round | Lowest search KL on the front |
+|---|---|---|---|---|---|
+| 32,768 | 30 | 277 | 80 | 0.125 | 0.0438, 12.75 GiB |
+| 131,072 | 30 | 517 (277 imported) | 57 | 0.060 | 0.0659, 11.01 GiB |
+
+At 131,072 tokens 48 of the 277 imported allocations fit.
+
+## 128K finalists
+
+Two points of the 131,072-token front, assembled to files and measured like the README's artifacts (MTP depth 4,
+chosen from 3, 4 and 5 by 4K decode; +150 MHz core, +1500 MHz memory, 350 W; 2026-10-16):
+
+| Finalist | File | Formats per family (objects) |
+|---|---|---|
+| most accurate | 11.02 GiB | MLP down mostly trellis 3.5 (51 of 64), MLP gate/up mostly 3.0 (44), GDN output 3.5 and 4.0 (24, 16), GDN query/key 3.0 and 4.0 (23, 19) with 5 NVFP4, GDN value/z 2.5 and 3.0 (14, 34), attention mostly 3.0 and 4.0 |
+| fastest prefill | 10.96 GiB | MLP down mostly NVFP4 (36 of 64), GDN output 20 NVFP4, MLP gate/up mostly 3.0 (42) with 6 NVFP4, GDN value/z almost all 2.5 (46 of 48), attention 2.5 to 4.0 with 4 NVFP4 |
+
+| Finalist | | 4K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| most accurate | prefill tok/s | 1,376 | 1,204 | 1,062 | 853 |
+| | decode tok/s (MTP) | 137.8 | 142.8 | 111.3 | 79.0 |
+| | time to first token | 2.89 s | 27.1 s | 59.8 s | 150 s |
+| | device memory in use | 11.63 GiB | 12.16 GiB | 12.72 GiB | 13.90 GiB |
+| fastest prefill | prefill tok/s | 1,589 | 1,364 | 1,185 | 931 |
+| | decode tok/s (MTP) | 132.9 | 125.5 | 106.6 | 82.3 |
+| | time to first token | 2.50 s | 24.0 s | 53.6 s | 138 s |
+| | device memory in use | 11.58 GiB | 12.10 GiB | 12.66 GiB | 13.84 GiB |
+
+Neither holds any weight in host memory at any of these contexts. Decode without speculation at 4K: 62.3 and
+60.8 tok/s.
+
+KL against the four references (T1 the README's quality document, T2 wikitext-2, T3 code, T4 the model's own
+generations; [docs/QUALITY.md](QUALITY.md)):
+
+| Finalist | T1 | T2 | T3 | T4 | T1 top-1 |
+|---|---|---|---|---|---|
+| most accurate | 0.0382 | 0.0450 | 0.0893 | 0.1935 | 90.3% |
+| fastest prefill | 0.0546 | 0.0637 | 0.1188 | 0.2246 | 86.7% |
+
+Two more front points were measured and not kept: one at search KL 0.0748 (T1 0.0440, T2 0.0525, T3 0.0948, T4 0.1935;
+prefill 1,214 tok/s at 32K, decode 134.3) and the knee at 0.0783 (T1 0.0546, T2 0.0567, T3 0.1126, T4 0.2359; prefill
+1,329 tok/s at 32K, decode 120.1); the fastest-prefill point prefills faster than the knee at the same T1 KL.
