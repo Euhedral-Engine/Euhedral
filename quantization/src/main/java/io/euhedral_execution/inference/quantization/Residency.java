@@ -142,9 +142,20 @@ public final class Residency {
             long hostBytes,
             int sequences,
             int tokens) {
+        return plan(artifact, speculation, gpu.deviceMemoryInfo().freeBytes(), hostBytes, sequences, tokens);
+    }
+
+    /// As above, for a device with `free` bytes free (see [#hostBacked(Artifact, ArtifactProfile.Speculation, long,
+    /// long, int, int)]).
+    public static ResidencyPlanner.Plan plan(
+            Artifact artifact,
+            ArtifactProfile.Speculation speculation,
+            long free,
+            long hostBytes,
+            int sequences,
+            int tokens) {
         ArtifactProfile found = ArtifactProfile.of(artifact);
         var profile = new ArtifactProfile(found.quantization(), found.compressed(), speculation, found.draftDepth());
-        long free = gpu.deviceMemoryInfo().freeBytes();
         int context = Math.toIntExact(Math.min(Integer.MAX_VALUE, (long) sequences * tokens));
         var plan = ResidencyPlanner.plan(
                 artifact,
