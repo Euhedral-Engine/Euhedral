@@ -64,9 +64,9 @@ A stream holds back only text that could still be the start of `</think>` or whi
 token by token.
 
 - **Stop sequences** apply to the answer only: a stop string inside the reasoning does not end the generation.
-- **Tools**: the reasoning is free text. After `</think>` the answer is constrained to the JSON tool-call envelope
-  ([TOOL_CALLING.md](TOOL_CALLING.md)); a few whitespace bytes may separate the two, and a generation terminator cannot
-  end the reasoning before an answer exists.
+- **Tools**: the reasoning is free text. After `</think>` the answer is free under `auto`, and constrained to native
+  `<tool_call>` blocks for `required` and a named function ([TOOL_CALLING.md](TOOL_CALLING.md)); a few whitespace
+  bytes may separate the two, and a generation terminator cannot end the reasoning before an answer exists.
 - **Speculative decoding** is unaffected: free reasoning needs no sampling constraint, so a greedy request still drafts
   with MTP.
 

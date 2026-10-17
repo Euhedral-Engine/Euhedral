@@ -274,8 +274,8 @@ All three request formats run on one pipeline, so they behave alike:
 - **Reasoning**: the model thinks before it answers (Chat Completions and Responses by default, Messages when asked,
   as each API defines it); the reasoning comes back separately (`reasoning_content`, a `reasoning` item, a `thinking`
   block), and its effort is selectable ([docs/REASONING.md](docs/REASONING.md)).
-- **Tool calling**: OpenAI and Anthropic tool definitions, single and parallel calls, tool results; `strict` tools get
-  arguments constrained to their schema. The server returns calls; the client runs them (an MCP client sits in the
+- **Tool calling**: OpenAI and Anthropic tool definitions, single and parallel calls, tool results, in the checkpoint's
+  native `<tool_call>` format; `required` and named `strict` tools get arguments constrained to their schema. The server returns calls; the client runs them (an MCP client sits in the
   client, not in the server) ([docs/TOOL_CALLING.md](docs/TOOL_CALLING.md)).
 - **Structured output**: `json_object` and `json_schema`, enforced token by token with llguidance; a schema that cannot
   be enforced exactly is refused instead of approximated ([docs/STRUCTURED_OUTPUT.md](docs/STRUCTURED_OUTPUT.md)).
