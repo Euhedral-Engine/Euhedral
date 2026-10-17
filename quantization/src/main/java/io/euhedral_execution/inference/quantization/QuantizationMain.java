@@ -42,8 +42,8 @@ import java.util.OptionalInt;
 /// [--norm-lr 2e-5] [--top-k 64] [--evaluate-every 50] [--probe 0] [--accumulate 8] [--fp32] [--batch 4]
 /// [--library
 /// LIBEUHEDRAL_CUDA]
-/// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--rows 8]
-/// [--host-mib N] [--batch 4] [--workers N] [--library LIBEUHEDRAL_CUDA]
+/// score --artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--values DIR]
+/// [--rows 8] [--host-mib N] [--batch 4] [--workers N] [--library LIBEUHEDRAL_CUDA]
 /// generate --artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens
 /// 4096]
 /// [--batch 12] [--host-mib N] [--limit N] [--workers N] [--library LIBEUHEDRAL_CUDA]
@@ -98,7 +98,7 @@ public final class QuantizationMain {
                     + "[--rounding-lanes N] [--viterbi-scratch-mib 256] "
                     + "[--memory-reserve-mib 1024] [--write-buffer-mib 16] [--library PATH]");
             System.err.println("       score --artifact ARTIFACT --results FILE (--reference R.kld --name NAME)... "
-                    + "[--rows 8] [--host-mib N] [--batch 4] [--workers N] [--library PATH]");
+                    + "[--values DIR] [--rows 8] [--host-mib N] [--batch 4] [--workers N] [--library PATH]");
             System.err.println(
                     "       generate --artifact ARTIFACT --tokenizer CHECKPOINT --out DIR (--prompts P.jsonl)... "
                             + "[--max-tokens 4096] [--batch 12] [--host-mib N] [--limit N] [--workers N] [--library PATH]");
@@ -266,6 +266,7 @@ public final class QuantizationMain {
                     references.stream().map(Path::of).toList(),
                     names,
                     Path.of(required(options, "results")),
+                    options.containsKey("values") ? Path.of(options.get("values")) : null,
                     Integer.parseInt(options.getOrDefault("rows", "8")),
                     hostBytes(options),
                     Integer.parseInt(options.getOrDefault("batch", "4")),
