@@ -1,15 +1,15 @@
 # Release test
 
-A held-out quality test that confirms quantization decisions at release checkpoints. The research texts T1–T4
-([QUALITY.md](QUALITY.md)) have informed many decisions and stay the research benchmarks; this test informs none. It
-answers one question per release: did the changes make Swift-1.5 better overall, or did they fit the texts measured
-over and over?
+A held-out quality set: the README's quality figures and release checks are measured on it. The research texts T1–T4
+([QUALITY.md](QUALITY.md)) have informed many decisions and stay the benchmarks for screening variants; this set
+does not choose among them. It answers whether the changes made Swift-1.5 better overall, or fitted the texts measured
+over and over.
 
 | Set | May influence |
 |---|---|
 | Calibration corpus | weights |
 | T1–T4 | research decisions (screening, choosing among variants) |
-| Release test | nothing: it only confirms a decision already made |
+| Release test | nothing: it measures the artifacts' published quality and confirms decisions already made |
 
 ## Version 1
 
@@ -67,6 +67,20 @@ scorer's commit (2c6118e).
 
 Any change to a recorded file makes a new version.
 
+## Quality by domain
+
+KL(BF16 ‖ artifact) and top-1 agreement per domain, measured 2026-10-17 (the README's quality table is the overall
+column):
+
+| Artifact | Overall | Conversation | Coding | Tool use | Multilingual | Prose | Code |
+|---|---|---|---|---|---|---|---|
+| `q3` | 0.134 / 89.6% | 0.131 / 88.4% | 0.130 / 90.3% | 0.305 / 86.2% | 0.105 / 89.6% | 0.056 / 91.5% | 0.078 / 91.8% |
+| `q3-compressed` | 0.161 / 88.3% | 0.163 / 87.0% | 0.158 / 89.0% | 0.325 / 85.0% | 0.138 / 88.1% | 0.072 / 90.7% | 0.109 / 90.4% |
+| `nvfp4` | 0.055 / 93.5% | 0.044 / 93.2% | 0.060 / 94.2% | 0.137 / 91.5% | 0.032 / 94.0% | 0.019 / 94.9% | 0.036 / 93.0% |
+| `nvfp4-compressed` | 0.054 / 93.6% | 0.042 / 93.5% | 0.060 / 94.2% | 0.140 / 91.2% | 0.031 / 94.0% | 0.019 / 94.9% | 0.036 / 93.7% |
+| `NVFP4-TA` | 0.075 / 92.5% | 0.062 / 92.0% | 0.081 / 93.3% | 0.180 / 89.5% | 0.048 / 92.7% | 0.028 / 93.9% | 0.057 / 93.5% |
+| `NVFP4-TB` | 0.091 / 91.6% | 0.081 / 91.0% | 0.098 / 92.2% | 0.212 / 88.9% | 0.065 / 91.5% | 0.038 / 93.1% | 0.053 / 93.0% |
+
 ## Scoring
 
 `tools/t5/run.py` scores the candidates with `quantization score --values` and prints, per domain and overall:
@@ -86,9 +100,8 @@ resolution: overall differences of a few percent; per domain, at 16 chunks, abou
 
 - **Aggregates only.** The runner checks every file against the manifest, then prints only aggregate and per-domain
   numbers; the per-token values are deleted after the run. Nothing per token, per chunk or per prompt is looked at.
-- **Release checkpoints only.** The test runs at designated release checkpoints, never after individual experiments.
-- **Retirement.** Once a result informs a quantization change, this version is retired for that change; the next
-  checkpoint uses a newly built version.
+- **No screening.** Variants are screened and chosen on T1–T4; this set measures the artifacts that are published and
+  confirms a decision already made.
 
 A behavioural check (thinking length, checkable task success, MTP tokens per verification) on a subset of the prompts
 is reported beside the test under its own thresholds; it is not part of the KL gate.

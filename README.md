@@ -109,8 +109,12 @@ Residency is described in [docs/NVFP4_RESIDENCY.md](docs/NVFP4_RESIDENCY.md) and
 
 ## Quality
 
-Error is measured four separate ways because they answer different questions. All use the 1279 teacher-forced tokens
-that follow a 1281-token prefix of one fixed document, and the BF16 checkpoint run in llama.cpp on the CPU as the reference.
+Error is measured four separate ways because they answer different questions. The model and quantization error is
+measured on a held-out quality set ([docs/RELEASE_TEST.md](docs/RELEASE_TEST.md)): 112 chunks of 2,560 tokens, each one
+independent conversation or document (BF16 Swift-1.5's own answers in conversation, coding, tool use and five other
+languages, with their chat-template, thinking and tool-call tokens, and human-written prose and code published after the
+model's training), the second half of every chunk scored (143,360 tokens), with BF16 Swift-1.5 in llama.cpp as the
+reference.
 
 All four artifacts' decoder layers and heads are rounded by GPTQ: each linear's rounding minimizes the error of
 its outputs on calibration activations of the quantized model, each column's error carried into the columns not yet
@@ -121,27 +125,28 @@ error weighted by the importance of each input column (`tools/convert_checkpoint
 `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`), and is measured against the Swift-1.5 BF16 checkpoint. `q3-compressed` limits its
 Q3 tensors other than the MLP down projections to the codes -3..3, which its lossless layout stores, while `q3` also uses -4 ([docs/COMPRESSED_Q3.md](docs/COMPRESSED_Q3.md)), so the two hold different values.
 
-**Model and quantization error** — the artifact against the BF16 checkpoint (reference: BF16 in llama.cpp on the CPU):
+**Model and quantization error** — the artifact against the BF16 checkpoint on the held-out set:
 
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
-| Swift-1.5 BF16 reference | 2.142 | 8.51 | | | |
-| `q3` | 2.229 | 9.30 | +0.088 ± 0.014 | 0.086 | 84.6% |
-| `q3-compressed` | 2.242 | 9.42 | +0.101 ± 0.017 | 0.106 | 84.0% |
-| `nvfp4` | 2.166 | 8.72 | +0.024 ± 0.008 | 0.028 | 90.9% |
-| `nvfp4-compressed` | 2.174 | 8.80 | +0.033 ± 0.007 | 0.028 | 90.3% |
-| `NVFP4-TA` | 2.175 | 8.80 | +0.033 ± 0.009 | 0.038 | 90.3% |
-| `NVFP4-TB` | 2.201 | 9.03 | +0.059 ± 0.011 | 0.055 | 86.7% |
+| Swift-1.5 BF16 reference | 0.609 | 1.84 | | | |
+| `q3` | 0.721 | 2.06 | +0.112 ± 0.009 | 0.134 | 89.6% |
+| `q3-compressed` | 0.749 | 2.12 | +0.140 ± 0.009 | 0.161 | 88.3% |
+| `nvfp4` | 0.662 | 1.94 | +0.053 ± 0.006 | 0.055 | 93.5% |
+| `nvfp4-compressed` | 0.649 | 1.91 | +0.040 ± 0.005 | 0.054 | 93.6% |
+| `NVFP4-TA` | 0.670 | 1.95 | +0.061 ± 0.007 | 0.075 | 92.5% |
+| `NVFP4-TB` | 0.685 | 1.98 | +0.076 ± 0.008 | 0.091 | 91.6% |
 
-Over a 75-chunk holdout of prose, code and the model's own chat answers, and with each artifact's weights alone in llama.cpp,
-the same order holds ([docs/QUALITY.md](docs/QUALITY.md#holdout-texts)).
+The perplexity is low because most of the set is the model's own text. In every domain the two NVFP4 forms have the least
+error and `q3-compressed` the most; tool use has the largest error for every artifact (KL 0.14 for `nvfp4-compressed` to 0.32 for `q3-compressed`) and prose the smallest
+(0.02 to 0.07). Per domain: [docs/RELEASE_TEST.md](docs/RELEASE_TEST.md#quality-by-domain).
 
 **Compression-induced error** — the compressed artifact against its uncompressed one:
 
 | Pair | Result |
 |---|---|
 | `q3-compressed` against the row-split Q3 with the same values (`q3_p2e2 expand`) | lossless: every route's logits are bitwise equal (`P2e2CudaIntegrationTest`) |
-| NVFP4-SD4 against `nvfp4`, both converted from Qwen3.8-27B with the same importance matrix | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
+| NVFP4-SD4 against `nvfp4`, both converted from Qwen3.8-27B with the same importance matrix (on one fixed document, 1279 scored tokens) | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
 
 **Relaxed-execution drift** — the production kernels against the exact scalar kernels on the same weights, 1024 teacher-forced
 decode steps after a 512-token prefill (measured on the round-to-nearest artifacts):
@@ -163,18 +168,18 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest prefill, and decode at short contexts:** `nvfp4-compressed` (perplexity 8.80 against 8.51 for BF16 on the quality
-  text): 4,033 tok/s of prefill and 135 tok/s of decode at 4K. On a 16 GB card it keeps 0.27 to 0.84 GiB of weights in host memory at 32K to 64K
+- **Fastest prefill, and decode at short contexts:** `nvfp4-compressed` (KL 0.054 against BF16 on the held-out
+  set): 4,033 tok/s of prefill and 135 tok/s of decode at 4K. On a 16 GB card it keeps 0.27 to 0.84 GiB of weights in host memory at 32K to 64K
   (2.02 GiB at 128K) and streams them in for every token: 125 tok/s at 32K, 90 at 64K and 50 at 128K.
-- **Fastest decode at 32K and beyond:** `NVFP4-TA` (perplexity 8.80): 138 tok/s at 4K, 143 at 32K, 111 at 64K and 79 at 128K,
-  with no host-backed weights, but the slowest prefill (1,376 tok/s at 4K, 853 at 128K). `NVFP4-TB` (perplexity 9.03)
+- **Fastest decode at 32K and beyond:** `NVFP4-TA` (KL 0.075): 138 tok/s at 4K, 143 at 32K, 111 at 64K and 79 at 128K,
+  with no host-backed weights, but the slowest prefill (1,376 tok/s at 4K, 853 at 128K). `NVFP4-TB` (KL 0.091)
   prefills 9 to 15% faster and decodes 82 tok/s at 128K.
-- **Faster prefill with every weight on the device:** `q3` (perplexity 9.30): 131 tok/s at 4K, 127 at 32K, 109 at 64K and 70 at
+- **Faster prefill with every weight on the device:** `q3` (KL 0.134): 131 tok/s at 4K, 127 at 32K, 109 at 64K and 70 at
   128K, prefill 2,099 tok/s at 4K and 1,085 at 128K.
-- **More room instead of speed:** `q3-compressed` (perplexity 9.42) is a file about 0.7 GiB smaller than `q3`, which leaves more
+- **More room instead of speed:** `q3-compressed` (KL 0.161) is a file about 0.7 GiB smaller than `q3`, which leaves more
   of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 114 tok/s at 4K,
   103 at 32K, 93 at 64K and 65 at 128K.
-- `nvfp4` (perplexity 8.72) keeps 1.02 to 1.58 GiB of weights in host memory at 32K to 64K (2.79 GiB at 128K) and decodes slower
+- `nvfp4` (KL 0.055) keeps 1.02 to 1.58 GiB of weights in host memory at 32K to 64K (2.79 GiB at 128K) and decodes slower
   than `nvfp4-compressed` at every context; the two NVFP4 forms differ by less than the noise of the quality measurement, and
   their prefill is within 2%.
 - A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.
