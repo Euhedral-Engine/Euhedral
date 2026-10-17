@@ -23,6 +23,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.StringJoiner;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -281,6 +282,43 @@ class ChatCompletionsCudaIntegrationTest {
                 JSON.readTree(message.at("/tool_calls/0/function/arguments").asString());
         assertTrue(arguments.get("city").asString().contains("Oslo"), arguments.toString());
         assertEquals("tool_calls", completion.at("/choices/0/finish_reason").asString());
+        assertSessionsReleased(before);
+    }
+
+    @Test
+    @Order(6)
+    void anAutomaticToolCallAndItsResultInTheNativeFormat() throws Exception {
+        DeviceBytes before = deviceBytes();
+        String tools = "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":"
+                + "\"Current weather for a city.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":"
+                + "{\"type\":\"string\"}},\"required\":[\"city\"]}}}]";
+        String question = "{\"role\":\"user\",\"content\":\"What is the weather in Oslo right now?\"}";
+        var first = post("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"low\",\"temperature\":0,"
+                + "\"max_tokens\":2048," + tools + ",\"messages\":[" + question + "]}");
+        assertEquals(200, first.statusCode(), first.body());
+        JsonNode call = JSON.readTree(first.body());
+        System.out.println("Automatic tool call: " + call);
+        JsonNode message = call.at("/choices/0/message");
+        assertEquals("get_weather", message.at("/tool_calls/0/function/name").asString());
+        String id = message.at("/tool_calls/0/id").asString();
+        String arguments = message.at("/tool_calls/0/function/arguments").asString();
+        assertTrue(JSON.readTree(arguments).get("city").asString().contains("Oslo"), arguments);
+        assertEquals("tool_calls", call.at("/choices/0/finish_reason").asString());
+
+        // The result goes back as a tool message; the model answers in text from it.
+        var second = post("{\"model\":\"" + MODEL + "\",\"reasoning_effort\":\"low\",\"temperature\":0,"
+                + "\"max_tokens\":2048," + tools + ",\"messages\":[" + question
+                + ",{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"" + id
+                + "\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":"
+                + JSON.writeValueAsString(arguments) + "}}]},{\"role\":\"tool\",\"tool_call_id\":\"" + id
+                + "\",\"content\":\"{\\\"temperature_c\\\": -3, \\\"conditions\\\": \\\"light snow\\\"}\"}]}");
+        assertEquals(200, second.statusCode(), second.body());
+        JsonNode answer = JSON.readTree(second.body());
+        System.out.println("Answer from the tool result: " + answer);
+        String content = answer.at("/choices/0/message/content").asString();
+        assertEquals("stop", answer.at("/choices/0/finish_reason").asString());
+        assertTrue(content.contains("-3") || content.toLowerCase(Locale.ROOT).contains("snow"), content);
+        assertFalse(content.contains("<tool_call>"), content);
         assertSessionsReleased(before);
     }
 
