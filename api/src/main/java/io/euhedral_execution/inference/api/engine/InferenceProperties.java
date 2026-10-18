@@ -70,10 +70,11 @@ public record InferenceProperties(
                 this.maxSequences);
     }
 
-    /// The selected processors: the configured ones, or every available one when none are configured.
+    /// The selected processors: the configured ones, or, when none are configured, every available one the
+    /// process's CPU quota pays for ([ProcessorTopology#withinQuota]).
     BitSet selectedCpus() {
         return workerCpus == null || workerCpus.isBlank()
-                ? ProcessorTopology.system().availableProcessorIds()
+                ? ProcessorTopology.system().withinQuota().processorIds()
                 : parseCpus(workerCpus);
     }
 
