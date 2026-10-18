@@ -11,7 +11,7 @@ over and over.
 | T1–T4 | research decisions (screening, choosing among variants) |
 | Release test | nothing: it measures the artifacts' published quality and confirms decisions already made |
 
-## Version 1
+## Version 2
 
 Frozen 2026-10-17. 112 chunks of 2,560 tokens (286,720 tokens); the second half of each chunk is scored (positions
 1281..2559, 143,360 scored tokens). Each chunk is one independent conversation or document.
@@ -32,7 +32,11 @@ Frozen 2026-10-17. 112 chunks of 2,560 tokens (286,720 tokens); the second half 
 - **Generation** (`tools/t5/generate.py`): the engine serving the BF16 Swift-1.5 artifact (BF16 attention caches,
   every weight on an RTX PRO 6000) through its OpenAI-compatible API, 57 conversations at once; sampled conversations at
   Swift-1.5's published settings (temperature 1.0, top-p 0.95, top-k 20, min-p 0) with random draws keyed by seed and
-  position; tool calls answered from the fixtures. Chat template, thinking and tool-call tokens are kept.
+  position; tool calls answered from the fixtures. Chat template, thinking and tool-call tokens are kept. The 32
+  conversations that offer tools (all of tool use, 8 of coding) were generated with the checkpoint's native
+  `<tool_call>` format ([TOOL_CALLING.md](TOOL_CALLING.md)), so the history the server replays matches what the model
+  wrote: 0.5% of follow-up requests in tool use, 0% in coding, do not continue the previous prompt and completion token
+  for token. Version 1 had generated them through a JSON envelope the checkpoint was not trained on and is retired.
 - **Chunks** (`tools/t5/chunks.py`): the first 2,560 tokens of each conversation or document. llama.cpp scores text, so
   a chunk is the tokenization of its own text: two conversations whose first 2,560 ids encode differently once decoded
   are cut at the nearest prefix that encodes to exactly 2,560 tokens (one cut one token later, one with two tokens
@@ -42,9 +46,9 @@ Frozen 2026-10-17. 112 chunks of 2,560 tokens (286,720 tokens); the second half 
 - **References**: BF16 Swift-1.5 in llama.cpp (commit 67a17c1, CUDA build, weights in host memory streamed through
   the GPU), independent of the engine that wrote the text:
   `LLAMA_PERPLEXITY_PARSE_SPECIAL=1 llama-perplexity -m Swift-1.5-Qwen3.8-27B-BF16.gguf -f text.txt -c 2560 -b 2560
-  -ub 2560 --chunks 112 -ngl 0 --kl-divergence-base reference.kld` (BF16 perplexity 1.8696 on the scored halves).
+  -ub 2560 --chunks 112 -ngl 0 --kl-divergence-base reference.kld` (BF16 perplexity 1.8713 on the scored halves).
 
-**Cross-check**: the engine's BF16 artifact (the one that wrote the text; 13.9 GB on the device, 21.8 GB in host memory,
+**Cross-check** (on version 1, whose 80 other chunks version 2 shares): the engine's BF16 artifact (the one that wrote the text; 13.9 GB on the device, 21.8 GB in host memory,
 18.9 GB read from disk) scored against the references once: mean KL 0.0029 ± 0.0011, top-1 agreement 98.6%, KL median
 0.00004, p95 0.0020, p99 0.0081, dNLL +0.017 ± 0.004 (on T1: KL 0.00057, top-1 97.3%). The median and tail percentiles
 are at the kernel noise floor; the mean and dNLL are raised by a few positions (largest KL 24.7). 14,331 s.
@@ -52,18 +56,18 @@ are at the kernel noise floor; the mean and dNLL are raised by a few positions (
 The set lives outside the repository. Its manifest (`frozen/manifest.json`, written by `tools/t5/freeze.py`) records
 the sha256 and size of every file the test depends on: the corpus, the references, the BF16 model file, the tokenizer
 and chat template, the generation record and settings, the prompt, document, fixture and check files, and the
-scorer's commit (2c6118e).
+scorer's commit (8494683).
 
 | File | sha256 |
 |---|---|
-| `frozen/manifest.json` | `9128d54c41af9a828bbdce6011e45444889a13412e6c3fa2299aa77100001843` |
-| `frozen/tokens.bin` (286,720 int32) | `3f86634c8ac7723b7fe09849a4d5aaf3a720e6d78e592b4d2e3bd0da2272f553` |
-| `frozen/chunks.jsonl` | `d0b5bbcad35f428382c8d33dbcdd806b84173f66193cb92da319ac229d05b658` |
-| `frozen/text.txt` | `1b372495bec31ad505dbf6e21358816238aea1398ddbf1abb3fe3ae9f6f2d88f` |
-| `frozen/reference.kld` (71,144,979,604 bytes) | `e4aa5af61832367dc7532476fee0fcf05851a8f6acd9664ad0904d083de55ef4` |
+| `frozen/manifest.json` | `eccd6a99f59f821fe6e6f81c6e1d4bb4839f3e809f067b1c314de2d871cff474` |
+| `frozen/tokens.bin` (286,720 int32) | `6b4e8f10af13ad9f3c0793d4eec6c68585e51dcfc09d37357c8d4c43ca27a3bd` |
+| `frozen/chunks.jsonl` | `5319e9130b2a61922f11290664c33d67e9f7106cbed1f6333d719f501544900f` |
+| `frozen/text.txt` | `75026930a31f04ecec23ec49d6db651a3e05a0caa32c1ecf76eb01faa2747cf5` |
+| `frozen/reference.kld` (71,144,979,604 bytes) | `a5eb3505e53bee093010652ec90efceab8d80e38e1c7b61368d350e0e3a51a66` |
 | BF16 model (`Swift-1.5-Qwen3.8-27B-BF16.gguf`) | `f1be0345521b1de10fc65aaf6bbbf2e49f7dff9b9c55b3b47070b71a201ebeee` |
 | `tokenizer.json` | `0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3` |
-| `generation/progress.json` | `90e5825fffccb68a9e059e60acdab20af92e8cc3430150fdca3e22e63697d8a2` |
+| `generation/progress.json` | `0c36140c85dd86211c74d775e7f96fe9cbe0d26d25156ef4ff8c4550ba96248e` |
 
 Any change to a recorded file makes a new version.
 
@@ -74,12 +78,12 @@ column):
 
 | Artifact | Overall | Conversation | Coding | Tool use | Multilingual | Prose | Code |
 |---|---|---|---|---|---|---|---|
-| `q3` | 0.134 / 89.6% | 0.131 / 88.4% | 0.130 / 90.3% | 0.305 / 86.2% | 0.105 / 89.6% | 0.056 / 91.5% | 0.078 / 91.8% |
-| `q3-compressed` | 0.161 / 88.3% | 0.163 / 87.0% | 0.158 / 89.0% | 0.325 / 85.0% | 0.138 / 88.1% | 0.072 / 90.7% | 0.109 / 90.4% |
-| `nvfp4` | 0.055 / 93.5% | 0.044 / 93.2% | 0.060 / 94.2% | 0.137 / 91.5% | 0.032 / 94.0% | 0.019 / 94.9% | 0.036 / 93.0% |
-| `nvfp4-compressed` | 0.054 / 93.6% | 0.042 / 93.5% | 0.060 / 94.2% | 0.140 / 91.2% | 0.031 / 94.0% | 0.019 / 94.9% | 0.036 / 93.7% |
-| `NVFP4-TA` | 0.075 / 92.5% | 0.062 / 92.0% | 0.081 / 93.3% | 0.180 / 89.5% | 0.048 / 92.7% | 0.028 / 93.9% | 0.057 / 93.5% |
-| `NVFP4-TB` | 0.091 / 91.6% | 0.081 / 91.0% | 0.098 / 92.2% | 0.212 / 88.9% | 0.065 / 91.5% | 0.038 / 93.1% | 0.053 / 93.0% |
+| `q3` | 0.124 / 90.3% | 0.131 / 88.4% | 0.099 / 91.1% | 0.286 / 89.9% | 0.105 / 89.6% | 0.056 / 91.5% | 0.078 / 91.8% |
+| `q3-compressed` | 0.152 / 89.0% | 0.163 / 87.0% | 0.121 / 89.8% | 0.317 / 88.7% | 0.138 / 88.1% | 0.072 / 90.7% | 0.109 / 90.4% |
+| `nvfp4` | 0.053 / 93.9% | 0.044 / 93.2% | 0.043 / 94.7% | 0.152 / 93.4% | 0.032 / 94.0% | 0.019 / 94.9% | 0.036 / 93.0% |
+| `nvfp4-compressed` | 0.051 / 94.0% | 0.042 / 93.5% | 0.041 / 94.6% | 0.145 / 93.6% | 0.031 / 94.0% | 0.019 / 94.9% | 0.036 / 93.7% |
+| `NVFP4-TA` | 0.071 / 93.0% | 0.062 / 92.0% | 0.055 / 93.8% | 0.189 / 92.1% | 0.048 / 92.7% | 0.028 / 93.9% | 0.057 / 93.5% |
+| `NVFP4-TB` | 0.087 / 92.1% | 0.081 / 91.0% | 0.074 / 92.7% | 0.221 / 91.4% | 0.065 / 91.5% | 0.038 / 93.1% | 0.053 / 93.0% |
 
 ## Scoring
 

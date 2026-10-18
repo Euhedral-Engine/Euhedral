@@ -130,15 +130,15 @@ Q3 tensors other than the MLP down projections to the codes -3..3, which its los
 | Artifact | Mean NLL | Perplexity | NLL vs BF16 (± s.e.) | KL(BF16 ‖ artifact) | Top-1 agreement |
 |---|---|---|---|---|---|
 | Swift-1.5 BF16 reference | 0.609 | 1.84 | | | |
-| `q3` | 0.721 | 2.06 | +0.112 ± 0.009 | 0.134 | 89.6% |
-| `q3-compressed` | 0.749 | 2.12 | +0.140 ± 0.009 | 0.161 | 88.3% |
-| `nvfp4` | 0.662 | 1.94 | +0.053 ± 0.006 | 0.055 | 93.5% |
-| `nvfp4-compressed` | 0.649 | 1.91 | +0.040 ± 0.005 | 0.054 | 93.6% |
-| `NVFP4-TA` | 0.670 | 1.95 | +0.061 ± 0.007 | 0.075 | 92.5% |
-| `NVFP4-TB` | 0.685 | 1.98 | +0.076 ± 0.008 | 0.091 | 91.6% |
+| `q3` | 0.710 | 2.03 | +0.101 ± 0.008 | 0.124 | 90.3% |
+| `q3-compressed` | 0.738 | 2.09 | +0.129 ± 0.009 | 0.152 | 89.0% |
+| `nvfp4` | 0.656 | 1.93 | +0.047 ± 0.006 | 0.053 | 93.9% |
+| `nvfp4-compressed` | 0.651 | 1.92 | +0.042 ± 0.005 | 0.051 | 94.0% |
+| `NVFP4-TA` | 0.665 | 1.94 | +0.056 ± 0.006 | 0.071 | 93.0% |
+| `NVFP4-TB` | 0.678 | 1.97 | +0.069 ± 0.007 | 0.087 | 92.1% |
 
 The perplexity is low because most of the set is the model's own text. In every domain the two NVFP4 forms have the least
-error and `q3-compressed` the most; tool use has the largest error for every artifact (KL 0.14 for `nvfp4-compressed` to 0.32 for `q3-compressed`) and prose the smallest
+error and `q3-compressed` the most; tool use has the largest error for every artifact (KL 0.145 for `nvfp4-compressed` to 0.317 for `q3-compressed`) and prose the smallest
 (0.02 to 0.07). Per domain: [docs/RELEASE_TEST.md](docs/RELEASE_TEST.md#quality-by-domain).
 
 **Compression-induced error** — the compressed artifact against its uncompressed one:
@@ -168,18 +168,18 @@ How to reproduce each measurement is in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Choosing an artifact
 
-- **Fastest prefill, and decode at short contexts:** `nvfp4-compressed` (KL 0.054 against BF16 on the held-out
+- **Fastest prefill, and decode at short contexts:** `nvfp4-compressed` (KL 0.051 against BF16 on the held-out
   set): 4,033 tok/s of prefill and 135 tok/s of decode at 4K. On a 16 GB card it keeps 0.27 to 0.84 GiB of weights in host memory at 32K to 64K
   (2.02 GiB at 128K) and streams them in for every token: 125 tok/s at 32K, 90 at 64K and 50 at 128K.
-- **Fastest decode at 32K and beyond:** `NVFP4-TA` (KL 0.075): 138 tok/s at 4K, 143 at 32K, 111 at 64K and 79 at 128K,
-  with no host-backed weights, but the slowest prefill (1,376 tok/s at 4K, 853 at 128K). `NVFP4-TB` (KL 0.091)
+- **Fastest decode at 32K and beyond:** `NVFP4-TA` (KL 0.071): 138 tok/s at 4K, 143 at 32K, 111 at 64K and 79 at 128K,
+  with no host-backed weights, but the slowest prefill (1,376 tok/s at 4K, 853 at 128K). `NVFP4-TB` (KL 0.087)
   prefills 9 to 15% faster and decodes 82 tok/s at 128K.
-- **Faster prefill with every weight on the device:** `q3` (KL 0.134): 131 tok/s at 4K, 127 at 32K, 109 at 64K and 70 at
+- **Faster prefill with every weight on the device:** `q3` (KL 0.124): 131 tok/s at 4K, 127 at 32K, 109 at 64K and 70 at
   128K, prefill 2,099 tok/s at 4K and 1,085 at 128K.
-- **More room instead of speed:** `q3-compressed` (KL 0.161) is a file about 0.7 GiB smaller than `q3`, which leaves more
+- **More room instead of speed:** `q3-compressed` (KL 0.152) is a file about 0.7 GiB smaller than `q3`, which leaves more
   of the card to the KV cache of a long context. Its kernels decode the compressed weights as they read them: 114 tok/s at 4K,
   103 at 32K, 93 at 64K and 65 at 128K.
-- `nvfp4` (KL 0.055) keeps 1.02 to 1.58 GiB of weights in host memory at 32K to 64K (2.79 GiB at 128K) and decodes slower
+- `nvfp4` (KL 0.053) keeps 1.02 to 1.58 GiB of weights in host memory at 32K to 64K (2.79 GiB at 128K) and decodes slower
   than `nvfp4-compressed` at every context; the two NVFP4 forms differ by less than the noise of the quality measurement, and
   their prefill is within 2%.
 - A card with more memory keeps more weights on the device and runs faster; the engine measures free memory at start and decides.
