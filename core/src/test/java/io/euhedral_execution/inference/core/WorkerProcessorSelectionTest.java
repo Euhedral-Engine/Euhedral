@@ -119,16 +119,18 @@ class WorkerProcessorSelectionTest {
         assertEquals(!SystemInfo.getECoreSet().isEmpty(), system.distinguishesPerformanceCores());
     }
 
-    /// Two sockets of four cores with SMT siblings (N, N+8): the host a container sees.
+    /// Two sockets of four cores (0-3 and 4-7) with SMT siblings (N, N+8): the host a container sees.
     static ProcessorTopology twoSockets(double quotaCpus) {
         Map<Integer, Integer> cores = new HashMap<>();
+        Map<Integer, Integer> sockets = new HashMap<>();
         for (int core = 0; core < 8; core++) {
             cores.put(core, core);
             cores.put(core + 8, core);
+            sockets.put(core, core / 4);
         }
         BitSet all = new BitSet();
         all.set(0, 16);
-        return ProcessorTopology.of(cores, all, new BitSet(), quotaCpus);
+        return ProcessorTopology.of(cores, sockets, all, new BitSet(), quotaCpus);
     }
 
     @Test
@@ -147,9 +149,9 @@ class WorkerProcessorSelectionTest {
     @Test
     void aQuotaBelowTheCoreCountSelectsThatManyWholeCores() {
         var selection = twoSockets(3.7).withinQuota();
-        assertEquals(ProcessorTopology.bits(0, 1, 2), selection.coreIds(), "floor(3.7) cores, by core ID");
-        assertEquals(ProcessorTopology.bits(0, 1, 2, 8, 9, 10), selection.processorIds(), "with their SMT siblings");
-        assertEquals(ProcessorTopology.bits(0), twoSockets(0.4).withinQuota().coreIds(), "at least one core");
+        assertEquals(ProcessorTopology.bits(0, 1, 4), selection.coreIds(), "floor(3.7) cores, the sockets in turn");
+        assertEquals(ProcessorTopology.bits(0, 1, 4, 8, 9, 12), selection.processorIds(), "with their SMT siblings");
+        assertEquals(ProcessorTopology.bits(0, 4), twoSockets(0.4).withinQuota().coreIds(), "a core on every socket");
     }
 
     @Test
@@ -157,6 +159,7 @@ class WorkerProcessorSelectionTest {
         // HYBRID: cores 0, 1, 2 performance, 3 efficiency; with a quota of two cores, two performance cores.
         var hybrid = ProcessorTopology.of(
                 Map.of(0, 0, 8, 0, 1, 1, 9, 1, 4, 2, 5, 2, 12, 3, 13, 4),
+                Map.of(),
                 ProcessorTopology.bits(0, 1, 4, 5, 8, 9, 12),
                 ProcessorTopology.bits(3),
                 2);
