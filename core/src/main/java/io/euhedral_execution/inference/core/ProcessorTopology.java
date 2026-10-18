@@ -1,7 +1,9 @@
 package io.euhedral_execution.inference.core;
 
 import io.euhedral_execution.hardware_utils.topology.SystemInfo;
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -21,6 +23,7 @@ import java.util.TreeMap;
 /// would throttle each other. [#withinQuota()] selects as many whole cores as the quota pays for.
 public final class ProcessorTopology {
     private final Map<Integer, Integer> coreByProcessor;
+    private final Map<Integer, Integer> socketByCore;
     private final BitSet available;
     private final BitSet performance;
     private final boolean distinguishesPerformanceCores;
@@ -29,11 +32,13 @@ public final class ProcessorTopology {
 
     private ProcessorTopology(
             Map<Integer, Integer> coreByProcessor,
+            Map<Integer, Integer> socketByCore,
             BitSet available,
             BitSet performance,
             boolean distinguishesPerformanceCores,
             double quotaCpus) {
         this.coreByProcessor = Map.copyOf(coreByProcessor);
+        this.socketByCore = Map.copyOf(socketByCore);
         this.available = (BitSet) available.clone();
         this.performance = (BitSet) performance.clone();
         this.distinguishesPerformanceCores = distinguishesPerformanceCores;
@@ -47,9 +52,12 @@ public final class ProcessorTopology {
     /// available processors and [#distinguishesPerformanceCores()] is false.
     public static ProcessorTopology system() {
         Map<Integer, Integer> cores = new TreeMap<>();
+        Map<Integer, Integer> sockets = new TreeMap<>();
         BitSet known = SystemInfo.getCpuSet();
         for (int cpu = known.nextSetBit(0); cpu >= 0; cpu = known.nextSetBit(cpu + 1)) {
-            cores.put(cpu, SystemInfo.getCpuInfo(cpu).core());
+            var info = SystemInfo.getCpuInfo(cpu);
+            cores.put(cpu, info.core());
+            sockets.put(info.core(), info.socket());
         }
         BitSet available = (BitSet) known.clone();
         double quota = 0;
@@ -60,6 +68,7 @@ public final class ProcessorTopology {
         }
         return new ProcessorTopology(
                 cores,
+                sockets,
                 available,
                 SystemInfo.getPCpuSet(),
                 !SystemInfo.getECoreSet().isEmpty(),
@@ -69,12 +78,17 @@ public final class ProcessorTopology {
     /// Test topology. `coreByProcessor` maps every known processor ID to its core ID; `available`
     /// and `efficiencyCores` are subsets. An empty efficiency set models a platform without P/E data.
     static ProcessorTopology of(Map<Integer, Integer> coreByProcessor, BitSet available, BitSet efficiencyCores) {
-        return of(coreByProcessor, available, efficiencyCores, 0);
+        return of(coreByProcessor, Map.of(), available, efficiencyCores, 0);
     }
 
-    /// As above, with a CPU quota of `quotaCpus` processors (0: none).
+    /// As above, with the socket of each core (cores it leaves out are on socket 0) and a CPU quota of
+    /// `quotaCpus` processors (0: none).
     static ProcessorTopology of(
-            Map<Integer, Integer> coreByProcessor, BitSet available, BitSet efficiencyCores, double quotaCpus) {
+            Map<Integer, Integer> coreByProcessor,
+            Map<Integer, Integer> socketByCore,
+            BitSet available,
+            BitSet efficiencyCores,
+            double quotaCpus) {
         BitSet unknown = (BitSet) available.clone();
         coreByProcessor.keySet().forEach(unknown::clear);
         if (!unknown.isEmpty()) throw new IllegalArgumentException("available processors must be known");
@@ -83,7 +97,10 @@ public final class ProcessorTopology {
             if (cpu < 0 || core < 0) throw new IllegalArgumentException("negative processor or core ID");
             if (!efficiencyCores.get(core)) performance.set(cpu);
         });
-        return new ProcessorTopology(coreByProcessor, available, performance, !efficiencyCores.isEmpty(), quotaCpus);
+        Map<Integer, Integer> sockets = new TreeMap<>();
+        coreByProcessor.values().forEach(core -> sockets.put(core, socketByCore.getOrDefault(core, 0)));
+        return new ProcessorTopology(
+                coreByProcessor, sockets, available, performance, !efficiencyCores.isEmpty(), quotaCpus);
     }
 
     /// Returns a copy of the processor IDs that may be selected as workers.
@@ -96,20 +113,29 @@ public final class ProcessorTopology {
         return this.quotaCpus;
     }
 
-    /// Every available processor when the CPU quota covers every available core (or there is none); otherwise
-    /// the available processors of as many whole cores as the quota pays for (at least one), performance cores
-    /// first, then by core ID. Each lattice worker is pinned to one core and runs it almost all of the time, so a
-    /// quota-sized lattice is not throttled.
+    /// Every available processor when the CPU quota covers every available core (or there is none);
+    /// otherwise the available processors of as many whole cores as the quota pays for, taken from the
+    /// sockets in turn so that every socket keeps at least one (the lattice starts a shard per socket
+    /// and waits for each), performance cores first within a socket, then by core ID. Each lattice
+    /// worker is pinned to one core and runs it almost all of the time, so a quota-sized lattice is
+    /// not throttled.
     public WorkerProcessorSelection withinQuota() {
         BitSet cores = coreIds(this.available);
-        int allowed = Math.max(1, (int) Math.floor(this.quotaCpus));
-        if (this.quotaCpus <= 0 || allowed >= cores.cardinality()) return allProcessors();
+        Map<Integer, List<Integer>> bySocket = new TreeMap<>();
         BitSet performanceCores = coreIds(intersection(this.available, this.performance));
-        BitSet chosen = new BitSet();
         for (BitSet tier : new BitSet[] {performanceCores, cores}) {
-            for (int core = tier.nextSetBit(0);
-                    core >= 0 && chosen.cardinality() < allowed;
-                    core = tier.nextSetBit(core + 1)) chosen.set(core);
+            for (int core = tier.nextSetBit(0); core >= 0; core = tier.nextSetBit(core + 1)) {
+                List<Integer> socket =
+                        bySocket.computeIfAbsent(this.socketByCore.getOrDefault(core, 0), k -> new ArrayList<>());
+                if (!socket.contains(core)) socket.add(core);
+            }
+        }
+        int allowed = Math.max(bySocket.size(), (int) Math.floor(this.quotaCpus));
+        if (this.quotaCpus <= 0 || allowed >= cores.cardinality()) return allProcessors();
+        BitSet chosen = new BitSet();
+        for (int round = 0; chosen.cardinality() < allowed; round++) {
+            for (List<Integer> socket : bySocket.values())
+                if (round < socket.size() && chosen.cardinality() < allowed) chosen.set(socket.get(round));
         }
         BitSet selected = new BitSet();
         this.coreByProcessor.forEach((cpu, core) -> {
