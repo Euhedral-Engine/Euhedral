@@ -151,10 +151,10 @@ def windows(ids: list[int], length: int, count: int, rng: random.Random) -> list
 
 def conversation_windows(store: Path, length: int, count: int, rng: random.Random) -> list[np.ndarray]:
     """Windows of `length` tokens of the conversations a `t5.generate` store holds, as the server tokenized them: each
-    conversation's first window, then its later whole windows, until `count`."""
+    conversation's first window, then its later whole windows, until `count`. A conversation that ended on an error
+    (an agent session whose file reads outgrew the context) still holds the text generated before it."""
     done = json.loads((store / "generation" / "progress.json").read_text(encoding="utf-8"))["conversations"]
-    streams = [np.asarray(c["tokens"], dtype=np.int32) for _, c in sorted(done.items())
-               if c["ended"] != "error" and len(c["tokens"]) >= length]
+    streams = [np.asarray(c["tokens"], dtype=np.int32) for _, c in sorted(done.items()) if len(c["tokens"]) >= length]
     rng.shuffle(streams)
     first = [s[:length] for s in streams]
     later = [s[start:start + length] for s in streams for start in range(length, len(s) - length + 1, length)]
